@@ -4,12 +4,15 @@ name: Windows ARM64 (native build)
 # (free for public repositories). Produces:
 #   - ctdozlite-<ver>-portable-windows-arm64.exe
 #   - ctdozlite-<ver>-setup-windows-arm64.exe   (Inno Setup, if available)
-# Run it from the Actions tab ("Run workflow") or by pushing a v* tag.
+# Run it from the Actions tab ("Run workflow"), by pushing a v* tag, or by
+# publishing a GitHub Release from the web UI (assets get attached to it).
 
 on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -93,8 +96,9 @@ jobs:
           name: ctdozlite-windows-arm64
           path: dist/*.exe
 
-      - name: Attach to release (tag builds only)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Attach to release (tag / release builds only)
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
           files: dist/*.exe
