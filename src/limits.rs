@@ -1,5 +1,7 @@
 //! Limits apply before allocating/decoding untrusted network data.
 use std::io::{Cursor, Read};
+pub static IMAGE_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
 pub const IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const INFLATED_BYTES: u64 = 8 * 1024 * 1024;
 

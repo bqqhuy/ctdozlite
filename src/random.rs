@@ -1,6 +1,9 @@
 //! Operating-system randomness for protocol nonces. No time/PID-derived seeds.
 use anyhow::Result;
 pub fn fill(bytes: &mut [u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
     #[cfg(windows)]
     {
         #[link(name = "bcrypt")]

@@ -11,7 +11,7 @@ These changes address the audit baseline at commit `3f28d2f99413d84e31d979cb914b
 | A05 | FFmpeg is resolved by absolute path, checked as ARM64 on Windows ARM64 and checked for capture, codec and filter support before enabling video. No FFmpeg binary is bundled. |
 | A06 | Windows ARM64 wgpu is constrained to DX12; adapter/backend is reported during initialization; glow remains an explicit/fallback renderer. |
 | A07 | Capture/playback dispatches F32/I16/U16/I32/F64 conversions and reports missing devices and stream creation failures in the GUI. |
-| A08 | Network responses are capped while streaming; image dimensions/allocations and decompressed payload sizes are bounded. |
+| A08 | Network responses are capped while streaming; image dimensions/allocations and decompressed payload sizes are bounded; concurrent image jobs are capped at four. |
 | A09 | Call signaling/wire logs require opt-in diagnostics and rotate under the data directory. |
 | A10 | ARM64 workflow covers PR/main, uses a pinned Rust toolchain/actions, runs all-target tests and checks/runs the built executable. |
 | A11 | Packaging fails if the installer is absent and emits an ARM64-specific checksum and source/toolchain manifest. Build jobs use read-only repository permissions; publishing uses a separate write-enabled job. |

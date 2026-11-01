@@ -269,8 +269,12 @@ mod dpapi {
         if ok == 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        let result =
-            unsafe { std::slice::from_raw_parts(output.data, output.len as usize).to_vec() };
+        let result = if output.len == 0 {
+            Vec::new()
+        } else {
+            anyhow::ensure!(!output.data.is_null(), "DPAPI returned a null buffer");
+            unsafe { std::slice::from_raw_parts(output.data, output.len as usize).to_vec() }
+        };
         unsafe {
             LocalFree(output.data.cast());
         }
@@ -342,6 +346,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn dpapi_roundtrip_and_tampering() {
+        assert!(unprotect(&protect(b"").unwrap()).unwrap().is_empty());
         let secret = b"session-token-test-fixture";
         let mut encrypted = protect(secret).unwrap();
         assert!(!encrypted.windows(secret.len()).any(|w| w == secret));

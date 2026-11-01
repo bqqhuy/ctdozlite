@@ -228,6 +228,7 @@ async fn prefetch_missing_sticker_thumbnails(
         let tx = gui_tx.clone();
         let ctx = egui_ctx.clone();
         async move {
+            let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else { return; };
             if let Ok(resp) = client.get(&url).send().await {
                 if resp.status().is_success() {
                     if let Ok(b) =
@@ -1304,6 +1305,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
+                                let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else { return; };
                                 let cache_dir = crate::storage::cache_dir();
                                 let _ = std::fs::create_dir_all(&cache_dir);
                                 let cache_path = cache_dir.join(format!("{key}.png"));
