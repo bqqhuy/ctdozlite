@@ -119,7 +119,13 @@ unsafe fn dimensions(mt: &IMFMediaType) -> Result<(usize, usize)> {
     let size = mt.GetUINT64(&MF_MT_FRAME_SIZE)?;
     let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
     anyhow::ensure!(
-        w > 0 && h > 0 && w <= 1920 && h <= 1080 && w % 2 == 0 && h % 2 == 0,
+        w > 0
+            && h > 0
+            && w <= 1920
+            && h <= 1920
+            && w * h <= 1920 * 1080
+            && w % 2 == 0
+            && h % 2 == 0,
         "Unsupported video size {w}x{h}"
     );
     Ok((w, h))

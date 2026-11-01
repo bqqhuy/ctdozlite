@@ -1,4 +1,3 @@
-pub mod audio;
 pub mod call;
 pub mod chat;
 pub mod crypto;
@@ -25,4 +24,4 @@ mod windows_video;
 
 mod history_sync;
 
-mod platform;
+pub mod platform;

@@ -59,3 +59,31 @@ pub fn open_folder(path: &std::path::Path) -> bool {
         false
     }
 }
+
+pub fn startup_error(message: &str) {
+    let path = crate::storage::root().join("diagnostics/startup-error.txt");
+    let _ = crate::storage::atomic_write(&path, message.as_bytes());
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(
+                hwnd: *mut std::ffi::c_void,
+                text: *const u16,
+                caption: *const u16,
+                kind: u32,
+            ) -> i32;
+        }
+        let text: Vec<u16> = format!("{message}\n\nChi tiết: {}", path.display())
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let title: Vec<u16> = "ctdozlite — Không mở được giao diện"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), 0x10);
+        }
+    }
+}

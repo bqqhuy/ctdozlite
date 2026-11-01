@@ -2557,63 +2557,73 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
     Ok(resp)
 }
 
-/// `GET /api/group/getlg/v4` (cmd 12027) — list of all groups user belongs to.
-pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
-    if s.login.is_none() {
-        return Ok(Vec::new());
+/// Unwrap encrypted/stringified JSON data without dropping server errors.
+fn response_data(mut value: Value) -> Result<Value> {
+    for _ in 0..4 {
+        if let Some(code) = value.get("error_code").and_then(Value::as_i64).filter(|code| *code != 0) {
+            anyhow::bail!("server error {code}: metadata unavailable");
+        }
+        if let Some(text) = value.as_str() {
+            value = serde_json::from_str(text)?;
+        } else if let Some(data) = value.get("data") {
+            value = data.clone();
+        } else { return Ok(value); }
     }
-    let url = format!("{}/api/group/getlg/v4?{}", s.domains.group, s.common_params());
-    let resp = s.get(&url).await?;
-    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    Ok(value)
+}
 
-    let mut groups = Vec::new();
-    if let Some(data) = resp.get("data") {
-        if let Some(map) = data.get("gridVerMap").and_then(Value::as_object) {
-            for (grid, _ver) in map {
-                groups.push(Thread {
-                    id: grid.clone(),
-                    name: format!("Nhóm {}", grid),
-                    preview: String::new(),
-                    time: crate::ui::clock(),
-                    avatar: None,
-                    is_group: true,
-                    messages: Vec::new(),
-                });
-            }
-            if !groups.is_empty() {
-                // getlg reports server versions, not metadata already cached by us.
-                // Sending those versions back suppresses the very names we need.
-                let missing_versions: serde_json::Map<String, Value> = map.keys()
-                    .map(|id| (id.clone(), json!(0))).collect();
-                if let Ok(gv_str) = serde_json::to_string(&missing_versions) {
-                    let body = obj(&[("gridVerMap", json!(gv_str))]);
-                    if let Ok(params) = s.encoded_params(&body) {
-                        let mg_url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
-                        if let Ok(mg_resp) = s.post_form(&mg_url, format!("params={params}")).await {
-                            let mg_dec = s.maybe_decrypt(mg_resp, s.session_key_bytes()).await;
-                            if let Some(info_map) = mg_dec.pointer("/data/gridInfoMap").and_then(Value::as_object) {
-                                for g in &mut groups {
-                                    if let Some(info) = info_map.get(&g.id) {
-                                        if let Some(name) = pick_str(info, &["name", "groupName", "displayName"]) {
-                                            g.name = name;
-                                        }
-                                        if let Some(avt) = pick_str(info, &["avt", "fullAvt", "avatar"]) {
-                                            g.avatar = Some(avt);
-                                        }
-                                    }
-                                }
-                            }
-                            if let Some(removed) = mg_dec.pointer("/data/removedsGroup").and_then(Value::as_array) {
-                                let rem_ids: std::collections::HashSet<&str> =
-                                    removed.iter().filter_map(Value::as_str).collect();
-                                groups.retain(|g| !rem_ids.contains(g.id.as_str()));
+/// List memberships then fetch full metadata in bounded batches. Server versions
+/// are not cached metadata: version zero explicitly requests names and avatars.
+pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
+    if s.login.is_none() { return Ok(Vec::new()); }
+    let url = format!("{}/api/group/getlg/v4?{}", s.domains.group, s.common_params());
+    let data = response_data(s.maybe_decrypt(s.get(&url).await?, s.session_key_bytes()).await)?;
+    let map = data.get("gridVerMap").and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Danh sách nhóm thiếu gridVerMap"))?;
+    let cached = load_threads_cache(s);
+    let mut groups: Vec<Thread> = map.keys().map(|id| {
+        let previous = cached.iter().find(|t| t.is_group && &t.id == id);
+        Thread {
+            id: id.clone(), name: previous.map(|t| t.name.clone()).unwrap_or_else(|| format!("Nhóm {id}")),
+            preview: previous.map(|t| t.preview.clone()).unwrap_or_default(),
+            time: previous.map(|t| t.time.clone()).unwrap_or_default(),
+            avatar: previous.and_then(|t| t.avatar.clone()), is_group: true, messages: Vec::new(),
+        }
+    }).collect();
+    let mut removed = std::collections::HashSet::new();
+    for chunk in groups.chunks_mut(50) {
+        let versions: serde_json::Map<String, Value> = chunk.iter().map(|g| (g.id.clone(),json!(0))).collect();
+        let body = json!({"gridVerMap": serde_json::to_string(&versions)?});
+        let params = s.encoded_params(&body)?;
+        let url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
+        let metadata = async {
+            let resp = s.post_form(&url, format!("params={params}")).await?;
+            response_data(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        }.await;
+        match metadata {
+            Ok(info) => {
+                if let Some(info_map) = info.get("gridInfoMap").and_then(Value::as_object) {
+                    for group in chunk {
+                        if let Some(raw) = info_map.get(&group.id) {
+                            if let Ok(info) = response_data(raw.clone()) {
+                                if let Some(name) = pick_str(&info, &["name","groupName","displayName"]).filter(|n| !n.trim().is_empty()) { group.name = name; }
+                                if let Some(avatar) = pick_str(&info, &["avt","fullAvt","avatar"]).filter(|n| !n.is_empty()) { group.avatar = Some(avatar); }
                             }
                         }
                     }
                 }
+                if let Some(ids) = info.get("removedsGroup").and_then(Value::as_array) {
+                    for id in ids { if let Some(id) = id.as_str() { removed.insert(id.to_owned()); } }
+                }
+            }
+            Err(e) => {
+                if crate::session::is_expired_error(&e.to_string()) { return Err(e); }
+                // Retain membership and previously verified names on partial outage.
+                crate::logger::log_error("group metadata", &e.to_string());
             }
         }
     }
+    groups.retain(|group| !removed.contains(&group.id));
     Ok(groups)
 }
 
@@ -4554,5 +4564,51 @@ mod tests {
         assert_eq!(list[0].messages.len(), 1);
         // Equal message IDs in separate conversations do not prove pollution.
         assert_eq!(list[1].messages.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod group_metadata_tests {
+    use super::*;
+    #[tokio::test]
+    async fn requests_missing_metadata_with_zero_version_and_decodes_group_name() {
+        use std::io::{Read,Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for step in 0..2 {
+                let (mut stream,_) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut input = Vec::new();
+                let header_end = loop {
+                    let mut b = [0;1024]; let n = stream.read(&mut b).unwrap(); assert!(n>0);
+                    input.extend_from_slice(&b[..n]);
+                    if let Some(end) = input.windows(4).position(|s| s == b"\r\n\r\n") { break end+4; }
+                };
+                let header = String::from_utf8_lossy(&input[..header_end]).to_string();
+                if step == 1 {
+                    assert!(header.starts_with("POST /api/group/getmg-v2?"));
+                    let length: usize = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|s| s.trim().parse().unwrap())).unwrap();
+                    while input.len() < header_end+length { let mut b=[0;1024]; let n=stream.read(&mut b).unwrap(); assert!(n>0); input.extend_from_slice(&b[..n]); }
+                    let form = String::from_utf8_lossy(&input[header_end..]);
+                    let url = reqwest::Url::parse(&format!("http://fixture/?{form}")).unwrap();
+                    let params = url.query_pairs().find(|(key,_)| key == "params").unwrap().1.to_string();
+                    let decoded = crate::crypto::decode_aes(&[0;32],&params).unwrap();
+                    let body: Value = serde_json::from_str(&decoded).unwrap();
+                    let versions: Value = serde_json::from_str(body["gridVerMap"].as_str().unwrap()).unwrap();
+                    assert_eq!(versions,json!({"123":0}));
+                }
+                let data = if step == 0 { json!({"gridVerMap":{"123":999}}) } else { json!({"gridInfoMap":{"123":{"name":"Nhóm ARM64","avt":"https://example.invalid/avatar.png"}}}) };
+                let body = json!({"error_code":0,"data":data.to_string()}).to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            }
+        });
+        let mut session = Session::new(false,false,false).unwrap();
+        session.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        session.domains.group = format!("http://{addr}"); session.secret_key = Some(vec![0;32]);
+        session.login = Some(crate::session::LoginInfo::default());
+        let groups = get_groups(&session).await.unwrap();
+        assert_eq!(groups.len(),1); assert_eq!(groups[0].name,"Nhóm ARM64");
+        server.join().unwrap();
     }
 }

@@ -1,6 +1,6 @@
 # Session Security Notice
 
-The default session is now `session.dat` under the per-user data directory. On Windows it is protected with current-user DPAPI. On Linux/macOS it uses a private directory and a file created with mode 0600. SQLite history remains unencrypted at the application layer.
+The default session is now `session.dat` under the per-user data directory. It is protected with current-user Windows DPAPI. SQLite history remains unencrypted at the application layer.
 
 Never commit or share session files, history databases, media caches or diagnostic logs. DPAPI does not protect against malicious processes running as the same Windows user. Disabling remember-login removes the saved session and prevents subsequent authentication/refresh paths from persisting it.
 

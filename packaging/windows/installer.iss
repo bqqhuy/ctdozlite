@@ -1,6 +1,6 @@
 #define MyAppName "ctdozlite"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.1"
+  #define MyAppVersion "0.0.2"
 #endif
 #ifndef BuildDir
   #define BuildDir "..\..\target\aarch64-pc-windows-msvc\release"
@@ -45,6 +45,7 @@ Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\docs\WINDOWS_ARM64.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

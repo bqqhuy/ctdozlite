@@ -8,7 +8,6 @@ mod limits;
 mod random;
 mod storage;
 mod video;
-mod audio;
 mod call;
 mod chat;
 mod crypto;
@@ -41,12 +40,16 @@ async fn main() -> Result<()> {
         println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if args.iter().any(|a| a == "--licenses") {
+        println!("{}", include_str!("../THIRD_PARTY_NOTICES.txt"));
+        return Ok(());
+    }
     let smoke = args.iter().any(|a| a == "--ui-smoke-test");
     if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
         anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
     }
     storage::init(args.iter().any(|a| a == "--portable"))?;
-    let _instance = storage::lock_instance()?;
+    let _instance = if args.iter().any(|a| a == "--doctor") { None } else { Some(storage::lock_instance()?) };
     let dev_mode = args
         .iter()
         .any(|a| a == "--dev" || a == "-v" || a == "--verbose");
@@ -189,10 +192,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        return Err(anyhow::anyhow!(
-            "Không thể khởi chạy GUI: {}",
-            last_err.map(|e| e.to_string()).unwrap_or_default()
-        ));
+        let message = format!("Không thể khởi chạy GUI: {}", last_err.map(|e| e.to_string()).unwrap_or_default());
+        if !smoke { platform::startup_error(&message); }
+        return Err(anyhow::anyhow!(message));
     }
 
     // 1. Initial server info check for TUI mode

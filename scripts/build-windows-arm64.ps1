@@ -46,6 +46,9 @@ Invoke-Checked $binary @('--version')
 $version = ((& cargo metadata --locked --no-deps --format-version 1) | ConvertFrom-Json).packages |
     Where-Object { $_.name -eq 'ctdozlite' } | Select-Object -ExpandProperty version
 if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'Cannot read package version' }
+if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
+    throw "Release tag must match Cargo version: expected v$version"
+}
 New-Item -ItemType Directory -Force dist | Out-Null
 # Start the real DX12 renderer with fixture data, capture pixels and require an exit.
 # The fixture explicitly bypasses account restore and all network workers.
@@ -102,12 +105,14 @@ Invoke-Checked $compiler.Source @("/DMyAppVersion=$version", "/DBuildDir=$buildD
 $installer = 'dist\ctdozlite-setup-windows-arm64.exe'
 if (-not (Test-Path $installer)) { throw 'Installer was not produced' }
 Move-Item $installer "dist\ctdozlite-$version-setup-windows-arm64.exe" -Force
-Copy-Item LICENSE-MIT, LICENSE-APACHE, docs\WINDOWS_ARM64.md dist -Force
+Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.txt, docs\WINDOWS_ARM64.md dist -Force
 $sourceCommit = (& git rev-parse HEAD).Trim()
 @{
     version = $version; target = $target; commit = $sourceCommit; rust = $hostInfo
     cargo_lock_sha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
-    ffmpeg = 'External native ARM64 dependency; run zalo-rust.exe --doctor'
+    video_backend = 'Windows Media Foundation (native)'
+    renderer = 'Direct3D 12'
+    minimum_windows_build = 22000
     crt = 'static'
     signed = $false
 } | ConvertTo-Json | Set-Content dist\build-info-windows-arm64.json -Encoding utf8

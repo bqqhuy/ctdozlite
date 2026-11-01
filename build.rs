@@ -16,7 +16,7 @@ fn main() {
         for dll in ["mfplat.dll", "mfreadwrite.dll", "mf.dll"] {
             println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
         }
-        println!("cargo:rustc-link-lib=delayimp");
+        println!("cargo:rustc-link-arg=/DEFAULTLIB:delayimp");
         if let Err(e) = embed_windows_icon() {
             println!("cargo:warning=Could not embed Windows icon resource: {e}");
         }

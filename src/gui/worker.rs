@@ -259,6 +259,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
 
+    let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
@@ -664,11 +665,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             });
                         }
                         WorkerCmd::RefreshThreads => {
+                            if refresh_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) { continue; }
+                            let refresh_guard = PollGuard(refresh_in_flight.clone());
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
+                                let _refresh_guard = refresh_guard;
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     let status = s.validate_session().await;

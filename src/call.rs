@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -879,7 +879,6 @@ struct PureRustCallState {
     udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
     keepalive_abort: Option<tokio::sync::watch::Sender<bool>>,
     /// Phase 1 audio session (mic->speaker pass-through). None until media starts.
-    audio: Option<crate::audio::AudioHandle>,
     /// Phase 2 media session (Opus/RTP over UDP). None until connected.
     media: Option<crate::media::MediaHandle>,
 }
@@ -1810,8 +1809,7 @@ impl CallBridge {
                                             udp_rtp_sock: None,
                                             udp_rtcp_sock: None,
                                             keepalive_abort: None,
-                                            audio: None,
-    media: None,
+                                            media: None,
                                         });
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::CallStateChanged("calling".into()));
@@ -1960,8 +1958,7 @@ impl CallBridge {
                                 udp_rtp_sock,
                                 udp_rtcp_sock,
                                 keepalive_abort,
-                                audio: None,
-    media: None,
+                                            media: None,
                             });
 
                             // Step 2: 416 (`/api/voicecall/request` — rings recipient's phone/Zalo)
@@ -2091,9 +2088,7 @@ impl CallBridge {
                                         }
                                         Err(e) => {
                                             eprintln!("media start failed: {e}");
-                                            if let Ok(sess) = crate::audio::AudioHandle::start() {
-                                                st.audio = Some(sess);
-                                            }
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không khởi động được media cuộc gọi: {e}")));
                                         }
                                     }
                                     let _ = gui_tx_clone
@@ -2420,10 +2415,7 @@ impl CallBridge {
                                             }
                                             Err(e) => {
                                                 eprintln!("media start failed: {e}");
-                                                if let Ok(sess) = crate::audio::AudioHandle::start()
-                                                {
-                                                    st.audio = Some(sess);
-                                                }
+                                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không khởi động được media cuộc gọi: {e}")));
                                             }
                                         }
                                         let call_id = st.call_id;
@@ -2676,8 +2668,7 @@ impl CallBridge {
                                             udp_rtp_sock: None,
                                             udp_rtcp_sock: None,
                                             keepalive_abort: None,
-                                            audio: None,
-                                            media: None,
+                                                                                    media: None,
                                         });
                                     }
                                 }
