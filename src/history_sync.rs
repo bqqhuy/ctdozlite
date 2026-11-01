@@ -35,19 +35,42 @@ pub fn page_metadata(response: &Value) -> Result<Page> {
             data = serde_json::from_str(text)?;
         } else if let Some(inner) = data.get("data") {
             data = inner.clone();
-        } else { break; }
+        } else {
+            break;
+        }
     }
     anyhow::ensure!(data.is_object(), "Phản hồi lịch sử không hợp lệ");
-    let flag = |name: &str| data.get(name).and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(0) > 0;
+    let flag = |name: &str| {
+        data.get(name)
+            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+            .unwrap_or(0)
+            > 0
+    };
     let filtered = flag("isFiltered");
     let more = flag("hasMore");
     let cursor = if more && !filtered {
-        let id = data.get("lastMsgId").context("Thiếu lastMsgId để tải trang tiếp theo")?;
-        let text = match id { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => anyhow::bail!("lastMsgId không hợp lệ") };
-        anyhow::ensure!(text.bytes().all(|c| c.is_ascii_digit()) && text.parse::<u64>().unwrap_or(0) > 0, "lastMsgId không hợp lệ");
+        let id = data
+            .get("lastMsgId")
+            .context("Thiếu lastMsgId để tải trang tiếp theo")?;
+        let text = match id {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            _ => anyhow::bail!("lastMsgId không hợp lệ"),
+        };
+        anyhow::ensure!(
+            text.bytes().all(|c| c.is_ascii_digit()) && text.parse::<u64>().unwrap_or(0) > 0,
+            "lastMsgId không hợp lệ"
+        );
         Some(text)
-    } else { None };
-    Ok(Page {cursor, more, old: flag("isOld"), filtered})
+    } else {
+        None
+    };
+    Ok(Page {
+        cursor,
+        more,
+        old: flag("isOld"),
+        filtered,
+    })
 }
 
 pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
@@ -77,12 +100,20 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .enumerate()
     {
         thread.messages.clear();
-        let checkpoint: Option<String> = store.conn.query_row(
-            "SELECT cursor FROM history_sync WHERE thread_id=?1", [&thread.id], |row| row.get(0)).ok();
+        let checkpoint: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT cursor FROM history_sync WHERE thread_id=?1",
+                [&thread.id],
+                |row| row.get(0),
+            )
+            .ok();
         // Legacy cursors were derived from individual rows and cannot be trusted.
         let saved = checkpoint.as_deref().and_then(|s| s.split_once(':'));
-        let mut cursor = saved.map(|(_, id)| id.to_owned()).unwrap_or_else(|| NEWEST_CURSOR.into());
-        let mut old = saved.map_or(false, |(kind, _)| kind == "old");
+        let mut cursor = saved
+            .map(|(_, id)| id.to_owned())
+            .unwrap_or_else(|| NEWEST_CURSOR.into());
+        let mut old = saved.is_some_and(|(kind, _)| kind == "old");
         for page in 0..200 {
             if canceled.load(Ordering::Relaxed) || !session.is_active() {
                 return Ok(format!(
@@ -124,7 +155,10 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 Ok::<_,anyhow::Error>(metadata.cursor.map(|next| (next, metadata.old)))
             }.await;
             match result {
-                Ok(Some((next, next_old))) => { cursor = next; old = next_old; },
+                Ok(Some((next, next_old))) => {
+                    cursor = next;
+                    old = next_old;
+                }
                 Ok(None) => break,
                 Err(e) => {
                     if e.to_string().contains("429") {
@@ -155,24 +189,32 @@ mod tests {
     #[test]
     fn follows_server_cursor_instead_of_message_ids() {
         let page = page_metadata(&serde_json::json!({"data":{"groupMsgs":[{"msgId":"1"}], "lastMsgId":"9007199254740993", "hasMore":1,"isOld":0}})).unwrap();
-        assert_eq!(page.cursor.as_deref(),Some("9007199254740993"));
+        assert_eq!(page.cursor.as_deref(), Some("9007199254740993"));
         assert!(!page.old);
         assert!(page.more);
     }
     #[test]
     fn stops_filtered_pages_even_when_server_reports_more() {
-        let page = page_metadata(&serde_json::json!({"data":"{\"groupMsgs\":[],\"hasMore\":1,\"isFiltered\":1}"})).unwrap();
+        let page = page_metadata(
+            &serde_json::json!({"data":"{\"groupMsgs\":[],\"hasMore\":1,\"isFiltered\":1}"}),
+        )
+        .unwrap();
         assert!(page.filtered);
         assert!(page.cursor.is_none());
     }
     #[test]
     fn old_endpoint_and_terminal_pages_follow_response_flags() {
-        let page = page_metadata(&serde_json::json!({"data":{"hasMore":1,"isOld":1,"lastMsgId":123}})).unwrap();
+        let page =
+            page_metadata(&serde_json::json!({"data":{"hasMore":1,"isOld":1,"lastMsgId":123}}))
+                .unwrap();
         assert!(page.old);
-        assert_eq!(page.cursor.as_deref(),Some("123"));
+        assert_eq!(page.cursor.as_deref(), Some("123"));
         assert!(page_metadata(&serde_json::json!({"data":{"hasMore":1}})).is_err());
         assert!(page_metadata(&serde_json::json!({"data":{"hasMore":1,"lastMsgId":"0"}})).is_err());
-        assert!(page_metadata(&serde_json::json!({"data":{"hasMore":0}})).unwrap().cursor.is_none());
+        assert!(page_metadata(&serde_json::json!({"data":{"hasMore":0}}))
+            .unwrap()
+            .cursor
+            .is_none());
         assert!(page_metadata(&serde_json::json!({"data":null})).is_err());
     }
 }

@@ -40,10 +40,10 @@ Cuộc gọi nhóm chưa hỗ trợ. Gọi 1-1 không bị khóa tài khoản th
 ## Chẩn đoán
 
 ```powershell
-.\zalo-rust.exe --doctor
-.\zalo-rust.exe --licenses
+.\ctdozlite.exe --doctor
+.\ctdozlite.exe --licenses
 $env:CTDOZ_RENDERER = 'dx12'
-.\zalo-rust.exe --gui --dev
+.\ctdozlite.exe --gui --dev
 ```
 
 DX12 là renderer mặc định. `CTDOZ_RENDERER=glow` chọn OpenGL nếu máy có driver phù hợp; một số máy cần OpenGL Compatibility Pack. Cập nhật Windows và driver GPU từ nhà sản xuất khi gặp màn hình đen.

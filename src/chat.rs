@@ -101,7 +101,9 @@ pub fn avatar_file_key(avatar: Option<&str>) -> Option<String> {
     }
     let path = url.split('?').next()?;
     let fname = path.rsplit('/').next()?.trim();
-    if fname.len() >= 12 && (fname.ends_with(".jpg") || fname.ends_with(".png") || fname.ends_with(".webp")) {
+    if fname.len() >= 12
+        && (fname.ends_with(".jpg") || fname.ends_with(".png") || fname.ends_with(".webp"))
+    {
         Some(fname.to_ascii_lowercase())
     } else {
         None
@@ -132,16 +134,23 @@ pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
     !a.id.is_empty() && a.id != "0" && a.is_group == b.is_group && a.id == b.id
 }
 
-fn pending_message_id(id: &str) -> bool { id.starts_with("out_") || id.starts_with("local_") }
+fn pending_message_id(id: &str) -> bool {
+    id.starts_with("out_") || id.starts_with("local_")
+}
 
 /// Real server IDs win over content/time heuristics. Only reconcile a local
 /// optimistic outgoing placeholder with its server echo; repeated real messages
 /// (including identical short replies) must remain separate.
 fn same_message(existing: &ChatMessage, incoming: &ChatMessage) -> bool {
-    if !existing.id.is_empty() && existing.id == incoming.id { return true; }
-    existing.is_outgoing && incoming.is_outgoing
+    if !existing.id.is_empty() && existing.id == incoming.id {
+        return true;
+    }
+    existing.is_outgoing
+        && incoming.is_outgoing
         && pending_message_id(&existing.id) != pending_message_id(&incoming.id)
-        && existing.text == incoming.text && existing.ts > 0 && incoming.ts > 0
+        && existing.text == incoming.text
+        && existing.ts > 0
+        && incoming.ts > 0
         && existing.ts.abs_diff(incoming.ts) < 5000
 }
 
@@ -163,21 +172,58 @@ pub fn merge_thread_into(
     if incoming.avatar.is_some()
         && (target.avatar.is_none()
             || incoming_id_is_authoritative
-            || avatar_url_time(incoming.avatar.as_deref()) >= avatar_url_time(target.avatar.as_deref()))
+            || avatar_url_time(incoming.avatar.as_deref())
+                >= avatar_url_time(target.avatar.as_deref()))
     {
         target.avatar = incoming.avatar;
     }
     target.is_group = target.is_group || incoming.is_group;
 
+    // Indexed lookup from upstream's large-history optimization, retaining strict
+    // real-message identities. Text/time matching only considers local echoes.
+    use std::collections::HashMap;
+    let mut by_id: HashMap<String, usize> = HashMap::new();
+    let mut by_text: HashMap<(String, bool), Vec<usize>> = HashMap::new();
+    for (idx, msg) in target.messages.iter().enumerate() {
+        if !msg.id.is_empty() {
+            by_id.insert(msg.id.clone(), idx);
+        }
+        by_text
+            .entry((msg.text.clone(), pending_message_id(&msg.id)))
+            .or_default()
+            .push(idx);
+    }
     for msg in incoming.messages {
         if msg.text == "sendBubbleMessage" {
             continue;
         }
-        if let Some(existing_msg) = target.messages.iter_mut().find(|m| same_message(m, &msg)) {
+        let pending = pending_message_id(&msg.id);
+        let found = by_id
+            .get(&msg.id)
+            .filter(|_| !msg.id.is_empty())
+            .copied()
+            .or_else(|| {
+                if !msg.is_outgoing {
+                    return None;
+                }
+                by_text
+                    .get(&(msg.text.clone(), !pending))?
+                    .iter()
+                    .copied()
+                    .find(|&idx| same_message(&target.messages[idx], &msg))
+            });
+        if let Some(idx) = found {
+            let existing_msg = &mut target.messages[idx];
+            let old_key = (
+                existing_msg.text.clone(),
+                pending_message_id(&existing_msg.id),
+            );
             if pending_message_id(&existing_msg.id)
                 && !msg.id.is_empty()
                 && !pending_message_id(&msg.id)
             {
+                by_id.remove(&existing_msg.id);
+                by_id.insert(msg.id.clone(), idx);
                 existing_msg.id = msg.id;
             }
             if msg.ts > 0 && existing_msg.ts != msg.ts {
@@ -215,7 +261,25 @@ pub fn merge_thread_into(
             }
             existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
             existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+            let new_key = (
+                existing_msg.text.clone(),
+                pending_message_id(&existing_msg.id),
+            );
+            if old_key != new_key {
+                if let Some(indices) = by_text.get_mut(&old_key) {
+                    indices.retain(|&i| i != idx);
+                }
+                by_text.entry(new_key).or_default().push(idx);
+            }
         } else {
+            let idx = target.messages.len();
+            if !msg.id.is_empty() {
+                by_id.insert(msg.id.clone(), idx);
+            }
+            by_text
+                .entry((msg.text.clone(), pending))
+                .or_default()
+                .push(idx);
             target.messages.push(msg);
         }
     }
@@ -251,7 +315,8 @@ pub fn deduplicate_threads(
         }
         t.messages.retain(|m| m.text != "sendBubbleMessage");
         if let Some(newest) = t.messages.last() {
-            if !newest.text.is_empty() && (t.preview.is_empty() || t.preview == "sendBubbleMessage") {
+            if !newest.text.is_empty() && (t.preview.is_empty() || t.preview == "sendBubbleMessage")
+            {
                 t.preview = newest.text.replace('\n', " ");
                 t.time = newest.time.clone();
             }
@@ -306,7 +371,17 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
     if s.account_key().is_empty() || !s.is_active() {
         return;
     }
-    if let Ok(text) = serde_json::to_string_pretty(threads) {
+    let keep = crate::store::MessageStore::PRELOAD_MSGS;
+    let slim: Vec<Thread> = threads
+        .iter()
+        .map(|t| {
+            let mut t = t.clone();
+            let skip = t.messages.len().saturating_sub(keep);
+            t.messages.drain(..skip);
+            t
+        })
+        .collect();
+    if let Ok(text) = serde_json::to_string(&slim) {
         if let Err(e) = crate::storage::atomic_write(&s.cache_path(), text.as_bytes()) {
             eprintln!("Cannot save history cache: {e}");
         }
@@ -348,7 +423,11 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             "{}/api/social/friend/getfriends?{}{}",
             host,
             s.common_params(),
-            if params.is_empty() { String::new() } else { format!("&{params}") }
+            if params.is_empty() {
+                String::new()
+            } else {
+                format!("&{params}")
+            }
         );
         match s.get(&url).await {
             Ok(r) => {
@@ -399,14 +478,14 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     // Merge user groups into threads list
     if let Ok(mut groups) = get_groups(s).await {
         for g in groups.drain(..) {
-            if !threads.iter().any(|t| t.id == g.id) {
+            if let Some(existing) = threads.iter_mut().find(|t| t.id == g.id && t.is_group) {
+                merge_thread_into(existing, g, true);
+            } else {
                 threads.push(g);
             }
         }
     }
 
-    // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads(s.history_path(), &mut threads, 200);
     resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
@@ -424,16 +503,14 @@ fn parse_thread(v: &Value) -> Option<Thread> {
         .unwrap_or_else(|| id.clone());
     let avatar = pick_str(v, &["avatar", "avt", "profile_avatar"]);
     let is_group = is_group_flag(v);
-    let time = v.get("lastActionTime")
+    let time = v
+        .get("lastActionTime")
         .and_then(|val| match val {
             Value::Number(n) => n.as_i64(),
             Value::String(s) => s.parse::<i64>().ok(),
             _ => None,
         })
-        .map(|ts| {
-            let s = ts / 1000;
-            format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
-        })
+        .map(crate::clock::message_time)
         .unwrap_or_default();
 
     Some(Thread {
@@ -484,10 +561,7 @@ pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value>
         &s.domains.chat
     };
 
-    let url = format!(
-        "{host}/api/message/sms?{}",
-        s.common_params()
-    );
+    let url = format!("{host}/api/message/sms?{}", s.common_params());
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -524,7 +598,11 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
         ("visibility", json!(0)),
     ]);
     let params = s.encoded_params(&body)?;
-    let url = format!("{}/api/group/sendmsg?{}", s.domains.group, s.common_params());
+    let url = format!(
+        "{}/api/group/sendmsg?{}",
+        s.domains.group,
+        s.common_params()
+    );
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -668,9 +746,12 @@ pub async fn send_attachment(
 
         let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
         let photo_id = pick_str(data_node, &["photoId", "clientFileId"]);
-        let normal_url = pick_str(data_node, &["normalUrl", "hdUrl", "oriUrl", "url"]).unwrap_or_default();
-        let hd_url = pick_str(data_node, &["hdUrl", "normalUrl", "oriUrl"]).unwrap_or_else(|| normal_url.clone());
-        let thumb_url = pick_str(data_node, &["thumbUrl", "normalUrl", "hdUrl"]).unwrap_or_else(|| normal_url.clone());
+        let normal_url =
+            pick_str(data_node, &["normalUrl", "hdUrl", "oriUrl", "url"]).unwrap_or_default();
+        let hd_url = pick_str(data_node, &["hdUrl", "normalUrl", "oriUrl"])
+            .unwrap_or_else(|| normal_url.clone());
+        let thumb_url = pick_str(data_node, &["thumbUrl", "normalUrl", "hdUrl"])
+            .unwrap_or_else(|| normal_url.clone());
 
         let send_resp = if let Some(pid) = photo_id.filter(|_| !normal_url.is_empty()) {
             let send_ep = if is_group {
@@ -678,7 +759,10 @@ pub async fn send_attachment(
             } else {
                 "/api/message/photo_original/send"
             };
-            let pid_val = pid.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(pid));
+            let pid_val = pid
+                .parse::<u64>()
+                .map(|n| json!(n))
+                .unwrap_or_else(|_| json!(pid));
             let mut send_obj = serde_json::Map::new();
             send_obj.insert("photoId".into(), pid_val);
             send_obj.insert("clientId".into(), json!(client_id));
@@ -781,7 +865,10 @@ pub async fn send_attachment(
             is_outgoing: true,
             ts: client_id as i64,
             link_url: Some(final_url),
-            link_title: Some(format!("{file_name} ({width}×{height} · {})", format_file_size(total_size))),
+            link_title: Some(format!(
+                "{file_name} ({width}×{height} · {})",
+                format_file_size(total_size)
+            )),
             link_desc: if caption.trim().is_empty() {
                 None
             } else {
@@ -855,7 +942,10 @@ pub async fn send_attachment(
         } else {
             "/api/message/asyncfile/msg"
         };
-        let fid_val = fid.parse::<u64>().map(|n| json!(n)).unwrap_or_else(|_| json!(fid));
+        let fid_val = fid
+            .parse::<u64>()
+            .map(|n| json!(n))
+            .unwrap_or_else(|_| json!(fid));
         let mut msg_obj = serde_json::Map::new();
         msg_obj.insert("fileId".into(), fid_val);
         if !file_url.is_empty() {
@@ -884,7 +974,12 @@ pub async fn send_attachment(
         json!({ "error_code": -1 })
     };
 
-    if send_resp.get("error_code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
+    if send_resp
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .unwrap_or(-1)
+        != 0
+    {
         // Fallback to single-shot `/api/message/sharefile_full` or `/api/group/sharefile_full`
         let share_ep = if is_group {
             "/api/group/sharefile_full"
@@ -892,9 +987,15 @@ pub async fn send_attachment(
             "/api/message/sharefile_full"
         };
         let body = if is_group {
-            obj(&[("grid", json!(clean_target)), ("clientId", json!(client_id))])
+            obj(&[
+                ("grid", json!(clean_target)),
+                ("clientId", json!(client_id)),
+            ])
         } else {
-            obj(&[("toid", json!(clean_target)), ("clientId", json!(client_id))])
+            obj(&[
+                ("toid", json!(clean_target)),
+                ("clientId", json!(client_id)),
+            ])
         };
         let params = s.encoded_params(&body)?;
         let url = format!(
@@ -971,10 +1072,12 @@ pub struct LinkMetadata {
 /// Extract the first `https://` or `http://` URL from a message text string.
 pub fn extract_first_url(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let pos = trimmed.find("https://").or_else(|| trimmed.find("http://"))?;
+    let pos = trimmed
+        .find("https://")
+        .or_else(|| trimmed.find("http://"))?;
     let after = &trimmed[pos..];
     let end = after.find(char::is_whitespace).unwrap_or(after.len());
-    let url = after[..end].trim_end_matches(|c: char| matches!(c, ')' | ']' | ',' | ';'));
+    let url = after[..end].trim_end_matches([')', ']', ',', ';']);
     if url.len() >= 10 {
         Some(url.to_string())
     } else {
@@ -1079,10 +1182,7 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
                 }
                 _ => {}
             }
-        } else if og_title.is_empty()
-            && tag.len() >= 6
-            && tag[1..6].eq_ignore_ascii_case("title")
-        {
+        } else if og_title.is_empty() && tag.len() >= 6 && tag[1..6].eq_ignore_ascii_case("title") {
             if let Some(close) = cursor.find("</") {
                 let raw_t = unescape_html_entities(&cursor[..close]);
                 if !raw_t.is_empty() {
@@ -1261,7 +1361,11 @@ pub async fn send_link_message(
                 ("imei", json!(s.imei)),
             ]);
             let params = s.encoded_params(&body)?;
-            let url = format!("{}/api/group/sendlink?{}", s.domains.group, s.common_params());
+            let url = format!(
+                "{}/api/group/sendlink?{}",
+                s.domains.group,
+                s.common_params()
+            );
             let resp = s.post_form(&url, format!("params={params}")).await?;
             let dec = s.maybe_decrypt(resp, s.session_key_bytes()).await;
             if let Some(code) = dec.get("error_code").and_then(Value::as_i64) {
@@ -1355,7 +1459,11 @@ pub async fn send_sticker(
             ("zsource", json!(101)),
         ]);
         let params = s.encoded_params(&body)?;
-        let url = format!("{}/api/group/sticker?{}", s.domains.group, s.common_params());
+        let url = format!(
+            "{}/api/group/sticker?{}",
+            s.domains.group,
+            s.common_params()
+        );
         let form = format!("params={params}");
         let resp = s.post_form(&url, form).await?;
         let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -1512,10 +1620,7 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
         if name.is_empty() || name.to_lowercase().contains("test") {
             continue;
         }
-        let total_image = item
-            .get("totalImage")
-            .and_then(Value::as_u64)
-            .unwrap_or(16) as u32;
+        let total_image = item.get("totalImage").and_then(Value::as_u64).unwrap_or(16) as u32;
         let icon_url = item
             .get("iconUrl")
             .or_else(|| item.get("thumbImg"))
@@ -1531,7 +1636,7 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
     }
 
     // Sort newest packs first (`id` descending) so modern Zalo packs appear at the top of the store
-    packs.sort_by(|a, b| b.id.cmp(&a.id));
+    packs.sort_by_key(|a| std::cmp::Reverse(a.id));
     if let Ok(txt) = serde_json::to_string(&packs) {
         let _ = std::fs::write(&cache_path, txt);
     }
@@ -1631,13 +1736,17 @@ pub fn strip_vn_for_sticker_kw(s: &str) -> String {
     for raw in s.chars() {
         for c in raw.to_lowercase() {
             let mapped = match c {
-                'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă'
-                | 'ằ' | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
+                'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
+                | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
+                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
+                    'e'
+                }
                 'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-                'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ'
-                | 'ờ' | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
-                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
+                'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
+                | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
+                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
+                    'u'
+                }
                 'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
                 'đ' => 'd',
                 '\u{a0}' => ' ',
@@ -1911,7 +2020,7 @@ async fn query_sticker_endpoints_once(
     // Merge and boost stickers that matched across multiple endpoints/queries
     let mut score_map: std::collections::HashMap<u64, (u64, u32, u8)> =
         std::collections::HashMap::new();
-    for batch in sugg_batches.into_iter().chain(search_batches.into_iter()) {
+    for batch in sugg_batches.into_iter().chain(search_batches) {
         for (cid, sid, stype, weight) in batch {
             score_map
                 .entry(sid)
@@ -2049,6 +2158,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 /// Send a quote/reply message (`sendQuoteMessage` / `sendGroupQuoteMessage` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14317494`):
 /// - 1-1 (`cmd 11771`): `POST {domains.chat}/api/message/quote?{common}`
 /// - Group (`cmd 11197`): `POST {domains.group}/api/group/quote?{common}`
+///
 /// Automatically falls back to `send_message` / `send_group_message` if the quoted message lacks a server ID.
 pub async fn send_quote_message(
     s: &Session,
@@ -2238,9 +2348,8 @@ pub async fn send_reaction(
         .unwrap_or(0);
 
     let (r_icon, r_type) = reaction_code_and_type(reaction);
-    let is_local_id = msg.id.is_empty()
-        || msg.id.starts_with("out_")
-        || msg.id.starts_with("local_");
+    let is_local_id =
+        msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
     let g_msg_id_val = if is_local_id {
         json!("")
     } else {
@@ -2351,7 +2460,11 @@ pub async fn delete_message_for_me(
             ("onlyMe", json!(1)),
         ]);
         let params = s.encoded_params(&body)?;
-        let url = format!("{}/api/group/deletemsg?{}", s.domains.group, s.common_params());
+        let url = format!(
+            "{}/api/group/deletemsg?{}",
+            s.domains.group,
+            s.common_params()
+        );
         let resp = s.post_form(&url, format!("params={params}")).await?;
         Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     } else {
@@ -2411,7 +2524,11 @@ pub async fn recall_message(
             ("imei", json!(s.imei)),
         ]);
         let params = s.encoded_params(&body)?;
-        let url = format!("{}/api/group/undomsg?{}", s.domains.group, s.common_params());
+        let url = format!(
+            "{}/api/group/undomsg?{}",
+            s.domains.group,
+            s.common_params()
+        );
         let resp = s.post_form(&url, format!("params={params}")).await?;
         Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     } else {
@@ -2550,7 +2667,10 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
     let params = match s.encoded_params(&body) {
         Ok(p) => format!("params={p}"),
         Err(e) => {
-            crate::logger::log_error("chat::get_group_history_raw::encoded_params", &e.to_string());
+            crate::logger::log_error(
+                "chat::get_group_history_raw::encoded_params",
+                &e.to_string(),
+            );
             Session::plain_params(&body)
         }
     };
@@ -2567,14 +2687,20 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
 /// Unwrap encrypted/stringified JSON data without dropping server errors.
 fn response_data(mut value: Value) -> Result<Value> {
     for _ in 0..4 {
-        if let Some(code) = value.get("error_code").and_then(Value::as_i64).filter(|code| *code != 0) {
+        if let Some(code) = value
+            .get("error_code")
+            .and_then(Value::as_i64)
+            .filter(|code| *code != 0)
+        {
             anyhow::bail!("server error {code}: metadata unavailable");
         }
         if let Some(text) = value.as_str() {
             value = serde_json::from_str(text)?;
         } else if let Some(data) = value.get("data") {
             value = data.clone();
-        } else { return Ok(value); }
+        } else {
+            return Ok(value);
+        }
     }
     Ok(value)
 }
@@ -2582,56 +2708,99 @@ fn response_data(mut value: Value) -> Result<Value> {
 /// List memberships then fetch full metadata in bounded batches. Server versions
 /// are not cached metadata: version zero explicitly requests names and avatars.
 pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
-    if s.login.is_none() { return Ok(Vec::new()); }
-    let url = format!("{}/api/group/getlg/v4?{}", s.domains.group, s.common_params());
-    let data = response_data(s.maybe_decrypt(s.get(&url).await?, s.session_key_bytes()).await)?;
-    let map = data.get("gridVerMap").and_then(Value::as_object)
+    if s.login.is_none() {
+        return Ok(Vec::new());
+    }
+    let url = format!(
+        "{}/api/group/getlg/v4?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let data = response_data(
+        s.maybe_decrypt(s.get(&url).await?, s.session_key_bytes())
+            .await,
+    )?;
+    let map = data
+        .get("gridVerMap")
+        .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Danh sách nhóm thiếu gridVerMap"))?;
     let cached = load_threads_cache(s);
-    let mut groups: Vec<Thread> = map.keys().map(|id| {
-        let previous = cached.iter().find(|t| t.is_group && &t.id == id);
-        Thread {
-            id: id.clone(), name: previous.map(|t| t.name.clone()).unwrap_or_else(|| format!("Nhóm {id}")),
-            preview: previous.map(|t| t.preview.clone()).unwrap_or_default(),
-            time: previous.map(|t| t.time.clone()).unwrap_or_default(),
-            avatar: previous.and_then(|t| t.avatar.clone()), is_group: true, messages: Vec::new(),
-        }
-    }).collect();
+    let mut groups: Vec<Thread> = map
+        .keys()
+        .map(|id| {
+            let previous = cached.iter().find(|t| t.is_group && &t.id == id);
+            Thread {
+                id: id.clone(),
+                name: previous
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| format!("Nhóm {id}")),
+                preview: previous.map(|t| t.preview.clone()).unwrap_or_default(),
+                time: previous.map(|t| t.time.clone()).unwrap_or_default(),
+                avatar: previous.and_then(|t| t.avatar.clone()),
+                is_group: true,
+                messages: Vec::new(),
+            }
+        })
+        .collect();
     let removed = resolve_group_metadata(s, &mut groups).await?;
     groups.retain(|group| !removed.contains(&group.id));
     Ok(groups)
 }
 
 /// Resolve names for known group IDs without reloading all memberships.
-async fn resolve_group_metadata(s: &Session, groups: &mut [Thread]) -> Result<std::collections::HashSet<String>> {
+async fn resolve_group_metadata(
+    s: &Session,
+    groups: &mut [Thread],
+) -> Result<std::collections::HashSet<String>> {
     let mut removed = std::collections::HashSet::new();
     for chunk in groups.chunks_mut(50) {
-        let versions: serde_json::Map<String, Value> = chunk.iter().map(|g| (g.id.clone(),json!(0))).collect();
+        let versions: serde_json::Map<String, Value> =
+            chunk.iter().map(|g| (g.id.clone(), json!(0))).collect();
         let body = json!({"gridVerMap": serde_json::to_string(&versions)?});
         let params = s.encoded_params(&body)?;
-        let url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());
+        let url = format!(
+            "{}/api/group/getmg-v2?{}",
+            s.domains.group,
+            s.common_params()
+        );
         let metadata = async {
             let resp = s.post_form(&url, format!("params={params}")).await?;
             response_data(s.maybe_decrypt(resp, s.session_key_bytes()).await)
-        }.await;
+        }
+        .await;
         match metadata {
             Ok(info) => {
                 if let Some(info_map) = info.get("gridInfoMap").and_then(Value::as_object) {
                     for group in chunk {
                         if let Some(raw) = info_map.get(&group.id) {
                             if let Ok(info) = response_data(raw.clone()) {
-                                if let Some(name) = pick_str(&info, &["name","groupName","displayName"]).filter(|n| !n.trim().is_empty()) { group.name = name; }
-                                if let Some(avatar) = pick_str(&info, &["avt","fullAvt","avatar"]).filter(|n| !n.is_empty()) { group.avatar = Some(avatar); }
+                                if let Some(name) =
+                                    pick_str(&info, &["name", "groupName", "displayName"])
+                                        .filter(|n| !n.trim().is_empty())
+                                {
+                                    group.name = name;
+                                }
+                                if let Some(avatar) = pick_str(&info, &["avt", "fullAvt", "avatar"])
+                                    .filter(|n| !n.is_empty())
+                                {
+                                    group.avatar = Some(avatar);
+                                }
                             }
                         }
                     }
                 }
                 if let Some(ids) = info.get("removedsGroup").and_then(Value::as_array) {
-                    for id in ids { if let Some(id) = id.as_str() { removed.insert(id.to_owned()); } }
+                    for id in ids {
+                        if let Some(id) = id.as_str() {
+                            removed.insert(id.to_owned());
+                        }
+                    }
                 }
             }
             Err(e) => {
-                if crate::session::is_expired_error(&e.to_string()) { return Err(e); }
+                if crate::session::is_expired_error(&e.to_string()) {
+                    return Err(e);
+                }
                 // Retain membership and previously verified names on partial outage.
                 crate::logger::log_error("group metadata", &e.to_string());
             }
@@ -2641,16 +2810,20 @@ async fn resolve_group_metadata(s: &Session, groups: &mut [Thread]) -> Result<st
 }
 
 /// `POST /api/social/friend/getminiprofiles` (cmd 12134) — get basic profiles (name, avatar) for user IDs.
-pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde_json::Map<String, Value>> {
+pub async fn get_mini_profiles(
+    s: &Session,
+    user_ids: &[String],
+) -> Result<serde_json::Map<String, Value>> {
     if s.login.is_none() || user_ids.is_empty() {
         return Ok(serde_json::Map::new());
     }
-    let body = obj(&[
-        ("friend_ids", json!(user_ids)),
-        ("imei", json!(s.imei)),
-    ]);
+    let body = obj(&[("friend_ids", json!(user_ids)), ("imei", json!(s.imei))]);
     let params = s.encoded_params(&body)?;
-    let url = format!("{}/api/social/friend/getminiprofiles?{}", s.domains.profile, s.common_params());
+    let url = format!(
+        "{}/api/social/friend/getminiprofiles?{}",
+        s.domains.profile,
+        s.common_params()
+    );
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -2664,14 +2837,23 @@ pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde
 
 /// Automatically resolve real display names and avatars for threads that only have placeholder names.
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
-    let mut unknown_groups: Vec<Thread> = threads.iter().filter(|t| t.is_group &&
-        (t.name.is_empty() || t.name == t.id || t.name == format!("Nhóm {}", t.id))).cloned().collect();
+    let mut unknown_groups: Vec<Thread> = threads
+        .iter()
+        .filter(|t| {
+            t.is_group
+                && (t.name.is_empty() || t.name == t.id || t.name == format!("Nhóm {}", t.id))
+        })
+        .cloned()
+        .collect();
     if !unknown_groups.is_empty() {
         if let Err(e) = resolve_group_metadata(s, &mut unknown_groups).await {
             crate::logger::log_error("group name resolution", &e.to_string());
         }
         for resolved in unknown_groups {
-            if let Some(thread) = threads.iter_mut().find(|t| t.id == resolved.id && t.is_group) {
+            if let Some(thread) = threads
+                .iter_mut()
+                .find(|t| t.id == resolved.id && t.is_group)
+            {
                 thread.name = resolved.name;
                 thread.avatar = resolved.avatar.or_else(|| thread.avatar.clone());
             }
@@ -2876,7 +3058,9 @@ pub async fn get_cloud_messages(
         "globalMsgId".into(),
         json!(if global_msg_id.is_empty() || global_msg_id == "0" {
             crate::history_sync::NEWEST_CURSOR
-        } else { global_msg_id }),
+        } else {
+            global_msg_id
+        }),
     );
     map.insert("count".into(), json!(count));
     map.insert("msgIds".into(), json!([]));
@@ -2884,7 +3068,17 @@ pub async fn get_cloud_messages(
     if is_send2me {
         map.insert("isOA".into(), json!(1));
     }
-    map.insert("src".into(), json!(if global_msg_id.is_empty() || global_msg_id == "0" || global_msg_id == crate::history_sync::NEWEST_CURSOR { 1 } else { 3 }));
+    map.insert(
+        "src".into(),
+        json!(if global_msg_id.is_empty()
+            || global_msg_id == "0"
+            || global_msg_id == crate::history_sync::NEWEST_CURSOR
+        {
+            1
+        } else {
+            3
+        }),
+    );
 
     let body = Value::Object(map);
     let params = s.encoded_params(&body)?;
@@ -3056,7 +3250,9 @@ fn extract_content_text(v: &Value) -> Option<String> {
                 .get("href")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")));
+                .filter(|h| {
+                    !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://"))
+                });
             for k in ["description", "caption", "text", "msg", "title"] {
                 if let Some(Value::String(s)) = o.get(k) {
                     let t = s.trim();
@@ -3080,24 +3276,23 @@ fn extract_content_text(v: &Value) -> Option<String> {
 }
 
 fn normalize_msg_type(it: &Value) -> String {
-    let raw = it.get("msgType")
+    let raw = it
+        .get("msgType")
         .or_else(|| it.get("messageType"))
         .or_else(|| it.get("type"));
     match raw {
         Some(Value::String(s)) => s.to_ascii_lowercase(),
-        Some(Value::Number(n)) => {
-            match n.as_i64() {
-                Some(1) => "chat.text".into(),
-                Some(2) => "chat.photo".into(),
-                Some(3) => "chat.voice".into(),
-                Some(4) => "chat.video".into(),
-                Some(5) => "chat.sticker".into(),
-                Some(19) => "chat.file".into(),
-                Some(24) => "chat.location".into(),
-                Some(31) => "chat.undo".into(),
-                _ => n.to_string(),
-            }
-        }
+        Some(Value::Number(n)) => match n.as_i64() {
+            Some(1) => "chat.text".into(),
+            Some(2) => "chat.photo".into(),
+            Some(3) => "chat.voice".into(),
+            Some(4) => "chat.video".into(),
+            Some(5) => "chat.sticker".into(),
+            Some(19) => "chat.file".into(),
+            Some(24) => "chat.location".into(),
+            Some(31) => "chat.undo".into(),
+            _ => n.to_string(),
+        },
         _ => String::new(),
     }
 }
@@ -3135,7 +3330,11 @@ fn extract_sticker_info(v: &Value) -> Option<(u64, u64, u32)> {
                 .map(|t| t as u32)
                 .unwrap_or(7);
             if let Some(sid) = stk_id {
-                if cat_id.is_some() || o.contains_key("stickerId") || o.contains_key("catId") || o.contains_key("cateId") {
+                if cat_id.is_some()
+                    || o.contains_key("stickerId")
+                    || o.contains_key("catId")
+                    || o.contains_key("cateId")
+                {
                     return Some((sid, cat_id.unwrap_or(0), stk_type));
                 }
             }
@@ -3145,18 +3344,17 @@ fn extract_sticker_info(v: &Value) -> Option<(u64, u64, u32)> {
     }
 }
 
+type LinkInfo = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Extract rich link/media card metadata (`link_url`, `link_title`, `link_desc`, `link_thumb`, `link_src`)
 /// from a Zalo `chat.recommended` (`recommened.link`) or rich-object `content`.
-fn extract_link_info(
-    v: &Value,
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
+fn extract_link_info(v: &Value) -> LinkInfo {
     match v {
         Value::String(s) => {
             let trimmed = s.trim();
@@ -3172,7 +3370,9 @@ fn extract_link_info(
                 .get("href")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|h| !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://")))
+                .filter(|h| {
+                    !h.is_empty() && (h.starts_with("http://") || h.starts_with("https://"))
+                })
                 .map(str::to_string);
             let Some(url) = href else {
                 return (None, None, None, None, None);
@@ -3182,7 +3382,9 @@ fn extract_link_info(
                 .or_else(|| o.get("hd"))
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|t| !t.is_empty() && (t.starts_with("http://") || t.starts_with("https://")))
+                .filter(|t| {
+                    !t.is_empty() && (t.starts_with("http://") || t.starts_with("https://"))
+                })
                 .map(str::to_string);
             let mut title = o
                 .get("title")
@@ -3234,11 +3436,17 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     let raw_content_val = it
         .get("content")
-        .or_else(|| it.get("message").and_then(|m| m.get("content")).or_else(|| it.get("message")))
+        .or_else(|| {
+            it.get("message")
+                .and_then(|m| m.get("content"))
+                .or_else(|| it.get("message"))
+        })
         .or_else(|| it.get("msg"));
 
     let mut sticker_meta = raw_content_val.and_then(extract_sticker_info);
-    if sticker_meta.is_none() && (msg_type == "chat.sticker" || msg_type == "sticker" || msg_type == "5") {
+    if sticker_meta.is_none()
+        && (msg_type == "chat.sticker" || msg_type == "sticker" || msg_type == "5")
+    {
         sticker_meta = extract_sticker_info(it);
     }
     let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
@@ -3270,7 +3478,10 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             _ => {
                 let obj = it.get("content").or_else(|| it.get("message"));
                 if let Some(o) = obj {
-                    if o.get("catId").is_some() || o.get("stickerId").is_some() || o.get("id").is_some() {
+                    if o.get("catId").is_some()
+                        || o.get("stickerId").is_some()
+                        || o.get("id").is_some()
+                    {
                         "[Nhãn dán]".to_string()
                     } else if o.get("href").is_some() || o.get("thumb").is_some() {
                         "[Hình ảnh]".to_string()
@@ -3289,9 +3500,11 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let undo_target_id = if is_undo_type {
         raw_content_val.and_then(|rv| match rv {
             Value::Object(_) => pick_str(rv, &["globalMsgId", "msgId", "cliMsgId"]),
-            Value::String(s) if s.trim().starts_with('{') => serde_json::from_str::<Value>(s.trim())
-                .ok()
-                .and_then(|parsed| pick_str(&parsed, &["globalMsgId", "msgId", "cliMsgId"])),
+            Value::String(s) if s.trim().starts_with('{') => {
+                serde_json::from_str::<Value>(s.trim())
+                    .ok()
+                    .and_then(|parsed| pick_str(&parsed, &["globalMsgId", "msgId", "cliMsgId"]))
+            }
             _ => None,
         })
     } else {
@@ -3342,8 +3555,15 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
 
     let is_outgoing = uid_from == "0"
         || uid_from.is_empty()
-        || it.get("isOutgoing").and_then(Value::as_bool).unwrap_or(false)
-        || it.get("is_outgoing").and_then(Value::as_i64).map(|n| n == 1).unwrap_or(false);
+        || it
+            .get("isOutgoing")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || it
+            .get("is_outgoing")
+            .and_then(Value::as_i64)
+            .map(|n| n == 1)
+            .unwrap_or(false);
 
     let ts = it
         .get("ts")
@@ -3365,16 +3585,19 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         crate::ui::clock()
     };
 
-    let (reply_to_id, reply_to_sender, reply_to_text) = if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
-        let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
-        let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
-        let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
-            q.get("msg").or_else(|| q.get("content")).and_then(extract_content_text)
-        });
-        (q_id, q_sender, q_text)
-    } else {
-        (None, None, None)
-    };
+    let (reply_to_id, reply_to_sender, reply_to_text) =
+        if let Some(q) = it.get("quote").filter(|v| v.is_object()) {
+            let q_id = pick_str(q, &["cliMsgId", "globalMsgId", "msgId"]);
+            let q_sender = pick_str(q, &["fromD", "dName", "ownerId", "fromUid", "uidFrom"]);
+            let q_text = pick_str(q, &["msg", "message", "content"]).or_else(|| {
+                q.get("msg")
+                    .or_else(|| q.get("content"))
+                    .and_then(extract_content_text)
+            });
+            (q_id, q_sender, q_text)
+        } else {
+            (None, None, None)
+        };
 
     Some(ChatMessage {
         id: msg_id,
@@ -3471,7 +3694,10 @@ fn extract_message_thread_id_ext(
         }
     }
 
-    if !uid_from.is_empty() && uid_from != "0" && (id_to.is_empty() || id_to == "0" || Some(id_to.as_str()) == cloud_thread_id) {
+    if !uid_from.is_empty()
+        && uid_from != "0"
+        && (id_to.is_empty() || id_to == "0" || Some(id_to.as_str()) == cloud_thread_id)
+    {
         // Incoming 1-1 message: peer sent it to us -> thread ID is `uid_from`
         Some((uid_from, false))
     } else if !id_to.is_empty() && id_to != "0" {
@@ -3480,10 +3706,18 @@ fn extract_message_thread_id_ext(
     } else if !uid_from.is_empty() && uid_from != "0" {
         Some((uid_from, false))
     } else {
-        pick_str(m_val, &["threadId", "conversId", "userId", "friendId", "id"])
-            .or_else(|| pick_str(entry, &["threadId", "conversId", "userId", "friendId", "id"]))
-            .filter(|s| s != "0" && !s.is_empty())
-            .map(|s| (s, is_group))
+        pick_str(
+            m_val,
+            &["threadId", "conversId", "userId", "friendId", "id"],
+        )
+        .or_else(|| {
+            pick_str(
+                entry,
+                &["threadId", "conversId", "userId", "friendId", "id"],
+            )
+        })
+        .filter(|s| s != "0" && !s.is_empty())
+        .map(|s| (s, is_group))
     }
 }
 
@@ -3497,7 +3731,10 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     let mut data_node = parsed_str_data
         .as_ref()
         .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
-    if let Some(inner_data) = data_node.get("data").filter(|v| v.is_object() || v.is_array()) {
+    if let Some(inner_data) = data_node
+        .get("data")
+        .filter(|v| v.is_object() || v.is_array())
+    {
         data_node = inner_data;
     }
     let cloud_tid: Option<String> = threads
@@ -3584,7 +3821,9 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
             raw_msgs.push((obj, is_grp_bucket || is_group_flag(obj)));
         }
         if raw_msgs.is_empty()
-            && (entry.get("content").is_some() || entry.get("msg").is_some() || entry.get("msgId").is_some())
+            && (entry.get("content").is_some()
+                || entry.get("msg").is_some()
+                || entry.get("msgId").is_some())
         {
             raw_msgs.push((entry, is_grp_bucket));
         }
@@ -3604,8 +3843,15 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 if thread_is_group {
                     t.is_group = true;
                 }
-                if let Some(existing) = t.messages.iter_mut().find(|existing| same_message(existing, &parsed)) {
-                    if pending_message_id(&existing.id) && !parsed.id.is_empty() && !pending_message_id(&parsed.id) {
+                if let Some(existing) = t
+                    .messages
+                    .iter_mut()
+                    .find(|existing| same_message(existing, &parsed))
+                {
+                    if pending_message_id(&existing.id)
+                        && !parsed.id.is_empty()
+                        && !pending_message_id(&parsed.id)
+                    {
                         existing.id = parsed.id;
                     }
                     if parsed.ts > 0 && existing.ts != parsed.ts {
@@ -3689,7 +3935,10 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
     let mut data_node = parsed_str_data
         .as_ref()
         .unwrap_or_else(|| resp.get("data").unwrap_or(resp));
-    if let Some(inner_data) = data_node.get("data").filter(|v| v.is_object() || v.is_array()) {
+    if let Some(inner_data) = data_node
+        .get("data")
+        .filter(|v| v.is_object() || v.is_array())
+    {
         data_node = inner_data;
     }
 
@@ -3723,7 +3972,11 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             }
         }
         if let Some(m) = parse_chat_message(it) {
-            if let Some(existing) = thread.messages.iter_mut().find(|existing| same_message(existing, &m)) {
+            if let Some(existing) = thread
+                .messages
+                .iter_mut()
+                .find(|existing| same_message(existing, &m))
+            {
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -3750,7 +4003,6 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum FriendshipStatus {
     #[default]
@@ -3771,7 +4023,10 @@ pub fn parse_friendship_status_response(resp: &Value) -> FriendshipStatus {
     let is_friend = d
         .get("is_friend")
         .or_else(|| d.get("isFriend"))
-        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
+        })
         .unwrap_or(0);
     if is_friend == 1 {
         return FriendshipStatus::Friend;
@@ -3779,7 +4034,10 @@ pub fn parse_friendship_status_response(resp: &Value) -> FriendshipStatus {
     let is_requesting = d
         .get("is_requesting")
         .or_else(|| d.get("isRequesting"))
-        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
+        })
         .unwrap_or(0);
     if is_requesting == 1 {
         return FriendshipStatus::IncomingPending;
@@ -3787,7 +4045,10 @@ pub fn parse_friendship_status_response(resp: &Value) -> FriendshipStatus {
     let is_requested = d
         .get("is_requested")
         .or_else(|| d.get("isRequested"))
-        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
+        })
         .unwrap_or(0);
     if is_requested == 1 {
         return FriendshipStatus::OutgoingPending;
@@ -3805,10 +4066,7 @@ pub async fn get_friend_request_status(s: &Session, fid: &str) -> Result<Value> 
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let body = obj(&[
-        ("fid", json!(fid)),
-        ("imei", json!(s.imei)),
-    ]);
+    let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
         "https://tt-friend-wpa.chat.zalo.me"
@@ -3866,10 +4124,7 @@ pub async fn accept_friend_request(s: &Session, fid: &str) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let body = obj(&[
-        ("fid", json!(fid)),
-        ("language", json!("vi")),
-    ]);
+    let body = obj(&[("fid", json!(fid)), ("language", json!("vi"))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
         "https://tt-friend-wpa.chat.zalo.me"
@@ -4010,10 +4265,16 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
     let Some(uid) = pick_str(data, &["uid", "userId", "id", "globalId"]) else {
         anyhow::bail!("Không tìm thấy tài khoản Zalo ứng với số điện thoại này");
     };
-    let display_name = pick_str(data, &["display_name", "displayName", "zalo_name", "zaloName"])
-        .unwrap_or_else(|| raw_phone.trim().to_string());
-    let zalo_name = pick_str(data, &["zalo_name", "zaloName", "display_name", "displayName"])
-        .unwrap_or_else(|| display_name.clone());
+    let display_name = pick_str(
+        data,
+        &["display_name", "displayName", "zalo_name", "zaloName"],
+    )
+    .unwrap_or_else(|| raw_phone.trim().to_string());
+    let zalo_name = pick_str(
+        data,
+        &["zalo_name", "zaloName", "display_name", "displayName"],
+    )
+    .unwrap_or_else(|| display_name.clone());
     let avatar = pick_str(data, &["avatar", "avt"]).unwrap_or_default();
     let status = pick_str(data, &["status"]).unwrap_or_default();
 
@@ -4308,7 +4569,10 @@ mod tests {
         assert_eq!(ps.last_action_id, "8399086511016");
         assert_eq!(ps.last_action_id_other, "8399036593265");
         assert_eq!(ps.queues.get("1").unwrap().last_id, "8399086511016");
-        assert_eq!(ps.queues.get("1").unwrap().ids, vec!["8399086511016".to_string()]);
+        assert_eq!(
+            ps.queues.get("1").unwrap().ids,
+            vec!["8399086511016".to_string()]
+        );
         // Socket-only queue "15" must NOT be added to HTTP polling queues
         assert!(!ps.queues.contains_key("15"));
     }
@@ -4384,7 +4648,10 @@ mod tests {
             "uidFrom": "user_b",
             "ts": 5000_i64
         });
-        assert_eq!(parse_chat_message(&undo).unwrap().text, "[Tin nhắn đã thu hồi]");
+        assert_eq!(
+            parse_chat_message(&undo).unwrap().text,
+            "[Tin nhắn đã thu hồi]"
+        );
     }
 
     #[test]
@@ -4482,7 +4749,10 @@ mod tests {
         assert_eq!(strip_vn_for_sticker_kw("Cảm ơn nhiều"), "cam on nhieu");
         assert_eq!(strip_vn_for_sticker_kw("Ngủ ngon nhé"), "ngu ngon nhe");
         assert_eq!(strip_vn_for_sticker_kw("Nguyễn Văn An"), "nguyen van an");
-        assert_eq!(normalize_sticker_keyword("  iu\u{a0}that\u{a0}  "), "iu that");
+        assert_eq!(
+            normalize_sticker_keyword("  iu\u{a0}that\u{a0}  "),
+            "iu that"
+        );
 
         let q1 = canonical_vn_sticker_queries("Mệt quá");
         assert!(q1.contains(&"mệt quá".to_string()));
@@ -4496,16 +4766,28 @@ mod tests {
     #[test]
     fn test_parse_friendship_status_response() {
         let r_friend = json!({"error_code": 0, "data": {"is_friend": 1, "is_requested": 0, "is_requesting": 0}});
-        assert_eq!(parse_friendship_status_response(&r_friend), FriendshipStatus::Friend);
+        assert_eq!(
+            parse_friendship_status_response(&r_friend),
+            FriendshipStatus::Friend
+        );
 
         let r_inc = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 0, "is_requesting": 1}});
-        assert_eq!(parse_friendship_status_response(&r_inc), FriendshipStatus::IncomingPending);
+        assert_eq!(
+            parse_friendship_status_response(&r_inc),
+            FriendshipStatus::IncomingPending
+        );
 
         let r_out = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 1, "is_requesting": 0}});
-        assert_eq!(parse_friendship_status_response(&r_out), FriendshipStatus::OutgoingPending);
+        assert_eq!(
+            parse_friendship_status_response(&r_out),
+            FriendshipStatus::OutgoingPending
+        );
 
         let r_stranger = json!({"error_code": 0, "data": {"is_friend": 0, "is_requested": 0, "is_requesting": 0}});
-        assert_eq!(parse_friendship_status_response(&r_stranger), FriendshipStatus::Stranger);
+        assert_eq!(
+            parse_friendship_status_response(&r_stranger),
+            FriendshipStatus::Stranger
+        );
     }
 
     #[test]
@@ -4583,43 +4865,78 @@ mod group_metadata_tests {
     use super::*;
     #[tokio::test]
     async fn requests_missing_metadata_with_zero_version_and_decodes_group_name() {
-        use std::io::{Read,Write};
+        use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             for step in 0..2 {
-                let (mut stream,_) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
                 let mut input = Vec::new();
                 let header_end = loop {
-                    let mut b = [0;1024]; let n = stream.read(&mut b).unwrap(); assert!(n>0);
+                    let mut b = [0; 1024];
+                    let n = stream.read(&mut b).unwrap();
+                    assert!(n > 0);
                     input.extend_from_slice(&b[..n]);
-                    if let Some(end) = input.windows(4).position(|s| s == b"\r\n\r\n") { break end+4; }
+                    if let Some(end) = input.windows(4).position(|s| s == b"\r\n\r\n") {
+                        break end + 4;
+                    }
                 };
                 let header = String::from_utf8_lossy(&input[..header_end]).to_string();
                 if step == 1 {
                     assert!(header.starts_with("POST /api/group/getmg-v2?"));
-                    let length: usize = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|s| s.trim().parse().unwrap())).unwrap();
-                    while input.len() < header_end+length { let mut b=[0;1024]; let n=stream.read(&mut b).unwrap(); assert!(n>0); input.extend_from_slice(&b[..n]); }
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|s| s.trim().parse().unwrap())
+                        })
+                        .unwrap();
+                    while input.len() < header_end + length {
+                        let mut b = [0; 1024];
+                        let n = stream.read(&mut b).unwrap();
+                        assert!(n > 0);
+                        input.extend_from_slice(&b[..n]);
+                    }
                     let form = String::from_utf8_lossy(&input[header_end..]);
                     let url = reqwest::Url::parse(&format!("http://fixture/?{form}")).unwrap();
-                    let params = url.query_pairs().find(|(key,_)| key == "params").unwrap().1.to_string();
-                    let decoded = crate::crypto::decode_aes(&[0;32],&params).unwrap();
+                    let params = url
+                        .query_pairs()
+                        .find(|(key, _)| key == "params")
+                        .unwrap()
+                        .1
+                        .to_string();
+                    let decoded = crate::crypto::decode_aes(&[0; 32], &params).unwrap();
                     let body: Value = serde_json::from_str(&decoded).unwrap();
-                    let versions: Value = serde_json::from_str(body["gridVerMap"].as_str().unwrap()).unwrap();
-                    assert_eq!(versions,json!({"123":0}));
+                    let versions: Value =
+                        serde_json::from_str(body["gridVerMap"].as_str().unwrap()).unwrap();
+                    assert_eq!(versions, json!({"123":0}));
                 }
-                let data = if step == 0 { json!({"gridVerMap":{"123":999}}) } else { json!({"gridInfoMap":{"123":{"name":"Nhóm ARM64","avt":"https://example.invalid/avatar.png"}}}) };
+                let data = if step == 0 {
+                    json!({"gridVerMap":{"123":999}})
+                } else {
+                    json!({"gridInfoMap":{"123":{"name":"Nhóm ARM64","avt":"https://example.invalid/avatar.png"}}})
+                };
                 let body = json!({"error_code":0,"data":data.to_string()}).to_string();
-                write!(stream,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
             }
         });
-        let mut session = Session::new(false,false,false).unwrap();
+        let mut session = Session::new(false, false, false).unwrap();
         session.http = reqwest::Client::builder().no_proxy().build().unwrap();
-        session.domains.group = format!("http://{addr}"); session.secret_key = Some(vec![0;32]);
+        session.domains.group = format!("http://{addr}");
+        session.secret_key = Some(vec![0; 32]);
         session.login = Some(crate::session::LoginInfo::default());
         let groups = get_groups(&session).await.unwrap();
-        assert_eq!(groups.len(),1); assert_eq!(groups[0].name,"Nhóm ARM64");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "Nhóm ARM64");
         server.join().unwrap();
     }
 }
@@ -4627,23 +4944,52 @@ mod group_metadata_tests {
 #[cfg(test)]
 mod message_identity_tests {
     use super::*;
-    fn message(id: &str, outgoing: bool) -> ChatMessage { ChatMessage {id:id.into(),text:"OK".into(),sender:"User".into(),time:"10:00".into(),ts:1000,is_outgoing:outgoing,..Default::default()} }
+    fn message(id: &str, outgoing: bool) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            text: "OK".into(),
+            sender: "User".into(),
+            time: "10:00".into(),
+            ts: 1000,
+            is_outgoing: outgoing,
+            ..Default::default()
+        }
+    }
     #[test]
     fn repeated_real_messages_survive_merge_and_server_replay_is_deduplicated() {
-        let mut target = Thread {id:"1".into(),name:"Contact".into(),preview:String::new(),time:String::new(),avatar:None,is_group:false,messages:vec![message("a",false)]};
-        let mut update = target.clone(); update.messages = vec![message("b",false)];
-        merge_thread_into(&mut target,update.clone(),true);
-        assert_eq!(target.messages.len(),2);
-        merge_thread_into(&mut target,update,true);
-        assert_eq!(target.messages.len(),2);
-        assert!(!same_message(&message("a",true), &message("b",true)));
+        let mut target = Thread {
+            id: "1".into(),
+            name: "Contact".into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: vec![message("a", false)],
+        };
+        let mut update = target.clone();
+        update.messages = vec![message("b", false)];
+        merge_thread_into(&mut target, update.clone(), true);
+        assert_eq!(target.messages.len(), 2);
+        merge_thread_into(&mut target, update, true);
+        assert_eq!(target.messages.len(), 2);
+        assert!(!same_message(&message("a", true), &message("b", true)));
     }
     #[test]
     fn optimistic_matching_is_only_for_outgoing_local_vs_server() {
-        assert!(same_message(&message("out_local",true), &message("server",true)));
-        assert!(!same_message(&message("out_local",false), &message("server",false)));
-        assert!(!same_message(&message("out_a",true), &message("out_b",true)));
-        let mut extreme = message("server",true); extreme.ts = i64::MIN;
-        assert!(!same_message(&message("out_local",true), &extreme));
+        assert!(same_message(
+            &message("out_local", true),
+            &message("server", true)
+        ));
+        assert!(!same_message(
+            &message("out_local", false),
+            &message("server", false)
+        ));
+        assert!(!same_message(
+            &message("out_a", true),
+            &message("out_b", true)
+        ));
+        let mut extreme = message("server", true);
+        extreme.ts = i64::MIN;
+        assert!(!same_message(&message("out_local", true), &extreme));
     }
 }

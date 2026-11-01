@@ -34,6 +34,8 @@ pub struct MessageStore {
 }
 
 impl MessageStore {
+    /// Initial history window; deeper reads occur when opening a thread.
+    pub const PRELOAD_MSGS: usize = 20;
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -48,6 +50,11 @@ impl MessageStore {
             Connection::open(path)?
         };
 
+        let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(schema <= 2, "Database requires a newer application version");
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        )?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
@@ -73,7 +80,11 @@ impl MessageStore {
         )?;
 
         // Transactional migration from the original globally keyed message ID.
-        let thread_pk: i64 = conn.query_row("SELECT pk FROM pragma_table_info('messages') WHERE name='thread_id'", [], |row| row.get(0))?;
+        let thread_pk: i64 = conn.query_row(
+            "SELECT pk FROM pragma_table_info('messages') WHERE name='thread_id'",
+            [],
+            |row| row.get(0),
+        )?;
         if thread_pk == 0 {
             let migration = conn.unchecked_transaction()?;
             migration.execute_batch("ALTER TABLE messages RENAME TO messages_v1;
@@ -86,6 +97,12 @@ impl MessageStore {
             migration.commit()?;
         }
 
+        if schema < 2 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute("DELETE FROM messages WHERE text = 'sendBubbleMessage'", [])?;
+            migration.pragma_update(None, "user_version", 2)?;
+            migration.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -117,7 +134,11 @@ impl MessageStore {
 
     /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
-        let key = if msg_id.is_empty() { format!("{thread_id}_{ts}") } else { msg_id.to_owned() };
+        let key = if msg_id.is_empty() {
+            format!("{thread_id}_{ts}")
+        } else {
+            msg_id.to_owned()
+        };
         self.conn.execute(
             "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
             params![thread_id, key],
@@ -146,14 +167,14 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Retrieve up to `limit` messages for a thread ordered by timestamp ascending.
+    /// Retrieve the newest `limit` messages in chronological order.
     pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
-             FROM messages
-             WHERE thread_id = ?1
-             ORDER BY ts ASC
-             LIMIT ?2",
+             FROM (
+                SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
+                FROM messages WHERE thread_id = ?1 ORDER BY ts DESC, msg_id DESC LIMIT ?2
+             ) ORDER BY ts ASC, msg_id ASC",
         )?;
 
         let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
@@ -203,11 +224,11 @@ impl MessageStore {
 
     /// Hydrate `threads` with persisted threads and message history from SQLite.
     /// Returns the total number of messages loaded into `threads`.
-    pub fn hydrate_threads(&self, threads: &mut Vec<Thread>, limit_per_thread: usize) -> Result<usize> {
-        let _ = self.conn.execute(
-            "DELETE FROM messages WHERE text = 'sendBubbleMessage'",
-            [],
-        );
+    pub fn hydrate_threads(
+        &self,
+        threads: &mut Vec<Thread>,
+        limit_per_thread: usize,
+    ) -> Result<usize> {
         crate::chat::deduplicate_threads(threads, None);
 
         let stored_threads = self.all_threads().unwrap_or_default();
@@ -216,9 +237,7 @@ impl MessageStore {
                 continue;
             }
             if let Some(existing) = threads.iter_mut().find(|t| t.id == st.thread_id) {
-                if crate::chat::is_generic_thread_name(&existing.name)
-                    && !st.name.is_empty()
-                {
+                if crate::chat::is_generic_thread_name(&existing.name) && !st.name.is_empty() {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
@@ -244,8 +263,7 @@ impl MessageStore {
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
-                    let s = sm.ts / 1000;
-                    format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+                    crate::clock::message_time(sm.ts)
                 } else {
                     crate::ui::clock()
                 };
@@ -273,10 +291,7 @@ impl MessageStore {
                             .get("cateId")
                             .or_else(|| val.get("catId"))
                             .and_then(|v| v.as_u64());
-                        sticker_type = val
-                            .get("type")
-                            .and_then(|v| v.as_u64())
-                            .map(|n| n as u32);
+                        sticker_type = val.get("type").and_then(|v| v.as_u64()).map(|n| n as u32);
                         reply_to_id = val
                             .get("reply_to_id")
                             .and_then(|v| v.as_str())
@@ -355,7 +370,10 @@ impl MessageStore {
                     (!existing.id.is_empty() && existing.id == cm.id)
                         || (existing.text == cm.text
                             && existing.is_outgoing == cm.is_outgoing
-                            && (existing.ts == cm.ts || (existing.ts != 0 && cm.ts != 0 && (existing.ts - cm.ts).abs() < 5000)))
+                            && (existing.ts == cm.ts
+                                || (existing.ts != 0
+                                    && cm.ts != 0
+                                    && (existing.ts - cm.ts).abs() < 5000)))
                 }) {
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
@@ -460,7 +478,11 @@ impl From<&ChatMessage> for StoredMessage {
                 format!("msg_{}", m.ts)
             },
             thread_id: String::new(),
-            sender_id: if m.is_outgoing { "0".into() } else { m.sender.clone() },
+            sender_id: if m.is_outgoing {
+                "0".into()
+            } else {
+                m.sender.clone()
+            },
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
@@ -515,6 +537,52 @@ pub fn load_history_into_threads(
 mod tests {
     use super::*;
 
+    #[test]
+    fn limited_history_keeps_newest_rows_and_uses_thread_index() {
+        let store = MessageStore::open(":memory:").unwrap();
+        for ts in 1..=10 {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: format!("m{ts}"),
+                    thread_id: "thread-1".into(),
+                    sender_id: "user-1".into(),
+                    sender_name: "Example".into(),
+                    text: "hello".into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    raw_json: String::new(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .messages_for("thread-1", 3)
+                .unwrap()
+                .iter()
+                .map(|m| m.ts)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        let plan: String = store.conn.query_row("EXPLAIN QUERY PLAN SELECT msg_id FROM messages WHERE thread_id=?1 ORDER BY ts DESC LIMIT 3", ["thread-1"],|row|row.get(3)).unwrap();
+        assert!(plan.contains("idx_thread_ts"), "{plan}");
+    }
+    #[test]
+    fn newer_database_is_rejected_without_writes() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdoz-newer-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        drop(conn);
+        assert!(MessageStore::open(&path).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
     #[test]
     fn test_insert_twice_returns_false() {
         let store = MessageStore::open(":memory:").unwrap();
@@ -619,7 +687,7 @@ mod tests {
             ],
         };
 
-        let count1 = persist_threads(&mut store, &[thread.clone()]).unwrap();
+        let count1 = persist_threads(&mut store, std::slice::from_ref(&thread)).unwrap();
         assert_eq!(count1, 2);
 
         // Second persist returns 0 newly inserted
@@ -650,7 +718,15 @@ mod transaction_tests {
     fn failed_snapshot_rolls_back_preceding_rows() {
         let mut store = MessageStore::open(":memory:").unwrap();
         store.conn.execute_batch("CREATE TRIGGER reject_fixture BEFORE INSERT ON threads WHEN NEW.thread_id = 'bad' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
-        let thread = |id: &str| Thread { id: id.into(), name: id.into(), preview: String::new(), time: String::new(), avatar: None, is_group: false, messages: Vec::new() };
+        let thread = |id: &str| Thread {
+            id: id.into(),
+            name: id.into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+        };
         assert!(persist_threads(&mut store, &[thread("good"), thread("bad")]).is_err());
         assert!(store.all_threads().unwrap().is_empty());
     }
@@ -660,46 +736,73 @@ mod transaction_tests {
 mod identity_tests {
     use super::*;
     fn message(thread_id: &str) -> StoredMessage {
-        StoredMessage { msg_id: "same-id".into(), thread_id: thread_id.into(), sender_id: "sender".into(), sender_name: "Same name".into(), text: thread_id.into(), msg_type: "text".into(), ts: 1, is_outgoing: false, raw_json: "{}".into() }
+        StoredMessage {
+            msg_id: "same-id".into(),
+            thread_id: thread_id.into(),
+            sender_id: "sender".into(),
+            sender_name: "Same name".into(),
+            text: thread_id.into(),
+            msg_type: "text".into(),
+            ts: 1,
+            is_outgoing: false,
+            raw_json: "{}".into(),
+        }
     }
     #[test]
     fn same_message_id_is_scoped_to_thread_and_delete_does_not_cross_threads() {
         let mut store = MessageStore::open(":memory:").unwrap();
         assert!(store.upsert_message(&message("a")).unwrap());
         assert!(store.upsert_message(&message("b")).unwrap());
-        let mut update = message("a"); update.text = "edited".into();
+        let mut update = message("a");
+        update.text = "edited".into();
         assert!(!store.upsert_message(&update).unwrap());
-        assert_eq!(store.messages_for("a",10).unwrap()[0].text,"edited");
-        assert_eq!(store.messages_for("b",10).unwrap()[0].text,"b");
-        let mut simultaneous = message("a"); simultaneous.msg_id = "other-id".into();
+        assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "edited");
+        assert_eq!(store.messages_for("b", 10).unwrap()[0].text, "b");
+        let mut simultaneous = message("a");
+        simultaneous.msg_id = "other-id".into();
         assert!(store.upsert_message(&simultaneous).unwrap());
-        store.delete_message("a","same-id",1).unwrap();
-        let remaining = store.messages_for("a",10).unwrap();
-        assert_eq!(remaining.len(),1); assert_eq!(remaining[0].msg_id,"other-id");
-        assert_eq!(store.messages_for("b",10).unwrap().len(),1);
+        store.delete_message("a", "same-id", 1).unwrap();
+        let remaining = store.messages_for("a", 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].msg_id, "other-id");
+        assert_eq!(store.messages_for("b", 10).unwrap().len(), 1);
     }
     #[test]
     fn old_pages_do_not_erase_group_name_or_recency() {
         let store = MessageStore::open(":memory:").unwrap();
-        let mut thread = StoredThread {thread_id:"123".into(),name:"Nhóm có tên".into(),is_group:true,last_ts:99};
+        let mut thread = StoredThread {
+            thread_id: "123".into(),
+            name: "Nhóm có tên".into(),
+            is_group: true,
+            last_ts: 99,
+        };
         store.upsert_thread(&thread).unwrap();
-        thread.name = "Nhóm 123".into(); thread.last_ts = 1;
+        thread.name = "Nhóm 123".into();
+        thread.last_ts = 1;
         store.upsert_thread(&thread).unwrap();
-        thread.name.clear(); store.upsert_thread(&thread).unwrap();
+        thread.name.clear();
+        store.upsert_thread(&thread).unwrap();
         let saved = store.all_threads().unwrap();
-        assert_eq!(saved[0].name,"Nhóm có tên"); assert_eq!(saved[0].last_ts,99);
+        assert_eq!(saved[0].name, "Nhóm có tên");
+        assert_eq!(saved[0].last_ts, 99);
     }
     #[test]
     fn migrates_legacy_database_without_losing_messages() {
-        let dir = std::env::temp_dir().join(format!("ctdoz-migration-{}-{}",std::process::id(),crate::param_cipher::random_hex(8)));
-        std::fs::create_dir_all(&dir).unwrap(); let path = dir.join("history.db");
+        let dir = std::env::temp_dir().join(format!(
+            "ctdoz-migration-{}-{}",
+            std::process::id(),
+            crate::param_cipher::random_hex(8)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE messages (msg_id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,sender_id TEXT,sender_name TEXT,text TEXT,msg_type TEXT,ts INTEGER,is_outgoing INTEGER,raw_json TEXT);
             INSERT INTO messages VALUES ('same-id','a','','','old','text',1,0,'{}');").unwrap();
         drop(conn);
         let store = MessageStore::open(&path).unwrap();
-        assert_eq!(store.messages_for("a",10).unwrap()[0].text,"old");
+        assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "old");
         assert!(store.upsert_message(&message("b")).unwrap());
-        drop(store); std::fs::remove_dir_all(dir).unwrap();
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -4,7 +4,7 @@ Phạm vi: mã nguồn Rust, worker/session/network, lưu trữ, GUI, audio/vide
 
 ## Đối chiếu upstream
 
-Đối chiếu mới nhất: upstream `main` đã chuyển sang `1345f5d` (v0.0.3), thêm 51 commit sau nền `73849bde5e5ffff21537e92886891db510e9c857` của nhánh này. Fork **chưa cập nhật đầy đủ v0.0.3**. Không dùng kết quả `0 2` của lần kiểm tra v0.0.2 để kết luận fork hiện đã theo bản mới nhất. `origin/main` vẫn ở `3f28d2f99413d84e31d979cb914be3cc7945fb15`; bản sửa nằm trên PR #2.
+Đã tích hợp upstream `main` tại `1345f5d` (**v0.0.3**, 51 commit sau nền v0.0.2). Phần runtime Windows được giữ khi có triển khai chồng lấn: DPAPI, dữ liệu từng tài khoản, DX12, Media Foundation và tray. Các thay đổi hiệu năng, giờ địa phương, font và tên binary v0.0.3 đã được đưa vào. Không nhập self-updater đa nền tảng trỏ tới artifact upstream; xem [ADR-0001](adr/0001-windows-arm64-runtime.md) để biết phạm vi khác biệt. `origin/main` vẫn ở `3f28d2f`; các bản sửa nằm trên PR #2, chưa đồng nghĩa đã phát hành.
 
 Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; không đồng nghĩa đã có trong `main` hoặc bản Release đang tải. Các PR upstream đang mở không được coi là code đã merge.
 
@@ -38,7 +38,7 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 
 ## Dependency audit
 
-Đã truy vấn OSV trên 312 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
+Đã truy vấn OSV trên 313 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
 
 | Phát hiện | Xử lý |
 |---|---|
@@ -88,3 +88,7 @@ Chưa hỗ trợ gọi nhóm, tải lại toàn bộ lịch sử 1-1 từ điệ
 ## Ưu tiên bổ sung theo thiết bị đích
 
 Huawei MateBook E Go Gen 3 / Snapdragon 8cx Gen 3. Đồng bộ tự bắt đầu sau đăng nhập và khi khôi phục phiên; nhận tin/persist hoạt động trong worker khi cửa sổ ẩn. CM dùng lastMsgId, hasMore, isOld và isFiltered của server; không dùng msgId làm cursor. Server có thể không cung cấp lịch sử trước thời điểm đăng nhập. Chat cá nhân cũ từ điện thoại vẫn chưa có API được kiểm chứng.
+
+## Đo hiệu năng gộp lịch sử
+
+Dữ liệu giả: 1.000 tin đang có + 1.000 tin đến, trùng 500 ID, nội dung lặp; 20 lượt trên Linux x86_64 trong cloud, profile debug. Trước tối ưu index: min 12,799 ms, trung bình 13,067 ms, p50 13,035 ms, p95 13,262 ms, p99 14,198 ms. Sau: min 2,183 ms, trung bình 2,344 ms, p50 2,232 ms, p95 2,586 ms, p99 3,559 ms. Chạy lại bằng `cargo run --locked --example history_bench`; đây không phải số đo trên Snapdragon 8cx Gen 3.

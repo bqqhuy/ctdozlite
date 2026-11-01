@@ -1,13 +1,13 @@
 #define MyAppName "ctdozlite"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.2"
+  #define MyAppVersion "0.0.3"
 #endif
 #ifndef BuildDir
   #define BuildDir "..\..\target\aarch64-pc-windows-msvc\release"
 #endif
 #define MyAppPublisher "bqqhuy"
 #define MyAppURL "https://github.com/bqqhuy/ctdozlite"
-#define MyAppExeName "zalo-rust.exe"
+#define MyAppExeName "ctdozlite.exe"
 #define ArchSuffix "arm64"
 #define ArchAllowed "arm64"
 

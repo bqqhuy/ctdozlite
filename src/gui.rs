@@ -21,7 +21,6 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
-
 mod messages;
 mod modals;
 mod stickers;
@@ -29,15 +28,18 @@ mod theme;
 mod worker;
 mod workspace;
 
-pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
-pub use worker::WorkerCmd;
 use messages::*;
 use stickers::*;
 use theme::*;
+pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
+pub use worker::WorkerCmd;
 use worker::*;
 
 pub enum GuiEvent {
-    HistorySyncStatus { running: bool, message: String },
+    HistorySyncStatus {
+        running: bool,
+        message: String,
+    },
     QrReady {
         qr_login: QrLogin,
         qr_image: egui::ColorImage,
@@ -278,7 +280,6 @@ impl AppSettings {
     }
 }
 
-
 struct UiSmoke {
     path: std::path::PathBuf,
     frames: u32,
@@ -313,6 +314,7 @@ pub struct ZaloGuiApp {
     // Chat screen state
     threads: Vec<Thread>,
     selected_thread_index: usize,
+    chat_render_window: (String, usize),
     thread_filter: ThreadFilter,
     search_query: String,
     input_message: String,
@@ -388,7 +390,6 @@ pub struct ZaloGuiApp {
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
     event_tx: Sender<GuiEvent>,
-
     // Background poll trigger
 }
 
@@ -421,7 +422,10 @@ impl ZaloGuiApp {
                 if let RawWindowHandle::Win32(window) = handle.as_raw() {
                     match crate::tray::Tray::new(cc.egui_ctx.clone(), window.hwnd.get()) {
                         Ok(tray) => app.tray = Some(tray),
-                        Err(e) => app.status_msg = format!("Không tạo được tray: {e}; nút X sẽ thoát ứng dụng"),
+                        Err(e) => {
+                            app.status_msg =
+                                format!("Không tạo được tray: {e}; nút X sẽ thoát ứng dụng")
+                        }
                     }
                 }
             }
@@ -429,10 +433,19 @@ impl ZaloGuiApp {
         app
     }
 
-    fn from_context(ctx: &egui::Context, session: Session, dev_mode: bool,
-        initial_threads: Vec<Thread>, bootstrap: bool) -> Self {
-        setup_custom_fonts(&ctx);
-        let loaded_settings = if bootstrap { AppSettings::load() } else { AppSettings::default() };
+    fn from_context(
+        ctx: &egui::Context,
+        session: Session,
+        dev_mode: bool,
+        initial_threads: Vec<Thread>,
+        bootstrap: bool,
+    ) -> Self {
+        setup_custom_fonts(ctx);
+        let loaded_settings = if bootstrap {
+            AppSettings::load()
+        } else {
+            AppSettings::default()
+        };
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = match loaded_settings.theme_mode.as_str() {
@@ -441,9 +454,9 @@ impl ZaloGuiApp {
             _ => true,
         };
         if dark_mode {
-            ThemePalette::dark().apply_to_ctx(&ctx);
+            ThemePalette::dark().apply_to_ctx(ctx);
         } else {
-            ThemePalette::light().apply_to_ctx(&ctx);
+            ThemePalette::light().apply_to_ctx(ctx);
         }
 
         let (tx, rx) = channel();
@@ -465,22 +478,8 @@ impl ZaloGuiApp {
             })
             .unwrap_or_default();
 
-        let mut threads = if !bootstrap { initial_threads } else if initial_threads.is_empty() {
-            crate::chat::load_threads_cache(&session)
-        } else {
-            let mut cached = crate::chat::load_threads_cache(&session);
-            for t in initial_threads {
-                if let Some(c) = cached
-                    .iter_mut()
-                    .find(|c| crate::chat::threads_represent_same_contact(c, &t))
-                {
-                    crate::chat::merge_thread_into(c, t, true);
-                } else {
-                    cached.push(t);
-                }
-            }
-            cached
-        };
+        // The launcher already read the account cache and SQLite before the GUI starts.
+        let mut threads = initial_threads;
         if let Some(li) = session.login.as_ref() {
             if !li.send2me_id.is_empty() {
                 for t in threads.iter_mut() {
@@ -491,9 +490,7 @@ impl ZaloGuiApp {
             }
         }
         crate::chat::deduplicate_threads(&mut threads, None);
-        if bootstrap { crate::store::load_history_into_threads(session.history_path(), &mut threads, 200); }
         crate::chat::deduplicate_threads(&mut threads, None);
-        if bootstrap { crate::chat::save_threads_cache(&session, &threads); }
 
         let selected_thread_index = threads
             .iter()
@@ -521,6 +518,7 @@ impl ZaloGuiApp {
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
             threads,
             selected_thread_index,
+            chat_render_window: (String::new(), 150),
             thread_filter: ThreadFilter::All,
             search_query: String::new(),
             input_message: String::new(),
@@ -546,8 +544,8 @@ impl ZaloGuiApp {
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
             loading_stickers: HashSet::new(),
-            emoji_textures: load_default_emoji_textures(&ctx),
-            app_logo_texture: load_app_logo_texture(&ctx),
+            emoji_textures: load_default_emoji_textures(ctx),
+            app_logo_texture: load_app_logo_texture(ctx),
             sticker_store_packs: Vec::new(),
             sticker_store_loading: false,
             sticker_store_filter: String::new(),
@@ -595,20 +593,38 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
         };
 
-        if !bootstrap { return app; }
+        if !bootstrap {
+            return app;
+        }
         let args: Vec<String> = std::env::args().collect();
         if let Some(index) = args.iter().position(|a| a == "--ui-smoke-test") {
-            let path = args.get(index+1).expect("--ui-smoke-test requires a PNG path");
-            app.smoke = Some(UiSmoke { path: path.into(), frames: 0, lifecycle_started: false });
+            let path = args
+                .get(index + 1)
+                .expect("--ui-smoke-test requires a PNG path");
+            app.smoke = Some(UiSmoke {
+                path: path.into(),
+                frames: 0,
+                lifecycle_started: false,
+            });
             app.is_logged_in = true;
             app.user_name = "ARM64 UI fixture".into();
             app.settings_modal_open = true;
-            app.settings_tab = match args.iter().position(|a| a == "--ui-smoke-tab").and_then(|i| args.get(i+1)).map(String::as_str) {
+            app.settings_tab = match args
+                .iter()
+                .position(|a| a == "--ui-smoke-tab")
+                .and_then(|i| args.get(i + 1))
+                .map(String::as_str)
+            {
                 Some("appearance") => SettingsTab::Appearance,
                 Some("sync") => SettingsTab::Sync,
                 _ => SettingsTab::General,
             };
-            if let Some(scale) = args.iter().position(|a| a == "--ui-smoke-scale").and_then(|i| args.get(i+1)).and_then(|n| n.parse::<f32>().ok()) {
+            if let Some(scale) = args
+                .iter()
+                .position(|a| a == "--ui-smoke-scale")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|n| n.parse::<f32>().ok())
+            {
                 ctx.set_pixels_per_point(scale.clamp(1.0, 2.0));
             }
             // No worker, account restore, network calls, or real contacts in smoke mode.
@@ -632,7 +648,9 @@ impl ZaloGuiApp {
         match self.settings.save() {
             Ok(()) => {
                 if self.settings.remember_login {
-                    if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PersistSession); }
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::PersistSession);
+                    }
                 }
             }
             Err(e) => self.show_toast(format!("Không thể lưu cài đặt: {e}")),
@@ -661,11 +679,8 @@ impl ZaloGuiApp {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 GuiEvent::QrReady { qr_image, .. } => {
-                    self.qr_texture = Some(ctx.load_texture(
-                        "qr_code_tex",
-                        qr_image,
-                        TextureOptions::NEAREST,
-                    ));
+                    self.qr_texture =
+                        Some(ctx.load_texture("qr_code_tex", qr_image, TextureOptions::NEAREST));
                     self.qr_status = "Mở ứng dụng Zalo trên điện thoại và quét mã QR".into();
                     self.login_in_progress = false;
                 }
@@ -757,11 +772,9 @@ impl ZaloGuiApp {
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
                             if !is_focused {
-                                ctx.send_viewport_cmd(
-                                    egui::ViewportCommand::RequestUserAttention(
-                                        egui::UserAttentionType::Informational,
-                                    ),
-                                );
+                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                                    egui::UserAttentionType::Informational,
+                                ));
                             }
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
@@ -799,7 +812,10 @@ impl ZaloGuiApp {
                     if let Some(call) = self.active_call.as_mut() {
                         call.cam_enabled = false;
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::SetCallMediaState { is_on_mic: !call.mic_muted, is_on_cam: false });
+                            let _ = tx.send(WorkerCmd::SetCallMediaState {
+                                is_on_mic: !call.mic_muted,
+                                is_on_cam: false,
+                            });
                         }
                     }
                     self.status_msg = reason.clone();
@@ -866,18 +882,26 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
+                            format!(
+                                "out_{}_{}",
+                                crate::login::unix_now(),
+                                crate::param_cipher::random_hex(8)
+                            )
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
+                        if !t
+                            .messages
+                            .iter()
+                            .any(|m| !m.id.is_empty() && m.id == final_id)
+                        {
                             t.messages.push(ChatMessage {
                                 id: final_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
                                 is_outgoing: true,
-                                ts: (crate::login::unix_now() * 1000) as i64,
+                                ts: (crate::login::unix_now() * 1000),
                                 ..Default::default()
                             });
                             t.messages.sort_by_key(|m| m.ts);
@@ -898,18 +922,26 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
+                            format!(
+                                "out_{}_{}",
+                                crate::login::unix_now(),
+                                crate::param_cipher::random_hex(8)
+                            )
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
+                        if !t
+                            .messages
+                            .iter()
+                            .any(|m| !m.id.is_empty() && m.id == final_id)
+                        {
                             t.messages.push(ChatMessage {
                                 id: final_id,
                                 sender: "Tôi".into(),
                                 text: "[Nhãn dán]".into(),
                                 time: now,
                                 is_outgoing: true,
-                                ts: (crate::login::unix_now() * 1000) as i64,
+                                ts: (crate::login::unix_now() * 1000),
                                 sticker_id: Some(sticker_id),
                                 sticker_cate_id: Some(cate_id),
                                 sticker_type: Some(sticker_type),
@@ -925,7 +957,11 @@ impl ZaloGuiApp {
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.preview = msg.text.clone();
                         t.time = msg.time.clone();
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == msg.id) {
+                        if !t
+                            .messages
+                            .iter()
+                            .any(|m| !m.id.is_empty() && m.id == msg.id)
+                        {
                             t.messages.push(msg);
                             t.messages.sort_by_key(|m| m.ts);
                         }
@@ -944,18 +980,26 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
+                            format!(
+                                "out_{}_{}",
+                                crate::login::unix_now(),
+                                crate::param_cipher::random_hex(8)
+                            )
                         } else {
                             msg_id
                         };
-                        if !t.messages.iter().any(|m| !m.id.is_empty() && m.id == final_id) {
+                        if !t
+                            .messages
+                            .iter()
+                            .any(|m| !m.id.is_empty() && m.id == final_id)
+                        {
                             t.messages.push(ChatMessage {
                                 id: final_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
                                 is_outgoing: true,
-                                ts: (crate::login::unix_now() * 1000) as i64,
+                                ts: (crate::login::unix_now() * 1000),
                                 reply_to_id: Some(quoted.id.clone()),
                                 reply_to_sender: Some(quoted.sender.clone()),
                                 reply_to_text: Some(quoted.text.clone()),
@@ -1044,7 +1088,11 @@ impl ZaloGuiApp {
                 } => {
                     self.loading_sticker_packs.remove(&cate_id);
                     let count = items.len();
-                    if !self.pinned_sticker_packs.iter().any(|(id, _)| *id == cate_id) {
+                    if !self
+                        .pinned_sticker_packs
+                        .iter()
+                        .any(|(id, _)| *id == cate_id)
+                    {
                         self.pinned_sticker_packs.insert(0, (cate_id, name.clone()));
                     }
                     self.sticker_pack_items.insert(cate_id, items);
@@ -1144,10 +1192,7 @@ impl ZaloGuiApp {
                     self.phone_lookup_loading = false;
                     self.phone_lookup_error = None;
                     self.phone_modal_open = true;
-                    self.show_toast(format!(
-                        "Đã tìm thấy tài khoản: {}",
-                        res.display_name
-                    ));
+                    self.show_toast(format!("Đã tìm thấy tài khoản: {}", res.display_name));
                     self.friend_status_map
                         .insert(res.user_id.clone(), res.friendship);
                     self.phone_lookup_result = Some(res);
@@ -1190,7 +1235,9 @@ impl ZaloGuiApp {
                                 "calling" | "ringing" => "Đang đổ chuông…".into(),
                                 "incoming_ringing" => "Cuộc gọi đến đang đổ chuông…".into(),
                                 "connecting" => "Đang kết nối luồng âm thanh/video…".into(),
-                                "incall" | "connected" => "Đang trong cuộc gọi (Pure-Rust VoIP)".into(),
+                                "incall" | "connected" => {
+                                    "Đang trong cuộc gọi (Pure-Rust VoIP)".into()
+                                }
                                 _ => format!("Đang kết nối ({state})…"),
                             };
                         }
@@ -1254,7 +1301,6 @@ impl ZaloGuiApp {
 // Lightweight Background Session Worker (2-thread Tokio pool, off-UI disk I/O)
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Main eframe::App Implementation
 // ---------------------------------------------------------------------------
@@ -1263,15 +1309,32 @@ impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(smoke) = &mut self.smoke {
             smoke.frames += 1;
-            let captured = ctx.input(|input| input.events.iter().find_map(|event| {
-                if let egui::Event::Screenshot { image, .. } = event { Some(image.clone()) } else { None }
-            }));
+            let captured = ctx.input(|input| {
+                input.events.iter().find_map(|event| {
+                    if let egui::Event::Screenshot { image, .. } = event {
+                        Some(image.clone())
+                    } else {
+                        None
+                    }
+                })
+            });
             if let Some(captured) = captured {
-                let colors: std::collections::HashSet<_> = captured.pixels.iter().map(|p| p.to_array()).collect();
-                if colors.len() < 16 { eprintln!("UI smoke failed: blank framebuffer"); std::process::exit(3); }
+                let colors: std::collections::HashSet<_> =
+                    captured.pixels.iter().map(|p| p.to_array()).collect();
+                if colors.len() < 16 {
+                    eprintln!("UI smoke failed: blank framebuffer");
+                    std::process::exit(3);
+                }
                 let rgba: Vec<u8> = captured.pixels.iter().flat_map(|p| p.to_array()).collect();
-                if let Err(e) = image::save_buffer(&smoke.path, &rgba, captured.size[0] as u32, captured.size[1] as u32, image::ColorType::Rgba8) {
-                    eprintln!("UI smoke failed: {e}"); std::process::exit(3);
+                if let Err(e) = image::save_buffer(
+                    &smoke.path,
+                    &rgba,
+                    captured.size[0] as u32,
+                    captured.size[1] as u32,
+                    image::ColorType::Rgba8,
+                ) {
+                    eprintln!("UI smoke failed: {e}");
+                    std::process::exit(3);
                 }
                 #[cfg(windows)]
                 if std::env::args().any(|a| a == "--tray-smoke-test") {
@@ -1288,11 +1351,15 @@ impl eframe::App for ZaloGuiApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
                 #[cfg(not(windows))]
-                { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+                {
+                    self.allow_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             } else if smoke.frames == 5 && !smoke.lifecycle_started {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             } else if smoke.frames > 300 {
-                eprintln!("UI smoke failed: screenshot timeout"); std::process::exit(3);
+                eprintln!("UI smoke failed: screenshot timeout");
+                std::process::exit(3);
             }
             ctx.request_repaint();
         }
@@ -1317,7 +1384,9 @@ impl eframe::App for ZaloGuiApp {
                 self.allow_quit = true;
             }
             #[cfg(not(windows))]
-            { self.allow_quit = true; }
+            {
+                self.allow_quit = true;
+            }
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
@@ -1325,6 +1394,15 @@ impl eframe::App for ZaloGuiApp {
         }
 
         self.check_events(ctx);
+        ensure_cjk_font(
+            ctx,
+            self.threads.iter().map(|t| t.name.as_str()).chain(
+                self.threads
+                    .get(self.selected_thread_index)
+                    .into_iter()
+                    .flat_map(|t| t.messages.iter().map(|m| m.text.as_str())),
+            ),
+        );
 
         ctx.request_repaint_after(Duration::from_millis(1200));
 
@@ -1630,8 +1708,11 @@ impl ZaloGuiApp {
 mod renderer_tests {
     #[test]
     fn dx12_backend_is_compiled_into_the_arm64_binary() {
-        assert!(eframe::wgpu::Instance::enabled_backend_features().contains(eframe::wgpu::Backends::DX12),
-            "Selecting DX12 at runtime is insufficient: enable the wgpu/dx12 Cargo feature");
+        assert!(
+            eframe::wgpu::Instance::enabled_backend_features()
+                .contains(eframe::wgpu::Backends::DX12),
+            "Selecting DX12 at runtime is insufficient: enable the wgpu/dx12 Cargo feature"
+        );
     }
 }
 
@@ -1641,20 +1722,37 @@ mod settings_layout_tests {
     #[test]
     fn settings_tabs_fit_small_wide_and_high_dpi_viewports() {
         let ctx = egui::Context::default();
-        let session = Session::new(false,false,false).unwrap();
+        let session = Session::new(false, false, false).unwrap();
         let mut app = ZaloGuiApp::from_context(&ctx, session, false, Vec::new(), false);
         app.is_logged_in = true;
         app.settings_modal_open = true;
         app.settings.download_dir = r"C:\Users\a-long-windows-user-name\Downloads".into();
-        app.smoke = Some(UiSmoke {path:Default::default(),frames:0,lifecycle_started:false});
-        for size in [[480.0,360.0],[1020.0,700.0],[320.0,240.0]] {
-            for tab in [SettingsTab::General,SettingsTab::Privacy,SettingsTab::Sync,
-                SettingsTab::Appearance,SettingsTab::Notifications,SettingsTab::Messages,SettingsTab::Utilities] {
+        app.smoke = Some(UiSmoke {
+            path: Default::default(),
+            frames: 0,
+            lifecycle_started: false,
+        });
+        for size in [[480.0, 360.0], [1020.0, 700.0], [320.0, 240.0]] {
+            for tab in [
+                SettingsTab::General,
+                SettingsTab::Privacy,
+                SettingsTab::Sync,
+                SettingsTab::Appearance,
+                SettingsTab::Notifications,
+                SettingsTab::Messages,
+                SettingsTab::Utilities,
+            ] {
                 app.settings_tab = tab;
                 for frame in 0..6 {
                     app.smoke.as_mut().unwrap().frames = frame;
-                    let input = egui::RawInput {screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(size[0],size[1]))),..Default::default()};
-                    let _ = ctx.run(input, |ctx| app.render_settings_modal(ctx,&app.palette()));
+                    let input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(size[0], size[1]),
+                        )),
+                        ..Default::default()
+                    };
+                    let _ = ctx.run(input, |ctx| app.render_settings_modal(ctx, &app.palette()));
                 }
             }
         }

@@ -40,7 +40,14 @@ use crate::session::Session;
 const POLL_SECS: u64 = 4;
 
 /// Quick-reaction palette for keys `1`..`6`, same order as the GUI picker.
-const QUICK_REACTIONS: [&str; 6] = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F606}", "\u{1F62E}", "\u{1F622}", "\u{1F620}"];
+const QUICK_REACTIONS: [&str; 6] = [
+    "\u{1F44D}",
+    "\u{2764}\u{FE0F}",
+    "\u{1F606}",
+    "\u{1F62E}",
+    "\u{1F622}",
+    "\u{1F620}",
+];
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Focus {
@@ -117,6 +124,8 @@ struct StickerState {
     loaded_name: String,
 }
 
+// These infrequent terminal events retain the existing TUI ownership boundary.
+#[allow(clippy::large_enum_variant)]
 enum BgEvent {
     PollDone {
         threads: Vec<Thread>,
@@ -283,7 +292,11 @@ impl<'a> TuiApp<'a> {
 
         let pos = preferred
             .as_ref()
-            .and_then(|id| self.filtered.iter().position(|&i| self.threads[i].id == *id))
+            .and_then(|id| {
+                self.filtered
+                    .iter()
+                    .position(|&i| self.threads[i].id == *id)
+            })
             .unwrap_or(0)
             .min(self.filtered.len() - 1);
         let idx = self.filtered[pos];
@@ -402,7 +415,11 @@ impl<'a> TuiApp<'a> {
     }
 
     fn move_message(&mut self, delta: isize) {
-        let Some(len) = self.threads.get(self.selected_thread).map(|t| t.messages.len()) else {
+        let Some(len) = self
+            .threads
+            .get(self.selected_thread)
+            .map(|t| t.messages.len())
+        else {
             return;
         };
         if len == 0 {
@@ -837,7 +854,11 @@ impl<'a> TuiApp<'a> {
     }
 
     fn react_quick(&mut self, key: char) {
-        let Some(idx) = key.to_digit(10).map(|d| d as usize).and_then(|d| d.checked_sub(1)) else {
+        let Some(idx) = key
+            .to_digit(10)
+            .map(|d| d as usize)
+            .and_then(|d| d.checked_sub(1))
+        else {
             return;
         };
         let Some(emoji) = QUICK_REACTIONS.get(idx).copied() else {
@@ -979,7 +1000,8 @@ impl<'a> TuiApp<'a> {
                         }
                         Err(e) => {
                             logger::log_error("tui::delete_message_for_me", &e.to_string());
-                            let _ = tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
+                            let _ =
+                                tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
                         }
                     }
                 });
@@ -1225,10 +1247,8 @@ impl<'a> TuiApp<'a> {
                 KeyCode::Backspace => {
                     self.input_text.pop();
                 }
-                KeyCode::Char(c) => {
-                    if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) {
-                        self.input_text.push(c);
-                    }
+                KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) => {
+                    self.input_text.push(c);
                 }
                 _ => {}
             },
@@ -1571,7 +1591,9 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Span::raw(" | Chua doc: "),
         Span::styled(
             total_unread.to_string(),
-            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | "),
         Span::styled(&app.status, Style::default().fg(Color::Yellow)),
@@ -1712,12 +1734,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
 
     let (name, id, is_group, msg_count) = match app.threads.get(app.selected_thread) {
         Some(t) => (t.name.clone(), t.id.clone(), t.is_group, t.messages.len()),
-        None => (
-            "Chua chon hoi thoai".to_string(),
-            String::new(),
-            false,
-            0,
-        ),
+        None => ("Chua chon hoi thoai".to_string(), String::new(), false, 0),
     };
     let kind = if is_group { "Nhom" } else { "Ca nhan" };
     let chat_header = Paragraph::new(Line::from(vec![
@@ -1775,7 +1792,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     app.chat_view_h = inner_h;
 
     let pct = if lines.len() <= inner_h {
-        format!("100%")
+        "100%".to_string()
     } else {
         format!(
             "{}%",
@@ -1805,7 +1822,11 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         let quote = format!(
             " {}: {}",
             q.sender,
-            q.text.replace('\n', " ").chars().take(120).collect::<String>()
+            q.text
+                .replace('\n', " ")
+                .chars()
+                .take(120)
+                .collect::<String>()
         );
         let reply = Paragraph::new(quote)
             .block(
@@ -2019,7 +2040,10 @@ fn build_chat_lines(
         for (ci, chunk) in chunks.iter().enumerate() {
             if ci == 0 {
                 let mut spans = prefix.clone();
-                spans.push(Span::styled(chunk.clone(), Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    chunk.clone(),
+                    Style::default().fg(Color::White),
+                ));
                 lines.push(Line::from(spans));
             } else {
                 lines.push(Line::from(vec![
@@ -2139,7 +2163,9 @@ fn unix_now_ms() -> i64 {
     crate::login::unix_now() * 1000
 }
 
-fn open_external_url(url: &str) { let _ = crate::platform::open_url(url); }
+fn open_external_url(url: &str) {
+    let _ = crate::platform::open_url(url);
+}
 
 fn help_line(keys: &str, desc: &str) -> Line<'static> {
     Line::from(vec![
@@ -2153,6 +2179,8 @@ fn help_line(keys: &str, desc: &str) -> Line<'static> {
     ])
 }
 
+// Sequential pushes keep the key/description pairs readable beside their styles.
+#[allow(clippy::vec_init_then_push)]
 fn render_help(f: &mut Frame, area: Rect) {
     let modal_area = centered_rect(80, 80, area);
     f.render_widget(Clear, modal_area);
@@ -2165,15 +2193,23 @@ fn render_help(f: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )));
     content.push(Line::raw(""));
-    content.push(help_line("Tab / BackTab", "Chuyen vung: Danh sach -> Tin nhan -> Soan tin"));
+    content.push(help_line(
+        "Tab / BackTab",
+        "Chuyen vung: Danh sach -> Tin nhan -> Soan tin",
+    ));
     content.push(help_line("F1 / ?", "Mo tro giup nay"));
     content.push(help_line("q / Ctrl+C", "Thoat (q chi khi khong go tin)"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Danh sach hoi thoai --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
-    content.push(help_line("Up/Down j/k", "Chon hoi thoai (cuon chuot cung duoc)"));
+    content.push(help_line(
+        "Up/Down j/k",
+        "Chon hoi thoai (cuon chuot cung duoc)",
+    ));
     content.push(help_line("PgUp/PgDn", "Nhay 10 hoi thoai"));
     content.push(help_line("Home / End", "Hoi thoai dau / cuoi"));
     content.push(help_line("/", "Tim theo ten, ID, noi dung, tin nhan"));
@@ -2185,25 +2221,35 @@ fn render_help(f: &mut Frame, area: Rect) {
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Tin nhan --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
     content.push(help_line("Up/Down j/k", "Chon tin nhan"));
     content.push(help_line("PgUp/PgDn", "Cuon nhanh"));
     content.push(help_line("Home / End", "Dau / cuoi hoi thoai"));
-    content.push(help_line("1 .. 6", "Tha cam xuc nhanh (Thich, Yeu, Haha, Wow, Buon, Phan no)"));
+    content.push(help_line(
+        "1 .. 6",
+        "Tha cam xuc nhanh (Thich, Yeu, Haha, Wow, Buon, Phan no)",
+    ));
     content.push(help_line("y", "Tra loi tin dang chon"));
     content.push(help_line("d", "Xoa tin nhan (chi phia ban)"));
     content.push(help_line("o", "Mo lien ket cua tin nhan"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Soan tin / dinh kem --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
     content.push(help_line("Enter", "Gui tin nhan"));
     content.push(help_line("Ctrl+U", "Xoa toan bo o soan"));
     content.push(help_line("Ctrl+X", "Huy tra loi"));
     content.push(help_line("Esc", "Lui ve vung truoc"));
-    content.push(help_line("F2", "Kho nhan dan: Enter chon bo, Enter lan 2 de gui"));
+    content.push(help_line(
+        "F2",
+        "Kho nhan dan: Enter chon bo, Enter lan 2 de gui",
+    ));
     content.push(help_line("F3", "Gui tep dinh kem bang duong dan"));
     content.push(help_line("l", "Dev log inspector (chi che do --dev)"));
     content.push(Line::raw(""));
@@ -2232,7 +2278,11 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(modal_area);
 
-    let loading = if app.sticker.loading { " (dang tai...)" } else { "" };
+    let loading = if app.sticker.loading {
+        " (dang tai...)"
+    } else {
+        ""
+    };
     let packs_title = if app.sticker.stage == 0 {
         format!(
             " Kho nhan dan ({} bo){loading} [DANG CHON] — Enter de mo bo ",
@@ -2250,10 +2300,7 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
         .iter()
         .map(|p| {
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", p.name),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!(" {} ", p.name), Style::default().fg(Color::White)),
                 Span::styled(
                     format!("({} sticker)", p.total_image),
                     Style::default().fg(Color::DarkGray),
@@ -2472,7 +2519,10 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
     )]));
     for e in entries.iter().rev() {
         let status_color = if e.is_error { Color::Red } else { Color::Green };
-        let status_str = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
+        let status_str = e
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "ERR".into());
 
         content.push(Line::from(vec![
             Span::styled(
@@ -2485,7 +2535,10 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{:<3} ", status_str), Style::default().fg(status_color)),
+            Span::styled(
+                format!("{:<3} ", status_str),
+                Style::default().fg(status_color),
+            ),
             Span::styled(
                 format!("({}ms) ", e.latency_ms),
                 Style::default().fg(Color::DarkGray),
@@ -2547,7 +2600,10 @@ mod tests {
 
     #[test]
     fn wraps_words_to_width() {
-        assert_eq!(wrap_text("a b c", 3), vec!["a b".to_string(), "c".to_string()]);
+        assert_eq!(
+            wrap_text("a b c", 3),
+            vec!["a b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

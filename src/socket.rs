@@ -153,7 +153,8 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
         let head: String = buf.iter().take(12).map(|b| format!("{b:02x}")).collect();
         trace(format!("inflate input {} bytes head={head}", buf.len()));
     }
-    let attempts: [(&str, fn(&[u8]) -> Box<dyn Read + '_>); 2] = [
+    type Decoder = for<'a> fn(&'a [u8]) -> Box<dyn Read + 'a>;
+    let attempts: [(&str, Decoder); 2] = [
         ("gzip", |b| Box::new(flate2::read::GzDecoder::new(b))),
         ("zlib", |b| Box::new(flate2::read::ZlibDecoder::new(b))),
     ];
@@ -309,7 +310,10 @@ fn build_url(sess: &Session, endpoint_idx: usize) -> String {
 fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
     let mut out: Vec<(u16, u8)> = Vec::new();
     for key in ["ctrl_qCmds", "qCmds"] {
-        if let Some(arr) = auth.pointer(&format!("/data/{key}")).and_then(|v| v.as_array()) {
+        if let Some(arr) = auth
+            .pointer(&format!("/data/{key}"))
+            .and_then(|v| v.as_array())
+        {
             for q in arr {
                 let cmd = q.get("cmd").and_then(|v| v.as_u64());
                 let sub = q.get("subCmd").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -340,13 +344,7 @@ fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str) -> Vec<u8> {
     encode_frame(cmd, sub_cmd, 1, Some(&data))
 }
 
-fn pull_next_frame(
-    cmd: u16,
-    sub_cmd: u8,
-    req_id: &str,
-    last_id: Value,
-    pre_ids: Value,
-) -> Vec<u8> {
+fn pull_next_frame(cmd: u16, sub_cmd: u8, req_id: &str, last_id: Value, pre_ids: Value) -> Vec<u8> {
     let data = json!({
         "first": false,
         "reqId": req_id,
@@ -365,7 +363,9 @@ pub fn spawn(sess: Session) -> mpsc::Receiver<WsEvent> {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
-            if !sess.is_active() || tx.is_closed() { break; }
+            if !sess.is_active() || tx.is_closed() {
+                break;
+            }
             match run_once(&sess, &tx, endpoint_idx).await {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
@@ -404,10 +404,16 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
-    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
-    config.max_message_size = Some(crate::limits::INFLATED_BYTES as usize);
-    config.max_frame_size = Some(crate::limits::INFLATED_BYTES as usize);
-    let connection = tokio::time::timeout(Duration::from_secs(15), connect_async_with_config(req, Some(config), false)).await?;
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(crate::limits::INFLATED_BYTES as usize),
+        max_frame_size: Some(crate::limits::INFLATED_BYTES as usize),
+        ..Default::default()
+    };
+    let connection = tokio::time::timeout(
+        Duration::from_secs(15),
+        connect_async_with_config(req, Some(config), false),
+    )
+    .await?;
     let (mut ws, resp) = match connection {
         Ok(pair) => pair,
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
@@ -436,7 +442,7 @@ async fn run_once(
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    ws.send(Message::Binary(f.into())).await?;
+                    ws.send(Message::Binary(f)).await?;
                     trace("-> ping");
                 }
             }
@@ -495,7 +501,7 @@ async fn run_once(
                     for (qcmd, qsub) in queues_from_auth(&auth) {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id).into())).await?;
+                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id))).await?;
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));
                     }
                     continue;
@@ -527,7 +533,7 @@ async fn run_once(
                         });
                         let _ = ws
                             .send(Message::Binary(
-                                encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)).into(),
+                                encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)),
                             ))
                             .await;
                         trace(format!("-> get_msg 570_0 {id}"));
@@ -548,7 +554,7 @@ async fn run_once(
                     req_id += 1;
                     let _ = ws
                         .send(Message::Binary(
-                            pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids).into(),
+                            pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids),
                         ))
                         .await;
                     trace(format!("-> pull next {qkey} {id}"));

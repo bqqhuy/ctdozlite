@@ -32,8 +32,8 @@ function Get-Dumpbin {
 $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
 if (-not $SkipTests) { Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target) }
-Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'zalo-rust', '--target', $target)
-$binary = (Resolve-Path "target\$target\release\zalo-rust.exe").Path
+Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'ctdozlite', '--target', $target)
+$binary = (Resolve-Path "target\$target\release\ctdozlite.exe").Path
 Assert-Arm64 $binary
 $dumpbin = Get-Dumpbin
 $imports = & $dumpbin /DEPENDENTS $binary
@@ -76,7 +76,7 @@ try {
         foreach ($argument in @('--gui', '--dev', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
             $process.StartInfo.ArgumentList.Add($argument)
         }
-        if ($case.Tray) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
+        if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }
             $outTask = $process.StandardOutput.ReadToEndAsync()

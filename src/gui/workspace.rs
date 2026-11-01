@@ -355,232 +355,235 @@ impl ZaloGuiApp {
                             });
                             ui.add_space(6.0);
                         } else {
-                        // Search Box + Quick Phone Lookup (`+👤`) Button
-                        let avail_row_w = ui.available_width();
-                        let mut trigger_phone_lookup: Option<String> = None;
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let search_box_w = (avail_row_w - 38.0).max(110.0);
-                            let has_q = !self.search_query.is_empty();
-                            egui::Frame::none()
-                                .fill(pal.bg_input)
-                                .rounding(Rounding::same(8.0))
-                                .stroke(Stroke::new(
-                                    1.0_f32,
-                                    if has_q {
-                                        pal.primary.linear_multiply(0.65)
-                                    } else {
-                                        pal.border
-                                    },
-                                ))
-                                .inner_margin(Margin::symmetric(9.0, 6.0))
-                                .show(ui, |ui| {
-                                    let inner_w = (search_box_w - 18.0).max(80.0);
-                                    ui.set_width(inner_w);
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 6.0;
-                                        let (icon_rect, _) = ui.allocate_exact_size(
-                                            Vec2::new(15.0, 18.0),
-                                            Sense::hover(),
-                                        );
-                                        draw_icon_search(
-                                            ui.painter(),
-                                            icon_rect.center(),
-                                            13.5,
-                                            if has_q {
-                                                pal.primary_hover
-                                            } else {
-                                                pal.text_muted
-                                            },
-                                        );
-                                        let edit_w = if has_q {
-                                            (inner_w - 42.0).max(48.0)
-                                        } else {
-                                            (inner_w - 22.0).max(60.0)
-                                        };
-                                        let s_resp = ui.add(
-                                            egui::TextEdit::singleline(&mut self.search_query)
-                                                .id(Id::new("sidebar_search_input"))
-                                                .frame(false)
-                                                .hint_text("Tìm hội thoại, tin nhắn, SĐT...")
-                                                .desired_width(edit_w),
-                                        );
-                                        let s_enter = (s_resp.lost_focus() || s_resp.has_focus())
-                                            && ui.input(|i| i.key_pressed(Key::Enter));
-                                        let digits_cnt = self
-                                            .search_query
-                                            .chars()
-                                            .filter(|c| c.is_ascii_digit())
-                                            .count();
-                                        if s_enter && digits_cnt >= 8 {
-                                            trigger_phone_lookup =
-                                                Some(self.search_query.trim().to_string());
-                                        }
+                            // Search Box + Quick Phone Lookup (`+👤`) Button
+                            let avail_row_w = ui.available_width();
+                            let mut trigger_phone_lookup: Option<String> = None;
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                let search_box_w = (avail_row_w - 38.0).max(110.0);
+                                let has_q = !self.search_query.is_empty();
+                                egui::Frame::none()
+                                    .fill(pal.bg_input)
+                                    .rounding(Rounding::same(8.0))
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
                                         if has_q {
-                                            let (clr_rect, clr_resp) = ui.allocate_exact_size(
-                                                Vec2::new(16.0, 16.0),
-                                                Sense::click(),
+                                            pal.primary.linear_multiply(0.65)
+                                        } else {
+                                            pal.border
+                                        },
+                                    ))
+                                    .inner_margin(Margin::symmetric(9.0, 6.0))
+                                    .show(ui, |ui| {
+                                        let inner_w = (search_box_w - 18.0).max(80.0);
+                                        ui.set_width(inner_w);
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 6.0;
+                                            let (icon_rect, _) = ui.allocate_exact_size(
+                                                Vec2::new(15.0, 18.0),
+                                                Sense::hover(),
                                             );
-                                            if clr_resp.hovered() {
-                                                ui.painter().circle_filled(
-                                                    clr_rect.center(),
-                                                    8.0,
-                                                    pal.bg_hover,
-                                                );
-                                            }
-                                            draw_lucide_icon(
+                                            draw_icon_search(
                                                 ui.painter(),
-                                                clr_rect.center(),
-                                                lucide::X,
-                                                11.5,
-                                                if clr_resp.hovered() {
-                                                    pal.text_primary
+                                                icon_rect.center(),
+                                                13.5,
+                                                if has_q {
+                                                    pal.primary_hover
                                                 } else {
                                                     pal.text_muted
                                                 },
                                             );
-                                            if clr_resp
-                                                .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("Xóa tìm kiếm")
-                                                .clicked()
-                                            {
-                                                self.search_query.clear();
+                                            let edit_w = if has_q {
+                                                (inner_w - 42.0).max(48.0)
+                                            } else {
+                                                (inner_w - 22.0).max(60.0)
+                                            };
+                                            let s_resp = ui.add(
+                                                egui::TextEdit::singleline(&mut self.search_query)
+                                                    .id(Id::new("sidebar_search_input"))
+                                                    .frame(false)
+                                                    .hint_text("Tìm hội thoại, tin nhắn, SĐT...")
+                                                    .desired_width(edit_w),
+                                            );
+                                            let s_enter = (s_resp.lost_focus()
+                                                || s_resp.has_focus())
+                                                && ui.input(|i| i.key_pressed(Key::Enter));
+                                            let digits_cnt = self
+                                                .search_query
+                                                .chars()
+                                                .filter(|c| c.is_ascii_digit())
+                                                .count();
+                                            if s_enter && digits_cnt >= 8 {
+                                                trigger_phone_lookup =
+                                                    Some(self.search_query.trim().to_string());
                                             }
-                                        }
+                                            if has_q {
+                                                let (clr_rect, clr_resp) = ui.allocate_exact_size(
+                                                    Vec2::new(16.0, 16.0),
+                                                    Sense::click(),
+                                                );
+                                                if clr_resp.hovered() {
+                                                    ui.painter().circle_filled(
+                                                        clr_rect.center(),
+                                                        8.0,
+                                                        pal.bg_hover,
+                                                    );
+                                                }
+                                                draw_lucide_icon(
+                                                    ui.painter(),
+                                                    clr_rect.center(),
+                                                    lucide::X,
+                                                    11.5,
+                                                    if clr_resp.hovered() {
+                                                        pal.text_primary
+                                                    } else {
+                                                        pal.text_muted
+                                                    },
+                                                );
+                                                if clr_resp
+                                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                                    .on_hover_text("Xóa tìm kiếm")
+                                                    .clicked()
+                                                {
+                                                    self.search_query.clear();
+                                                }
+                                            }
+                                        });
                                     });
-                                });
 
-                            // Add Friend / Lookup by Phone Button (`+👤`)
-                            let (add_rect, add_resp) =
-                                ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
-                            ui.painter().rect_filled(
-                                add_rect,
-                                Rounding::same(8.0),
-                                if self.phone_modal_open {
-                                    pal.primary.linear_multiply(0.22)
-                                } else if add_resp.hovered() {
-                                    pal.bg_hover
-                                } else {
-                                    pal.bg_input
-                                },
-                            );
-                            ui.painter().rect_stroke(
-                                add_rect,
-                                Rounding::same(8.0),
-                                Stroke::new(
-                                    1.0_f32,
-                                    if self.phone_modal_open || add_resp.hovered() {
-                                        pal.primary
+                                // Add Friend / Lookup by Phone Button (`+👤`)
+                                let (add_rect, add_resp) =
+                                    ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
+                                ui.painter().rect_filled(
+                                    add_rect,
+                                    Rounding::same(8.0),
+                                    if self.phone_modal_open {
+                                        pal.primary.linear_multiply(0.22)
+                                    } else if add_resp.hovered() {
+                                        pal.bg_hover
                                     } else {
-                                        pal.border
+                                        pal.bg_input
                                     },
-                                ),
-                            );
-                            draw_icon_user_plus(
-                                ui.painter(),
-                                add_rect.center(),
-                                16.5,
-                                if self.phone_modal_open || add_resp.hovered() {
-                                    pal.primary_hover
-                                } else {
-                                    pal.text_secondary
-                                },
-                            );
-                            if add_resp
-                                .on_hover_cursor(CursorIcon::PointingHand)
-                                .on_hover_text("Tìm kiếm số điện thoại Zalo & Kết bạn")
-                                .clicked()
-                            {
-                                self.phone_modal_open = true;
-                                let digits_cnt = self
-                                    .search_query
-                                    .chars()
-                                    .filter(|c| c.is_ascii_digit())
-                                    .count();
-                                if digits_cnt >= 8 && self.phone_modal_input.is_empty() {
-                                    self.phone_modal_input = self.search_query.trim().to_string();
-                                }
-                            }
-                        });
-
-                        if let Some(phone_str) = trigger_phone_lookup {
-                            self.phone_modal_open = true;
-                            self.phone_modal_input = phone_str.clone();
-                            self.phone_lookup_loading = true;
-                            self.phone_lookup_error = None;
-                            self.phone_lookup_result = None;
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::LookupPhone { phone: phone_str });
-                            }
-                        }
-                        ui.add_space(10.0);
-
-                        // Clean Underline Segmented Tabs (`Tất cả`, `Cá nhân`, `Nhóm`) + `Đã ghim (1)`
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 16.0;
-                            for (filter, label) in [
-                                (ThreadFilter::All, "Tất cả"),
-                                (ThreadFilter::Direct, "Cá nhân"),
-                                (ThreadFilter::Groups, "Nhóm"),
-                            ] {
-                                let active = self.thread_filter == filter;
-                                let text_w = ui.fonts(|f| {
-                                    f.layout_no_wrap(
-                                        label.to_string(),
-                                        FontId::proportional(12.5),
-                                        pal.text_primary,
-                                    )
-                                    .size()
-                                    .x
-                                });
-                                let (tab_rect, tab_resp) = ui.allocate_exact_size(
-                                    Vec2::new(text_w + 4.0, 26.0),
-                                    Sense::click(),
                                 );
-                                let fg = if active {
-                                    pal.primary_hover
-                                } else if tab_resp.hovered() {
-                                    pal.text_primary
-                                } else {
-                                    pal.text_secondary
-                                };
-                                ui.painter().text(
-                                    Pos2::new(tab_rect.center().x, tab_rect.top() + 8.0),
-                                    egui::Align2::CENTER_CENTER,
-                                    label,
-                                    FontId::proportional(12.5),
-                                    fg,
+                                ui.painter().rect_stroke(
+                                    add_rect,
+                                    Rounding::same(8.0),
+                                    Stroke::new(
+                                        1.0_f32,
+                                        if self.phone_modal_open || add_resp.hovered() {
+                                            pal.primary
+                                        } else {
+                                            pal.border
+                                        },
+                                    ),
                                 );
-                                if active {
-                                    let line_y = tab_rect.bottom() - 1.0;
-                                    ui.painter().line_segment(
-                                        [
-                                            Pos2::new(tab_rect.left(), line_y),
-                                            Pos2::new(tab_rect.right(), line_y),
-                                        ],
-                                        Stroke::new(2.2_f32, pal.primary),
-                                    );
-                                }
-                                if tab_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                    self.thread_filter = filter;
-                                }
-                            }
-
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                let pinned_cnt = self
-                                    .threads
-                                    .iter()
-                                    .filter(|t| t.name.contains("Cloud của tôi"))
-                                    .count();
-                                if pinned_cnt > 0 {
-                                    ui.label(
-                                        RichText::new(format!("Đã ghim ({pinned_cnt})"))
-                                            .size(11.0)
-                                            .color(pal.text_muted),
-                                    );
+                                draw_icon_user_plus(
+                                    ui.painter(),
+                                    add_rect.center(),
+                                    16.5,
+                                    if self.phone_modal_open || add_resp.hovered() {
+                                        pal.primary_hover
+                                    } else {
+                                        pal.text_secondary
+                                    },
+                                );
+                                if add_resp
+                                    .on_hover_cursor(CursorIcon::PointingHand)
+                                    .on_hover_text("Tìm kiếm số điện thoại Zalo & Kết bạn")
+                                    .clicked()
+                                {
+                                    self.phone_modal_open = true;
+                                    let digits_cnt = self
+                                        .search_query
+                                        .chars()
+                                        .filter(|c| c.is_ascii_digit())
+                                        .count();
+                                    if digits_cnt >= 8 && self.phone_modal_input.is_empty() {
+                                        self.phone_modal_input =
+                                            self.search_query.trim().to_string();
+                                    }
                                 }
                             });
-                        });
+
+                            if let Some(phone_str) = trigger_phone_lookup {
+                                self.phone_modal_open = true;
+                                self.phone_modal_input = phone_str.clone();
+                                self.phone_lookup_loading = true;
+                                self.phone_lookup_error = None;
+                                self.phone_lookup_result = None;
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::LookupPhone { phone: phone_str });
+                                }
+                            }
+                            ui.add_space(10.0);
+
+                            // Clean Underline Segmented Tabs (`Tất cả`, `Cá nhân`, `Nhóm`) + `Đã ghim (1)`
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 16.0;
+                                for (filter, label) in [
+                                    (ThreadFilter::All, "Tất cả"),
+                                    (ThreadFilter::Direct, "Cá nhân"),
+                                    (ThreadFilter::Groups, "Nhóm"),
+                                ] {
+                                    let active = self.thread_filter == filter;
+                                    let text_w = ui.fonts(|f| {
+                                        f.layout_no_wrap(
+                                            label.to_string(),
+                                            FontId::proportional(12.5),
+                                            pal.text_primary,
+                                        )
+                                        .size()
+                                        .x
+                                    });
+                                    let (tab_rect, tab_resp) = ui.allocate_exact_size(
+                                        Vec2::new(text_w + 4.0, 26.0),
+                                        Sense::click(),
+                                    );
+                                    let fg = if active {
+                                        pal.primary_hover
+                                    } else if tab_resp.hovered() {
+                                        pal.text_primary
+                                    } else {
+                                        pal.text_secondary
+                                    };
+                                    ui.painter().text(
+                                        Pos2::new(tab_rect.center().x, tab_rect.top() + 8.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        label,
+                                        FontId::proportional(12.5),
+                                        fg,
+                                    );
+                                    if active {
+                                        let line_y = tab_rect.bottom() - 1.0;
+                                        ui.painter().line_segment(
+                                            [
+                                                Pos2::new(tab_rect.left(), line_y),
+                                                Pos2::new(tab_rect.right(), line_y),
+                                            ],
+                                            Stroke::new(2.2_f32, pal.primary),
+                                        );
+                                    }
+                                    if tab_resp.on_hover_cursor(CursorIcon::PointingHand).clicked()
+                                    {
+                                        self.thread_filter = filter;
+                                    }
+                                }
+
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let pinned_cnt = self
+                                        .threads
+                                        .iter()
+                                        .filter(|t| t.name.contains("Cloud của tôi"))
+                                        .count();
+                                    if pinned_cnt > 0 {
+                                        ui.label(
+                                            RichText::new(format!("Đã ghim ({pinned_cnt})"))
+                                                .size(11.0)
+                                                .color(pal.text_muted),
+                                        );
+                                    }
+                                });
+                            });
                         }
                     });
 
@@ -613,7 +616,12 @@ impl ZaloGuiApp {
                             ui.horizontal(|ui| {
                                 let (ir, _) =
                                     ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
-                                draw_icon_user_plus(ui.painter(), ir.center(), 16.0, pal.primary_hover);
+                                draw_icon_user_plus(
+                                    ui.painter(),
+                                    ir.center(),
+                                    16.0,
+                                    pal.primary_hover,
+                                );
                                 ui.vertical(|ui| {
                                     ui.label(
                                         RichText::new(format!("Tìm Zalo qua SĐT: {raw_q}"))
@@ -742,6 +750,9 @@ impl ZaloGuiApp {
                                 Sense::click(),
                             );
                             let row_rect = row_rect.translate(Vec2::new(4.0, 0.0));
+                            if !ui.is_rect_visible(row_rect) {
+                                continue;
+                            }
 
                             let bg = if is_selected {
                                 pal.bg_selected
@@ -751,8 +762,7 @@ impl ZaloGuiApp {
                                 Color32::TRANSPARENT
                             };
 
-                            ui.painter()
-                                .rect_filled(row_rect, Rounding::same(11.0), bg);
+                            ui.painter().rect_filled(row_rect, Rounding::same(11.0), bg);
 
                             // Left active indicator bar (`w-1 bg-zalo-500 rounded-r-full`)
                             if is_selected {
@@ -826,10 +836,7 @@ impl ZaloGuiApp {
                                     if is_pinned_cloud {
                                         draw_icon_pin(
                                             ui.painter(),
-                                            Pos2::new(
-                                                time_right - tw - 9.0,
-                                                row_rect.top() + 19.5,
-                                            ),
+                                            Pos2::new(time_right - tw - 9.0, row_rect.top() + 19.5),
                                             11.0,
                                             pal.text_muted,
                                         );
@@ -837,11 +844,8 @@ impl ZaloGuiApp {
                                 }
 
                                 // Snippet with `Bạn:` prefix when latest message is outgoing
-                                let last_outgoing = t
-                                    .messages
-                                    .last()
-                                    .map(|m| m.is_outgoing)
-                                    .unwrap_or(false);
+                                let last_outgoing =
+                                    t.messages.last().map(|m| m.is_outgoing).unwrap_or(false);
                                 let raw_preview = if t.preview.is_empty() {
                                     "Chưa có tin nhắn".to_string()
                                 } else if last_outgoing && !t.preview.starts_with("Bạn:") {
@@ -877,7 +881,10 @@ impl ZaloGuiApp {
                                     };
                                     let bw = if unread_n >= 10 { 22.0 } else { 18.0 };
                                     let b_rect = Rect::from_min_size(
-                                        Pos2::new(row_rect.right() - bw - 8.0, row_rect.top() + 31.5),
+                                        Pos2::new(
+                                            row_rect.right() - bw - 8.0,
+                                            row_rect.top() + 31.5,
+                                        ),
                                         Vec2::new(bw, 17.0),
                                     );
                                     ui.painter().rect_filled(
@@ -937,10 +944,8 @@ impl ZaloGuiApp {
                                     );
                                 }
                                 let av_c = Pos2::new(r_rect.left() + 24.0, r_rect.center().y);
-                                let hit_ava = self
-                                    .threads
-                                    .get(*t_idx)
-                                    .and_then(|th| th.avatar.as_deref());
+                                let hit_ava =
+                                    self.threads.get(*t_idx).and_then(|th| th.avatar.as_deref());
                                 paint_user_avatar(
                                     ui.painter(),
                                     av_c,
@@ -989,9 +994,11 @@ impl ZaloGuiApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(32.0);
                                 ui.label(
-                                    RichText::new("Không tìm thấy hội thoại hoặc tin nhắn phù hợp.")
-                                        .size(12.5)
-                                        .color(pal.text_muted),
+                                    RichText::new(
+                                        "Không tìm thấy hội thoại hoặc tin nhắn phù hợp.",
+                                    )
+                                    .size(12.5)
+                                    .color(pal.text_muted),
                                 );
                             });
                         }
@@ -1104,10 +1111,8 @@ impl ZaloGuiApp {
                             .inner_margin(Margin::symmetric(16.0, 18.0))
                             .show(ui, |ui| {
                                 ui.vertical_centered(|ui| {
-                                    let (av_rect, _) = ui.allocate_exact_size(
-                                        Vec2::new(64.0, 64.0),
-                                        Sense::hover(),
-                                    );
+                                    let (av_rect, _) = ui
+                                        .allocate_exact_size(Vec2::new(64.0, 64.0), Sense::hover());
                                     paint_user_avatar(
                                         ui.painter(),
                                         av_rect.center(),
@@ -1182,7 +1187,8 @@ impl ZaloGuiApp {
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::RefreshThreads);
-                                                if d_is_group || d_name.contains("Cloud của tôi") {
+                                                if d_is_group || d_name.contains("Cloud của tôi")
+                                                {
                                                     let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                                         group_id: d_id.clone(),
                                                         is_group: d_is_group,
@@ -1193,27 +1199,28 @@ impl ZaloGuiApp {
                                         }
 
                                         let star_active = self.filter_starred_only;
-                                        let star_btn = egui::Button::new(
-                                            RichText::new(if star_active {
-                                                "Hiện tất cả"
+                                        let star_btn =
+                                            egui::Button::new(
+                                                RichText::new(if star_active {
+                                                    "Hiện tất cả"
+                                                } else {
+                                                    "Tin đánh dấu"
+                                                })
+                                                .size(11.5)
+                                                .color(if star_active {
+                                                    Color32::WHITE
+                                                } else {
+                                                    pal.text_secondary
+                                                }),
+                                            )
+                                            .fill(if star_active {
+                                                pal.primary
                                             } else {
-                                                "Tin đánh dấu"
+                                                pal.bg_elevated
                                             })
-                                            .size(11.5)
-                                            .color(if star_active {
-                                                Color32::WHITE
-                                            } else {
-                                                pal.text_secondary
-                                            }),
-                                        )
-                                        .fill(if star_active {
-                                            pal.primary
-                                        } else {
-                                            pal.bg_elevated
-                                        })
-                                        .stroke(Stroke::new(1.0_f32, pal.border))
-                                        .rounding(Rounding::same(8.0))
-                                        .min_size(Vec2::new(92.0, 30.0));
+                                            .stroke(Stroke::new(1.0_f32, pal.border))
+                                            .rounding(Rounding::same(8.0))
+                                            .min_size(Vec2::new(92.0, 30.0));
                                         if ui
                                             .add(star_btn)
                                             .on_hover_cursor(CursorIcon::PointingHand)
@@ -1383,10 +1390,7 @@ impl ZaloGuiApp {
                                             },
                                         );
                                         ui.painter().text(
-                                            Pos2::new(
-                                                id_rect.left() + 7.0,
-                                                id_rect.center().y,
-                                            ),
+                                            Pos2::new(id_rect.left() + 7.0, id_rect.center().y),
                                             egui::Align2::LEFT_CENTER,
                                             short_id,
                                             FontId::monospace(10.5),
@@ -1394,10 +1398,7 @@ impl ZaloGuiApp {
                                         );
                                         draw_icon_copy(
                                             ui.painter(),
-                                            Pos2::new(
-                                                id_rect.right() - 10.0,
-                                                id_rect.center().y,
-                                            ),
+                                            Pos2::new(id_rect.right() - 10.0, id_rect.center().y),
                                             11.5,
                                             pal.text_secondary,
                                         );
@@ -2045,12 +2046,11 @@ impl ZaloGuiApp {
                     }
 
                     // 1d. In-Conversation Message Search Bar (`self.in_chat_search_open`)
-                    if self.in_chat_search_open {
-                        if ui.input(|i| i.key_pressed(Key::Escape)) {
+                    if self.in_chat_search_open
+                        && ui.input(|i| i.key_pressed(Key::Escape)) {
                             self.in_chat_search_open = false;
                             self.in_chat_search_query.clear();
                         }
-                    }
                     if self.in_chat_search_open {
                         let q_low = self.in_chat_search_query.trim().to_lowercase();
                         let q_folded = fold_vn_search(&q_low);
@@ -2229,6 +2229,10 @@ impl ZaloGuiApp {
                         });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let mut load_older_clicked = false;
+                    if self.chat_render_window.0 != thread_id {
+                        self.chat_render_window = (thread_id.clone(), 150);
+                    }
+                    let render_limit = self.chat_render_window.1;
                     let msg_area_height =
                         (ui.available_height() - 66.0 - picker_reserve).max(100.0);
 
@@ -2319,6 +2323,12 @@ impl ZaloGuiApp {
                                                 })
                                                 .map(|(i, _)| i)
                                                 .collect();
+                                            let visible_indices = if only_starred || !in_chat_q.is_empty() {
+                                                visible_indices
+                                            } else {
+                                                let skip = visible_indices.len().saturating_sub(render_limit);
+                                                visible_indices[skip..].to_vec()
+                                            };
                                             if visible_indices.is_empty() && !in_chat_q.is_empty() {
                                                 ui.vertical_centered(|ui| {
                                                     ui.add_space(56.0);
@@ -2411,6 +2421,7 @@ impl ZaloGuiApp {
                                 });
                         });
                     if load_older_clicked {
+                        self.chat_render_window.1 = self.chat_render_window.1.saturating_add(150);
                         self.show_toast("Đang tải thêm tin nhắn cũ từ máy chủ Zalo…");
                     }
 
@@ -3143,5 +3154,4 @@ impl ZaloGuiApp {
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
     }
-
 }

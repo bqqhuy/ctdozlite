@@ -16,7 +16,7 @@ use session::Session;
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        println!("ctdozlite v{} (Windows ARM64)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.iter().any(|a| a == "--licenses") {
@@ -24,12 +24,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let smoke = args.iter().any(|a| a == "--ui-smoke-test");
-    anyhow::ensure!(!args.iter().any(|a| a == "--tray-smoke-test") || smoke, "--tray-smoke-test requires --ui-smoke-test");
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--tray-smoke-test") || smoke,
+        "--tray-smoke-test requires --ui-smoke-test"
+    );
     if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
         anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
     }
     storage::init(args.iter().any(|a| a == "--portable"))?;
-    let _instance = if args.iter().any(|a| a == "--doctor") { None } else { Some(storage::lock_instance()?) };
+    let _instance = if args.iter().any(|a| a == "--doctor") {
+        None
+    } else {
+        Some(storage::lock_instance()?)
+    };
     let dev_mode = args
         .iter()
         .any(|a| a == "--dev" || a == "-v" || a == "--verbose");
@@ -51,7 +58,9 @@ async fn main() -> Result<()> {
     logger::init(dev_mode);
 
     if dev_mode {
-        println!("🔧 [DEV MODE ACTIVATED] – Quét log, chẩn đoán giao thức và trace chi tiết được bật.");
+        println!(
+            "🔧 [DEV MODE ACTIVATED] – Quét log, chẩn đoán giao thức và trace chi tiết được bật."
+        );
     } else {
         println!("🔒 [PRODUCTION MODE] – Toàn bộ nhật ký và dev inspector được ẩn.");
     }
@@ -69,10 +78,17 @@ async fn main() -> Result<()> {
 
     // Attempt to restore persistent session from disk
     let session_restored = if !force_logout && !smoke {
-        if let Ok(_) = s.load_from_file("session.json") {
+        if s.load_from_file("session.json").is_ok() {
             if let Some(li) = &s.login {
-                let name = if li.display_name.is_empty() { "Zalo User" } else { &li.display_name };
-                println!("✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})", li.uin);
+                let name = if li.display_name.is_empty() {
+                    "Zalo User"
+                } else {
+                    &li.display_name
+                };
+                println!(
+                    "✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})",
+                    li.uin
+                );
                 true
             } else {
                 false
@@ -113,20 +129,42 @@ async fn main() -> Result<()> {
             .with_min_inner_size([480.0, 360.0])
             .with_title("Zalo");
         if smoke {
-            let size = args.iter().position(|a| a == "--ui-smoke-size").and_then(|i| args.get(i+1))
-                .map(|s| s.split('x').filter_map(|n| n.parse::<f32>().ok()).collect::<Vec<_>>())
-                .unwrap_or_else(|| vec![480.0,360.0]);
-            anyhow::ensure!(size.len() == 2 && size.iter().all(|n| n.is_finite() && *n >= 360.0 && *n <= 1920.0), "Invalid smoke size");
+            let size = args
+                .iter()
+                .position(|a| a == "--ui-smoke-size")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| {
+                    s.split('x')
+                        .filter_map(|n| n.parse::<f32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![480.0, 360.0]);
+            anyhow::ensure!(
+                size.len() == 2
+                    && size
+                        .iter()
+                        .all(|n| n.is_finite() && *n >= 360.0 && *n <= 1920.0),
+                "Invalid smoke size"
+            );
             viewport = viewport.with_inner_size([size[0], size[1]]);
         }
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
         let mut initial_threads = chat::load_threads_cache(&s);
-        store::load_history_into_threads(s.history_path(), &mut initial_threads, 200);
+        store::load_history_into_threads(
+            s.history_path(),
+            &mut initial_threads,
+            store::MessageStore::PRELOAD_MSGS,
+        );
 
         #[cfg(all(windows, target_arch = "aarch64"))]
-        if dev_mode { eprintln!("Compiled graphics backends: {:?}", eframe::wgpu::Instance::enabled_backend_features()); }
+        if dev_mode {
+            eprintln!(
+                "Compiled graphics backends: {:?}",
+                eframe::wgpu::Instance::enabled_backend_features()
+            );
+        }
         let renderers = gui_renderer_order();
         let mut last_err = None;
         for (i, renderer) in renderers.iter().enumerate() {
@@ -174,8 +212,13 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        let message = format!("Không thể khởi chạy GUI: {}", last_err.map(|e| e.to_string()).unwrap_or_default());
-        if !smoke { platform::startup_error(&message); }
+        let message = format!(
+            "Không thể khởi chạy GUI: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        );
+        if !smoke {
+            platform::startup_error(&message);
+        }
         return Err(anyhow::anyhow!(message));
     }
 
@@ -185,7 +228,10 @@ async fn main() -> Result<()> {
             s.apply_server_info(d);
         }
         if dev_mode {
-            println!("✓ getServerInfo: chat {} • convers {}", s.domains.chat, s.domains.conversation);
+            println!(
+                "✓ getServerInfo: chat {} • convers {}",
+                s.domains.chat, s.domains.conversation
+            );
         }
     }
 
@@ -247,12 +293,18 @@ async fn main() -> Result<()> {
     }
 
     if s.login.is_some() {
-        if let Err(e) = s.save_to_file("session.json") { eprintln!("Không thể lưu phiên: {e}"); }
+        if let Err(e) = s.save_to_file("session.json") {
+            eprintln!("Không thể lưu phiên: {e}");
+        }
     }
 
     // Fetch initial threads and hydrate with local SQLite history
     let mut initial_threads = chat::load_threads_cache(&s);
-    store::load_history_into_threads(s.history_path(), &mut initial_threads, 200);
+    store::load_history_into_threads(
+        s.history_path(),
+        &mut initial_threads,
+        store::MessageStore::PRELOAD_MSGS,
+    );
     if s.login.is_some() {
         match chat::get_friends(&s).await {
             Ok(list) => {
@@ -267,7 +319,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 let mut poll_state = chat::PollState::default();
-                if let Err(e) = chat::poll_new_messages(&s, &mut poll_state, &mut initial_threads).await {
+                if let Err(e) =
+                    chat::poll_new_messages(&s, &mut poll_state, &mut initial_threads).await
+                {
                     crate::logger::log_error("main::poll_new_messages", &e.to_string());
                     eprintln!("! Lỗi tải tin nhắn gần nhất: {e}");
                 }

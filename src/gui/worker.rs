@@ -8,7 +8,9 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
-    SyncHistory { threads: Vec<Thread> },
+    SyncHistory {
+        threads: Vec<Thread>,
+    },
     CancelHistorySync,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
@@ -141,7 +143,9 @@ pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox(std::sync::Mutex::new
 
 struct PollGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for PollGuard {
-    fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
@@ -227,7 +231,9 @@ async fn prefetch_missing_sticker_thumbnails(
         let tx = gui_tx.clone();
         let ctx = egui_ctx.clone();
         async move {
-            let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else { return; };
+            let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else {
+                return;
+            };
             if let Ok(resp) = client.get(&url).send().await {
                 if resp.status().is_success() {
                     if let Ok(b) =
@@ -261,18 +267,27 @@ async fn persist_received(session: &Session, threads: &[Thread]) {
     let session = session.clone();
     let threads = threads.to_vec();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        if !session.is_active() { return Ok(()); }
+        if !session.is_active() {
+            return Ok(());
+        }
         let mut store = crate::store::MessageStore::open(session.history_path())?;
         crate::store::persist_threads(&mut store, &threads)?;
         Ok(())
-    }).await;
-    if !matches!(result, Ok(Ok(()))) { eprintln!("Cannot persist received message batch"); }
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        eprintln!("Cannot persist received message batch");
+    }
 }
 
-pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: egui::Context) {
+pub(super) fn spawn_session_worker(
+    session: Session,
+    gui_tx: Sender<GuiEvent>,
+    egui_ctx: egui::Context,
+) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let commands = cmd_tx.downgrade();
-    let _ = WORKER_TX.set(cmd_tx);
+    WORKER_TX.set(cmd_tx);
 
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -280,8 +295,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState::default()));
-    let ctrl_poll_state =
-        std::sync::Arc::new(tokio::sync::Mutex::new(crate::call::CtrlPollState::default()));
+    let ctrl_poll_state = std::sync::Arc::new(tokio::sync::Mutex::new(
+        crate::call::CtrlPollState::default(),
+    ));
 
     std::thread::Builder::new()
         .name("zalo-worker".into())
@@ -760,7 +776,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     crate::store::load_history_into_threads(
                                         s.history_path(),
                                         &mut list,
-                                        200,
+                                        crate::store::MessageStore::PRELOAD_MSGS,
                                     );
                                     {
                                         let mut ps = poll_clone.lock().await;
@@ -987,7 +1003,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 text,
                                                 time: now,
                                                 is_outgoing: true,
-                                                ts: (crate::login::unix_now() * 1000) as i64,
+                                                ts: (crate::login::unix_now() * 1000),
                                                 link_url: Some(meta.url),
                                                 link_title: if meta.title.is_empty() {
                                                     None
@@ -1923,13 +1939,15 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
         .expect("Failed to spawn zalo-worker thread");
 }
 
-
 #[cfg(test)]
 mod lifecycle_tests {
     use super::PollGuard;
     #[tokio::test]
     async fn cancelling_poll_releases_inflight_flag() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
         let flag = Arc::new(AtomicBool::new(true));
         let guard = PollGuard(flag.clone());
         let task = tokio::spawn(async move {

@@ -34,3 +34,5 @@ Script chạy test, build release, kiểm tra PE `0xAA64`, dependency DLL, khở
 ## Mã nguồn và giấy phép
 
 MIT hoặc Apache-2.0; giữ ghi nhận tác giả upstream trong Git history và các file giấy phép. [Giao thức](docs/GIAO_THUC_ZALO.md), `re-notes/` và công cụ đọc log phục vụ chẩn đoán; không đưa log chứa dữ liệu tài khoản lên issue công khai.
+
+Zalo và các nhãn hiệu liên quan thuộc VNG. Fork cộng đồng này độc lập, không phải ứng dụng chính thức và không được VNG bảo trợ. Ghi nhận tác giả dự án gốc: [ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite).
