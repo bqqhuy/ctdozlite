@@ -5,15 +5,18 @@ fn main() {
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
 
-    #[cfg(target_os = "windows")]
-    {
+    // Decide on the *target* OS, not the host: `#[cfg(target_os)]` inside a build
+    // script describes the machine running the script, so the icon was silently
+    // skipped when cross-compiling (e.g. building the ARM64 exe from x64/Linux).
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if target_os == "windows" && target_env == "msvc" {
         if let Err(e) = embed_windows_icon() {
             println!("cargo:warning=Could not embed Windows icon resource: {e}");
         }
     }
 }
 
-#[cfg(target_os = "windows")]
 fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
 
@@ -72,7 +75,6 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
 fn write_res_header(buf: &mut Vec<u8>, data_size: u32, res_type: u16, res_name: u16, mem_flags: u16) {
     buf.extend_from_slice(&data_size.to_le_bytes());
     buf.extend_from_slice(&32u32.to_le_bytes()); // HeaderSize = 32
@@ -87,7 +89,6 @@ fn write_res_header(buf: &mut Vec<u8>, data_size: u32, res_type: u16, res_name: 
     buf.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
 }
 
-#[cfg(target_os = "windows")]
 fn align4(buf: &mut Vec<u8>) {
     while buf.len() % 4 != 0 {
         buf.push(0);

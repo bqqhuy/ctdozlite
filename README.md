@@ -258,6 +258,7 @@ Workflow GitHub Actions tại [`.github/workflows/ci-release.yml`](.github/workf
 - [docs/HUONG_DAN_SU_DUNG.md](docs/HUONG_DAN_SU_DUNG.md): Các cờ CLI, phím tắt GUI/TUI và cách dùng các tính năng trong app.
 - [docs/KIEN_TRUC_HE_THONG.md](docs/KIEN_TRUC_HE_THONG.md): Thiết kế luồng giao diện, luồng worker bất đồng bộ và lưu trữ SQLite + JSON.
 - [docs/GIAO_THUC_ZALO.md](docs/GIAO_THUC_ZALO.md): Ghi chú về `ParamCipher v2`, `PasswordCipher`, `signkey` MD5 và bảng domain.
+- [docs/WINDOWS_ARM64.md](docs/WINDOWS_ARM64.md): Build native ARM64 cho Windows on ARM (DX12, hộp thoại Win32 gốc, CI `windows-11-arm`).
 - [docs/KHAC_PHUC_SU_CO.md](docs/KHAC_PHUC_SU_CO.md): Giải thích các mã lỗi máy chủ Zalo thường gặp và cách xử lý.
 
 ---

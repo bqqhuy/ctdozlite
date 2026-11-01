@@ -301,43 +301,43 @@ pub(super) fn open_external_url(url: &str) {
         let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
     }
 }
+/// Pick a folder. Windows uses the real folder picker; other platforms keep the
+/// upstream behaviour (pick any file, the caller uses its parent directory).
+pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        return rfd::FileDialog::new()
+            .set_title("Chọn thư mục lưu file tải về")
+            .pick_folder();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let f = pick_native_file_dialog(false)?;
+        Some(f.parent().map(|p| p.to_path_buf()).unwrap_or(f))
+    }
+}
 /// Open a native OS file-picker dialog on a worker thread and return the selected path.
 pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let filter = if images_only {
-            "Image Files (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp)|*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp|All Files (*.*)|*.*"
-        } else {
-            "All Files (*.*)|*.*|Video & Media (*.mp4;*.mov;*.mkv;*.mp3;*.wav)|*.mp4;*.mov;*.mkv;*.mp3;*.wav|Documents (*.pdf;*.zip;*.docx;*.xlsx;*.txt)|*.pdf;*.zip;*.docx;*.xlsx;*.txt"
-        };
+        // Native Win32 IFileOpenDialog (via `rfd`): opens instantly, no PowerShell /
+        // .NET cold start, and runs natively on ARM64. Called from a worker thread,
+        // so the blocking API does not freeze the egui event loop.
         let title = if images_only {
             "Chọn hình ảnh để gửi qua Zalo"
         } else {
             "Chọn video hoặc tập tin đính kèm để gửi qua Zalo"
         };
-        let script = format!(
-            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; \
-             Add-Type -AssemblyName System.Windows.Forms; \
-             $f = New-Object System.Windows.Forms.OpenFileDialog; \
-             $f.Title = '{title}'; \
-             $f.Filter = '{filter}'; \
-             $top = New-Object System.Windows.Forms.Form; \
-             $top.TopMost = $true; \
-             if ($f.ShowDialog($top) -eq [System.Windows.Forms.DialogResult]::OK) {{ Write-Output $f.FileName }}"
-        );
-        let out = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-STA", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-            .ok()?;
-        let path_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if path_str.is_empty() {
-            None
+        let mut dlg = rfd::FileDialog::new().set_title(title);
+        dlg = if images_only {
+            dlg.add_filter("Hình ảnh", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+                .add_filter("Tất cả tập tin", &["*"])
         } else {
-            Some(std::path::PathBuf::from(path_str))
-        }
+            dlg.add_filter("Tất cả tập tin", &["*"])
+                .add_filter("Video & âm thanh", &["mp4", "mov", "mkv", "mp3", "wav"])
+                .add_filter("Tài liệu", &["pdf", "zip", "docx", "xlsx", "txt"])
+        };
+        return dlg.pick_file();
     }
     #[cfg(target_os = "macos")]
     {

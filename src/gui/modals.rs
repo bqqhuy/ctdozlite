@@ -1353,8 +1353,7 @@ impl ZaloGuiApp {
             self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
         }
         if pick_dl_dir {
-            if let Some(folder) = pick_native_file_dialog(false) {
-                let dir_path = folder.parent().unwrap_or(&folder).to_path_buf();
+            if let Some(dir_path) = pick_native_folder_dialog() {
                 self.settings.download_dir = dir_path.display().to_string();
                 self.settings.save();
                 self.show_toast(format!("Đã đổi thư mục lưu file: {}", self.settings.download_dir));

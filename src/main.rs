@@ -109,23 +109,45 @@ async fn main() -> Result<()> {
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
-        let native_options = eframe::NativeOptions {
-            viewport,
-            ..Default::default()
-        };
-
         let mut initial_threads = chat::load_threads_cache();
         store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
 
-        let app_session = s;
-        return eframe::run_native(
-            "Zalo - Rust Native Client",
-            native_options,
-            Box::new(move |cc| {
-                Ok(Box::new(gui::ZaloGuiApp::new(cc, app_session, dev_mode, initial_threads)))
-            }),
-        )
-        .map_err(|e| anyhow::anyhow!("Không thể khởi chạy GUI: {e}"));
+        let renderers = gui_renderer_order();
+        let mut last_err = None;
+        for (i, renderer) in renderers.iter().enumerate() {
+            if dev_mode {
+                println!("🎨 Renderer: {renderer:?}");
+            }
+            let native_options = eframe::NativeOptions {
+                viewport: viewport.clone(),
+                renderer: *renderer,
+                ..Default::default()
+            };
+            let app_session = s.clone();
+            let threads = initial_threads.clone();
+            match eframe::run_native(
+                "Zalo - Rust Native Client",
+                native_options,
+                Box::new(move |cc| {
+                    Ok(Box::new(gui::ZaloGuiApp::new(cc, app_session, dev_mode, threads)))
+                }),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // Only fall through when the graphics backend itself failed to
+                    // initialise; that happens before the window is ever shown.
+                    eprintln!("⚠️ Renderer {renderer:?} lỗi: {e}");
+                    last_err = Some(e);
+                    if i + 1 < renderers.len() {
+                        eprintln!("↪ Thử renderer dự phòng…");
+                    }
+                }
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "Không thể khởi chạy GUI: {}",
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ));
     }
 
     // 1. Initial server info check for TUI mode
@@ -227,4 +249,27 @@ async fn main() -> Result<()> {
     tui::run_tui(tui_app).await?;
 
     Ok(())
+}
+
+/// Order in which GUI graphics backends are tried.
+///
+/// * Windows on ARM64: Direct3D 12 via wgpu first (always present), then OpenGL
+///   (only works when the vendor driver or the "OpenGL Compatibility Pack" is installed).
+/// * Everywhere else: OpenGL (`glow`), unchanged from upstream.
+///
+/// `CTDOZ_RENDERER=glow|wgpu` overrides the order for troubleshooting.
+fn gui_renderer_order() -> Vec<eframe::Renderer> {
+    #[allow(unused_mut)]
+    let mut order = vec![eframe::Renderer::Glow];
+    #[cfg(all(windows, target_arch = "aarch64"))]
+    {
+        order = vec![eframe::Renderer::Wgpu, eframe::Renderer::Glow];
+    }
+    match std::env::var("CTDOZ_RENDERER").ok().as_deref() {
+        Some("glow") | Some("gl") | Some("opengl") => order = vec![eframe::Renderer::Glow],
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        Some("wgpu") | Some("dx12") => order = vec![eframe::Renderer::Wgpu],
+        _ => {}
+    }
+    order
 }
