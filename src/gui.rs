@@ -1287,6 +1287,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::HistorySyncStatus { running, message } => {
                     self.history_sync_running = running;
+                    self.status_msg = message.clone();
                     self.history_sync_status = message;
                 }
                 GuiEvent::StatusUpdate(msg) => {

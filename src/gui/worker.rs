@@ -18,6 +18,7 @@ pub enum WorkerCmd {
     LoadGroupHistory {
         group_id: String,
         is_group: bool,
+        limit: usize,
     },
     SendMessage {
         to_id: String,
@@ -786,7 +787,8 @@ pub(super) fn spawn_session_worker(
                                     }
                                     persist_received(&s, &list).await;
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
-                                    if !auto_history_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                    let eligible = list.iter().any(|t| t.is_group || s.login.as_ref().is_some_and(|li| !li.send2me_id.is_empty() && li.send2me_id == t.id));
+                                    if eligible && !auto_history_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                         if let Some(tx) = commands.upgrade() {
                                             let _ = tx.send(WorkerCmd::SyncHistory { threads: list.clone() });
                                         }
@@ -888,7 +890,7 @@ pub(super) fn spawn_session_worker(
                                 }
                             });
                         }
-                        WorkerCmd::LoadGroupHistory { group_id, is_group } => {
+                        WorkerCmd::LoadGroupHistory { group_id, is_group, limit } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -909,16 +911,19 @@ pub(super) fn spawn_session_worker(
                                         is_group: is_group && !is_send2me,
                                         messages: Vec::new(),
                                     };
-                                    let mut t_list = vec![t];
-                                    crate::store::load_history_into_threads(
-                                        s.history_path(),
-                                        &mut t_list,
-                                        500,
-                                    );
-                                    let Some(mut t) =
-                                        t_list.into_iter().find(|x| x.id == group_id)
-                                    else {
-                                        return;
+                                    let path = s.history_path();
+                                    let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Thread>> {
+                                        let store = crate::store::MessageStore::open(path)?;
+                                        let mut list = vec![t];
+                                        store.hydrate_selected_threads(&mut list, limit)?;
+                                        Ok(list)
+                                    }).await;
+                                    let mut t = match loaded {
+                                        Ok(Ok(mut list)) => list.remove(0),
+                                        _ => {
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate("Không thể đọc lịch sử cục bộ".into()));
+                                            ctx_clone.request_repaint(); return;
+                                        }
                                     };
                                     if is_group && !is_send2me {
                                         if let Ok(resp) =
@@ -939,23 +944,13 @@ pub(super) fn spawn_session_worker(
                                         {
                                             crate::chat::merge_group_history(&mut t, &cm_resp);
                                         }
-                                        if let Ok(cm_old) = crate::chat::get_cloud_messages(
-                                            &s,
-                                            &group_id,
-                                            "",
-                                            true,
-                                            50,
-                                        )
-                                        .await
-                                        {
-                                            crate::chat::merge_group_history(&mut t, &cm_old);
-                                        }
                                     }
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
+                                        persist_received(&s, std::slice::from_ref(&t)).await;
                                         let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã đồng bộ {cnt} tin nhắn lịch sử"
+                                            "Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ"
                                         )));
                                         ctx_clone.request_repaint();
                                     }
@@ -993,7 +988,7 @@ pub(super) fn spawn_session_worker(
                                             let msg_id = extract_msg_id(&resp);
                                             let now = crate::ui::clock();
                                             let final_id = if msg_id.is_empty() {
-                                                format!("out_{}", crate::login::unix_now())
+                                                format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(16))
                                             } else {
                                                 msg_id
                                             };

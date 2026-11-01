@@ -229,6 +229,26 @@ impl MessageStore {
         threads: &mut Vec<Thread>,
         limit_per_thread: usize,
     ) -> Result<usize> {
+        self.hydrate_scoped(threads, limit_per_thread, true)
+    }
+
+    /// Read history only for the requested threads, leaving unrelated histories unloaded.
+    /// # Errors
+    /// Returns database query and decode failures without modifying other threads.
+    pub fn hydrate_selected_threads(
+        &self,
+        threads: &mut Vec<Thread>,
+        limit_per_thread: usize,
+    ) -> Result<usize> {
+        self.hydrate_scoped(threads, limit_per_thread, false)
+    }
+
+    fn hydrate_scoped(
+        &self,
+        threads: &mut Vec<Thread>,
+        limit_per_thread: usize,
+        include_unlisted: bool,
+    ) -> Result<usize> {
         crate::chat::deduplicate_threads(threads, None);
 
         let stored_threads = self.all_threads().unwrap_or_default();
@@ -241,7 +261,7 @@ impl MessageStore {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
-            } else {
+            } else if include_unlisted {
                 threads.push(Thread {
                     id: st.thread_id.clone(),
                     name: if st.name.is_empty() {
@@ -537,6 +557,32 @@ pub fn load_history_into_threads(
 mod tests {
     use super::*;
 
+    #[test]
+    fn opening_one_thread_does_not_load_other_histories() {
+        let store = MessageStore::open(":memory:").unwrap();
+        for id in ["thread-1", "thread-2"] {
+            store
+                .upsert_thread(&StoredThread {
+                    thread_id: id.into(),
+                    name: format!("Name {id}"),
+                    is_group: true,
+                    last_ts: 1,
+                })
+                .unwrap();
+        }
+        let mut selected = vec![Thread {
+            id: "thread-1".into(),
+            name: String::new(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: true,
+            messages: Vec::new(),
+        }];
+        store.hydrate_selected_threads(&mut selected, 500).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "Name thread-1");
+    }
     #[test]
     fn limited_history_keeps_newest_rows_and_uses_thread_index() {
         let store = MessageStore::open(":memory:").unwrap();

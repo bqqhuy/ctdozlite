@@ -200,6 +200,7 @@ impl ZaloGuiApp {
                             self.selected_thread_index = cidx;
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                    limit: 500,
                                     group_id: cid,
                                     is_group: false,
                                 });
@@ -1033,6 +1034,7 @@ impl ZaloGuiApp {
                     if is_group || is_cloud {
                         if let Some(tx) = WORKER_TX.get() {
                             let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                limit: 500,
                                 group_id: tid,
                                 is_group,
                             });
@@ -1190,6 +1192,7 @@ impl ZaloGuiApp {
                                                 if d_is_group || d_name.contains("Cloud của tôi")
                                                 {
                                                     let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                                                        limit: 500,
                                                         group_id: d_id.clone(),
                                                         is_group: d_is_group,
                                                     });
@@ -2286,6 +2289,7 @@ impl ZaloGuiApp {
                                                         if let Some(tx) = WORKER_TX.get() {
                                                             let _ = tx.send(
                                                                 WorkerCmd::LoadGroupHistory {
+                                                                    limit: render_limit.saturating_add(150).max(500),
                                                                     group_id: thread_id.clone(),
                                                                     is_group,
                                                                 },
