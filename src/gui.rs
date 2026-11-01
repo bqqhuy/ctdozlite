@@ -675,10 +675,10 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::ThreadsUpdated(updates) => {
                     if self.is_logged_in && !updates.is_empty() {
-                        let prev_selected_name = self
+                        let prev_selected_id = self
                             .threads
                             .get(self.selected_thread_index)
-                            .map(|t| (t.name.clone(), t.is_group));
+                            .map(|t| (t.id.clone(), t.is_group));
                         let live_ids: HashSet<String> = updates
                             .iter()
                             .filter(|u| !u.id.is_empty() && u.id != "0")
@@ -743,11 +743,11 @@ impl ZaloGuiApp {
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
 
-                        if let Some((sel_name, sel_grp)) = prev_selected_name {
+                        if let Some((sel_id, sel_grp)) = prev_selected_id {
                             if let Some(idx) = self
                                 .threads
                                 .iter()
-                                .position(|t| t.is_group == sel_grp && t.name == sel_name)
+                                .position(|t| t.is_group == sel_grp && t.id == sel_id)
                             {
                                 self.selected_thread_index = idx;
                             }
@@ -843,7 +843,7 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
                         } else {
                             msg_id
                         };
@@ -875,7 +875,7 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
                         } else {
                             msg_id
                         };
@@ -921,7 +921,7 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!("out_{}", crate::login::unix_now())
+                            format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(8))
                         } else {
                             msg_id
                         };
@@ -1587,5 +1587,14 @@ impl ZaloGuiApp {
         let text = msg.into();
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
+    }
+}
+
+#[cfg(all(test, windows, target_arch = "aarch64"))]
+mod renderer_tests {
+    #[test]
+    fn dx12_backend_is_compiled_into_the_arm64_binary() {
+        assert!(eframe::wgpu::Instance::enabled_backend_features().contains(eframe::wgpu::Backends::DX12),
+            "Selecting DX12 at runtime is insufficient: enable the wgpu/dx12 Cargo feature");
     }
 }

@@ -107,28 +107,21 @@ impl MessageStore {
             ],
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
-            let _ = self.conn.execute(
+            self.conn.execute(
                 "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3 AND thread_id = ?5",
                 params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text, msg.thread_id],
-            );
+            )?;
         }
         Ok(rows > 0)
     }
 
     /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
-        if !msg_id.is_empty() {
-            let _ = self.conn.execute(
-                "DELETE FROM messages WHERE msg_id = ?1 AND thread_id = ?2",
-                params![msg_id, thread_id],
-            );
-        }
-        if ts > 0 && !thread_id.is_empty() {
-            let _ = self.conn.execute(
-                "DELETE FROM messages WHERE thread_id = ?1 AND ts = ?2",
-                params![thread_id, ts],
-            );
-        }
+        let key = if msg_id.is_empty() { format!("{thread_id}_{ts}") } else { msg_id.to_owned() };
+        self.conn.execute(
+            "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
+            params![thread_id, key],
+        )?;
         Ok(())
     }
 
@@ -678,8 +671,11 @@ mod identity_tests {
         assert!(!store.upsert_message(&update).unwrap());
         assert_eq!(store.messages_for("a",10).unwrap()[0].text,"edited");
         assert_eq!(store.messages_for("b",10).unwrap()[0].text,"b");
-        store.delete_message("a","same-id",0).unwrap();
-        assert!(store.messages_for("a",10).unwrap().is_empty());
+        let mut simultaneous = message("a"); simultaneous.msg_id = "other-id".into();
+        assert!(store.upsert_message(&simultaneous).unwrap());
+        store.delete_message("a","same-id",1).unwrap();
+        let remaining = store.messages_for("a",10).unwrap();
+        assert_eq!(remaining.len(),1); assert_eq!(remaining[0].msg_id,"other-id");
         assert_eq!(store.messages_for("b",10).unwrap().len(),1);
     }
     #[test]

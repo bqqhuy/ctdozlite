@@ -4,34 +4,13 @@
 
 #![allow(dead_code)]
 
-mod limits;
-mod random;
-mod storage;
-mod video;
-mod call;
-mod chat;
-mod crypto;
-mod endpoints;
-mod gui;
-mod logger;
-mod login;
-mod media;
-mod param_cipher;
-mod qr;
-mod session;
-mod socket;
-mod store;
-mod tui;
-mod ui;
-mod voip_log;
+use zalo_rust::{chat, gui, logger, login, platform, qr, session, storage, store, tui, ui, video};
 
 #[cfg(all(not(debug_assertions), not(all(windows, target_arch = "aarch64"))))]
 compile_error!("Production builds of this fork require Windows ARM64 (aarch64-pc-windows-msvc)");
 
 use anyhow::Result;
 use session::Session;
-
-pub const POLL_SECS: u64 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -145,6 +124,8 @@ async fn main() -> Result<()> {
         let mut initial_threads = chat::load_threads_cache(&s);
         store::load_history_into_threads(s.history_path(), &mut initial_threads, 200);
 
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        if dev_mode { eprintln!("Compiled graphics backends: {:?}", eframe::wgpu::Instance::enabled_backend_features()); }
         let renderers = gui_renderer_order();
         let mut last_err = None;
         for (i, renderer) in renderers.iter().enumerate() {
@@ -326,9 +307,3 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
     order
 }
 
-#[cfg(windows)]
-mod windows_video;
-
-mod history_sync;
-
-mod platform;

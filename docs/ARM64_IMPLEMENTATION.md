@@ -14,7 +14,7 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 
 | Vấn đề | Nguyên nhân/hướng sửa trong mã | Giới hạn kiểm chứng |
 |---|---|---|
-| Màn hình đen sau cài | DX12 thay OpenGL làm mặc định; CRT tĩnh; kiểm tra import DLL; GUI smoke chụp framebuffer thật, từ chối ảnh trống. DLL Media Foundation delay-load và kiểm tra thiếu Media Feature Pack. | Cần thử GPU/driver của máy đã báo lỗi. |
+| Màn hình đen sau cài | Bật rõ feature biên dịch `wgpu/dx12` (trước đây chỉ chọn DX12 lúc runtime nhưng backend không có trong binary); DX12 làm mặc định; CRT tĩnh; kiểm tra import DLL; GUI smoke chụp framebuffer thật, từ chối ảnh trống. DLL Media Foundation delay-load và kiểm tra thiếu Media Feature Pack. | Cần thử GPU/driver của máy đã báo lỗi. |
 | Không kéo/resize cửa sổ | Bỏ khung và hit-test tự vẽ, dùng caption/resizing của Windows. | Cần thử chuột/cảm ứng, Snap và nhiều màn hình. |
 | Settings vỡ | Sửa phép tính lề bị cộng thừa 48px, bỏ kích thước tối thiểu vượt màn hình; tab dạng dropdown khi hẹp, nội dung cuộn, card co theo chiều rộng. | CI kiểm tra ảnh và biên cửa sổ ở 480×360, 1020×700/150%, 1280×900/200%. |
 | Không tắt được app | Bỏ CancelClose + Minimized ở nút X; không join luồng driver media trên UI thread. Camera có watcher Shutdown để ngắt ReadSample khi dừng. | Test GUI yêu cầu tiến trình tự thoát trong 45 giây; cần thử driver thật khi đang gọi. |
@@ -26,10 +26,11 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 
 ## Các phát hiện bổ sung đã xử lý
 
-- **Định danh hội thoại:** không gộp/migrate recipient ID theo tên hoặc avatar. Hai liên hệ trùng tên/ảnh phải giữ lịch sử và đích gửi/gọi riêng. Loại bỏ migration SQLite theo tên và thao tác xóa message xuyên hội thoại.
+- **Định danh hội thoại:** không gộp/migrate recipient ID theo tên hoặc avatar. Hai liên hệ trùng tên/ảnh phải giữ lịch sử và đích gửi/gọi riêng. Loại bỏ migration SQLite theo tên và thao tác xóa message xuyên hội thoại; giữ lựa chọn chat theo ID khi refresh. Xóa một tin có ID không được xóa các tin khác cùng timestamp. Hai tin thật cùng nội dung gửi trong 5 giây không bị gộp mất; heuristic chỉ đối soát placeholder gửi đi với echo server.
 - **SQLite:** khóa tin là `(thread_id,msg_id)`, chuyển schema cũ bằng transaction; checkpoint lịch sử ghi sau message; tải trang cũ không làm lùi timestamp hoặc xóa tên nhóm. Không tự sửa dữ liệu đã bị bản cũ trộn vì thiếu bằng chứng sở hữu.
 - **Phiên:** phân biệt Valid/Expired/Unreachable; chỉ mã server 600/-102 làm hết phiên, không dùng từ khóa zpw_sek/HTTP 404 để logout. Offline giữ credential/history. Explicit logout vẫn xóa phiên cục bộ.
 - **Endpoint:** REST verified ưu tiên hơn service map; host discovery hợp lệ giữ làm fallback trong bộ nhớ, không lưu thành ưu tiên lâu dài. GET có thể đổi host khi connect/timeout/404; POST chỉ retry khi có HTTP 404 chắc chắn, tránh gửi trùng mutation sau timeout. Long-poll và WebSocket vẫn cập nhật động.
+- **Build/test:** binary dùng library chung, bỏ việc khai báo lại toàn bộ module và chạy trùng cùng một bộ unit test ở lib/bin.
 - **Giới hạn tài nguyên:** response/decompression/image có giới hạn; WebSocket giới hạn frame/message và queue có backpressure; debug preview tối đa 16 KiB/trường; enumerate thiết bị chạy nền, camera giữ COM MTA riêng để không xung đột STA của CPAL; tái dùng texture video thay vì tạo GPU texture mỗi frame.
 - **Media:** bỏ frame video giả và trộn keyframe cũ với P-frame mới; giữ thứ tự frame. Lỗi decoder reset và yêu cầu keyframe lại. Các đường thoát sớm của audio dừng task camera/decoder. Không dùng tiến trình FFmpeg/ZaloCall ngoài app.
 - **Windows:** file/folder picker Win32, shell API thay helper process, font Windows/CJK fallback, theme hệ thống lấy từ egui/winit.
@@ -52,6 +53,24 @@ MD5/AES-CBC/zero-IV ở lớp giao thức là hành vi tương thích của Zalo
 Đã bỏ workflow đa nền tảng, packaging khác Windows ARM64, metadata Debian, hướng dẫn build/release nền tảng khác và các binary probe/reverse-engineering không dùng trong sản phẩm. Bỏ bridge Named Pipe và mã tìm ZaloCall.exe cũ. Giữ giấy phép, tài liệu bằng chứng giao thức và tool đọc log cần cho bảo trì.
 
 Release binary bị chặn compile ngoài Windows ARM64; một số implementation cho test host được giữ để kiểm thử protocol/storage debug. Pipeline duy nhất tạo installer và portable ARM64; job upload Release có quyền ghi riêng, build dùng quyền đọc. Không sửa lịch sử Git hoặc xóa release cũ của người dùng.
+
+## Kiểm kê Settings
+
+Rà soát nơi đọc giá trị ngoài panel Settings cho thấy nhiều tùy chọn upstream mới chỉ lưu JSON. Đây là phần chưa hoàn thiện của thiết kế, không được tính là tính năng đã có.
+
+| Tùy chọn | Hành vi hiện có |
+|---|---|
+| Ghi nhớ đăng nhập, theme, chọn mic/camera | Đã nối với lưu phiên, giao diện và media. Theme “hệ thống” đọc theme của Windows qua winit/egui. |
+| Thông báo | Cập nhật tiêu đề/unread và yêu cầu Windows chú ý tới cửa sổ; chưa có toast Windows hoặc âm báo theo lựa chọn. |
+| Thư mục tải | Chọn, lưu và mở thư mục; link tải vẫn mở trình duyệt, nên chưa điều khiển nơi trình duyệt lưu file. |
+| Gợi ý sticker khi gõ, tìm sticker theo từ khóa | Có nơi đọc giá trị và áp dụng trong UI sticker. |
+| Hiện trạng thái online | Chỉ là dấu phiên cục bộ trong dock; không thay privacy/presence trên server. |
+| Danh bạ toàn bộ, đổi ngôn ngữ, autostart, avatar làm wallpaper | Chưa có hành vi runtime đầy đủ. Autostart đang bị vô hiệu hóa trong UI. |
+| Sinh nhật/đã xem/ai được nhắn-gọi/tìm qua số điện thoại/nguồn kết bạn | Chưa tích hợp server; đã gỡ các nút privacy giả và hướng dẫn dùng app chính thức. |
+| Tin nhanh, PIN ẩn chat, chia priority, chế độ dán Excel, double-click reply, typing | Giá trị kế thừa được lưu nhưng chưa thực thi tương ứng đầy đủ. |
+| Gợi ý mention và tìm GIF | Chưa có pipeline runtime tương ứng với các công tắc. |
+
+Không nên phát hành như một bản “đầy đủ mọi tính năng thiết kế” khi các mục này và kiểm thử cuộc gọi thật chưa được hoàn tất.
 
 ## Kiểm chứng và những mục chưa hoàn tất
 

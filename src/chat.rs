@@ -132,6 +132,19 @@ pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
     !a.id.is_empty() && a.id != "0" && a.is_group == b.is_group && a.id == b.id
 }
 
+fn pending_message_id(id: &str) -> bool { id.starts_with("out_") || id.starts_with("local_") }
+
+/// Real server IDs win over content/time heuristics. Only reconcile a local
+/// optimistic outgoing placeholder with its server echo; repeated real messages
+/// (including identical short replies) must remain separate.
+fn same_message(existing: &ChatMessage, incoming: &ChatMessage) -> bool {
+    if !existing.id.is_empty() && existing.id == incoming.id { return true; }
+    existing.is_outgoing && incoming.is_outgoing
+        && pending_message_id(&existing.id) != pending_message_id(&incoming.id)
+        && existing.text == incoming.text && existing.ts > 0 && incoming.ts > 0
+        && existing.ts.abs_diff(incoming.ts) < 5000
+}
+
 /// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
@@ -160,16 +173,10 @@ pub fn merge_thread_into(
         if msg.text == "sendBubbleMessage" {
             continue;
         }
-        if let Some(existing_msg) = target.messages.iter_mut().find(|m| {
-            (!m.id.is_empty() && !msg.id.is_empty() && m.id == msg.id)
-                || (m.text == msg.text
-                    && m.is_outgoing == msg.is_outgoing
-                    && (m.time == msg.time
-                        || (m.ts != 0 && msg.ts != 0 && (m.ts - msg.ts).abs() < 5000)))
-        }) {
-            if existing_msg.id.starts_with("out_")
+        if let Some(existing_msg) = target.messages.iter_mut().find(|m| same_message(m, &msg)) {
+            if pending_message_id(&existing_msg.id)
                 && !msg.id.is_empty()
-                && !msg.id.starts_with("out_")
+                && !pending_message_id(&msg.id)
             {
                 existing_msg.id = msg.id;
             }
@@ -3584,14 +3591,8 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 if thread_is_group {
                     t.is_group = true;
                 }
-                if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && !parsed.id.is_empty() && existing.id == parsed.id)
-                        || (existing.text == parsed.text
-                            && existing.is_outgoing == parsed.is_outgoing
-                            && (existing.time == parsed.time
-                                || (existing.ts != 0 && parsed.ts != 0 && (existing.ts - parsed.ts).abs() < 5000)))
-                }) {
-                    if existing.id.starts_with("out_") && !parsed.id.is_empty() && !parsed.id.starts_with("out_") {
+                if let Some(existing) = t.messages.iter_mut().find(|existing| same_message(existing, &parsed)) {
+                    if pending_message_id(&existing.id) && !parsed.id.is_empty() && !pending_message_id(&parsed.id) {
                         existing.id = parsed.id;
                     }
                     if parsed.ts > 0 && existing.ts != parsed.ts {
@@ -3709,10 +3710,7 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
             }
         }
         if let Some(m) = parse_chat_message(it) {
-            if let Some(existing) = thread.messages.iter_mut().find(|existing| {
-                (!existing.id.is_empty() && !m.id.is_empty() && existing.id == m.id)
-                    || (existing.text == m.text && existing.ts != 0 && existing.ts == m.ts)
-            }) {
+            if let Some(existing) = thread.messages.iter_mut().find(|existing| same_message(existing, &m)) {
                 if existing.link_url.is_none() && m.link_url.is_some() {
                     existing.link_url = m.link_url;
                     existing.link_title = m.link_title;
@@ -4610,5 +4608,29 @@ mod group_metadata_tests {
         let groups = get_groups(&session).await.unwrap();
         assert_eq!(groups.len(),1); assert_eq!(groups[0].name,"Nhóm ARM64");
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod message_identity_tests {
+    use super::*;
+    fn message(id: &str, outgoing: bool) -> ChatMessage { ChatMessage {id:id.into(),text:"OK".into(),sender:"User".into(),time:"10:00".into(),ts:1000,is_outgoing:outgoing,..Default::default()} }
+    #[test]
+    fn repeated_real_messages_survive_merge_and_server_replay_is_deduplicated() {
+        let mut target = Thread {id:"1".into(),name:"Contact".into(),preview:String::new(),time:String::new(),avatar:None,is_group:false,messages:vec![message("a",false)]};
+        let mut update = target.clone(); update.messages = vec![message("b",false)];
+        merge_thread_into(&mut target,update.clone(),true);
+        assert_eq!(target.messages.len(),2);
+        merge_thread_into(&mut target,update,true);
+        assert_eq!(target.messages.len(),2);
+        assert!(!same_message(&message("a",true), &message("b",true)));
+    }
+    #[test]
+    fn optimistic_matching_is_only_for_outgoing_local_vs_server() {
+        assert!(same_message(&message("out_local",true), &message("server",true)));
+        assert!(!same_message(&message("out_local",false), &message("server",false)));
+        assert!(!same_message(&message("out_a",true), &message("out_b",true)));
+        let mut extreme = message("server",true); extreme.ts = i64::MIN;
+        assert!(!same_message(&message("out_local",true), &extreme));
     }
 }
