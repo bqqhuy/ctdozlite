@@ -100,9 +100,16 @@ unsafe fn devices() -> Result<Vec<(String, IMFActivate)>> {
     Ok(result)
 }
 pub fn camera_names() -> Result<Vec<String>> {
-    let _runtime = Runtime::new()?;
-    unsafe { Ok(devices()?.into_iter().map(|(name, _)| name).collect()) }
+    // CPAL initializes its enumeration thread as STA. Keep Media Foundation in
+    // a fresh MTA rather than failing with RPC_E_CHANGED_MODE after listing mics.
+    std::thread::spawn(|| -> Result<Vec<String>> {
+        let _runtime = Runtime::new()?;
+        unsafe { Ok(devices()?.into_iter().map(|(name, _)| name).collect()) }
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Camera enumeration thread failed"))?
 }
+
 unsafe fn media_type(subtype: &GUID, size: Option<(u32, u32)>) -> Result<IMFMediaType> {
     let mt = MFCreateMediaType()?;
     mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
@@ -508,6 +515,21 @@ mod tests {
             [0, 0, 0, 255].repeat(4)
         );
         assert!(nv12_rgba(&black[..8], 2, 2, 4).is_err());
+    }
+    #[test]
+    fn camera_enumeration_isolated_from_sta_caller() -> Result<()> {
+        std::thread::spawn(|| -> Result<()> {
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
+            }
+            let result = camera_names();
+            unsafe {
+                CoUninitialize();
+            }
+            result.map(|_| ())
+        })
+        .join()
+        .unwrap()
     }
     #[test]
     fn native_h264_roundtrip() -> Result<()> {
