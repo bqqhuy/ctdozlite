@@ -59,7 +59,8 @@ try {
     foreach ($case in @(
         @{ Size='480x360'; Scale='1'; Tab='general' },
         @{ Size='1020x700'; Scale='1.5'; Tab='appearance' },
-        @{ Size='1280x900'; Scale='2'; Tab='sync' }
+        @{ Size='1280x900'; Scale='2'; Tab='sync' },
+        @{ Size='800x600'; Scale='1'; Tab='general'; Tray=$true }
     )) {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
@@ -75,6 +76,7 @@ try {
         foreach ($argument in @('--gui', '--dev', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
             $process.StartInfo.ArgumentList.Add($argument)
         }
+        if ($case.Tray) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }
             $outTask = $process.StandardOutput.ReadToEndAsync()

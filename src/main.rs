@@ -24,6 +24,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let smoke = args.iter().any(|a| a == "--ui-smoke-test");
+    anyhow::ensure!(!args.iter().any(|a| a == "--tray-smoke-test") || smoke, "--tray-smoke-test requires --ui-smoke-test");
     if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
         anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
     }

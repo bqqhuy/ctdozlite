@@ -282,9 +282,12 @@ impl AppSettings {
 struct UiSmoke {
     path: std::path::PathBuf,
     frames: u32,
+    lifecycle_started: bool,
 }
 
 pub struct ZaloGuiApp {
+    #[cfg(windows)]
+    tray: Option<crate::tray::Tray>,
     smoke: Option<UiSmoke>,
     // Theme state
     dark_mode: bool,
@@ -387,7 +390,6 @@ pub struct ZaloGuiApp {
     event_tx: Sender<GuiEvent>,
 
     // Background poll trigger
-    last_poll: std::time::Instant,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -410,19 +412,38 @@ impl ZaloGuiApp {
         dev_mode: bool,
         initial_threads: Vec<Thread>,
     ) -> Self {
-        setup_custom_fonts(&cc.egui_ctx);
-        let loaded_settings = AppSettings::load();
+        #[allow(unused_mut)]
+        let mut app = Self::from_context(&cc.egui_ctx, session, dev_mode, initial_threads, true);
+        #[cfg(windows)]
+        if app.smoke.is_none() || std::env::args().any(|a| a == "--tray-smoke-test") {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = cc.window_handle() {
+                if let RawWindowHandle::Win32(window) = handle.as_raw() {
+                    match crate::tray::Tray::new(cc.egui_ctx.clone(), window.hwnd.get()) {
+                        Ok(tray) => app.tray = Some(tray),
+                        Err(e) => app.status_msg = format!("Không tạo được tray: {e}; nút X sẽ thoát ứng dụng"),
+                    }
+                }
+            }
+        }
+        app
+    }
+
+    fn from_context(ctx: &egui::Context, session: Session, dev_mode: bool,
+        initial_threads: Vec<Thread>, bootstrap: bool) -> Self {
+        setup_custom_fonts(&ctx);
+        let loaded_settings = if bootstrap { AppSettings::load() } else { AppSettings::default() };
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = match loaded_settings.theme_mode.as_str() {
             "light" => false,
-            "system" => cc.egui_ctx.system_theme() != Some(egui::Theme::Light),
+            "system" => ctx.system_theme() != Some(egui::Theme::Light),
             _ => true,
         };
         if dark_mode {
-            ThemePalette::dark().apply_to_ctx(&cc.egui_ctx);
+            ThemePalette::dark().apply_to_ctx(&ctx);
         } else {
-            ThemePalette::light().apply_to_ctx(&cc.egui_ctx);
+            ThemePalette::light().apply_to_ctx(&ctx);
         }
 
         let (tx, rx) = channel();
@@ -444,7 +465,7 @@ impl ZaloGuiApp {
             })
             .unwrap_or_default();
 
-        let mut threads = if initial_threads.is_empty() {
+        let mut threads = if !bootstrap { initial_threads } else if initial_threads.is_empty() {
             crate::chat::load_threads_cache(&session)
         } else {
             let mut cached = crate::chat::load_threads_cache(&session);
@@ -470,9 +491,9 @@ impl ZaloGuiApp {
             }
         }
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::store::load_history_into_threads(session.history_path(), &mut threads, 200);
+        if bootstrap { crate::store::load_history_into_threads(session.history_path(), &mut threads, 200); }
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::chat::save_threads_cache(&session, &threads);
+        if bootstrap { crate::chat::save_threads_cache(&session, &threads); }
 
         let selected_thread_index = threads
             .iter()
@@ -482,6 +503,8 @@ impl ZaloGuiApp {
             .unwrap_or(0);
 
         let mut app = Self {
+            #[cfg(windows)]
+            tray: None,
             smoke: None,
             dark_mode,
             theme_dirty: false,
@@ -523,8 +546,8 @@ impl ZaloGuiApp {
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
             loading_stickers: HashSet::new(),
-            emoji_textures: load_default_emoji_textures(&cc.egui_ctx),
-            app_logo_texture: load_app_logo_texture(&cc.egui_ctx),
+            emoji_textures: load_default_emoji_textures(&ctx),
+            app_logo_texture: load_app_logo_texture(&ctx),
             sticker_store_packs: Vec::new(),
             sticker_store_loading: false,
             sticker_store_filter: String::new(),
@@ -570,13 +593,13 @@ impl ZaloGuiApp {
             scanner_findings: Vec::new(),
             event_rx: rx,
             event_tx: tx.clone(),
-            last_poll: std::time::Instant::now(),
         };
 
+        if !bootstrap { return app; }
         let args: Vec<String> = std::env::args().collect();
         if let Some(index) = args.iter().position(|a| a == "--ui-smoke-test") {
             let path = args.get(index+1).expect("--ui-smoke-test requires a PNG path");
-            app.smoke = Some(UiSmoke { path: path.into(), frames: 0 });
+            app.smoke = Some(UiSmoke { path: path.into(), frames: 0, lifecycle_started: false });
             app.is_logged_in = true;
             app.user_name = "ARM64 UI fixture".into();
             app.settings_modal_open = true;
@@ -586,13 +609,13 @@ impl ZaloGuiApp {
                 _ => SettingsTab::General,
             };
             if let Some(scale) = args.iter().position(|a| a == "--ui-smoke-scale").and_then(|i| args.get(i+1)).and_then(|n| n.parse::<f32>().ok()) {
-                cc.egui_ctx.set_pixels_per_point(scale.clamp(1.0, 2.0));
+                ctx.set_pixels_per_point(scale.clamp(1.0, 2.0));
             }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
         }
 
-        spawn_session_worker(session, tx, cc.egui_ctx.clone());
+        spawn_session_worker(session, tx, ctx.clone());
 
         if let Some(wtx) = WORKER_TX.get() {
             if is_logged_in {
@@ -1250,9 +1273,23 @@ impl eframe::App for ZaloGuiApp {
                 if let Err(e) = image::save_buffer(&smoke.path, &rgba, captured.size[0] as u32, captured.size[1] as u32, image::ColorType::Rgba8) {
                     eprintln!("UI smoke failed: {e}"); std::process::exit(3);
                 }
-                self.allow_quit = true;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            } else if smoke.frames == 5 {
+                #[cfg(windows)]
+                if std::env::args().any(|a| a == "--tray-smoke-test") {
+                    if !smoke.lifecycle_started {
+                        smoke.lifecycle_started = true;
+                        let Some(tray) = &self.tray else {
+                            eprintln!("Tray smoke failed: no native tray");
+                            std::process::exit(3);
+                        };
+                        crate::tray::smoke_lifecycle(tray.control());
+                    }
+                } else {
+                    self.allow_quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                #[cfg(not(windows))]
+                { self.allow_quit = true; ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
+            } else if smoke.frames == 5 && !smoke.lifecycle_started {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             } else if smoke.frames > 300 {
                 eprintln!("UI smoke failed: screenshot timeout"); std::process::exit(3);
@@ -1263,10 +1300,24 @@ impl eframe::App for ZaloGuiApp {
             self.allow_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        // Use the Windows caption and hit testing. Closing the main window exits;
-        // minimizing on close without an actual tray icon made the process unreachable.
-        if ctx.input(|i| i.viewport().close_requested()) {
-            self.allow_quit = true;
+        #[cfg(windows)]
+        if let Some(tray) = &self.tray {
+            if tray.control().quitting() {
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_quit {
+            #[cfg(windows)]
+            if let Some(tray) = &self.tray {
+                tray.control().hide_on_close();
+            } else {
+                // A failed/missing shell must never leave an unreachable process.
+                self.allow_quit = true;
+            }
+            #[cfg(not(windows))]
+            { self.allow_quit = true; }
         }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
@@ -1274,21 +1325,6 @@ impl eframe::App for ZaloGuiApp {
         }
 
         self.check_events(ctx);
-
-        // Non-overlapping long-poll trigger; wakes only every 1.2s to keep idle CPU ~0%
-        if self.smoke.is_none() && self.is_logged_in && self.last_poll.elapsed() >= Duration::from_millis(1200) {
-            self.last_poll = std::time::Instant::now();
-            if let Some(tx) = WORKER_TX.get() {
-                let known: Vec<(String, String, bool)> = self
-                    .threads
-                    .iter()
-                    .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
-                    .collect();
-                let _ = tx.send(WorkerCmd::PollMessages {
-                    known_threads: known,
-                });
-            }
-        }
 
         ctx.request_repaint_after(Duration::from_millis(1200));
 
@@ -1596,5 +1632,31 @@ mod renderer_tests {
     fn dx12_backend_is_compiled_into_the_arm64_binary() {
         assert!(eframe::wgpu::Instance::enabled_backend_features().contains(eframe::wgpu::Backends::DX12),
             "Selecting DX12 at runtime is insufficient: enable the wgpu/dx12 Cargo feature");
+    }
+}
+
+#[cfg(test)]
+mod settings_layout_tests {
+    use super::*;
+    #[test]
+    fn settings_tabs_fit_small_wide_and_high_dpi_viewports() {
+        let ctx = egui::Context::default();
+        let session = Session::new(false,false,false).unwrap();
+        let mut app = ZaloGuiApp::from_context(&ctx, session, false, Vec::new(), false);
+        app.is_logged_in = true;
+        app.settings_modal_open = true;
+        app.settings.download_dir = r"C:\Users\a-long-windows-user-name\Downloads".into();
+        app.smoke = Some(UiSmoke {path:Default::default(),frames:0,lifecycle_started:false});
+        for size in [[480.0,360.0],[1020.0,700.0],[320.0,240.0]] {
+            for tab in [SettingsTab::General,SettingsTab::Privacy,SettingsTab::Sync,
+                SettingsTab::Appearance,SettingsTab::Notifications,SettingsTab::Messages,SettingsTab::Utilities] {
+                app.settings_tab = tab;
+                for frame in 0..6 {
+                    app.smoke.as_mut().unwrap().frames = frame;
+                    let input = egui::RawInput {screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(size[0],size[1]))),..Default::default()};
+                    let _ = ctx.run(input, |ctx| app.render_settings_modal(ctx,&app.palette()));
+                }
+            }
+        }
     }
 }

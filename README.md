@@ -12,7 +12,7 @@ Khởi chạy GUI mặc định và đăng nhập bằng QR. Không cần Node.j
 
 ## Chức năng và phạm vi
 
-- Giao diện Rust/egui, renderer Direct3D 12; khung cửa sổ Windows hỗ trợ kéo, resize, Snap và đóng bằng X/Alt+F4.
+- Giao diện Rust/egui, renderer Direct3D 12; khung cửa sổ Windows hỗ trợ kéo, resize, Snap và Snap. X/Alt+F4 ẩn xuống tray; click trái hoặc phải icon để chọn **Mở Apps** / **Thoát Apps**.
 - Nhắn tin, nhóm, tệp/ảnh/sticker và lịch sử SQLite theo tài khoản; phiên đăng nhập được bảo vệ bằng Windows DPAPI.
 - Cập nhật hội thoại/tin gần đây tách riêng với tải lịch sử nhóm và Cloud theo trang. Có tiến độ, dừng và tiếp tục; không cam kết lấy lại dữ liệu server đã xóa hoặc toàn bộ lịch sử chat cá nhân từ điện thoại.
 - Audio WASAPI qua CPAL/Opus; camera và H.264 qua Media Foundation trong tiến trình ARM64. Cuộc gọi dùng giao thức riêng của Zalo; khả năng tương tác cuộc gọi đi/đến cần xác nhận với tài khoản và thiết bị thật. Gọi nhóm chưa được hỗ trợ.

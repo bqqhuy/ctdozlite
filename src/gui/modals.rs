@@ -694,6 +694,9 @@ impl ZaloGuiApp {
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(24.0, 16.0))
                         .show(ui, |ui| {
+                            // The surrounding row is horizontal. Explicitly stack
+                            // the page header and scroll viewport vertically.
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.set_width(content_w);
                             ui.set_height(win_h - 32.0);
 
@@ -709,7 +712,7 @@ impl ZaloGuiApp {
                                 };
                                 if compact {
                                     egui::ComboBox::from_id_salt("settings_compact_tab")
-                                        .width((content_w - 40.0).max(60.0))
+                                        .width((content_w - 70.0).max(40.0))
                                         .selected_text(tab_title)
                                         .show_ui(ui, |ui| {
                                             for (tab, title) in [
@@ -767,6 +770,8 @@ impl ZaloGuiApp {
                             ui.add_space(8.0);
 
                             egui::ScrollArea::both()
+                                .max_width(content_w)
+                                .min_scrolled_width(0.0)
                                 .max_height((win_h - 100.0).max(32.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
@@ -864,7 +869,9 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
-                                                    let (mics, cams) = crate::media::list_media_devices(false);
+                                                    let (mics, cams) = if self.smoke.is_some() {
+                                                        (vec!["Fixture microphone".into()], vec!["Fixture camera".into()])
+                                                    } else { crate::media::list_media_devices(false) };
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(format!("{} Đầu vào Mic:", lucide::MIC)).color(pal.text_primary).size(13.0));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1271,6 +1278,7 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 });
+                            });
                         });
                 });
             });

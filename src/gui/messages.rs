@@ -364,6 +364,7 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
     }
 }
 
+#[cfg(windows)]
 pub(super) fn finalize_clipboard_rgba_image(
     rgba: image::RgbaImage,
 ) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {

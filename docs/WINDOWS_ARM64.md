@@ -13,13 +13,13 @@ Chọn portable hoặc setup từ [Releases của fork](https://github.com/bqqhu
 - Mỗi thư mục dữ liệu chỉ cho chạy một instance. `--portable` dùng thư mục `data` cạnh exe; cần quyền ghi. `CTDOZ_DATA_DIR` chỉ định thư mục tuyệt đối khác.
 - Session JSON và lịch sử cũ không có thông tin chủ sở hữu không được tự nhập. Giữ chúng riêng và đăng nhập lại bằng QR.
 
-Nút X, Alt+F4 và Ctrl+Q thoát ứng dụng. Dùng nút thu nhỏ của Windows nếu muốn giữ ứng dụng chạy. Khung cửa sổ Windows hỗ trợ kéo, resize và Snap.
+Nút X và Alt+F4 ẩn cửa sổ xuống tray. Click trái hoặc phải icon để mở menu **Mở Apps** / **Thoát Apps**. Chọn Thoát Apps hoặc Ctrl+Q để tắt hẳn. Nếu không tạo được tray, nút X sẽ thoát để tránh tiến trình không thể mở lại. Khung cửa sổ Windows hỗ trợ kéo, resize và Snap.
 
 ## Hội thoại và lịch sử
 
 **Cập nhật hội thoại** lấy danh bạ, nhóm và tin gần đây; không đồng nghĩa sao chép toàn bộ tin từ điện thoại.
 
-Trong Settings → Đồng bộ, chọn **Tải / tiếp tục lịch sử** để tải nhóm và Cloud theo trang vào SQLite. Có tiến độ và nút dừng. Mỗi lượt tối đa 200 trang/hội thoại, 50 tin/trang, cách nhau ít nhất 300 ms. Bấm tiếp tục để tải thêm. Vị trí được lưu sau khi tin nhắn đã ghi vào database, nên đóng ứng dụng giữa chừng không làm mất dữ liệu đã ghi.
+Sau đăng nhập, ứng dụng tự tải hội thoại, tên nhóm, tin gần đây và lịch sử nhóm/Cloud mà máy chủ cho phép. Trong Settings → Đồng bộ, chọn **Tải / tiếp tục lịch sử** để tải nhóm và Cloud theo trang vào SQLite. Có tiến độ và nút dừng. Mỗi lượt tối đa 200 trang/hội thoại, 50 tin/trang, cách nhau ít nhất 300 ms. Bấm tiếp tục để tải thêm. Vị trí được lưu sau khi tin nhắn đã ghi vào database, nên đóng ứng dụng giữa chừng không làm mất dữ liệu đã ghi.
 
 Chỉ tải được tin máy chủ còn cung cấp. API tải toàn bộ lịch sử chat cá nhân và đồng bộ trực tiếp từ điện thoại chưa được xác minh; các chat này dùng lịch sử đã nhận trên máy. Server trả thiếu con trỏ hoặc lặp trang sẽ được báo lỗi và dừng, không báo thành công giả.
 
@@ -61,6 +61,8 @@ rustup set default-host aarch64-pc-windows-msvc
 .\scripts\build-windows-arm64.ps1
 ```
 
-Workflow duy nhất chạy trên `windows-11-arm`: test native, build release, kiểm tra PE `0xAA64`, kiểm tra DLL phụ thuộc, khởi chạy `--version`, thử GUI DX12 ở ba kích thước/DPI và đóng gói. Ảnh PNG và log giúp kiểm tra bố cục; file manifest ghi commit/toolchain. Chỉ tag/release hợp lệ mới đính kèm binary vào Release.
+Workflow duy nhất chạy trên `windows-11-arm`: test native, build release, kiểm tra PE `0xAA64`, kiểm tra DLL phụ thuộc, khởi chạy `--version`, thử GUI DX12 ở ba kích thước/DPI, kiểm tra vòng đời tray trên cửa sổ thật và đóng gói. Ảnh PNG và log giúp kiểm tra bố cục; file manifest ghi commit/toolchain. Chỉ tag/release hợp lệ mới đính kèm binary vào Release.
 
 Các test GUI dùng dữ liệu giả trong data directory riêng, không khôi phục phiên, không tạo QR, không gọi mạng hoặc gửi tin/gọi người thật. Vẫn cần kiểm tra trên thiết bị ARM64 thật: GPU, camera, mic/Bluetooth, resize/Snap, nhiều màn hình, sleep/resume, cài/gỡ và cuộc gọi với tài khoản được phép.
+
+Máy đích do người dùng cung cấp: **Huawei MateBook E Go Gen 3 — Snapdragon 8cx Gen 3**. Chưa có kết quả thử GPU/camera trên thiết bị này; CI dùng GPU phần mềm Microsoft Basic Render Driver.

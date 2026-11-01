@@ -4,7 +4,7 @@ Phạm vi: mã nguồn Rust, worker/session/network, lưu trữ, GUI, audio/vide
 
 ## Đối chiếu upstream
 
-Upstream mặc định là `main`, commit `73849bde5e5ffff21537e92886891db510e9c857`, cũng là tag mới nhất **v0.0.2**, phát hành 2026-10-31. `origin/main` của fork ở `3f28d2f99413d84e31d979cb914be3cc7945fb15` chứa toàn bộ upstream và thêm hai commit ARM64 (`git rev-list --left-right --count upstream/main...origin/main`: `0 2`).
+Đối chiếu mới nhất: upstream `main` đã chuyển sang `1345f5d` (v0.0.3), thêm 51 commit sau nền `73849bde5e5ffff21537e92886891db510e9c857` của nhánh này. Fork **chưa cập nhật đầy đủ v0.0.3**. Không dùng kết quả `0 2` của lần kiểm tra v0.0.2 để kết luận fork hiện đã theo bản mới nhất. `origin/main` vẫn ở `3f28d2f99413d84e31d979cb914be3cc7945fb15`; bản sửa nằm trên PR #2.
 
 Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; không đồng nghĩa đã có trong `main` hoặc bản Release đang tải. Các PR upstream đang mở không được coi là code đã merge.
 
@@ -17,7 +17,7 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 | Màn hình đen sau cài | Bật rõ feature biên dịch `wgpu/dx12` (trước đây chỉ chọn DX12 lúc runtime nhưng backend không có trong binary); DX12 làm mặc định; CRT tĩnh; kiểm tra import DLL; GUI smoke chụp framebuffer thật, từ chối ảnh trống. DLL Media Foundation delay-load và kiểm tra thiếu Media Feature Pack. | Cần thử GPU/driver của máy đã báo lỗi. |
 | Không kéo/resize cửa sổ | Bỏ khung và hit-test tự vẽ, dùng caption/resizing của Windows. | Cần thử chuột/cảm ứng, Snap và nhiều màn hình. |
 | Settings vỡ | Sửa phép tính lề bị cộng thừa 48px, bỏ kích thước tối thiểu vượt màn hình; tab dạng dropdown khi hẹp, nội dung cuộn, card co theo chiều rộng. | CI kiểm tra ảnh và biên cửa sổ ở 480×360, 1020×700/150%, 1280×900/200%. |
-| Không tắt được app | Bỏ CancelClose + Minimized ở nút X; không join luồng driver media trên UI thread. Camera có watcher Shutdown để ngắt ReadSample khi dừng. | Test GUI yêu cầu tiến trình tự thoát trong 45 giây; cần thử driver thật khi đang gọi. |
+| Không tắt được app | X/Alt+F4 ẩn xuống tray thật; cả click trái/phải có Mở Apps và Thoát Apps; không join luồng driver media trên UI thread. Camera có watcher Shutdown để ngắt ReadSample khi dừng. | Test GUI kiểm tra HWND ẩn/mở lại, thoát từ trạng thái ẩn trong 45 giây; cần thử driver thật khi đang gọi. |
 | Bấm đồng bộ không thấy gì | Tách cập nhật gần đây với tải lịch sử nhóm/Cloud; có phân trang, checkpoint SQLite, dừng/tiếp tục và báo lỗi. Không đổi lỗi danh bạ thành danh sách rỗng/thành công. | Chưa xác minh tải toàn bộ lịch sử chat cá nhân hoặc điện thoại. Cần test API bằng tài khoản thật. |
 | Tất cả user đều online | Xóa chấm xanh/trạng thái cố định của liên hệ; trạng thái không có nguồn presence được để chưa biết. | Chưa có API presence thực. |
 | Gọi đi chưa OK | Bỏ khóa test mặc định; sửa mất `typeRequest=3` khi khởi tạo video (trước đây fallback luôn gửi loại thoại 1); giữ wire shape riêng cho invite có metadata. | Chưa kết luận tương tác cuộc gọi đi/đến end-to-end. Cold-start invite chưa có relay metadata đầy đủ vẫn là đường tương thích cần kiểm tra. |
@@ -38,7 +38,7 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 
 ## Dependency audit
 
-Đã truy vấn OSV trên 302 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
+Đã truy vấn OSV trên 312 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
 
 | Phát hiện | Xử lý |
 |---|---|
@@ -84,3 +84,7 @@ Cần test thiết bị/tài khoản thật trước khi gọi bản này “đ�
 4. Gọi đi/đến audio/video với client Zalo chính thức, NAT/mạng khác nhau, mic/camera/Bluetooth, chuyển thiết bị, rút camera, sleep/resume.
 
 Chưa hỗ trợ gọi nhóm, tải lại toàn bộ lịch sử 1-1 từ điện thoại, thay quyền riêng tư server, cập nhật ứng dụng tự động hoặc autostart. Một số tùy chọn UI kế thừa (ngôn ngữ khác, PIN ẩn chat, gợi ý typing/GIF/mention tùy mục) chưa có tác động đầy đủ; không coi việc lưu một giá trị setting là đã triển khai tính năng. Bộ cài chưa ký số và chưa có kiểm thử physical hardware.
+
+## Ưu tiên bổ sung theo thiết bị đích
+
+Huawei MateBook E Go Gen 3 / Snapdragon 8cx Gen 3. Đồng bộ tự bắt đầu sau đăng nhập và khi khôi phục phiên; nhận tin/persist hoạt động trong worker khi cửa sổ ẩn. CM dùng lastMsgId, hasMore, isOld và isFiltered của server; không dùng msgId làm cursor. Server có thể không cung cấp lịch sử trước thời điểm đăng nhập. Chat cá nhân cũ từ điện thoại vẫn chưa có API được kiểm chứng.

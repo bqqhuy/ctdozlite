@@ -25,3 +25,6 @@ mod windows_video;
 mod history_sync;
 
 pub mod platform;
+
+#[cfg(windows)]
+mod tray;

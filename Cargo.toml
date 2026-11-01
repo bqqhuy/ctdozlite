@@ -50,6 +50,8 @@ wgpu = { version = "22.1", default-features = false, features = ["dx12", "wgsl"]
 # (PowerShell cold start is 1–3 s and is emulated x64 on some ARM images).
 [target.'cfg(windows)'.dependencies]
 rfd = { version = "0.15", default-features = false }
+tray-icon = { version = "0.21", default-features = false }
+raw-window-handle = "0.6"
 windows = { version = "0.54", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 
 [profile.release]

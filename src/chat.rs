@@ -2597,6 +2597,13 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
             avatar: previous.and_then(|t| t.avatar.clone()), is_group: true, messages: Vec::new(),
         }
     }).collect();
+    let removed = resolve_group_metadata(s, &mut groups).await?;
+    groups.retain(|group| !removed.contains(&group.id));
+    Ok(groups)
+}
+
+/// Resolve names for known group IDs without reloading all memberships.
+async fn resolve_group_metadata(s: &Session, groups: &mut [Thread]) -> Result<std::collections::HashSet<String>> {
     let mut removed = std::collections::HashSet::new();
     for chunk in groups.chunks_mut(50) {
         let versions: serde_json::Map<String, Value> = chunk.iter().map(|g| (g.id.clone(),json!(0))).collect();
@@ -2630,8 +2637,7 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
             }
         }
     }
-    groups.retain(|group| !removed.contains(&group.id));
-    Ok(groups)
+    Ok(removed)
 }
 
 /// `POST /api/social/friend/getminiprofiles` (cmd 12134) — get basic profiles (name, avatar) for user IDs.
@@ -2658,6 +2664,19 @@ pub async fn get_mini_profiles(s: &Session, user_ids: &[String]) -> Result<serde
 
 /// Automatically resolve real display names and avatars for threads that only have placeholder names.
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
+    let mut unknown_groups: Vec<Thread> = threads.iter().filter(|t| t.is_group &&
+        (t.name.is_empty() || t.name == t.id || t.name == format!("Nhóm {}", t.id))).cloned().collect();
+    if !unknown_groups.is_empty() {
+        if let Err(e) = resolve_group_metadata(s, &mut unknown_groups).await {
+            crate::logger::log_error("group name resolution", &e.to_string());
+        }
+        for resolved in unknown_groups {
+            if let Some(thread) = threads.iter_mut().find(|t| t.id == resolved.id && t.is_group) {
+                thread.name = resolved.name;
+                thread.avatar = resolved.avatar.or_else(|| thread.avatar.clone());
+            }
+        }
+    }
     let unknown_ids: Vec<String> = threads
         .iter()
         .filter(|t| {
@@ -2855,15 +2874,9 @@ pub async fn get_cloud_messages(
     map.insert("groupId".into(), json!(clean_id));
     map.insert(
         "globalMsgId".into(),
-        json!(if global_msg_id.is_empty() {
-            if is_old {
-                "10000000000000000"
-            } else {
-                "0"
-            }
-        } else {
-            global_msg_id
-        }),
+        json!(if global_msg_id.is_empty() || global_msg_id == "0" {
+            crate::history_sync::NEWEST_CURSOR
+        } else { global_msg_id }),
     );
     map.insert("count".into(), json!(count));
     map.insert("msgIds".into(), json!([]));
@@ -2871,7 +2884,7 @@ pub async fn get_cloud_messages(
     if is_send2me {
         map.insert("isOA".into(), json!(1));
     }
-    map.insert("src".into(), json!(if is_old { 3 } else { 1 }));
+    map.insert("src".into(), json!(if global_msg_id.is_empty() || global_msg_id == "0" || global_msg_id == crate::history_sync::NEWEST_CURSOR { 1 } else { 3 }));
 
     let body = Value::Object(map);
     let params = s.encoded_params(&body)?;

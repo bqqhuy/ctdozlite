@@ -255,8 +255,23 @@ async fn prefetch_missing_sticker_thumbnails(
     futures_util::future::join_all(futs).await;
 }
 
+// Hidden viewports may stop rendering. Persist worker deltas before notifying UI
+// so delivery and history do not depend on a visible application window.
+async fn persist_received(session: &Session, threads: &[Thread]) {
+    let session = session.clone();
+    let threads = threads.to_vec();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if !session.is_active() { return Ok(()); }
+        let mut store = crate::store::MessageStore::open(session.history_path())?;
+        crate::store::persist_threads(&mut store, &threads)?;
+        Ok(())
+    }).await;
+    if !matches!(result, Ok(Ok(()))) { eprintln!("Cannot persist received message batch"); }
+}
+
 pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, egui_ctx: egui::Context) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+    let commands = cmd_tx.downgrade();
     let _ = WORKER_TX.set(cmd_tx);
 
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -370,6 +385,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                         &mut ws_threads,
                                                     )
                                                     .await;
+                                                    persist_received(&s_snap, &ws_threads).await;
                                                     let _ = gui_tx_ws.send(
                                                         GuiEvent::ThreadsUpdated(ws_threads),
                                                     );
@@ -424,6 +440,30 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
 
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let is_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let known_threads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<(String, String, bool)>::new()));
+                let auto_history_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                {
+                    let commands = commands.clone();
+                    let session = session.clone();
+                    let known = known_threads.clone();
+                    let polling = is_polling.clone();
+                    tokio::spawn(async move {
+                        let mut timer = tokio::time::interval(Duration::from_millis(1200));
+                        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            timer.tick().await;
+                            if commands.strong_count() == 0 { break; }
+                            if polling.load(std::sync::atomic::Ordering::SeqCst) { continue; }
+                            let s = session.lock().await;
+                            if s.login.is_none() || !s.is_active() { continue; }
+                            drop(s);
+                            let snapshot = known.lock().await.clone();
+                            if let Some(tx) = commands.upgrade() {
+                                if tx.send(WorkerCmd::PollMessages {known_threads: snapshot}).is_err() { break; }
+                            } else { break; }
+                        }
+                    });
+                }
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
@@ -472,6 +512,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let commands = commands.clone();
 
                             let handle = tokio::spawn(async move {
                                 {
@@ -600,24 +641,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                         );
                                                         ctx_clone.request_repaint();
 
-                                                        let mut list = crate::chat::get_friends(&s)
-                                                            .await
-                                                            .unwrap_or_default();
-                                                        crate::store::load_history_into_threads(
-                                                            s.history_path(),
-                                                            &mut list,
-                                                            200,
-                                                        );
-                                                        {
-                                                            let mut ps = poll_clone.lock().await;
-                                                            let _ = crate::chat::poll_new_messages(
-                                                                &s, &mut ps, &mut list,
-                                                            )
-                                                            .await;
+                                                        if let Some(tx) = commands.upgrade() {
+                                                            let _ = tx.send(WorkerCmd::RefreshThreads);
                                                         }
-                                                        let _ = gui_tx_clone
-                                                            .send(GuiEvent::ThreadsUpdated(list));
-                                                        ctx_clone.request_repaint();
 
                                                         let s_kw = s.clone();
                                                         let tx_kw = gui_tx_clone.clone();
@@ -654,6 +680,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let cancel = history_sync_cancel.clone();
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang đồng bộ lịch sử từ máy chủ…".into() });
+                            ctx.request_repaint();
                             tokio::spawn(async move {
                                 let result = crate::history_sync::download(&s, threads, cancel,
                                     |message| { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); },
@@ -671,6 +699,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let commands = commands.clone();
+                            let known = known_threads.clone();
+                            let auto_history_started = auto_history_started.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
                                 let mut s = session_clone.lock().await.clone();
@@ -736,6 +767,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         let _ =
                                             crate::chat::poll_new_messages(&s, &mut ps, &mut list)
                                                 .await;
+                                    }
+                                    persist_received(&s, &list).await;
+                                    *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
+                                    if !auto_history_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                                        if let Some(tx) = commands.upgrade() {
+                                            let _ = tx.send(WorkerCmd::SyncHistory { threads: list.clone() });
+                                        }
                                     }
                                     let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
@@ -825,6 +863,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 &mut temp_threads,
                                             )
                                             .await;
+                                            persist_received(&s, &temp_threads).await;
                                             let _ = gui_tx_clone
                                                 .send(GuiEvent::ThreadsUpdated(temp_threads));
                                             ctx_clone.request_repaint();
@@ -1820,7 +1859,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             if let Some(task) = current_qr_task.take() { task.abort(); }
                             session.lock().await.logout();
                             let session_clone = session.clone();
-                            let poll_clone = poll_state.clone();
+                            let commands = commands.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
@@ -1863,20 +1902,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 });
                                                 ctx_clone.request_repaint();
 
-                                                if let Ok(mut list) =
-                                                    crate::chat::get_friends(&s).await
-                                                {
-                                                    {
-                                                        let mut ps = poll_clone.lock().await;
-                                                        *ps = crate::chat::PollState::default();
-                                                        let _ = crate::chat::poll_new_messages(
-                                                            &s, &mut ps, &mut list,
-                                                        )
-                                                        .await;
-                                                    }
-                                                    let _ = gui_tx_clone
-                                                        .send(GuiEvent::ThreadsUpdated(list));
-                                                    ctx_clone.request_repaint();
+                                                if let Some(tx) = commands.upgrade() {
+                                                    let _ = tx.send(WorkerCmd::RefreshThreads);
                                                 }
                                             }
                                         }
