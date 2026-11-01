@@ -769,7 +769,12 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::CameraUnavailable(reason) => {
-                    if let Some(call) = self.active_call.as_mut() { call.cam_enabled = false; }
+                    if let Some(call) = self.active_call.as_mut() {
+                        call.cam_enabled = false;
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::SetCallMediaState { is_on_mic: !call.mic_muted, is_on_cam: false });
+                        }
+                    }
                     self.status_msg = reason.clone();
                     self.show_toast(reason);
                 }

@@ -63,3 +63,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "zalo-rust"
 path = "src/main.rs"
+
+[patch.crates-io]
+lru = { path = "vendor/lru-compat" }

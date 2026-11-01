@@ -584,7 +584,7 @@ impl ZaloGuiApp {
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
 
-        egui::Window::new("settings_window_modal")
+        let response = egui::Window::new("settings_window_modal")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -767,7 +767,7 @@ impl ZaloGuiApp {
                             ui.add_space(8.0);
 
                             egui::ScrollArea::both()
-                                .max_height((win_h - 100.0).max(100.0))
+                                .max_height((win_h - 100.0).max(32.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     match self.settings_tab {
@@ -1275,6 +1275,13 @@ impl ZaloGuiApp {
                 });
             });
 
+        if self.smoke.as_ref().map_or(false, |smoke| smoke.frames >= 3) {
+            if let Some(response) = response {
+                let rect = response.response.rect;
+                assert!(screen.expand(1.0).contains_rect(rect), "Settings outside screen: {rect:?}, screen={screen:?}");
+            }
+        }
+
         if self.settings.remember_login != previous_remember {
             self.save_settings();
         }
@@ -1306,17 +1313,8 @@ impl ZaloGuiApp {
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
             let _ = std::fs::create_dir_all(&p);
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("explorer").arg(&p).spawn();
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open").arg(&p).spawn();
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            if !crate::platform::open_folder(std::path::Path::new(&p)) {
+                self.show_toast("Không mở được thư mục tải về");
             }
         }
 

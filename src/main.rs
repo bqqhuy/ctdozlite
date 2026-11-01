@@ -328,3 +328,5 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
 mod windows_video;
 
 mod history_sync;
+
+mod platform;

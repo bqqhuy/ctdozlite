@@ -2139,25 +2139,7 @@ fn unix_now_ms() -> i64 {
     crate::login::unix_now() * 1000
 }
 
-fn open_external_url(url: &str) {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", trimmed])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
-    }
-}
+fn open_external_url(url: &str) { let _ = crate::platform::open_url(url); }
 
 fn help_line(keys: &str, desc: &str) -> Line<'static> {
     Line::from(vec![

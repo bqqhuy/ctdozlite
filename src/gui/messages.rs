@@ -279,30 +279,9 @@ pub(super) fn render_call_card_widget(
 
 /// Open an `http://` or `https://` URL in the user's default system browser.
 pub(super) fn open_external_url(url: &str) {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", trimmed])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(trimmed).spawn();
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
-    }
+    let _ = crate::platform::open_url(url);
 }
-/// Pick a folder. Windows uses the real folder picker; other platforms keep the
-/// upstream behaviour (pick any file, the caller uses its parent directory).
+/// Native Windows folder picker.
 pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
@@ -311,10 +290,8 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
             .pick_folder();
     }
     #[cfg(not(target_os = "windows"))]
-    {
-        let f = pick_native_file_dialog(false)?;
-        Some(f.parent().map(|p| p.to_path_buf()).unwrap_or(f))
-    }
+    { None }
+
 }
 /// Open a native OS file-picker dialog on a worker thread and return the selected path.
 pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
@@ -339,54 +316,8 @@ pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::Pa
         };
         return dlg.pick_file();
     }
-    #[cfg(target_os = "macos")]
-    {
-        let prompt = if images_only {
-            "POSIX path of (choose file with prompt \"Chọn hình ảnh để gửi qua Zalo\" of type {\"public.image\"})"
-        } else {
-            "POSIX path of (choose file with prompt \"Chọn tập tin đính kèm để gửi qua Zalo\")"
-        };
-        if let Ok(out) = std::process::Command::new("osascript")
-            .args(["-e", prompt])
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        None
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let mut zcmd = std::process::Command::new("zenity");
-        zcmd.arg("--file-selection");
-        if images_only {
-            zcmd.arg("--file-filter=Images | *.png *.jpg *.jpeg *.webp *.gif *.bmp");
-        }
-        if let Ok(out) = zcmd.output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        if let Ok(out) = std::process::Command::new("kdialog")
-            .arg("--getopenfilename")
-            .output()
-        {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !s.is_empty() {
-                    return Some(std::path::PathBuf::from(s));
-                }
-            }
-        }
-        None
-    }
+    #[cfg(not(windows))]
+    { let _ = images_only; None }
 }
 
 /// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
@@ -656,26 +587,8 @@ pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, 
             None
         }
     }
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Wayland (`wl-paste --type image/png`) or X11 (`xclip -selection clipboard -t image/png -o`)
-        for (prog, args) in [
-            ("wl-paste", &["--no-newline", "--type", "image/png"][..]),
-            (
-                "xclip",
-                &["-selection", "clipboard", "-t", "image/png", "-o"][..],
-            ),
-        ] {
-            if let Ok(out) = std::process::Command::new(prog).args(args).output() {
-                if out.status.success() && out.stdout.len() > 8 {
-                    if let Ok(dyn_img) = crate::limits::decode_image(&out.stdout) {
-                        return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
-                    }
-                }
-            }
-        }
-        None
-    }
+    #[cfg(not(windows))]
+    { None }
 }
 
 

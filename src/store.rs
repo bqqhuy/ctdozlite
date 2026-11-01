@@ -51,7 +51,7 @@ impl MessageStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
-                msg_id TEXT PRIMARY KEY,
+                msg_id TEXT NOT NULL,
                 thread_id TEXT NOT NULL,
                 sender_id TEXT,
                 sender_name TEXT,
@@ -59,7 +59,8 @@ impl MessageStore {
                 msg_type TEXT,
                 ts INTEGER,
                 is_outgoing INTEGER,
-                raw_json TEXT
+                raw_json TEXT,
+                PRIMARY KEY(thread_id, msg_id)
             );
             CREATE INDEX IF NOT EXISTS idx_thread_ts ON messages(thread_id, ts);
             CREATE TABLE IF NOT EXISTS history_sync (thread_id TEXT PRIMARY KEY, cursor TEXT NOT NULL);
@@ -70,6 +71,20 @@ impl MessageStore {
                 last_ts INTEGER
             );",
         )?;
+
+        // Transactional migration from the original globally keyed message ID.
+        let thread_pk: i64 = conn.query_row("SELECT pk FROM pragma_table_info('messages') WHERE name='thread_id'", [], |row| row.get(0))?;
+        if thread_pk == 0 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch("ALTER TABLE messages RENAME TO messages_v1;
+                CREATE TABLE messages (msg_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                    sender_id TEXT, sender_name TEXT, text TEXT, msg_type TEXT,
+                    ts INTEGER, is_outgoing INTEGER, raw_json TEXT, PRIMARY KEY(thread_id,msg_id));
+                INSERT INTO messages SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json FROM messages_v1;
+                DROP TABLE messages_v1;
+                CREATE INDEX idx_thread_ts ON messages(thread_id,ts);")?;
+            migration.commit()?;
+        }
 
         Ok(Self { conn })
     }
@@ -93,8 +108,8 @@ impl MessageStore {
         )?;
         if rows == 0 && !msg.raw_json.is_empty() {
             let _ = self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text],
+                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3 AND thread_id = ?5",
+                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text, msg.thread_id],
             );
         }
         Ok(rows > 0)
@@ -104,8 +119,8 @@ impl MessageStore {
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
         if !msg_id.is_empty() {
             let _ = self.conn.execute(
-                "DELETE FROM messages WHERE msg_id = ?1",
-                params![msg_id],
+                "DELETE FROM messages WHERE msg_id = ?1 AND thread_id = ?2",
+                params![msg_id, thread_id],
             );
         }
         if ts > 0 && !thread_id.is_empty() {
@@ -123,7 +138,9 @@ impl MessageStore {
             "INSERT INTO threads (thread_id, name, is_group, last_ts)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(thread_id) DO UPDATE SET
-                 name = excluded.name,
+                 name = CASE WHEN excluded.name = '' OR excluded.name = 'Nhóm ' || excluded.thread_id
+                    OR excluded.name = 'Người dùng ' || excluded.thread_id
+                    THEN threads.name ELSE excluded.name END,
                  is_group = excluded.is_group,
                  last_ts = MAX(threads.last_ts, excluded.last_ts)",
             params![
@@ -212,26 +229,6 @@ impl MessageStore {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
-            } else if !crate::chat::is_generic_thread_name(&st.name)
-                && threads
-                    .iter()
-                    .any(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
-            {
-                // Migrate stale session-scoped `thread_id` in SQLite to the active contact's `id`
-                if let Some(live_id) = threads
-                    .iter()
-                    .find(|t| t.is_group == st.is_group && t.name.trim() == st.name.trim())
-                    .map(|t| t.id.clone())
-                {
-                    let _ = self.conn.execute(
-                        "UPDATE messages SET thread_id = ?1 WHERE thread_id = ?2",
-                        params![live_id, st.thread_id],
-                    );
-                    let _ = self.conn.execute(
-                        "DELETE FROM threads WHERE thread_id = ?1",
-                        params![st.thread_id],
-                    );
-                }
             } else {
                 threads.push(Thread {
                     id: st.thread_id.clone(),
@@ -249,36 +246,8 @@ impl MessageStore {
             }
         }
 
-        let mut msg_owner: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Ok(mut stmt) = self.conn.prepare("SELECT msg_id, thread_id FROM messages") {
-            if let Ok(rows) = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                for r in rows.flatten() {
-                    msg_owner.insert(r.0, r.1);
-                }
-            }
-        }
-
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
-            let before = t.messages.len();
-            t.messages.retain(|m| {
-                if let Some(owner_tid) = msg_owner.get(&m.id) {
-                    owner_tid == &t.id
-                } else {
-                    true
-                }
-            });
-            if t.messages.len() != before && t.messages.is_empty() {
-                t.preview.clear();
-                t.time.clear();
-                let _ = self.conn.execute(
-                    "UPDATE threads SET last_ts = 0 WHERE thread_id = ?1",
-                    params![t.id],
-                );
-            }
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
@@ -691,5 +660,50 @@ mod transaction_tests {
         let thread = |id: &str| Thread { id: id.into(), name: id.into(), preview: String::new(), time: String::new(), avatar: None, is_group: false, messages: Vec::new() };
         assert!(persist_threads(&mut store, &[thread("good"), thread("bad")]).is_err());
         assert!(store.all_threads().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    fn message(thread_id: &str) -> StoredMessage {
+        StoredMessage { msg_id: "same-id".into(), thread_id: thread_id.into(), sender_id: "sender".into(), sender_name: "Same name".into(), text: thread_id.into(), msg_type: "text".into(), ts: 1, is_outgoing: false, raw_json: "{}".into() }
+    }
+    #[test]
+    fn same_message_id_is_scoped_to_thread_and_delete_does_not_cross_threads() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        assert!(store.upsert_message(&message("a")).unwrap());
+        assert!(store.upsert_message(&message("b")).unwrap());
+        let mut update = message("a"); update.text = "edited".into();
+        assert!(!store.upsert_message(&update).unwrap());
+        assert_eq!(store.messages_for("a",10).unwrap()[0].text,"edited");
+        assert_eq!(store.messages_for("b",10).unwrap()[0].text,"b");
+        store.delete_message("a","same-id",0).unwrap();
+        assert!(store.messages_for("a",10).unwrap().is_empty());
+        assert_eq!(store.messages_for("b",10).unwrap().len(),1);
+    }
+    #[test]
+    fn old_pages_do_not_erase_group_name_or_recency() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let mut thread = StoredThread {thread_id:"123".into(),name:"Nhóm có tên".into(),is_group:true,last_ts:99};
+        store.upsert_thread(&thread).unwrap();
+        thread.name = "Nhóm 123".into(); thread.last_ts = 1;
+        store.upsert_thread(&thread).unwrap();
+        thread.name.clear(); store.upsert_thread(&thread).unwrap();
+        let saved = store.all_threads().unwrap();
+        assert_eq!(saved[0].name,"Nhóm có tên"); assert_eq!(saved[0].last_ts,99);
+    }
+    #[test]
+    fn migrates_legacy_database_without_losing_messages() {
+        let dir = std::env::temp_dir().join(format!("ctdoz-migration-{}-{}",std::process::id(),crate::param_cipher::random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap(); let path = dir.join("history.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE messages (msg_id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,sender_id TEXT,sender_name TEXT,text TEXT,msg_type TEXT,ts INTEGER,is_outgoing INTEGER,raw_json TEXT);
+            INSERT INTO messages VALUES ('same-id','a','','','old','text',1,0,'{}');").unwrap();
+        drop(conn);
+        let store = MessageStore::open(&path).unwrap();
+        assert_eq!(store.messages_for("a",10).unwrap()[0].text,"old");
+        assert!(store.upsert_message(&message("b")).unwrap());
+        drop(store); std::fs::remove_dir_all(dir).unwrap();
     }
 }

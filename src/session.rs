@@ -818,7 +818,7 @@ impl Session {
                     None,
                     Some(&e.to_string()),
                 );
-                return Err(e.into());
+                return Err(e.without_url().into());
             }
         };
 
@@ -875,7 +875,7 @@ impl Session {
                 Some(&text),
                 Some(&format!("server error {code}: {msg}")),
             );
-            bail!("server error {code}: {msg} (from {url})");
+            bail!("server error {code}: {msg}");
         }
         Ok(v)
     }

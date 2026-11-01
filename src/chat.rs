@@ -126,28 +126,10 @@ pub fn avatar_url_time(avatar: Option<&str>) -> i64 {
     0
 }
 
-/// Return `true` if two `Thread` entries represent the same underlying contact or group,
-/// even if Zalo issued a new session-scoped `userId` after a QR re-login.
+/// Display names and avatars are not identities: multiple contacts can share
+/// both. Never migrate a conversation to another recipient using those fields.
 pub fn threads_represent_same_contact(a: &Thread, b: &Thread) -> bool {
-    if !a.id.is_empty() && a.id == b.id {
-        return true;
-    }
-    if a.is_group != b.is_group {
-        return false;
-    }
-    if let (Some(ka), Some(kb)) = (
-        avatar_file_key(a.avatar.as_deref()),
-        avatar_file_key(b.avatar.as_deref()),
-    ) {
-        return ka == kb;
-    }
-    if !is_generic_thread_name(&a.name)
-        && !is_generic_thread_name(&b.name)
-        && a.name.trim() == b.name.trim()
-    {
-        return true;
-    }
-    false
+    !a.id.is_empty() && a.id != "0" && a.is_group == b.is_group && a.id == b.id
 }
 
 /// Merge `incoming` thread into `target`. When `incoming_id_is_authoritative` is `true`,
@@ -250,7 +232,7 @@ pub fn merge_thread_into(
 }
 
 /// Deduplicate `threads` in-place, merging entries that represent the same contact/group
-/// (by `id`, avatar hash, or non-generic display name) and preserving the authoritative/newer `id`.
+/// by the same server ID and kind. Names and avatars never authorize migration.
 pub fn deduplicate_threads(
     threads: &mut Vec<Thread>,
     authoritative_ids: Option<&std::collections::HashSet<String>>,
@@ -268,7 +250,7 @@ pub fn deduplicate_threads(
             }
         }
         if let Some(existing) = merged.iter_mut().find(|e| {
-            if e.id == t.id {
+            if threads_represent_same_contact(e, &t) {
                 return true;
             }
             if let Some(auth) = authoritative_ids {
@@ -293,35 +275,6 @@ pub fn deduplicate_threads(
             merge_thread_into(existing, t, incoming_auth);
         } else {
             merged.push(t);
-        }
-    }
-    let cloud_msg_ids: std::collections::HashSet<String> = merged
-        .iter()
-        .filter(|t| t.name.contains("Cloud của tôi"))
-        .flat_map(|t| t.messages.iter())
-        .filter_map(|m| {
-            if !m.id.is_empty() && !m.id.starts_with("out_") && !m.id.starts_with("local_") {
-                Some(m.id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    if !cloud_msg_ids.is_empty() {
-        for t in merged.iter_mut() {
-            if !t.name.contains("Cloud của tôi") {
-                let before = t.messages.len();
-                t.messages.retain(|m| !cloud_msg_ids.contains(&m.id));
-                if t.messages.len() != before {
-                    if let Some(newest) = t.messages.last() {
-                        t.preview = newest.text.replace('\n', " ");
-                        t.time = newest.time.clone();
-                    } else {
-                        t.preview.clear();
-                        t.time.clear();
-                    }
-                }
-            }
         }
     }
     *threads = merged;
@@ -4442,7 +4395,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deduplicate_threads_migrates_session_scoped_ids() {
+    fn test_distinct_ids_with_same_name_and_avatar_stay_separate() {
         let old_dtc = Thread {
             id: "1000000000000000005".into(),
             name: "Đtc".into(),
@@ -4471,10 +4424,11 @@ mod tests {
         };
         let mut threads = vec![old_dtc, new_dtc];
         deduplicate_threads(&mut threads, None);
-        assert_eq!(threads.len(), 1);
-        assert_eq!(threads[0].id, "1000000000000000006");
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "1000000000000000005");
+        assert_eq!(threads[1].id, "1000000000000000006");
         assert_eq!(threads[0].messages.len(), 1);
-        assert_eq!(threads[0].preview, "Hi");
+        assert!(threads[1].messages.is_empty());
     }
 
     #[test]
@@ -4598,7 +4552,7 @@ mod tests {
         let mut list = vec![cloud, polluted_contact];
         deduplicate_threads(&mut list, None);
         assert_eq!(list[0].messages.len(), 1);
-        assert!(list[1].messages.is_empty());
-        assert!(list[1].preview.is_empty());
+        // Equal message IDs in separate conversations do not prove pollution.
+        assert_eq!(list[1].messages.len(), 1);
     }
 }

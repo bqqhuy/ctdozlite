@@ -314,7 +314,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                     let ctx_ws = egui_ctx.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
-                            tokio::sync::mpsc::UnboundedReceiver<crate::socket::WsEvent>,
+                            tokio::sync::mpsc::Receiver<crate::socket::WsEvent>,
                         > = None;
                         let mut ws_sek = String::new();
                         loop {

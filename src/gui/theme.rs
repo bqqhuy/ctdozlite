@@ -529,29 +529,20 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Load system Vietnamese sans-serif font
-    let font_candidates = [
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Tahoma.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ];
-
-    for path in font_candidates {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "vietnamese_font".to_owned(),
-                egui::FontData::from_owned(font_data),
-            );
+    // Read installed Windows fonts; do not redistribute proprietary font files.
+    let font_dir = std::env::var_os("WINDIR").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows")).join("Fonts");
+    for name in ["segoeui.ttf", "arial.ttf", "tahoma.ttf"] {
+        if let Ok(data) = std::fs::read(font_dir.join(name)) {
+            fonts.font_data.insert("vietnamese_font".into(), egui::FontData::from_owned(data));
             break;
+        }
+    }
+    let mut fallback_fonts = Vec::new();
+    for name in ["msyh.ttc", "simsun.ttc", "meiryo.ttc", "malgun.ttf", "seguisym.ttf"] {
+        if let Ok(data) = std::fs::read(font_dir.join(name)) {
+            fonts.font_data.insert(name.into(), egui::FontData::from_owned(data));
+            fallback_fonts.push(name.to_string());
         }
     }
 
@@ -570,5 +561,8 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
     }
     mono.push("lucide_font".to_owned());
 
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().extend(fallback_fonts.iter().cloned());
+    }
     ctx.set_fonts(fonts);
 }

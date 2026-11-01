@@ -41,15 +41,22 @@ pub fn selected_camera_device() -> String {
     SELECTED_CAMERA_DEVICE.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
-/// Return cached `(mic_devices, camera_devices)` or enumerate once (with `refresh=true` to rescan).
+/// Return immediately; slow device/driver enumeration never blocks the GUI.
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
-    if !refresh {
-        if let Ok(g) = CACHED_DEVICES.lock() {
-            if let Some(ref cached) = *g {
-                return cached.clone();
-            }
-        }
+    static SCANNING: AtomicBool = AtomicBool::new(false);
+    let cached = CACHED_DEVICES.lock().ok().and_then(|g| g.clone());
+    if (refresh || cached.is_none()) && !SCANNING.swap(true, Ordering::SeqCst) {
+        thread::spawn(|| {
+            struct ScanDone;
+            impl Drop for ScanDone { fn drop(&mut self) { SCANNING.store(false, Ordering::SeqCst); } }
+            let _done = ScanDone;
+            let devices = enumerate_devices();
+            if let Ok(mut cache) = CACHED_DEVICES.lock() { *cache = Some(devices); }
+        });
     }
+    cached.unwrap_or_default()
+}
+fn enumerate_devices() -> (Vec<String>, Vec<String>) {
     let mut mics = Vec::new();
     let host = cpal::default_host();
     if let Ok(devs) = host.input_devices() {
@@ -66,11 +73,7 @@ pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
     let cams = crate::windows_video::camera_names().unwrap_or_default();
     #[cfg(not(windows))]
     let cams = Vec::new();
-    let pair = (mics, cams);
-    if let Ok(mut g) = CACHED_DEVICES.lock() {
-        *g = Some(pair.clone());
-    }
-    pair
+    (mics, cams)
 }
 
 pub struct MediaHandle {
@@ -680,9 +683,17 @@ fn spawn_camera_capture_thread(
     #[cfg(windows)]
     {
         thread::spawn(move || {
-            if let Err(e) = crate::windows_video::capture(stop, cam_enabled, want_keyframe, cam_au_tx, gui_tx.clone(), egui_ctx.clone()) {
-                if let Some(tx) = gui_tx { let _ = tx.send(crate::gui::GuiEvent::CameraUnavailable(format!("Camera: {e:#}"))); }
-                if let Some(ctx) = egui_ctx { ctx.request_repaint(); }
+            while !stop.load(Ordering::Relaxed) {
+                match crate::windows_video::capture(stop.clone(), cam_enabled.clone(), want_keyframe.clone(), cam_au_tx.clone(), gui_tx.clone(), egui_ctx.clone()) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        cam_enabled.store(false, Ordering::Relaxed);
+                        if let Some(tx) = &gui_tx { let _ = tx.send(crate::gui::GuiEvent::CameraUnavailable(format!("Camera: {e:#}"))); }
+                        if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
+                        // capture waits for the next explicit camera enable, allowing
+                        // recovery after changing device or granting Windows permission.
+                    }
+                }
             }
         });
         return;

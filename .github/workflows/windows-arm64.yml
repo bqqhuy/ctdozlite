@@ -66,9 +66,19 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-arm64-1.99.1
+          save-if: ${{ always() }}
       - name: Tests, native PE smoke check and package
         shell: pwsh
         run: ./scripts/build-windows-arm64.ps1
+      - name: Upload renderer diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-arm64-renderer-diagnostics
+          path: |
+            dist/*.log
+            dist/*.png
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ctdozlite-windows-arm64

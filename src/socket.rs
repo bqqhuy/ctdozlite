@@ -27,7 +27,7 @@ use generic_array::typenum::U16;
 use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::{COOKIE, ORIGIN, USER_AGENT};
 use tokio_tungstenite::tungstenite::http::HeaderValue;
@@ -359,12 +359,13 @@ fn pull_next_frame(
 /// Connect, authenticate, pull the control/voip queues, then stream events.
 ///
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
-pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
-    let (tx, rx) = mpsc::unbounded_channel();
+pub fn spawn(sess: Session) -> mpsc::Receiver<WsEvent> {
+    let (tx, rx) = mpsc::channel(32);
     tokio::spawn(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
         loop {
+            if !sess.is_active() || tx.is_closed() { break; }
             match run_once(&sess, &tx, endpoint_idx).await {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
@@ -383,7 +384,7 @@ pub fn spawn(sess: Session) -> mpsc::UnboundedReceiver<WsEvent> {
 
 async fn run_once(
     sess: &Session,
-    tx: &mpsc::UnboundedSender<WsEvent>,
+    tx: &mpsc::Sender<WsEvent>,
     endpoint_idx: usize,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
@@ -403,7 +404,11 @@ async fn run_once(
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
-    let (mut ws, resp) = match connect_async(req).await {
+    let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    config.max_message_size = Some(crate::limits::INFLATED_BYTES as usize);
+    config.max_frame_size = Some(crate::limits::INFLATED_BYTES as usize);
+    let connection = tokio::time::timeout(Duration::from_secs(15), connect_async_with_config(req, Some(config), false)).await?;
+    let (mut ws, resp) = match connection {
         Ok(pair) => pair,
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
             let mut detail = format!("handshake status {}", resp.status());
@@ -425,7 +430,9 @@ async fn run_once(
 
     loop {
         tokio::select! {
+            _ = tx.closed() => return Ok("receiver closed".into()),
             _ = ping.tick() => {
+                if !sess.is_active() { return Ok("session revoked".into()); }
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
@@ -483,7 +490,7 @@ async fn run_once(
                         return Err(anyhow!("auth rejected: {text}"));
                     }
                     authed = true;
-                    let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() });
+                    tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() }).await?;
 
                     for (qcmd, qsub) in queues_from_auth(&auth) {
                         let id = format!("req_{req_id}");
@@ -546,7 +553,7 @@ async fn run_once(
                         .await;
                     trace(format!("-> pull next {qkey} {id}"));
                 }
-                let _ = tx.send(WsEvent { cmd, sub_cmd, version, payload });
+                tx.send(WsEvent { cmd, sub_cmd, version, payload }).await?;
             }
         }
     }

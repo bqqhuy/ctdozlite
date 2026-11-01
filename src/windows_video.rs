@@ -118,7 +118,9 @@ unsafe fn bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     let mut ptr = std::ptr::null_mut();
     let mut len = 0;
     buffer.Lock(&mut ptr, None, Some(&mut len))?;
-    let result = if len <= 16 * 1024 * 1024 {
+    let result = if len == 0 {
+        Ok(Vec::new())
+    } else if len <= 16 * 1024 * 1024 {
         Ok(std::slice::from_raw_parts(ptr, len as usize).to_vec())
     } else {
         Err(anyhow::anyhow!("Decoded video exceeds limit"))
@@ -276,7 +278,7 @@ pub fn decode(
 ) -> Result<()> {
     let _runtime = Runtime::new()?;
     unsafe {
-        let codec = Codec::decoder()?;
+        let mut codec = Codec::decoder()?;
         let mut timestamp = 0;
         while !stop.load(Ordering::Relaxed) {
             let packet = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -287,22 +289,30 @@ pub fn decode(
             if packet.is_empty() {
                 continue;
             }
-            codec.input(&sample(&packet, timestamp)?)?;
-            timestamp += 10_000_000 / 15;
-            while let Some(output) = codec.output()? {
-                let mt = codec.transform.GetOutputCurrentType(0)?;
-                let (w, h) = dimensions(&mt)?;
-                let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
-                show_frame(
-                    &bytes(&output)?,
-                    w,
-                    h,
-                    stride,
-                    "call_remote_video",
-                    &tx,
-                    &ctx,
-                )?;
-                synced.store(true, Ordering::Relaxed);
+            let result = (|| -> Result<()> {
+                codec.input(&sample(&packet, timestamp)?)?;
+                timestamp += 10_000_000 / 15;
+                while let Some(output) = codec.output()? {
+                    let mt = codec.transform.GetOutputCurrentType(0)?;
+                    let (w, h) = dimensions(&mt)?;
+                    let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
+                    show_frame(
+                        &bytes(&output)?,
+                        w,
+                        h,
+                        stride,
+                        "call_remote_video",
+                        &tx,
+                        &ctx,
+                    )?;
+                    synced.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                synced.store(false, Ordering::Relaxed);
+                crate::voip_log::line("VDEC", format!("Native decoder reset: {e}"));
+                codec = Codec::decoder()?;
             }
         }
     }

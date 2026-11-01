@@ -61,12 +61,33 @@ try {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
         $png = Join-Path (Resolve-Path dist) "ui-$($case.Size)-$($case.Scale)-$($case.Tab).png"
-        $process = Start-Process -FilePath $binary -ArgumentList @('--gui', '--ui-smoke-test', ('"' + $png + '"'), '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab) -PassThru
-        if (-not $process.WaitForExit(45000)) {
-            $process.Kill()
-            throw "GUI did not exit within 45 seconds: $($case.Size)"
+        $stdout = "$png.stdout.log"
+        $stderr = "$png.stderr.log"
+        $process = [Diagnostics.Process]::new()
+        $process.StartInfo.FileName = $binary
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        foreach ($argument in @('--gui', '--dev', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
+            $process.StartInfo.ArgumentList.Add($argument)
         }
-        if ($process.ExitCode -ne 0 -or -not (Test-Path $png)) { throw "GUI renderer smoke failed: $($case.Size)" }
+        try {
+            if (-not $process.Start()) { throw 'Cannot start GUI process' }
+            $outTask = $process.StandardOutput.ReadToEndAsync()
+            $errTask = $process.StandardError.ReadToEndAsync()
+            if (-not $process.WaitForExit(45000)) {
+                $process.Kill($true)
+                $process.WaitForExit()
+                throw "GUI did not exit within 45 seconds: $($case.Size)"
+            }
+            $outTask.GetAwaiter().GetResult() | Set-Content $stdout -Encoding utf8
+            $errTask.GetAwaiter().GetResult() | Set-Content $stderr -Encoding utf8
+            if ($process.ExitCode -ne 0 -or -not (Test-Path $png)) {
+                Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | Write-Host
+                throw "GUI renderer smoke failed: $($case.Size), exit=$($process.ExitCode)"
+            }
+        } finally { $process.Dispose() }
         Remove-Item -Recurse -Force $fixture -ErrorAction SilentlyContinue
     }
 } finally {

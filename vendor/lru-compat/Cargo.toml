@@ -1,0 +1,12 @@
+[package]
+name = "lru"
+version = "0.12.6"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+[dependencies]
+lru_fixed = { package = "lru", version = "=0.18.2", default-features = false }
+[features]
+default = ["hashbrown"]
+hashbrown = ["lru_fixed/hashbrown"]
+nightly = ["hashbrown", "lru_fixed/nightly"]
