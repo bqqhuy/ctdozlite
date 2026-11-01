@@ -93,7 +93,15 @@ impl ThemePalette {
     }
 
     pub(super) fn apply_to_ctx(&self, ctx: &egui::Context) {
-        let mut style = (*ctx.style()).clone();
+        // egui stores separate light/dark styles. A late native system-theme
+        // event must not switch to an unconfigured style behind our painted UI.
+        let theme = if self.is_dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        ctx.set_theme(theme);
+        let mut style = (*ctx.style_of(theme)).clone();
         let mut visuals = if self.is_dark {
             egui::Visuals::dark()
         } else {
@@ -139,7 +147,7 @@ impl ThemePalette {
         style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.spacing.scroll.bar_width = 6.0;
         style.visuals = visuals;
-        ctx.set_style(style);
+        ctx.set_style_of(theme, style);
     }
 }
 
@@ -836,4 +844,35 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    #[test]
+    fn selected_palette_survives_opposite_system_theme_arriving() {
+        for (palette, system_theme) in [
+            (ThemePalette::dark(), egui::Theme::Light),
+            (ThemePalette::light(), egui::Theme::Dark),
+        ] {
+            let ctx = egui::Context::default();
+            palette.apply_to_ctx(&ctx);
+            let _ = ctx.run(
+                egui::RawInput {
+                    system_theme: Some(system_theme),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert_eq!(
+                        ctx.style().visuals.override_text_color,
+                        Some(palette.text_primary)
+                    );
+                    assert_eq!(
+                        ctx.style().visuals.widgets.inactive.bg_fill,
+                        palette.bg_elevated
+                    );
+                },
+            );
+        }
+    }
 }

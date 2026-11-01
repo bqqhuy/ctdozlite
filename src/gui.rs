@@ -1402,6 +1402,13 @@ impl eframe::App for ZaloGuiApp {
                 self.allow_quit = true;
             }
         }
+        if self.settings.theme_mode == "system" {
+            let dark = ctx.system_theme() != Some(egui::Theme::Light);
+            if dark != self.dark_mode {
+                self.dark_mode = dark;
+                self.theme_dirty = true;
+            }
+        }
         if self.theme_dirty {
             self.palette().apply_to_ctx(ctx);
             self.theme_dirty = false;
