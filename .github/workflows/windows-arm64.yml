@@ -3,7 +3,7 @@ name: Windows ARM64 (native build)
 on:
   workflow_dispatch:
   push:
-    branches: [main, 'fix/windows-arm64-audit']
+    branches: [main]
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -14,8 +14,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: windows-arm64-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: windows-arm64-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/') }}
 
 env:
   CARGO_TERM_COLOR: always

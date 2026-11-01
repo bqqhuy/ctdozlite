@@ -25,6 +25,4 @@ Persistence snapshots are transactional. A cancelled polling task releases its i
 
 The Windows-only DPAPI test is included in ARM64 CI. Windows ARM64 execution, actual DPAPI behavior, GPU rendering/fallback, microphone/camera/Bluetooth, sleep/resume and installer behavior still require the Windows runner or physical hardware. The build script and workflow provide those build/test hooks; a Linux test pass does not establish Windows runtime behavior.
 
-GitHub rejected branch creation and Git push with HTTP 403 during this session, so remote CI and a pull request could not be started with the current connection. The local branch and patch can be pushed after repository write access is granted. No release was published.
-
 The binaries remain unsigned. SQLite history is scoped per account but not encrypted at the application layer. Legacy session/history is retained in its old location and needs a verified migration before reuse. The unimplemented autostart setting is disabled in the UI; attachment links still use the external application/browser for downloads.
