@@ -1,26 +1,11 @@
-//! Zalo Call & Video Call (`zcall-v2`) native bridge and signaling protocol.
-//!
-//! Reverse-engineered from `Zalo-26.10.11`:
-//! - Main process bridge (`main-dist/main.js` modules `"3Zc2"`, `"vqv6"`, `"5NUA"`, `"bhjE"`, `"ZQzv"`):
-//!   - Verifies `plugins/capture/ZaloCall.exe` MD5 (`a2b920c00115ba11a7fcdcb642147e9c`).
-//!   - Creates Windows Named Pipes `\\.\pipe\PipeZCallRecv` and `\\.\pipe\PipeZCallSend`.
-//!   - Encrypts/decrypts JSON frames with AES-128-CBC (`key = base64("yjAF9oqMWl6XfXYJn9mA7w==")`,
-//!     `iv = [0u8; 16]`), hex-encoded and delimited by `'$'`.
-//! - Renderer `[zcall-v2] call-helper` (`default-login-main-startup-shared-worker-znotification.*.js`):
-//!   - Dispatches `sendSignal` (`401`–`416`, `12006`–`12447`) over `/api/voicecall/*` and `/api/voicecall/group/*`,
-//!     returning decrypted `data` payloads via `recvSignal`.
-//!   - Forwards incoming VoIP control events (`act_type == "voip"`) from `lp_control` (`queueIds: [4, 5]`)
-//!     to `ZaloCall.exe` via `{ "type": "control", "data": event }`.
+//! Pure Rust call signaling and ZRTP relay engine for Windows ARM64.
+//! Protocol evidence is preserved in re-notes/06_call_media.md and 08_video_call.md.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
-use aes::Aes128;
 use anyhow::{anyhow, bail, Result};
-use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
-use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
@@ -28,22 +13,6 @@ use tokio::sync::{mpsc, Mutex};
 use crate::chat::QueueCursor;
 use crate::gui::GuiEvent;
 use crate::session::Session;
-
-/// Expected MD5 digest of `Zalo-26.10.11/plugins/capture/ZaloCall.exe` (`CALL_NATIVE_HASH` in module `"ZQzv"`).
-pub const CALL_NATIVE_HASH: &str = "a2b920c00115ba11a7fcdcb642147e9c";
-
-/// Named Pipe where `zalo-rust` receives frames from `ZaloCall.exe`.
-pub const PIPE_ZCALL_RECV: &str = r"\\.\pipe\PipeZCallRecv";
-
-/// Named Pipe where `zalo-rust` sends frames to `ZaloCall.exe`.
-pub const PIPE_ZCALL_SEND: &str = r"\\.\pipe\PipeZCallSend";
-
-/// `callV2TransportAesKey = "yjAF9oqMWl6XfXYJn9mA7w=="` decoded to 16 raw bytes.
-pub const CALL_V2_AES_KEY: [u8; 16] = [
-    0xca, 0x30, 0x05, 0xf6, 0x8a, 0x8c, 0x5a, 0x5e, 0x97, 0x7d, 0x76, 0x09, 0x9f, 0xd9, 0x80, 0xef,
-];
-
-const ZERO_IV: [u8; 16] = [0u8; 16];
 
 /// Call type constants matching `[zcall-v2] call-helper::makeCall` (`r = n ? (t ? 6 : 5) : (t ? 3 : 1)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,214 +181,6 @@ pub fn ensure_call_target_allowed(
     bail!("Đã khoá gọi ra: chỉ được gọi Hoang, Đỗ Thành, ĐTC (đích: {who})")
 }
 
-/// Encrypt a JSON string into a `$`-terminated hex AES-128-CBC frame (`encrypt` in module `"vqv6"`).
-pub fn encrypt_pipe_frame(plain_json: &str) -> Result<String> {
-    let bytes = plain_json.as_bytes();
-    let mut buf = vec![0u8; bytes.len() + 16];
-    buf[..bytes.len()].copy_from_slice(bytes);
-    let enc = cbc::Encryptor::<Aes128>::new_from_slices(&CALL_V2_AES_KEY, &ZERO_IV)?;
-    let ct = enc
-        .encrypt_padded_mut::<Pkcs7>(&mut buf, bytes.len())
-        .map_err(|_| anyhow!("AES-128-CBC pipe encryption padding failed"))?;
-
-    let mut out = String::with_capacity(ct.len() * 2 + 1);
-    for b in ct {
-        use std::fmt::Write;
-        let _ = write!(out, "{b:02x}");
-    }
-    out.push('$');
-    Ok(out)
-}
-
-/// Decrypt a single hex-encoded AES-128-CBC frame (without the trailing `$`) into UTF-8 JSON (`decrypt` in `"vqv6"`).
-pub fn decrypt_pipe_frame(hex_cipher: &str) -> Result<String> {
-    let trimmed = hex_cipher.trim().trim_end_matches('$');
-    if trimmed.is_empty() {
-        bail!("empty pipe frame");
-    }
-    if trimmed.len() % 2 != 0 {
-        bail!("odd hex length in pipe frame: {}", trimmed.len());
-    }
-    let mut raw = Vec::with_capacity(trimmed.len() / 2);
-    let bytes = trimmed.as_bytes();
-    for chunk in bytes.chunks_exact(2) {
-        let s = std::str::from_utf8(chunk)?;
-        let b = u8::from_str_radix(s, 16)?;
-        raw.push(b);
-    }
-    let dec = cbc::Decryptor::<Aes128>::new_from_slices(&CALL_V2_AES_KEY, &ZERO_IV)?;
-    let pt = dec
-        .decrypt_padded_mut::<Pkcs7>(&mut raw)
-        .map_err(|_| anyhow!("AES-128-CBC pipe unpad failed"))?;
-    Ok(String::from_utf8(pt.to_vec())?)
-}
-
-/// Extract complete `$`-delimited frames from an accumulation buffer, leaving any partial tail in `accum`.
-pub fn drain_pipe_frames(accum: &mut String) -> Vec<String> {
-    let mut frames = Vec::new();
-    while let Some(pos) = accum.find('$') {
-        let token: String = accum.drain(..=pos).collect();
-        let hex_part = token.trim_end_matches('$').trim();
-        if !hex_part.is_empty() {
-            frames.push(hex_part.to_string());
-        }
-    }
-    frames
-}
-
-/// Compute lowercase hex MD5 of a file on disk (`verifyMd5` in module `"vqv6"`).
-pub fn compute_file_md5(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
-    let mut h = Md5::new();
-    h.update(&bytes);
-    let out = h.finalize();
-    Ok(out.iter().fold(String::with_capacity(32), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    }))
-}
-
-/// Locate `ZaloCall.exe` across workspace and standard Zalo PC install directories.
-pub fn find_zalocall_exe() -> Option<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from(r"..\Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"plugins\capture\ZaloCall.exe"),
-        PathBuf::from(r"F:\CODE\Reverse-engineer\DATA\4_zalo\Zalo-26.10.11\plugins\capture\ZaloCall.exe"),
-    ];
-
-    if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
-        let zalo_root = Path::new(&local_app).join("Programs").join("Zalo");
-        if let Ok(entries) = std::fs::read_dir(&zalo_root) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    let candidate = p.join("plugins").join("capture").join("ZaloCall.exe");
-                    candidates.push(candidate);
-                }
-            }
-        }
-    }
-
-    candidates.into_iter().find(|p| p.is_file())
-}
-
-/// Build the `init` / `updateLocal` payload expected by `ZaloCall.exe` (`getInitialData` in `[zcall-v2] call-helper`).
-pub fn build_init_payload(s: &Session, command: &str, should_start_native: bool) -> Value {
-    let (uid, dname) = s
-        .login
-        .as_ref()
-        .map(|l| {
-            // `ZaloCall.exe` converts `local.id` to a 64-bit integer via `std::stoull`.
-            // Prefer the user's decimal `userId` (`l.uin`); fall back to `send2me_id` only if `uin` is a hex `dkey`.
-            let numeric_uid = if !l.uin.is_empty() && l.uin.chars().all(|c| c.is_ascii_digit()) {
-                l.uin.clone()
-            } else if !l.send2me_id.is_empty()
-                && l.send2me_id.chars().all(|c| c.is_ascii_digit())
-            {
-                l.send2me_id.clone()
-            } else if !l.uin.is_empty() {
-                l.uin.clone()
-            } else {
-                l.send2me_id.clone()
-            };
-            (numeric_uid, l.display_name.clone())
-        })
-        .unwrap_or_else(|| ("0".into(), "Zalo User".into()));
-
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let log_dir = cwd.join("dump");
-    let _ = std::fs::create_dir_all(&log_dir);
-
-    let call_log = log_dir.join("call.log").to_string_lossy().to_string();
-    let zrtc_log = log_dir.join("zrtc.log").to_string_lossy().to_string();
-    let crash_dmp = log_dir.join("crash.dmp").to_string_lossy().to_string();
-
-    let os_info = format!(
-        "Windows_NT_10.0_win32_x64;{} ({})",
-        s.computer_name,
-        std::env::consts::ARCH
-    );
-
-    json!({
-        "type": "update",
-        "command": command,
-        "data": {
-            "local": {
-                "id": uid,
-                "avatar": "",
-                "name": if dname.is_empty() { "Zalo User" } else { &dname }
-            },
-            "osInfo": os_info,
-            "mainWindowId": uid,
-            "logPath": call_log,
-            "zrtcLogPath": zrtc_log,
-            "dumpPath": crash_dmp,
-            "clientVersion": 694,
-            "language": "vi",
-            "timeoutMakeCall2ZRtp": 15000,
-            "enablePreviewDeviceOutgoing": true,
-            "enablePreviewDeviceIncall": true,
-            "enableUnstableConnecting": true,
-            "receiveCallWhileNoMicrophoneDetected": true,
-            "receiveCallWhileNoSpeakerDetected": true,
-            "autoAudioInput": true,
-            "autoAudioOutput": true,
-            "defaultAudInputDevice": null,
-            "defaultAudOutputDevice": null,
-            "defaultVidDevice": null
-        },
-        "_optional": !should_start_native
-    })
-}
-
-/// Build the `makeCall` request frame (`makeCall` in `[zcall-v2] call-helper`).
-pub fn build_make_call_payload(
-    partner_id: &str,
-    partner_name: &str,
-    partner_avatar: Option<&str>,
-    is_video: bool,
-    is_group: bool,
-) -> Value {
-    let call_type = CallType::from_flags(is_video, is_group) as u8;
-    let avatar_url = partner_avatar.unwrap_or("");
-    let group_info = if is_group {
-        let clean_gid = partner_id
-            .trim_start_matches("group_")
-            .trim_start_matches('g')
-            .trim_start_matches('G');
-        json!({
-            "id": format!("group_{clean_gid}"),
-            "name": partner_name,
-            "avatar": avatar_url
-        })
-    } else {
-        Value::Null
-    };
-
-    json!({
-        "type": "request",
-        "command": "makeCall",
-        "data": {
-            "partner": [
-                {
-                    "id": partner_id,
-                    "avatar": avatar_url,
-                    "name": partner_name
-                }
-            ],
-            "type": call_type,
-            "groupInfo": group_info,
-            "isFirstCall": false
-        }
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Outbound Native-to-Server Signaling (`/api/voicecall/*` & `/api/voicecall/group/*`)
-// ---------------------------------------------------------------------------
-
 fn voice_call_domain(s: &Session) -> &str {
     if s.domains.voice_call.is_empty() {
         "https://voicecall-wpa.chat.zalo.me"
@@ -516,6 +277,33 @@ pub async fn dispatch_send_signal(s: &Session, command: i64, n: &Value) -> Resul
     result
 }
 
+fn initial_call_request(s: &Session, n: &Value) -> Value {
+            let has_media = n
+                .get("extendData")
+                .filter(|v| !v.is_null() && v.as_str() != Some(""))
+                .is_some();
+            if has_media {
+                json!({
+                    "callId": n.get("callId").cloned().unwrap_or(json!(0)),
+                    "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
+                    "codec": n.get("codec").cloned().unwrap_or(json!("[]")),
+                    "extendData": n.get("extendData").cloned().unwrap_or(json!("")),
+                    "rtcpAddress": n.get("rtcpAddress").cloned().unwrap_or(json!("")),
+                    "rtpAddress": n.get("rtpAddress").cloned().unwrap_or(json!("")),
+                    "session": n.get("session").cloned().unwrap_or(json!("")),
+                })
+            } else {
+                // Legacy path (no cached relay yet): keep the original minimal dial body.
+                json!({
+                    "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
+                    "callId": n.get("callId").cloned().unwrap_or(json!(0)),
+                    "codec": n.get("codec").cloned().unwrap_or(json!("[]")),
+                    "typeRequest": n.get("typeRequest").or_else(|| n.get("type")).cloned().unwrap_or(json!(1)),
+                    "imei": s.imei,
+                })
+            }
+}
+
 async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Result<Value> {
     // Outbound-dial lock: `401`/`416` are the only commands that create a call record server-side,
     // so refusing them here covers the GUI, `call_probe` and any future caller in one place.
@@ -539,30 +327,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
             // else. The desktop body has exactly these seven keys: no `typeRequest`, no `imei`,
             // no `subCommand` (`subCommand:3` belongs to the 416 only). Extra keys made the
             // backend degrade the invite (`params.status=5`, `extendData` stripped).
-            let has_media = n
-                .get("extendData")
-                .filter(|v| !v.is_null() && v.as_str() != Some(""))
-                .is_some();
-            let body = if has_media {
-                json!({
-                    "callId": n.get("callId").cloned().unwrap_or(json!(0)),
-                    "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
-                    "codec": n.get("codec").cloned().unwrap_or(json!("[]")),
-                    "extendData": n.get("extendData").cloned().unwrap_or(json!("")),
-                    "rtcpAddress": n.get("rtcpAddress").cloned().unwrap_or(json!("")),
-                    "rtpAddress": n.get("rtpAddress").cloned().unwrap_or(json!("")),
-                    "session": n.get("session").cloned().unwrap_or(json!("")),
-                })
-            } else {
-                // Legacy path (no cached relay yet): keep the original minimal dial body.
-                json!({
-                    "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
-                    "callId": n.get("callId").cloned().unwrap_or(json!(0)),
-                    "codec": n.get("codec").cloned().unwrap_or(json!("[]")),
-                    "typeRequest": n.get("typeRequest").or_else(|| n.get("type")).cloned().unwrap_or(json!(1)),
-                    "imei": s.imei,
-                })
-            };
+            let body = initial_call_request(s, n);
             voicecall_get(s, "/api/voicecall/requestcall", &body).await
         }
         // 416 -> cmd 11301: `/api/voicecall/request`
@@ -3053,6 +2818,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn initial_video_request_preserves_type_and_rich_invite_shape() {
+        let s = Session::new(false,false,false).unwrap();
+        let video = initial_call_request(&s,&json!({"calleeId":"fixture","callId":42,"typeRequest":3,"codec":"[]"}));
+        assert_eq!(video["typeRequest"],3);
+        let rich = initial_call_request(&s,&json!({"calleeId":"fixture","callId":42,"typeRequest":3,"extendData":"{}","codec":"[]","rtpAddress":"127.0.0.1:9","rtcpAddress":"127.0.0.1:9","session":"fixture"}));
+        assert_eq!(rich.as_object().unwrap().len(),7);
+        assert!(rich.get("typeRequest").is_none());
+        assert!(rich.get("imei").is_none());
+    }
+
+    #[test]
     fn outbound_call_lock_allows_only_test_accounts() {
         // 19-digit mock thread ids / uins
         assert!(restricted_call_target_allowed(
@@ -3121,42 +2897,11 @@ mod tests {
     }
 
     #[test]
-    fn pipe_aes_roundtrip_and_delimiter() {
-        let msg = r#"{"type":"update","command":"native-ready"}"#;
-        let frame = encrypt_pipe_frame(msg).unwrap();
-        assert!(frame.ends_with('$'));
-        let decoded = decrypt_pipe_frame(&frame).unwrap();
-        assert_eq!(decoded, msg);
-    }
-
-    #[test]
-    fn drain_pipe_frames_splits_multiple_and_keeps_partial() {
-        let f1 = encrypt_pipe_frame(r#"{"a":1}"#).unwrap();
-        let f2 = encrypt_pipe_frame(r#"{"b":2}"#).unwrap();
-        let mut buf = format!("{f1}{f2}deadbeef");
-        let drained = drain_pipe_frames(&mut buf);
-        assert_eq!(drained.len(), 2);
-        assert_eq!(decrypt_pipe_frame(&drained[0]).unwrap(), r#"{"a":1}"#);
-        assert_eq!(decrypt_pipe_frame(&drained[1]).unwrap(), r#"{"b":2}"#);
-        assert_eq!(buf, "deadbeef");
-    }
-
-    #[test]
     fn call_type_codes_match_zalo_pc() {
         assert_eq!(CallType::from_flags(false, false) as u8, 1);
         assert_eq!(CallType::from_flags(true, false) as u8, 3);
         assert_eq!(CallType::from_flags(false, true) as u8, 5);
         assert_eq!(CallType::from_flags(true, true) as u8, 6);
-    }
-
-    #[test]
-    fn make_call_payload_structure() {
-        let p = build_make_call_payload("12345", "Nguyen Van A", Some("https://ava.zdn.vn/1.jpg"), true, false);
-        assert_eq!(p["type"], "request");
-        assert_eq!(p["command"], "makeCall");
-        assert_eq!(p["data"]["type"], 3);
-        assert_eq!(p["data"]["partner"][0]["id"], "12345");
-        assert_eq!(p["data"]["partner"][0]["name"], "Nguyen Van A");
     }
 
     #[test]
@@ -3191,20 +2936,6 @@ mod tests {
         let parsed = normalize_voicecall_data(json!(r#"{"callId":42,"sessId":"abc"}"#));
         assert_eq!(parsed["callId"], 42);
         assert_eq!(parsed["sessId"], "abc");
-    }
-
-    #[test]
-    fn init_payload_prefers_numeric_uin_over_send2me() {
-        let mut s = Session::new(false, false, false).unwrap();
-        s.login = Some(crate::session::LoginInfo {
-            uin: "1000000000000000002".into(),
-            send2me_id: "9000000000000000001".into(),
-            display_name: "Hoang".into(),
-            ..Default::default()
-        });
-        let init = build_init_payload(&s, "init", true);
-        assert_eq!(init["data"]["local"]["id"], "1000000000000000002");
-        assert_eq!(init["data"]["local"]["name"], "Hoang");
     }
 
     #[test]

@@ -15,9 +15,37 @@ use windows::{
     Win32::{Media::MediaFoundation::*, System::Com::*},
 };
 
+fn media_components() -> Result<()> {
+    static READY: std::sync::OnceLock<std::result::Result<(), String>> = std::sync::OnceLock::new();
+    let result = READY.get_or_init(|| {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryExW(
+                name: *const u16,
+                file: *mut std::ffi::c_void,
+                flags: u32,
+            ) -> *mut std::ffi::c_void;
+        }
+        for name in ["mfplat.dll", "mfreadwrite.dll", "mf.dll"] {
+            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+            // System32 only, with modules held for process lifetime to back delay imports.
+            if unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0x800) }.is_null() {
+                return Err(format!(
+                    "Thiếu {name}; Windows N cần cài Media Feature Pack rồi khởi động lại ứng dụng"
+                ));
+            }
+        }
+        Ok(())
+    });
+    result
+        .as_ref()
+        .map(|_| ())
+        .map_err(|reason| anyhow::anyhow!("{reason}"))
+}
 struct Runtime;
 impl Runtime {
     fn new() -> Result<Self> {
+        media_components()?;
         unsafe {
             CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
             if let Err(e) = MFStartup(MF_VERSION, MFSTARTUP_FULL) {

@@ -414,7 +414,11 @@ impl ZaloGuiApp {
         let loaded_settings = AppSettings::load();
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
-        let dark_mode = loaded_settings.theme_mode != "light";
+        let dark_mode = match loaded_settings.theme_mode.as_str() {
+            "light" => false,
+            "system" => cc.egui_ctx.system_theme() != Some(egui::Theme::Light),
+            _ => true,
+        };
         if dark_mode {
             ThemePalette::dark().apply_to_ctx(&cc.egui_ctx);
         } else {
@@ -503,7 +507,7 @@ impl ZaloGuiApp {
             filter_starred_only: false,
             active_call: None,
             image_viewer: None,
-            status_msg: "Trực tuyến · Sẵn sàng".into(),
+            status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: true,
             profile_menu_open: false,
             toast_notice: None,
@@ -663,7 +667,7 @@ impl ZaloGuiApp {
                     self.login_in_progress = false;
                     self.password_input.clear();
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
-                    self.status_msg = "Trực tuyến · Đồng bộ thời gian thực".into();
+                    self.status_msg = "Đã đăng nhập · Nhận cập nhật".into();
                 }
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
@@ -753,7 +757,7 @@ impl ZaloGuiApp {
                         }
                         self.persist_threads_async();
                     }
-                    self.status_msg = format!("Trực tuyến · Cập nhật {}", crate::ui::clock());
+                    self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
                     self.is_logged_in = false;
@@ -997,8 +1001,12 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
-                    let tex = ctx.load_texture(&key, image, TextureOptions::LINEAR);
-                    self.sticker_textures.insert(key, tex);
+                    if let Some(texture) = self.sticker_textures.get_mut(&key) {
+                        texture.set(image, TextureOptions::LINEAR);
+                    } else {
+                        let texture = ctx.load_texture(&key, image, TextureOptions::LINEAR);
+                        self.sticker_textures.insert(key, texture);
+                    }
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;

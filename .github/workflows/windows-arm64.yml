@@ -66,7 +66,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-arm64-1.99.1
-          save-if: ${{ always() }}
+          save-if: 'true'
       - name: Tests, native PE smoke check and package
         shell: pwsh
         run: ./scripts/build-windows-arm64.ps1

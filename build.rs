@@ -11,6 +11,12 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_os == "windows" && target_env == "msvc" {
+        // Optional Windows N media components must not prevent the GUI from loading.
+        // windows_video checks/loads System32 DLLs before calling delay imports.
+        for dll in ["mfplat.dll", "mfreadwrite.dll", "mf.dll"] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-lib=delayimp");
         if let Err(e) = embed_windows_icon() {
             println!("cargo:warning=Could not embed Windows icon resource: {e}");
         }

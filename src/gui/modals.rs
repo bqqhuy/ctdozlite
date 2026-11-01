@@ -1019,7 +1019,7 @@ impl ZaloGuiApp {
                                                                 let r_clicked = ui.radio(selected, label).clicked();
                                                                 if c_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() || r_clicked {
                                                                     self.settings.theme_mode = mode_key.into();
-                                                                    self.dark_mode = is_dark_val;
+                                                                    self.dark_mode = if mode_key == "system" { ctx.system_theme() != Some(egui::Theme::Light) } else { is_dark_val };
                                                                     theme_switched = true;
                                                                 }
                                                             });
