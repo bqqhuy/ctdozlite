@@ -160,10 +160,7 @@ pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
 }
 
 pub(super) fn is_session_expired_error(err_str: &str) -> bool {
-    err_str.contains("server error 600")
-        || err_str.contains("zpw_sek")
-        || err_str.contains("server error -102")
-        || err_str.contains("chưa đăng nhập")
+    crate::session::is_expired_error(err_str)
 }
 
 /// Immediately decode any disk-cached sticker thumbnails (`stickers_cache/stk_{cid}_{sid}.png`)
@@ -650,7 +647,13 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             tokio::spawn(async move {
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
-                                    if !s.validate_session().await {
+                                    let status = s.validate_session().await;
+                                    if let crate::session::SessionStatus::Unreachable(reason) = &status {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Chưa thể kết nối; giữ phiên và lịch sử cục bộ: {reason}")));
+                                        ctx_clone.request_repaint();
+                                        return;
+                                    }
+                                    if status == crate::session::SessionStatus::Expired {
                                         if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                         {
                                             let mut sl = session_clone.lock().await;
@@ -687,8 +690,14 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             avatar: u_ava,
                                         });
                                     }
-                                    let mut list =
-                                        crate::chat::get_friends(&s).await.unwrap_or_default();
+                                    let mut list = match crate::chat::get_friends(&s).await {
+                                        Ok(list) => list,
+                                        Err(e) => {
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Cập nhật hội thoại thất bại: {e}")));
+                                            ctx_clone.request_repaint();
+                                            return;
+                                        }
+                                    };
                                     crate::store::load_history_into_threads(
                                         s.history_path(),
                                         &mut list,
@@ -700,7 +709,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             crate::chat::poll_new_messages(&s, &mut ps, &mut list)
                                                 .await;
                                     }
+                                    let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Đã cập nhật {count} hội thoại và tin gần đây; chưa tải toàn bộ lịch sử")));
                                     ctx_clone.request_repaint();
                                 }
                             });

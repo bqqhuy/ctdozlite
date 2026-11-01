@@ -62,6 +62,9 @@ pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
             }
         }
     }
+    #[cfg(windows)]
+    let cams = crate::windows_video::camera_names().unwrap_or_default();
+    #[cfg(not(windows))]
     let cams = enumerate_ffmpeg_cameras();
     let pair = (mics, cams);
     if let Ok(mut g) = CACHED_DEVICES.lock() {
@@ -258,9 +261,9 @@ impl MediaHandle {
 impl Drop for MediaHandle {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for t in self.threads.drain(..) {
-            let _ = t.join();
-        }
+        // Device shutdown can block in a driver. Never join it on the GUI thread.
+        let threads = std::mem::take(&mut self.threads);
+        thread::spawn(move || { for t in threads { let _ = t.join(); } });
     }
 }
 
@@ -768,6 +771,17 @@ fn spawn_camera_capture_thread(
     gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     egui_ctx: Option<eframe::egui::Context>,
 ) {
+    #[cfg(windows)]
+    {
+        thread::spawn(move || {
+            if let Err(e) = crate::windows_video::capture(stop, cam_enabled, want_keyframe, cam_au_tx, gui_tx.clone(), egui_ctx.clone()) {
+                if let Some(tx) = gui_tx { let _ = tx.send(crate::gui::GuiEvent::CameraUnavailable(format!("Camera: {e:#}"))); }
+                if let Some(ctx) = egui_ctx { ctx.request_repaint(); }
+            }
+        });
+        return;
+    }
+    #[cfg(not(windows))]
     thread::spawn(move || {
         use std::io::Read;
         use std::process::Stdio;
@@ -1154,6 +1168,10 @@ fn run_media_loop(
     gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     egui_ctx: Option<eframe::egui::Context>,
 ) {
+    // Stop camera/decoder tasks on every early return (missing mic, codec or device).
+    struct StopOnExit(Arc<AtomicBool>);
+    impl Drop for StopOnExit { fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); } }
+    let _stop_on_exit = StopOnExit(stop.clone());
     let (h264_tx, h264_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(120);
     let (cam_au_tx, cam_au_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
     let video_synced = Arc::new(AtomicBool::new(false));
@@ -1379,8 +1397,6 @@ fn run_media_loop(
     let mut vid_seq: u16 = 0;
     let mut vid_ts: u32 = 0;
     let mut vid_frame_no: u32 = 0;
-    let mut vid_gop_pos: usize = 0;
-    let mut vid_idr_parity: u8 = 0;
     clear_rtcp_inbox();
     // Reception stats for the peer's audio/video streams (they share one SSRC but have separate seq spaces),
     // and the last Sender Report seen (for LSR/DLSR in our report blocks).
@@ -1410,7 +1426,6 @@ fn run_media_loop(
     );
     let vid_ssrc = ssrc.wrapping_add(1);
     let mut nego_seq: u32 = 1;
-    let mut last_cam_idr: Option<Vec<u8>> = None;
 
     while !stop.load(Ordering::Relaxed) {
         // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
@@ -1465,7 +1480,7 @@ fn run_media_loop(
             }
         }
 
-        // --- Video: synthetic H.264 stream (90 kHz clock, 15 fps) in the Zalo wire format ---
+        // --- Video: live H.264 stream (90 kHz clock, 15 fps) in the Zalo wire format ---
         // One Annex-B access unit per frame: `PT 97` when it fits `RTP_MAX_PAYLOAD`, else `PT 98` fragments
         // (see `packetize_zalo_au`); marker bit only on the last packet of the frame.
         // A PLI/FIR from the peer (RTCP inbox, or RTP socket if the relay mixes them) forces an immediate SPS+PPS+IDR.
@@ -1473,70 +1488,13 @@ fn run_media_loop(
             && last_video_tx.elapsed() >= Duration::from_millis(66)
         {
             last_video_tx = std::time::Instant::now();
-            let force_kf = vid_frame_no == 0
-                || vid_gop_pos >= H264_PSLICES.len()
-                || vid_frame_no % VIDEO_IDR_INTERVAL_FRAMES == 0
-                || want_keyframe.swap(false, Ordering::Relaxed);
-
-            // Drain latest live webcam access unit if available
-            let mut latest_cam_au: Option<Vec<u8>> = None;
-            while let Ok(au) = cam_au_rx.try_recv() {
-                if au_has_idr(&au) {
-                    last_cam_idr = Some(au.clone());
-                }
-                latest_cam_au = Some(au);
-            }
-
-            let au_bytes: Vec<u8> = if cam_enabled.load(Ordering::Relaxed) {
-                if let Some(au) = latest_cam_au {
-                    if force_kf && !au_has_idr(&au) {
-                        if let Some(cached_idr) = &last_cam_idr {
-                            cached_idr.clone()
-                        } else {
-                            au
-                        }
-                    } else {
-                        au
-                    }
-                } else if let Some(cached_idr) = &last_cam_idr {
-                    if force_kf {
-                        cached_idr.clone()
-                    } else {
-                        let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                        vid_gop_pos = (vid_gop_pos + 1) % H264_PSLICES.len();
-                        annexb_au(&[p_nal])
-                    }
-                } else {
-                    let idr_nal = if (vid_idr_parity & 1) == 0 {
-                        H264_IDR
-                    } else {
-                        H264_IDR_ALT
-                    };
-                    let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                    if force_kf {
-                        vid_idr_parity = vid_idr_parity.wrapping_add(1);
-                        vid_gop_pos = 0;
-                        annexb_au(&[H264_SPS, H264_PPS, idr_nal])
-                    } else {
-                        vid_gop_pos += 1;
-                        annexb_au(&[p_nal])
-                    }
-                }
+            // Preserve encoded frame order. Dropping P frames or replaying a stale
+            // IDR among newer P frames corrupts the decoder reference picture.
+            let au_bytes = if cam_enabled.load(Ordering::Relaxed) {
+                cam_au_rx.try_recv().unwrap_or_default()
             } else {
-                let idr_nal = if (vid_idr_parity & 1) == 0 {
-                    H264_IDR
-                } else {
-                    H264_IDR_ALT
-                };
-                let p_nal = H264_PSLICES[vid_gop_pos.min(H264_PSLICES.len() - 1)];
-                if force_kf {
-                    vid_idr_parity = vid_idr_parity.wrapping_add(1);
-                    vid_gop_pos = 0;
-                    annexb_au(&[H264_SPS, H264_PPS, idr_nal])
-                } else {
-                    vid_gop_pos += 1;
-                    annexb_au(&[p_nal])
-                }
+                while cam_au_rx.try_recv().is_ok() {}
+                Vec::new()
             };
 
             let payloads = packetize_zalo_au(&au_bytes, RTP_MAX_PAYLOAD);
@@ -1888,6 +1846,16 @@ fn run_h264_ffmpeg_decoder(
     egui_ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
 ) {
+    #[cfg(windows)]
+    {
+        if let Err(e) = crate::windows_video::decode(stop, h264_rx, gui_tx.clone(), egui_ctx.clone(), synced) {
+            let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(format!("Video decode: {e:#}")));
+            egui_ctx.request_repaint();
+        }
+        return;
+    }
+    #[cfg(not(windows))]
+    {
     use std::io::{Read, Write};
     use std::process::Stdio;
 
@@ -2044,6 +2012,7 @@ fn run_h264_ffmpeg_decoder(
     }
     crate::voip_log::line("VDEC", format!("decoder stop, {decoded} frames decoded"));
     let _ = child.kill();
+    }
 }
 
 #[cfg(test)]

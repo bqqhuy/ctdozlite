@@ -125,6 +125,13 @@ fn listing(path: &Path, argument: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[cfg(windows)]
+pub fn readiness() -> Result<PathBuf> {
+    crate::windows_video::readiness()?;
+    Ok(PathBuf::from("Windows Media Foundation (native)"))
+}
+
+#[cfg(not(windows))]
 pub fn readiness() -> Result<PathBuf> {
     let path = resolve()?;
     check_architecture(&path)?;

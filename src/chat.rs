@@ -377,7 +377,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             Session::plain_params(&body)
         }
     };
-    let hosts = [&s.domains.profile, &s.domains.friend];
+    let hosts = [&s.domains.friend, &s.domains.profile];
     let mut resp_opt = None;
     let mut last_err = None;
     for host in hosts {
@@ -2628,7 +2628,11 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
                 });
             }
             if !groups.is_empty() {
-                if let Ok(gv_str) = serde_json::to_string(map) {
+                // getlg reports server versions, not metadata already cached by us.
+                // Sending those versions back suppresses the very names we need.
+                let missing_versions: serde_json::Map<String, Value> = map.keys()
+                    .map(|id| (id.clone(), json!(0))).collect();
+                if let Ok(gv_str) = serde_json::to_string(&missing_versions) {
                     let body = obj(&[("gridVerMap", json!(gv_str))]);
                     if let Ok(params) = s.encoded_params(&body) {
                         let mg_url = format!("{}/api/group/getmg-v2?{}", s.domains.group, s.common_params());

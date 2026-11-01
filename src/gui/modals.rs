@@ -574,8 +574,10 @@ impl ZaloGuiApp {
         let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
-        let win_w = (screen.width() * 0.88).clamp(620.0, 780.0);
-        let win_h = (screen.height() * 0.82).clamp(480.0, 600.0);
+        let win_w = (screen.width() - 24.0).min(900.0).max(280.0);
+        let win_h = (screen.height() - 24.0).min(680.0).max(240.0);
+        let compact = win_w < 700.0;
+        let sidebar_w = if compact { 48.0 } else { 200.0 };
 
         let mut theme_switched = false;
         let mut trigger_sync = false;
@@ -604,7 +606,7 @@ impl ZaloGuiApp {
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(10.0, 16.0))
                         .show(ui, |ui| {
-                            ui.set_width(200.0);
+                            ui.set_width(sidebar_w);
                             ui.set_height(win_h - 32.0);
                             ui.vertical(|ui| {
                                 ui.add_space(4.0);
@@ -635,7 +637,7 @@ impl ZaloGuiApp {
                                     };
 
                                     let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(196.0, 36.0),
+                                        Vec2::new(sidebar_w - 4.0, 36.0),
                                         Sense::click(),
                                     );
                                     if is_active || resp.hovered() {
@@ -657,6 +659,7 @@ impl ZaloGuiApp {
                                         14.5,
                                         text_col,
                                     );
+                                    if !compact {
                                     let text_pt = Pos2::new(rect.left() + 38.0, rect.center().y);
                                     ui.painter().text(
                                         text_pt,
@@ -670,6 +673,8 @@ impl ZaloGuiApp {
                                         },
                                     );
 
+                                    }
+
                                     if resp
                                         .on_hover_cursor(CursorIcon::PointingHand)
                                         .clicked()
@@ -682,7 +687,7 @@ impl ZaloGuiApp {
                         });
 
                     // Right Content Panel
-                    let content_w = win_w - 220.0;
+                    let content_w = (win_w - sidebar_w - 20.0 - 48.0).max(160.0);
                     egui::Frame::none()
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(24.0, 16.0))
@@ -742,7 +747,8 @@ impl ZaloGuiApp {
                             ui.separator();
                             ui.add_space(8.0);
 
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
+                                .max_height((win_h - 100.0).max(100.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     match self.settings_tab {
@@ -1036,15 +1042,15 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(18.0, 16.0))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 18.0;
+                                                        ui.spacing_mut().item_spacing.x = 8.0;
                                                         for (mode_key, label, is_dark_val) in [
                                                             ("light", "Sáng", false),
                                                             ("dark", "Tối", true),
                                                             ("system", "Hệ Thống", true),
                                                         ] {
                                                             let selected = self.settings.theme_mode == mode_key;
-                                                            ui.vertical_centered(|ui| {
-                                                                let (card_r, c_resp) = ui.allocate_exact_size(Vec2::new(132.0, 84.0), Sense::click());
+                                                            ui.vertical(|ui| {
+                                                                let (card_r, c_resp) = ui.allocate_exact_size(Vec2::new(((content_w - 52.0) / 3.0).clamp(60.0, 132.0), 84.0), Sense::click());
                                                                 let stroke_col = if selected {
                                                                     pal.primary_hover
                                                                 } else if c_resp.hovered() {

@@ -784,27 +784,7 @@ impl ZaloGuiApp {
                                 &self.sticker_textures,
                                 &mut self.loading_stickers,
                             );
-                            // Cutout status dot (`2.5px` ring matching row background)
-                            let cutout_col = if is_selected {
-                                pal.bg_selected
-                            } else {
-                                pal.bg_sidebar
-                            };
-                            let badge_pos = Pos2::new(
-                                avatar_center.x + av_radius * 0.71,
-                                avatar_center.y + av_radius * 0.71,
-                            );
-                            ui.painter().circle_filled(badge_pos, 6.0, cutout_col);
-                            ui.painter().circle_filled(
-                                badge_pos,
-                                4.0,
-                                if t.is_group {
-                                    pal.primary
-                                } else {
-                                    pal.accent_online
-                                },
-                            );
-
+                            // Presence is unknown: no verified presence feed is available.
                             // Only show text labels when sidebar is expanded
                             if !is_narrow_w {
                                 // Thread Name
@@ -1156,13 +1136,13 @@ impl ZaloGuiApp {
                                             .unwrap_or(crate::chat::FriendshipStatus::Unknown)
                                     };
                                     let (sub_txt, sub_col) = if d_is_group {
-                                        ("Nhóm đang hoạt động", pal.accent_online)
+                                        ("Nhóm trò chuyện", pal.text_secondary)
                                     } else if d_is_cloud {
                                         ("Lưu trữ đám mây cá nhân", pal.primary_hover)
                                     } else {
                                         match d_fr_status {
                                             crate::chat::FriendshipStatus::Friend => {
-                                                ("✓ Đã kết bạn · Trực tuyến", pal.accent_online)
+                                                ("✓ Đã kết bạn", pal.text_secondary)
                                             }
                                             crate::chat::FriendshipStatus::IncomingPending => (
                                                 "📩 Đã gửi lời mời kết bạn cho bạn",
@@ -1487,11 +1467,6 @@ impl ZaloGuiApp {
                                     &self.sticker_textures,
                                     &mut self.loading_stickers,
                                 );
-                                let dot_pos =
-                                    Pos2::new(av_rect.right() - 4.0, av_rect.bottom() - 4.0);
-                                ui.painter().circle_filled(dot_pos, 6.2, pal.bg_sidebar);
-                                ui.painter().circle_filled(dot_pos, 4.2, pal.accent_online);
-
                                 ui.add_space(6.0);
                                 // Reserve room for the right-hand action cluster so the name/tag
                                 // block can never be overlapped by the call buttons.
@@ -1572,13 +1547,13 @@ impl ZaloGuiApp {
                                             }
                                         });
                                         let (sub_status_lbl, sub_status_col) = if is_group {
-                                            ("Đang hoạt động", pal.accent_online)
+                                            ("Nhóm trò chuyện", pal.text_secondary)
                                         } else if is_cloud_thread {
                                             ("Lưu trữ đám mây cá nhân", pal.text_secondary)
                                         } else {
                                             match cur_friendship {
                                                 crate::chat::FriendshipStatus::Friend => {
-                                                    ("Đã kết bạn · Vừa mới truy cập", pal.accent_online)
+                                                    ("Đã kết bạn", pal.text_secondary)
                                                 }
                                                 crate::chat::FriendshipStatus::IncomingPending => (
                                                     "Đã gửi lời mời kết bạn cho bạn",
@@ -1593,7 +1568,7 @@ impl ZaloGuiApp {
                                                     Color32::from_rgb(249, 115, 22),
                                                 ),
                                                 crate::chat::FriendshipStatus::Unknown => {
-                                                    ("Vừa mới truy cập", pal.text_secondary)
+                                                    ("Chưa có thông tin trạng thái", pal.text_secondary)
                                                 }
                                             }
                                         };

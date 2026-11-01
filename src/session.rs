@@ -29,6 +29,21 @@ pub const CONFIG_DOMAIN: &str = "zaloapp.com";
 /// flavours differ, and using the wrong set yields nginx 404s.
 ///
 /// [`Session::apply_server_info`] re-applies them from the login payload each run.
+/// Only explicit authentication errors expire a saved login. Offline/HTTP/parse
+/// failures must leave the protected session and local history intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionStatus {
+    Valid,
+    Expired,
+    Unreachable(String),
+}
+
+pub fn is_expired_error(message: &str) -> bool {
+    message.split("server error ").skip(1).any(|part| {
+        matches!(part.split(|c: char| !c.is_ascii_digit() && c != '-').next(), Some("600" | "-102"))
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domains {
     /// `wpa.zaloapp.com` — `reqqr`, password login.
@@ -104,8 +119,8 @@ impl Default for Domains {
         Self {
             auth: crate::endpoints::AUTH.into(),
             wpa_chat: crate::endpoints::WPA_CHAT.into(),
-            chat: crate::endpoints::MSG_CHAT.into(),
-            conversation: crate::endpoints::CONVERS_CTL.into(),
+            chat: crate::endpoints::service("chat").unwrap().into(),
+            conversation: crate::endpoints::service("conversation").unwrap().into(),
             lp_chat: default_lp_chat(),
             lp_control: default_lp_control(),
             friend: "https://tt-friend-wpa.chat.zalo.me".into(),
@@ -243,33 +258,29 @@ impl Session {
         }
     }
 
-    /// Check whether the current session is valid on the server.
-    pub async fn validate_session(&self) -> bool {
+    /// Check the server without treating a transient network failure as logout.
+    pub async fn validate_session(&self) -> SessionStatus {
         if self.login.is_none() || self.zpw_sek.is_none() {
-            return false;
+            return SessionStatus::Expired;
         }
-        let body = serde_json::json!({
-            "avatar_size": 160,
-            "imei": self.imei,
-        });
-        let url = match self.encoded_params(&body) {
-            Ok(enc) => format!(
-                "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
-                self.domains.profile,
-                self.common_params()
-            ),
-            Err(_) => format!(
-                "{}/api/social/profile/me-v2?{}",
-                self.domains.profile,
-                self.common_params()
-            ),
+        let body = serde_json::json!({ "avatar_size": 160, "imei": self.imei });
+        let enc = match self.encoded_params(&body) {
+            Ok(enc) => enc,
+            Err(e) => return SessionStatus::Unreachable(e.to_string()),
         };
+        let url = format!("{}/api/social/profile/me-v2?{}&params={enc}&os=8",
+            self.domains.profile, self.common_params());
         match self.get(&url).await {
             Ok(resp) => {
-                let code = resp.get("error_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
-                code == 0
+                let resp = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+                match resp.get("error_code").and_then(Value::as_i64) {
+                    Some(0) => SessionStatus::Valid,
+                    Some(600 | -102) => SessionStatus::Expired,
+                    _ => SessionStatus::Unreachable("Không đọc được phản hồi xác thực".into()),
+                }
             }
-            Err(_) => false,
+            Err(e) if is_expired_error(&e.to_string()) => SessionStatus::Expired,
+            Err(e) => SessionStatus::Unreachable(e.to_string()),
         }
     }
 

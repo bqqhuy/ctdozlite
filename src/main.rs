@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
             }
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()
-            .with_decorations(false)
+            .with_decorations(true)
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("Zalo");
@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
 
     // Validate session on server to avoid getting stuck in an expired session
     let session_restored = if session_restored {
-        if s.validate_session().await {
+        if s.validate_session().await != session::SessionStatus::Expired {
             true
         } else {
             println!(
@@ -309,3 +309,6 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
     }
     order
 }
+
+#[cfg(windows)]
+mod windows_video;
