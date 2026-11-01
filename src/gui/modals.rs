@@ -72,7 +72,7 @@ impl ZaloGuiApp {
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::RefreshThreads);
                             }
-                            self.show_toast("Đang đồng bộ 20 hội thoại ngầm…");
+                            self.show_toast("Đang cập nhật hội thoại và tin gần đây…");
                             close_menu = true;
                         }
 
@@ -574,8 +574,8 @@ impl ZaloGuiApp {
         let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
-        let win_w = (screen.width() - 24.0).min(900.0).max(280.0);
-        let win_h = (screen.height() - 24.0).min(680.0).max(240.0);
+        let win_w = (screen.width() - 16.0).clamp(160.0, 900.0);
+        let win_h = (screen.height() - 16.0).clamp(160.0, 680.0);
         let compact = win_w < 700.0;
         let sidebar_w = if compact { 48.0 } else { 200.0 };
 
@@ -601,6 +601,7 @@ impl ZaloGuiApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
 
+                    if !compact {
                     // Left Tabs Navigation Sidebar (200px)
                     egui::Frame::none()
                         .fill(pal.bg_sidebar)
@@ -686,8 +687,9 @@ impl ZaloGuiApp {
                             });
                         });
 
+                    }
                     // Right Content Panel
-                    let content_w = (win_w - sidebar_w - 20.0 - 48.0).max(160.0);
+                    let content_w = (win_w - if compact { 0.0 } else { sidebar_w + 20.0 } - 48.0).max(64.0);
                     egui::Frame::none()
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(24.0, 16.0))
@@ -705,12 +707,29 @@ impl ZaloGuiApp {
                                     SettingsTab::Messages => "Cài đặt tin nhắn",
                                     SettingsTab::Utilities => "Tiện ích & Gợi ý",
                                 };
+                                if compact {
+                                    egui::ComboBox::from_id_salt("settings_compact_tab")
+                                        .width((content_w - 40.0).max(60.0))
+                                        .selected_text(tab_title)
+                                        .show_ui(ui, |ui| {
+                                            for (tab, title) in [
+                                                (SettingsTab::General,"Cài đặt chung"),
+                                                (SettingsTab::Privacy,"Quyền riêng tư"),
+                                                (SettingsTab::Sync,"Lịch sử tin nhắn"),
+                                                (SettingsTab::Appearance,"Giao diện"),
+                                                (SettingsTab::Notifications,"Thông báo"),
+                                                (SettingsTab::Messages,"Tin nhắn"),
+                                                (SettingsTab::Utilities,"Tiện ích"),
+                                            ] { ui.selectable_value(&mut self.settings_tab,tab,title); }
+                                        });
+                                } else {
                                 ui.label(
                                     RichText::new(tab_title)
                                         .size(15.5)
                                         .color(pal.text_primary)
                                         .strong(),
                                 );
+                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let (cr, c_resp) = ui.allocate_exact_size(
                                         Vec2::splat(26.0),
@@ -912,104 +931,8 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Privacy => {
-                                            ui.label(RichText::new("Cá nhân").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiện ngày sinh").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_bday_combo")
-                                                                .selected_text(&self.settings.show_birthday)
-                                                                .width(170.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Không hiện".into(), "Không hiện");
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Hiện ngày, tháng, năm".into(), "Hiện ngày, tháng, năm");
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Hiện ngày, tháng".into(), "Hiện ngày, tháng");
-                                                                });
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiển thị trạng thái truy cập").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.show_online_status, pal);
-                                                        });
-                                                    });
-                                                });
-                                            ui.add_space(14.0);
-
-                                            ui.label(RichText::new("Tin nhắn và cuộc gọi").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiện trạng thái \"Đã xem\"").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.show_seen_status, pal);
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép nhắn tin").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_msg_stranger_combo")
-                                                                .selected_text(&self.settings.allow_message_from)
-                                                                .width(170.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.allow_message_from, "Tất cả mọi người".into(), "Tất cả mọi người");
-                                                                    ui.selectable_value(&mut self.settings.allow_message_from, "Chỉ bạn bè".into(), "Chỉ bạn bè");
-                                                                });
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép gọi điện").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_call_stranger_combo")
-                                                                .selected_text(&self.settings.allow_call_from)
-                                                                .width(220.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Bạn bè và người lạ từng liên hệ".into(), "Bạn bè và người lạ từng liên hệ");
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Tất cả mọi người".into(), "Tất cả mọi người");
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Chỉ bạn bè".into(), "Chỉ bạn bè");
-                                                                });
-                                                        });
-                                                    });
-                                                });
-                                            ui.add_space(14.0);
-
-                                            ui.label(RichText::new("Nguồn tìm kiếm").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép người lạ tìm thấy và kết bạn qua số điện thoại").color(pal.text_primary).size(13.0));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.allow_search_by_phone, pal);
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.separator();
-                                                    ui.add_space(6.0);
-                                                    ui.label(RichText::new("Cho phép người lạ kết bạn").color(pal.text_secondary).size(12.2));
-                                                    ui.add_space(4.0);
-                                                    ui.checkbox(&mut self.settings.friend_src_qr, "Mã QR của tôi");
-                                                    ui.checkbox(&mut self.settings.friend_src_group, "Nhóm chung");
-                                                    ui.checkbox(&mut self.settings.friend_src_card, "Danh thiếp Zalo");
-                                                });
+                                            ui.heading("Quyền riêng tư tài khoản");
+                                            ui.label("Các thiết lập quyền riêng tư trên máy chủ chưa được tích hợp. Hãy thay đổi trên ứng dụng Zalo chính thức; các nút cũ chỉ lưu cục bộ nên đã được gỡ để tránh hiểu nhầm.");
                                         }
                                         SettingsTab::Sync => {
                                             ui.label(RichText::new("Đồng bộ tin nhắn").color(pal.text_primary).size(13.5).strong());
@@ -1021,14 +944,25 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Zalo lưu trữ và đồng bộ dữ liệu lịch sử tin nhắn với đám mây Zalo và SQLite cục bộ (zalo_history.db).").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Lịch sử nhóm và Cloud được tải theo trang vào SQLite. Chat cá nhân chỉ hiển thị lịch sử đã nhận trên máy này; không sao chép toàn bộ dữ liệu từ điện thoại.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
-                                                        if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
+                                                        if ui.button(RichText::new(format!("{} Cập nhật hội thoại", lucide::REFRESH)).size(13.0).strong()).clicked() {
                                                             trigger_sync = true;
                                                         }
+                                                        ui.add_space(8.0);
+                                                        ui.label("Tải tiếp lịch sử nhóm và Cloud (tối đa 200 trang/hội thoại mỗi lượt).");
+                                                        if ui.button(if self.history_sync_running { "Dừng tải lịch sử" } else { "Tải / tiếp tục lịch sử" }).clicked() {
+                                                            if let Some(tx) = WORKER_TX.get() {
+                                                                let command = if self.history_sync_running { WorkerCmd::CancelHistorySync }
+                                                                    else { WorkerCmd::SyncHistory { threads: self.threads.clone() } };
+                                                                if tx.send(command).is_ok() { self.history_sync_running = true; }
+                                                            }
+                                                        }
+                                                        ui.label(&self.history_sync_status);
+
                                                     });
                                                 });
                                         }
@@ -1357,7 +1291,7 @@ impl ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::RefreshThreads);
             }
-            self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
+            self.show_toast("Đang cập nhật hội thoại và tin gần đây…");
         }
         if pick_dl_dir {
             let tx = self.event_tx.clone();

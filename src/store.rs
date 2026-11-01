@@ -62,6 +62,7 @@ impl MessageStore {
                 raw_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_thread_ts ON messages(thread_id, ts);
+            CREATE TABLE IF NOT EXISTS history_sync (thread_id TEXT PRIMARY KEY, cursor TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS threads (
                 thread_id TEXT PRIMARY KEY,
                 name TEXT,
@@ -124,7 +125,7 @@ impl MessageStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  name = excluded.name,
                  is_group = excluded.is_group,
-                 last_ts = excluded.last_ts",
+                 last_ts = MAX(threads.last_ts, excluded.last_ts)",
             params![
                 t.thread_id,
                 t.name,

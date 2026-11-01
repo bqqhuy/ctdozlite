@@ -47,11 +47,37 @@ $version = ((& cargo metadata --locked --no-deps --format-version 1) | ConvertFr
     Where-Object { $_.name -eq 'ctdozlite' } | Select-Object -ExpandProperty version
 if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'Cannot read package version' }
 New-Item -ItemType Directory -Force dist | Out-Null
+# Start the real DX12 renderer with fixture data, capture pixels and require an exit.
+# The fixture explicitly bypasses account restore and all network workers.
+$previousData = $env:CTDOZ_DATA_DIR
+$previousRenderer = $env:CTDOZ_RENDERER
+try {
+    $env:CTDOZ_RENDERER = 'dx12'
+    foreach ($case in @(
+        @{ Size='480x360'; Scale='1'; Tab='general' },
+        @{ Size='1020x700'; Scale='1.5'; Tab='appearance' },
+        @{ Size='1280x900'; Scale='2'; Tab='sync' }
+    )) {
+        $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
+        $env:CTDOZ_DATA_DIR = $fixture
+        $png = Join-Path (Resolve-Path dist) "ui-$($case.Size)-$($case.Scale)-$($case.Tab).png"
+        $process = Start-Process -FilePath $binary -ArgumentList @('--gui', '--ui-smoke-test', ('"' + $png + '"'), '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab) -PassThru
+        if (-not $process.WaitForExit(45000)) {
+            $process.Kill()
+            throw "GUI did not exit within 45 seconds: $($case.Size)"
+        }
+        if ($process.ExitCode -ne 0 -or -not (Test-Path $png)) { throw "GUI renderer smoke failed: $($case.Size)" }
+        Remove-Item -Recurse -Force $fixture -ErrorAction SilentlyContinue
+    }
+} finally {
+    $env:CTDOZ_DATA_DIR = $previousData
+    $env:CTDOZ_RENDERER = $previousRenderer
+}
 Copy-Item $binary "dist\ctdozlite-$version-portable-windows-arm64.exe" -Force
 $compiler = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $compiler) { throw 'Install Inno Setup 6.7.1 or newer before packaging' }
 $buildDir = Split-Path $binary
-Invoke-Checked $compiler.Source @('/DArch=arm64', "/DMyAppVersion=$version", "/DBuildDir=$buildDir", 'packaging\windows\installer.iss')
+Invoke-Checked $compiler.Source @("/DMyAppVersion=$version", "/DBuildDir=$buildDir", 'packaging\windows\installer.iss')
 $installer = 'dist\ctdozlite-setup-windows-arm64.exe'
 if (-not (Test-Path $installer)) { throw 'Installer was not produced' }
 Move-Item $installer "dist\ctdozlite-$version-setup-windows-arm64.exe" -Force

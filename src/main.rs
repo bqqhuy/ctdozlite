@@ -26,6 +26,9 @@ mod tui;
 mod ui;
 mod voip_log;
 
+#[cfg(all(not(debug_assertions), not(all(windows, target_arch = "aarch64"))))]
+compile_error!("Production builds of this fork require Windows ARM64 (aarch64-pc-windows-msvc)");
+
 use anyhow::Result;
 use session::Session;
 
@@ -37,6 +40,10 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    let smoke = args.iter().any(|a| a == "--ui-smoke-test");
+    if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
+        anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
     }
     storage::init(args.iter().any(|a| a == "--portable"))?;
     let _instance = storage::lock_instance()?;
@@ -70,7 +77,7 @@ async fn main() -> Result<()> {
         println!("Architecture: {}", std::env::consts::ARCH);
         println!("Data directory: {}", storage::root().display());
         match video::readiness() {
-            Ok(path) => println!("Video ready: {}", path.display()),
+            Ok(path) => println!("Video ready: {path}"),
             Err(e) => println!("Video unavailable: {e}"),
         }
         return Ok(());
@@ -78,7 +85,7 @@ async fn main() -> Result<()> {
     let mut s = Session::new(dev_mode, dump, dump_raw)?;
 
     // Attempt to restore persistent session from disk
-    let session_restored = if !force_logout {
+    let session_restored = if !force_logout && !smoke {
         if let Ok(_) = s.load_from_file("session.json") {
             if let Some(li) = &s.login {
                 let name = if li.display_name.is_empty() { "Zalo User" } else { &li.display_name };
@@ -122,6 +129,13 @@ async fn main() -> Result<()> {
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("Zalo");
+        if smoke {
+            let size = args.iter().position(|a| a == "--ui-smoke-size").and_then(|i| args.get(i+1))
+                .map(|s| s.split('x').filter_map(|n| n.parse::<f32>().ok()).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![480.0,360.0]);
+            anyhow::ensure!(size.len() == 2 && size.iter().all(|n| n.is_finite() && *n >= 360.0 && *n <= 1920.0), "Invalid smoke size");
+            viewport = viewport.with_inner_size([size[0], size[1]]);
+        }
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
@@ -312,3 +326,5 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
 
 #[cfg(windows)]
 mod windows_video;
+
+mod history_sync;

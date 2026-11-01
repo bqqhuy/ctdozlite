@@ -46,6 +46,8 @@ pub fn is_expired_error(message: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domains {
+    #[serde(skip)]
+    pub service_fallbacks: std::collections::BTreeMap<String, Vec<String>>,
     /// `wpa.zaloapp.com` — `reqqr`, password login.
     pub auth: String,
     /// `wpa.chat.zalo.me` — `getServerInfo` / `getLoginInfo` once a session exists.
@@ -117,6 +119,7 @@ fn default_ws() -> Vec<String> {
 impl Default for Domains {
     fn default() -> Self {
         Self {
+            service_fallbacks: Default::default(),
             auth: crate::endpoints::AUTH.into(),
             wpa_chat: crate::endpoints::WPA_CHAT.into(),
             chat: crate::endpoints::service("chat").unwrap().into(),
@@ -135,6 +138,40 @@ impl Default for Domains {
         }
     }
 }
+
+impl Domains {
+    /// Keep verified REST hosts first; service discovery may advertise a PC host
+    /// which returns 404 for a Web/QR session. Long-poll and WS stay dynamic.
+    fn prefer_verified_rest(&mut self) {
+        for (key, slot) in [
+            ("chat", &mut self.chat), ("friend", &mut self.friend),
+            ("conversation", &mut self.convers_api), ("profile", &mut self.profile),
+            ("group", &mut self.group), ("file", &mut self.file),
+            ("voice_call", &mut self.voice_call), ("sticker", &mut self.sticker),
+        ] {
+            if let Some(verified) = crate::endpoints::service(key) {
+                if slot != verified && trusted_service_url(slot) {
+                    let fallback = self.service_fallbacks.entry(verified.into()).or_default();
+                    if !fallback.contains(slot) { fallback.push(slot.clone()); }
+                }
+                *slot = verified.into();
+            }
+        }
+        self.conversation = self.convers_api.clone();
+    }
+}
+fn trusted_service_url(value: &str) -> bool {
+    reqwest::Url::parse(value).map(|url| url.scheme() == "https" && url.username().is_empty()
+        && url.password().is_none() && url.port().is_none() && url.path() == "/"
+        && url.query().is_none() && url.fragment().is_none()
+        && url.host_str().map_or(false, |h| h.ends_with(".zalo.me") || h.ends_with(".zaloapp.com"))).unwrap_or(false)
+}
+#[derive(Debug)]
+struct HttpFailure(u16);
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "HTTP {}", self.0) }
+}
+impl std::error::Error for HttpFailure {}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoginInfo {
@@ -195,6 +232,7 @@ impl Session {
         );
         let http = Client::builder()
             .cookie_provider(Arc::clone(&jar))
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(35))
@@ -360,6 +398,7 @@ impl Session {
         );
         if let Ok(c) = Client::builder()
             .cookie_provider(Arc::clone(&self.jar))
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(35))
@@ -442,6 +481,7 @@ impl Session {
         };
         self.computer_name = saved.computer_name;
         self.domains = saved.domains;
+        self.domains.prefer_verified_rest();
         // Auto-heal older session.json files where `zpw_chts_new` / `zpw_ctrs_new` overwrote REST domains
         if self.domains.chat.contains("-msg-chat.") || self.domains.chat.contains("tt-chat2-wpa") || self.domains.chat.is_empty() {
             if self.domains.chat.contains("-msg-chat.") && self.domains.lp_chat.is_empty() {
@@ -616,6 +656,7 @@ impl Session {
                 self.domains.conversation = v;
             }
         }
+        self.domains.prefer_verified_rest();
     }
 
     pub async fn get(&self, url: &str) -> Result<Value> {
@@ -689,7 +730,7 @@ impl Session {
             },
         );
         if !status.is_success() {
-            anyhow::bail!("HTTP {status} from {url}: {}", truncate(&text, 300));
+            return Err(HttpFailure(status.as_u16()).into());
         }
         if text.trim().is_empty() {
             return Ok(serde_json::json!({ "error_code": 0, "data": null }));
@@ -700,6 +741,31 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        let mut urls = vec![url.to_string()];
+        for (verified, fallbacks) in &self.domains.service_fallbacks {
+            if let Some(suffix) = url.strip_prefix(&format!("{verified}/")) {
+                urls.extend(fallbacks.iter().map(|base| format!("{base}/{suffix}")));
+                break;
+            }
+        }
+        let mut last = None;
+        for candidate in urls {
+            match self.send_once(m.clone(), &candidate, body.clone()).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    // Retry GET on transport failure, or any method on a definite
+                    // 404. Never replay a possibly delivered mutation after timeout.
+                    let retry = e.downcast_ref::<HttpFailure>().map_or(false, |e| e.0 == 404)
+                        || (m == Method::GET && e.downcast_ref::<reqwest::Error>().map_or(false, |e| e.is_connect() || e.is_timeout()));
+                    if !retry { return Err(e); }
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("No service endpoint")))
+    }
+
+    async fn send_once(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
         anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         if self.verbose {
@@ -785,7 +851,7 @@ impl Session {
         );
 
         if is_err {
-            bail!("HTTP {status} from {url}: {}", truncate(&text, 300));
+            return Err(HttpFailure(status.as_u16()).into());
         }
         if text.trim().is_empty() {
             // Long-polling endpoints (`p4-msg-chat.zaloapp.com`) return HTTP 200 with an empty body `""`
@@ -944,5 +1010,55 @@ mod tests {
         assert_eq!(redact_secret("1234567890abcdef"), "12345678…<redacted>");
         assert_eq!(redact_secret("short"), "short…<redacted>");
         assert_eq!(redact_secret(""), "…<redacted>");
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn expiry_requires_exact_server_code() {
+        for text in ["server error 600: expired", "server error -102: expired"] { assert!(is_expired_error(text)); }
+        for text in ["server error 6000", "HTTP 404", "zpw_sek missing in response", "timeout", "server error -1020"] { assert!(!is_expired_error(text)); }
+    }
+    #[test]
+    fn discovery_preserves_verified_rest_and_dynamic_polling() {
+        let mut s = Session::new(false,false,false).unwrap();
+        let verified = s.domains.profile.clone();
+        s.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"profile":["https://tt-profile-wpa.zaloapp.com"],"friend":["https://attacker.example"]},
+            "zpw_chts_new":["https://p9-msg-chat.zaloapp.com"]
+        }));
+        assert_eq!(s.domains.profile, verified);
+        assert_eq!(s.domains.service_fallbacks[&verified], vec!["https://tt-profile-wpa.zaloapp.com"]);
+        assert_eq!(s.domains.lp_chat, "https://p9-msg-chat.zaloapp.com");
+        assert!(!s.domains.service_fallbacks.values().flatten().any(|v| v.contains("attacker")));
+        assert!(!s.domains.chat.contains("-msg-chat"));
+    }
+    #[tokio::test]
+    async fn validation_distinguishes_expiry_from_server_and_parse_failures() {
+        use std::io::{Read, Write};
+        for (status,body,expected) in [
+            (200,r#"{"error_code":0,"data":{}}"#,0),
+            (200,r#"{"error_code":600}"#,1),
+            (200,r#"{"error_code":-102}"#,1),
+            (404,"not found",2), (503,"offline",2), (200,"not json",2),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream,_) = listener.accept().unwrap();
+                let mut request = [0;4096]; let _ = stream.read(&mut request);
+                write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let mut s = Session::new(false,false,false).unwrap();
+            s.http = reqwest::Client::builder().no_proxy().build().unwrap();
+            s.domains.profile = format!("http://{addr}");
+            s.login = Some(LoginInfo::default()); s.secret_key = Some(vec![0;32]); s.set_zpw_sek("fixture".into());
+            let result = s.validate_session().await;
+            match expected { 0 => assert_eq!(result,SessionStatus::Valid), 1 => assert_eq!(result,SessionStatus::Expired), _ => assert!(matches!(result,SessionStatus::Unreachable(_))) }
+            assert_eq!(s.zpw_sek.as_deref(), Some("fixture"));
+            server.join().unwrap();
+        }
     }
 }

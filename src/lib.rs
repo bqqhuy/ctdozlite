@@ -22,3 +22,5 @@ pub mod voip_log;
 
 #[cfg(windows)]
 mod windows_video;
+
+mod history_sync;

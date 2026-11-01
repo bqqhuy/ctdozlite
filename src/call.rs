@@ -559,7 +559,7 @@ async fn dispatch_send_signal_inner(s: &Session, command: i64, n: &Value) -> Res
                     "calleeId": n.get("calleeId").cloned().unwrap_or(json!("")),
                     "callId": n.get("callId").cloned().unwrap_or(json!(0)),
                     "codec": n.get("codec").cloned().unwrap_or(json!("[]")),
-                    "typeRequest": n.get("type").cloned().unwrap_or(json!(1)),
+                    "typeRequest": n.get("typeRequest").or_else(|| n.get("type")).cloned().unwrap_or(json!(1)),
                     "imei": s.imei,
                 })
             };

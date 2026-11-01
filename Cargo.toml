@@ -3,9 +3,9 @@ name = "ctdozlite"
 version = "0.0.1"
 edition = "2021"
 authors = ["TIPC1110 <tienichpc1110@gmail.com>"]
-description = "Lightweight, high-performance native Zalo PC client written in Rust (zero Node.js, zero Electron)"
-homepage = "https://ctdozlite.ctdo.net/"
-repository = "https://github.com/ctdoteam1110/ctdozlite"
+description = "Native Zalo client for Windows 11 ARM64"
+homepage = "https://github.com/bqqhuy/ctdozlite"
+repository = "https://github.com/bqqhuy/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "zalo-rust"
 
@@ -63,40 +63,3 @@ path = "src/lib.rs"
 [[bin]]
 name = "zalo-rust"
 path = "src/main.rs"
-
-[[bin]]
-name = "compare"
-path = "src/bin/compare.rs"
-
-[[bin]]
-name = "probe_media"
-path = "src/bin/probe_media.rs"
-
-[[bin]]
-name = "test_fetch"
-path = "src/bin/test_fetch.rs"
-
-[[bin]]
-name = "test_qr_tag"
-path = "src/bin/test_qr_tag.rs"
-
-[[bin]]
-name = "call_probe"
-path = "src/bin/call_probe.rs"
-
-[package.metadata.deb]
-name = "ctdozlite"
-maintainer = "TIPC1110 <tienichpc1110@gmail.com>"
-copyright = "2026, TIPC1110 <tienichpc1110@gmail.com>"
-license-file = ["LICENSE-MIT", "0"]
-depends = "libc6 (>= 2.31), libasound2 | libasound2t64, libx11-6, libxcb1, libxkbcommon0, libgl1"
-recommends = "ffmpeg, zenity, xclip, wl-clipboard, fonts-noto-core"
-section = "net"
-priority = "optional"
-assets = [
-    ["target/release/zalo-rust", "usr/bin/", "755"],
-    ["packaging/linux/ctdozlite", "usr/bin/", "755"],
-    ["packaging/linux/ctdozlite.desktop", "usr/share/applications/", "644"],
-    ["src/assets/app_icon.png", "usr/share/icons/hicolor/256x256/apps/ctdozlite.png", "644"],
-    ["README.md", "usr/share/doc/ctdozlite/README.md", "644"],
-]

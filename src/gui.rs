@@ -37,6 +37,7 @@ use theme::*;
 use worker::*;
 
 pub enum GuiEvent {
+    HistorySyncStatus { running: bool, message: String },
     QrReady {
         qr_login: QrLogin,
         qr_image: egui::ColorImage,
@@ -278,7 +279,13 @@ impl AppSettings {
 }
 
 
+struct UiSmoke {
+    path: std::path::PathBuf,
+    frames: u32,
+}
+
 pub struct ZaloGuiApp {
+    smoke: Option<UiSmoke>,
     // Theme state
     dark_mode: bool,
     theme_dirty: bool,
@@ -361,6 +368,8 @@ pub struct ZaloGuiApp {
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
     checking_friend_status: HashSet<String>,
     allow_quit: bool,
+    history_sync_running: bool,
+    history_sync_status: String,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     settings: AppSettings,
@@ -468,7 +477,8 @@ impl ZaloGuiApp {
             .map(|(idx, _)| idx)
             .unwrap_or(0);
 
-        let app = Self {
+        let mut app = Self {
+            smoke: None,
             dark_mode,
             theme_dirty: false,
             is_logged_in,
@@ -544,6 +554,8 @@ impl ZaloGuiApp {
             friend_status_map: HashMap::new(),
             checking_friend_status: HashSet::new(),
             allow_quit: false,
+            history_sync_running: false,
+            history_sync_status: String::new(),
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             settings: loaded_settings,
@@ -556,6 +568,25 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             last_poll: std::time::Instant::now(),
         };
+
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(index) = args.iter().position(|a| a == "--ui-smoke-test") {
+            let path = args.get(index+1).expect("--ui-smoke-test requires a PNG path");
+            app.smoke = Some(UiSmoke { path: path.into(), frames: 0 });
+            app.is_logged_in = true;
+            app.user_name = "ARM64 UI fixture".into();
+            app.settings_modal_open = true;
+            app.settings_tab = match args.iter().position(|a| a == "--ui-smoke-tab").and_then(|i| args.get(i+1)).map(String::as_str) {
+                Some("appearance") => SettingsTab::Appearance,
+                Some("sync") => SettingsTab::Sync,
+                _ => SettingsTab::General,
+            };
+            if let Some(scale) = args.iter().position(|a| a == "--ui-smoke-scale").and_then(|i| args.get(i+1)).and_then(|n| n.parse::<f32>().ok()) {
+                cc.egui_ctx.set_pixels_per_point(scale.clamp(1.0, 2.0));
+            }
+            // No worker, account restore, network calls, or real contacts in smoke mode.
+            return app;
+        }
 
         spawn_session_worker(session, tx, cc.egui_ctx.clone());
 
@@ -1171,6 +1202,10 @@ impl ZaloGuiApp {
                         call.error_reason = Some(reason);
                     }
                 }
+                GuiEvent::HistorySyncStatus { running, message } => {
+                    self.history_sync_running = running;
+                    self.history_sync_status = message;
+                }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
                 }
@@ -1190,6 +1225,27 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(smoke) = &mut self.smoke {
+            smoke.frames += 1;
+            let captured = ctx.input(|input| input.events.iter().find_map(|event| {
+                if let egui::Event::Screenshot { image, .. } = event { Some(image.clone()) } else { None }
+            }));
+            if let Some(captured) = captured {
+                let colors: std::collections::HashSet<_> = captured.pixels.iter().map(|p| p.to_array()).collect();
+                if colors.len() < 16 { eprintln!("UI smoke failed: blank framebuffer"); std::process::exit(3); }
+                let rgba: Vec<u8> = captured.pixels.iter().flat_map(|p| p.to_array()).collect();
+                if let Err(e) = image::save_buffer(&smoke.path, &rgba, captured.size[0] as u32, captured.size[1] as u32, image::ColorType::Rgba8) {
+                    eprintln!("UI smoke failed: {e}"); std::process::exit(3);
+                }
+                self.allow_quit = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else if smoke.frames == 5 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+            } else if smoke.frames > 300 {
+                eprintln!("UI smoke failed: screenshot timeout"); std::process::exit(3);
+            }
+            ctx.request_repaint();
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
             self.allow_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1207,7 +1263,7 @@ impl eframe::App for ZaloGuiApp {
         self.check_events(ctx);
 
         // Non-overlapping long-poll trigger; wakes only every 1.2s to keep idle CPU ~0%
-        if self.is_logged_in && self.last_poll.elapsed() >= Duration::from_millis(1200) {
+        if self.smoke.is_none() && self.is_logged_in && self.last_poll.elapsed() >= Duration::from_millis(1200) {
             self.last_poll = std::time::Instant::now();
             if let Some(tx) = WORKER_TX.get() {
                 let known: Vec<(String, String, bool)> = self

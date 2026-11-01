@@ -8,6 +8,8 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
+    SyncHistory { threads: Vec<Thread> },
+    CancelHistorySync,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
     },
@@ -257,6 +259,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
     let _ = WORKER_TX.set(cmd_tx);
 
+    let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState::default()));
@@ -638,6 +642,26 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 }
                             });
                             current_qr_task = Some(handle);
+                        }
+                        WorkerCmd::CancelHistorySync => {
+                            history_sync_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        WorkerCmd::SyncHistory { threads } => {
+                            if history_sync_running.swap(true, std::sync::atomic::Ordering::SeqCst) { continue; }
+                            history_sync_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                            let running = history_sync_running.clone();
+                            let cancel = history_sync_cancel.clone();
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let result = crate::history_sync::download(&s, threads, cancel,
+                                    |message| { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); },
+                                    |thread| { let _ = tx.send(GuiEvent::ThreadsUpdated(vec![thread])); ctx.request_repaint(); }).await;
+                                running.store(false, std::sync::atomic::Ordering::SeqCst);
+                                let message = result.unwrap_or_else(|e| format!("Lỗi tải lịch sử: {e}"));
+                                let _ = tx.send(GuiEvent::HistorySyncStatus { running: false, message });
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::RefreshThreads => {
                             let session_clone = session.clone();
