@@ -377,6 +377,43 @@ impl Drop for Source {
     }
 }
 
+// SourceReader conversion can resize NV12 without requiring a camera-native
+// 320x240@15 mode. If that fails, decode a bounded advertised native mode and
+// normalize its padded NV12 planes ourselves before the encoder.
+unsafe fn select_camera_output(reader: &IMFSourceReader, stream: u32) -> Result<()> {
+    let requested = media_type(&MFVideoFormat_NV12, Some((320, 240)))?;
+    requested.DeleteItem(&MF_MT_FRAME_RATE)?;
+    if reader.SetCurrentMediaType(stream, None, &requested).is_ok() {
+        return Ok(());
+    }
+    let mut candidates = Vec::new();
+    for index in 0..128 {
+        let Ok(native) = reader.GetNativeMediaType(stream, index) else {
+            break;
+        };
+        if let Ok((w, h)) = dimensions(&native) {
+            let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
+            let (num, den) = (rate >> 32, rate & 0xffff_ffff);
+            let slow = den == 0 || num < 15 * den;
+            candidates.push(((slow, (w * h).abs_diff(320 * 240)), native));
+        }
+    }
+    candidates.sort_by_key(|(score, _)| *score);
+    for (_, native) in candidates {
+        if reader.SetCurrentMediaType(stream, None, &native).is_err() {
+            continue;
+        }
+        if reader
+            .SetCurrentMediaType(stream, None, &media_type(&MFVideoFormat_NV12, None)?)
+            .is_ok()
+        {
+            dimensions(&reader.GetCurrentMediaType(stream)?)?;
+            return Ok(());
+        }
+    }
+    anyhow::bail!("Camera không có định dạng NV12/chuyển đổi phù hợp; thử camera khác hoặc cập nhật driver Huawei")
+}
+
 pub fn capture(
     stop: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
@@ -400,18 +437,15 @@ pub fn capture(
                 .context(
                     "Không tìm thấy camera; kiểm tra Settings > Privacy & security > Camera",
                 )?;
-            let source = Source(device.ActivateObject::<IMFMediaSource>()?);
+            let source = Source(device.ActivateObject::<IMFMediaSource>().context(
+                "Không mở được camera; kiểm tra quyền Camera cho desktop apps và ứng dụng đang chiếm camera")?);
             let attrs = attributes()?;
             attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
             let reader = MFCreateSourceReaderFromMediaSource(&source.0, &attrs)?;
             let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
             reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
             reader.SetStreamSelection(stream, true)?;
-            reader.SetCurrentMediaType(
-                stream,
-                None,
-                &media_type(&MFVideoFormat_NV12, Some((320, 240)))?,
-            )?;
+            select_camera_output(&reader, stream)?;
             let mut encoder = Codec::encoder(320, 240)?;
             // Shutdown interrupts ReadSample even when a camera/driver stops producing.
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -419,6 +453,11 @@ pub fn capture(
             let watch_stop = stop.clone();
             let watch_enabled = enabled.clone();
             let watch_name = desired.clone();
+            let capture_start = std::time::Instant::now();
+            let last_sample = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let watch_last_sample = last_sample.clone();
+            let stalled = Arc::new(AtomicBool::new(false));
+            let watch_stalled = stalled.clone();
             let watcher = std::thread::spawn(move || {
                 let Ok(_runtime) = Runtime::new() else {
                     return;
@@ -427,6 +466,12 @@ pub fn capture(
                     if done_rx.recv_timeout(Duration::from_millis(100))
                         != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                     {
+                        break;
+                    }
+                    let elapsed = capture_start.elapsed().as_millis() as u64;
+                    if elapsed.saturating_sub(watch_last_sample.load(Ordering::Relaxed)) > 5_000 {
+                        watch_stalled.store(true, Ordering::Relaxed);
+                        watch_source.shutdown();
                         break;
                     }
                     if watch_stop.load(Ordering::Relaxed)
@@ -440,18 +485,20 @@ pub fn capture(
             });
             let result = (|| -> Result<()> {
                 let mut frame_number = 0i64;
+                let mut cadence = crate::video_frame::CaptureCadence::default();
                 while !stop.load(Ordering::Relaxed)
                     && enabled.load(Ordering::Relaxed)
                     && crate::media::selected_camera_device() == desired
                 {
                     let mut sample = None;
                     let mut flags = 0;
+                    let mut source_time = 0;
                     let read = reader.ReadSample(
                         stream,
                         0,
                         None,
                         Some(&mut flags),
-                        None,
+                        Some(&mut source_time),
                         Some(&mut sample),
                     );
                     if stop.load(Ordering::Relaxed)
@@ -468,21 +515,29 @@ pub fn capture(
                     let Some(sample) = sample else {
                         continue;
                     };
+                    last_sample.store(
+                        capture_start.elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                    if !cadence.accepts(source_time) {
+                        continue;
+                    }
                     let mt = reader.GetCurrentMediaType(stream)?;
                     let (w, h) = dimensions(&mt)?;
-                    anyhow::ensure!((w, h) == (320, 240), "Camera changed output size");
-                    sample.SetSampleTime(frame_number * (10_000_000 / 15))?;
-                    sample.SetSampleDuration(10_000_000 / 15)?;
+                    let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
+                    let raw = bytes(&sample)?;
+                    let normalized = crate::video_frame::normalize_nv12(&raw, w, h, stride)?;
+                    let encoded_sample =
+                        self::sample(&normalized, frame_number * (10_000_000 / 15))?;
                     frame_number += 1;
                     // Reinitializing guarantees an IDR with SPS/PPS on peer request.
                     if keyframe.swap(false, Ordering::Relaxed) || frame_number % 30 == 0 {
                         encoder = Codec::encoder(320, 240)?;
                     }
                     if let (Some(tx), Some(ctx)) = (&tx, &ctx) {
-                        let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(320) as usize;
-                        show_frame(&bytes(&sample)?, w, h, stride, "call_local_video", tx, ctx)?;
+                        show_frame(&normalized, 320, 240, 320, "call_local_video", tx, ctx)?;
                     }
-                    encoder.input(&sample)?;
+                    encoder.input(&encoded_sample)?;
                     while let Some(output) = encoder.output()? {
                         let packet = bytes(&output)?;
                         match au_tx.try_send(packet) {
@@ -498,6 +553,10 @@ pub fn capture(
             })();
             drop(done_tx);
             let _ = watcher.join();
+            anyhow::ensure!(
+                !stalled.load(Ordering::Relaxed),
+                "Camera không trả khung hình trong 5 giây; thử tắt/bật camera hoặc đổi thiết bị"
+            );
             result?;
         }
     }

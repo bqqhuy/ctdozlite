@@ -19,6 +19,25 @@ use std::time::Duration;
 
 const SAMPLE_RATE: u32 = 16000;
 const FRAME_SAMPLES: usize = 320; // 20 ms @ 16 kHz
+const MAX_OPUS_SAMPLES: usize = SAMPLE_RATE as usize * 120 / 1000;
+const PLAYBACK_BUFFER_SAMPLES: usize = SAMPLE_RATE as usize / 2;
+
+// A paused/disconnected output device must not retain an unbounded call backlog.
+fn queue_playback(buffer: &mut Vec<f32>, samples: &[f32]) {
+    let tail = &samples[samples.len().saturating_sub(PLAYBACK_BUFFER_SAMPLES)..];
+    let excess = (buffer.len() + tail.len()).saturating_sub(PLAYBACK_BUFFER_SAMPLES);
+    buffer.drain(..excess.min(buffer.len()));
+    buffer.extend_from_slice(tail);
+}
+
+fn decode_audio<'a>(
+    decoder: &mut Decoder,
+    payload: &[u8],
+    pcm: &'a mut [f32; MAX_OPUS_SAMPLES],
+) -> Result<&'a [f32]> {
+    let count = decoder.decode_float(payload, pcm, false)?;
+    Ok(&pcm[..count])
+}
 
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
 static SELECTED_CAMERA_DEVICE: Mutex<String> = Mutex::new(String::new());
@@ -824,6 +843,27 @@ fn report_media_error(
     }
 }
 
+fn start_audio_stream(
+    result: std::result::Result<cpal::Stream, cpal::BuildStreamError>,
+    name: &str,
+    tx: &Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+    ctx: &Option<eframe::egui::Context>,
+) -> Option<cpal::Stream> {
+    match result {
+        Ok(stream) => match stream.play() {
+            Ok(()) => Some(stream),
+            Err(e) => {
+                report_media_error(tx, ctx, &format!("Không khởi động được {name}: {e}"));
+                None
+            }
+        },
+        Err(e) => {
+            report_media_error(tx, ctx, &format!("Không mở được {name}: {e}"));
+            None
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -885,43 +925,48 @@ fn run_media_loop(
             }
         })
         .or_else(|| host.default_input_device());
-    let input_dev = match input_dev {
-        Some(d) => d,
-        None => {
+    let input_setup = input_dev.and_then(|device| match device.default_input_config() {
+        Ok(config) => Some((device, config)),
+        Err(e) => {
             report_media_error(
                 &gui_tx,
                 &egui_ctx,
-                "Không tìm thấy microphone hoặc chưa cấp quyền truy cập",
+                &format!("Không đọc được cấu hình microphone: {e}"),
             );
-            return;
+            None
         }
-    };
-    let output_dev = match host.default_output_device() {
-        Some(d) => d,
-        None => {
-            report_media_error(&gui_tx, &egui_ctx, "Không tìm thấy thiết bị phát âm thanh");
-            return;
-        }
-    };
-
-    let in_cfg = match input_dev.default_input_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("media: input config err {e}");
-            return;
-        }
-    };
-    let out_cfg = match output_dev.default_output_config() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("media: output config err {e}");
-            return;
-        }
-    };
-    let in_rate = in_cfg.sample_rate().0.max(8000);
-    let in_channels = (in_cfg.channels() as usize).max(1);
-    let out_rate = out_cfg.sample_rate().0.max(8000);
-    let out_channels = (out_cfg.channels() as usize).max(1);
+    });
+    let output_setup =
+        host.default_output_device()
+            .and_then(|device| match device.default_output_config() {
+                Ok(config) => Some((device, config)),
+                Err(e) => {
+                    report_media_error(
+                        &gui_tx,
+                        &egui_ctx,
+                        &format!("Không đọc được cấu hình loa: {e}"),
+                    );
+                    None
+                }
+            });
+    if input_setup.is_none() {
+        report_media_error(&gui_tx,&egui_ctx,"Microphone không khả dụng; vẫn có thể nhận âm thanh/video. Kiểm tra quyền microphone hoặc đổi thiết bị.");
+    }
+    if output_setup.is_none() {
+        report_media_error(
+            &gui_tx,
+            &egui_ctx,
+            "Loa không khả dụng; vẫn tiếp tục camera/video. Kiểm tra thiết bị phát âm thanh.",
+        );
+    }
+    let (in_rate, in_channels) = input_setup
+        .as_ref()
+        .map(|(_, c)| (c.sample_rate().0.max(8000), (c.channels() as usize).max(1)))
+        .unwrap_or((SAMPLE_RATE, 1));
+    let (out_rate, out_channels) = output_setup
+        .as_ref()
+        .map(|(_, c)| (c.sample_rate().0.max(8000), (c.channels() as usize).max(1)))
+        .unwrap_or((SAMPLE_RATE, 1));
 
     // Shared 16kHz mono buffers
     let input_buf: Arc<Mutex<Vec<f32>>> =
@@ -932,9 +977,9 @@ fn run_media_loop(
 
     // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
     macro_rules! capture_stream {
-        ($sample:ty) => {
-            input_dev.build_input_stream(
-                &in_cfg.clone().into(),
+        ($sample:ty, $device:ident, $config:ident) => {
+            $device.build_input_stream(
+                &$config.clone().into(),
                 move |data: &[$sample], _| {
                     if let Ok(mut b) = ib.lock() {
                         let total_frames = data.len() / in_channels;
@@ -960,38 +1005,36 @@ fn run_media_loop(
             )
         };
     }
-    let input_result = match in_cfg.sample_format() {
-        cpal::SampleFormat::F32 => capture_stream!(f32),
-        cpal::SampleFormat::I16 => capture_stream!(i16),
-        cpal::SampleFormat::U16 => capture_stream!(u16),
-        cpal::SampleFormat::I32 => capture_stream!(i32),
-        cpal::SampleFormat::F64 => capture_stream!(f64),
-        format => {
-            report_media_error(
-                &gui_tx,
-                &egui_ctx,
-                &format!("Unsupported microphone sample format: {format:?}"),
-            );
-            return;
-        }
-    };
-    let input_stream = match input_result {
-        Ok(s) => s,
-        Err(e) => {
-            report_media_error(&gui_tx, &egui_ctx, &format!("Cannot start microphone: {e}"));
-            return;
-        }
-    };
-    if let Err(e) = input_stream.play() {
-        eprintln!("media: play input err {e}");
-    }
+    let input_stream = input_setup.and_then(|(input_dev, in_cfg)| {
+        let result = match in_cfg.sample_format() {
+            cpal::SampleFormat::F32 => capture_stream!(f32, input_dev, in_cfg),
+            cpal::SampleFormat::F64 => capture_stream!(f64, input_dev, in_cfg),
+            cpal::SampleFormat::I8 => capture_stream!(i8, input_dev, in_cfg),
+            cpal::SampleFormat::I16 => capture_stream!(i16, input_dev, in_cfg),
+            cpal::SampleFormat::I32 => capture_stream!(i32, input_dev, in_cfg),
+            cpal::SampleFormat::I64 => capture_stream!(i64, input_dev, in_cfg),
+            cpal::SampleFormat::U8 => capture_stream!(u8, input_dev, in_cfg),
+            cpal::SampleFormat::U16 => capture_stream!(u16, input_dev, in_cfg),
+            cpal::SampleFormat::U32 => capture_stream!(u32, input_dev, in_cfg),
+            cpal::SampleFormat::U64 => capture_stream!(u64, input_dev, in_cfg),
+            format => {
+                report_media_error(
+                    &gui_tx,
+                    &egui_ctx,
+                    &format!("Định dạng microphone chưa hỗ trợ: {format:?}"),
+                );
+                return None;
+            }
+        };
+        start_audio_stream(result, "microphone", &gui_tx, &egui_ctx)
+    });
 
     // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
     let ob2 = output_buf.clone();
     macro_rules! playback_stream {
-        ($sample:ty) => {
-            output_dev.build_output_stream(
-                &out_cfg.clone().into(),
+        ($sample:ty, $device:ident, $config:ident) => {
+            $device.build_output_stream(
+                &$config.clone().into(),
                 move |data: &mut [$sample], _| {
                     if let Ok(mut b) = ob2.lock() {
                         let out_frames = data.len() / out_channels;
@@ -1024,31 +1067,29 @@ fn run_media_loop(
             )
         };
     }
-    let output_result = match out_cfg.sample_format() {
-        cpal::SampleFormat::F32 => playback_stream!(f32),
-        cpal::SampleFormat::I16 => playback_stream!(i16),
-        cpal::SampleFormat::U16 => playback_stream!(u16),
-        cpal::SampleFormat::I32 => playback_stream!(i32),
-        cpal::SampleFormat::F64 => playback_stream!(f64),
-        format => {
-            report_media_error(
-                &gui_tx,
-                &egui_ctx,
-                &format!("Unsupported speaker sample format: {format:?}"),
-            );
-            return;
-        }
-    };
-    let output_stream = match output_result {
-        Ok(s) => s,
-        Err(e) => {
-            report_media_error(&gui_tx, &egui_ctx, &format!("Cannot start speaker: {e}"));
-            return;
-        }
-    };
-    if let Err(e) = output_stream.play() {
-        eprintln!("media: play output err {e}");
-    }
+    let output_stream = output_setup.and_then(|(output_dev, out_cfg)| {
+        let result = match out_cfg.sample_format() {
+            cpal::SampleFormat::F32 => playback_stream!(f32, output_dev, out_cfg),
+            cpal::SampleFormat::F64 => playback_stream!(f64, output_dev, out_cfg),
+            cpal::SampleFormat::I8 => playback_stream!(i8, output_dev, out_cfg),
+            cpal::SampleFormat::I16 => playback_stream!(i16, output_dev, out_cfg),
+            cpal::SampleFormat::I32 => playback_stream!(i32, output_dev, out_cfg),
+            cpal::SampleFormat::I64 => playback_stream!(i64, output_dev, out_cfg),
+            cpal::SampleFormat::U8 => playback_stream!(u8, output_dev, out_cfg),
+            cpal::SampleFormat::U16 => playback_stream!(u16, output_dev, out_cfg),
+            cpal::SampleFormat::U32 => playback_stream!(u32, output_dev, out_cfg),
+            cpal::SampleFormat::U64 => playback_stream!(u64, output_dev, out_cfg),
+            format => {
+                report_media_error(
+                    &gui_tx,
+                    &egui_ctx,
+                    &format!("Định dạng loa chưa hỗ trợ: {format:?}"),
+                );
+                return None;
+            }
+        };
+        start_audio_stream(result, "loa", &gui_tx, &egui_ctx)
+    });
 
     // Opus codecs
     let mut encoder = match Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip) {
@@ -1111,6 +1152,7 @@ fn run_media_loop(
     let vid_ssrc = ssrc.wrapping_add(1);
     let mut nego_seq: u32 = 1;
 
+    let mut decoded_pcm = [0.0_f32; MAX_OPUS_SAMPLES];
     while !stop.load(Ordering::Relaxed) {
         // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
         let mut frame: Vec<f32> = {
@@ -1351,10 +1393,9 @@ fn run_media_loop(
                 }
                 if pt == 112 {
                     if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
-                        let mut pcm = vec![0f32; FRAME_SAMPLES];
-                        if decoder.decode_float(payload, &mut pcm, false).is_ok() {
-                            if let Ok(mut b) = output_buf.lock() {
-                                b.extend_from_slice(&pcm);
+                        if let Ok(samples) = decode_audio(&mut decoder, payload, &mut decoded_pcm) {
+                            if let Ok(mut buffer) = output_buf.lock() {
+                                queue_playback(&mut buffer, samples);
                             }
                         }
                     }
@@ -1975,5 +2016,41 @@ mod tests {
         }
         let (cw, ch, cropped) = trim_black_borders(&padded, 64, 48);
         assert_eq!((cw, ch, cropped.len()), (32, 48, 32 * 48 * 4));
+    }
+}
+
+#[cfg(test)]
+mod audio_playback_tests {
+    use super::*;
+    #[test]
+    fn opus_packet_duration_does_not_add_silence_or_drop_long_frames() {
+        for millis in [10, 20, 40, 60] {
+            let count = SAMPLE_RATE as usize * millis / 1000;
+            let input: Vec<f32> = (0..count).map(|n| (n as f32 * 0.05).sin() * 0.1).collect();
+            let mut encoder =
+                Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip).unwrap();
+            let mut packet = [0u8; 4000];
+            let size = encoder.encode_float(&input, &mut packet).unwrap();
+            let mut decoder = Decoder::new(SAMPLE_RATE, OpusChannels::Mono).unwrap();
+            let mut scratch = [0f32; MAX_OPUS_SAMPLES];
+            assert_eq!(
+                decode_audio(&mut decoder, &packet[..size], &mut scratch)
+                    .unwrap()
+                    .len(),
+                count
+            );
+        }
+    }
+    #[test]
+    fn inactive_speaker_queue_keeps_only_recent_audio() {
+        let mut buffer = vec![1.0; PLAYBACK_BUFFER_SAMPLES];
+        queue_playback(&mut buffer, &[2.0; FRAME_SAMPLES]);
+        assert_eq!(buffer.len(), PLAYBACK_BUFFER_SAMPLES);
+        assert_eq!(
+            &buffer[buffer.len() - FRAME_SAMPLES..],
+            &[2.0; FRAME_SAMPLES]
+        );
+        queue_playback(&mut buffer, &vec![3.0; PLAYBACK_BUFFER_SAMPLES * 2]);
+        assert_eq!(buffer, vec![3.0; PLAYBACK_BUFFER_SAMPLES]);
     }
 }

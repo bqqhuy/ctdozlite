@@ -1364,6 +1364,43 @@ pub fn build_pure_rust_invite_fields(
     build_pure_rust_invite_fields_with_port(resp_401, is_video, None)
 }
 
+/// Reject empty/decode-failure allocation responses before opening UDP sockets.
+/// A valid allocation advertises at least one media address; a missing status
+/// alone is allowed for legacy successful payloads containing that metadata.
+fn validate_outgoing_allocation(response: &Value) -> Result<()> {
+    let status = response
+        .get("status")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .unwrap_or(0);
+    anyhow::ensure!(
+        status == 0,
+        "Máy chủ từ chối khởi tạo cuộc gọi (mã {status})"
+    );
+    let has_address = ["rtpIP", "rtpSerIp", "rtpAddress"].iter().any(|k| {
+        response
+            .get(k)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    }) || response
+        .get("servers")
+        .and_then(Value::as_array)
+        .is_some_and(|servers| {
+            servers.iter().any(|server| {
+                ["rtpaddr", "rtp"].iter().any(|key| {
+                    server
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+            })
+        });
+    anyhow::ensure!(
+        has_address,
+        "Máy chủ chưa trả địa chỉ media cho cuộc gọi; không thể bắt đầu. Thử lại sau."
+    );
+    Ok(())
+}
+
 /// Official PC `imei` = `uuid_v4()` + `"-"` + `md5(userAgent)` → 69 chars. The desktop sends
 /// exactly that (`2820ea6b-8652-403d-b2dd-7fc95213b59f-1e181a64c8e8c99ddc7c7de8cd35931b`), and the
 /// voicecall backend reacts to the shape: a 24-hex homegrown value gets a degraded invite
@@ -1883,6 +1920,15 @@ impl CallBridge {
                                         "📞 Cuộc gọi đi (0s) — {reason} (Mã {status_401})"
                                     ),
                                     msg_id: format!("call_{}", crate::login::unix_now()),
+                                });
+                                ctx_clone.request_repaint();
+                                return;
+                            }
+
+                            if let Err(error) = validate_outgoing_allocation(&resp_401) {
+                                let _ = gui_tx_clone.send(GuiEvent::CallRejected {
+                                    code: -502,
+                                    reason: error.to_string(),
                                 });
                                 ctx_clone.request_repaint();
                                 return;
@@ -2852,6 +2898,20 @@ impl CallBridge {
 mod tests {
     use super::*;
 
+    #[test]
+    fn invalid_allocation_never_starts_an_empty_media_session() {
+        for response in [
+            json!({}),
+            json!({"status":0,"servers":[]}),
+            json!({"status":5,"rtpIP":"127.0.0.1:9"}),
+        ] {
+            assert!(validate_outgoing_allocation(&response).is_err());
+        }
+        assert!(validate_outgoing_allocation(&json!({"status":"0","rtpIP":"127.0.0.1:9"})).is_ok());
+        assert!(
+            validate_outgoing_allocation(&json!({"servers":[{"rtpaddr":"127.0.0.1:9"}]})).is_ok()
+        );
+    }
     #[test]
     fn initial_video_request_preserves_type_and_rich_invite_shape() {
         let s = Session::new(false, false, false).unwrap();

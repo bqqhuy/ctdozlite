@@ -33,3 +33,6 @@ mod tray;
 pub mod message_model;
 pub mod reactions;
 pub mod unread;
+
+#[cfg(any(windows, test))]
+mod video_frame;
