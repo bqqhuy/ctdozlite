@@ -135,6 +135,8 @@ pub enum GuiEvent {
     },
     StatusUpdate(String),
     LoggedOut,
+    DownloadFolderPicked(std::path::PathBuf),
+    CameraUnavailable(String),
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +232,7 @@ impl Default for AppSettings {
         Self {
             show_all_contacts: false,
             language: "Tiếng Việt".into(),
-            autostart_on_boot: true,
+            autostart_on_boot: false,
             remember_login: true,
             download_dir: default_dl,
             show_birthday: "Không hiện".into(),
@@ -264,16 +266,14 @@ impl Default for AppSettings {
 
 impl AppSettings {
     fn load() -> Self {
-        std::fs::read_to_string("app_settings.json")
+        std::fs::read_to_string(crate::storage::settings_path())
             .ok()
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
     }
 
-    fn save(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write("app_settings.json", json);
-        }
+    fn save(&self) -> anyhow::Result<()> {
+        crate::storage::save_settings(self)
     }
 }
 
@@ -432,9 +432,9 @@ impl ZaloGuiApp {
             .unwrap_or_default();
 
         let mut threads = if initial_threads.is_empty() {
-            crate::chat::load_threads_cache()
+            crate::chat::load_threads_cache(&session)
         } else {
-            let mut cached = crate::chat::load_threads_cache();
+            let mut cached = crate::chat::load_threads_cache(&session);
             for t in initial_threads {
                 if let Some(c) = cached
                     .iter_mut()
@@ -457,9 +457,9 @@ impl ZaloGuiApp {
             }
         }
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+        crate::store::load_history_into_threads(session.history_path(), &mut threads, 200);
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::chat::save_threads_cache(&threads);
+        crate::chat::save_threads_cache(&session, &threads);
 
         let selected_thread_index = threads
             .iter()
@@ -570,6 +570,17 @@ impl ZaloGuiApp {
         app
     }
 
+    fn save_settings(&mut self) {
+        match self.settings.save() {
+            Ok(()) => {
+                if self.settings.remember_login {
+                    if let Some(tx) = WORKER_TX.get() { let _ = tx.send(WorkerCmd::PersistSession); }
+                }
+            }
+            Err(e) => self.show_toast(format!("Không thể lưu cài đặt: {e}")),
+        }
+    }
+
     fn palette(&self) -> ThemePalette {
         if self.dark_mode {
             ThemePalette::dark()
@@ -581,7 +592,10 @@ impl ZaloGuiApp {
     fn persist_threads_async(&self) {
         let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
-            let _ = wtx.send(WorkerCmd::PersistThreads(snapshot));
+            let _ = wtx.send(WorkerCmd::PersistThreads {
+                owner: self.user_uin.clone(),
+                threads: snapshot,
+            });
         }
     }
 
@@ -602,6 +616,13 @@ impl ZaloGuiApp {
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
+                    if self.user_uin != uin {
+                        self.threads.clear();
+                        self.selected_thread_index = 0;
+                        self.unread_counts.clear();
+                        self.sticker_textures.clear();
+                        self.loading_stickers.clear();
+                    }
                     self.is_logged_in = true;
                     self.user_name = name;
                     self.user_uin = uin;
@@ -609,6 +630,7 @@ impl ZaloGuiApp {
                         self.user_avatar = avatar;
                     }
                     self.login_in_progress = false;
+                    self.password_input.clear();
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Trực tuyến · Đồng bộ thời gian thực".into();
                 }
@@ -704,11 +726,26 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::SessionExpired(reason) => {
                     self.is_logged_in = false;
+                    self.threads.clear();
+                    self.user_uin.clear();
+                    self.user_name.clear();
+                    self.active_call = None;
                     self.qr_texture = None;
-                    self.qr_status = format!(
-                        "{reason} — Quét mã QR bên dưới để khôi phục phiên trực tuyến."
-                    );
-                    self.status_msg = format!("{reason} (Lịch sử tin nhắn vẫn được bảo toàn)");
+                    self.status_msg = reason;
+                    // Expiry is an account boundary too. Restart the runtime/channel before QR.
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::Logout);
+                    }
+                }
+                GuiEvent::CameraUnavailable(reason) => {
+                    if let Some(call) = self.active_call.as_mut() { call.cam_enabled = false; }
+                    self.status_msg = reason.clone();
+                    self.show_toast(reason);
+                }
+                GuiEvent::DownloadFolderPicked(path) => {
+                    self.settings.download_dir = path.display().to_string();
+                    self.save_settings();
+                    self.show_toast("Đã đổi thư mục tải về");
                 }
                 GuiEvent::LoggedOut => {
                     self.is_logged_in = false;
@@ -719,6 +756,42 @@ impl ZaloGuiApp {
                     self.qr_texture = None;
                     self.qr_status = "Đang xin mã QR mới…".into();
                     self.status_msg = "Đã đăng xuất".into();
+                    self.active_call = None;
+                    self.image_viewer = None;
+                    self.user_avatar = None;
+                    self.input_message.clear();
+                    self.password_input.clear();
+                    self.phone_input.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
+                    self.pending_clipboard_image = None;
+                    self.search_query.clear();
+                    self.phone_lookup_result = None;
+                    self.phone_modal_input.clear();
+                    self.friend_status_map.clear();
+                    self.checking_friend_status.clear();
+                    self.loading_link_previews.clear();
+                    self.dismissed_link_preview_for.clear();
+                    self.dismissed_sticker_suggest_for.clear();
+                    self.last_composer_text.clear();
+                    self.unread_counts.clear();
+                    self.sticker_textures.clear();
+                    self.loading_stickers.clear();
+                    self.composer_sticker_cache.clear();
+                    self.link_metadata_cache.clear();
+                    let (tx, rx) = channel();
+                    self.event_rx = rx;
+                    self.event_tx = tx.clone();
+                    match Session::new(self.dev_mode, false, false) {
+                        Ok(session) => {
+                            spawn_session_worker(session, tx, ctx.clone());
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::RequestQr);
+                            }
+                        }
+                        Err(e) => self.show_toast(format!("Không thể tạo phiên mới: {e}")),
+                    }
                 }
                 GuiEvent::MessageSent {
                     thread_id,

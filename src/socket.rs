@@ -165,18 +165,20 @@ fn inflate(buf: &[u8]) -> Result<Vec<u8>> {
     let mut last_err: Option<anyhow::Error> = None;
     for idx in order {
         let (name, make) = attempts[idx];
-        let mut out = Vec::new();
-        match make(buf).read_to_end(&mut out) {
-            Ok(_) if !out.is_empty() => {
-                trace(format!("inflate ok via {name}: {} -> {} bytes", buf.len(), out.len()));
+        match crate::limits::read_inflated(make(buf)) {
+            Ok(out) if !out.is_empty() => {
+                trace(format!(
+                    "inflate ok via {name}: {} -> {} bytes",
+                    buf.len(),
+                    out.len()
+                ));
                 return Ok(out);
             }
             Ok(_) => last_err = Some(anyhow!("{name}: empty output")),
             Err(e) => last_err = Some(anyhow!("{name}: {e}")),
         }
     }
-    let mut out = Vec::new();
-    flate2::read::DeflateDecoder::new(buf).read_to_end(&mut out)?;
+    let out = crate::limits::read_inflated(flate2::read::DeflateDecoder::new(buf))?;
     if out.is_empty() {
         return Err(last_err.unwrap_or_else(|| anyhow!("empty inflate output")));
     }

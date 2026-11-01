@@ -34,11 +34,58 @@ pub const STAT_INTERVAL: Duration = Duration::from_secs(5);
 
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
+pub fn diagnostics_enabled() -> bool {
+    crate::logger::is_dev_mode() || std::env::var("ZALO_DIAGNOSTICS").ok().as_deref() == Some("1")
+}
+
 fn log_path() -> Option<String> {
+    if !diagnostics_enabled() {
+        return None;
+    }
     match std::env::var("ZALO_VOIP_LOG") {
         Ok(v) if v.eq_ignore_ascii_case("off") || v == "0" => None,
         Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => Some("voip.log".to_string()),
+        _ => Some(
+            crate::storage::root()
+                .join("diagnostics/voip.log")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    }
+}
+
+pub fn append_diagnostic(name: &str, text: &str) {
+    let path = crate::storage::root().join("diagnostics").join(name);
+    append_to_path(&path, text);
+}
+
+fn append_to_path(path: &std::path::Path, text: &str) {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parent) = path.parent() {
+        if crate::storage::private_dir(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::metadata(path)
+        .map(|m| m.len() >= ROTATE_BYTES)
+        .unwrap_or(false)
+    {
+        let previous = path.with_file_name(format!(
+            "{}.1",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&previous);
+        let _ = std::fs::rename(path, previous);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut f) = options.open(path) {
+        let _ = f.write_all(text.as_bytes());
     }
 }
 
@@ -75,15 +122,7 @@ pub fn line(tag: &str, body: impl AsRef<str>) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let text = format!("{}\t{} {}\n", format_ts(now), tag, body.as_ref());
-    let _guard = FILE_LOCK.lock();
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() >= ROTATE_BYTES {
-            let _ = std::fs::rename(&path, format!("{path}.1"));
-        }
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(text.as_bytes());
-    }
+    append_to_path(std::path::Path::new(&path), &text);
 }
 
 /// Lower-case hex of the first `max` bytes, with `..` appended if truncated.

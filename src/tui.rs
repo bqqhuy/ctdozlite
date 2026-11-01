@@ -189,7 +189,7 @@ pub struct TuiApp<'a> {
 
 impl<'a> TuiApp<'a> {
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
-        let store = crate::store::MessageStore::open("zalo_history.db").ok();
+        let store = crate::store::MessageStore::open(session.history_path()).ok();
         if let Some(ref st) = store {
             let _ = st.hydrate_threads(&mut threads, 200);
         }
@@ -459,7 +459,7 @@ impl<'a> TuiApp<'a> {
     fn persist_snapshot(&mut self, threads: &[Thread]) {
         if let Some(ref mut st) = self.store {
             let _ = crate::store::persist_threads(st, threads);
-        } else if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+        } else if let Ok(mut st) = crate::store::MessageStore::open(self.session.history_path()) {
             let _ = crate::store::persist_threads(&mut st, threads);
             self.store = Some(st);
         }
@@ -483,9 +483,13 @@ impl<'a> TuiApp<'a> {
 
     fn persist_async(&self) {
         let snapshot = self.threads.clone();
+        let account = self.session.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+                if !account.is_active() {
+                    return;
+                }
+                if let Ok(mut st) = crate::store::MessageStore::open(account.history_path()) {
                     let _ = crate::store::persist_threads(&mut st, &snapshot);
                 }
             })
@@ -688,7 +692,7 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
@@ -796,7 +800,7 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
         self.bump_thread(&to_id);
 
         let session = self.session_clone();
@@ -942,8 +946,11 @@ impl<'a> TuiApp<'a> {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
             ConfirmKind::Logout => {
-                let _ = std::fs::remove_file("session.json");
-                let _ = std::fs::remove_file("threads_cache.json");
+                if let Err(e) = crate::storage::remove_session() {
+                    self.status = format!("Không thể xóa phiên: {e}");
+                    return;
+                }
+                self.store = None;
                 self.session.logout();
                 self.threads.clear();
                 self.filtered.clear();
@@ -1325,7 +1332,7 @@ impl<'a> TuiApp<'a> {
             }
         }
         self.rebuild_filter();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
         self.persist_async();
     }
 
@@ -1337,7 +1344,7 @@ impl<'a> TuiApp<'a> {
                     let changed = self.apply_polled(threads, state);
                     self.status = format!("Cap nhat {}", crate::ui::clock());
                     if changed {
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.persist_async();
                     }
                 }
@@ -1358,7 +1365,7 @@ impl<'a> TuiApp<'a> {
                     }
                     if count > 0 {
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.selected_msg = None;
                         self.follow_tail = true;
                         self.status = format!("Da tai lich su nhom ({count} tin)");
@@ -1390,7 +1397,7 @@ impl<'a> TuiApp<'a> {
                     if appended {
                         self.bump_thread(&thread_id);
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.follow_tail = true;
                         self.status = "Da gui tep dinh kem".into();
                     }
@@ -1423,7 +1430,7 @@ impl<'a> TuiApp<'a> {
                     }
                     self.selected_msg = None;
                     self.persist_thread_by_id(&thread_id);
-                    chat::save_threads_cache(&self.threads);
+                    chat::save_threads_cache(self.session, &self.threads);
                     self.status = "Da xoa tin nhan".into();
                 }
                 BgEvent::StickerPacks(packs) => {

@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::Sample;
 use opus::{Channels as OpusChannels, Decoder, Encoder};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
@@ -73,9 +74,19 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"])
-            .creation_flags(0x08000000);
+        let Ok(mut cmd) = crate::video::command() else {
+            return Vec::new();
+        };
+        cmd.args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .creation_flags(0x08000000);
         if let Ok(out) = cmd.output() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut cams = Vec::new();
@@ -98,8 +109,18 @@ fn enumerate_ffmpeg_cameras() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
-        let mut cmd = std::process::Command::new("ffmpeg");
-        cmd.args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
+        let Ok(mut cmd) = crate::video::command() else {
+            return Vec::new();
+        };
+        cmd.args([
+            "-hide_banner",
+            "-f",
+            "avfoundation",
+            "-list_devices",
+            "true",
+            "-i",
+            "",
+        ]);
         if let Ok(out) = cmd.output() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let mut cams = Vec::new();
@@ -749,7 +770,7 @@ fn spawn_camera_capture_thread(
 ) {
     thread::spawn(move || {
         use std::io::Read;
-        use std::process::{Command, Stdio};
+        use std::process::Stdio;
 
         let mut current_dev = String::new();
         let mut child_opt: Option<std::process::Child> = None;
@@ -795,7 +816,14 @@ fn spawn_camera_capture_thread(
                 current_dev = desired.clone();
                 stream_acc.clear();
 
-                let mut cmd = Command::new("ffmpeg");
+                let mut cmd = match crate::video::command() {
+                    Ok(command) => command,
+                    Err(e) => {
+                        if let Some(tx) = &gui_tx { let _ = tx.send(crate::gui::GuiEvent::CameraUnavailable(format!("Video unavailable: {e}"))); }
+                        if let Some(ctx) = &egui_ctx { ctx.request_repaint(); }
+                        return;
+                    }
+                };
                 cmd.args(["-hide_banner", "-loglevel", "error"]);
                 #[cfg(target_os = "windows")]
                 cmd.args([
@@ -928,13 +956,20 @@ fn run_local_preview_decoder(
     egui_ctx: eframe::egui::Context,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     const PREV_W: usize = 240;
     const PREV_H: usize = 180;
     const PREV_BYTES: usize = PREV_W * PREV_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = match crate::video::command() {
+        Ok(command) => command,
+        Err(e) => {
+            let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(format!("Video unavailable: {e}")));
+            egui_ctx.request_repaint();
+            return;
+        }
+    };
     cmd.args([
         "-hide_banner",
         "-loglevel",
@@ -1087,6 +1122,20 @@ fn extract_rtp_opus_payload(rtp: &[u8]) -> Option<&[u8]> {
     }
 }
 
+fn report_media_error(
+    tx: &Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
+    ctx: &Option<eframe::egui::Context>,
+    message: &str,
+) {
+    eprintln!("media: {message}");
+    if let Some(tx) = tx {
+        let _ = tx.send(crate::gui::GuiEvent::StatusUpdate(message.to_owned()));
+    }
+    if let Some(ctx) = ctx {
+        ctx.request_repaint();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -1123,8 +1172,8 @@ fn run_media_loop(
         cam_enabled.clone(),
         want_keyframe.clone(),
         cam_au_tx,
-        gui_tx,
-        egui_ctx,
+        gui_tx.clone(),
+        egui_ctx.clone(),
     );
     let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
     let host = cpal::default_host();
@@ -1143,14 +1192,18 @@ fn run_media_loop(
     let input_dev = match input_dev {
         Some(d) => d,
         None => {
-            eprintln!("media: no input device");
+            report_media_error(
+                &gui_tx,
+                &egui_ctx,
+                "Không tìm thấy microphone hoặc chưa cấp quyền truy cập",
+            );
             return;
         }
     };
     let output_dev = match host.default_output_device() {
         Some(d) => d,
         None => {
-            eprintln!("media: no output device");
+            report_media_error(&gui_tx, &egui_ctx, "Không tìm thấy thiết bị phát âm thanh");
             return;
         }
     };
@@ -1182,33 +1235,54 @@ fn run_media_loop(
     let ib = input_buf.clone();
 
     // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
-    let input_stream = match input_dev.build_input_stream(
-        &in_cfg.into(),
-        move |data: &[f32], _| {
-            if let Ok(mut b) = ib.lock() {
-                let total_frames = data.len() / in_channels;
-                let step = (in_rate as f32 / SAMPLE_RATE as f32).max(1.0);
-                let out_frames = (total_frames as f32 / step) as usize;
-                for i in 0..out_frames {
-                    let src_idx = ((i as f32 * step) as usize).min(total_frames.saturating_sub(1));
-                    let mut sum = 0.0_f32;
-                    for ch in 0..in_channels {
-                        sum += data[src_idx * in_channels + ch];
+    macro_rules! capture_stream {
+        ($sample:ty) => {
+            input_dev.build_input_stream(
+                &in_cfg.clone().into(),
+                move |data: &[$sample], _| {
+                    if let Ok(mut b) = ib.lock() {
+                        let total_frames = data.len() / in_channels;
+                        let step = (in_rate as f32 / SAMPLE_RATE as f32).max(1.0);
+                        let out_frames = (total_frames as f32 / step) as usize;
+                        for i in 0..out_frames {
+                            let src_idx =
+                                ((i as f32 * step) as usize).min(total_frames.saturating_sub(1));
+                            let mut sum = 0.0_f32;
+                            for ch in 0..in_channels {
+                                sum += data[src_idx * in_channels + ch].to_sample::<f32>();
+                            }
+                            b.push(sum / in_channels as f32);
+                        }
+                        if b.len() > FRAME_SAMPLES * 25 {
+                            let drop_n = b.len() - FRAME_SAMPLES * 25;
+                            b.drain(0..drop_n);
+                        }
                     }
-                    b.push(sum / in_channels as f32);
-                }
-                if b.len() > FRAME_SAMPLES * 25 {
-                    let drop_n = b.len() - FRAME_SAMPLES * 25;
-                    b.drain(0..drop_n);
-                }
-            }
-        },
-        |e| eprintln!("input stream err {e}"),
-        None,
-    ) {
+                },
+                |e| eprintln!("input stream err {e}"),
+                None,
+            )
+        };
+    }
+    let input_result = match in_cfg.sample_format() {
+        cpal::SampleFormat::F32 => capture_stream!(f32),
+        cpal::SampleFormat::I16 => capture_stream!(i16),
+        cpal::SampleFormat::U16 => capture_stream!(u16),
+        cpal::SampleFormat::I32 => capture_stream!(i32),
+        cpal::SampleFormat::F64 => capture_stream!(f64),
+        format => {
+            report_media_error(
+                &gui_tx,
+                &egui_ctx,
+                &format!("Unsupported microphone sample format: {format:?}"),
+            );
+            return;
+        }
+    };
+    let input_stream = match input_result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("media: build input err {e}");
+            report_media_error(&gui_tx, &egui_ctx, &format!("Cannot start microphone: {e}"));
             return;
         }
     };
@@ -1218,41 +1292,61 @@ fn run_media_loop(
 
     // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
     let ob2 = output_buf.clone();
-    let output_stream = match output_dev.build_output_stream(
-        &out_cfg.into(),
-        move |data: &mut [f32], _| {
-            if let Ok(mut b) = ob2.lock() {
-                let out_frames = data.len() / out_channels;
-                let step = SAMPLE_RATE as f32 / out_rate as f32;
-                let mut consumed = 0usize;
-                for i in 0..out_frames {
-                    let src_idx = (i as f32 * step) as usize;
-                    let sample = if src_idx < b.len() {
-                        consumed = consumed.max(src_idx + 1);
-                        b[src_idx]
+    macro_rules! playback_stream {
+        ($sample:ty) => {
+            output_dev.build_output_stream(
+                &out_cfg.clone().into(),
+                move |data: &mut [$sample], _| {
+                    if let Ok(mut b) = ob2.lock() {
+                        let out_frames = data.len() / out_channels;
+                        let step = SAMPLE_RATE as f32 / out_rate as f32;
+                        let mut consumed = 0usize;
+                        for i in 0..out_frames {
+                            let src_idx = (i as f32 * step) as usize;
+                            let sample = if src_idx < b.len() {
+                                consumed = consumed.max(src_idx + 1);
+                                b[src_idx]
+                            } else {
+                                0.0
+                            };
+                            for ch in 0..out_channels {
+                                data[i * out_channels + ch] = sample.to_sample::<$sample>();
+                            }
+                        }
+                        if consumed > 0 {
+                            let drain_n = consumed.min(b.len());
+                            b.drain(0..drain_n);
+                        }
                     } else {
-                        0.0
-                    };
-                    for ch in 0..out_channels {
-                        data[i * out_channels + ch] = sample;
+                        for s in data.iter_mut() {
+                            *s = 0.0_f32.to_sample::<$sample>();
+                        }
                     }
-                }
-                if consumed > 0 {
-                    let drain_n = consumed.min(b.len());
-                    b.drain(0..drain_n);
-                }
-            } else {
-                for s in data.iter_mut() {
-                    *s = 0.0;
-                }
-            }
-        },
-        |e| eprintln!("output stream err {e}"),
-        None,
-    ) {
+                },
+                |e| eprintln!("output stream err {e}"),
+                None,
+            )
+        };
+    }
+    let output_result = match out_cfg.sample_format() {
+        cpal::SampleFormat::F32 => playback_stream!(f32),
+        cpal::SampleFormat::I16 => playback_stream!(i16),
+        cpal::SampleFormat::U16 => playback_stream!(u16),
+        cpal::SampleFormat::I32 => playback_stream!(i32),
+        cpal::SampleFormat::F64 => playback_stream!(f64),
+        format => {
+            report_media_error(
+                &gui_tx,
+                &egui_ctx,
+                &format!("Unsupported speaker sample format: {format:?}"),
+            );
+            return;
+        }
+    };
+    let output_stream = match output_result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("media: build output err {e}");
+            report_media_error(&gui_tx, &egui_ctx, &format!("Cannot start speaker: {e}"));
             return;
         }
     };
@@ -1795,13 +1889,20 @@ fn run_h264_ffmpeg_decoder(
     synced: Arc<AtomicBool>,
 ) {
     use std::io::{Read, Write};
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     const VID_W: usize = 640;
     const VID_H: usize = 480;
     const FRAME_BYTES: usize = VID_W * VID_H * 4;
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = match crate::video::command() {
+        Ok(command) => command,
+        Err(e) => {
+            let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(format!("Video unavailable: {e}")));
+            egui_ctx.request_repaint();
+            return;
+        }
+    };
     cmd.args([
         "-hide_banner",
         "-loglevel",

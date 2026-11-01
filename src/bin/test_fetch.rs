@@ -110,9 +110,12 @@ async fn main() -> Result<()> {
 
     // 5. Cache persistence test
     println!("\n--- [5] Kiểm tra lưu và đọc threads_cache.json ---");
-    zalo_rust::chat::save_threads_cache(&friends);
-    let reloaded = zalo_rust::chat::load_threads_cache();
-    println!("✓ threads_cache.json: Đã lưu và nạp lại thành công {} hội thoại.", reloaded.len());
+    zalo_rust::chat::save_threads_cache(&s, &friends);
+    let reloaded = zalo_rust::chat::load_threads_cache(&s);
+    println!(
+        "✓ threads_cache.json: Đã lưu và nạp lại thành công {} hội thoại.",
+        reloaded.len()
+    );
 
     // 6. Optional send test (1-1 or group)
     let args: Vec<String> = std::env::args().skip(1).collect();

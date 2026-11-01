@@ -35,13 +35,20 @@ pub struct MessageStore {
 
 impl MessageStore {
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
-    pub fn open(path: &str) -> Result<Self> {
-        let conn = if path == ":memory:" {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if path != std::path::Path::new(":memory:") {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                crate::storage::private_dir(parent)?;
+            }
+        }
+        let conn = if path == std::path::Path::new(":memory:") {
             Connection::open_in_memory()?
         } else {
             Connection::open(path)?
         };
 
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT PRIMARY KEY,
@@ -67,7 +74,7 @@ impl MessageStore {
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
-    pub fn upsert_message(&mut self, msg: &StoredMessage) -> Result<bool> {
+    pub fn upsert_message(&self, msg: &StoredMessage) -> Result<bool> {
         let rows = self.conn.execute(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -110,7 +117,7 @@ impl MessageStore {
     }
 
     /// Insert or update thread metadata.
-    pub fn upsert_thread(&mut self, t: &StoredThread) -> Result<()> {
+    pub fn upsert_thread(&self, t: &StoredThread) -> Result<()> {
         self.conn.execute(
             "INSERT INTO threads (thread_id, name, is_group, last_ts)
              VALUES (?1, ?2, ?3, ?4)
@@ -503,6 +510,7 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    let transaction = store.conn.unchecked_transaction()?;
     let mut new_count = 0;
     for t in threads {
         let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
@@ -525,11 +533,16 @@ pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<u
             }
         }
     }
+    transaction.commit()?;
     Ok(new_count)
 }
 
 /// Convenience helper: open `zalo_history.db` (or `path`) and hydrate `threads` with saved history.
-pub fn load_history_into_threads(path: &str, threads: &mut Vec<Thread>, limit_per_thread: usize) {
+pub fn load_history_into_threads(
+    path: impl AsRef<std::path::Path>,
+    threads: &mut Vec<Thread>,
+    limit_per_thread: usize,
+) {
     if let Ok(store) = MessageStore::open(path) {
         let _ = store.hydrate_threads(threads, limit_per_thread);
     }
@@ -541,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_insert_twice_returns_false() {
-        let mut store = MessageStore::open(":memory:").unwrap();
+        let store = MessageStore::open(":memory:").unwrap();
         let msg = StoredMessage {
             msg_id: "m_1001".into(),
             thread_id: "thread_1".into(),
@@ -560,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_messages_for_returns_ordered_rows() {
-        let mut store = MessageStore::open(":memory:").unwrap();
+        let store = MessageStore::open(":memory:").unwrap();
         let thread_id = "thread_order_test";
 
         let m1 = StoredMessage {
@@ -664,5 +677,18 @@ mod tests {
         assert_eq!(hydrated[0].name, "Test Thread");
         assert_eq!(hydrated[0].messages.len(), 2);
         assert_eq!(hydrated[0].preview, "Hi Alice");
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    #[test]
+    fn failed_snapshot_rolls_back_preceding_rows() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER reject_fixture BEFORE INSERT ON threads WHEN NEW.thread_id = 'bad' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+        let thread = |id: &str| Thread { id: id.into(), name: id.into(), preview: String::new(), time: String::new(), avatar: None, is_group: false, messages: Vec::new() };
+        assert!(persist_threads(&mut store, &[thread("good"), thread("bad")]).is_err());
+        assert!(store.all_threads().unwrap().is_empty());
     }
 }

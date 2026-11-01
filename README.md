@@ -1,5 +1,8 @@
 # ctdozlite
 
+Bản fork Windows 11 ARM64: xem [hướng dẫn build, lưu trữ an toàn và FFmpeg native](docs/WINDOWS_ARM64.md).
+
+
 Client Zalo Desktop viết bằng Rust (`eframe`/`egui` + `ratatui`), giao tiếp trực tiếp với hệ thống API và WebSocket của Zalo Web/PC mà không qua Electron hay Chromium.
 
 - **Trang chủ dự án (Website & Tải nhanh):** [https://ctdozlite.ctdo.net/](https://ctdozlite.ctdo.net/)

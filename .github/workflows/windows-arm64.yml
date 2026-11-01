@@ -1,104 +1,96 @@
 name: Windows ARM64 (native build)
 
-# Builds ctdozlite natively on GitHub's Windows 11 ARM64 hosted runner
-# (free for public repositories). Produces:
-#   - ctdozlite-<ver>-portable-windows-arm64.exe
-#   - ctdozlite-<ver>-setup-windows-arm64.exe   (Inno Setup, if available)
-# Run it from the Actions tab ("Run workflow"), by pushing a v* tag, or by
-# publishing a GitHub Release from the web UI (assets get attached to it).
-
 on:
   workflow_dispatch:
   push:
-    tags: ["v*"]
+    branches: [main, 'fix/windows-arm64-audit']
+    tags: ['v*']
+  pull_request:
+    branches: [main]
   release:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: windows-arm64-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
 jobs:
   windows-arm64:
     name: Windows 11 ARM64 (.exe)
     runs-on: windows-11-arm
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust (native aarch64-pc-windows-msvc)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned native Rust
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
             Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
-            .\rustup-init.exe -y --profile minimal --default-host aarch64-pc-windows-msvc
+            .\rustup-init.exe -y --profile minimal --default-host aarch64-pc-windows-msvc --default-toolchain 1.99.1
+            if ($LASTEXITCODE -ne 0) { throw 'Rust installation failed' }
             "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           } else {
             rustup set default-host aarch64-pc-windows-msvc
-            rustup toolchain install stable --profile minimal
-            rustup default stable
+            rustup toolchain install 1.99.1-aarch64-pc-windows-msvc --profile minimal
+            if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed' }
           }
-
-      # `ring` (TLS crypto used by reqwest/rustls) needs clang to build its
-      # assembly for aarch64-pc-windows-msvc; MSVC's cl.exe cannot.
-      - name: Ensure clang + CMake
+      - name: Prepare build and packaging tools
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
-            $llvm = "C:\Program Files\LLVM\bin"
-            if (-not (Test-Path "$llvm\clang.exe")) { choco install llvm -y --no-progress }
-            $llvm | Out-File -FilePath $env:GITHUB_PATH -Append
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'LLVM installation failed' }
+            'C:\Program Files\LLVM\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
           }
-          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) { choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System' }
-
-      - name: Toolchain info
+          if (-not (Get-Command cmake -ErrorAction SilentlyContinue)) {
+            choco install cmake -y --no-progress --installargs 'ADD_CMAKE_TO_PATH=System'
+            if ($LASTEXITCODE -ne 0) { throw 'CMake installation failed' }
+            'C:\Program Files\CMake\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup --version=6.7.1 -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
+            'C:\Program Files (x86)\Inno Setup 6' | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: windows-arm64-1.99.1
+      - name: Tests, native PE smoke check and package
         shell: pwsh
-        run: |
-          rustc -vV
-          clang --version
-          cmake --version
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run tests
-        run: cargo test --locked --release --lib
-
-      - name: Build release binary
-        run: cargo build --release --locked --bin zalo-rust
-
-      - name: Verify it is a native ARM64 PE
-        shell: pwsh
-        run: |
-          $bytes = [System.IO.File]::ReadAllBytes("target\release\zalo-rust.exe")
-          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
-          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
-          "Machine: 0x{0:X4}" -f $machine
-          if ($machine -ne 0xAA64) { throw "Not an ARM64 binary" }
-          "Size: {0:N1} MB" -f ((Get-Item target\release\zalo-rust.exe).Length / 1MB)
-
-      - name: Package
-        shell: pwsh
-        run: |
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\zalo-rust.exe "dist\ctdozlite-$ver-portable-windows-arm64.exe"
-          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
-          if (-not $iscc) { choco install innosetup -y --no-progress; $env:PATH += ";C:\Program Files (x86)\Inno Setup 6" }
-          iscc /DArch=arm64 packaging\windows\installer.iss
-          Get-ChildItem dist\ctdozlite-setup-windows-arm64.exe -ErrorAction SilentlyContinue |
-            Rename-Item -NewName "ctdozlite-$ver-setup-windows-arm64.exe"
-          Get-ChildItem dist
-
-      - uses: actions/upload-artifact@v4
+        run: ./scripts/build-windows-arm64.ps1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ctdozlite-windows-arm64
-          path: dist/*.exe
-
-      - name: Attach to release (tag / release builds only)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    name: Attach ARM64 binaries and checksums
+    needs: windows-arm64
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ctdozlite-windows-arm64
+          path: dist
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.ref_name }}
-          files: dist/*.exe
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.exe
+            dist/SHA256SUMS-windows-arm64.txt
+            dist/build-info-windows-arm64.json

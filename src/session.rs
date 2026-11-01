@@ -3,7 +3,10 @@
 //! Mirrors the `_get` / `_post` / `_getCommonParams` / `getEncodedParams` helpers from
 //! `compact-app-pc-*.js`. See `re-notes/02_chat_data.md` §2–§4.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{bail, Result};
 use reqwest::cookie::Jar;
@@ -144,6 +147,7 @@ pub struct SavedSession {
 
 #[derive(Clone)]
 pub struct Session {
+    active: Arc<AtomicBool>,
     pub http: Client,
     pub jar: Arc<Jar>,
     pub domains: Domains,
@@ -185,6 +189,7 @@ impl Session {
             )
             .build()?;
         Ok(Self {
+            active: Arc::new(AtomicBool::new(true)),
             http,
             jar,
             domains: Domains::default(),
@@ -323,6 +328,11 @@ impl Session {
 
     /// Clear all session credentials, tokens, keys, and cookies.
     pub fn logout(&mut self) {
+        let _lock = crate::storage::SESSION_IO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.active.store(false, Ordering::SeqCst);
+        self.active = Arc::new(AtomicBool::new(true));
         self.login = None;
         self.zpw_sek = None;
         self.secret_key = None;
@@ -352,9 +362,42 @@ impl Session {
         }
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn account_key(&self) -> &str {
+        self.login
+            .as_ref()
+            .map(|l| {
+                if !l.uin.is_empty() {
+                    l.uin.as_str()
+                } else {
+                    l.send2me_id.as_str()
+                }
+            })
+            .unwrap_or("")
+    }
+
+    pub fn history_path(&self) -> std::path::PathBuf {
+        crate::storage::account_file(self.account_key(), "zalo_history.db")
+    }
+
+    pub fn cache_path(&self) -> std::path::PathBuf {
+        crate::storage::account_file(self.account_key(), "threads_cache.json")
+    }
+
     /// Save the authenticated session to disk so subsequent runs can restore it without re-authenticating.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         use base64::Engine;
+        let _lock = crate::storage::SESSION_IO
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock poisoned"))?;
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
+        if !crate::storage::remember_login()? {
+            crate::storage::remove_session_unlocked()?;
+            return Ok(());
+        }
         let saved = SavedSession {
             imei: self.imei.clone(),
             computer_name: self.computer_name.clone(),
@@ -365,15 +408,21 @@ impl Session {
             domains: self.domains.clone(),
         };
         let text = serde_json::to_string_pretty(&saved)?;
-        std::fs::write(path, text)?;
+        let protected = crate::storage::protect(text.as_bytes())?;
+        crate::storage::atomic_write(&crate::storage::session_path(path), &protected)?;
         Ok(())
     }
 
     /// Load a previously saved session from disk and restore cookies, keys, and endpoints.
     pub fn load_from_file(&mut self, path: &str) -> Result<()> {
         use base64::Engine;
-        let text = std::fs::read_to_string(path)?;
-        let saved: SavedSession = serde_json::from_str(&text)?;
+        if !crate::storage::remember_login()? {
+            crate::storage::remove_session()?;
+            anyhow::bail!("Remember login is disabled");
+        }
+        let bytes = std::fs::read(crate::storage::session_path(path))?;
+        let text = crate::storage::unprotect(&bytes)?;
+        let saved: SavedSession = serde_json::from_slice(&text)?;
 
         self.imei = if saved.imei.len() == 69 {
             saved.imei
@@ -433,7 +482,8 @@ impl Session {
     ///
     /// Credentials are redacted; the point is the response *shape*, not the content.
     fn dump_exchange(&self, method: &str, url: &str, status: u16, body: &str) {
-        let dir = std::path::Path::new("dump");
+        let dump_dir = crate::storage::root().join("diagnostics/dump");
+        let dir = dump_dir.as_path();
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("! dump dir: {e}");
             return;
@@ -575,6 +625,7 @@ impl Session {
         mime_type: &str,
         file_bytes: &[u8],
     ) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let boundary = format!(
             "----WebKitFormBoundary{}",
             crate::param_cipher::random_hex(16)
@@ -610,7 +661,9 @@ impl Session {
         let resp = rb.body(body).send().await?;
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
-        let text = resp.text().await?;
+        let bytes =
+            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         crate::logger::log_request(
             "POST(multipart)",
             url,
@@ -636,6 +689,7 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         if self.verbose {
             eprintln!("→ {} {}", m, if self.dump_raw { url.to_string() } else { redact_url(url) });
@@ -692,7 +746,9 @@ impl Session {
         };
 
         let status = resp.status();
-        let text = resp.text().await?;
+        let bytes =
+            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         if self.verbose {
             eprintln!("← {status} {}", truncate(&text, 400));
         }

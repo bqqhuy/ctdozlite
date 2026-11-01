@@ -291,9 +291,9 @@ pub async fn login_via_qr(s: &mut Session, language: &str) -> Result<Value> {
         Ok(art) => println!("{art}"),
         Err(e) => {
             eprintln!("! không vẽ được QR trong terminal: {e}");
-            let path = "qr.png";
-            save_png(&q, path)?;
-            println!("  ảnh QR đã lưu: {path}");
+            let path = crate::storage::root().join("qr.png");
+            save_png(&q, &path.to_string_lossy())?;
+            println!("  ảnh QR đã lưu: {}", path.display());
         }
     }
     println!("Quét mã bằng Zalo trên điện thoại…");
@@ -372,7 +372,8 @@ async fn get_raw(s: &Session, url: &str) -> Result<(u16, String, Option<String>)
         }
     }
 
-    let text = resp.text().await?;
+    let bytes = crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     if s.verbose {
         eprintln!("→ GET {}", crate::session::redact_url(url));
         eprintln!("← {status} {}", crate::session::truncate(&text, 200));

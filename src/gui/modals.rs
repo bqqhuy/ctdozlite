@@ -189,11 +189,8 @@ impl ZaloGuiApp {
             self.login_status_msg.clear();
             self.qr_status = "Đang xin mã QR mới…".into();
             self.status_msg = "Đã đăng xuất".into();
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if close_menu {
@@ -570,10 +567,11 @@ impl ZaloGuiApp {
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.settings_modal_open = false;
-            self.settings.save();
+            self.save_settings();
             return;
         }
 
+        let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
         let win_w = (screen.width() * 0.88).clamp(620.0, 780.0);
@@ -800,7 +798,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Khởi động Zalo khi mở máy").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal);
+                                                            ui.add_enabled_ui(false, |ui| { render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal); }).response.on_hover_text("Chưa hỗ trợ tự khởi động");
                                                         });
                                                     });
                                                     ui.add_space(8.0);
@@ -857,13 +855,13 @@ impl ZaloGuiApp {
                                                                     if ui.selectable_label(self.settings.selected_mic_device.is_empty(), "Mặc định hệ thống").clicked() {
                                                                         self.settings.selected_mic_device.clear();
                                                                         crate::media::set_selected_mic_device("");
-                                                                        self.settings.save();
+                                                                        self.save_settings();
                                                                     }
                                                                     for m in &mics {
                                                                         if ui.selectable_label(self.settings.selected_mic_device == *m, m).clicked() {
                                                                             self.settings.selected_mic_device = m.clone();
                                                                             crate::media::set_selected_mic_device(m);
-                                                                            self.settings.save();
+                                                                            self.save_settings();
                                                                         }
                                                                     }
                                                                 });
@@ -885,13 +883,13 @@ impl ZaloGuiApp {
                                                                     if ui.selectable_label(self.settings.selected_camera_device.is_empty(), "Tự động (Camera đầu tiên)").clicked() {
                                                                         self.settings.selected_camera_device.clear();
                                                                         crate::media::set_selected_camera_device("");
-                                                                        self.settings.save();
+                                                                        self.save_settings();
                                                                     }
                                                                     for c in &cams {
                                                                         if ui.selectable_label(self.settings.selected_camera_device == *c, c).clicked() {
                                                                             self.settings.selected_camera_device = c.clone();
                                                                             crate::media::set_selected_camera_device(c);
-                                                                            self.settings.save();
+                                                                            self.save_settings();
                                                                         }
                                                                     }
                                                                 });
@@ -1337,9 +1335,12 @@ impl ZaloGuiApp {
                 });
             });
 
+        if self.settings.remember_login != previous_remember {
+            self.save_settings();
+        }
         if theme_switched {
             self.theme_dirty = true;
-            self.settings.save();
+            self.save_settings();
             self.show_toast(if self.dark_mode {
                 "Đã chuyển sang giao diện Tối (Atom One Dark)"
             } else {
@@ -1353,11 +1354,14 @@ impl ZaloGuiApp {
             self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
         }
         if pick_dl_dir {
-            if let Some(dir_path) = pick_native_folder_dialog() {
-                self.settings.download_dir = dir_path.display().to_string();
-                self.settings.save();
-                self.show_toast(format!("Đã đổi thư mục lưu file: {}", self.settings.download_dir));
-            }
+            let tx = self.event_tx.clone();
+            let context = ctx.clone();
+            std::thread::spawn(move || {
+                if let Some(path) = pick_native_folder_dialog() {
+                    let _ = tx.send(GuiEvent::DownloadFolderPicked(path));
+                    context.request_repaint();
+                }
+            });
         }
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
@@ -1378,7 +1382,7 @@ impl ZaloGuiApp {
 
         if !open {
             self.settings_modal_open = false;
-            self.settings.save();
+            self.save_settings();
         }
     }
 
@@ -1501,7 +1505,7 @@ impl ZaloGuiApp {
                                             {
                                                 self.settings.selected_mic_device.clear();
                                                 crate::media::set_selected_mic_device("");
-                                                self.settings.save();
+                                                self.save_settings();
                                             }
                                             for m in &mics {
                                                 if ui
@@ -1513,7 +1517,7 @@ impl ZaloGuiApp {
                                                 {
                                                     self.settings.selected_mic_device = m.clone();
                                                     crate::media::set_selected_mic_device(m);
-                                                    self.settings.save();
+                                                    self.save_settings();
                                                 }
                                             }
                                         });
@@ -1543,7 +1547,7 @@ impl ZaloGuiApp {
                                             {
                                                 self.settings.selected_camera_device.clear();
                                                 crate::media::set_selected_camera_device("");
-                                                self.settings.save();
+                                                self.save_settings();
                                             }
                                             for c in &cams {
                                                 if ui
@@ -1556,7 +1560,7 @@ impl ZaloGuiApp {
                                                     self.settings.selected_camera_device =
                                                         c.clone();
                                                     crate::media::set_selected_camera_device(c);
-                                                    self.settings.save();
+                                                    self.save_settings();
                                                 }
                                             }
                                         });

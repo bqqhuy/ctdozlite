@@ -154,6 +154,18 @@ fn call_name_allowed(name: &str) -> bool {
 
 /// Allowlist gate for an outbound call. `is_group` always fails.
 pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool) -> bool {
+    if std::env::var("ZALO_CALL_TEST_LOCK").ok().as_deref() != Some("1") {
+        return !is_group
+            && !partner_id.trim().is_empty()
+            && !partner_id
+                .trim_start()
+                .to_ascii_lowercase()
+                .starts_with("group");
+    }
+    restricted_call_target_allowed(partner_id, partner_name, is_group)
+}
+
+fn restricted_call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool) -> bool {
     if is_group {
         return false;
     }
@@ -178,16 +190,6 @@ pub fn call_target_allowed(partner_id: &str, partner_name: &str, is_group: bool)
     if call_name_allowed(partner_name) || call_name_allowed(partner_id) {
         return true;
     }
-    // When `dispatch_send_signal_inner` only has `calleeId` (`partner_name == ""`), look up the
-    // contact's display name in the local gitignored `threads_cache.json` so allowlisted contacts
-    // (Hoang, Đỗ Thành, ĐTC) work out of the box without hardcoding live UIDs in Git.
-    if !id.is_empty() && partner_name.trim().is_empty() {
-        for t in crate::chat::load_threads_cache() {
-            if !t.is_group && only_digits(&t.id) == id && call_name_allowed(&t.name) {
-                return true;
-            }
-        }
-    }
     false
 }
 /// Same as [`call_target_allowed`], returning the Vietnamese refusal reason for the UI.
@@ -200,7 +202,7 @@ pub fn ensure_call_target_allowed(
         return Ok(());
     }
     if is_group {
-        bail!("Cuộc gọi nhóm đang bị khoá: chỉ cho phép gọi 3 tài khoản test (Hoang, Đỗ Thành, ĐTC)");
+        bail!("Cuộc gọi nhóm chưa được hỗ trợ");
     }
     let who = if partner_name.trim().is_empty() {
         partner_id.trim().to_string()
@@ -492,17 +494,14 @@ async fn voicecall_get(s: &Session, endpoint_path: &str, payload: &Value) -> Res
 /// The trace contains decrypted signaling payloads (call ids, session ids, RTP addresses),
 /// so treat `call_trace.log` like `session.json`: never commit it.
 pub fn trace_line(tag: &str, body: impl AsRef<str>) {
-    use std::io::Write;
-    let body = body.as_ref();
-    let ts = crate::login::unix_now();
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("call_trace.log")
-    {
-        let _ = writeln!(f, "[{ts}] {tag} {body}");
+    if !crate::voip_log::diagnostics_enabled() {
+        return;
     }
-    eprintln!("[call] {tag} {body}");
+    let body = body.as_ref();
+    crate::voip_log::append_diagnostic(
+        "call_trace.log",
+        &format!("{} {tag} {body}\n", crate::login::unix_now()),
+    );
 }
 
 /// Execute the exact Zalo signaling HTTP endpoint for a native `sendSignal` command (`handleSendSignal`).
@@ -1930,6 +1929,22 @@ impl CallBridge {
                             continue;
                         }
 
+                        if is_video {
+                            match tokio::task::spawn_blocking(crate::video::readiness).await {
+                                Ok(Ok(_)) => {}
+                                result => {
+                                    let reason = match result {
+                                        Ok(Err(e)) => e.to_string(),
+                                        Err(e) => e.to_string(),
+                                        _ => unreachable!(),
+                                    };
+                                    let _ =
+                                        gui_tx.send(GuiEvent::CallRejected { code: -503, reason });
+                                    egui_ctx.request_repaint();
+                                    continue;
+                                }
+                            }
+                        }
                         let s_snap = {
                             let mut s_lock = session.lock().await;
                             let needs_uid = s_lock
@@ -2240,6 +2255,14 @@ impl CallBridge {
                     }
 
                     CallEngineCmd::AnswerCall { accept } => {
+                        let needs_video = accept && active_call.lock().await.as_ref().map(|s| s.is_video).unwrap_or(false);
+                        if needs_video {
+                            if let Err(error) = tokio::task::spawn_blocking(crate::video::readiness).await.unwrap_or_else(|e| Err(e.into())) {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Video unavailable: {error}")));
+                                egui_ctx.request_repaint();
+                                continue;
+                            }
+                        }
                         let s_snap = session.lock().await.clone();
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
@@ -2342,7 +2365,7 @@ impl CallBridge {
                                     req_402["subCommand"] = json!(3);
                                 }
                                 match dispatch_send_signal(&s_snap, 402, &req_402).await {
-                                    Ok(r) => eprintln!("[call] 402 answer resp: {}", r),
+                                    Ok(r) => trace_line("ANSWER", format!("402 {r}")),
                                     Err(e) => eprintln!("[call] 402 answer err: {e}"),
                                 }
                             }
@@ -2353,6 +2376,13 @@ impl CallBridge {
                         is_on_mic,
                         is_on_cam,
                     } => {
+                        if is_on_cam {
+                            if let Err(error) = tokio::task::spawn_blocking(crate::video::readiness).await.unwrap_or_else(|e| Err(e.into())) {
+                                let _ = gui_tx.send(GuiEvent::CameraUnavailable(format!("Video unavailable: {error}")));
+                                egui_ctx.request_repaint();
+                                continue;
+                            }
+                        }
                         let s_snap = session.lock().await.clone();
                         let guard = active_call.lock().await;
                         if let Some(ref st) = *guard {
@@ -2502,7 +2532,7 @@ impl CallBridge {
                                 egui_ctx.request_repaint();
                             }
                             "answer" | "group_answer" => {
-                                eprintln!("[call] ctrl answer raw: {}", voip_ctrl);
+                                trace_line("CONTROL", format!("answer {voip_ctrl}"));
                                 let status = data
                                     .get("status")
                                     .and_then(|v| {
@@ -2768,7 +2798,7 @@ impl CallBridge {
                                         _ => None,
                                     })
                                     .unwrap_or_default();
-                                eprintln!("[call] incoming request call_id={} caller={} data={}", ev_call_id, caller_id, data);
+                                trace_line("INCOMING", format!("call_id={ev_call_id} caller={caller_id} data={data}"));
                                 let caller_name = media
                                     .get("Dname")
                                     .or_else(|| data.get("Dname"))
@@ -3025,29 +3055,61 @@ mod tests {
     #[test]
     fn outbound_call_lock_allows_only_test_accounts() {
         // 19-digit mock thread ids / uins
-        assert!(call_target_allowed("1000000000000000001", "", false));
-        assert!(call_target_allowed("1000000000000000002", "", false));
-        assert!(call_target_allowed("1000000000000000003", "", false));
-        assert!(call_target_allowed("1000000000000000004", "", false));
-        assert!(call_target_allowed("1000000000000000005", "", false));
+        assert!(restricted_call_target_allowed(
+            "1000000000000000001",
+            "",
+            false
+        ));
+        assert!(restricted_call_target_allowed(
+            "1000000000000000002",
+            "",
+            false
+        ));
+        assert!(restricted_call_target_allowed(
+            "1000000000000000003",
+            "",
+            false
+        ));
+        assert!(restricted_call_target_allowed(
+            "1000000000000000004",
+            "",
+            false
+        ));
+        assert!(restricted_call_target_allowed(
+            "1000000000000000005",
+            "",
+            false
+        ));
         // 32-bit mock aliases
-        assert!(call_target_allowed("100000001", "", false));
-        assert!(call_target_allowed("100000002", "", false));
-        assert!(call_target_allowed("100000003", "", false));
+        assert!(restricted_call_target_allowed("100000001", "", false));
+        assert!(restricted_call_target_allowed("100000002", "", false));
+        assert!(restricted_call_target_allowed("100000003", "", false));
         // accent-folded display names
-        assert!(call_target_allowed("", "Hoàng", false));
-        assert!(call_target_allowed("", "Đỗ Thành", false));
-        assert!(call_target_allowed("", "ĐTC", false));
-        assert!(call_target_allowed("", "Nguyễn Hoàng (Zalo)", false));
+        assert!(restricted_call_target_allowed("", "Hoàng", false));
+        assert!(restricted_call_target_allowed("", "Đỗ Thành", false));
+        assert!(restricted_call_target_allowed("", "ĐTC", false));
+        assert!(restricted_call_target_allowed(
+            "",
+            "Nguyễn Hoàng (Zalo)",
+            false
+        ));
         // everyone else is refused
-        assert!(!call_target_allowed("123456789012345678", "", false));
-        assert!(!call_target_allowed("", "Nguyễn Văn A", false));
-        assert!(!call_target_allowed("", "", false));
+        assert!(!restricted_call_target_allowed(
+            "123456789012345678",
+            "",
+            false
+        ));
+        assert!(!restricted_call_target_allowed("", "Nguyễn Văn A", false));
+        assert!(!restricted_call_target_allowed("", "", false));
         // group calls are always refused, even for an allowlisted person
-        assert!(!call_target_allowed("1000000000000000001", "Hoàng", true));
-        assert!(!call_target_allowed("group_123", "", true));
-        assert!(!call_target_allowed("group_123", "", false));
-        assert!(ensure_call_target_allowed("123456789", "", false).is_err());
+        assert!(!restricted_call_target_allowed(
+            "1000000000000000001",
+            "Hoàng",
+            true
+        ));
+        assert!(!restricted_call_target_allowed("group_123", "", true));
+        assert!(!restricted_call_target_allowed("group_123", "", false));
+        assert!(ensure_call_target_allowed("", "", false).is_err());
         assert!(ensure_call_target_allowed("1000000000000000001", "", false).is_ok());
     }
 

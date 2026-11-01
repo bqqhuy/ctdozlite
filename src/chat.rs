@@ -328,8 +328,11 @@ pub fn deduplicate_threads(
 }
 
 /// Load locally cached conversations and message history.
-pub fn load_threads_cache() -> Vec<Thread> {
-    if let Ok(text) = std::fs::read_to_string("threads_cache.json") {
+pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
+    if s.account_key().is_empty() || !s.is_active() {
+        return Vec::new();
+    }
+    if let Ok(text) = std::fs::read_to_string(s.cache_path()) {
         if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
             deduplicate_threads(&mut threads, None);
             return threads;
@@ -339,9 +342,14 @@ pub fn load_threads_cache() -> Vec<Thread> {
 }
 
 /// Persist conversations and message history locally so they survive app restarts.
-pub fn save_threads_cache(threads: &[Thread]) {
+pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
+    if s.account_key().is_empty() || !s.is_active() {
+        return;
+    }
     if let Ok(text) = serde_json::to_string_pretty(threads) {
-        let _ = std::fs::write("threads_cache.json", text);
+        if let Err(e) = crate::storage::atomic_write(&s.cache_path(), text.as_bytes()) {
+            eprintln!("Cannot save history cache: {e}");
+        }
     }
 }
 
@@ -438,7 +446,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
     }
 
     // Hydrate with locally persisted history from SQLite (`zalo_history.db`)
-    crate::store::load_history_into_threads("zalo_history.db", &mut threads, 200);
+    crate::store::load_history_into_threads(s.history_path(), &mut threads, 200);
     resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
@@ -654,7 +662,7 @@ pub async fn send_attachment(
     let target_type = if is_group { 11 } else { 2 };
 
     if is_image {
-        let (width, height) = image::load_from_memory(&file_bytes)
+        let (width, height) = crate::limits::decode_image(&file_bytes)
             .map(|img| (img.width(), img.height()))
             .unwrap_or((800, 600));
         let mime = match ext.as_str() {
@@ -788,9 +796,12 @@ pub async fn send_attachment(
         };
         // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
         // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all("stickers_cache");
+        let _ = std::fs::create_dir_all(crate::storage::cache_dir());
         let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(format!("stickers_cache/{cache_key}.png"), &file_bytes);
+        let _ = std::fs::write(
+            crate::storage::cache_dir().join(format!("{cache_key}.png")),
+            &file_bytes,
+        );
 
         let msg_id = send_resp
             .get("data")
@@ -1065,7 +1076,7 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
     if !resp.status().is_success() {
         return None;
     }
-    let bytes = resp.bytes().await.ok()?;
+    let bytes = crate::limits::response_bytes(resp, 131_072).await.ok()?;
     let take_len = bytes.len().min(131_072);
     let html = String::from_utf8_lossy(&bytes[..take_len]);
 
@@ -1456,8 +1467,8 @@ pub struct StickerItem {
 /// Returns ~390 official Zalo sticker packs sorted by newest/featured first and caches them to
 /// `stickers_cache/store_packs.json`.
 pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInfo>> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::storage::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
     let cache_path = cache_dir.join("store_packs.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerPackInfo>>(&raw_cache) {
@@ -1514,13 +1525,11 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
         .replace("http://", "https://");
 
     let cdn_resp = s.http.get(&data_url).send().await?;
-    let raw_bytes = cdn_resp.bytes().await?;
+    let raw_bytes =
+        crate::limits::response_bytes(cdn_resp, crate::limits::INFLATED_BYTES as usize).await?;
     let json_text = if raw_bytes.len() >= 2 && raw_bytes[0] == 0x1f && raw_bytes[1] == 0x8b {
-        use std::io::Read;
-        let mut gz = flate2::read::GzDecoder::new(&raw_bytes[..]);
-        let mut out = String::new();
-        gz.read_to_string(&mut out)?;
-        out
+        let bytes = crate::limits::read_inflated(flate2::read::GzDecoder::new(&raw_bytes[..]))?;
+        String::from_utf8(bytes)?
     } else {
         String::from_utf8_lossy(&raw_bytes).into_owned()
     };
@@ -1586,8 +1595,8 @@ pub async fn fetch_sticker_pack_items(
             .collect());
     }
 
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::storage::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
     let cache_path = cache_dir.join(format!("pack_{cate_id}.json"));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -1765,8 +1774,8 @@ pub fn canonical_vn_sticker_queries(keyword: &str) -> Vec<String> {
 /// Includes both normalized accented/raw forms and ASCII-folded forms so typing accented or
 /// unaccented Vietnamese triggers suggestions reliably.
 pub async fn fetch_sticker_suggest_keywords(s: &Session) -> Result<Vec<String>> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::storage::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
     let cache_path = cache_dir.join("suggest_keywords_v2.json");
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<String>>(&raw_cache) {
@@ -1970,8 +1979,8 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
     if kw.is_empty() {
         return Ok(Vec::new());
     }
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::storage::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
     let cache_path = cache_dir.join(format!("suggest_v2_{}.json", crate::crypto::md5_hex(&kw)));
     if let Ok(raw_cache) = std::fs::read_to_string(&cache_path) {
         if let Ok(cached) = serde_json::from_str::<Vec<StickerItem>>(&raw_cache) {
@@ -3023,10 +3032,13 @@ pub async fn poll_new_messages(
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
     deduplicate_threads(threads, None);
-    if let Ok(mut store) = crate::store::MessageStore::open("zalo_history.db") {
+    if !s.is_active() || s.account_key().is_empty() {
+        return Ok(());
+    }
+    if let Ok(mut store) = crate::store::MessageStore::open(s.history_path()) {
         let _ = crate::store::persist_threads(&mut store, threads);
     }
-    save_threads_cache(threads);
+    save_threads_cache(s, threads);
     Ok(())
 }
 

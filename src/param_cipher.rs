@@ -25,23 +25,9 @@ fn split_even_odd(s: &str) -> (Vec<char>, Vec<char>) {
 /// `Math.random().toString(16).substr(2, n)` — 8 random hex chars would be 4 bytes;
 /// the bundle produces 6..12 hex chars.
 pub fn random_hex(len: usize) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-        ^ (std::process::id() as u64) << 23;
-    const HEX: &[u8] = b"0123456789abcdef";
-    let mut out = String::with_capacity(len);
-    for _ in 0..len {
-        // xorshift64*
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        let r = seed.wrapping_mul(0x2545F4914F6CDD1D);
-        out.push(HEX[(r >> 33) as usize % 16] as char);
-    }
-    out
+    let mut bytes = vec![0u8; len.div_ceil(2)];
+    crate::random::fill(&mut bytes).expect("OS random generator is unavailable");
+    bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()[..len].to_string()
 }
 
 /// `C.encodeAES(key, text, "hex", true)` — AES-256-CBC, zero IV, PKCS7, hex, uppercased.

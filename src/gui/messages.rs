@@ -440,12 +440,12 @@ pub(super) fn finalize_clipboard_rgba_image(
     if width == 0 || height == 0 {
         return None;
     }
-    let _ = std::fs::create_dir_all("stickers_cache");
+    let _ = std::fs::create_dir_all(crate::storage::cache_dir());
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = std::path::PathBuf::from(format!("stickers_cache/clipboard_{now_ms}.png"));
+    let path = crate::storage::cache_dir().join(format!("clipboard_{now_ms}.png"));
     rgba.save(&path).ok()?;
 
     let thumb = if width > 240 || height > 240 {
@@ -524,10 +524,10 @@ pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, 
                     if !hmem.is_null() {
                         let ptr = GlobalLock(hmem);
                         let len = GlobalSize(hmem);
-                        if !ptr.is_null() && len > 8 {
+                        if !ptr.is_null() && len > 8 && len <= crate::limits::IMAGE_BYTES {
                             let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
                             GlobalUnlock(hmem);
-                            if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                            if let Ok(dyn_img) = crate::limits::decode_image(&bytes) {
                                 CloseClipboard();
                                 return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
                             }
@@ -585,7 +585,11 @@ pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, 
                             u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
 
                         if width_i > 0
+                            && width_i <= 8192
                             && height_i != 0
+                            && height_i.unsigned_abs() <= 8192
+                            && (width_i as u64) * (height_i.unsigned_abs() as u64)
+                                <= 32 * 1024 * 1024
                             && (bit_count == 24 || bit_count == 32)
                             && bi_size >= 40
                             && bi_size <= slice.len()
@@ -664,7 +668,7 @@ pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, 
         ] {
             if let Ok(out) = std::process::Command::new(prog).args(args).output() {
                 if out.status.success() && out.stdout.len() > 8 {
-                    if let Ok(dyn_img) = image::load_from_memory(&out.stdout) {
+                    if let Ok(dyn_img) = crate::limits::decode_image(&out.stdout) {
                         return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
                     }
                 }

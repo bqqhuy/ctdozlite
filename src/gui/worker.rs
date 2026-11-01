@@ -2,6 +2,7 @@ use super::*;
 
 pub enum WorkerCmd {
     RequestQr,
+    PersistSession,
     LoginPassword {
         phone: String,
         pass: String,
@@ -115,12 +116,31 @@ pub enum WorkerCmd {
         user_id: String,
         user_name: String,
     },
-    PersistThreads(Vec<Thread>),
+    PersistThreads {
+        owner: String,
+        threads: Vec<Thread>,
+    },
     Logout,
 }
 
-pub(super) static WORKER_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> =
-    std::sync::OnceLock::new();
+// Replaceable mailbox: each logout tears down the old worker runtime and event channel.
+pub(super) struct WorkerMailbox(
+    std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<WorkerCmd>>>,
+);
+impl WorkerMailbox {
+    pub(super) fn get(&self) -> Option<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> {
+        self.0.lock().ok()?.clone()
+    }
+    fn set(&self, sender: tokio::sync::mpsc::UnboundedSender<WorkerCmd>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
+    }
+}
+pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox(std::sync::Mutex::new(None));
+
+struct PollGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for PollGuard {
+    fn drop(&mut self) { self.0.store(false, std::sync::atomic::Ordering::SeqCst); }
+}
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
     resp.get("data")
@@ -154,15 +174,15 @@ pub(super) fn preload_disk_sticker_thumbnails(
     gui_tx: &Sender<GuiEvent>,
     limit: usize,
 ) -> Vec<(String, String, std::path::PathBuf)> {
-    let cache_dir = std::path::Path::new("stickers_cache");
-    let _ = std::fs::create_dir_all(cache_dir);
+    let cache_dir = crate::storage::cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
 
     let mut missing = Vec::new();
     for item in items.iter().take(limit) {
         let key = format!("stk_{}_{}", item.cate_id, item.sticker_id);
         let cache_path = cache_dir.join(format!("{key}.png"));
         if let Ok(disk_bytes) = std::fs::read(&cache_path) {
-            if let Ok(dyn_img) = image::load_from_memory(&disk_bytes) {
+            if let Ok(dyn_img) = crate::limits::decode_image(&disk_bytes) {
                 let rgba = dyn_img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels = rgba.as_flat_samples();
@@ -210,9 +230,11 @@ async fn prefetch_missing_sticker_thumbnails(
         async move {
             if let Ok(resp) = client.get(&url).send().await {
                 if resp.status().is_success() {
-                    if let Ok(b) = resp.bytes().await {
+                    if let Ok(b) =
+                        crate::limits::response_bytes(resp, crate::limits::IMAGE_BYTES).await
+                    {
                         let vec = b.to_vec();
-                        if let Ok(dyn_img) = image::load_from_memory(&vec) {
+                        if let Ok(dyn_img) = crate::limits::decode_image(&vec) {
                             let _ = std::fs::write(&cache_path, &vec);
                             let rgba = dyn_img.to_rgba8();
                             let size = [rgba.width() as usize, rgba.height() as usize];
@@ -398,37 +420,46 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                 }
 
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
+                let is_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
-                        WorkerCmd::PersistThreads(threads_snapshot) => {
-                            tokio::task::spawn_blocking(move || {
-                                if let Ok(mut store) =
-                                    crate::store::MessageStore::open("zalo_history.db")
-                                {
-                                    let _ =
-                                        crate::store::persist_threads(&mut store, &threads_snapshot);
-                                }
-                                crate::chat::save_threads_cache(&threads_snapshot);
-                            });
+                        WorkerCmd::PersistThreads { owner, threads } => {
+                            let s = session.lock().await.clone();
+                            if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
+                            // Await writes in command order: logout cannot race a detached snapshot write.
+                            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                if !s.is_active() { return Ok(()); }
+                                let mut store = crate::store::MessageStore::open(s.history_path())?;
+                                crate::store::persist_threads(&mut store, &threads)?;
+                                crate::chat::save_threads_cache(&s, &threads);
+                                Ok(())
+                            }).await;
+                            if !matches!(result, Ok(Ok(()))) {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể lưu lịch sử hội thoại".into()));
+                            }
                         }
                         WorkerCmd::Logout => {
-                            if let Some(task) = current_qr_task.take() {
-                                task.abort();
-                            }
-                            let _ = std::fs::remove_file("session.json");
-                            let _ = std::fs::remove_file("threads_cache.json");
-                            let _ = std::fs::remove_file("zalo_history.db");
-                            {
-                                let mut s = session.lock().await;
-                                s.logout();
-                            }
-                            {
-                                let mut ps = poll_state.lock().await;
-                                *ps = crate::chat::PollState::default();
+                            if let Some(task) = current_qr_task.take() { task.abort(); }
+                            call_bridge.end_call();
+                            session.lock().await.logout();
+                            if let Err(e) = crate::storage::remove_session() {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể xóa phiên: {e}")));
+                                continue;
                             }
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
                             egui_ctx.request_repaint();
+                            // Dropping this runtime cancels all old network tasks. A fresh UI channel
+                            // prevents queued events from the previous account reaching the next one.
+                            break;
+                        }
+                        WorkerCmd::PersistSession => {
+                            let s = session.lock().await;
+                            if s.login.is_some() {
+                                if let Err(e) = s.save_to_file("session.json") {
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                }
+                            }
                         }
                         WorkerCmd::RequestQr => {
                             if let Some(task) = current_qr_task.take() {
@@ -523,7 +554,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                                 &mut s, data,
                                                             );
                                                         }
-                                                        let _ = s.save_to_file("session.json");
+                                                        if let Err(e) = s.save_to_file("session.json") {
+                                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                                        }
 
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
@@ -536,7 +569,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        let _ = s.save_to_file("session.json");
+                                                        if let Err(e) = s.save_to_file("session.json") {
+                                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                                        }
 
                                                         let uin = s
                                                             .login
@@ -566,7 +601,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                             .await
                                                             .unwrap_or_default();
                                                         crate::store::load_history_into_threads(
-                                                            "zalo_history.db",
+                                                            s.history_path(),
                                                             &mut list,
                                                             200,
                                                         );
@@ -615,7 +650,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     if !s.validate_session().await {
-                                        let _ = std::fs::remove_file("session.json");
+                                        if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                         {
                                             let mut sl = session_clone.lock().await;
                                             sl.logout();
@@ -625,9 +660,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 .into(),
                                         ));
                                         ctx_clone.request_repaint();
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::RequestQr);
-                                        }
                                         return;
                                     }
                                     if let Some((uid, name)) = s.sync_profile_me().await {
@@ -639,7 +671,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                     li.display_name = name.clone();
                                                 }
                                             }
-                                            let _ = sl.save_to_file("session.json");
+                                            if let Err(e) = sl.save_to_file("session.json") {
+                                                let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                            }
                                         }
                                         let u_ava = s
                                             .login
@@ -655,7 +689,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     let mut list =
                                         crate::chat::get_friends(&s).await.unwrap_or_default();
                                     crate::store::load_history_into_threads(
-                                        "zalo_history.db",
+                                        s.history_path(),
                                         &mut list,
                                         200,
                                     );
@@ -671,9 +705,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             });
                         }
                         WorkerCmd::PollMessages { known_threads } => {
-                            static IS_POLLING: std::sync::atomic::AtomicBool =
-                                std::sync::atomic::AtomicBool::new(false);
-                            if IS_POLLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            if is_polling.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                 continue;
                             }
 
@@ -681,7 +713,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let poll_guard = PollGuard(is_polling.clone());
                             tokio::spawn(async move {
+                                let _poll_guard = poll_guard;
                                 let s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     let mut temp_threads: Vec<Thread> = known_threads
@@ -733,7 +767,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
 
                                     if let Some(err_s) = poll_err {
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                             {
                                                 let mut sl = session_clone.lock().await;
                                                 sl.logout();
@@ -742,9 +776,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
                                             ));
                                             ctx_clone.request_repaint();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
                                         }
                                     } else {
                                         temp_threads.retain(|t| !t.messages.is_empty());
@@ -760,7 +791,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                         }
                                     }
                                 }
-                                IS_POLLING.store(false, std::sync::atomic::Ordering::SeqCst);
                             });
                         }
                         WorkerCmd::LoadGroupHistory { group_id, is_group } => {
@@ -786,7 +816,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     };
                                     let mut t_list = vec![t];
                                     crate::store::load_history_into_threads(
-                                        "zalo_history.db",
+                                        s.history_path(),
                                         &mut t_list,
                                         500,
                                     );
@@ -947,7 +977,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             error: err_s.clone(),
                                         });
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                             {
                                                 let mut sl = session_clone.lock().await;
                                                 sl.logout();
@@ -955,9 +985,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
                                                 "Không thể gửi vì phiên zpw_sek đã hết hạn".into(),
                                             ));
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
                                         }
                                         ctx_clone.request_repaint();
                                     }
@@ -1129,7 +1156,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             (to_id.clone(), msg.id.clone(), msg.ts);
                                         let _ = tokio::task::spawn_blocking(move || {
                                             if let Ok(mut store) =
-                                                crate::store::MessageStore::open("zalo_history.db")
+                                                crate::store::MessageStore::open(s.history_path())
                                             {
                                                 let _ = store.delete_message(&tid, &mid, ts);
                                             }
@@ -1257,7 +1284,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             error: err_s.clone(),
                                         });
                                         if is_session_expired_error(&err_s) {
-                                            let _ = std::fs::remove_file("session.json");
+                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                             {
                                                 let mut sl = session_clone.lock().await;
                                                 sl.logout();
@@ -1266,9 +1293,6 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                                 "Không thể gửi nhãn dán vì phiên zpw_sek đã hết hạn"
                                                     .into(),
                                             ));
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RequestQr);
-                                            }
                                         }
                                         ctx_clone.request_repaint();
                                     }
@@ -1280,12 +1304,12 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let cache_dir = std::path::Path::new("stickers_cache");
-                                let _ = std::fs::create_dir_all(cache_dir);
+                                let cache_dir = crate::storage::cache_dir();
+                                let _ = std::fs::create_dir_all(&cache_dir);
                                 let cache_path = cache_dir.join(format!("{key}.png"));
 
                                 let bytes_opt = if let Ok(disk_bytes) = std::fs::read(&cache_path) {
-                                    if image::load_from_memory(&disk_bytes).is_ok() {
+                                    if crate::limits::decode_image(&disk_bytes).is_ok() {
                                         Some(disk_bytes)
                                     } else {
                                         let _ = std::fs::remove_file(&cache_path);
@@ -1297,9 +1321,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                     let client = { session_clone.lock().await.clone().http };
                                     if let Ok(resp) = client.get(&url).send().await {
                                         if resp.status().is_success() {
-                                            if let Ok(b) = resp.bytes().await {
+                                            if let Ok(b) = crate::limits::response_bytes(resp, crate::limits::IMAGE_BYTES).await {
                                                 let vec = b.to_vec();
-                                                if image::load_from_memory(&vec).is_ok() {
+                                                if crate::limits::decode_image(&vec).is_ok() {
                                                     let _ = std::fs::write(&cache_path, &vec);
                                                     Some(vec)
                                                 } else {
@@ -1317,7 +1341,7 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                 };
 
                                 if let Some(bytes) = bytes_opt {
-                                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                                    if let Ok(dyn_img) = crate::limits::decode_image(&bytes) {
                                         let mut rgba = dyn_img.to_rgba8();
                                         // Apply smooth anti-aliased circular alpha mask for avatar textures (`ava_*`)
                                         if key.starts_with("ava_") {
@@ -1752,6 +1776,8 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                             });
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
+                            if let Some(task) = current_qr_task.take() { task.abort(); }
+                            session.lock().await.logout();
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -1770,7 +1796,9 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
                                                 s.apply_server_info(cfg);
-                                                let _ = s.save_to_file("session.json");
+                                                if let Err(e) = s.save_to_file("session.json") {
+                                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                                }
 
                                                 let uin = s
                                                     .login
@@ -1827,3 +1855,22 @@ pub(super) fn spawn_session_worker(session: Session, gui_tx: Sender<GuiEvent>, e
         .expect("Failed to spawn zalo-worker thread");
 }
 
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::PollGuard;
+    #[tokio::test]
+    async fn cancelling_poll_releases_inflight_flag() {
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = PollGuard(flag.clone());
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+}

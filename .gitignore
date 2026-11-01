@@ -43,3 +43,7 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Protected credentials and explicit portable data
+session.dat
+data/

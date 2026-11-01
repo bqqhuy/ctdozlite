@@ -4,6 +4,10 @@
 
 #![allow(dead_code)]
 
+mod limits;
+mod random;
+mod storage;
+mod video;
 mod audio;
 mod call;
 mod chat;
@@ -34,7 +38,11 @@ async fn main() -> Result<()> {
         println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
+    storage::init(args.iter().any(|a| a == "--portable"))?;
+    let _instance = storage::lock_instance()?;
+    let dev_mode = args
+        .iter()
+        .any(|a| a == "--dev" || a == "-v" || a == "--verbose");
     let dump = args.iter().any(|a| a == "-d" || a == "--dump");
     let dump_raw = args.iter().any(|a| a == "--dump-raw");
     let force_tui = args.iter().any(|a| a == "--tui");
@@ -43,9 +51,8 @@ async fn main() -> Result<()> {
     let force_logout = args.iter().any(|a| a == "--logout");
 
     if force_logout {
-        let _ = std::fs::remove_file("session.json");
-        let _ = std::fs::remove_file("threads_cache.json");
-        println!("✓ Đã đăng xuất và xóa phiên lưu trữ cũ (session.json, threads_cache.json).");
+        storage::remove_session()?;
+        println!("✓ Đã đăng xuất. Lịch sử được giữ riêng cho tài khoản đã đăng nhập.");
         if !force_gui && !force_tui && !force_qr {
             return Ok(());
         }
@@ -59,6 +66,15 @@ async fn main() -> Result<()> {
         println!("🔒 [PRODUCTION MODE] – Toàn bộ nhật ký và dev inspector được ẩn.");
     }
 
+    if args.iter().any(|a| a == "--doctor") {
+        println!("Architecture: {}", std::env::consts::ARCH);
+        println!("Data directory: {}", storage::root().display());
+        match video::readiness() {
+            Ok(path) => println!("Video ready: {}", path.display()),
+            Err(e) => println!("Video unavailable: {e}"),
+        }
+        return Ok(());
+    }
     let mut s = Session::new(dev_mode, dump, dump_raw)?;
 
     // Attempt to restore persistent session from disk
@@ -109,8 +125,8 @@ async fn main() -> Result<()> {
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+        let mut initial_threads = chat::load_threads_cache(&s);
+        store::load_history_into_threads(s.history_path(), &mut initial_threads, 200);
 
         let renderers = gui_renderer_order();
         let mut last_err = None;
@@ -121,6 +137,11 @@ async fn main() -> Result<()> {
             let native_options = eframe::NativeOptions {
                 viewport: viewport.clone(),
                 renderer: *renderer,
+                #[cfg(all(windows, target_arch = "aarch64"))]
+                wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+                    supported_backends: eframe::wgpu::Backends::DX12,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let app_session = s.clone();
@@ -129,7 +150,17 @@ async fn main() -> Result<()> {
                 "Zalo - Rust Native Client",
                 native_options,
                 Box::new(move |cc| {
-                    Ok(Box::new(gui::ZaloGuiApp::new(cc, app_session, dev_mode, threads)))
+                    #[cfg(all(windows, target_arch = "aarch64"))]
+                    if let Some(state) = &cc.wgpu_render_state {
+                        let info = state.adapter.get_info();
+                        eprintln!("Graphics: {} ({:?})", info.name, info.backend);
+                    }
+                    Ok(Box::new(gui::ZaloGuiApp::new(
+                        cc,
+                        app_session,
+                        dev_mode,
+                        threads,
+                    )))
                 }),
             ) {
                 Ok(()) => return Ok(()),
@@ -168,9 +199,10 @@ async fn main() -> Result<()> {
         if s.validate_session().await {
             true
         } else {
-            println!("⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…");
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
+            println!(
+                "⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…"
+            );
+            storage::remove_session()?;
             s.logout();
             false
         }
@@ -216,9 +248,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    if s.login.is_some() {
+        if let Err(e) = s.save_to_file("session.json") { eprintln!("Không thể lưu phiên: {e}"); }
+    }
+
     // Fetch initial threads and hydrate with local SQLite history
-    let mut initial_threads = chat::load_threads_cache();
-    store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+    let mut initial_threads = chat::load_threads_cache(&s);
+    store::load_history_into_threads(s.history_path(), &mut initial_threads, 200);
     if s.login.is_some() {
         match chat::get_friends(&s).await {
             Ok(list) => {
