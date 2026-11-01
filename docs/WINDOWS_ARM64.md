@@ -1,6 +1,6 @@
 # Windows 11 ARM64
 
-ctdozlite dùng Rust MSVC ARM64 native, renderer Direct3D 12 và dialog Win32. OpenGL là renderer dự phòng. Bản phát hành phải vượt qua CI Windows ARM64; build thành công chưa thay thế được kiểm thử GPU, microphone, camera và tài khoản thật trên thiết bị.
+ctdozlite dùng Rust MSVC ARM64 native, CRT tĩnh, renderer Direct3D 12 và dialog Win32. Executable chính không cần cài thêm Visual C++ Runtime. OpenGL là renderer dự phòng. Bản phát hành phải vượt qua CI Windows ARM64; build thành công chưa thay thế được kiểm thử GPU, microphone, camera và tài khoản thật trên thiết bị.
 
 ## Build và tải artifact
 
@@ -14,7 +14,7 @@ rustup toolchain install 1.99.1-aarch64-pc-windows-msvc --profile minimal
 .\scripts\build-windows-arm64.ps1
 ```
 
-Script chạy test tất cả target, build `aarch64-pc-windows-msvc`, kiểm tra PE `0xAA64`, thực thi `--version`, rồi tạo bộ cài và checksum. Bản build chưa ký Authenticode; chữ ký cần chứng chỉ riêng của nhà phát hành.
+Script chạy test tất cả target, build `aarch64-pc-windows-msvc`, kiểm tra PE `0xAA64` và DLL phụ thuộc, thực thi `--version`, rồi tạo bộ cài và checksum. Bản build chưa ký Authenticode; chữ ký cần chứng chỉ riêng của nhà phát hành.
 
 ## Dữ liệu và phiên đăng nhập
 

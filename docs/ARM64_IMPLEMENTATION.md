@@ -13,7 +13,7 @@ These changes address the audit baseline at commit `3f28d2f99413d84e31d979cb914b
 | A07 | Capture/playback dispatches F32/I16/U16/I32/F64 conversions and reports missing devices and stream creation failures in the GUI. |
 | A08 | Network responses are capped while streaming; image dimensions/allocations and decompressed payload sizes are bounded; concurrent image jobs are capped at four. |
 | A09 | Call signaling/wire logs require opt-in diagnostics and rotate under the data directory. |
-| A10 | ARM64 workflow covers PR/main, uses a pinned Rust toolchain/actions, runs all-target tests and checks/runs the built executable. |
+| A10 | ARM64 workflow covers PR/main, uses a pinned Rust toolchain/actions, runs all-target tests and checks/runs the built executable. The ARM64 target uses a static CRT, and packaging rejects external VC++/Opus/SQLite runtime DLL imports. |
 | A11 | Packaging fails if the installer is absent and emits an ARM64-specific checksum and source/toolchain manifest. Build jobs use read-only repository permissions; publishing uses a separate write-enabled job. |
 | A12 | Folder selection runs off the GUI thread and returns through the current UI event channel. |
 

@@ -18,12 +18,30 @@ function Assert-Arm64([string]$Path) {
     if ($machine -ne 0xAA64) { throw "Expected native ARM64 PE, got 0x$('{0:X4}' -f $machine): $Path" }
     Write-Host "ARM64 PE verified: $Path"
 }
+function Get-Dumpbin {
+    $tool = Get-Command dumpbin -ErrorAction SilentlyContinue
+    if ($tool) { return $tool.Source }
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { throw 'Visual Studio vswhere is required to inspect DLL dependencies' }
+    foreach ($hostArch in @('Hostarm64', 'Hostx64')) {
+        $paths = @(& $vswhere -latest -products '*' -find "VC\Tools\MSVC\*\bin\$hostArch\arm64\dumpbin.exe")
+        if ($LASTEXITCODE -eq 0 -and $paths.Count -gt 0 -and (Test-Path $paths[0])) { return $paths[0] }
+    }
+    throw 'ARM64 MSVC dumpbin was not found'
+}
 $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
 if (-not $SkipTests) { Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target) }
 Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'zalo-rust', '--target', $target)
 $binary = (Resolve-Path "target\$target\release\zalo-rust.exe").Path
 Assert-Arm64 $binary
+$dumpbin = Get-Dumpbin
+$imports = & $dumpbin /DEPENDENTS $binary
+if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect DLL imports' }
+$imports | Write-Host
+if ($imports -match '(?i)(?:VCRUNTIME|MSVCP)\w*\.dll|(?:opus|sqlite3)\.dll') {
+    throw 'Portable ARM64 executable depends on a separately installed runtime DLL'
+}
 Invoke-Checked $binary @('--version')
 $version = ((& cargo metadata --locked --no-deps --format-version 1) | ConvertFrom-Json).packages |
     Where-Object { $_.name -eq 'ctdozlite' } | Select-Object -ExpandProperty version
@@ -43,6 +61,7 @@ $sourceCommit = (& git rev-parse HEAD).Trim()
     version = $version; target = $target; commit = $sourceCommit; rust = $hostInfo
     cargo_lock_sha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
     ffmpeg = 'External native ARM64 dependency; run zalo-rust.exe --doctor'
+    crt = 'static'
     signed = $false
 } | ConvertTo-Json | Set-Content dist\build-info-windows-arm64.json -Encoding utf8
 Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
