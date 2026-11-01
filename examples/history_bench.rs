@@ -3,6 +3,8 @@ use std::time::Instant;
 use zalo_rust::chat::{merge_thread_into, ChatMessage, Thread};
 fn thread(start: usize, count: usize) -> Thread {
     Thread {
+        presentation: Default::default(),
+        unread: Default::default(),
         id: "thread-1".into(),
         name: "Benchmark".into(),
         preview: String::new(),

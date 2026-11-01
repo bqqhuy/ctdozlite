@@ -27,3 +27,7 @@ CM history pagination follows `lastMsgId`, `hasMore`, `isOld`, `isFiltered`, wit
 ## Verification
 
 Native CI must pass tests, PE ARM64/static runtime inspection, nonblank DX12 screenshots at multiple sizes/scales, hide/restore/exit against the real HWND, and installer creation. Manual verification on the target device must still cover login, old group/Cloud history, both tray mouse buttons, background delivery, outgoing calls and camera capture. No live account was used during automated checks.
+
+## Follow-up upstream snapshot
+
+At 2026-11-01 15:21 UTC, upstream advanced to `aad565c2d8a6528239f4b7b1990377c5e5a1348f`. Import the message/reaction/unread foundation modules and timestamp helpers with their offline tests. Retain DPAPI atomic session replacement instead of importing plaintext session writes. Exclude macOS helper packaging under the Windows-only distribution decision. Foundation-model tests do not establish live server/UI/SQLite feature parity.

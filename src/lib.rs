@@ -1,6 +1,6 @@
 pub mod call;
 pub mod chat;
-mod clock;
+pub mod clock;
 pub mod crypto;
 pub mod endpoints;
 pub mod gui;
@@ -29,3 +29,7 @@ pub mod platform;
 
 #[cfg(windows)]
 mod tray;
+
+pub mod message_model;
+pub mod reactions;
+pub mod unread;

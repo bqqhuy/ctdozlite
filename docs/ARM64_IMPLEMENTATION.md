@@ -4,7 +4,7 @@ Phạm vi: mã nguồn Rust, worker/session/network, lưu trữ, GUI, audio/vide
 
 ## Đối chiếu upstream
 
-Đã tích hợp upstream `main` tại `1345f5d` (**v0.0.3**, 51 commit sau nền v0.0.2). Phần runtime Windows được giữ khi có triển khai chồng lấn: DPAPI, dữ liệu từng tài khoản, DX12, Media Foundation và tray. Các thay đổi hiệu năng, giờ địa phương, font và tên binary v0.0.3 đã được đưa vào. Không nhập self-updater đa nền tảng trỏ tới artifact upstream; xem [ADR-0001](adr/0001-windows-arm64-runtime.md) để biết phạm vi khác biệt. `origin/main` vẫn ở `3f28d2f`; các bản sửa nằm trên PR #2, chưa đồng nghĩa đã phát hành.
+Đã tích hợp upstream `main` tại `aad565c2d8a6528239f4b7b1990377c5e5a1348f` (dòng **v0.0.3**, 57 commit sau nền v0.0.2; đối chiếu 2026-11-01 15:21 UTC). Phần runtime Windows được giữ khi có triển khai chồng lấn: DPAPI, dữ liệu từng tài khoản, DX12, Media Foundation và tray. Các thay đổi hiệu năng, giờ địa phương, font và tên binary v0.0.3 đã được đưa vào. Không nhập self-updater đa nền tảng trỏ tới artifact upstream; xem [ADR-0001](adr/0001-windows-arm64-runtime.md) để biết phạm vi khác biệt. `origin/main` vẫn ở `3f28d2f`; các bản sửa nằm trên PR #2, chưa đồng nghĩa đã phát hành.
 
 Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; không đồng nghĩa đã có trong `main` hoặc bản Release đang tải. Các PR upstream đang mở không được coi là code đã merge.
 
@@ -92,3 +92,5 @@ Huawei MateBook E Go Gen 3 / Snapdragon 8cx Gen 3. Đồng bộ tự bắt đầ
 ## Đo hiệu năng gộp lịch sử
 
 Dữ liệu giả: 1.000 tin đang có + 1.000 tin đến, trùng 500 ID, nội dung lặp; 20 lượt trên Linux x86_64 trong cloud, profile debug. Trước tối ưu index: min 12,799 ms, trung bình 13,067 ms, p50 13,035 ms, p95 13,262 ms, p99 14,198 ms. Sau: min 2,183 ms, trung bình 2,344 ms, p50 2,232 ms, p95 2,586 ms, p99 3,559 ms. Chạy lại bằng `cargo run --locked --example history_bench`; đây không phải số đo trên Snapdragon 8cx Gen 3.
+
+Bổ sung từ upstream sau `1345f5d`: các module nền tảng message/reaction/unread và chuẩn hóa timestamp đã được đưa vào cùng kiểm thử. Chưa coi các module này là bằng chứng trạng thái đọc/reaction đã đồng bộ đầy đủ từ mạng qua SQLite và UI. Cơ chế ghi phiên nguyên tử của upstream đã có triển khai tương đương trên DPAPI của fork, nên không thay bằng session JSON.

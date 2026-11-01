@@ -530,6 +530,8 @@ impl ZaloGuiApp {
                 self.threads.insert(
                     0,
                     Thread {
+                        presentation: Default::default(),
+                        unread: Default::default(),
                         id: prof.user_id.clone(),
                         name: prof.display_name.clone(),
                         preview: format!("SĐT: {}", prof.phone),

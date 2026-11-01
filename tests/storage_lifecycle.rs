@@ -35,6 +35,8 @@ fn remember_logout_and_account_history_are_isolated() {
     restored.load_from_file("session.json").unwrap();
     assert_eq!(restored.account_key(), alice.account_key());
     let threads = vec![chat::Thread {
+        presentation: Default::default(),
+        unread: Default::default(),
         id: "contact-fixture".into(),
         name: "Alice private thread".into(),
         preview: "private".into(),

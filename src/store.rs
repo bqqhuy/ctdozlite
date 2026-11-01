@@ -263,6 +263,8 @@ impl MessageStore {
                 existing.is_group = existing.is_group || st.is_group;
             } else if include_unlisted {
                 threads.push(Thread {
+                    presentation: Default::default(),
+                    unread: Default::default(),
                     id: st.thread_id.clone(),
                     name: if st.name.is_empty() {
                         format!("Người dùng {}", st.thread_id)
@@ -385,16 +387,14 @@ impl MessageStore {
                     link_desc,
                     link_thumb,
                     link_src,
+
+                    ..Default::default()
                 };
-                if let Some(existing) = t.messages.iter_mut().find(|existing| {
-                    (!existing.id.is_empty() && existing.id == cm.id)
-                        || (existing.text == cm.text
-                            && existing.is_outgoing == cm.is_outgoing
-                            && (existing.ts == cm.ts
-                                || (existing.ts != 0
-                                    && cm.ts != 0
-                                    && (existing.ts - cm.ts).abs() < 5000)))
-                }) {
+                if let Some(existing) = t
+                    .messages
+                    .iter_mut()
+                    .find(|existing| crate::chat::same_message(existing, &cm))
+                {
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
                         existing.sticker_cate_id = cm.sticker_cate_id;
@@ -571,6 +571,8 @@ mod tests {
                 .unwrap();
         }
         let mut selected = vec![Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
             id: "thread-1".into(),
             name: String::new(),
             preview: String::new(),
@@ -609,6 +611,23 @@ mod tests {
                 .map(|m| m.ts)
                 .collect::<Vec<_>>(),
             vec![8, 9, 10]
+        );
+        let mut selected = vec![Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: "thread-1".into(),
+            name: String::new(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: false,
+            messages: Vec::new(),
+        }];
+        store.hydrate_selected_threads(&mut selected, 3).unwrap();
+        assert_eq!(
+            selected[0].messages.len(),
+            3,
+            "Distinct IDs with repeated text must survive SQLite hydration"
         );
         let plan: String = store.conn.query_row("EXPLAIN QUERY PLAN SELECT msg_id FROM messages WHERE thread_id=?1 ORDER BY ts DESC LIMIT 3", ["thread-1"],|row|row.get(3)).unwrap();
         assert!(plan.contains("idx_thread_ts"), "{plan}");
@@ -705,6 +724,8 @@ mod tests {
     fn test_persist_threads_and_upsert_thread() {
         let mut store = MessageStore::open(":memory:").unwrap();
         let thread = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
             id: "t_test".into(),
             name: "Test Thread".into(),
             preview: "Preview".into(),
@@ -765,6 +786,8 @@ mod transaction_tests {
         let mut store = MessageStore::open(":memory:").unwrap();
         store.conn.execute_batch("CREATE TRIGGER reject_fixture BEFORE INSERT ON threads WHEN NEW.thread_id = 'bad' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
         let thread = |id: &str| Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
             id: id.into(),
             name: id.into(),
             preview: String::new(),
