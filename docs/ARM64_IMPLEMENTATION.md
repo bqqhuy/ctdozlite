@@ -38,7 +38,7 @@ Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; khôn
 
 ## Dependency audit
 
-Đã truy vấn OSV trên 300 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
+Đã truy vấn OSV trên 302 package registry thuộc graph normal/build của target Windows ARM64, không chỉ đọc tên crate trong manifest. Xem [kết quả máy đọc](DEPENDENCY_AUDIT.json).
 
 | Phát hiện | Xử lý |
 |---|---|

@@ -306,4 +306,3 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
     }
     order
 }
-

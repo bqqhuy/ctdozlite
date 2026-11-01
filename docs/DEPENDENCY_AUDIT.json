@@ -1,5 +1,5 @@
 {
-  "packages": 300,
+  "packages": 302,
   "findings": [
     {
       "package": "audiopus_sys",
@@ -23,9 +23,9 @@
       ]
     }
   ],
-  "checked_at_utc": "2026-11-01T10:39:17.636600+00:00",
+  "checked_at_utc": "2026-11-01T11:08:06.935459+00:00",
   "target": "aarch64-pc-windows-msvc",
-  "cargo_lock_sha256": "1c3e4ea70f6a8dd7369b523db20c6fdd972598c9eb6235916f2528433a41ddae",
+  "cargo_lock_sha256": "677af4e8eda6b6c8c6e159a701e198df5ef7e6ffd9432361ddd82ad77d4aaf93",
   "source": "https://api.osv.dev/v1/querybatch",
   "scope": "Registry packages on normal/build dependency graph; local lru compatibility export is not a registry implementation."
 }
