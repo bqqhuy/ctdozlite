@@ -20,7 +20,7 @@ function Assert-Arm64([string]$Path) {
 }
 $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
-if (-not $SkipTests) { Invoke-Checked cargo @('test', '--locked', '--release', '--all-targets', '--target', $target) }
+if (-not $SkipTests) { Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target) }
 Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'zalo-rust', '--target', $target)
 $binary = (Resolve-Path "target\$target\release\zalo-rust.exe").Path
 Assert-Arm64 $binary
