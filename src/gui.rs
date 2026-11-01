@@ -1364,6 +1364,19 @@ impl eframe::App for ZaloGuiApp {
             }
             ctx.request_repaint();
         }
+        #[cfg(windows)]
+        if crate::tray::take_restore_request() && self.smoke.is_none() && self.is_logged_in {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::RefreshThreads);
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                        group_id: thread.id.clone(),
+                        is_group: thread.is_group,
+                        limit: thread.messages.len().max(500),
+                    });
+                }
+            }
+        }
         if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
             self.allow_quit = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

@@ -25,6 +25,8 @@ pub(crate) struct Control {
     ctx: Context,
     hwnd: isize,
     quitting: Arc<AtomicBool>,
+    hidden: Arc<AtomicBool>,
+    restored: Arc<AtomicBool>,
 }
 impl Control {
     fn command(&self, command: ViewportCommand) {
@@ -34,6 +36,9 @@ impl Control {
     pub(crate) fn open(&self) {
         if self.quitting.load(Ordering::SeqCst) {
             return;
+        }
+        if self.hidden.swap(false, Ordering::SeqCst) {
+            self.restored.store(true, Ordering::SeqCst);
         }
         // SAFETY: the HWND belongs to the live root viewport. These user32 calls
         // accept window handles from any thread and do not dereference Rust data.
@@ -64,6 +69,7 @@ impl Control {
         }
     }
     pub(crate) fn hide_on_close(&self) {
+        self.hidden.store(true, Ordering::SeqCst);
         self.command(ViewportCommand::CancelClose);
         self.command(ViewportCommand::Visible(false));
         // SAFETY: the HWND belongs to the live root viewport. These user32 calls
@@ -121,6 +127,8 @@ impl Tray {
             ctx,
             hwnd,
             quitting: Arc::new(AtomicBool::new(false)),
+            hidden: Arc::new(AtomicBool::new(false)),
+            restored: Arc::new(AtomicBool::new(false)),
         };
         *DISPATCH
             .lock()
@@ -188,4 +196,67 @@ pub(crate) fn smoke_lifecycle(control: Control) {
         eprintln!("Tray smoke passed: X hides, Open restores, Exit requested while hidden");
         control.quit();
     });
+}
+
+/// Avoid retaining every history page in an unbounded GUI queue while hidden.
+pub(crate) fn hidden() -> bool {
+    DISPATCH
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.control.hidden.load(Ordering::SeqCst)))
+        .unwrap_or(false)
+}
+
+/// Consume the restore signal once; the UI reloads changes persisted while hidden.
+pub(crate) fn take_restore_request() -> bool {
+    DISPATCH
+        .lock()
+        .ok()
+        .and_then(|d| {
+            d.as_ref()
+                .map(|d| d.control.restored.swap(false, Ordering::SeqCst))
+        })
+        .unwrap_or(false)
+}
+
+/// Wake the native window for an incoming call even when rendering is suspended.
+pub(crate) fn show_incoming_call() {
+    let control = DISPATCH
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.control.clone()));
+    if let Some(control) = control {
+        if control.hidden.load(Ordering::SeqCst) {
+            control.open();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hidden_window_requests_one_reload_when_restored() {
+        let control = Control {
+            ctx: Context::default(),
+            hwnd: 0,
+            quitting: Arc::new(AtomicBool::new(false)),
+            hidden: Arc::new(AtomicBool::new(false)),
+            restored: Arc::new(AtomicBool::new(false)),
+        };
+        *DISPATCH.lock().unwrap() = Some(Dispatch {
+            open: MenuId::new("fixture-open"),
+            quit: MenuId::new("fixture-quit"),
+            control: control.clone(),
+        });
+        assert!(!hidden());
+        control.hide_on_close();
+        assert!(hidden());
+        assert!(!take_restore_request());
+        control.open();
+        assert!(!hidden());
+        assert!(take_restore_request());
+        assert!(!take_restore_request());
+        *DISPATCH.lock().unwrap() = None;
+    }
 }

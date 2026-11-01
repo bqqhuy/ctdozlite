@@ -264,6 +264,17 @@ async fn prefetch_missing_sticker_thumbnails(
 
 // Hidden viewports may stop rendering. Persist worker deltas before notifying UI
 // so delivery and history do not depend on a visible application window.
+fn deliver_thread_updates() -> bool {
+    #[cfg(windows)]
+    {
+        !crate::tray::hidden()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 async fn persist_received(session: &Session, threads: &[Thread]) {
     let session = session.clone();
     let threads = threads.to_vec();
@@ -403,9 +414,9 @@ pub(super) fn spawn_session_worker(
                                                     )
                                                     .await;
                                                     persist_received(&s_snap, &ws_threads).await;
-                                                    let _ = gui_tx_ws.send(
-                                                        GuiEvent::ThreadsUpdated(ws_threads),
-                                                    );
+                                                    if deliver_thread_updates() {
+                                                        let _ = gui_tx_ws.send(GuiEvent::ThreadsUpdated(ws_threads));
+                                                    }
                                                     ctx_ws.request_repaint();
                                                 }
                                             }
@@ -701,8 +712,8 @@ pub(super) fn spawn_session_worker(
                             ctx.request_repaint();
                             tokio::spawn(async move {
                                 let result = crate::history_sync::download(&s, threads, cancel,
-                                    |message| { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); },
-                                    |thread| { let _ = tx.send(GuiEvent::ThreadsUpdated(vec![thread])); ctx.request_repaint(); }).await;
+                                    |message| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); } },
+                                    |thread| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::ThreadsUpdated(vec![thread])); ctx.request_repaint(); } }).await;
                                 running.store(false, std::sync::atomic::Ordering::SeqCst);
                                 let message = result.unwrap_or_else(|e| format!("Lỗi tải lịch sử: {e}"));
                                 let _ = tx.send(GuiEvent::HistorySyncStatus { running: false, message });
@@ -882,8 +893,9 @@ pub(super) fn spawn_session_worker(
                                             )
                                             .await;
                                             persist_received(&s, &temp_threads).await;
-                                            let _ = gui_tx_clone
-                                                .send(GuiEvent::ThreadsUpdated(temp_threads));
+                                            if deliver_thread_updates() {
+                                                let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(temp_threads));
+                                            }
                                             ctx_clone.request_repaint();
                                         }
                                     }

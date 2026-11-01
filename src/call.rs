@@ -2719,6 +2719,8 @@ impl CallBridge {
                                         is_video,
                                         is_group,
                                     });
+                                    #[cfg(windows)]
+                                    crate::tray::show_incoming_call();
                                     ctx_clone.request_repaint();
                                 }
 
