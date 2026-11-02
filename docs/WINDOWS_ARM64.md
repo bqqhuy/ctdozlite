@@ -21,7 +21,11 @@ Nút X và Alt+F4 ẩn cửa sổ xuống tray. Click trái hoặc phải icon �
 
 Sau đăng nhập, ứng dụng tự tải hội thoại, tên nhóm, tin gần đây và lịch sử nhóm/Cloud mà máy chủ cho phép. Trong Settings → Đồng bộ, chọn **Tải / tiếp tục lịch sử** để tải nhóm và Cloud theo trang vào SQLite. Có tiến độ và nút dừng. Mỗi lượt tối đa 200 trang/hội thoại, 50 tin/trang, cách nhau ít nhất 300 ms. Bấm tiếp tục để tải thêm. Vị trí được lưu sau khi tin nhắn đã ghi vào database, nên đóng ứng dụng giữa chừng không làm mất dữ liệu đã ghi.
 
-Tải nhóm/Cloud chỉ lấy được tin máy chủ còn cung cấp. Muốn yêu cầu lịch sử từ điện thoại, chọn **Đồng bộ từ điện thoại**, mở Zalo di động và xác nhận **Đồng bộ ngay**. Tiến độ và nút dừng hiện tại cửa sổ chính. Luồng này chưa có kiểm chứng đầu-cuối với điện thoại thật; dữ liệu đã lưu được giữ khi dừng hoặc mất mạng. Chỉ khôi phục tin điện thoại còn giữ; media phụ thuộc liên kết còn hạn. Lần đầu cần tải bộ giải mã chính thức có SHA-256 cố định; module không được đóng gói trong installer. Nhóm chưa nhận diện đúng ID được giữ riêng, không gán nhầm thành hội thoại gửi tin. Xem ADR-0005.
+Tải nhóm/Cloud chỉ lấy được tin máy chủ còn cung cấp. Muốn yêu cầu lịch sử từ điện thoại, chọn **Đồng bộ từ điện thoại**, mở Zalo di động và xác nhận **Đồng bộ ngay**. Tiến độ và nút dừng hiện tại cửa sổ chính. Người dùng đã xác nhận luồng ban đầu nhận được lịch sử từ điện thoại thật; cơ chế khoảng thời gian/checkpoint mới vẫn cần thử trên máy đích; dữ liệu đã lưu được giữ khi dừng hoặc mất mạng. Chỉ khôi phục tin điện thoại còn giữ; media phụ thuộc liên kết còn hạn. Lần đầu cần tải bộ giải mã chính thức có SHA-256 cố định; module không được đóng gói trong installer. Nhóm chưa nhận diện đúng ID được giữ riêng, không gán nhầm thành hội thoại gửi tin. Xem ADR-0005.
+
+Đồng bộ điện thoại ưu tiên hội thoại hoạt động gần nhất, lần lượt yêu cầu khoảng 7 ngày quanh hoạt động cuối → 90 ngày → lịch sử còn lại. Checkpoint schema 5 chỉ được ghi sau khi cả đợt đã nhập thành công. Lần sau chỉ yêu cầu tin mới (chồng lấn 2 phút để đối soát) và phần còn thiếu; dừng giữa đợt sẽ tải lại đợt đó. Nút **Chỉ cập nhật tin gần đây** bỏ qua hai lượt lịch sử cũ; **Quét lại toàn bộ lịch sử điện thoại** chỉ xóa checkpoint, giữ tin. Bản cũ không có checkpoint nên không tự suy đoán tiến độ từ số tin đã lưu. Xem [ADR-0007](adr/0007-recent-first-resumable-phone-sync.md).
+
+Ảnh hiển thị trực tiếp và mở trình xem trong ứng dụng khi bấm; URL CDN được giữ trong metadata nhưng không hiện thay cho chú thích. Giờ tin mới và lịch sử dùng chung múi giờ hệ thống.
 
 Tên/ảnh đại diện không được dùng để gộp hai ID khác nhau. Bản cũ đã trộn lịch sử thì không có đủ bằng chứng để tự tách lại an toàn; bản mới ngăn phát sinh thêm. Không xóa database để chữa lỗi này.
 
@@ -35,7 +39,7 @@ Trong Windows Settings → Privacy & security → Camera/Microphone, bật quy�
 
 Windows N cần cài Media Feature Pack. Thiếu thành phần media sẽ báo lỗi chức năng camera/video; các DLL media được delay-load để không chặn khởi động GUI. Camera ưu tiên RGB thay cho IR/Hello, thương lượng NV12 ở độ phân giải driver hỗ trợ rồi chuẩn hóa stride, scale/letterbox về 320×240. Nhịp gửi 15 fps được giới hạn sau capture, không ép camera phải có mode 15 fps. Camera không trả frame trong 5 giây sẽ báo lỗi; chưa xác nhận driver máy đích. Audio giữ pha resampling giữa callback và giải mã theo số mẫu Opus thực tế; lỗi mic/loa được báo riêng để video vẫn có thể hoạt động.
 
-Cuộc gọi nhóm chưa hỗ trợ. Gọi 1-1 không bị khóa tài khoản thử nghiệm mặc định. Chỉ bật `ZALO_CALL_TEST_LOCK=1` khi chủ động dùng allowlist chẩn đoán. Test codec tự động không chứng minh cuộc gọi tới ứng dụng Zalo chính thức hoạt động trên mọi mạng/thiết bị.
+Đã tích hợp relay/SFU gọi nhóm với trộn audio và tối đa hai video từ xa; còn cần kiểm chứng đầu-cuối. Gọi 1-1 không bị khóa tài khoản thử nghiệm mặc định. Chỉ bật `ZALO_CALL_TEST_LOCK=1` khi chủ động dùng allowlist chẩn đoán. Test codec tự động không chứng minh cuộc gọi tới ứng dụng Zalo chính thức hoạt động trên mọi mạng/thiết bị.
 
 ## Chẩn đoán
 

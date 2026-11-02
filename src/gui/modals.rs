@@ -987,6 +987,13 @@ impl ZaloGuiApp {
                                                                 }
                                                             }
                                                         }
+                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Chỉ cập nhật tin gần đây")).on_hover_text("Lấy phần mới từ checkpoint; nếu chưa có mốc thì lấy 7 ngày quanh hoạt động gần nhất, chưa tải lịch sử cũ hơn").clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::SyncPhoneRecent).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị lấy tin gần đây…".into();self.sync_notice_dismissed=false;}}
+                                                        }
+                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Quét lại toàn bộ lịch sử điện thoại")).on_hover_text("Bỏ mốc tiến độ để kiểm tra lại lịch sử; không xóa tin đã lưu").clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::RescanPhoneHistory).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị quét lại lịch sử điện thoại…".into();self.sync_notice_dismissed=false;}}
+                                                        }
+                                                        ui.label("Ưu tiên hội thoại hoạt động gần đây; lấy khoảng tin mới trước rồi mới tải lịch sử cũ. Lần sau tiếp tục từ mốc đã hoàn tất.");
                                                         ui.label(&self.phone_sync_status);
                                                         ui.label("Mở Zalo trên điện thoại, chọn Đồng bộ ngay khi được hỏi. Có thể dừng và chạy lại; các tin đã lưu không bị mất.");
 

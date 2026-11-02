@@ -640,6 +640,9 @@ pub(super) fn extract_clean_domain(url: &str) -> String {
 }
 
 pub(super) fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, String, String)> {
+    if msg.is_photo() {
+        return None;
+    }
     if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
         let desc_trim = msg.link_desc.as_deref().unwrap_or("").trim();
         let title_trim = msg.link_title.as_deref().unwrap_or("").trim();
@@ -690,21 +693,6 @@ pub(super) fn extract_message_link_view(msg: &ChatMessage) -> Option<(String, St
     Some((caption, url.to_string(), domain))
 }
 
-/// Convert days since 1970-01-01 into `(year, month, day)` (Howard Hinnant's algorithm).
-pub(super) fn civil_from_days(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u32;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = (y + if m <= 2 { 1 } else { 0 }) as i32;
-    (year, m, d)
-}
-
 /// Normalize a millisecond or second timestamp to milliseconds (`> 0`).
 pub(super) fn normalize_ts_ms(ts: i64) -> i64 {
     if ts <= 0 {
@@ -723,45 +711,23 @@ pub(super) fn should_show_time_divider(prev: Option<&ChatMessage>, curr: &ChatMe
     };
     let prev_ms = normalize_ts_ms(prev.ts);
     let curr_ms = normalize_ts_ms(curr.ts);
-    if prev_ms > 0 && curr_ms > 0 {
-        let tz_offset_sec = 7 * 3600; // UTC+7 (Vietnam)
-        let prev_day = (prev_ms / 1000 + tz_offset_sec) / 86_400;
-        let curr_day = (curr_ms / 1000 + tz_offset_sec) / 86_400;
-        if prev_day != curr_day {
-            return true;
-        }
-        return (curr_ms - prev_ms).abs() >= 30 * 60 * 1000;
-    }
-    false
+    prev_ms > 0
+        && curr_ms > 0
+        && (crate::clock::local_day(prev_ms) != crate::clock::local_day(curr_ms)
+            || prev_ms.abs_diff(curr_ms) >= 30 * 60 * 1000)
 }
 
-/// Format the label for a centered date/time separator pill.
+/// Use the same local timezone for dividers and message clocks.
 pub(super) fn format_time_divider_label(msg: &ChatMessage) -> String {
-    let ts_ms = normalize_ts_ms(msg.ts);
-    if ts_ms <= 0 {
-        return if msg.time.is_empty() {
-            "Cuộc trò chuyện".to_string()
+    let label = crate::clock::divider_label_at(msg.ts, crate::login::unix_now() * 1000);
+    if label.is_empty() {
+        if msg.display_time().is_empty() {
+            "Cuộc trò chuyện".into()
         } else {
             format!("Hôm nay • {}", msg.time)
-        };
-    }
-    let tz_offset_sec = 7 * 3600;
-    let local_sec = ts_ms / 1000 + tz_offset_sec;
-    let msg_day = local_sec.div_euclid(86_400);
-    let sec_of_day = local_sec.rem_euclid(86_400);
-    let hh = sec_of_day / 3600;
-    let mm = (sec_of_day % 3600) / 60;
-
-    let now_sec = crate::login::unix_now() + tz_offset_sec;
-    let today_day = now_sec.div_euclid(86_400);
-    let (y, m, d) = civil_from_days(msg_day);
-
-    if msg_day == today_day {
-        format!("Hôm nay • {hh:02}:{mm:02}")
-    } else if msg_day == today_day - 1 {
-        format!("Hôm qua • {hh:02}:{mm:02}")
+        }
     } else {
-        format!("{d:02}/{m:02}/{y}")
+        label
     }
 }
 
@@ -915,9 +881,7 @@ pub(super) fn render_message_body(
     };
 
     // Dedicated inline Photo Card when the message is an uploaded/received Zalo photo
-    let is_zalo_photo = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-        || trimmed_text == "[Hình ảnh]"
-        || trimmed_text.starts_with("[Hình ảnh] ");
+    let is_zalo_photo = msg.is_photo();
     if is_zalo_photo {
         if let Some(thumb_url) = msg
             .link_thumb
@@ -935,12 +899,7 @@ pub(super) fn render_message_body(
                 }
             }
             let open_target = msg.link_url.as_deref().unwrap_or(thumb_url).to_string();
-            let title_label = msg
-                .link_title
-                .as_deref()
-                .filter(|t| !t.is_empty())
-                .unwrap_or(trimmed_text)
-                .to_string();
+            let title_label = "Hình ảnh".to_string();
             if let Some(tex) = sticker_textures.get(&key) {
                 let [tw, th] = tex.size();
                 let tw_f = (tw.max(1)) as f32;
@@ -996,7 +955,7 @@ pub(super) fn render_message_body(
                         full_url: open_target,
                         title: title_label,
                         sender: sender_label,
-                        time: msg.time.clone(),
+                        time: msg.display_time(),
                     });
                 }
             } else {
@@ -1031,18 +990,13 @@ pub(super) fn render_message_body(
                         full_url: open_target,
                         title: title_label,
                         sender: sender_label,
-                        time: msg.time.clone(),
+                        time: msg.display_time(),
                     });
                 }
             }
-            if let Some(cap) = msg.link_desc.as_deref().filter(|c| !c.trim().is_empty()) {
+            if let Some(caption) = msg.photo_caption() {
                 ui.add_space(5.0);
-                ui.add(egui::Label::new(RichText::new(cap).color(text_col).size(14.2)).wrap());
-            } else if !trimmed_text.starts_with("[Hình ảnh]") && !trimmed_text.is_empty() {
-                ui.add_space(5.0);
-                ui.add(
-                    egui::Label::new(RichText::new(trimmed_text).color(text_col).size(14.2)).wrap(),
-                );
+                ui.add(egui::Label::new(RichText::new(caption).color(text_col).size(14.2)).wrap());
             }
             return body_action;
         }
@@ -1268,9 +1222,7 @@ pub(super) fn render_chat_bubble(
     let has_sticker = is_sticker_message(msg).is_some();
     let call_card_opt = extract_call_card_view(msg);
     let is_call_card = call_card_opt.is_some();
-    let is_photo_card = msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-        || msg.text.trim() == "[Hình ảnh]"
-        || msg.text.trim().starts_with("[Hình ảnh] ");
+    let is_photo_card = msg.is_photo();
     let is_file_card = matches!(
         msg.link_src.as_deref(),
         Some("Tập tin Zalo") | Some("Video Zalo")
@@ -1280,7 +1232,7 @@ pub(super) fn render_chat_bubble(
     let has_link_card = extract_message_link_view(msg).is_some();
     let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
 
-    let show_timestamp = !msg.time.is_empty()
+    let show_timestamp = !msg.display_time().is_empty()
         && (!next_same_sender
             || is_latest_outgoing
             || has_interactive_card
@@ -1288,13 +1240,7 @@ pub(super) fn render_chat_bubble(
             || msg.is_pinned
             || msg.is_starred);
 
-    let has_photo_caption = is_photo_card
-        && (msg
-            .link_desc
-            .as_deref()
-            .map(|c| !c.trim().is_empty())
-            .unwrap_or(false)
-            || (!msg.text.trim().starts_with("[Hình ảnh]") && !msg.text.trim().is_empty()));
+    let has_photo_caption = is_photo_card && msg.photo_caption().is_some();
     let is_frameless_photo = is_photo_card
         && !has_photo_caption
         && msg.reply_to_text.is_none()
@@ -1558,24 +1504,24 @@ pub(super) fn render_chat_bubble(
                                 let ts_txt = if is_latest_outgoing {
                                     match msg.delivery {
                                         crate::message_model::DeliveryState::ServerAccepted => {
-                                            format!("{} · Đã gửi", msg.time)
+                                            format!("{} · Đã gửi", msg.display_time())
                                         }
                                         crate::message_model::DeliveryState::Delivered => {
-                                            format!("{} · Đã nhận", msg.time)
+                                            format!("{} · Đã nhận", msg.display_time())
                                         }
                                         crate::message_model::DeliveryState::Read => {
-                                            format!("{} · Đã xem", msg.time)
+                                            format!("{} · Đã xem", msg.display_time())
                                         }
                                         crate::message_model::DeliveryState::Pending => {
-                                            format!("{} · Đang gửi", msg.time)
+                                            format!("{} · Đang gửi", msg.display_time())
                                         }
                                         crate::message_model::DeliveryState::Failed => {
-                                            format!("{} · Gửi lỗi", msg.time)
+                                            format!("{} · Gửi lỗi", msg.display_time())
                                         }
-                                        _ => msg.time.clone(),
+                                        _ => msg.display_time(),
                                     }
                                 } else {
-                                    msg.time.clone()
+                                    msg.display_time()
                                 };
                                 ui.label(
                                     RichText::new(ts_txt).size(11.0).color(pal.bubble_out_meta),
@@ -1703,7 +1649,7 @@ pub(super) fn render_chat_bubble(
                             if show_timestamp && !has_sticker && !is_frameless_photo {
                                 ui.add_space(3.5);
                                 ui.label(
-                                    RichText::new(&msg.time)
+                                    RichText::new(msg.display_time())
                                         .color(pal.bubble_in_meta)
                                         .size(11.0),
                                 );
@@ -1832,7 +1778,7 @@ pub(super) fn bubble_context_menu(
                     } else {
                         msg.sender.clone()
                     },
-                    time: msg.time.clone(),
+                    time: msg.display_time(),
                 });
                 ui.close_menu();
             }
@@ -2174,5 +2120,80 @@ mod quote_navigation_tests {
             }
         }
         panic!("Quote with an exact reference must advertise a clickable target");
+    }
+}
+
+#[cfg(test)]
+mod photo_viewer_tests {
+    use super::*;
+
+    #[test]
+    fn photo_click_opens_viewer_and_transport_url_is_never_painted() {
+        for is_outgoing in [false, true] {
+            let ctx = egui::Context::default();
+            let url = "https://photo-stal-16.zdn.vn/fixture/photo.jpg";
+            // Exercise old cached link metadata as well as the new photo classifier.
+            let msg = ChatMessage {
+                id: "photo-fixture".into(),
+                kind: crate::message_model::MessageKind::Link,
+                text: url.into(),
+                link_url: Some(url.into()),
+                link_title: Some(url.into()),
+                is_outgoing,
+                ..Default::default()
+            };
+            let texture = ctx.load_texture(
+                "fixture",
+                egui::ColorImage::new([160, 120], Color32::LIGHT_BLUE),
+                Default::default(),
+            );
+            let textures =
+                HashMap::from([(format!("thumb_{}", crate::crypto::md5_hex(url)), texture)]);
+            let mut action = None;
+            for frame in 0..4 {
+                let position = egui::pos2(30.0, 30.0);
+                let mut events = vec![egui::Event::PointerMoved(position)];
+                if frame >= 2 {
+                    events.push(egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: frame == 2,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                }
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            Vec2::new(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            action = render_message_body(
+                                ui,
+                                &msg,
+                                "Fixture",
+                                &ThemePalette::light(),
+                                is_outgoing,
+                                300.0,
+                                &textures,
+                                &mut HashSet::new(),
+                            );
+                        });
+                    },
+                );
+                for shape in output.shapes {
+                    if let egui::Shape::Text(text) = shape.shape {
+                        assert!(!text.galley.job.text.contains("zdn.vn"));
+                    }
+                }
+            }
+            assert!(
+                matches!(action, Some(BubbleAction::OpenImagePopup { full_url, title, .. }) if full_url == url && title == "Hình ảnh")
+            );
+        }
     }
 }

@@ -822,7 +822,7 @@ impl ZaloGuiApp {
                                     t_idx,
                                     t.name.clone(),
                                     m.text.clone(),
-                                    m.time.clone(),
+                                    m.display_time(),
                                     t.is_group,
                                 ));
                                 if hits.len() >= 25 {
@@ -999,11 +999,12 @@ impl ZaloGuiApp {
                                 );
 
                                 // Pin icon + Timestamp (top-right)
+                                let row_time = t.sidebar_timestamp(crate::login::unix_now() * 1000);
                                 let time_right = row_rect.right() - 9.0;
-                                if !t.time.is_empty() {
+                                if !row_time.is_empty() {
                                     let tw = ui.fonts(|f| {
                                         f.layout_no_wrap(
-                                            t.time.clone(),
+                                            row_time.clone(),
                                             FontId::proportional(11.0),
                                             pal.text_muted,
                                         )
@@ -1013,7 +1014,7 @@ impl ZaloGuiApp {
                                     ui.painter().text(
                                         Pos2::new(time_right, row_rect.top() + 13.5),
                                         egui::Align2::RIGHT_TOP,
-                                        &t.time,
+                                        &row_time,
                                         FontId::proportional(11.0),
                                         pal.text_muted,
                                     );
@@ -1298,7 +1299,7 @@ impl ZaloGuiApp {
                             .iter()
                             .rev()
                             .filter_map(|m| {
-                                let is_photo = m.link_src.as_deref() == Some("Hình ảnh Zalo")
+                                let is_photo = m.is_photo()
                                     || m.text.trim() == "[Hình ảnh]"
                                     || m.text.trim().starts_with("[Hình ảnh] ");
                                 if !is_photo {
@@ -1310,10 +1311,7 @@ impl ZaloGuiApp {
                                     .or(m.link_url.as_deref())
                                     .filter(|u| !u.is_empty())?;
                                 let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
-                                let title = m
-                                    .link_title
-                                    .clone()
-                                    .unwrap_or_else(|| "Hình ảnh đã chia sẻ".into());
+                                let title = "Hình ảnh đã chia sẻ".to_string();
                                 Some((
                                     format!("thumb_{}", crate::crypto::md5_hex(thumb)),
                                     thumb.to_string(),

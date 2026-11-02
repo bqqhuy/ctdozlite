@@ -793,6 +793,30 @@ impl ZaloGuiApp {
                     scroll_pending: true,
                 });
             }
+            if args.iter().any(|a| a == "--ui-smoke-photo") {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                let url = "https://photo-stal-16.zdn.vn/fixture/photo.jpg";
+                let image = egui::ColorImage::example();
+                let texture = ctx.load_texture("photo-fixture", image, Default::default());
+                app.sticker_textures
+                    .insert(format!("thumb_{}", crate::crypto::md5_hex(url)), texture);
+                app.threads = vec![Thread {
+                    id: "fixture-photo".into(),
+                    name: "Kiểm thử ảnh nhận được".into(),
+                    messages: vec![ChatMessage {
+                        id: "fixture-photo-message".into(),
+                        kind: crate::message_model::MessageKind::Link,
+                        text: url.into(),
+                        link_url: Some(url.into()),
+                        link_title: Some(url.into()),
+                        ts: crate::login::unix_now() * 1000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                app.selected_thread_index = 0;
+            }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
         }

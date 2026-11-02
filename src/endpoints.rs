@@ -48,3 +48,6 @@ pub const PHONE_SYNC_CODEC: &str =
     "https://chat.zalo.me/libs/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm";
 /// Signed transfer download families, validated again after every redirect.
 pub const SYNC_DOWNLOAD_DOMAINS: &[&str] = &["zalo.me", "zaloapp.com", "zdn.vn"];
+
+/// CDN families serving direct chat photo files.
+pub const PHOTO_CDN_DOMAINS: &[&str] = &["zdn.vn", "zalo.me", "zaloapp.com"];

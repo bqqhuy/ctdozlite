@@ -62,17 +62,23 @@ Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đ�
 
 Đối soát tin gửi dùng server/client ID thay vì nội dung/thời gian, tránh gộp nhầm các tin giống nhau. Có thể bấm khối trích dẫn để cuộn tới tin gốc **đã nạp** trong hội thoại; tin chưa nạp hoặc ID không duy nhất sẽ được báo rõ. Xem [ADR-0006](docs/adr/0006-exact-message-identity-and-quote-navigation.md).
 
+Ảnh nhận được hiển thị thumbnail và chú thích (nếu có), ẩn URL vận chuyển. Bấm ảnh để mở trình xem ảnh trong ứng dụng. Giờ tin mới, tin đồng bộ và mốc ngày dùng chung múi giờ Windows.
+
+Đồng bộ điện thoại ưu tiên hội thoại hoạt động gần nhất: tải khoảng 7 ngày quanh lần hoạt động cuối, rồi mở rộng 90 ngày và lịch sử còn lại. **Đồng bộ từ điện thoại** tiếp tục theo checkpoint đã lưu, chỉ yêu cầu phần mới và phần chưa hoàn tất; **Chỉ cập nhật tin gần đây** bỏ qua hai lượt lịch sử cũ. **Quét lại toàn bộ lịch sử điện thoại** đặt lại tiến độ, giữ nguyên tin đã lưu. Mỗi lần vẫn cần điện thoại chấp thuận.
+
+Bản cũ chưa ghi checkpoint nên không thể suy ra đợt tải đã hoàn tất từ số tin hiện có. Với dữ liệu từ bản cũ, dùng chế độ cập nhật gần đây nếu chưa muốn tải lại phần lịch sử cũ. Thứ tự gói do điện thoại quyết định; ưu tiên này áp dụng cho khoảng thời gian được yêu cầu, không bảo đảm từng tin đến đúng thứ tự mới → cũ. Xem [ADR-0007](docs/adr/0007-recent-first-resumable-phone-sync.md).
+
 ## Trạng thái kiểm chứng và giới hạn
 
-Bản mã nguồn tại [`7c1a416`](https://github.com/bqqhuy/ctdozlite/commit/7c1a416) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41370210700): **210 kiểm thử đạt**, kiểm tra PE/metadata, ảnh framebuffer DX12 và quy trình ẩn/mở/thoát từ tray. CI dùng GPU phần mềm Microsoft Basic Render Driver.
+Bản mã nguồn tại [`c45882a`](https://github.com/bqqhuy/ctdozlite/commit/c45882a) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41400539416): **261 kiểm thử đạt**, kiểm tra PE/metadata, ảnh framebuffer DX12 và quy trình ẩn/mở/thoát từ tray. CI dùng GPU phần mềm Microsoft Basic Render Driver. Kết quả cho các sửa tiếp theo được cập nhật trong [PR #2](https://github.com/bqqhuy/ctdozlite/pull/2).
 
 Những điểm cần biết trước khi dùng:
 
 - **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
-- Đã bổ sung **Settings → Đồng bộ → Đồng bộ từ điện thoại**: cần mở Zalo di động và xác nhận. Tiến độ và nút dừng hiện ở cửa sổ chính. Đây là luồng mới đang chờ kiểm chứng đầu-cuối với điện thoại thật; chỉ lấy được dữ liệu điện thoại còn giữ, không bảo đảm media cũ còn hạn. Xem [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
+- Đã bổ sung **Settings → Đồng bộ → Đồng bộ từ điện thoại**: cần mở Zalo di động và xác nhận. Tiến độ và nút dừng hiện ở cửa sổ chính. Người dùng đã xác nhận luồng đồng bộ ban đầu hoạt động với điện thoại thật; cơ chế ưu tiên khoảng thời gian và tiếp tục mới vẫn cần kiểm chứng trên thiết bị; chỉ lấy được dữ liệu điện thoại còn giữ, không bảo đảm media cũ còn hạn. Xem [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
 - Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.
 - Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed, scheduler hoặc REST/MCP của upstream trong bản tích hợp này.
-- Database hiện dùng **schema 4**. Bản cũ hỗ trợ schema 2/3 sẽ từ chối mở; xem rollback trong [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
+- Database hiện dùng **schema 5**, bổ sung checkpoint đồng bộ điện thoại. Bản cũ hỗ trợ schema 2/3/4 sẽ từ chối mở; xem rollback trong [ADR-0007](docs/adr/0007-recent-first-resumable-phone-sync.md).
 
 Đây là tích hợp có chọn lọc từ upstream, chưa phải bản sao đầy đủ mọi tính năng của upstream mới nhất. Chi tiết có trong [báo cáo đối chiếu commit](docs/UPSTREAM_REVIEW_2026-11-02.md) và [audit Windows ARM64](docs/ARM64_IMPLEMENTATION.md).
 

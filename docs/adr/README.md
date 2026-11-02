@@ -41,4 +41,8 @@ What we will do, in one paragraph, present tense.
 | [0003](0003-group-sfu-native-media.md) | Selective group SFU integration with native media | accepted |
 | [0004](0004-local-conversation-menu.md) | Account-scoped local conversation menu | accepted |
 
+| [0005](0005-phone-approved-history-sync.md) | Phone-approved history sync | accepted |
+| [0006](0006-exact-message-identity-and-quote-navigation.md) | Exact message identity and quote navigation | accepted |
+| [0007](0007-recent-first-resumable-phone-sync.md) | Recent-first resumable phone sync | accepted |
+
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).

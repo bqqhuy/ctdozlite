@@ -245,3 +245,39 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+    #[test]
+    #[ignore = "manual synthetic import performance measurement"]
+    fn import_5000_phone_messages() {
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let mut store = MessageStore::open(":memory:").unwrap();
+            let thread = Thread {
+                id: "123".into(),
+                name: "Synthetic group".into(),
+                is_group: true,
+                ..Default::default()
+            };
+            let threads = HashMap::from([("group/fake".into(), thread)]);
+            let senders = HashMap::from([("self".into(), "999".into())]);
+            let messages:Vec<_>=(1..=5000).map(|i|json!({"globalId":i.to_string(),"clientId":(1700000000000i64+i).to_string(),"senderId":"self","timestamp":(1700000000000i64+i).to_string(),"content":"Synthetic message","msgType":0})).collect();
+            let body = json!({"partitions":[{"id":"group/fake","messages":messages}]});
+            let now = std::time::Instant::now();
+            assert_eq!(
+                save(&mut store, &body, &threads, &senders, "999")
+                    .unwrap()
+                    .inserted,
+                5000
+            );
+            times.push(now.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            json!({"task":"import_5000_phone_messages","iterations":5,"min_ms":times[0],"avg_ms":times.iter().sum::<f64>()/5.0,"p50_ms":times[2],"p95_ms":times[4],"p99_ms":times[4],"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"profile":"debug"})
+        );
+    }
+}

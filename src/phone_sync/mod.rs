@@ -2,6 +2,7 @@
 mod assets;
 pub mod codec;
 mod import;
+mod plan;
 mod transfer;
 mod wire;
 pub(crate) use transfer::download;

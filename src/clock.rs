@@ -63,6 +63,35 @@ where
         .to_string()
 }
 
+/// Format a date divider in the same OS timezone as bubble and sidebar clocks.
+pub fn divider_label_at(ts: i64, now: i64) -> String {
+    divider_label_in(ts, now, &Local)
+}
+fn divider_label_in<T: TimeZone>(ts: i64, now: i64, timezone: &T) -> String
+where
+    T::Offset: std::fmt::Display,
+{
+    let Some(date) = timezone
+        .timestamp_millis_opt(normalize_ts_ms(ts))
+        .single()
+        .filter(|_| ts > 0)
+    else {
+        return String::new();
+    };
+    let Some(today) = timezone.timestamp_millis_opt(normalize_ts_ms(now)).single() else {
+        return String::new();
+    };
+    let days = today
+        .date_naive()
+        .signed_duration_since(date.date_naive())
+        .num_days();
+    match days {
+        0 => format!("Hôm nay • {}", date.format("%H:%M")),
+        1 => format!("Hôm qua • {}", date.format("%H:%M")),
+        _ => date.format("%d/%m/%Y").to_string(),
+    }
+}
+
 pub fn local_day(ts: i64) -> Option<i64> {
     local_datetime(ts).map(|dt| dt.date_naive().num_days_from_ce() as i64)
 }
@@ -117,5 +146,23 @@ mod tests {
         for ts in [i64::MIN, -1, 0, i64::MAX] {
             assert_eq!(message_time_in(ts, &timezone), "", "timestamp {ts}");
         }
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn vietnam_bubble_sidebar_and_divider_agree_at_1404_without_changing_epoch() {
+        let tz = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+        let ts = tz
+            .with_ymd_and_hms(2026, 11, 2, 14, 4, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(message_time_in(ts, &tz), "14:04");
+        assert_eq!(sidebar_time_in(ts, ts, &tz), "14:04");
+        assert_eq!(divider_label_in(ts, ts, &tz), "Hôm nay • 14:04");
+        assert_eq!(message_time_in(ts, &chrono::Utc), "07:04");
+        assert_eq!(normalize_ts_ms(ts), ts);
     }
 }

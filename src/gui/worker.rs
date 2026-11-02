@@ -23,6 +23,8 @@ pub enum WorkerCmd {
     CancelHistorySync,
     /// Explicit phone-approved history transfer; never started by login/refresh.
     SyncPhoneHistory,
+    RescanPhoneHistory,
+    SyncPhoneRecent,
     CancelPhoneHistory,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
@@ -851,7 +853,9 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::CancelPhoneHistory => {
                             phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
                         }
-                        WorkerCmd::SyncPhoneHistory => {
+                        command @ (WorkerCmd::SyncPhoneHistory | WorkerCmd::RescanPhoneHistory | WorkerCmd::SyncPhoneRecent) => {
+                            let full_rescan=matches!(command,WorkerCmd::RescanPhoneHistory);
+                            let recent_only=matches!(command,WorkerCmd::SyncPhoneRecent);
                             if phone_sync_running.swap(true,std::sync::atomic::Ordering::SeqCst) {continue;}
                             phone_sync_cancel.store(false,std::sync::atomic::Ordering::Relaxed);
                             let cancel=phone_sync_cancel.clone();let running=phone_sync_running.clone();
@@ -862,7 +866,7 @@ pub(super) fn spawn_session_worker(
                             tokio::spawn(async move {
                                 let _guard=PollGuard(running);
                                 let result=if let Some(transport)=transport {
-                                    crate::phone_sync::download(&account,transport,cancel,
+                                    crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,
                                         |message|{let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,message});ctx.request_repaint();},
                                         |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};

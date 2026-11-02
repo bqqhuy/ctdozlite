@@ -23,3 +23,7 @@ Unknown group identity stays quarantined, never guessed by display name. User gl
 ## Verification boundary
 
 `tests/fixtures/phone_sync_crypto_synthetic.json` contains synthetic keys/ciphertexts generated with the pinned official module entirely offline. The explicit asset test checks known-answer decryption plus independent fresh-key metadata/message roundtrips and authentication rejection. It does **not** prove server acceptance, phone prompt delivery, historical completeness, media URL lifetime or phone model compatibility. The physical MateBook/phone validation in ADR-0005 remains required.
+
+## Range scheduling follow-up (2026-11-02)
+
+The original implementation always requested `from:0`. The public wire schema already has `from`/`to`; the public reference carries `win.from` into message queries. The recent-first implementation now sends explicit ranges without changing command IDs, cipher calls or approval. A synthetic request test checks exact bounds and partition order. User reports confirm the original full transfer works; range filtering/resume on the real phone still needs manual verification. Coverage is recorded only after all batches in a completed round are imported, never inferred from existing min/max message timestamps. See ADR-0007 for overlap, cancellation and legacy database limits.

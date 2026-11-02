@@ -129,7 +129,8 @@ try {
         @{ Size='480x360'; Scale='1'; Tab='workspace-sync'; WorkspaceSync=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='workspace-sync'; WorkspaceSync=$true },
         @{ Size='480x360'; Scale='1.5'; Tab='phone-sync'; PhoneSync=$true },
-        @{ Size='1020x700'; Scale='1.5'; Tab='quote-jump'; QuoteJump=$true }
+        @{ Size='1020x700'; Scale='1.5'; Tab='quote-jump'; QuoteJump=$true },
+        @{ Size='1020x700'; Scale='1.5'; Tab='photo'; Photo=$true }
     )) {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
@@ -148,6 +149,7 @@ try {
         if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
         if ($case.ContainsKey('WorkspaceSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-workspace-sync') }
         if ($case.ContainsKey('PhoneSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-phone-sync') }
+        if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
         if ($case.ContainsKey('QuoteJump')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-quote-jump') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }

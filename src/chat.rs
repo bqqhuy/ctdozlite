@@ -342,6 +342,54 @@ impl ChatMessage {
         changed
     }
 
+    /// Derive visible time from the epoch so stale cached UTC strings cannot leak into the UI.
+    pub fn display_time(&self) -> String {
+        let time = crate::clock::message_time(self.ts);
+        if time.is_empty() {
+            self.time.clone()
+        } else {
+            time
+        }
+    }
+    /// Recognize actual photo messages and direct image files on trusted Zalo photo CDNs.
+    pub fn is_photo(&self) -> bool {
+        if self.kind == crate::message_model::MessageKind::Recall
+            || self.text == "[Tin nhắn đã thu hồi]"
+        {
+            return false;
+        }
+        self.kind == crate::message_model::MessageKind::Photo
+            || self.link_src.as_deref() == Some("Hình ảnh Zalo")
+            || self.text.trim().starts_with("[Hình ảnh]")
+            || self.link_url.as_deref().is_some_and(direct_zalo_photo)
+    }
+    /// Suppress transport URLs while retaining a real photo caption.
+    pub fn photo_caption(&self) -> Option<&str> {
+        let transport_text = |text: &str| {
+            self.link_url
+                .iter()
+                .chain(self.link_thumb.iter())
+                .any(|url| {
+                    text == url
+                        || text
+                            == url
+                                .trim_start_matches("https://")
+                                .trim_start_matches("http://")
+                })
+                || direct_zalo_photo(text)
+        };
+        self.link_desc
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(self.text.as_str()))
+            .map(str::trim)
+            .find(|text| {
+                !text.is_empty()
+                    && !matches!(*text, "[Hình ảnh]" | "[Photo]")
+                    && !transport_text(text)
+            })
+    }
+
     /// Repair cached media metadata without changing captions or signed URL bytes.
     pub fn hydrate_media_metadata(&mut self) -> bool {
         if self.text == "[Tin nhắn đã thu hồi]" {
@@ -351,6 +399,8 @@ impl ChatMessage {
             self.link_url.clone(),
             self.link_thumb.clone(),
             self.link_src.clone(),
+            self.kind,
+            self.text.clone(),
         );
         let source_kind = self.history_source.as_ref().and_then(|source| {
             let kind = source
@@ -383,10 +433,21 @@ impl ChatMessage {
             "[Video]" => Some("Video Zalo"),
             _ => None,
         };
-        if let Some(kind) = source_kind.or(label_kind) {
+        let photo = self.is_photo();
+        if let Some(kind) = source_kind.or(label_kind).or(if photo {
+            Some("Hình ảnh Zalo")
+        } else {
+            None
+        }) {
             self.link_src = Some(kind.into());
             if kind == "Hình ảnh Zalo" && self.link_thumb.is_none() {
                 self.link_thumb = self.link_url.clone();
+            }
+        }
+        if self.link_src.as_deref() == Some("Hình ảnh Zalo") {
+            self.kind = crate::message_model::MessageKind::Photo;
+            if self.photo_caption().is_none() {
+                self.text = "[Hình ảnh]".into();
             }
         }
         before
@@ -394,6 +455,8 @@ impl ChatMessage {
                 self.link_url.clone(),
                 self.link_thumb.clone(),
                 self.link_src.clone(),
+                self.kind,
+                self.text.clone(),
             )
     }
 
@@ -479,6 +542,30 @@ pub struct Thread {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub unread: crate::unread::UnreadState,
+}
+
+/// Only direct image paths on known Zalo image-serving families are photo cards.
+fn direct_zalo_photo(text: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(text) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let trusted = crate::endpoints::PHOTO_CDN_DOMAINS.iter().any(|suffix| {
+        host == *suffix
+            || host
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    });
+    let path = url.path().to_ascii_lowercase();
+    url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && trusted
+        && [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]
+            .iter()
+            .any(|ext| path.ends_with(ext))
 }
 
 /// Durable sidebar metadata, including metadata-only startup snapshots.
@@ -4566,8 +4653,7 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         .unwrap_or(0);
 
     let time = if ts > 0 {
-        let s = ts / 1000;
-        format!("{:02}:{:02}", (s / 3600) % 24, (s / 60) % 60)
+        crate::clock::message_time(ts)
     } else {
         crate::ui::clock()
     };
@@ -4586,7 +4672,7 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             (None, None, None)
         };
 
-    Some(ChatMessage {
+    let mut message = ChatMessage {
         kind: if is_undo_type {
             crate::message_model::MessageKind::Recall
         } else {
@@ -4621,7 +4707,9 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_src,
 
         ..Default::default()
-    })
+    };
+    message.hydrate_media_metadata();
+    Some(message)
 }
 
 fn extract_reactions(it: &Value) -> Vec<String> {
@@ -6346,5 +6434,39 @@ mod send_identity_tests {
         for (_, body) in requests {
             assert_eq!(body["clientId"], json!(client_id));
         }
+    }
+}
+
+#[cfg(test)]
+mod live_photo_time_tests {
+    use super::*;
+    #[test]
+    fn live_timestamp_uses_local_formatter_and_cached_clock_is_not_authoritative() {
+        let ts = 1793603040000i64;
+        let mut msg=parse_chat_message(&json!({"msgId":"fixture-time","uidFrom":"123","ts":ts,"msgType":"webchat","content":"hello"})).unwrap();
+        assert_eq!(msg.time, crate::clock::message_time(ts));
+        msg.time = "07:04".into();
+        assert_eq!(msg.display_time(), crate::clock::message_time(ts));
+    }
+    #[test]
+    fn live_and_cached_direct_photos_use_image_metadata_without_losing_captions() {
+        let url = "https://photo-stal-16.zdn.vn/fake/photo.jpg?token=synthetic";
+        let mut msg=parse_chat_message(&json!({"msgId":"fixture-photo","uidFrom":"123","msgType":"chat.photo","content":{"href":url,"thumb":url}})).unwrap();
+        assert!(msg.is_photo());
+        assert_eq!(msg.link_src.as_deref(), Some("Hình ảnh Zalo"));
+        assert_eq!(msg.link_url.as_deref(), Some(url));
+        assert!(msg.photo_caption().is_none());
+        msg.text = "Ảnh có chú thích".into();
+        assert_eq!(msg.photo_caption(), Some("Ảnh có chú thích"));
+        msg.kind = crate::message_model::MessageKind::Link;
+        msg.link_src = None;
+        msg.text = url.into();
+        msg.hydrate_media_metadata();
+        assert!(msg.is_photo());
+        assert!(msg.photo_caption().is_none());
+        assert!(!direct_zalo_photo("https://zdn.vn.evil.invalid/photo.jpg"));
+        assert!(!direct_zalo_photo("https://example.invalid/article.jpg"));
+        msg.mark_recalled();
+        assert!(!msg.is_photo());
     }
 }

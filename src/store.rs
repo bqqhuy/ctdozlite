@@ -40,6 +40,14 @@ pub struct ConversationPreference {
     pub hidden: bool,
 }
 
+/// Successfully imported contiguous phone-history interval, scoped by the account database.
+#[derive(Clone, Debug)]
+pub(crate) struct PhoneSyncRange {
+    pub thread_id: String,
+    pub from_ts: i64,
+    pub to_ts: i64,
+}
+
 pub struct MessageStore {
     pub conn: Connection,
 }
@@ -62,7 +70,7 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 4, "Database requires a newer application version");
+        anyhow::ensure!(schema <= 5, "Database requires a newer application version");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -136,14 +144,84 @@ impl MessageStore {
             )?;
             migration.commit()?;
         }
+        if schema < 5 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch("CREATE TABLE IF NOT EXISTS phone_sync_ranges(partition_id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,from_ts INTEGER NOT NULL CHECK(from_ts>=0),to_ts INTEGER NOT NULL CHECK(to_ts>=from_ts)); PRAGMA user_version=5;")?;
+            migration.commit()?;
+        }
         Ok(Self { conn })
+    }
+
+    /// Read only coverage explicitly committed by a successful phone-sync range.
+    /// # Errors
+    /// Returns SQLite or invalid coverage failures.
+    pub(crate) fn phone_sync_ranges(
+        &self,
+    ) -> Result<std::collections::HashMap<String, PhoneSyncRange>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT partition_id,thread_id,from_ts,to_ts FROM phone_sync_ranges")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                PhoneSyncRange {
+                    thread_id: r.get(1)?,
+                    from_ts: r.get(2)?,
+                    to_ts: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+    /// Commit completed coverage after all downloads/imports succeed; never store transfer keys/URLs.
+    /// # Errors
+    /// Invalid, disconnected ranges or SQLite errors roll back the coverage transaction.
+    pub(crate) fn save_phone_sync_ranges(&self, ranges: &[(String, PhoneSyncRange)]) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let tx = self.conn.unchecked_transaction()?;
+        for (partition, range) in ranges {
+            anyhow::ensure!(
+                !range.thread_id.is_empty() && range.from_ts >= 0 && range.to_ts >= range.from_ts,
+                "Invalid phone coverage"
+            );
+            let previous = tx
+                .query_row(
+                    "SELECT thread_id,from_ts,to_ts FROM phone_sync_ranges WHERE partition_id=?1",
+                    [partition],
+                    |r| {
+                        Ok(PhoneSyncRange {
+                            thread_id: r.get(0)?,
+                            from_ts: r.get(1)?,
+                            to_ts: r.get(2)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(old) = previous.filter(|old| old.thread_id == range.thread_id) {
+                anyhow::ensure!(
+                    range.from_ts <= old.to_ts && range.to_ts >= old.from_ts,
+                    "Disconnected phone coverage"
+                );
+            }
+            tx.execute("INSERT INTO phone_sync_ranges(partition_id,thread_id,from_ts,to_ts) VALUES(?1,?2,?3,?4) ON CONFLICT(partition_id) DO UPDATE SET thread_id=excluded.thread_id,from_ts=excluded.from_ts,to_ts=excluded.to_ts",params![partition,range.thread_id,range.from_ts,range.to_ts])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Explicit full rescan discards progress only, retaining every stored message.
+    ///
+    /// # Errors
+    /// Returns the SQLite error if progress cannot be removed.
+    pub(crate) fn reset_phone_sync_ranges(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM phone_sync_ranges", [])?;
+        Ok(())
     }
 
     /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
     pub fn upsert_message(&self, msg: &StoredMessage) -> Result<bool> {
-        let rows = self.conn.execute(
+        let rows = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(
             params![
                 msg.msg_id,
                 msg.thread_id,
@@ -239,7 +317,7 @@ impl MessageStore {
         if !incoming.is_outgoing || client.is_empty() || client == "0" {
             return Ok(());
         }
-        let mut statement=self.conn.prepare("SELECT msg_id,text,msg_type,ts,raw_json FROM messages WHERE thread_id=?1 AND is_outgoing=1 AND (CASE WHEN json_valid(raw_json) THEN json_extract(raw_json,'$.message_state.client_message_id') END)=?2 LIMIT 2")?;
+        let mut statement=self.conn.prepare_cached("SELECT msg_id,text,msg_type,ts,raw_json FROM messages WHERE thread_id=?1 AND is_outgoing=1 AND (CASE WHEN json_valid(raw_json) THEN json_extract(raw_json,'$.message_state.client_message_id') END)=?2 LIMIT 2")?;
         let candidates = statement
             .query_map(params![row.thread_id, client], |r| {
                 Ok((
@@ -255,6 +333,9 @@ impl MessageStore {
             return Ok(());
         }
         let (id, text, kind, ts, raw) = &candidates[0];
+        if *id == row.msg_id {
+            return Ok(());
+        }
         let mut existing = ChatMessage {
             id: id.clone(),
             text: text.clone(),
@@ -344,6 +425,10 @@ impl MessageStore {
         tx.execute("DELETE FROM messages WHERE thread_id=?1", params![id])?;
         tx.execute("DELETE FROM history_sync WHERE thread_id=?1", params![id])?;
         tx.execute(
+            "DELETE FROM phone_sync_ranges WHERE thread_id=?1",
+            params![id],
+        )?;
+        tx.execute(
             "UPDATE threads SET last_ts=0 WHERE thread_id=?1",
             params![id],
         )?;
@@ -353,7 +438,7 @@ impl MessageStore {
 
     /// Insert or update thread metadata.
     pub fn upsert_thread(&self, t: &StoredThread) -> Result<()> {
-        self.conn.execute(
+        self.conn.prepare_cached(
             "INSERT INTO threads (thread_id, name, is_group, last_ts)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(thread_id) DO UPDATE SET
@@ -361,7 +446,7 @@ impl MessageStore {
                     OR excluded.name = 'Người dùng ' || excluded.thread_id
                     THEN threads.name ELSE excluded.name END,
                  is_group = excluded.is_group,
-                 last_ts = MAX(threads.last_ts, excluded.last_ts)",
+                 last_ts = MAX(threads.last_ts, excluded.last_ts)")?.execute(
             params![
                 t.thread_id,
                 t.name,
@@ -1310,7 +1395,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                4
+                5
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -1400,5 +1485,121 @@ mod send_identity_tests {
         persist_threads(&mut store, &[thread("server-a", "shared")]).unwrap();
         persist_threads(&mut store, &[thread("server-b", "other")]).unwrap();
         assert_eq!(store.messages_for("thread-identity", 20).unwrap().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod phone_resume_tests {
+    use super::*;
+    fn range(from_ts: i64, to_ts: i64) -> PhoneSyncRange {
+        PhoneSyncRange {
+            thread_id: "fake-thread".into(),
+            from_ts,
+            to_ts,
+        }
+    }
+    #[test]
+    fn coverage_is_explicit_atomic_and_reset_does_not_delete_messages() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        assert!(store.phone_sync_ranges().unwrap().is_empty());
+        let thread = Thread {
+            id: "fake-thread".into(),
+            messages: vec![ChatMessage {
+                id: "fake-message".into(),
+                ts: 1000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        persist_threads(&mut store, &[thread]).unwrap();
+        assert!(
+            store.phone_sync_ranges().unwrap().is_empty(),
+            "Stored rows do not prove complete history"
+        );
+        store
+            .save_phone_sync_ranges(&[("oneone/fake".into(), range(100, 1000))])
+            .unwrap();
+        assert!(store
+            .save_phone_sync_ranges(&[
+                ("group/other".into(), range(0, 100)),
+                ("oneone/fake".into(), range(2000, 3000))
+            ])
+            .is_err());
+        assert_eq!(store.phone_sync_ranges().unwrap().len(), 1);
+        store.reset_phone_sync_ranges().unwrap();
+        assert_eq!(store.messages_for("fake-thread", 20).unwrap().len(), 1);
+        store
+            .save_phone_sync_ranges(&[("oneone/fake".into(), range(0, 1000))])
+            .unwrap();
+        store.clear_thread_history("fake-thread").unwrap();
+        assert!(store.phone_sync_ranges().unwrap().is_empty());
+    }
+    #[test]
+    fn schema_four_migrates_without_inventing_coverage_or_changing_messages() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-schema-four-{}",
+            crate::param_cipher::random_hex(12)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.db");
+        let mut store = MessageStore::open(&path).unwrap();
+        persist_threads(
+            &mut store,
+            &[Thread {
+                id: "migration-thread".into(),
+                messages: vec![ChatMessage {
+                    id: "migration-message".into(),
+                    text: "preserve".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        store
+            .conn
+            .execute_batch("DROP TABLE phone_sync_ranges; PRAGMA user_version=4;")
+            .unwrap();
+        drop(store);
+        let store = MessageStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            store.messages_for("migration-thread", 20).unwrap()[0].text,
+            "preserve"
+        );
+        assert!(store.phone_sync_ranges().unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn checkpoint_roundtrip_is_account_scoped_and_reopens_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-phone-checkpoint-{}",
+            crate::param_cipher::random_hex(12)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("account-a.db");
+        MessageStore::open(&path)
+            .unwrap()
+            .save_phone_sync_ranges(&[("group/fake".into(), range(100, 1000))])
+            .unwrap();
+        let reopened = MessageStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.phone_sync_ranges().unwrap()["group/fake"].from_ts,
+            100
+        );
+        assert!(MessageStore::open(root.join("account-b.db"))
+            .unwrap()
+            .phone_sync_ranges()
+            .unwrap()
+            .is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
