@@ -182,7 +182,7 @@ impl ZaloGuiApp {
                     ui.add_space(18.0);
 
                     // Navigation Icon 1: Tin nhắn (All / Active Chat)
-                    let is_msg_nav = self.thread_filter == ThreadFilter::All;
+                    let is_msg_nav = self.thread_filter == ThreadFilter::All && !self.contacts_view_open;
                     let (nav1_rect, nav1_resp) =
                         ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
                     if is_msg_nav {
@@ -216,13 +216,14 @@ impl ZaloGuiApp {
                         .on_hover_text("Tin nhắn")
                         .clicked()
                     {
+                        self.contacts_view_open = false;
                         self.thread_filter = ThreadFilter::All;
                     }
 
                     ui.add_space(6.0);
 
-                    // Navigation Icon 2: Danh bạ / Cá nhân
-                    let is_contacts_nav = self.thread_filter == ThreadFilter::Direct;
+                    // Navigation Icon 2: Danh bạ (friends and groups in one page)
+                    let is_contacts_nav = self.contacts_view_open;
                     let (nav2_rect, nav2_resp) =
                         ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
                     if is_contacts_nav {
@@ -253,24 +254,21 @@ impl ZaloGuiApp {
                     );
                     if nav2_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text(format!("Danh bạ ({} liên hệ)", self.threads.len()))
+                        .on_hover_text("Danh bạ")
                         .clicked()
                     {
-                        self.thread_filter = if self.thread_filter == ThreadFilter::Direct {
-                            ThreadFilter::All
-                        } else {
-                            ThreadFilter::Direct
-                        };
+                        self.contacts_view_open = !self.contacts_view_open;
                     }
 
                     ui.add_space(6.0);
 
                     // Navigation Icon 3: Cloud của tôi
-                    let is_cloud_selected = self
-                        .threads
-                        .get(self.selected_thread_index)
-                        .map(|t| t.name.contains("Cloud của tôi"))
-                        .unwrap_or(false);
+                    let is_cloud_selected = !self.contacts_view_open
+                        && self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .map(|t| t.name.contains("Cloud của tôi"))
+                            .unwrap_or(false);
                     let (nav3_rect, nav3_resp) =
                         ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
                     if is_cloud_selected {
@@ -305,6 +303,7 @@ impl ZaloGuiApp {
                             .find(|(_, t)| t.name.contains("Cloud của tôi"))
                         {
                             let cid = cthread.id.clone();
+                            self.contacts_view_open = false;
                             self.selected_thread_index = cidx;
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
@@ -397,6 +396,12 @@ impl ZaloGuiApp {
                     }
                 });
             });
+
+        if self.contacts_view_open {
+            self.render_contacts_page(ctx, pal);
+            self.render_workspace_overlays(ctx, pal);
+            return;
+        }
 
         // -------------------------------------------------------------------
         // 2. CONVERSATION LIST SIDEBAR (Responsive width, auto-adapts on resize)
@@ -896,6 +901,7 @@ impl ZaloGuiApp {
                                 {
                                     preference_action = Some((
                                         t.id.clone(),
+                                        t.is_group,
                                         crate::store::ConversationPreference {
                                             pinned: !preference.pinned,
                                             ..preference
@@ -905,14 +911,15 @@ impl ZaloGuiApp {
                                 }
                                 if ui
                                     .button(if preference.muted {
-                                        "Bật thông báo"
+                                        "Bật thông báo (mọi thiết bị)"
                                     } else {
-                                        "Tắt thông báo"
+                                        "Tắt thông báo (mọi thiết bị)"
                                     })
                                     .clicked()
                                 {
                                     preference_action = Some((
                                         t.id.clone(),
+                                        t.is_group,
                                         crate::store::ConversationPreference {
                                             muted: !preference.muted,
                                             ..preference
@@ -930,6 +937,7 @@ impl ZaloGuiApp {
                                 {
                                     preference_action = Some((
                                         t.id.clone(),
+                                        t.is_group,
                                         crate::store::ConversationPreference {
                                             hidden: !preference.hidden,
                                             ..preference
@@ -1203,11 +1211,12 @@ impl ZaloGuiApp {
                         }
                     });
 
-                if let Some((thread_id, value)) = preference_action {
+                if let Some((thread_id, is_group, value)) = preference_action {
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::SetConversationPreference {
                             owner: self.user_uin.clone(),
                             thread_id,
+                            is_group,
                             value,
                         });
                     }
@@ -1259,38 +1268,7 @@ impl ZaloGuiApp {
                     self.in_chat_search_query = q_str;
                 }
                 if let Some((idx, tid, is_group)) = clicked_thread {
-                    if self.selected_thread_index != idx {
-                        self.replying_to = None;
-                        self.filter_starred_only = false;
-                    }
-                    self.selected_thread_index = idx;
-                    if let Some(thread) = self.threads.get_mut(idx) {
-                        thread.unread.read_visible(&thread.messages);
-                    }
-                    self.persist_threads_async();
-                    if self.unread_counts.remove(&tid).is_some() {
-                        let total_unread: usize = self.unread_counts.values().sum();
-                        let title = if total_unread > 0 {
-                            format!("({total_unread}) Zalo Lite — Native Rust Client")
-                        } else {
-                            "Zalo Lite — Native Rust Client".to_string()
-                        };
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                    }
-                    let is_cloud = self
-                        .threads
-                        .get(idx)
-                        .map(|t| t.name.contains("Cloud của tôi"))
-                        .unwrap_or(false);
-                    if is_group || is_cloud {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                                limit: 500,
-                                group_id: tid,
-                                is_group,
-                            });
-                        }
-                    }
+                    self.open_thread(ctx, idx, tid, is_group);
                 }
             });
 
@@ -2511,7 +2489,7 @@ impl ZaloGuiApp {
                     }
                     let render_limit = self.chat_render_window.1;
                     let msg_area_height =
-                        (ui.available_height() - 66.0 - picker_reserve).max(100.0);
+                        (ui.available_height() - 66.0 - picker_reserve - composer_extra_height(&self.input_message)).max(100.0);
 
                     egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
@@ -3206,18 +3184,33 @@ impl ZaloGuiApp {
                                         let send_btn_w = if is_narrow_w { 52.0 } else { 76.0 };
                                         let input_w =
                                             (ui.available_width() - send_btn_w - 12.0).max(50.0);
+                                        let composer_id = Id::new(("chat_composer_input", &thread_id));
+                                        // Enter sends; Shift+Enter is left to the editor as a newline.
+                                        // Only consumed while the composer owns focus, so other fields keep Enter.
+                                        let enter_send = ui.memory(|m| m.has_focus(composer_id))
+                                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                                        let rows = composer_rows(&self.input_message);
                                         let text_edit =
-                                            egui::TextEdit::singleline(&mut self.input_message)
-                                                .id(Id::new(("chat_composer_input", &thread_id)))
+                                            egui::TextEdit::multiline(&mut self.input_message)
+                                                .id(composer_id)
                                                 .frame(false)
                                                 .hint_text(format!(
                                                     "Nhập tin nhắn tới {}...",
                                                     truncate_chars(&thread_name, 16)
                                                 ))
                                                 .margin(Margin::symmetric(6.0, 7.0))
+                                                .desired_rows(rows)
                                                 .desired_width(input_w);
 
-                                        let response = ui.add(text_edit);
+                                        let response = egui::ScrollArea::vertical()
+                                            .id_salt(("chat_composer_scroll", &thread_id))
+                                            .max_width(input_w)
+                                            .min_scrolled_width(input_w)
+                                            .auto_shrink([false, true])
+                                            .max_height(COMPOSER_MAX_HEIGHT)
+                                            .stick_to_bottom(true)
+                                            .show(ui, |ui| ui.add(text_edit))
+                                            .inner;
                                         if self.composer_focus_pending {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
@@ -3267,9 +3260,7 @@ impl ZaloGuiApp {
                                             self.composer_sticker_selected = None;
                                         }
 
-                                        let enter_pressed =
-                                            (response.lost_focus() || response.has_focus())
-                                                && ui.input(|i| i.key_pressed(Key::Enter));
+                                        let enter_pressed = enter_send;
                                         if enter_pressed {
                                             if let Some(sel) = self.composer_sticker_selected {
                                                 if let Some(st) = contextual_stickers.get(sel) {
@@ -3435,6 +3426,46 @@ impl ZaloGuiApp {
                 }
             });
 
+        self.render_workspace_overlays(ctx, pal);
+    }
+
+    /// Select a conversation, mark visible messages read and load server history when needed.
+    pub(super) fn open_thread(&mut self, ctx: &egui::Context, idx: usize, tid: String, is_group: bool) {
+        if self.selected_thread_index != idx {
+            self.replying_to = None;
+            self.filter_starred_only = false;
+        }
+        self.selected_thread_index = idx;
+        if let Some(thread) = self.threads.get_mut(idx) {
+            thread.unread.read_visible(&thread.messages);
+        }
+        self.persist_threads_async();
+        if self.unread_counts.remove(&tid).is_some() {
+            let total_unread: usize = self.unread_counts.values().sum();
+            let title = if total_unread > 0 {
+                format!("({total_unread}) Zalo Lite — Native Rust Client")
+            } else {
+                "Zalo Lite — Native Rust Client".to_string()
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+        let is_cloud = self
+            .threads
+            .get(idx)
+            .map(|t| t.name.contains("Cloud của tôi"))
+            .unwrap_or(false);
+        if is_group || is_cloud {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::LoadGroupHistory {
+                    limit: 500,
+                    group_id: tid,
+                    is_group,
+                });
+            }
+        }
+    }
+
+    fn render_workspace_overlays(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         self.render_profile_popover(ctx, pal);
         self.render_toast_overlay(ctx, pal);
         self.render_forward_dialog(ctx, pal);
@@ -3644,6 +3675,23 @@ mod sync_and_order_tests {
 }
 
 /// Highlight the exact resolved row and optionally center it in the message viewport.
+/// Composer grows with explicit lines up to five rows, then scrolls.
+const COMPOSER_MAX_ROWS: usize = 5;
+/// Approximate laid-out height of one 14px composer row.
+const COMPOSER_ROW_HEIGHT: f32 = 20.0;
+/// Height of five rows plus the editor margin.
+const COMPOSER_MAX_HEIGHT: f32 = 114.0;
+
+fn composer_rows(text: &str) -> usize {
+    text.split('\n').count().clamp(1, COMPOSER_MAX_ROWS)
+}
+
+/// Extra height the message list yields while the composer shows more than one row.
+fn composer_extra_height(text: &str) -> f32 {
+    let height = |rows: usize| (rows as f32 * COMPOSER_ROW_HEIGHT + 14.0).min(COMPOSER_MAX_HEIGHT);
+    height(composer_rows(text)) - height(1)
+}
+
 fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
     ui.painter().rect_stroke(
         rect.expand(2.0),
@@ -3756,5 +3804,24 @@ mod quote_navigation_tests {
                 "Jump must center the older target, not remain at the bottom: {after}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+
+    #[test]
+    fn composer_rows_grow_with_lines_and_cap_at_five() {
+        assert_eq!(composer_rows(""), 1);
+        assert_eq!(composer_rows("một dòng"), 1);
+        assert_eq!(composer_rows("a\nb\nc"), 3);
+        assert_eq!(composer_rows("1\n2\n3\n4\n5\n6\n7"), 5);
+        assert_eq!(composer_extra_height("one"), 0.0);
+        assert!(composer_extra_height("a\nb") > 0.0);
+        assert_eq!(
+            composer_extra_height("1\n2\n3\n4\n5\n6"),
+            COMPOSER_MAX_HEIGHT - (COMPOSER_ROW_HEIGHT + 14.0)
+        );
     }
 }

@@ -489,10 +489,27 @@ async fn run_once(
         max_frame_size: Some(crate::limits::INFLATED_BYTES as usize),
         ..Default::default()
     };
-    let connection = tokio::time::timeout(
-        Duration::from_secs(15),
-        connect_async_with_config(req, Some(config), false),
-    )
+    let connection = tokio::time::timeout(Duration::from_secs(15), async {
+        match crate::proxy::current() {
+            Some(proxy) => {
+                let uri = req.uri();
+                let host = uri.host().unwrap_or_default().to_owned();
+                let port = uri
+                    .port_u16()
+                    .unwrap_or(if uri.scheme_str() == Some("ws") { 80 } else { 443 });
+                let stream = crate::proxy::connect_via(proxy, &host, port)
+                    .await
+                    .map_err(|e| {
+                        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::other(
+                            e.to_string(),
+                        ))
+                    })?;
+                tokio_tungstenite::client_async_tls_with_config(req, stream, Some(config), None)
+                    .await
+            }
+            None => connect_async_with_config(req, Some(config), false).await,
+        }
+    })
     .await?;
     let (mut ws, resp) = match connection {
         Ok(pair) => pair,

@@ -40,8 +40,80 @@ fn default_root() -> Result<PathBuf> {
     }
 }
 
+/// Longest accepted `--profile` name.
+const PROFILE_MAX_LEN: usize = 32;
+
+/// Validate a `--profile` name so it maps to exactly one directory on every platform.
+///
+/// # Errors
+/// Rejects empty or overlong names, characters other than ASCII letters, digits, `-` and `_`,
+/// and Windows reserved device names. Names are rejected rather than silently rewritten so two
+/// different inputs can never share one profile.
+pub fn validate_profile(name: &str) -> Result<String> {
+    anyhow::ensure!(
+        !name.is_empty() && name.len() <= PROFILE_MAX_LEN,
+        "Tên hồ sơ phải dài 1–{PROFILE_MAX_LEN} ký tự"
+    );
+    anyhow::ensure!(
+        name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        "Tên hồ sơ chỉ được dùng chữ, số, '-' hoặc '_'"
+    );
+    let upper = name.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit());
+    anyhow::ensure!(!reserved, "Tên hồ sơ trùng tên thiết bị dành riêng của Windows");
+    // Case-insensitive file systems would otherwise merge `Work` and `work`.
+    Ok(name.to_ascii_lowercase())
+}
+
+/// Read `--profile NAME` or `--profile=NAME` from command-line arguments.
+///
+/// # Errors
+/// Fails when the flag is repeated, has no value, or the name is invalid.
+pub fn profile_from_args(args: &[String]) -> Result<Option<String>> {
+    let mut found = None;
+    let mut i = 0;
+    while i < args.len() {
+        let value = if args[i] == "--profile" {
+            i += 1;
+            Some(
+                args.get(i)
+                    .filter(|v| !v.starts_with('-'))
+                    .context("--profile cần tên hồ sơ, ví dụ: --profile cong-viec")?
+                    .as_str(),
+            )
+        } else {
+            args[i].strip_prefix("--profile=")
+        };
+        if let Some(value) = value {
+            anyhow::ensure!(found.is_none(), "--profile chỉ được dùng một lần");
+            found = Some(validate_profile(value.trim())?);
+        }
+        i += 1;
+    }
+    Ok(found)
+}
+
+fn profile_root(base: PathBuf, profile: Option<&str>) -> PathBuf {
+    match profile {
+        Some(name) => base.join("profiles").join(name),
+        None => base,
+    }
+}
+
 pub fn init(portable: bool) -> Result<()> {
-    let path = if portable {
+    init_profile(portable, None)
+}
+
+/// Select the data directory once; a profile gets its own sessions, history, settings and
+/// instance lock under `<root>/profiles/<name>`.
+///
+/// # Errors
+/// Fails when the directory cannot be created or the root was already initialized.
+pub fn init_profile(portable: bool, profile: Option<&str>) -> Result<()> {
+    let base = if portable {
         std::env::current_exe()?
             .parent()
             .context("Executable has no directory")?
@@ -49,6 +121,10 @@ pub fn init(portable: bool) -> Result<()> {
     } else {
         default_root()?
     };
+    if let Some(name) = profile {
+        anyhow::ensure!(validate_profile(name)? == name, "Invalid profile name");
+    }
+    let path = profile_root(base, profile);
     private_dir(&path)?;
     ROOT.set(path)
         .map_err(|_| anyhow::anyhow!("Data directory is already initialized"))?;
@@ -306,6 +382,42 @@ pub fn unprotect(bytes: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn profile_names_are_strict_and_case_folded_when_parsed() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(profile_from_args(&args(&["--gui"])).unwrap(), None);
+        assert_eq!(
+            profile_from_args(&args(&["--profile", "Cong_Viec-2"])).unwrap(),
+            Some("cong_viec-2".into())
+        );
+        assert_eq!(
+            profile_from_args(&args(&["--profile=work"])).unwrap(),
+            Some("work".into())
+        );
+        for bad in [
+            &["--profile"][..],
+            &["--profile", "--gui"],
+            &["--profile=../x"],
+            &["--profile=a b"],
+            &["--profile=nul"],
+            &["--profile=COM1"],
+            &["--profile=tài-khoản"],
+            &["--profile=a", "--profile=b"],
+        ] {
+            assert!(profile_from_args(&args(bad)).is_err(), "{bad:?}");
+        }
+        assert!(validate_profile(&"x".repeat(33)).is_err());
+        assert!(validate_profile("COM").is_ok());
+    }
+    #[test]
+    fn profile_root_is_nested_under_profiles_when_selected() {
+        let base = PathBuf::from("/data/ctdozlite");
+        assert_eq!(profile_root(base.clone(), None), base);
+        assert_eq!(
+            profile_root(base.clone(), Some("work")),
+            base.join("profiles").join("work")
+        );
+    }
     #[test]
     fn account_paths_cannot_escape_or_collide() {
         let a = account_file("../alice", "history.db");

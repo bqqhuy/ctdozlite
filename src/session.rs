@@ -254,7 +254,7 @@ impl Session {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
         default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
-        let http = Client::builder()
+        let http = crate::proxy::apply(Client::builder())?
             .cookie_provider(Arc::clone(&jar))
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
@@ -417,7 +417,8 @@ impl Session {
         let mut default_headers = HeaderMap::new();
         default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
         default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
-        if let Ok(c) = Client::builder()
+        if let Ok(c) = crate::proxy::apply(Client::builder()).and_then(|builder| {
+            Ok(builder
             .cookie_provider(Arc::clone(&self.jar))
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
@@ -427,8 +428,8 @@ impl Session {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36",
             )
-            .build()
-        {
+            .build()?)
+        }) {
             self.http = c;
         }
     }

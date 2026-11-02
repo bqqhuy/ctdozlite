@@ -31,7 +31,13 @@ async fn main() -> Result<()> {
     if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
         anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
     }
-    storage::init(args.iter().any(|a| a == "--portable"))?;
+    let profile = storage::profile_from_args(&args)?;
+    storage::init_profile(args.iter().any(|a| a == "--portable"), profile.as_deref())?;
+    let proxy = zalo_rust::proxy::from_args(&args, std::env::var("CTDOZ_PROXY").ok())?;
+    if let Some(config) = &proxy {
+        println!("Proxy: {}", config.redacted());
+    }
+    zalo_rust::proxy::init(proxy)?;
     let _instance = if args.iter().any(|a| a == "--doctor") {
         None
     } else {
@@ -68,6 +74,9 @@ async fn main() -> Result<()> {
     if args.iter().any(|a| a == "--doctor") {
         println!("Architecture: {}", std::env::consts::ARCH);
         println!("Data directory: {}", storage::root().display());
+        if let Some(name) = &profile {
+            println!("Profile: {name}");
+        }
         match video::readiness() {
             Ok(path) => println!("Video ready: {path}"),
             Err(e) => println!("Video unavailable: {e}"),

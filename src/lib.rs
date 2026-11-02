@@ -59,3 +59,12 @@ pub mod outgoing;
 pub mod upload;
 
 pub mod tools;
+
+/// Account-wide conversation mute state shared with official Zalo clients.
+pub mod mute_sync;
+
+/// Display-only styling for Zalo rich-text messages.
+pub mod rich_text;
+
+/// Optional outbound proxy for Zalo HTTP and WebSocket traffic.
+pub mod proxy;

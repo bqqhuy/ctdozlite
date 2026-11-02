@@ -881,6 +881,17 @@ pub fn extract_voip_controls(data_node: &Value) -> Vec<Value> {
 
 /// Poll `lp_control` (`getControllFromPolling`, cmd `99101`) once and return any incoming VoIP control events.
 pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Result<Vec<Value>> {
+    Ok(poll_control_events(s, state).await?.0)
+}
+
+/// Poll `lp_control` once and return VoIP control events plus account-wide mute changes.
+///
+/// # Errors
+/// Returns transport failures; the cursor only advances on a decoded response.
+pub async fn poll_control_events(
+    s: &Session,
+    state: &mut CtrlPollState,
+) -> Result<(Vec<Value>, Vec<crate::mute_sync::MuteChange>)> {
     if s.login.is_none() {
         bail!("chưa đăng nhập");
     }
@@ -907,8 +918,9 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
     if is_initial_cursor {
         // First poll with cursor "1" only syncs `lastActionId` to the server's latest cursor;
         // discard historical replay events from previous sessions.
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
+    let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
     let events = extract_voip_controls(data_node);
     if !events.is_empty() {
         trace_line(
@@ -921,7 +933,7 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
             ),
         );
     }
-    Ok(events)
+    Ok((events, mutes))
 }
 
 // ---------------------------------------------------------------------------

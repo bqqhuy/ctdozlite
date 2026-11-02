@@ -21,6 +21,8 @@ pub enum WorkerCmd {
     SetConversationPreference {
         owner: String,
         thread_id: String,
+        /// Addresses the account-wide mute change (`muteType` 1 peer, 2 group).
+        is_group: bool,
         value: crate::store::ConversationPreference,
     },
     ClearThreadHistory {
@@ -412,6 +414,7 @@ pub(super) fn spawn_session_worker(
     });
 
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mute_sync = MuteSync::default();
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let phone_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -499,6 +502,7 @@ pub(super) fn spawn_session_worker(
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
                     let live_updates = live_updates.clone();
+                    let mute_sync = mute_sync.clone();
                     let s_ws = session.clone();
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
@@ -534,6 +538,10 @@ pub(super) fn spawn_session_worker(
                                                 crate::call::extract_voip_controls(data_node)
                                             {
                                                 cb.handle_control_event(voip_ev);
+                                            }
+                                            if ev.is_voip_ish() {
+                                                let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
+                                                apply_server_mutes(&s_snap, mutes, &mute_sync, &gui_tx_ws, &live_updates, &ctx_ws).await;
                                             }
                                             if ev.is_chat_ish() || data_node.get("clearUnreads").is_some()
                                                 || data_node.get("clearUnreadInfo").is_some() || data_node.get("chatEntries").is_some() || data_node.get("statusMap").is_some() {
@@ -591,23 +599,28 @@ pub(super) fn spawn_session_worker(
                     });
                 }
 
-                // 2) Background HTTP long-poll fallback for VoIP control events (`lp_control`)
+                // 2) Background HTTP long-poll fallback for VoIP and mute control events (`lp_control`)
                 {
                     let s_ctrl = session.clone();
                     let cps = ctrl_poll_state.clone();
                     let cb = call_bridge.clone();
+                    let mute_sync = mute_sync.clone();
+                    let live_ctrl = live_updates.clone();
+                    let gui_tx_ctrl = gui_tx.clone();
+                    let ctx_ctrl = egui_ctx.clone();
                     tokio::spawn(async move {
                         loop {
                             let s_snap = s_ctrl.lock().await.clone();
                             if s_snap.login.is_some() {
                                 let voip_res = {
                                     let mut st = cps.lock().await;
-                                    crate::call::poll_voip_controls(&s_snap, &mut st).await
+                                    crate::call::poll_control_events(&s_snap, &mut st).await
                                 };
-                                if let Ok(events) = voip_res {
+                                if let Ok((events, mutes)) = voip_res {
                                     for ev in events {
                                         cb.handle_control_event(ev);
                                     }
+                                    apply_server_mutes(&s_snap, mutes, &mute_sync, &gui_tx_ctrl, &live_ctrl, &ctx_ctrl).await;
                                 } else {
                                     tokio::time::sleep(Duration::from_secs(5)).await;
                                 }
@@ -737,21 +750,41 @@ pub(super) fn spawn_session_worker(
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::SetConversationPreference { owner, thread_id, value } => {
+                        WorkerCmd::SetConversationPreference { owner, thread_id, is_group, value } => {
                             let s = session.lock().await.clone();
                             if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
                             let owner = owner.clone();
-                            let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                                anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
-                                let store=crate::store::MessageStore::open(s.history_path())?;
-                                store.set_conversation_preference(&thread_id,value)?;
-                                store.conversation_preferences()
-                            }).await;
-                            match result {
-                                Ok(Ok(values)) => { live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences { owner, values }); }
-                                _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); }
-                            }
-                            egui_ctx.request_repaint();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            let live = live_updates.clone(); let mute_sync = mute_sync.clone();
+                            // Runs off the command loop: the mute flag is account-wide and waits on the server.
+                            tokio::spawn(async move {
+                                let account = s.clone(); let id = thread_id.clone();
+                                let current = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                    Ok(crate::store::MessageStore::open(account.history_path())?.conversation_preferences()?.get(&id).copied().unwrap_or_default())
+                                }).await;
+                                let Ok(Ok(current)) = current else {
+                                    let _ = tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); ctx.request_repaint(); return;
+                                };
+                                if current.muted != value.muted {
+                                    mute_sync.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    // Fail closed: never show a mute state the server did not accept.
+                                    if crate::mute_sync::set_remote_mute(&s, &thread_id, is_group, value.muted).await.is_err() {
+                                        let _ = tx.send(GuiEvent::StatusUpdate("Không thể đổi thông báo trên máy chủ Zalo; giữ nguyên trạng thái".into()));
+                                        ctx.request_repaint(); return;
+                                    }
+                                }
+                                let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                    anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
+                                    let store=crate::store::MessageStore::open(s.history_path())?;
+                                    store.set_conversation_preference(&thread_id,value)?;
+                                    store.conversation_preferences()
+                                }).await;
+                                match result {
+                                    Ok(Ok(values)) => { live.set_muted(&values); let _ = tx.send(GuiEvent::ConversationPreferences { owner, values }); }
+                                    _ => { let _ = tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); }
+                                }
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::ClearThreadHistory { owner, thread_id } => {
                             let s = session.lock().await.clone();
@@ -1036,6 +1069,8 @@ pub(super) fn spawn_session_worker(
                                     Ok(Ok((values,cached))) => { live_updates.seed(&cached); live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
                                     _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể đọc tùy chọn hội thoại".into())); }
                                 }
+                                let s_mute = session.lock().await.clone();
+                                tokio::spawn(sync_mute_snapshot(s_mute, mute_sync.clone(), gui_tx.clone(), live_updates.clone(), egui_ctx.clone()));
                             }
 
                             if refresh_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) { continue; }
@@ -1990,6 +2025,141 @@ mod refresh_notice_tests {
         assert!(
             matches!(rx.try_recv().unwrap(),GuiEvent::ConversationRefreshStatus {running:false,message} if message=="Không thể kết nối máy chủ")
         );
+    }
+}
+
+/// Orders server mute reconciliation against newer local or realtime mute changes.
+#[derive(Clone, Default)]
+struct MuteSync {
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Most local-only mutes published during the first reconciliation of one refresh.
+const MUTE_SEED_LIMIT: usize = 50;
+
+async fn persist_mutes(
+    s: &Session,
+    changes: Vec<crate::mute_sync::MuteChange>,
+    mark_seeded: bool,
+) -> Option<HashMap<String, crate::store::ConversationPreference>> {
+    let account = s.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        anyhow::ensure!(account.is_active(), "Session ended");
+        crate::store::MessageStore::open(account.history_path())?
+            .apply_mute_changes(&changes, mark_seeded)
+    })
+    .await;
+    match result {
+        Ok(Ok(values)) => Some(values),
+        _ => {
+            crate::logger::log_error("mute sync", "Cannot persist server mute state");
+            None
+        }
+    }
+}
+
+fn publish_preferences(
+    s: &Session,
+    values: HashMap<String, crate::store::ConversationPreference>,
+    gui_tx: &Sender<GuiEvent>,
+    live: &crate::live_updates::LiveUpdates,
+    ctx: &egui::Context,
+) {
+    live.set_muted(&values);
+    let _ = gui_tx.send(GuiEvent::ConversationPreferences {
+        owner: s.account_key().to_owned(),
+        values,
+    });
+    ctx.request_repaint();
+}
+
+/// Apply realtime `act_type: "mute"` controls; newer than any snapshot already in flight.
+async fn apply_server_mutes(
+    s: &Session,
+    changes: Vec<crate::mute_sync::MuteChange>,
+    sync: &MuteSync,
+    gui_tx: &Sender<GuiEvent>,
+    live: &crate::live_updates::LiveUpdates,
+    ctx: &egui::Context,
+) {
+    if changes.is_empty() || !s.is_active() || s.account_key().is_empty() {
+        return;
+    }
+    sync.generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if let Some(values) = persist_mutes(s, changes, false).await {
+        publish_preferences(s, values, gui_tx, live, ctx);
+    }
+}
+
+/// Reconcile local mute flags with the complete server snapshot (ADR-0013).
+async fn sync_mute_snapshot(
+    s: Session,
+    sync: MuteSync,
+    gui_tx: Sender<GuiEvent>,
+    live: std::sync::Arc<crate::live_updates::LiveUpdates>,
+    ctx: egui::Context,
+) {
+    if s.login.is_none() || !s.is_active() || s.account_key().is_empty() {
+        return;
+    }
+    if sync.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _running = PollGuard(sync.running.clone());
+    let generation = sync.generation.load(std::sync::atomic::Ordering::SeqCst);
+    let server = match crate::mute_sync::fetch_mute_snapshot(&s).await {
+        Ok(server) => server,
+        Err(_) => {
+            crate::logger::log_error("mute sync", "Mute snapshot unavailable; keeping local state");
+            return;
+        }
+    };
+    let account = s.clone();
+    let plan = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        anyhow::ensure!(account.is_active(), "Session ended");
+        let store = crate::store::MessageStore::open(account.history_path())?;
+        let changes = crate::mute_sync::reconcile(&store.conversation_preferences()?, &server);
+        let seeded = store.mute_sync_seeded()?;
+        let mut local_only = Vec::new();
+        if !seeded {
+            for change in changes.iter().filter(|c| !c.muted) {
+                local_only.push((change.thread_id.clone(), store.thread_is_group(&change.thread_id)?));
+            }
+        }
+        Ok((changes, seeded, local_only))
+    })
+    .await;
+    let Ok(Ok((mut changes, seeded, local_only))) = plan else {
+        crate::logger::log_error("mute sync", "Cannot read local mute state");
+        return;
+    };
+    let mut complete = true;
+    if !seeded {
+        // Before this sync existed mutes were device-only; publish them once instead of
+        // letting the first authoritative snapshot silently turn them back on.
+        complete = local_only.len() <= MUTE_SEED_LIMIT;
+        for (id, is_group) in local_only.iter().take(MUTE_SEED_LIMIT) {
+            let published = match is_group {
+                Some(is_group) => crate::mute_sync::set_remote_mute(&s, id, *is_group, true)
+                    .await
+                    .is_ok(),
+                None => false,
+            };
+            complete &= published;
+        }
+        changes.retain(|change| change.muted);
+    }
+    if sync.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+        // A newer local or realtime change won; the next refresh reconciles again.
+        return;
+    }
+    if changes.is_empty() && seeded {
+        return;
+    }
+    if let Some(values) = persist_mutes(&s, changes, complete).await {
+        publish_preferences(&s, values, &gui_tx, &live, &ctx);
     }
 }
 

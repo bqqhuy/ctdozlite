@@ -21,6 +21,7 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod contacts;
 mod messages;
 mod modals;
 mod stickers;
@@ -396,6 +397,10 @@ pub struct ZaloGuiApp {
     selected_thread_index: usize,
     chat_render_window: (String, usize),
     thread_filter: ThreadFilter,
+    /// Contacts page replaces the conversation list and chat while open.
+    contacts_view_open: bool,
+    contacts_tab: contacts::ContactsTab,
+    contacts_query: String,
     search_query: String,
     input_message: String,
     status_msg: String,
@@ -618,6 +623,9 @@ impl ZaloGuiApp {
             selected_thread_index,
             chat_render_window: (String::new(), 150),
             thread_filter: ThreadFilter::All,
+            contacts_view_open: false,
+            contacts_tab: contacts::ContactsTab::default(),
+            contacts_query: String::new(),
             search_query: String::new(),
             input_message: String::new(),
             replying_to: None,
@@ -812,6 +820,51 @@ impl ZaloGuiApp {
                     highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(60),
                     scroll_pending: true,
                 });
+            }
+            if args.iter().any(|a| a == "--ui-smoke-contacts") {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                app.contacts_view_open = true;
+                app.threads.extend(
+                    [("fixture-an", "An Nguyễn"), ("fixture-binh", "Bình Trần"), ("fixture-duc", "Đức Lê")]
+                        .into_iter()
+                        .map(|(id, name)| Thread {
+                            id: id.into(),
+                            name: name.into(),
+                            ..Default::default()
+                        }),
+                );
+            }
+            if args.iter().any(|a| a == "--ui-smoke-rich-text") {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                let text = "Chú ý: họp lúc 9h, mang tài liệu cũ và mới";
+                let style = |start, len, apply: fn(&mut crate::rich_text::TextStyle)| {
+                    let mut s = crate::rich_text::TextStyle { start, len, ..Default::default() };
+                    apply(&mut s);
+                    s
+                };
+                app.threads = vec![Thread {
+                    id: "fixture-rich".into(),
+                    name: "Kiểm thử định dạng".into(),
+                    messages: vec![ChatMessage {
+                        id: "fixture-rich-1".into(),
+                        sender: "Người dùng thử".into(),
+                        text: text.into(),
+                        ts: 1_700_000_000_000,
+                        time: "10:00".into(),
+                        text_styles: vec![
+                            style(0, 6, |s| s.bold = true),
+                            style(15, 2, |s| s.underline = true),
+                            style(33, 2, |s| s.strike = true),
+                            style(36, 2, |s| s.italic = true),
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                app.selected_thread_index = 0;
+                app.input_message = "Dòng 1\nDòng 2\nDòng 3".into();
             }
             if args.iter().any(|a| a == "--ui-smoke-photo") {
                 app.settings_modal_open = false;

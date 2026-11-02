@@ -427,6 +427,60 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Whether this account has completed its first server mute reconciliation.
+    /// # Errors
+    /// Returns SQLite errors.
+    pub fn mute_sync_seeded(&self) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tool_config WHERE key='mute_sync_seeded' AND value='1')",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Group flag of a known thread, used to address account-wide mute changes.
+    /// # Errors
+    /// Returns SQLite errors; `None` means the thread kind is unknown.
+    pub fn thread_is_group(&self, id: &str) -> Result<Option<bool>> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT is_group FROM threads WHERE thread_id=?1",
+                params![id],
+                |r| r.get::<_, Option<bool>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Apply server mute changes in one transaction, preserving local pin/hide choices.
+    ///
+    /// `mark_seeded` records that the first reconciliation finished, after which complete
+    /// server snapshots are authoritative for the mute flag.
+    /// # Errors
+    /// Rejects an empty identity; any SQLite failure rolls back every change.
+    pub fn apply_mute_changes(
+        &self,
+        changes: &[crate::mute_sync::MuteChange],
+        mark_seeded: bool,
+    ) -> Result<std::collections::HashMap<String, ConversationPreference>> {
+        let tx = self.conn.unchecked_transaction()?;
+        for change in changes {
+            anyhow::ensure!(!change.thread_id.trim().is_empty(), "Missing thread identity");
+            tx.execute(
+                "INSERT INTO thread_preferences(thread_id,is_muted) VALUES(?1,?2)
+                ON CONFLICT(thread_id) DO UPDATE SET is_muted=excluded.is_muted",
+                params![change.thread_id, change.muted],
+            )?;
+        }
+        if mark_seeded {
+            tx.execute("INSERT INTO tool_config(key,value) VALUES('mute_sync_seeded','1') ON CONFLICT(key) DO UPDATE SET value='1'", [])?;
+        }
+        tx.commit()?;
+        self.conversation_preferences()
+    }
+
     /// Delete local messages and history checkpoint atomically, retaining thread identity/preferences.
     /// # Errors
     /// Propagates SQLite failures; a later explicit sync may download history again.
@@ -1363,6 +1417,71 @@ mod conversation_menu_tests {
             account_a.conversation_preferences().unwrap()["group-fixture"],
             ConversationPreference::default()
         );
+    }
+    #[test]
+    fn mute_changes_keep_pin_and_hide_when_server_state_applied() {
+        use crate::mute_sync::MuteChange;
+        let store = MessageStore::open(":memory:").unwrap();
+        store
+            .set_conversation_preference(
+                "1",
+                ConversationPreference {
+                    pinned: true,
+                    muted: true,
+                    hidden: true,
+                },
+            )
+            .unwrap();
+        assert!(!store.mute_sync_seeded().unwrap());
+        let values = store
+            .apply_mute_changes(
+                &[
+                    MuteChange {
+                        thread_id: "1".into(),
+                        muted: false,
+                    },
+                    MuteChange {
+                        thread_id: "2".into(),
+                        muted: true,
+                    },
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            values["1"],
+            ConversationPreference {
+                pinned: true,
+                muted: false,
+                hidden: true
+            }
+        );
+        assert_eq!(
+            values["2"],
+            ConversationPreference {
+                muted: true,
+                ..Default::default()
+            }
+        );
+        assert!(store.mute_sync_seeded().unwrap());
+    }
+    #[test]
+    fn mute_changes_roll_back_when_one_identity_is_invalid() {
+        use crate::mute_sync::MuteChange;
+        let store = MessageStore::open(":memory:").unwrap();
+        let changes = [
+            MuteChange {
+                thread_id: "1".into(),
+                muted: true,
+            },
+            MuteChange {
+                thread_id: " ".into(),
+                muted: true,
+            },
+        ];
+        assert!(store.apply_mute_changes(&changes, true).is_err());
+        assert!(store.conversation_preferences().unwrap().is_empty());
+        assert!(!store.mute_sync_seeded().unwrap());
     }
     #[test]
     fn clear_history_is_transactional_and_does_not_touch_another_thread() {

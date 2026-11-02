@@ -57,6 +57,9 @@ pub struct ChatMessage {
     pub is_pinned: bool,
     #[serde(default)]
     pub is_starred: bool,
+    /// Display-only rich-text spans over `text` (UTF-16 offsets); `text` itself is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text_styles: Vec<crate::rich_text::TextStyle>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2093,7 +2096,9 @@ fn extract_meta_attr(tag: &str, attr_name: &str) -> Option<String> {
 
 /// Scrape OpenGraph / Twitter Card / HTML `<meta>` tags directly from a webpage URL.
 pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
-    let client = reqwest::Client::builder()
+    // Link previews fetch third-party URLs; they must use the same proxy as Zalo traffic.
+    let client = crate::proxy::apply(reqwest::Client::builder())
+        .ok()?
         .timeout(std::time::Duration::from_millis(3800))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
@@ -4574,6 +4579,8 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
+    // Styles index the original text; generated labels below never carry styles.
+    let content_for_styles = content.clone();
     let is_undo_type = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
     if is_undo_type {
         content = "[Tin nhắn đã thu hồi]".to_string();
@@ -4711,6 +4718,12 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
             (None, None, None)
         };
 
+    let text_styles = match raw_content_val {
+        Some(value) if content == content_for_styles => {
+            crate::rich_text::parse_rtf_styles(value, &content)
+        }
+        _ => Vec::new(),
+    };
     let mut message = ChatMessage {
         kind: if is_undo_type {
             crate::message_model::MessageKind::Recall
@@ -4744,7 +4757,7 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_desc,
         link_thumb,
         link_src,
-
+        text_styles,
         ..Default::default()
     };
     message.hydrate_media_metadata();
@@ -6517,5 +6530,26 @@ mod live_photo_time_tests {
         assert!(!direct_zalo_photo("https://example.invalid/article.jpg"));
         msg.mark_recalled();
         assert!(!msg.is_photo());
+    }
+}
+
+#[cfg(test)]
+mod rich_text_parse_tests {
+    use super::*;
+
+    #[test]
+    fn rtf_message_keeps_plain_text_and_carries_styles_when_received() {
+        let content = json!({"action":"rtf","title":"Chú ý: họp lúc 9h","params":"{\"styles\":[{\"start\":0,\"len\":6,\"st\":\"b\"}],\"ver\":0}"});
+        let msg = parse_chat_message(&json!({"msgId":"fixture-rtf","uidFrom":"user-1","msgType":"webchat","content":content})).unwrap();
+        assert_eq!(msg.text, "Chú ý: họp lúc 9h");
+        assert_eq!(msg.text_styles.len(), 1);
+        assert!(msg.text_styles[0].bold);
+    }
+
+    #[test]
+    fn recalled_message_drops_styles_when_text_is_replaced() {
+        let content = json!({"action":"rtf","title":"bí mật","params":"{\"styles\":[{\"start\":0,\"len\":2,\"st\":\"b\"}]}"});
+        let msg = parse_chat_message(&json!({"msgId":"fixture-undo","uidFrom":"user-1","msgType":"chat.undo","content":content})).unwrap();
+        assert!(msg.text_styles.is_empty());
     }
 }

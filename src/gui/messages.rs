@@ -1094,7 +1094,11 @@ pub(super) fn render_message_body(
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
-        ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
+        if msg.text_styles.is_empty() {
+            ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
+        } else {
+            ui.add(egui::Label::new(styled_text_job(&msg.text, &msg.text_styles, text_col, 14.0)).wrap());
+        }
         return None;
     };
 
@@ -2302,5 +2306,56 @@ mod media_visibility_tests {
         let _=ctx.run(input(),|ctx|{egui::CentralPanel::default().show(ctx,|ui|{ui.add_space(2000.0);render_sticker_widget(ui,&msg,&textures,&mut loading);});});
         assert!(loading.is_empty(),"offscreen history must not flood the image queue");
         let _=ctx.run(input(),|ctx|{egui::CentralPanel::default().show(ctx,|ui|{render_sticker_widget(ui,&msg,&textures,&mut loading);});});assert!(loading.contains("stk_0_1"));
+    }
+}
+
+/// Lay out rich-text spans; egui ships no bold face, so bold is a slightly larger glyph size.
+pub(super) fn styled_text_job(
+    text: &str,
+    styles: &[crate::rich_text::TextStyle],
+    color: Color32,
+    size: f32,
+) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for (range, style) in crate::rich_text::segments(text, styles) {
+        let stroke = egui::Stroke::new(1.0_f32, color);
+        job.append(
+            &text[range],
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(if style.bold { size + 0.6 } else { size }),
+                color,
+                italics: style.italic,
+                underline: if style.underline { stroke } else { egui::Stroke::NONE },
+                strikethrough: if style.strike { stroke } else { egui::Stroke::NONE },
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+#[cfg(test)]
+mod rich_text_tests {
+    use super::*;
+
+    #[test]
+    fn styled_job_keeps_exact_text_and_marks_styled_sections() {
+        let styles = [crate::rich_text::TextStyle {
+            start: 4,
+            len: 3,
+            underline: true,
+            italic: true,
+            ..Default::default()
+        }];
+        let job = styled_text_job("Xin đậm nhé", &styles, Color32::WHITE, 14.0);
+        assert_eq!(job.text, "Xin đậm nhé");
+        let marked: Vec<&str> = job
+            .sections
+            .iter()
+            .filter(|s| s.format.italics)
+            .map(|s| &job.text[s.byte_range.clone()])
+            .collect();
+        assert_eq!(marked, ["đậm"]);
     }
 }
