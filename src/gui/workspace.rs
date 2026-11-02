@@ -1199,7 +1199,11 @@ impl ZaloGuiApp {
                     }
                 }
                 if let Some(id) = read_action {
+                    if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
+                        thread.unread.read_visible(&thread.messages);
+                    }
                     self.unread_counts.remove(&id);
+                    self.persist_threads_async();
                     self.refresh_unread_title(ctx);
                 }
                 if let Some(id) = clear_history_action {
@@ -1246,6 +1250,10 @@ impl ZaloGuiApp {
                         self.filter_starred_only = false;
                     }
                     self.selected_thread_index = idx;
+                    if let Some(thread) = self.threads.get_mut(idx) {
+                        thread.unread.read_visible(&thread.messages);
+                    }
+                    self.persist_threads_async();
                     if self.unread_counts.remove(&tid).is_some() {
                         let total_unread: usize = self.unread_counts.values().sum();
                         let title = if total_unread > 0 {
@@ -2702,6 +2710,16 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                BubbleAction::RetrySend => {
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let thread_id = self.threads[self.selected_thread_index].id.clone();
+                                        let mut message = m.clone();
+                                        message.delivery = crate::message_model::DeliveryState::Pending;
+                                        if let Some(job) = message.outgoing_job.as_mut() { job.attempt += 1; }
+                                        self.threads[self.selected_thread_index].messages[idx] = message.clone();
+                                        let _ = tx.send(WorkerCmd::RetryOutgoing { thread_id, message });
+                                    }
+                                }
                                 BubbleAction::Reply => self.replying_to = Some(m),
                                 BubbleAction::DoubleClickReply => { if self.settings.double_click_to_reply {self.replying_to=Some(m);} },
                                 BubbleAction::JumpToQuoted(reference) => {
@@ -2948,23 +2966,9 @@ impl ZaloGuiApp {
                         }
                     }
                     // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
-                    if is_clipboard_paste_triggered(ctx) {
-                        if let Some((path, w, h, col_img)) = read_clipboard_image_to_png() {
-                            // Consume any text Paste event on this frame so the composer doesn't paste a file path
-                            ctx.input_mut(|i| {
-                                i.events.retain(|e| !matches!(e, egui::Event::Paste(_)));
-                            });
-                            let tex = ctx.load_texture(
-                                format!("clip_preview_{}", crate::login::unix_now()),
-                                col_img,
-                                TextureOptions::LINEAR,
-                            );
-                            self.pending_clipboard_image = Some((path, w, h, tex));
-                            self.composer_focus_pending = true;
-                            self.show_toast(format!(
-                                "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
-                            ));
-                        }
+                    if is_clipboard_paste_triggered(ctx) && clipboard_has_image() {
+                        ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
+                        self.request_clipboard_image();
                     }
                     if self.pending_clipboard_image.is_some() {
                         let mut clear_clip = false;
@@ -3213,28 +3217,7 @@ impl ZaloGuiApp {
                                                 .clicked()
                                             {
                                                 ui.close_menu();
-                                                if let Some((path, w, h, col_img)) =
-                                                    read_clipboard_image_to_png()
-                                                {
-                                                    let tex = ctx.load_texture(
-                                                        format!(
-                                                            "clip_preview_{}",
-                                                            crate::login::unix_now()
-                                                        ),
-                                                        col_img,
-                                                        TextureOptions::LINEAR,
-                                                    );
-                                                    self.pending_clipboard_image =
-                                                        Some((path, w, h, tex));
-                                                    self.composer_focus_pending = true;
-                                                    self.show_toast(format!(
-                                                        "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
-                                                    ));
-                                                } else {
-                                                    self.show_toast(
-                                                        "Không tìm thấy hình ảnh nào trong Clipboard",
-                                                    );
-                                                }
+                                                self.request_clipboard_image();
                                             }
                                         });
 

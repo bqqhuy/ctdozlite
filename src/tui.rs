@@ -315,7 +315,8 @@ impl<'a> TuiApp<'a> {
         let pos = self.filtered.iter().position(|&i| i == thread_idx);
         self.list_state.select(pos);
         self.selected_thread = thread_idx;
-        if let Some(t) = self.threads.get(thread_idx) {
+        if let Some(t) = self.threads.get_mut(thread_idx) {
+            t.unread.read_visible(&t.messages);
             self.unread.remove(&t.id);
             self.selected_msg = t.messages.len().checked_sub(1);
         } else {
@@ -1318,6 +1319,8 @@ impl<'a> TuiApp<'a> {
                         .iter()
                         .filter(|m| {
                             !m.is_outgoing
+                                && m.unread_policy.counts_unread()
+                                && m.kind != crate::message_model::MessageKind::System
                                 && !m.id.is_empty()
                                 && !m.id.starts_with("local_")
                                 && !prev_ids.contains(&m.id)
@@ -1335,15 +1338,30 @@ impl<'a> TuiApp<'a> {
 
         // Merge into the live threads instead of replacing them, so optimistic
         // messages and history loaded while the poll was in flight survive.
-        for incoming in polled {
+        for mut incoming in polled {
             if let Some(pos) = self.threads.iter().position(|x| x.id == incoming.id) {
                 chat::merge_thread_into(&mut self.threads[pos], incoming, false);
             } else {
+                incoming.unread.advance_seen("0");
+                incoming.unread.observe(&incoming.messages);
                 self.threads.push(incoming);
                 changed = true;
             }
         }
 
+        for thread in &mut self.threads {
+            if thread.unread.last_seen_id.is_some() {
+                thread.unread.observe(&thread.messages);
+                if current_id.as_deref() == Some(&thread.id) {
+                    thread.unread.read_visible(&thread.messages);
+                }
+                if thread.unread.count() == 0 {
+                    self.unread.remove(&thread.id);
+                } else {
+                    self.unread.insert(thread.id.clone(), thread.unread.count());
+                }
+            }
+        }
         if let Some(id) = &current_id {
             self.unread.remove(id);
         }

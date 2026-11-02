@@ -44,5 +44,8 @@ What we will do, in one paragraph, present tense.
 | [0005](0005-phone-approved-history-sync.md) | Phone-approved history sync | accepted |
 | [0006](0006-exact-message-identity-and-quote-navigation.md) | Exact message identity and quote navigation | accepted |
 | [0007](0007-recent-first-resumable-phone-sync.md) | Recent-first resumable phone sync | accepted |
+| [0008](0008-fail-closed-mutations-and-background-unread.md) | Fail-closed mutations and coalesced background unread delivery | accepted |
 
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
+
+- [0009 — Outgoing retry, streaming uploads and Windows popups](0009-outgoing-retry-streaming-and-windows-popup.md)

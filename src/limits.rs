@@ -2,6 +2,8 @@
 use std::io::{Cursor, Read};
 pub static IMAGE_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
+/// At most two files stream concurrently; additional files await a permit.
+pub static UPLOAD_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 pub const IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const INFLATED_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -45,11 +47,14 @@ pub fn read_file(path: &std::path::Path, limit: usize) -> anyhow::Result<Vec<u8>
     let file = std::fs::File::open(path)?;
     anyhow::ensure!(
         file.metadata()?.len() <= limit as u64,
-        "Image file exceeds size limit"
+        "Tệp vượt giới hạn dung lượng cho phép"
     );
     let mut bytes = Vec::new();
     file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= limit, "Image file exceeds size limit");
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "Tệp vượt giới hạn dung lượng cho phép"
+    );
     Ok(bytes)
 }
 

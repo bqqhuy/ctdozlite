@@ -74,6 +74,10 @@ Bản mã nguồn tại [`c45882a`](https://github.com/bqqhuy/ctdozlite/commit/c
 
 Những điểm cần biết trước khi dùng:
 
+- Upload đọc theo khối **1 MiB**, tối đa **hai tệp đang truyền**, các tệp còn lại chờ; hộp chọn Windows hỗ trợ nhiều tệp. Không đặt giới hạn MB/tệp ở ứng dụng; máy chủ vẫn có thể áp dụng giới hạn riêng. Giới hạn giải mã preview ảnh 16 MiB vẫn giữ.
+- Chuyển tiếp hiện hỗ trợ **tin chữ và sticker**. Chuyển tiếp ảnh/tệp/video bị khóa kèm hướng dẫn tải và gửi lại tệp gốc; ứng dụng không gửi nhãn chữ rồi báo đã chuyển tiếp media.
+- Tin gửi lỗi giữ trong hội thoại cùng cảnh báo và nút **Gửi lại**; nút biến mất sau xác nhận thành công. Popup Windows hoạt động khi minimize hoặc ẩn tray, theo tùy chọn thông báo/âm thanh và tắt tiếng hội thoại. Xem [ADR-0009](docs/adr/0009-outgoing-retry-streaming-and-windows-popup.md).
+- Nếu máy chủ chưa xác nhận gửi/thu hồi, ứng dụng báo chưa rõ kết quả và không tự gửi lại thành tin thường. Kiểm tra hội thoại trước khi thử lại. Trên Windows, dấu chưa đọc ở tray được cập nhật cả khi cửa sổ ẩn; âm báo dùng tùy chọn thông báo hiện có. Xem [ADR-0008](docs/adr/0008-fail-closed-mutations-and-background-unread.md).
 - **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
 - Đã bổ sung **Settings → Đồng bộ → Đồng bộ từ điện thoại**: cần mở Zalo di động và xác nhận. Tiến độ và nút dừng hiện ở cửa sổ chính. Người dùng đã xác nhận luồng đồng bộ ban đầu hoạt động với điện thoại thật; cơ chế ưu tiên khoảng thời gian và tiếp tục mới vẫn cần kiểm chứng trên thiết bị; chỉ lấy được dữ liệu điện thoại còn giữ, không bảo đảm media cũ còn hạn. Xem [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
 - Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.

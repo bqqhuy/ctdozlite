@@ -116,13 +116,46 @@ impl Tray {
         menu.append_items(&[&open, &quit])?;
         let rgba = crate::limits::decode_image(include_bytes!("assets/app_icon.png"))?.to_rgba8();
         let (w, h) = rgba.dimensions();
-        let icon = Icon::from_rgba(rgba.into_raw(), w, h)?;
+        let normal_icon = Icon::from_rgba(rgba.clone().into_raw(), w, h)?;
+        let mut marked = rgba;
+        let radius = (w.min(h) / 5).max(1) as i64;
+        let center = (w as i64 - radius - 1, radius + 1);
+        for (x, y, pixel) in marked.enumerate_pixels_mut() {
+            let distance = (x as i64 - center.0).pow(2) + (y as i64 - center.1).pow(2);
+            if distance <= radius.pow(2) {
+                *pixel = image::Rgba([220, 38, 38, 255]);
+            }
+        }
+        let unread_icon = Icon::from_rgba(marked.into_raw(), w, h)?;
+        let icon = normal_icon.clone();
         let tray = TrayIconBuilder::new()
             .with_tooltip("ctdozlite — Mở Apps / Thoát Apps")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(true)
             .build()?;
+        let timer_hwnd = tray.window_handle();
+        // SAFETY: the tray HWND and callback live until Tray::drop cancels this owner-thread timer.
+        if unsafe {
+            SetTimer(
+                timer_hwnd.cast(),
+                NOTIFICATION_TIMER,
+                250,
+                Some(notification_tick),
+            )
+        } == 0
+        {
+            anyhow::bail!("Không thể khởi tạo thông báo nền ở khay hệ thống");
+        }
+        NOTIFICATION_ICON.with(|slot| {
+            *slot.borrow_mut() = Some(NotificationIcon {
+                icon: tray.clone(),
+                normal: normal_icon,
+                unread: unread_icon,
+                shown: false,
+                popup: false,
+            })
+        });
         let control = Control {
             ctx,
             hwnd,
@@ -138,6 +171,13 @@ impl Tray {
             control: control.clone(),
         });
         HANDLER.call_once(|| {
+            tray_icon::TrayIconEvent::set_event_handler(Some(|event: tray_icon::TrayIconEvent| {
+                if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
+                    if let Some(dispatch) = DISPATCH.lock().ok().and_then(|state| state.clone()) {
+                        dispatch.control.open();
+                    }
+                }
+            }));
             MenuEvent::set_event_handler(Some(|event: MenuEvent| {
                 let dispatch = DISPATCH.lock().ok().and_then(|state| state.clone());
                 if let Some(dispatch) = dispatch {
@@ -160,6 +200,13 @@ impl Tray {
 }
 impl Drop for Tray {
     fn drop(&mut self) {
+        // SAFETY: this is the same owner thread and live tray HWND used to create the timer.
+        unsafe {
+            KillTimer(self._icon.window_handle().cast(), NOTIFICATION_TIMER);
+        }
+        NOTIFICATION_ICON.with(|slot| *slot.borrow_mut() = None);
+        HAS_UNREAD.store(false, Ordering::Release);
+        POPUP_PENDING.store(false, Ordering::Release);
         if let Ok(mut dispatch) = DISPATCH.lock() {
             if dispatch.as_ref().map_or(false, |state| {
                 Arc::ptr_eq(&state.control.quitting, &self.control.quitting)
@@ -273,4 +320,94 @@ pub(crate) fn previews_visible() -> bool {
             unsafe { IsIconic(c.hwnd as *mut _) == 0 }
         }
     })
+}
+
+// Native timers run on the tray message loop even when eframe stops painting a hidden viewport.
+// TrayIcon is Rc-based and must only be touched by that owner thread.
+struct NotificationIcon {
+    icon: TrayIcon,
+    normal: Icon,
+    unread: Icon,
+    shown: bool,
+    popup: bool,
+}
+thread_local! {
+    static NOTIFICATION_ICON: std::cell::RefCell<Option<NotificationIcon>> = const { std::cell::RefCell::new(None) };
+}
+static HAS_UNREAD: AtomicBool = AtomicBool::new(false);
+static NOTIFICATIONS_ENABLED: AtomicBool = AtomicBool::new(true);
+static NOTIFICATION_SOUND: AtomicBool = AtomicBool::new(false);
+static POPUP_PENDING: AtomicBool = AtomicBool::new(false);
+const NOTIFICATION_TIMER: usize = 0x4354444f;
+#[link(name = "user32")]
+extern "system" {
+    fn SetTimer(
+        hwnd: *mut std::ffi::c_void,
+        id: usize,
+        interval: u32,
+        callback: Option<unsafe extern "system" fn(*mut std::ffi::c_void, u32, usize, u32)>,
+    ) -> usize;
+    fn KillTimer(hwnd: *mut std::ffi::c_void, id: usize) -> i32;
+
+}
+unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _: usize, _: u32) {
+    NOTIFICATION_ICON.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return;
+        };
+        let Some(icon) = slot.as_mut() else {
+            return;
+        };
+        if icon.popup && !NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
+            if icon.icon.show_notification("", "", false).is_ok() {
+                icon.popup = false;
+            }
+        }
+        let unread =
+            HAS_UNREAD.load(Ordering::Acquire) && NOTIFICATIONS_ENABLED.load(Ordering::Relaxed);
+        if unread != icon.shown {
+            let image = if unread { &icon.unread } else { &icon.normal };
+            if icon.icon.set_icon(Some(image.clone())).is_ok() {
+                icon.shown = unread;
+                let tip = if unread {
+                    "ctdozlite — Có tin nhắn chưa đọc"
+                } else {
+                    "ctdozlite — Mở Apps / Thoát Apps"
+                };
+                if icon.icon.set_tooltip(Some(tip)).is_err() {
+                    crate::logger::log_error(
+                        "tray attention",
+                        "Cannot update notification tooltip",
+                    );
+                }
+            }
+        }
+        if POPUP_PENDING.swap(false, Ordering::AcqRel) && unread && !previews_visible() {
+            if let Err(error) = icon.icon.show_notification(
+                "ctdozlite",
+                "Bạn có tin nhắn mới. Mở ctdozlite để xem.",
+                NOTIFICATION_SOUND.load(Ordering::Relaxed),
+            ) {
+                crate::logger::log_error("Windows notification", &error.to_string());
+            } else {
+                icon.popup = true;
+            }
+        }
+    });
+}
+pub(crate) fn configure_notifications(enabled: bool, sound: bool) {
+    if !enabled {
+        POPUP_PENDING.store(false, Ordering::Release);
+    }
+    NOTIFICATIONS_ENABLED.store(enabled, Ordering::Relaxed);
+    NOTIFICATION_SOUND.store(sound, Ordering::Relaxed);
+}
+pub(crate) fn set_unread(unread: bool) {
+    HAS_UNREAD.store(unread, Ordering::Release);
+}
+pub(crate) fn note_background_unread(new_alert: bool) {
+    HAS_UNREAD.store(true, Ordering::Release);
+    if !previews_visible() && new_alert && NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
+        POPUP_PENDING.store(true, Ordering::Release);
+    }
 }

@@ -713,6 +713,85 @@ impl Session {
         body.extend_from_slice(file_bytes);
         body.extend_from_slice(tail.as_bytes());
 
+        self.send_multipart_body(
+            url,
+            field_name,
+            &safe_name,
+            &boundary,
+            reqwest::Body::from(body),
+            file_bytes.len() as u64,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn post_multipart_file(
+        &self,
+        url: &str,
+        field_name: &str,
+        file_name: &str,
+        mime: &str,
+        file: tokio::fs::File,
+        size: u64,
+    ) -> Result<Value> {
+        use futures_util::StreamExt;
+        let boundary = format!("----ctdozlite{}", crate::param_cipher::random_hex(16));
+        let safe_name = file_name.replace(['"', '\r', '\n'], "_");
+        let head = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n");
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let length = size
+            .checked_add(head.len() as u64)
+            .and_then(|n| n.checked_add(tail.len() as u64))
+            .ok_or_else(|| anyhow::anyhow!("Tệp quá lớn"))?;
+        let first =
+            futures_util::stream::once(
+                async move { Ok::<Vec<u8>, std::io::Error>(head.into_bytes()) },
+            );
+        let chunks =
+            futures_util::stream::try_unfold((file, size), |(mut file, remaining)| async move {
+                use tokio::io::AsyncReadExt;
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let mut chunk = vec![0; remaining.min(crate::upload::CHUNK as u64) as usize];
+                file.read_exact(&mut chunk).await?;
+                Ok::<_, std::io::Error>(Some((
+                    chunk,
+                    (
+                        file,
+                        remaining - crate::upload::CHUNK.min(remaining as usize) as u64,
+                    ),
+                )))
+            });
+        let last =
+            futures_util::stream::once(
+                async move { Ok::<Vec<u8>, std::io::Error>(tail.into_bytes()) },
+            );
+        let body = reqwest::Body::wrap_stream(first.chain(chunks).chain(last));
+        self.send_multipart_body(
+            url,
+            field_name,
+            &safe_name,
+            &boundary,
+            body,
+            size,
+            Some(length),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_multipart_body(
+        &self,
+        url: &str,
+        field_name: &str,
+        safe_name: &str,
+        boundary: &str,
+        body: reqwest::Body,
+        size: u64,
+        length: Option<u64>,
+    ) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         let mut rb = self
             .http
@@ -731,6 +810,9 @@ impl Session {
                     .header("Referer", "https://chat.zalo.me/");
             }
         }
+        if let Some(length) = length {
+            rb = rb.header("Content-Length", length);
+        }
         let resp = rb.body(body).send().await?;
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
@@ -742,7 +824,7 @@ impl Session {
             url,
             Some(status.as_u16()),
             latency_ms,
-            &format!("[{field_name}: {safe_name} ({} bytes)]", file_bytes.len()),
+            &format!("[{field_name}: {safe_name} ({} bytes)]", size),
             Some(&text),
             if status.is_success() {
                 None

@@ -856,6 +856,14 @@ fn persist_snapshot(
 
         for m in &t.messages {
             let mut sm = StoredMessage::from(m);
+            if m.is_outgoing && crate::chat::server_message_id(m).is_some() {
+                let mut accepted = m.clone();
+                accepted.delivery = accepted
+                    .delivery
+                    .merge(crate::message_model::DeliveryState::ServerAccepted);
+                accepted.outgoing_job = None;
+                sm = StoredMessage::from(&accepted);
+            }
             sm.thread_id = t.id.clone();
             if sm.msg_id.is_empty() {
                 sm.msg_id = format!("{}_{}", t.id, sm.ts);

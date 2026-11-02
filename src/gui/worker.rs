@@ -1,6 +1,11 @@
 use super::*;
 
 pub enum WorkerCmd {
+    RetryOutgoing {
+        thread_id: String,
+        message: ChatMessage,
+    },
+    ReadClipboardImage,
     RequestQr,
     PersistSession,
     LoginPassword {
@@ -161,10 +166,6 @@ impl Drop for PollGuard {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::SeqCst);
     }
-}
-
-pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
-    crate::chat::sent_server_id(resp)
 }
 
 pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
@@ -404,6 +405,7 @@ pub(super) fn spawn_session_worker(
     egui_ctx: egui::Context,
 ) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+    let live_updates = std::sync::Arc::new(crate::live_updates::LiveUpdates::default());
     let image_jobs = crate::media_resources::MediaJobQueue::default();
     let commands = cmd_tx.downgrade();
     WORKER_TX.set(cmd_tx);
@@ -435,6 +437,11 @@ pub(super) fn spawn_session_worker(
             rt.block_on(async move {
                 {
                     let s = session.lock().await.clone();
+                    let cached_session = s.clone();
+                    match tokio::task::spawn_blocking(move || crate::chat::load_threads_cache(&cached_session)).await {
+                        Ok(cached) => live_updates.seed(&cached),
+                        Err(_) => crate::logger::log_error("live baseline", "Cannot prime cached message identities"),
+                    }
                     let _ = crate::login::get_server_info(&s).await;
                 }
                 {
@@ -463,6 +470,7 @@ pub(super) fn spawn_session_worker(
 
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
+                    let live_updates = live_updates.clone();
                     let s_ws = session.clone();
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
@@ -499,7 +507,8 @@ pub(super) fn spawn_session_worker(
                                             {
                                                 cb.handle_control_event(voip_ev);
                                             }
-                                            if ev.is_chat_ish() {
+                                            if ev.is_chat_ish() || data_node.get("clearUnreads").is_some()
+                                                || data_node.get("clearUnreadInfo").is_some() || data_node.get("chatEntries").is_some() || data_node.get("statusMap").is_some() {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
                                                     if !li.send2me_id.is_empty() {
@@ -521,7 +530,7 @@ pub(super) fn spawn_session_worker(
                                                     &mut ws_threads,
                                                     &ev.payload,
                                                 );
-                                                ws_threads.retain(|t| !t.messages.is_empty());
+                                                ws_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
                                                 if !ws_threads.is_empty() {
                                                     crate::chat::resolve_thread_names(
                                                         &s_snap,
@@ -529,8 +538,8 @@ pub(super) fn spawn_session_worker(
                                                     )
                                                     .await;
                                                     persist_received(&s_snap, &ws_threads).await;
-                                                    if deliver_thread_updates() {
-                                                        let _ = gui_tx_ws.send(GuiEvent::ThreadsUpdated {threads:ws_threads,source:ThreadUpdateSource::Live});
+                                                    if publish_live(&live_updates, ws_threads) {
+                                                        let _ = gui_tx_ws.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                                     }
                                                     ctx_ws.request_repaint();
                                                 }
@@ -609,7 +618,49 @@ pub(super) fn spawn_session_worker(
                 }
 
                 while let Some(cmd) = cmd_rx.recv().await {
+                    if let Some((thread_id, mut message)) = outgoing_command(&cmd) {
+                        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
+                        let tx = gui_tx.clone(); let ctx = egui_ctx.clone(); let shared = session.clone();
+                        tokio::spawn(async move {
+                            let active = active;
+                            let s = shared.lock().await.clone();
+                            let owner = s.account_key().to_owned();
+                            message.delivery = crate::message_model::DeliveryState::Pending;
+                            if let Some(job) = message.outgoing_job.as_mut() { job.error.clear(); }
+                            persist_outgoing(&s, &thread_id, &message).await;
+                            let _ = tx.send(GuiEvent::OutgoingState { owner: owner.clone(), thread_id: thread_id.clone(), message: message.clone() });
+                            ctx.request_repaint();
+                            let result = crate::outgoing::send(&s, &thread_id, &message).await;
+                            let expired = result.as_ref().err().is_some_and(|error| is_session_expired_error(&error.to_string()));
+                            match result {
+                                Ok(sent) => message = sent,
+                                Err(error) => {
+                                    message.delivery = crate::message_model::DeliveryState::Failed;
+                                    if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); }
+                                }
+                            }
+                            persist_outgoing(&s, &thread_id, &message).await;
+                            drop(active);
+                            let _ = tx.send(GuiEvent::OutgoingState { owner, thread_id, message });
+                            if expired {
+                                let _ = tokio::task::spawn_blocking(crate::storage::remove_session).await;
+                                shared.lock().await.logout();
+                                let _ = tx.send(GuiEvent::SessionExpired("Không thể gửi vì phiên đăng nhập đã hết hạn".into()));
+                            }
+                            ctx.request_repaint();
+                        });
+                        continue;
+                    }
                     match cmd {
+                        WorkerCmd::RetryOutgoing { .. } => {},
+                        WorkerCmd::ReadClipboardImage => {
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let image = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten();
+                                let _ = tx.send(GuiEvent::ClipboardImageRead(image));
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerCmd::SetConversationPreference { owner, thread_id, value } => {
                             let s = session.lock().await.clone();
                             if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
@@ -621,7 +672,7 @@ pub(super) fn spawn_session_worker(
                                 store.conversation_preferences()
                             }).await;
                             match result {
-                                Ok(Ok(values)) => { let _ = gui_tx.send(GuiEvent::ConversationPreferences { owner, values }); }
+                                Ok(Ok(values)) => { live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences { owner, values }); }
                                 _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); }
                             }
                             egui_ctx.request_repaint();
@@ -636,6 +687,7 @@ pub(super) fn spawn_session_worker(
                                 store.clear_thread_history(&id)?;
                                 let mut cache=crate::chat::load_threads_cache(&s);
                                 if let Some(thread)=cache.iter_mut().find(|t|t.id==id) {
+                                    thread.unread.read_visible(&thread.messages);
                                     thread.messages.clear(); thread.preview.clear(); thread.time.clear(); thread.presentation=Default::default();
                                 }
                                 crate::chat::save_threads_cache(&s,&cache);
@@ -650,6 +702,7 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::PersistThreads { owner, threads } => {
                             let s = session.lock().await.clone();
                             if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
+                            live_updates.seed(&threads);
                             // Await writes in command order: logout cannot race a detached snapshot write.
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 if !s.is_active() { return Ok(()); }
@@ -900,8 +953,11 @@ pub(super) fn spawn_session_worker(
                             let s_pref=session.lock().await.clone();
                             if !s_pref.account_key().is_empty() && s_pref.is_active() {
                                 let owner=s_pref.account_key().to_owned();
-                                match tokio::task::spawn_blocking(move || crate::store::MessageStore::open(s_pref.history_path())?.conversation_preferences()).await {
-                                    Ok(Ok(values)) => { let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
+                                match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                    let preferences = crate::store::MessageStore::open(s_pref.history_path())?.conversation_preferences()?;
+                                    Ok((preferences, crate::chat::load_threads_cache(&s_pref)))
+                                }).await {
+                                    Ok(Ok((values,cached))) => { live_updates.seed(&cached); live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
                                     _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể đọc tùy chọn hội thoại".into())); }
                                 }
                             }
@@ -1006,6 +1062,7 @@ pub(super) fn spawn_session_worker(
                                 continue;
                             }
 
+                            let live_updates = live_updates.clone();
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -1077,7 +1134,7 @@ pub(super) fn spawn_session_worker(
                                             ctx_clone.request_repaint();
                                         }
                                     } else {
-                                        temp_threads.retain(|t| !t.messages.is_empty());
+                                        temp_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
                                         if !temp_threads.is_empty() {
                                             crate::chat::resolve_thread_names(
                                                 &s,
@@ -1085,8 +1142,8 @@ pub(super) fn spawn_session_worker(
                                             )
                                             .await;
                                             persist_received(&s, &temp_threads).await;
-                                            if deliver_thread_updates() {
-                                                let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:temp_threads,source:ThreadUpdateSource::Live});
+                                            if publish_live(&live_updates, temp_threads) {
+                                                let _ = gui_tx_clone.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                             }
                                             ctx_clone.request_repaint();
                                         }
@@ -1163,230 +1220,8 @@ pub(super) fn spawn_session_worker(
                                 }
                             });
                         }
-                        WorkerCmd::SendMessage {
-                            to_id,
-                            text,
-                            is_group,
-                        } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                let client_id = crate::chat::next_client_message_id();
-                                if let Some(found_url) = crate::chat::extract_first_url(&text) {
-                                    let meta = crate::chat::parse_link_metadata(&s, &found_url)
-                                        .await
-                                        .unwrap_or_else(|_| crate::chat::LinkMetadata {
-                                            url: found_url.clone(),
-                                            title: found_url.clone(),
-                                            desc: String::new(),
-                                            thumb: String::new(),
-                                            src: "Liên kết".into(),
-                                        });
-                                    let _ =
-                                        gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta.clone()));
-                                    match crate::chat::send_link_message_with_client_id(
-                                        &s, &to_id, &text, &meta, is_group, client_id)
-                                    .await
-                                    {
-                                        Ok(resp) => {
-                                            let msg_id = extract_msg_id(&resp);
-                                            let now = crate::ui::clock();
-                                            let final_id = if msg_id.is_empty() {
-                                                format!("out_{client_id}")
-                                            } else {
-                                                msg_id
-                                            };
-                                            let msg = ChatMessage {
-                                                id: final_id,
-                                                client_message_id: client_id.to_string(),
-                                                sender: "Tôi".into(),
-                                                text,
-                                                time: now,
-                                                is_outgoing: true,
-                                                ts: (crate::login::unix_now() * 1000),
-                                                link_url: Some(meta.url),
-                                                link_title: if meta.title.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(meta.title)
-                                                },
-                                                link_desc: if meta.desc.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(meta.desc)
-                                                },
-                                                link_thumb: if meta.thumb.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(meta.thumb)
-                                                },
-                                                link_src: if meta.src.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(meta.src)
-                                                },
-                                                ..Default::default()
-                                            };
-                                            let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
-                                                thread_id: to_id,
-                                                msg,
-                                            });
-                                            ctx_clone.request_repaint();
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            let err_s = e.to_string();
-                                            crate::logger::log_error("gui::send_link", &err_s);
-                                            let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                                thread_id: to_id,
-                                                text,
-                                                error: err_s,
-                                            });
-                                            ctx_clone.request_repaint();
-                                            return;
-                                        }
-                                    }
-                                }
-
-                                let res = if is_group {
-                                    crate::chat::send_group_message_with_client_id(&s, &to_id, &text, client_id).await
-                                } else {
-                                    crate::chat::send_message_with_client_id(&s, &to_id, &text, client_id).await
-                                };
-                                match res {
-                                    Ok(resp) => {
-                                        let msg_id = extract_msg_id(&resp);
-                                        let _ = gui_tx_clone.send(GuiEvent::MessageSent {
-                                            client_message_id: client_id.to_string(),
-                                            thread_id: to_id,
-                                            text,
-                                            msg_id,
-                                        });
-                                        ctx_clone.request_repaint();
-                                    }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_message", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text,
-                                            error: err_s.clone(),
-                                        });
-                                        if is_session_expired_error(&err_s) {
-                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Không thể gửi vì phiên zpw_sek đã hết hạn".into(),
-                                            ));
-                                        }
-                                        ctx_clone.request_repaint();
-                                    }
-                                }
-                            });
-                        }
-                        WorkerCmd::SendQuote {
-                            to_id,
-                            text,
-                            quoted,
-                            is_group,
-                        } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                let client_id = crate::chat::next_client_message_id();
-                                match crate::chat::send_quote_message_with_client_id(
-                                    &s, &to_id, &text, &quoted, is_group, client_id)
-                                .await
-                                {
-                                    Ok(resp) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::QuoteSent {
-                                            client_message_id: client_id.to_string(),
-                                            thread_id: to_id,
-                                            text,
-                                            msg_id: extract_msg_id(&resp),
-                                            quoted,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_quote", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text,
-                                            error: err_s,
-                                        });
-                                    }
-                                }
-                                ctx_clone.request_repaint();
-                            });
-                        }
-                        WorkerCmd::Forward {
-                            target_id,
-                            target_is_group,
-                            msg,
-                        } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                let client_id = crate::chat::next_client_message_id();
-                                let res = crate::chat::forward_message_with_client_id(
-                                    &s,
-                                    &target_id,
-                                    target_is_group,
-                                    &msg, client_id)
-                                .await;
-                                match res {
-                                    Ok(resp) if resp_error_code(&resp).is_none() => {
-                                        let msg_id = extract_msg_id(&resp);
-                                        if let Some(sid) = msg.sticker_id.filter(|v| *v > 0) {
-                                            let _ = gui_tx_clone.send(GuiEvent::StickerSent {
-                                                client_message_id: client_id.to_string(),
-                                                thread_id: target_id,
-                                                msg_id,
-                                                sticker_id: sid,
-                                                cate_id: msg.sticker_cate_id.unwrap_or(0),
-                                                sticker_type: msg.sticker_type.unwrap_or(7),
-                                            });
-                                        } else {
-                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
-                                                client_message_id: client_id.to_string(),
-                                                thread_id: target_id,
-                                                text: msg.text.clone(),
-                                                msg_id,
-                                            });
-                                        }
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
-                                            "Đã chuyển tiếp tin nhắn".into(),
-                                        ));
-                                    }
-                                    Ok(resp) => {
-                                        let err_s = format!(
-                                            "server error {}",
-                                            resp_error_code(&resp).unwrap_or(0)
-                                        );
-                                        crate::logger::log_error("gui::forward", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Chuyển tiếp thất bại: {err_s}"
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        crate::logger::log_error("gui::forward", &e.to_string());
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Chuyển tiếp thất bại: {e}"
-                                        )));
-                                    }
-                                }
-                                ctx_clone.request_repaint();
-                            });
+                        WorkerCmd::SendMessage { .. } | WorkerCmd::SendQuote { .. } | WorkerCmd::Forward { .. } | WorkerCmd::SendSticker { .. } => {
+                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể gửi loại tin nhắn này".into()));
                         }
                         WorkerCmd::React {
                             to_id,
@@ -1503,7 +1338,7 @@ pub(super) fn spawn_session_worker(
                                     || msg.id.starts_with("out_")
                                     || msg.id.starts_with("local_");
                                 let res: anyhow::Result<serde_json::Value> = if local_only {
-                                    Ok(serde_json::json!({}))
+                                    Err(anyhow::anyhow!("Tin chưa có ID máy chủ; chưa thể xác nhận thu hồi cho mọi người"))
                                 } else {
                                     crate::chat::recall_message(&s, &to_id, is_group, &msg).await
                                 };
@@ -1522,7 +1357,7 @@ pub(super) fn spawn_session_worker(
                                         );
                                         crate::logger::log_error("gui::recall", &err_s);
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã thu hồi cục bộ (Máy chủ: {err_s})"
+                                            "Máy chủ từ chối thu hồi: {err_s}"
                                         )));
                                     }
                                     Err(e) => {
@@ -1533,64 +1368,6 @@ pub(super) fn spawn_session_worker(
                                     }
                                 }
                                 ctx_clone.request_repaint();
-                            });
-                        }
-                        WorkerCmd::SendSticker {
-                            to_id,
-                            sticker_id,
-                            cate_id,
-                            sticker_type,
-                            is_group,
-                        } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                let client_id = crate::chat::next_client_message_id();
-                                let res = crate::chat::send_sticker_with_client_id(
-                                    &s,
-                                    &to_id,
-                                    sticker_id,
-                                    cate_id,
-                                    sticker_type,
-                                    is_group, client_id)
-                                .await;
-                                match res {
-                                    Ok(resp) => {
-                                        let msg_id = extract_msg_id(&resp);
-                                        let _ = gui_tx_clone.send(GuiEvent::StickerSent {
-                                            client_message_id: client_id.to_string(),
-                                            thread_id: to_id,
-                                            msg_id,
-                                            sticker_id,
-                                            cate_id,
-                                            sticker_type,
-                                        });
-                                        ctx_clone.request_repaint();
-                                    }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_sticker", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text: String::new(),
-                                            error: err_s.clone(),
-                                        });
-                                        if is_session_expired_error(&err_s) {
-                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Không thể gửi nhãn dán vì phiên zpw_sek đã hết hạn"
-                                                    .into(),
-                                            ));
-                                        }
-                                        ctx_clone.request_repaint();
-                                    }
-                                }
                             });
                         }
                         WorkerCmd::FetchStickerImage { key, url } => {
@@ -1754,53 +1531,32 @@ pub(super) fn spawn_session_worker(
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let picked_path = if let Some(p) = preset_path {
-                                    Some(p)
-                                } else {
-                                    tokio::task::spawn_blocking(move || {
-                                        pick_native_file_dialog(images_only)
-                                    })
-                                    .await
-                                    .ok()
-                                    .flatten()
+                                let paths = if let Some(path) = preset_path { vec![path] } else {
+                                    tokio::task::spawn_blocking(move || super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default()
                                 };
-
-                                let Some(path) = picked_path else {
-                                    return;
-                                };
-                                let fname = path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("tập tin")
-                                    .to_string();
-                                let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                    "⏳ Đang tải lên và gửi '{fname}'…"
-                                )));
-                                ctx_clone.request_repaint();
-
                                 let s = session_clone.lock().await.clone();
-                                match crate::chat::send_attachment(
-                                    &s, &to_id, is_group, &path, &caption,
-                                )
-                                .await
-                                {
-                                    Ok((_resp, cm)) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::AttachmentSent {
-                                            thread_id: to_id,
-                                            msg: cm,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let err_s = e.to_string();
-                                        crate::logger::log_error("gui::send_attachment", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::SendFailed {
-                                            thread_id: to_id,
-                                            text: caption,
-                                            error: format!("Lỗi gửi '{fname}': {err_s}"),
-                                        });
-                                    }
+                                let owner = s.account_key().to_owned();
+                                for path in paths {
+                                    let stamp = crate::outgoing::FileStamp::read(&path).await.ok();
+                                    let mut message = crate::outgoing::pending(format!("[Tệp] {}", path.file_name().unwrap_or_default().to_string_lossy()), is_group,
+                                        crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp });
+                                    let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
+                                    persist_outgoing(&s, &to_id, &message).await;
+                                    let _ = gui_tx_clone.send(GuiEvent::OutgoingState { owner: owner.clone(), thread_id: to_id.clone(), message: message.clone() });
+                                    ctx_clone.request_repaint();
+                                    let s = s.clone();
+                                    let owner = owner.clone();
+                                    let tx = gui_tx_clone.clone(); let ctx = ctx_clone.clone(); let thread_id = to_id.clone();
+                                    tokio::spawn(async move {
+                                        match crate::outgoing::send(&s, &thread_id, &message).await {
+                                            Ok(sent) => message = sent,
+                                            Err(error) => { message.delivery = crate::message_model::DeliveryState::Failed; if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); } }
+                                        }
+                                        persist_outgoing(&s, &thread_id, &message).await;
+                                        drop(active);
+                                        let _ = tx.send(GuiEvent::OutgoingState { owner, thread_id, message }); ctx.request_repaint();
+                                    });
                                 }
-                                ctx_clone.request_repaint();
                             });
                         }
                         WorkerCmd::StartCall {
@@ -2171,4 +1927,122 @@ mod refresh_notice_tests {
             matches!(rx.try_recv().unwrap(),GuiEvent::ConversationRefreshStatus {running:false,message} if message=="Không thể kết nối máy chủ")
         );
     }
+}
+
+fn outgoing_command(cmd: &WorkerCmd) -> Option<(String, ChatMessage)> {
+    use crate::outgoing::{pending, Payload};
+    match cmd {
+        WorkerCmd::RetryOutgoing { thread_id, message } => {
+            Some((thread_id.clone(), message.clone()))
+        }
+        WorkerCmd::SendMessage {
+            to_id,
+            text,
+            is_group,
+        } => Some((
+            to_id.clone(),
+            pending(text.clone(), *is_group, Payload::Text),
+        )),
+        WorkerCmd::SendQuote {
+            to_id,
+            text,
+            quoted,
+            is_group,
+        } => {
+            let mut quote = quoted.clone();
+            quote.outgoing_job = None;
+            let mut msg = pending(text.clone(), *is_group, Payload::Quote(Box::new(quote)));
+            msg.reply_to_id = Some(quoted.id.clone());
+            msg.reply_to_sender = Some(quoted.sender.clone());
+            msg.reply_to_text = Some(quoted.text.clone());
+            Some((to_id.clone(), msg))
+        }
+        WorkerCmd::SendSticker {
+            to_id,
+            sticker_id,
+            cate_id,
+            sticker_type,
+            is_group,
+        } => {
+            let mut msg = pending(
+                "[Nhãn dán]".into(),
+                *is_group,
+                Payload::Sticker {
+                    id: *sticker_id,
+                    category: *cate_id,
+                    kind: *sticker_type,
+                },
+            );
+            msg.sticker_id = Some(*sticker_id);
+            msg.sticker_cate_id = Some(*cate_id);
+            msg.sticker_type = Some(*sticker_type);
+            Some((to_id.clone(), msg))
+        }
+        WorkerCmd::Forward {
+            target_id,
+            target_is_group,
+            msg,
+        } if crate::chat::can_forward_message(msg) => {
+            let mut original = msg.clone();
+            original.outgoing_job = None;
+            let mut outgoing = pending(
+                msg.text.clone(),
+                *target_is_group,
+                Payload::Forward(Box::new(original)),
+            );
+            outgoing.sticker_id = msg.sticker_id;
+            outgoing.sticker_cate_id = msg.sticker_cate_id;
+            outgoing.sticker_type = msg.sticker_type;
+            Some((target_id.clone(), outgoing))
+        }
+        _ => None,
+    }
+}
+
+async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMessage) {
+    let session = session.clone();
+    let thread_id = thread_id.to_owned();
+    let message = message.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        if !session.is_active() {
+            return Ok(());
+        }
+        let mut store = crate::store::MessageStore::open(session.history_path())?;
+        let saved = store
+            .all_threads()?
+            .into_iter()
+            .find(|thread| thread.thread_id == thread_id);
+        let is_group = message
+            .outgoing_job
+            .as_ref()
+            .is_some_and(|job| job.is_group);
+        let thread = Thread {
+            id: thread_id.clone(),
+            name: saved.as_ref().map(|t| t.name.clone()).unwrap_or(thread_id),
+            is_group: saved.as_ref().map(|t| t.is_group).unwrap_or(is_group),
+            messages: vec![message],
+            ..Default::default()
+        };
+        crate::store::persist_local_threads(&mut store, &[thread])?;
+        Ok(())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        crate::logger::log_error("outgoing persistence", "Cannot persist outgoing message");
+    }
+}
+
+fn publish_live(updates: &crate::live_updates::LiveUpdates, threads: Vec<Thread>) -> bool {
+    let wake = updates.publish(threads);
+    #[cfg(windows)]
+    {
+        let alert = updates.take_notification();
+        if updates.has_unread() {
+            crate::tray::set_unread(true);
+        }
+        if alert {
+            crate::tray::note_background_unread(true);
+        }
+    }
+    wake
 }

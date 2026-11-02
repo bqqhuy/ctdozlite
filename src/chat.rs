@@ -9,6 +9,8 @@ use crate::session::{obj, Session};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing_job: Option<Box<crate::outgoing::Job>>,
     #[serde(default)]
     pub kind: crate::message_model::MessageKind,
     #[serde(default)]
@@ -75,7 +77,7 @@ impl ChatMessage {
     /// Durable wire/receipt/reaction metadata, separate from searchable message columns.
     pub(crate) fn durable_state(&self) -> Value {
         json!({"kind":self.kind,"wire_ref":self.wire_ref,"unread_policy":self.unread_policy,
-            "delivery":self.delivery,"client_message_id":self.client_message_id,
+            "outgoing_job":self.outgoing_job,"delivery":self.delivery,"client_message_id":self.client_message_id,
             "reaction_summaries":self.reaction_summaries,"reaction_snapshot":self.reaction_snapshot,
             "reaction_authoritative_snapshot":self.reaction_authoritative_snapshot,
             "reaction_snapshot_provenance":self.reaction_snapshot_provenance,
@@ -94,6 +96,7 @@ impl ChatMessage {
             "wire_ref",
             "unread_policy",
             "delivery",
+            "outgoing_job",
             "client_message_id",
             "reaction_summaries",
             "reaction_snapshot",
@@ -108,12 +111,42 @@ impl ChatMessage {
             }
         }
         let restored: Self = serde_json::from_value(candidate)?;
+        let previous_attempt = self
+            .outgoing_job
+            .as_ref()
+            .map(|job| job.attempt)
+            .unwrap_or(0);
         self.merge_reaction_metadata(&restored);
+        if matches!(
+            self.delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+                | crate::message_model::DeliveryState::Delivered
+                | crate::message_model::DeliveryState::Read
+        ) {
+            self.outgoing_job = None;
+        } else if let Some(job) = restored.outgoing_job {
+            if job.attempt >= previous_attempt {
+                if job.attempt > previous_attempt {
+                    self.delivery = restored.delivery;
+                }
+                self.outgoing_job = Some(job);
+            }
+        }
+        if self.outgoing_job.is_some()
+            && self.delivery == crate::message_model::DeliveryState::Pending
+            && !crate::outgoing::is_active(&self.client_message_id)
+        {
+            self.delivery = crate::message_model::DeliveryState::Failed;
+            if let Some(job) = self.outgoing_job.as_mut() {
+                job.error = "Lần gửi trước bị gián đoạn; kiểm tra cuộc trò chuyện trước khi gửi lại để tránh trùng tin".into();
+            }
+        }
         Ok(())
     }
 
     /// Remove recalled content while preserving the original routing/message identifiers.
     pub(crate) fn mark_recalled(&mut self) {
+        self.outgoing_job = None;
         self.text = "[Tin nhắn đã thu hồi]".into();
         self.kind = crate::message_model::MessageKind::Recall;
         self.sticker_id = None;
@@ -180,6 +213,17 @@ impl ChatMessage {
             self.history_source = incoming.history_source.clone();
         }
         self.delivery = self.delivery.merge(incoming.delivery);
+        if self.outgoing_job.is_some()
+            && incoming.is_outgoing
+            && !self.client_message_id.is_empty()
+            && self.client_message_id == incoming.client_message_id
+            && server_message_id(incoming).is_some()
+        {
+            self.delivery = self
+                .delivery
+                .merge(crate::message_model::DeliveryState::ServerAccepted);
+            self.outgoing_job = None;
+        }
         previous_mentions != self.resolved_mention_uids
             || before
                 != (
@@ -887,7 +931,7 @@ fn wire_sender(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn server_message_id(message: &ChatMessage) -> Option<String> {
+pub(crate) fn server_message_id(message: &ChatMessage) -> Option<String> {
     let wire_server = wire_identity(message.wire_ref.server_id.as_ref());
     let wire_client = wire_identity(message.wire_ref.client_id.as_ref());
     if pending_message_id(&message.id)
@@ -1095,6 +1139,7 @@ pub fn merge_thread_into(
         target.presentation.global_id = incoming.presentation.global_id.clone();
     }
     target.is_group = target.is_group || incoming.is_group;
+    target.unread.merge_metadata(&incoming.unread);
 
     // Repeated text and timestamps are not identities. Keep ambiguous keys instead of
     // choosing the first candidate, especially when multiple pending sends collide.
@@ -1237,6 +1282,19 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
     }
     if let Ok(text) = std::fs::read_to_string(s.cache_path()) {
         if let Ok(mut threads) = serde_json::from_str::<Vec<Thread>>(&text) {
+            for thread in &mut threads {
+                for message in &mut thread.messages {
+                    if message.delivery == crate::message_model::DeliveryState::Pending
+                        && message.outgoing_job.is_some()
+                        && !crate::outgoing::is_active(&message.client_message_id)
+                    {
+                        message.delivery = crate::message_model::DeliveryState::Failed;
+                        if let Some(job) = message.outgoing_job.as_mut() {
+                            job.error = "Lần gửi trước bị gián đoạn; kiểm tra trước khi gửi lại để tránh trùng tin".into();
+                        }
+                    }
+                }
+            }
             deduplicate_threads(&mut threads, None);
             return threads;
         }
@@ -1423,22 +1481,51 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
 // HTTP 200 (including an empty long-poll-style response) is not a send receipt.
 // Keep the server error marker used by session expiry classification, without
 // copying arbitrary server text or decrypted payloads into diagnostics.
-fn confirmed_send(mut response: Value) -> Result<Value> {
-    let code = response
-        .get("error_code")
-        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-        .context("Máy chủ chưa xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại")?;
-    anyhow::ensure!(code == 0, "server error {code}: yêu cầu gửi tin bị từ chối");
-    if let Some(text) = response.get("data").and_then(Value::as_str) {
-        response["data"] = serde_json::from_str(text)
-            .context("Không đọc được xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại")?;
-    }
+fn confirmed_send(response: Value) -> Result<Value> {
+    let response = confirmed_upload(response)?;
+    anyhow::ensure!(
+        !sent_server_id(&response).is_empty(),
+        "Máy chủ chưa trả ID xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại"
+    );
+    Ok(response)
+}
+
+fn confirmed_upload(response: Value) -> Result<Value> {
+    let response = confirmed_mutation(response)?;
     anyhow::ensure!(
         response
             .get("data")
             .is_some_and(|v| v.is_object() || v.is_array()),
-        "Máy chủ chưa xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại"
+        "Máy chủ chưa xác nhận dữ liệu gửi; kiểm tra hội thoại trước khi gửi lại"
     );
+    Ok(response)
+}
+
+/// Require an explicit server acknowledgement before changing local mutation state.
+/// # Errors
+/// Rejects missing codes, server rejections and opaque/undecodable response bodies.
+pub(crate) fn confirmed_mutation(mut response: Value) -> Result<Value> {
+    let code = response
+        .get("error_code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .context("Máy chủ chưa xác nhận thao tác; kiểm tra hội thoại trước khi thử lại")?;
+    anyhow::ensure!(code == 0, "server error {code}: thao tác bị từ chối");
+    if let Some(text) = response.get("data").and_then(Value::as_str) {
+        response["data"] = serde_json::from_str(text)
+            .context("Không đọc được xác nhận thao tác; chưa thay đổi dữ liệu cục bộ")?;
+    }
+    anyhow::ensure!(
+        response
+            .get("data")
+            .is_some_and(|v| v.is_null() || v.is_object() || v.is_array()),
+        "Máy chủ chưa xác nhận thao tác; chưa thay đổi dữ liệu cục bộ"
+    );
+    if let Some(code) = response.pointer("/data/error_code") {
+        anyhow::ensure!(
+            code.as_i64().or_else(|| code.as_str()?.parse().ok()) == Some(0),
+            "Máy chủ từ chối thao tác"
+        );
+    }
     Ok(response)
 }
 
@@ -1558,18 +1645,6 @@ pub fn format_file_size(bytes: u64) -> String {
     }
 }
 
-fn md5_hex_bytes(bytes: &[u8]) -> String {
-    use md5::{Digest, Md5};
-    let mut h = Md5::new();
-    h.update(bytes);
-    let out = h.finalize();
-    out.iter().fold(String::with_capacity(32), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
-}
-
 /// Upload and send a photo, video, or general file attachment to a 1-1 or group conversation.
 ///
 /// Implements Zalo PC 26.10.11's two-stage chunked upload (`photo_original/upload` -> `photo_original/send`
@@ -1582,13 +1657,33 @@ pub async fn send_attachment(
     file_path: &std::path::Path,
     caption: &str,
 ) -> Result<(Value, ChatMessage)> {
+    send_attachment_with_client_id(
+        s,
+        to_id,
+        is_group,
+        file_path,
+        caption,
+        next_client_message_id(),
+    )
+    .await
+}
+
+pub(crate) async fn send_attachment_with_client_id(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    file_path: &std::path::Path,
+    caption: &str,
+    client_id: u64,
+) -> Result<(Value, ChatMessage)> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let file_bytes = std::fs::read(file_path)?;
-    if file_bytes.is_empty() {
-        anyhow::bail!("Tập tin rỗng (0 byte)");
-    }
+    let _permit = crate::limits::UPLOAD_JOBS
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("Hàng đợi tải lên đã đóng"))?;
+    let mut source = crate::upload::Source::open(file_path).await?;
     let file_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -1619,16 +1714,15 @@ pub async fn send_attachment(
     } else {
         to_id
     };
-    let client_id = next_client_message_id();
-    let total_size = file_bytes.len() as u64;
+    let total_size = source.size;
     let chunk_size: usize = 1_048_576; // 1 MiB chunks
-    let total_chunks = file_bytes.len().div_ceil(chunk_size).max(1);
+    let total_chunks = total_size.div_ceil(chunk_size as u64);
     let target_type = if is_group { 11 } else { 2 };
 
     if is_image {
-        let (width, height) = crate::limits::decode_image(&file_bytes)
-            .map(|img| (img.width(), img.height()))
-            .unwrap_or((800, 600));
+        let (width, height) = source
+            .dimensions
+            .ok_or_else(|| anyhow::anyhow!("Không đọc được kích thước hình ảnh"))?;
         let mime = match ext.as_str() {
             "png" => "image/png",
             "webp" => "image/webp",
@@ -1643,7 +1737,8 @@ pub async fn send_attachment(
         };
 
         let mut last_up_dec = Value::Null;
-        for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
+        for idx in 0..total_chunks {
+            let chunk = source.next_chunk().await?;
             let chunk_id = idx + 1;
             let mut m = serde_json::Map::new();
             m.insert("totalChunk".into(), json!(total_chunks));
@@ -1665,11 +1760,12 @@ pub async fn send_attachment(
                 s.common_params()
             );
             let up_raw = s
-                .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
+                .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
                 .await?;
-            last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
+            last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
         }
 
+        source.verify().await?;
         let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
         let photo_id = pick_str(data_node, &["photoId", "clientFileId"]);
         let normal_url =
@@ -1739,20 +1835,19 @@ pub async fn send_attachment(
                 s.common_params()
             );
             let r = s
-                .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
+                .post_multipart_file(
+                    &url,
+                    "fileContent",
+                    &file_name,
+                    mime,
+                    source.rewind().await?,
+                    total_size,
+                )
                 .await?;
             s.maybe_decrypt(r, s.session_key_bytes()).await
         };
 
-        if let Some(code) = send_resp.get("error_code").and_then(Value::as_i64) {
-            if code != 0 {
-                let msg = send_resp
-                    .get("error_message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                anyhow::bail!("server error {code}: {msg}");
-            }
-        }
+        let send_resp = confirmed_send(send_resp)?;
 
         let final_thumb = if !thumb_url.is_empty() {
             thumb_url
@@ -1764,14 +1859,7 @@ pub async fn send_attachment(
         } else {
             file_path.display().to_string()
         };
-        // Pre-populate `stickers_cache/thumb_<md5>.png` with the local image bytes so the GUI
-        // renders the sent photo immediately without an extra network round-trip.
-        let _ = std::fs::create_dir_all(crate::storage::cache_dir());
-        let cache_key = format!("thumb_{}", crate::crypto::md5_hex(&final_thumb));
-        let _ = std::fs::write(
-            crate::storage::cache_dir().join(format!("{cache_key}.png")),
-            &file_bytes,
-        );
+        source.verify().await?;
 
         let msg_id = send_resp
             .get("data")
@@ -1821,7 +1909,7 @@ pub async fn send_attachment(
         "txt" | "md" | "log" => "text/plain",
         _ => "application/octet-stream",
     };
-    let checksum = md5_hex_bytes(&file_bytes);
+    let checksum = source.checksum.clone();
     let upload_ep = if is_group {
         "/api/group/asyncfile/upload"
     } else {
@@ -1829,7 +1917,8 @@ pub async fn send_attachment(
     };
 
     let mut last_up_dec = Value::Null;
-    for (idx, chunk) in file_bytes.chunks(chunk_size).enumerate() {
+    for idx in 0..total_chunks {
+        let chunk = source.next_chunk().await?;
         let chunk_id = idx + 1;
         let mut m = serde_json::Map::new();
         m.insert("totalChunk".into(), json!(total_chunks));
@@ -1849,21 +1938,18 @@ pub async fn send_attachment(
             "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
             s.common_params()
         );
-        if let Ok(up_raw) = s
-            .post_multipart(&url, "chunkContent", &file_name, mime, chunk)
-            .await
-        {
-            last_up_dec = s.maybe_decrypt(up_raw, s.session_key_bytes()).await;
-        } else {
-            break;
-        }
+        let up_raw = s
+            .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
+            .await?;
+        last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
     }
 
+    source.verify().await?;
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
     let file_id = pick_str(data_node, &["fileId", "clientFileId"]);
     let file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
 
-    let mut send_resp = if let Some(fid) = file_id {
+    let send_resp = if let Some(fid) = file_id {
         let msg_ep = if is_group {
             "/api/group/asyncfile/msg"
         } else {
@@ -1901,49 +1987,7 @@ pub async fn send_attachment(
         json!({ "error_code": -1 })
     };
 
-    if send_resp
-        .get("error_code")
-        .and_then(Value::as_i64)
-        .unwrap_or(-1)
-        != 0
-    {
-        // Fallback to single-shot `/api/message/sharefile_full` or `/api/group/sharefile_full`
-        let share_ep = if is_group {
-            "/api/group/sharefile_full"
-        } else {
-            "/api/message/sharefile_full"
-        };
-        let body = if is_group {
-            obj(&[
-                ("grid", json!(clean_target)),
-                ("clientId", json!(client_id)),
-            ])
-        } else {
-            obj(&[
-                ("toid", json!(clean_target)),
-                ("clientId", json!(client_id)),
-            ])
-        };
-        let params = s.encoded_params(&body)?;
-        let url = format!(
-            "{file_host}{share_ep}?{}&params={params}&type={target_type}",
-            s.common_params()
-        );
-        let r = s
-            .post_multipart(&url, "fileContent", &file_name, mime, &file_bytes)
-            .await?;
-        send_resp = s.maybe_decrypt(r, s.session_key_bytes()).await;
-    }
-
-    if let Some(code) = send_resp.get("error_code").and_then(Value::as_i64) {
-        if code != 0 {
-            let msg = send_resp
-                .get("error_message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
-        }
-    }
+    let send_resp = confirmed_send(send_resp)?;
 
     let final_url = if !file_url.is_empty() {
         file_url
@@ -2085,7 +2129,7 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
         let tag = &after[..=end];
         cursor = &after[end + 1..];
 
-        if tag.len() >= 5 && tag[1..5].eq_ignore_ascii_case("meta") {
+        if tag.len() >= 5 && tag.as_bytes()[1..5].eq_ignore_ascii_case(b"meta") {
             let key = extract_meta_attr(tag, "property")
                 .or_else(|| extract_meta_attr(tag, "name"))
                 .unwrap_or_default()
@@ -2110,7 +2154,10 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
                 }
                 _ => {}
             }
-        } else if og_title.is_empty() && tag.len() >= 6 && tag[1..6].eq_ignore_ascii_case("title") {
+        } else if og_title.is_empty()
+            && tag.len() >= 6
+            && tag.as_bytes()[1..6].eq_ignore_ascii_case(b"title")
+        {
             if let Some(close) = cursor.find("</") {
                 let raw_t = unescape_html_entities(&cursor[..close]);
                 if !raw_t.is_empty() {
@@ -2276,7 +2323,7 @@ pub(crate) async fn send_link_message_with_client_id(
     })
     .to_string();
 
-    let res: Result<Value> = async {
+    async {
         if is_group {
             let clean_grid = to_id
                 .trim_start_matches("group_")
@@ -2349,18 +2396,8 @@ pub(crate) async fn send_link_message_with_client_id(
             Ok(dec)
         }
     }
-    .await;
-
-    match res {
-        Ok(v) => Ok(v),
-        Err(_) => {
-            if is_group {
-                send_group_message_with_client_id(s, to_id, msg_str, now).await
-            } else {
-                send_message_with_client_id(s, to_id, msg_str, now).await
-            }
-        }
-    }
+    .await
+    .and_then(confirmed_send)
 }
 
 /// Send a sticker (`sendSticker` in `compact-app-pc.b7bec208c4c8f73e09f8.js:14325410`):
@@ -3117,7 +3154,7 @@ pub async fn search_stickers_by_keyword(s: &Session, keyword: &str) -> Result<Ve
 /// - 1-1 (`cmd 11771`): `POST {domains.chat}/api/message/quote?{common}`
 /// - Group (`cmd 11197`): `POST {domains.group}/api/group/quote?{common}`
 ///
-/// Automatically falls back to `send_message` / `send_group_message` if the quoted message lacks a server ID.
+/// Missing reference metadata fails before sending; uncertain delivery is never replayed.
 pub async fn send_quote_message(
     s: &Session,
     to_id: &str,
@@ -3144,31 +3181,35 @@ pub(crate) async fn send_quote_message_with_client_id(
         anyhow::bail!("chưa đăng nhập");
     }
 
-    let my_uid = s
-        .login
-        .as_ref()
-        .map(|l| l.uin.clone())
-        .unwrap_or_else(|| "0".into());
-
     let qmsg_owner = if quoted.is_outgoing {
-        my_uid.as_str()
-    } else if !quoted.sender.is_empty() && quoted.sender.chars().all(|c| c.is_ascii_digit()) {
-        quoted.sender.as_str()
-    } else if !is_group {
-        to_id
+        s.account_key().to_owned()
     } else {
-        "0"
+        wire_identity(quoted.wire_ref.sender.as_ref())
+            .or_else(|| {
+                (!quoted.sender.is_empty() && quoted.sender.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| quoted.sender.clone())
+            })
+            .or_else(|| (!is_group).then(|| to_id.to_owned()))
+            .context("Thiếu định danh người gửi của tin trích dẫn")?
     };
+    anyhow::ensure!(
+        !qmsg_owner.is_empty() && qmsg_owner != "0",
+        "Thiếu định danh người gửi của tin trích dẫn"
+    );
+    let qmsg_id_num = server_message_id(quoted)
+        .context("Tin chưa có ID máy chủ; hãy chờ xác nhận trước khi trả lời")?
+        .parse::<u64>()
+        .context("ID tin trích dẫn không hợp lệ")?;
+    let qmsg_cli_id = client_message_id(quoted)
+        .context("Thiếu client ID của tin trích dẫn; không gửi thay bằng tin thường")?
+        .parse::<u64>()
+        .context("Client ID tin trích dẫn không hợp lệ")?;
+    let qmsg_ts = u64::try_from(quoted.ts)
+        .ok()
+        .filter(|ts| *ts > 0)
+        .context("Thiếu thời gian của tin trích dẫn")?;
 
-    let qmsg_id_num = quoted.id.parse::<u64>().unwrap_or(now.saturating_sub(1000));
-    let qmsg_ts = if quoted.ts > 0 {
-        quoted.ts as u64
-    } else {
-        now.saturating_sub(1000)
-    };
-    let qmsg_cli_id = qmsg_ts;
-
-    let quote_res: Result<Value> = async {
+    async {
         if quoted.id.starts_with("out_") || quoted.id.starts_with("local_") || quoted.id.is_empty()
         {
             anyhow::bail!("local quote id");
@@ -3239,18 +3280,28 @@ pub(crate) async fn send_quote_message_with_client_id(
             Ok(resp)
         }
     }
-    .await;
+    .await
+    .and_then(confirmed_send)
+}
 
-    match quote_res {
-        Ok(r) => Ok(r),
-        Err(_) => {
-            if is_group {
-                send_group_message_with_client_id(s, to_id, text, now).await
-            } else {
-                send_message_with_client_id(s, to_id, text, now).await
-            }
-        }
+/// Whether the verified forwarding paths can preserve this message's content.
+pub fn can_forward_message(msg: &ChatMessage) -> bool {
+    if msg.kind == crate::message_model::MessageKind::Recall || msg.text == "[Tin nhắn đã thu hồi]"
+    {
+        return false;
     }
+    if msg.sticker_id.is_some_and(|id| id > 0) {
+        return true;
+    }
+    matches!(
+        msg.kind,
+        crate::message_model::MessageKind::Text | crate::message_model::MessageKind::Unknown
+    ) && msg.link_url.is_none()
+        && msg.link_thumb.is_none()
+        && msg.link_src.is_none()
+        && !["[Tập tin]", "[Video]", "[Hình ảnh]", "[Tin nhắn thoại]"]
+            .iter()
+            .any(|label| msg.text.starts_with(label))
 }
 
 /// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
@@ -3274,6 +3325,10 @@ pub(crate) async fn forward_message_with_client_id(
     msg: &ChatMessage,
     now: u64,
 ) -> Result<Value> {
+    anyhow::ensure!(
+        can_forward_message(msg),
+        "Chưa hỗ trợ chuyển tiếp loại tin này; hãy tải và gửi lại tệp gốc"
+    );
     if let Some(sid) = msg.sticker_id {
         if sid > 0 {
             let cid = msg.sticker_cate_id.unwrap_or(0);
@@ -3340,18 +3395,11 @@ pub async fn send_reaction(
         .unwrap_or(0);
 
     let (r_icon, r_type) = reaction_code_and_type(reaction);
-    let is_local_id =
-        msg.id.is_empty() || msg.id.starts_with("out_") || msg.id.starts_with("local_");
-    let g_msg_id_val = if is_local_id {
-        json!("")
-    } else {
-        json!(msg.id)
-    };
-    let c_msg_id = if msg.ts > 0 {
-        msg.ts as u64
-    } else {
-        msg.id.parse::<u64>().unwrap_or(now)
-    };
+    let g_msg_id_val = server_message_id(msg).context("Thiếu ID máy chủ của tin nhắn")?;
+    let c_msg_id = client_message_id(msg)
+        .context("Thiếu client ID của tin nhắn")?
+        .parse::<u64>()
+        .context("Client ID tin nhắn không hợp lệ")?;
 
     let inner_msg = json!({
         "rMsg": [{
@@ -3398,7 +3446,7 @@ pub async fn send_reaction(
 
     let params = s.encoded_params(&body)?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
-    Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
 /// Delete a message for me (`deleteOneOneMessageV2` / `deleteGroupMessageV2` @ `compact-app-pc.js:14373319`, cmd `11779` / `11834`).
@@ -3415,27 +3463,19 @@ pub async fn delete_message_for_me(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let my_uid = s
-        .login
-        .as_ref()
-        .map(|l| l.uin.clone())
-        .unwrap_or_else(|| "0".into());
     let owner_id = if msg.is_outgoing {
-        my_uid.as_str()
-    } else if !is_group {
-        to_id
+        s.account_key().to_owned()
     } else {
-        &msg.sender
+        wire_identity(msg.wire_ref.sender.as_ref())
+            .or_else(|| (!is_group).then(|| to_id.to_owned()))
+            .context("Thiếu định danh người gửi của tin nhắn")?
     };
-    let cli_id = if msg.ts > 0 {
-        msg.ts.to_string()
-    } else {
-        now.to_string()
-    };
+    let cli_id = client_message_id(msg).context("Thiếu client ID của tin nhắn")?;
+    let server_id = server_message_id(msg).context("Thiếu ID máy chủ của tin nhắn")?;
 
     let msgs_arr = json!([{
         "cliMsgId": cli_id,
-        "globalMsgId": msg.id,
+        "globalMsgId": server_id,
         "ownerId": owner_id,
         "destId": to_id
     }]);
@@ -3458,7 +3498,7 @@ pub async fn delete_message_for_me(
             s.common_params()
         );
         let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     } else {
         let host = if s.domains.chat.contains("-msg-chat.")
             || s.domains.chat.contains("tt-chat2-wpa")
@@ -3478,7 +3518,7 @@ pub async fn delete_message_for_me(
         let params = s.encoded_params(&body)?;
         let url = format!("{host}/api/message/delete?{}", s.common_params());
         let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     }
 }
 
@@ -3496,11 +3536,10 @@ pub async fn recall_message(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let cli_id = if msg.ts > 0 {
-        msg.ts.to_string()
-    } else {
-        now.to_string()
-    };
+    anyhow::ensure!(msg.is_outgoing, "Chỉ có thể thu hồi tin do bạn gửi");
+    let cli_id = client_message_id(msg).context("Thiếu client ID của tin nhắn")?;
+    let server_id =
+        server_message_id(msg).context("Thiếu ID máy chủ; chưa thể thu hồi tin nhắn")?;
 
     if is_group {
         let clean_grid = to_id
@@ -3508,7 +3547,7 @@ pub async fn recall_message(
             .trim_start_matches('g')
             .trim_start_matches('G');
         let body = obj(&[
-            ("msgId", json!(msg.id)),
+            ("msgId", json!(server_id)),
             ("grid", json!(clean_grid)),
             ("clientId", json!(now)),
             ("visibility", json!(0)),
@@ -3522,7 +3561,7 @@ pub async fn recall_message(
             s.common_params()
         );
         let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     } else {
         let host = if s.domains.chat.contains("-msg-chat.")
             || s.domains.chat.contains("tt-chat2-wpa")
@@ -3533,7 +3572,7 @@ pub async fn recall_message(
             &s.domains.chat
         };
         let body = obj(&[
-            ("msgId", json!(msg.id)),
+            ("msgId", json!(server_id)),
             ("toid", json!(to_id)),
             ("clientId", json!(now)),
             ("cliMsgIdUndo", json!(cli_id)),
@@ -3541,7 +3580,7 @@ pub async fn recall_message(
         let params = s.encoded_params(&body)?;
         let url = format!("{host}/api/message/undo?{}", s.common_params());
         let resp = s.post_form(&url, format!("params={params}")).await?;
-        Ok(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
     }
 }
 
@@ -4852,7 +4891,12 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 found_list = true;
             }
         }
-        if let Some(cu_arr) = obj.get("clearUnreads").and_then(Value::as_array) {
+        if let Some(cu_arr) = obj
+            .get("clearUnreads")
+            .or_else(|| obj.get("clearUnreadInfo"))
+            .or_else(|| obj.get("statusMap").and_then(|v| v.get("clearUnreads")))
+            .and_then(Value::as_array)
+        {
             for cu in cu_arr {
                 let Some(tid) = pick_str(cu, &["idTo", "threadId", "userId"]) else {
                     continue;
@@ -4863,7 +4907,10 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 let is_grp = is_group_flag(cu);
                 // Only auto-create 1-1 conversation threads from `clearUnreads`; disbanded groups
                 // may linger in `clearUnreads` after removal, whereas active groups come from `get_groups`.
-                if !is_grp && !threads.iter().any(|t| t.id == tid) {
+                if !threads.iter().any(|t| {
+                    t.id.trim_start_matches('g') == tid.trim_start_matches('g')
+                        && t.is_group == is_grp
+                }) {
                     threads.push(Thread {
                         presentation: Default::default(),
                         unread: Default::default(),
@@ -4872,7 +4919,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                         preview: String::new(),
                         time: String::new(),
                         avatar: None,
-                        is_group: false,
+                        is_group: is_grp,
                         messages: Vec::new(),
                     });
                 }
@@ -5022,6 +5069,11 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
         }
     }
 
+    crate::unread::merge_read_points(threads, data_node);
+    crate::unread::merge_mute_metadata(threads, data_node);
+    for t in threads.iter_mut() {
+        t.unread.observe(&t.messages);
+    }
     for t in threads.iter_mut() {
         if !t.messages.is_empty() {
             t.messages.sort_by_key(|m| m.ts);
@@ -6287,7 +6339,7 @@ mod send_identity_tests {
     }
 
     #[tokio::test]
-    async fn request_client_id_survives_send_variants_and_fallbacks() {
+    async fn request_client_id_survives_verified_send_variants() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::Duration;
@@ -6297,7 +6349,7 @@ mod send_identity_tests {
         let host = format!("http://{}", listener.local_addr().unwrap());
         let fixture = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..9 {
+            for _ in 0..7 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -6343,13 +6395,8 @@ mod send_identity_tests {
                     .nth(1)
                     .unwrap()
                     .to_string();
-                let fail = path.contains("/link?") || path.contains("/quote?");
                 requests.push((path, body));
-                let response = if fail {
-                    r#"{"error_code":114}"#
-                } else {
-                    r#"{"error_code":0,"data":{"msgId":"server-a"}}"#
-                };
+                let response = r#"{"error_code":0,"data":{"msgId":"server-a"}}"#;
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", response.len(), response).unwrap();
             }
             requests
@@ -6397,7 +6444,9 @@ mod send_identity_tests {
             "contact-1",
             "Text",
             &ChatMessage {
-                id: "server-quote".into(),
+                id: "123".into(),
+                client_message_id: "777".into(),
+                ts: 1700000000000,
                 ..Default::default()
             },
             false,
@@ -6430,7 +6479,7 @@ mod send_identity_tests {
         .await
         .unwrap();
         let requests = fixture.join().unwrap();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 7);
         for (_, body) in requests {
             assert_eq!(body["clientId"], json!(client_id));
         }

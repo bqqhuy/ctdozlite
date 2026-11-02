@@ -291,7 +291,7 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
     }
 }
 /// Open a native OS file-picker dialog on a worker thread and return the selected path.
-pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::PathBuf> {
+pub(super) fn pick_native_files_dialog(images_only: bool) -> Option<Vec<std::path::PathBuf>> {
     #[cfg(target_os = "windows")]
     {
         // Native Win32 IFileOpenDialog (via `rfd`): opens instantly, no PowerShell /
@@ -311,7 +311,7 @@ pub(super) fn pick_native_file_dialog(images_only: bool) -> Option<std::path::Pa
                 .add_filter("Video & âm thanh", &["mp4", "mov", "mkv", "mp3", "wav"])
                 .add_filter("Tài liệu", &["pdf", "zip", "docx", "xlsx", "txt"])
         };
-        return dlg.pick_file();
+        return dlg.pick_files();
     }
     #[cfg(not(windows))]
     {
@@ -389,6 +389,33 @@ pub(super) fn finalize_clipboard_rgba_image(
     let col_img =
         egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], thumb.as_raw());
     Some((path, width, height, col_img))
+}
+
+/// Inspect clipboard formats without opening it or decoding pixels on the UI thread.
+pub(super) fn clipboard_has_image() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn IsClipboardFormatAvailable(format: u32) -> i32;
+            fn RegisterClipboardFormatA(name: *const u8) -> u32;
+        }
+        // SAFETY: constant format IDs and NUL-terminated static strings; no borrowed clipboard memory.
+        unsafe {
+            [
+                8,
+                15,
+                RegisterClipboardFormatA(b"PNG\0".as_ptr()),
+                RegisterClipboardFormatA(b"image/png\0".as_ptr()),
+            ]
+            .into_iter()
+            .any(|format| format != 0 && IsClipboardFormatAvailable(format) != 0)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Read an image from the Windows Clipboard supporting:
@@ -481,7 +508,12 @@ pub(super) fn read_clipboard_image_to_png(
                     if chars > 0 && chars < buf.len() {
                         let file_path =
                             std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
-                        if let Ok(dyn_img) = image::open(&file_path) {
+                        if let Ok(dyn_img) =
+                            crate::limits::read_file(&file_path, crate::limits::IMAGE_BYTES)
+                                .and_then(|bytes| {
+                                    crate::limits::decode_image(&bytes).map_err(Into::into)
+                                })
+                        {
                             CloseClipboard();
                             let rgba = dyn_img.to_rgba8();
                             let (width, height) = rgba.dimensions();
@@ -1499,6 +1531,28 @@ pub(super) fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
+                            if let Some(job) = &msg.outgoing_job {
+                                if msg.delivery == crate::message_model::DeliveryState::Failed {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(
+                                            Color32::from_rgb(220, 60, 60),
+                                            "⚠ Gửi lỗi",
+                                        )
+                                        .on_hover_text(&job.error);
+                                        if ui.button("Gửi lại").clicked() {
+                                            card_action = Some(BubbleAction::RetrySend);
+                                        }
+                                    });
+                                    ui.label(RichText::new(&job.error).size(11.0));
+                                } else if msg.delivery
+                                    == crate::message_model::DeliveryState::Pending
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Đang gửi / chờ tải lên…");
+                                    });
+                                }
+                            }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
                                 ui.add_space(3.5);
                                 let ts_txt = if is_latest_outgoing {
@@ -1646,6 +1700,28 @@ pub(super) fn render_chat_bubble(
                                 );
                             }
                             render_reactions(ui, msg, pal, emoji_textures);
+                            if let Some(job) = &msg.outgoing_job {
+                                if msg.delivery == crate::message_model::DeliveryState::Failed {
+                                    ui.horizontal(|ui| {
+                                        ui.colored_label(
+                                            Color32::from_rgb(220, 60, 60),
+                                            "⚠ Gửi lỗi",
+                                        )
+                                        .on_hover_text(&job.error);
+                                        if ui.button("Gửi lại").clicked() {
+                                            card_action = Some(BubbleAction::RetrySend);
+                                        }
+                                    });
+                                    ui.label(RichText::new(&job.error).size(11.0));
+                                } else if msg.delivery
+                                    == crate::message_model::DeliveryState::Pending
+                                {
+                                    ui.horizontal(|ui| {
+                                        ui.spinner();
+                                        ui.label("Đang gửi / chờ tải lên…");
+                                    });
+                                }
+                            }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
                                 ui.add_space(3.5);
                                 ui.label(
@@ -1679,6 +1755,7 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    RetrySend,
     DoubleClickReply,
     Reply,
     JumpToQuoted(String),
@@ -1787,7 +1864,16 @@ pub(super) fn bubble_context_menu(
             action = Some(BubbleAction::Reply);
             ui.close_menu();
         }
-        if ui.button("Chuyển tiếp").clicked() {
+        if ui
+            .add_enabled(
+                crate::chat::can_forward_message(msg),
+                egui::Button::new("Chuyển tiếp"),
+            )
+            .on_disabled_hover_text(
+                "Chưa hỗ trợ chuyển tiếp loại tin này; hãy tải và gửi lại tệp gốc",
+            )
+            .clicked()
+        {
             action = Some(BubbleAction::Forward);
             ui.close_menu();
         }

@@ -70,7 +70,19 @@ impl UnreadState {
         })
     }
     pub fn merge_metadata(&mut self, incoming: &Self) -> bool {
-        let before = self.clone();
+        let snapshot = |state: &Self| {
+            (
+                state.last_seen_id.clone(),
+                state.unread_ids.len(),
+                state.mention_ids.len(),
+                state.muted,
+                state.muted_until,
+                state.marked_unread,
+                state.fresh,
+                state.settings_fresh,
+            )
+        };
+        let before = snapshot(self);
         if incoming.fresh {
             if let Some(point) = &incoming.last_seen_id {
                 self.advance_seen(point);
@@ -86,6 +98,7 @@ impl UnreadState {
                 self.muted = incoming.muted;
                 self.muted_until = incoming.muted_until;
                 self.marked_unread = incoming.marked_unread;
+                self.settings_fresh = true;
             }
             self.fresh = true;
         } else if self.last_seen_id.is_none() && incoming.last_seen_id.is_some() {
@@ -100,7 +113,7 @@ impl UnreadState {
                 }
             }
         }
-        *self != before
+        snapshot(self) != before
     }
     pub fn advance_seen(&mut self, point: &str) {
         if numeric_id(point).is_none() {
@@ -124,15 +137,18 @@ impl UnreadState {
             return;
         };
         for message in messages {
-            if !message.is_outgoing
-                && message.kind != crate::message_model::MessageKind::System
-                && message.unread_policy.counts_unread()
-                && compare_ids(&message.id, point).is_some_and(|v| v.is_gt())
+            if message.is_outgoing
+                || message.kind == crate::message_model::MessageKind::System
+                || !message.unread_policy.counts_unread()
             {
+                self.unread_ids.remove(&message.id);
+                self.mention_ids.remove(&message.id);
+            } else if compare_ids(&message.id, point).is_some_and(|v| v.is_gt()) {
                 self.unread_ids.insert(message.id.clone());
             }
         }
     }
+
     pub fn observe_for_account(&mut self, messages: &[ChatMessage], account: &str) {
         self.observe(messages);
         self.observe_mentions(messages, account);
