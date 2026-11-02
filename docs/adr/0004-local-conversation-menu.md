@@ -1,6 +1,6 @@
 # ADR-0004: Account-scoped local conversation menu
 
-- **Status:** accepted
+- **Status:** accepted; mute flag superseded by [ADR-0013](0013-upstream-v006-selective-port.md)
 - **Date:** 2026-11-02
 - **Deciders:** maintainer request for conversation menu integration
 

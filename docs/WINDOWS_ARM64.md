@@ -11,6 +11,8 @@ Chọn portable hoặc setup từ [Releases của fork](https://github.com/bqqhu
 - `accounts/<sha256-id>/` chứa lịch sử SQLite và cache riêng cho tài khoản. SQLite chưa mã hóa ở mức ứng dụng.
 - Tắt **Ghi nhớ đăng nhập** xóa phiên đã lưu và chặn ghi phiên mới. Đăng xuất giữ lịch sử trong vùng của tài khoản cũ, không thu hồi phiên trên máy chủ.
 - Mỗi thư mục dữ liệu chỉ cho chạy một instance. `--portable` dùng thư mục `data` cạnh exe; cần quyền ghi. `CTDOZ_DATA_DIR` chỉ định thư mục tuyệt đối khác.
+- `--profile TÊN` dùng thư mục con `profiles/<tên>` (session, lịch sử, cài đặt riêng), nên có thể mở nhiều tài khoản cùng lúc, mỗi tài khoản một hồ sơ. Tên chỉ gồm chữ, số, `-`, `_`, tối đa 32 ký tự; không phân biệt hoa thường.
+- `--proxy URL` hoặc biến `CTDOZ_PROXY` cho tin nhắn và WebSocket đi qua proxy `http://`, `socks5://` hoặc `socks5h://` (ví dụ `--proxy socks5h://user:mk@127.0.0.1:1080`). Proxy không được lưu xuống đĩa; cuộc gọi thoại/video (UDP) không đi qua proxy.
 - Session JSON và lịch sử cũ không có thông tin chủ sở hữu không được tự nhập. Giữ chúng riêng và đăng nhập lại bằng QR.
 
 Nút X và Alt+F4 ẩn cửa sổ xuống tray. Click trái hoặc phải icon để mở menu **Mở Apps** / **Thoát Apps**. Chọn Thoát Apps hoặc Ctrl+Q để tắt hẳn. Nếu không tạo được tray, nút X sẽ thoát để tránh tiến trình không thể mở lại. Khung cửa sổ Windows hỗ trợ kéo, resize và Snap.

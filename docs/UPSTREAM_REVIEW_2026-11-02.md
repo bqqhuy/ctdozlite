@@ -104,3 +104,16 @@ Không có bằng chứng trong 13 commit mới này cho một luồng đồng b
 ## Tích hợp tiếp #61 và #60
 
 Đã port có chọn lọc `c65e82e` (định danh/đối soát tin) và `7529696` (điều hướng trích dẫn đã nạp), giữ kiến trúc ARM64 của fork. Bổ sung đối soát SQLite trong transaction, kiểm thử hydrate/rollback và alias self của lịch sử điện thoại. Những dòng “chưa port” ở phần snapshot trên là trạng thái trước đợt tích hợp này. Phạm vi và giới hạn cuối cùng nằm trong [ADR-0006](adr/0006-exact-message-identity-and-quote-navigation.md); không có nghĩa đã merge toàn bộ v0.0.5.
+
+## Rà soát và tiếp nhận v0.0.6
+
+Upstream HEAD kiểm tra: **ed550f6** (v0.0.6), sau mốc `56ea374`. Commit iOS (`478f34c`…`8e16464`) đã bị upstream xóa ở `d5833c2`, không có gì để nhập.
+
+- `9328cc9` #67 đồng bộ tắt thông báo: **đã port** (getmute/setmute/control `act_type: "mute"`), fail-closed khi đổi, lần đầu đẩy các hội thoại đã tắt cục bộ lên máy chủ.
+- `9328cc9` #64 proxy và nhiều hồ sơ: **đã port** với khác biệt: proxy không lưu vào `session.json`, có hỗ trợ socks thật (bật feature `socks`) và WebSocket cũng đi qua proxy; tên hồ sơ sai bị từ chối thay vì tự lọc ký tự.
+- `9328cc9` #68 đồng bộ điện thoại: **không nhập**; chỉ gửi tín hiệu rồi đọc lại tin gần đây, fork đã có luồng phê duyệt trên điện thoại (ADR-0005/0007/0010).
+- `ed550f6` RTF: **đã port phần hiển thị tin nhận**, giữ nguyên nội dung chữ; không port tự chuyển Markdown khi gửi (upstream biến `2*3*4` thành "234" có chữ nghiêng).
+- `ed550f6` trang Danh bạ, ô soạn 5 dòng: **đã port** bản rút gọn, bỏ hai tab lời mời luôn trống.
+- `ed550f6` sticker "Mèo Ami Bụng Bự", giao diện hẹn giờ mới: **không nhập** (bản quyền ảnh chưa rõ; fork đã có bộ hẹn giờ).
+
+Chi tiết quyết định: [ADR-0013](adr/0013-upstream-v006-selective-port.md).

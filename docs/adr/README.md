@@ -52,3 +52,4 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0010 — Minimal-request phone sync](0010-minimal-request-phone-sync.md)
 - [0011 — Visible media priority](0011-visible-media-priority.md)
 - [0012 — Account tools and schema 6](0012-account-tools.md)
+- [0013 — Selective upstream v0.0.6 port](0013-upstream-v006-selective-port.md)
