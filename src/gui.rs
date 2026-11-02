@@ -55,6 +55,10 @@ pub enum GuiEvent {
         running: bool,
         message: String,
     },
+    PhoneSyncStatus {
+        running: bool,
+        message: String,
+    },
     HistorySyncStatus {
         running: bool,
         message: String,
@@ -418,6 +422,8 @@ pub struct ZaloGuiApp {
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
     checking_friend_status: HashSet<String>,
     allow_quit: bool,
+    phone_sync_running: bool,
+    phone_sync_status: String,
     history_sync_running: bool,
     history_sync_status: String,
     refresh_sync_running: bool,
@@ -636,6 +642,8 @@ impl ZaloGuiApp {
             friend_status_map: HashMap::new(),
             checking_friend_status: HashSet::new(),
             allow_quit: false,
+            phone_sync_running: false,
+            phone_sync_status: String::new(),
             history_sync_running: false,
             history_sync_status: String::new(),
             refresh_sync_running: false,
@@ -670,11 +678,19 @@ impl ZaloGuiApp {
             });
             app.is_logged_in = true;
             app.user_name = "ARM64 UI fixture".into();
-            app.settings_modal_open = !args.iter().any(|a| a == "--ui-smoke-workspace-sync");
+            app.settings_modal_open = !args
+                .iter()
+                .any(|a| a == "--ui-smoke-workspace-sync" || a == "--ui-smoke-phone-sync");
             if !app.settings_modal_open {
                 app.history_sync_running = true;
                 app.history_sync_status =
                     "Lịch sử 2/4: Nhóm thử nghiệm — trang 3, 125 tin mới".into();
+                if args.iter().any(|a| a == "--ui-smoke-phone-sync") {
+                    app.history_sync_running = false;
+                    app.phone_sync_running = true;
+                    app.phone_sync_status =
+                        "Chờ xác nhận trên điện thoại: mở Zalo và chọn Đồng bộ ngay…".into();
+                }
                 let now = crate::login::unix_now() * 1000;
                 app.threads = [
                     (
@@ -1509,13 +1525,28 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ConversationRefreshStatus { running, message } => {
+                    if !self.phone_sync_running {
+                        self.phone_sync_status.clear();
+                    }
                     self.refresh_sync_running = running;
                     self.refresh_sync_status = message.clone();
                     self.status_msg = message;
                     self.last_sync_was_history = false;
                     self.sync_notice_dismissed = false;
                 }
+                GuiEvent::PhoneSyncStatus { running, message } => {
+                    if !running || !self.phone_sync_running {
+                        self.sync_cancel_requested = false;
+                    }
+                    self.phone_sync_running = running;
+                    self.phone_sync_status = message.clone();
+                    self.status_msg = message;
+                    self.sync_notice_dismissed = false;
+                }
                 GuiEvent::HistorySyncStatus { running, message } => {
+                    if !self.phone_sync_running {
+                        self.phone_sync_status.clear();
+                    }
                     if !running || !self.history_sync_running {
                         self.sync_cancel_requested = false;
                     }

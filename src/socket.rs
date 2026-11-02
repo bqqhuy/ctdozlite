@@ -43,6 +43,10 @@ pub const CMD_PING_ACTIVE: u16 = 4;
 pub const SUB_KEEP_CONNECTION: u8 = 1;
 pub const SUB_KEEP_ACTIVE: u8 = 2;
 
+/// Phone-approved transfer request and disposal (see re-notes/11_phone_sync.md).
+pub const CMD_SYNC_REQUEST: u16 = 590;
+/// Release the matching phone transfer session.
+pub const CMD_SYNC_DISPOSE: u16 = 591;
 pub const CMD_CTRL_PUSH_CTRL: u16 = 601;
 pub const CMD_CTRL_ACTION: u16 = 602;
 pub const CMD_CTRL_PULL_CTRL: u16 = 603;
@@ -358,34 +362,120 @@ fn pull_next_frame(cmd: u16, sub_cmd: u8, req_id: &str, last_id: Value, pre_ids:
 ///
 /// Reconnects forever with capped backoff. Dropping the returned receiver stops the task.
 pub fn spawn(sess: Session) -> mpsc::Receiver<WsEvent> {
+    spawn_with_sync(sess).0
+}
+
+struct SyncWrite {
+    epoch: u64,
+    command: u16,
+    body: Value,
+    ack: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Phone transfer shares the live-chat socket, but cannot replay across reconnects.
+#[derive(Clone)]
+pub(crate) struct SyncTransport {
+    commands: mpsc::Sender<SyncWrite>,
+    ready: tokio::sync::watch::Receiver<Option<u64>>,
+    controls: tokio::sync::broadcast::Sender<WsEvent>,
+}
+impl SyncTransport {
+    pub(crate) fn epoch(&self) -> Option<u64> {
+        *self.ready.borrow()
+    }
+    pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WsEvent> {
+        self.controls.subscribe()
+    }
+    pub(crate) async fn request(&self, epoch: u64, body: Value) -> Result<()> {
+        self.write(epoch, CMD_SYNC_REQUEST, body).await
+    }
+    pub(crate) async fn dispose(&self, epoch: u64, id: &str) -> Result<()> {
+        self.write(
+            epoch,
+            CMD_SYNC_DISPOSE,
+            json!({"data":{"syncId":id,"toDevice":0,"reason":1},"reqId":"req_dispose"}),
+        )
+        .await
+    }
+    async fn write(&self, epoch: u64, command: u16, body: Value) -> Result<()> {
+        anyhow::ensure!(self.epoch() == Some(epoch), "Phone sync connection changed");
+        let (ack, result) = tokio::sync::oneshot::channel();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            self.commands
+                .send(SyncWrite {
+                    epoch,
+                    command,
+                    body,
+                    ack,
+                })
+                .await?;
+            anyhow::ensure!(result.await?, "Phone sync frame was not sent");
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTransport) {
     let (tx, rx) = mpsc::channel(32);
+    let (commands, mut writes) = mpsc::channel(8);
+    let (ready_tx, ready) = tokio::sync::watch::channel(None);
+    let (controls, _) = tokio::sync::broadcast::channel(256);
+    let transport = SyncTransport {
+        commands,
+        ready,
+        controls: controls.clone(),
+    };
     tokio::spawn(async move {
         let mut backoff = 2u64;
         let mut endpoint_idx = 0usize;
+        let mut epoch = 0;
         loop {
             if !sess.is_active() || tx.is_closed() {
                 break;
             }
-            match run_once(&sess, &tx, endpoint_idx).await {
+            epoch += 1;
+            match run_once(
+                &sess,
+                &tx,
+                endpoint_idx,
+                &mut writes,
+                &ready_tx,
+                &controls,
+                epoch,
+            )
+            .await
+            {
                 Ok(reason) => trace(format!("closed: {reason}")),
                 Err(e) => trace(format!("error: {e:#}")),
+            }
+            ready_tx.send_replace(None);
+            while let Ok(write) = writes.try_recv() {
+                let _ = write.ack.send(false);
             }
             if tx.is_closed() {
                 break;
             }
-            // `3002 NOT_FOUND_WORKER` means this shard does not host the session; rotate.
             endpoint_idx = endpoint_idx.wrapping_add(1);
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
+            tokio::select! {
+                _=tx.closed()=>break,
+                _=tokio::time::sleep(Duration::from_secs(backoff))=>{}
+            }
             backoff = (backoff * 2).min(30);
         }
     });
-    rx
+    (rx, transport)
 }
 
 async fn run_once(
     sess: &Session,
     tx: &mpsc::Sender<WsEvent>,
     endpoint_idx: usize,
+    writes: &mut mpsc::Receiver<SyncWrite>,
+    ready: &tokio::sync::watch::Sender<Option<u64>>,
+    controls: &tokio::sync::broadcast::Sender<WsEvent>,
+    epoch: u64,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {url}"));
@@ -434,6 +524,7 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
+    let mut writes_open = true;
     loop {
         tokio::select! {
             _ = tx.closed() => return Ok("receiver closed".into()),
@@ -445,6 +536,19 @@ async fn run_once(
                     ws.send(Message::Binary(f)).await?;
                     trace("-> ping");
                 }
+            }
+            outgoing = writes.recv(), if writes_open => {
+                if let Some(outgoing)=outgoing {
+                    if !authed || outgoing.epoch!=epoch || outgoing.ack.is_closed() {
+                        let _=outgoing.ack.send(false);
+                        continue;
+                    }
+                    let frame=encode_frame(outgoing.command,0,1,Some(&outgoing.body));
+                    let sent=tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(frame))).await;
+                    let success=matches!(sent,Ok(Ok(())));
+                    let _=outgoing.ack.send(success);
+                    anyhow::ensure!(success,"Phone sync socket write failed");
+                } else { writes_open=false; }
             }
             incoming = ws.next() => {
                 let Some(incoming) = incoming else {
@@ -496,6 +600,7 @@ async fn run_once(
                         return Err(anyhow!("auth rejected: {text}"));
                     }
                     authed = true;
+                    ready.send_replace(Some(epoch));
                     tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() }).await?;
 
                     for (qcmd, qsub) in queues_from_auth(&auth) {
@@ -559,6 +664,10 @@ async fn run_once(
                         .await;
                     trace(format!("-> pull next {qkey} {id}"));
                 }
+                if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE) {
+                    // Broadcast is bounded and never waits for phone decoding or disk writes.
+                    let _=controls.send(WsEvent{cmd,sub_cmd,version,payload:payload.clone()});
+                }
                 tx.send(WsEvent { cmd, sub_cmd, version, payload }).await?;
             }
         }
@@ -568,6 +677,33 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn phone_writes_require_current_epoch_and_acknowledgement() {
+        let (commands, mut writes) = mpsc::channel(8);
+        let (ready_tx, ready) = tokio::sync::watch::channel(Some(4));
+        let (controls, _) = tokio::sync::broadcast::channel(4);
+        let transport = SyncTransport {
+            commands,
+            ready,
+            controls,
+        };
+        assert!(transport.request(3, json!({})).await.is_err());
+        assert!(writes.try_recv().is_err());
+        let copy = transport.clone();
+        let task = tokio::spawn(async move {
+            copy.request(4, json!({"data":{"syncId":"synthetic"}}))
+                .await
+        });
+        let write = writes.recv().await.unwrap();
+        assert_eq!(write.command, CMD_SYNC_REQUEST);
+        assert_eq!(write.epoch, 4);
+        write.ack.send(true).unwrap();
+        assert!(task.await.unwrap().is_ok());
+        ready_tx.send_replace(None);
+        assert!(transport.dispose(4, "synthetic").await.is_err());
+        assert!(writes.try_recv().is_err());
+    }
 
     #[test]
     fn frame_roundtrip() {

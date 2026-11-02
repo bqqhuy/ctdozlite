@@ -45,3 +45,6 @@ pub mod updater;
 mod video_preview;
 
 mod diagnostics;
+
+/// Phone-approved encrypted history transfer.
+pub mod phone_sync;

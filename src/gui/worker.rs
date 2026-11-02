@@ -21,6 +21,9 @@ pub enum WorkerCmd {
         threads: Vec<Thread>,
     },
     CancelHistorySync,
+    /// Explicit phone-approved history transfer; never started by login/refresh.
+    SyncPhoneHistory,
+    CancelPhoneHistory,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
     },
@@ -413,6 +416,10 @@ pub(super) fn spawn_session_worker(
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let phone_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let phone_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (phone_transport_tx, phone_transport_rx) =
+        tokio::sync::watch::channel::<Option<crate::socket::SyncTransport>>(None);
     let session = std::sync::Arc::new(tokio::sync::Mutex::new(session));
     let poll_state =
         std::sync::Arc::new(tokio::sync::Mutex::new(crate::chat::PollState::default()));
@@ -476,7 +483,9 @@ pub(super) fn spawn_session_worker(
                                 let cur_sek = s_snap.zpw_sek.clone().unwrap_or_default();
                                 if !cur_sek.is_empty() && (ws_rx.is_none() || ws_sek != cur_sek) {
                                     ws_sek = cur_sek;
-                                    ws_rx = Some(crate::socket::spawn(s_snap.clone()));
+                                    let (events,transport)=crate::socket::spawn_with_sync(s_snap.clone());
+                                    ws_rx = Some(events);
+                                    phone_transport_tx.send_replace(Some(transport));
                                 }
                                 if let Some(rx) = ws_rx.as_mut() {
                                     match tokio::time::timeout(
@@ -845,6 +854,28 @@ pub(super) fn spawn_session_worker(
                                 }
                             });
                             current_qr_task = Some(handle);
+                        }
+                        WorkerCmd::CancelPhoneHistory => {
+                            phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
+                        }
+                        WorkerCmd::SyncPhoneHistory => {
+                            if phone_sync_running.swap(true,std::sync::atomic::Ordering::SeqCst) {continue;}
+                            phone_sync_cancel.store(false,std::sync::atomic::Ordering::Relaxed);
+                            let cancel=phone_sync_cancel.clone();let running=phone_sync_running.clone();
+                            let transport=phone_transport_rx.borrow().clone();
+                            let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Đang chuẩn bị đồng bộ từ điện thoại…".into()});
+                            ctx.request_repaint();
+                            tokio::spawn(async move {
+                                let _guard=PollGuard(running);
+                                let result=if let Some(transport)=transport {
+                                    crate::phone_sync::download(&account,transport,cancel,
+                                        |message|{let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,message});ctx.request_repaint();},
+                                        |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
+                                }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};
+                                let message=result.unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
+                                let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,message});ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::CancelHistorySync => {
                             history_sync_cancel.store(true, std::sync::atomic::Ordering::Relaxed);

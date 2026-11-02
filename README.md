@@ -67,10 +67,10 @@ Bản mã nguồn tại [`7c1a416`](https://github.com/bqqhuy/ctdozlite/commit/7
 Những điểm cần biết trước khi dùng:
 
 - **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
-- Đồng bộ lịch sử cũ từ điện thoại như client chính thức chưa được triển khai trong fork; đây là phần giao thức cần nghiên cứu thêm. Không thể bảo đảm khôi phục dữ liệu server không còn cung cấp.
+- Đã bổ sung **Settings → Đồng bộ → Đồng bộ từ điện thoại**: cần mở Zalo di động và xác nhận. Tiến độ và nút dừng hiện ở cửa sổ chính. Đây là luồng mới đang chờ kiểm chứng đầu-cuối với điện thoại thật; chỉ lấy được dữ liệu điện thoại còn giữ, không bảo đảm media cũ còn hạn. Xem [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
 - Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.
 - Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed, scheduler hoặc REST/MCP của upstream trong bản tích hợp này.
-- Database hiện dùng **schema 3**. Bản cũ chỉ hỗ trợ schema 2 sẽ từ chối mở; xem hướng dẫn rollback trong [ADR-0004](docs/adr/0004-local-conversation-menu.md).
+- Database hiện dùng **schema 4**. Bản cũ hỗ trợ schema 2/3 sẽ từ chối mở; xem rollback trong [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
 
 Đây là tích hợp có chọn lọc từ upstream, chưa phải bản sao đầy đủ mọi tính năng của upstream mới nhất. Chi tiết có trong [báo cáo đối chiếu commit](docs/UPSTREAM_REVIEW_2026-11-02.md) và [audit Windows ARM64](docs/ARM64_IMPLEMENTATION.md).
 

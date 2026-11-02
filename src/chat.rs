@@ -485,6 +485,8 @@ pub struct Thread {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SidebarPresentation {
+    /// Opaque sync partition identity; never used as an outbound recipient ID.
+    pub global_id: String,
     pub members: Vec<SidebarMember>,
     /// Server totalMember only; never inferred from message senders or avatar samples.
     pub member_count: Option<u64>,
@@ -625,6 +627,9 @@ impl Thread {
 
     /// Parse only group roster metadata observed in the original getmg-v2 consumer.
     pub fn apply_group_sidebar_metadata(&mut self, info: &Value) {
+        if let Some(id) = pick_str(info, &["globalId"]) {
+            self.presentation.global_id = id;
+        }
         if let Some(count) = info
             .get("totalMember")
             .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
@@ -807,6 +812,9 @@ pub fn merge_thread_into(
     {
         target.avatar = incoming.avatar;
     }
+    if !incoming.presentation.global_id.is_empty() {
+        target.presentation.global_id = incoming.presentation.global_id.clone();
+    }
     target.is_group = target.is_group || incoming.is_group;
 
     // Indexed lookup from upstream's large-history optimization, retaining strict
@@ -833,7 +841,8 @@ pub fn merge_thread_into(
             .filter(|_| !msg.id.is_empty())
             .copied()
             .or_else(|| {
-                if !msg.is_outgoing {
+                if !msg.is_outgoing || msg.history_source.is_some() {
+                    // A historical phone row cannot acknowledge a pending live send by text/time.
                     return None;
                 }
                 by_text
@@ -1149,7 +1158,10 @@ fn parse_thread(v: &Value) -> Option<Thread> {
         .unwrap_or_default();
 
     Some(Thread {
-        presentation: Default::default(),
+        presentation: SidebarPresentation {
+            global_id: pick_str(v, &["globalId"]).unwrap_or_default(),
+            ..Default::default()
+        },
         unread: Default::default(),
         id,
         name,
@@ -3435,6 +3447,45 @@ pub async fn fetch_group_profiles(
     Ok((profiles, removed))
 }
 
+/// Resolve opaque phone-sync user identities through the profile service.
+/// # Errors
+/// Returns transport, protocol or authentication failures. Never accepts names as identities.
+pub(crate) async fn resolve_sync_ids(
+    s: &Session,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    anyhow::ensure!(
+        s.is_active() && s.login.is_some() && ids.len() <= 50,
+        "Invalid sync identity request"
+    );
+    if ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let params =
+        s.encoded_params(&json!({"globalUids":serde_json::to_string(ids)?,"imei":s.imei}))?;
+    let url = format!(
+        "{}/api/gid/decrypt?{}&params={params}",
+        s.domains.profile,
+        s.common_params()
+    );
+    let data = response_data(
+        s.maybe_decrypt(s.get(&url).await?, s.session_key_bytes())
+            .await,
+    )?;
+    let map = data
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Invalid sync identity envelope"))?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| {
+            let uid = pick_str(&json!({"id":map.get(id)?}), &["id"])?;
+            // A routing ID must be a real numeric server identity, never an opaque partition.
+            (!uid.is_empty() && uid.bytes().all(|c| c.is_ascii_digit()) && uid != "0")
+                .then(|| (id.clone(), uid))
+        })
+        .collect())
+}
+
 /// Resolve names for known group IDs without reloading all memberships.
 async fn resolve_group_metadata(
     s: &Session,
@@ -3462,6 +3513,7 @@ async fn resolve_group_metadata(
                     for group in chunk {
                         if let Some(raw) = info_map.get(&group.id) {
                             if let Ok(info) = response_data(raw.clone()) {
+                                group.apply_group_sidebar_metadata(&info);
                                 if let Some(name) =
                                     pick_str(&info, &["name", "groupName", "displayName"])
                                         .filter(|n| !n.trim().is_empty())
@@ -4119,7 +4171,7 @@ fn extract_link_info(v: &Value) -> LinkInfo {
         _ => (None, None, None, None, None),
     }
 }
-fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
+pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
     let raw_content_val = it

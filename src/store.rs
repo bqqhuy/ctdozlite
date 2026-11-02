@@ -62,7 +62,7 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 3, "Database requires a newer application version");
+        anyhow::ensure!(schema <= 4, "Database requires a newer application version");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -121,6 +121,18 @@ impl MessageStore {
                 thread_id TEXT PRIMARY KEY, is_pinned INTEGER NOT NULL DEFAULT 0,
                 is_muted INTEGER NOT NULL DEFAULT 0, is_hidden INTEGER NOT NULL DEFAULT 0);
                 PRAGMA user_version=3;",
+            )?;
+            migration.commit()?;
+        }
+        if schema < 4 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch(
+                "CREATE TABLE IF NOT EXISTS phone_unmapped (
+                partition_id TEXT NOT NULL, msg_id TEXT NOT NULL, raw_json TEXT NOT NULL,
+                PRIMARY KEY(partition_id,msg_id));
+                CREATE INDEX IF NOT EXISTS idx_message_client ON messages(thread_id,
+                    CASE WHEN json_valid(raw_json) THEN json_extract(raw_json,'$.message_state.client_message_id') END);
+                PRAGMA user_version=4;",
             )?;
             migration.commit()?;
         }
@@ -1241,7 +1253,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                3
+                4
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");

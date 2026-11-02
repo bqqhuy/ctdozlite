@@ -21,7 +21,7 @@ Nút X và Alt+F4 ẩn cửa sổ xuống tray. Click trái hoặc phải icon �
 
 Sau đăng nhập, ứng dụng tự tải hội thoại, tên nhóm, tin gần đây và lịch sử nhóm/Cloud mà máy chủ cho phép. Trong Settings → Đồng bộ, chọn **Tải / tiếp tục lịch sử** để tải nhóm và Cloud theo trang vào SQLite. Có tiến độ và nút dừng. Mỗi lượt tối đa 200 trang/hội thoại, 50 tin/trang, cách nhau ít nhất 300 ms. Bấm tiếp tục để tải thêm. Vị trí được lưu sau khi tin nhắn đã ghi vào database, nên đóng ứng dụng giữa chừng không làm mất dữ liệu đã ghi.
 
-Chỉ tải được tin máy chủ còn cung cấp. API tải toàn bộ lịch sử chat cá nhân và đồng bộ trực tiếp từ điện thoại chưa được xác minh; các chat này dùng lịch sử đã nhận trên máy. Server trả thiếu con trỏ hoặc lặp trang sẽ được báo lỗi và dừng, không báo thành công giả.
+Tải nhóm/Cloud chỉ lấy được tin máy chủ còn cung cấp. Muốn yêu cầu lịch sử từ điện thoại, chọn **Đồng bộ từ điện thoại**, mở Zalo di động và xác nhận **Đồng bộ ngay**. Tiến độ và nút dừng hiện tại cửa sổ chính. Luồng này chưa có kiểm chứng đầu-cuối với điện thoại thật; dữ liệu đã lưu được giữ khi dừng hoặc mất mạng. Chỉ khôi phục tin điện thoại còn giữ; media phụ thuộc liên kết còn hạn. Lần đầu cần tải bộ giải mã chính thức có SHA-256 cố định; module không được đóng gói trong installer. Nhóm chưa nhận diện đúng ID được giữ riêng, không gán nhầm thành hội thoại gửi tin. Xem ADR-0005.
 
 Tên/ảnh đại diện không được dùng để gộp hai ID khác nhau. Bản cũ đã trộn lịch sử thì không có đủ bằng chứng để tự tách lại an toàn; bản mới ngăn phát sinh thêm. Không xóa database để chữa lỗi này.
 

@@ -31,7 +31,39 @@ function Get-Dumpbin {
 }
 $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
-if (-not $SkipTests) { Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target) }
+if (-not $SkipTests) {
+    Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target)
+    # Public codec only; no account/session/phone connection is used by this test.
+    $codecPath = Join-Path ([IO.Path]::GetTempPath()) ('ctdoz-codec-' + [guid]::NewGuid().ToString() + '.wasm')
+    $previousCodec = $env:CTDOZ_CODEC_TEST_PATH
+    try {
+        $source = Get-Content src/endpoints.rs -Raw
+        $codecUrl = [regex]::Match($source, 'PHONE_SYNC_CODEC: &str =\s*"(https://[^" ]+)"').Groups[1].Value
+        if (-not $codecUrl) { throw 'Pinned codec URL missing' }
+        Invoke-WebRequest -Uri $codecUrl -OutFile $codecPath -TimeoutSec 60
+        $codecBytes = [IO.File]::ReadAllBytes($codecPath)
+        if ($codecBytes.Length -ge 2 -and $codecBytes[0] -eq 0x1f -and $codecBytes[1] -eq 0x8b) {
+            $inputStream = [IO.MemoryStream]::new($codecBytes)
+            $gzip = [IO.Compression.GZipStream]::new($inputStream, [IO.Compression.CompressionMode]::Decompress)
+            $output = [IO.MemoryStream]::new()
+            try {
+                $buffer = [byte[]]::new(8192)
+                while (($read = $gzip.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    if ($output.Length + $read -gt 1048576) { throw 'Codec exceeds size limit' }
+                    $output.Write($buffer, 0, $read)
+                }
+                [IO.File]::WriteAllBytes($codecPath, $output.ToArray())
+            } finally { $gzip.Dispose(); $inputStream.Dispose(); $output.Dispose() }
+        }
+        $expected = [regex]::Match((Get-Content src/phone_sync/assets.rs -Raw), 'CODEC_SHA256: &str =\s*"([a-f0-9]{64})"').Groups[1].Value
+        if (-not $expected -or (Get-FileHash -Algorithm SHA256 $codecPath).Hash.ToLowerInvariant() -ne $expected) { throw 'Official codec hash mismatch' }
+        $env:CTDOZ_CODEC_TEST_PATH = $codecPath
+        Invoke-Checked cargo @('test', '--locked', '--lib', '--target', $target, 'phone_sync::codec', '--', '--ignored')
+    } finally {
+        $env:CTDOZ_CODEC_TEST_PATH = $previousCodec
+        Remove-Item $codecPath -Force -ErrorAction SilentlyContinue
+    }
+}
 Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'ctdozlite', '--target', $target)
 $binary = (Resolve-Path "target\$target\release\ctdozlite.exe").Path
 Assert-Arm64 $binary
@@ -95,7 +127,8 @@ try {
         @{ Size='1280x900'; Scale='2'; Tab='sync' },
         @{ Size='800x600'; Scale='1'; Tab='general'; Tray=$true },
         @{ Size='480x360'; Scale='1'; Tab='workspace-sync'; WorkspaceSync=$true },
-        @{ Size='1020x700'; Scale='1.5'; Tab='workspace-sync'; WorkspaceSync=$true }
+        @{ Size='1020x700'; Scale='1.5'; Tab='workspace-sync'; WorkspaceSync=$true },
+        @{ Size='480x360'; Scale='1.5'; Tab='phone-sync'; PhoneSync=$true }
     )) {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
@@ -113,6 +146,7 @@ try {
         }
         if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
         if ($case.ContainsKey('WorkspaceSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-workspace-sync') }
+        if ($case.ContainsKey('PhoneSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-phone-sync') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }
             $outTask = $process.StandardOutput.ReadToEndAsync()

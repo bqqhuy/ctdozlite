@@ -35,6 +35,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 rusqlite = { version = "0.32", features = ["bundled"] }
 cpal = "0.15"
 opus = "0.3"
+wasmi = "0.40"
+zstd = "0.14.3"
+zeroize = "1"
 
 # --- Windows ARM64 tuning -------------------------------------------------
 # Windows on ARM (Snapdragon) has no guaranteed native OpenGL driver: older

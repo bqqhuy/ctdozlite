@@ -1,0 +1,7 @@
+//! Phone-approved history transfer over the existing authenticated socket.
+mod assets;
+pub mod codec;
+mod import;
+mod transfer;
+mod wire;
+pub(crate) use transfer::download;

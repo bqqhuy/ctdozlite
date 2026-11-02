@@ -19,6 +19,8 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn reset_sync_status(&mut self) {
+        self.phone_sync_running = false;
+        self.phone_sync_status.clear();
         self.history_sync_running = false;
         self.history_sync_status.clear();
         self.refresh_sync_running = false;
@@ -29,7 +31,13 @@ impl ZaloGuiApp {
     }
 
     fn sync_status_message(&self) -> &str {
-        if self.history_sync_running {
+        if self.phone_sync_running
+            || (!self.phone_sync_status.is_empty()
+                && !self.history_sync_running
+                && !self.refresh_sync_running)
+        {
+            &self.phone_sync_status
+        } else if self.history_sync_running {
             &self.history_sync_status
         } else if self.refresh_sync_running || !self.last_sync_was_history {
             &self.refresh_sync_status
@@ -39,7 +47,8 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn render_sync_status_bar(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
-        let running = self.history_sync_running || self.refresh_sync_running;
+        let running =
+            self.phone_sync_running || self.history_sync_running || self.refresh_sync_running;
         if !self.is_logged_in
             || (!running && (self.sync_notice_dismissed || self.sync_status_message().is_empty()))
         {
@@ -57,8 +66,8 @@ impl ZaloGuiApp {
                     if running {
                         ui.spinner();
                     }
-                    ui.strong("Đồng bộ từ máy chủ");
-                    if self.history_sync_running
+                    ui.strong(if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {"Đồng bộ từ điện thoại"}else{"Đồng bộ từ máy chủ"});
+                    if (self.phone_sync_running || self.history_sync_running)
                         && ui
                             .add_enabled(
                                 !self.sync_cancel_requested,
@@ -71,7 +80,7 @@ impl ZaloGuiApp {
                             .clicked()
                     {
                         if let Some(tx) = WORKER_TX.get() {
-                            if tx.send(WorkerCmd::CancelHistorySync).is_ok() {
+                            if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::CancelHistorySync}).is_ok() {
                                 self.sync_cancel_requested = true;
                             }
                         }
@@ -92,7 +101,7 @@ impl ZaloGuiApp {
                 )
                 .on_hover_text(self.sync_status_message());
                 ui.label(
-                    RichText::new("Đồng bộ lịch sử từ điện thoại chưa được hỗ trợ trong bản này.")
+                    RichText::new("Đồng bộ điện thoại cần xác nhận trên Zalo di động; chỉ lấy dữ liệu điện thoại còn giữ.")
                         .size(11.5)
                         .color(pal.text_muted),
                 );
@@ -3421,6 +3430,23 @@ mod sync_and_order_tests {
             avatar: None,
             unread: Default::default(),
         }
+    }
+    #[test]
+    fn phone_progress_is_visible_and_resets_with_account() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (mut app, ctx) = app_and_context();
+        app.event_rx = rx;
+        tx.send(GuiEvent::PhoneSyncStatus {
+            running: true,
+            message: "Chờ xác nhận trên điện thoại…".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.phone_sync_running);
+        assert_eq!(app.sync_status_message(), "Chờ xác nhận trên điện thoại…");
+        app.reset_sync_status();
+        assert!(!app.phone_sync_running);
+        assert!(app.phone_sync_status.is_empty());
     }
     #[test]
     fn latest_group_or_direct_sorts_first_even_with_evicted_or_out_of_order_history() {

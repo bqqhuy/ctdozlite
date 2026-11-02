@@ -957,7 +957,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Lịch sử nhóm và Cloud được tải theo trang vào SQLite. Đồng bộ lịch sử từ điện thoại chưa được triển khai; chat cá nhân hiện chỉ có dữ liệu đã nhận trên máy này.").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Đồng bộ từ điện thoại yêu cầu xác nhận trong Zalo di động. Lịch sử được lưu vào SQLite theo tài khoản; chỉ khôi phục dữ liệu điện thoại còn giữ, không bảo đảm tệp đính kèm cũ còn hạn.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
@@ -978,6 +978,17 @@ impl ZaloGuiApp {
                                                             }
                                                         }
                                                         ui.label(&self.history_sync_status);
+                                                        ui.separator();
+                                                        if ui.button(if self.phone_sync_running {"Dừng đồng bộ điện thoại"}else{"Đồng bộ từ điện thoại"}).clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {
+                                                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::SyncPhoneHistory}).is_ok() {
+                                                                    if self.phone_sync_running {self.sync_cancel_requested=true;}
+                                                                    else {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị đồng bộ điện thoại…".into();self.sync_notice_dismissed=false;}
+                                                                }
+                                                            }
+                                                        }
+                                                        ui.label(&self.phone_sync_status);
+                                                        ui.label("Mở Zalo trên điện thoại, chọn Đồng bộ ngay khi được hỏi. Có thể dừng và chạy lại; các tin đã lưu không bị mất.");
 
                                                     });
                                                 });

@@ -1,3 +1,5 @@
+> Historical pre-implementation scope note. Superseded by [11_phone_sync.md](11_phone_sync.md) and ADR-0005 for the new phone-approved implementation; real-phone validation is still pending.
+
 # Phone-history synchronization scope — 2026-11-02
 
 ## Evidence

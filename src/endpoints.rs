@@ -42,3 +42,9 @@ pub fn service(key: &str) -> Option<&'static str> {
         .find(|(k, _)| *k == key)
         .map(|(_, v)| *v)
 }
+
+/// Public, version-pinned Zalo Web crypto module; verified before instantiation.
+pub const PHONE_SYNC_CODEC: &str =
+    "https://chat.zalo.me/libs/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm";
+/// Signed transfer download families, validated again after every redirect.
+pub const SYNC_DOWNLOAD_DOMAINS: &[&str] = &["zalo.me", "zaloapp.com", "zdn.vn"];
