@@ -50,4 +50,10 @@ pub const PHONE_SYNC_CODEC: &str =
 pub const SYNC_DOWNLOAD_DOMAINS: &[&str] = &["zalo.me", "zaloapp.com", "zdn.vn"];
 
 /// CDN families serving direct chat photo files.
-pub const PHOTO_CDN_DOMAINS: &[&str] = &["zdn.vn", "zalo.me", "zaloapp.com"];
+pub const PHOTO_CDN_DOMAINS: &[&str] = &["zdn.vn", "zadn.vn", "zalo.me", "zaloapp.com"];
+
+/// Public media requests carry no authenticated session cookie.
+pub const WEB_ORIGIN: &str = "https://chat.zalo.me/";
+
+/// Zalo PC 26.11.10 playNoti public asset.
+pub const NOTIFICATION_SOUND: &str = "https://stc-chat.zdn.vn/sound/noti.mp3";

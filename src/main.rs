@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
         println!("Proxy: {}", config.redacted());
     }
     zalo_rust::proxy::init(proxy)?;
+    zalo_rust::crash_report::install();
     let _instance = if args.iter().any(|a| a == "--doctor") {
         None
     } else {

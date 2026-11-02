@@ -12,11 +12,11 @@ fn client() -> Result<&'static reqwest::Client> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let client = reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
-        .build()?;
+        .timeout(Duration::from_secs(60));
+    let client = crate::proxy::apply(builder)?.build()?;
     let _ = CLIENT.set(client);
     CLIENT.get().context("Public download client unavailable")
 }
@@ -68,6 +68,35 @@ pub(super) async fn download(url: &str, limit: usize) -> Result<Vec<u8>> {
         return crate::limits::response_bytes(response, limit.min(DOWNLOAD_LIMIT))
             .await
             .map_err(|_| anyhow::anyhow!("Sync download incomplete or exceeds size limit"));
+    }
+    anyhow::bail!("Too many sync redirects")
+}
+
+/// Download encrypted containers to disk without keeping a full response in RAM.
+pub(super) async fn download_to<F:FnMut(u64,Option<u64>)>(raw:&str,path:&Path,session:&crate::session::Session,cancel:&std::sync::atomic::AtomicBool,mut progress:F)->Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut url=reqwest::Url::parse(raw).map_err(|_|anyhow::anyhow!("Invalid sync URL"))?;
+    for _ in 0..4 {
+        ensure!(allowed(&url),"Sync download host rejected");
+        let mut response=client()?.get(url.clone()).send().await.map_err(|_|anyhow::anyhow!("Tải gói đồng bộ bị gián đoạn"))?;
+        if response.status().is_redirection(){
+            let location=response.headers().get(reqwest::header::LOCATION).and_then(|h|h.to_str().ok()).context("Invalid sync redirect")?;
+            url=url.join(location).map_err(|_|anyhow::anyhow!("Invalid sync redirect"))?;continue;
+        }
+        ensure!(response.status().is_success(),"Tải gói đồng bộ lỗi HTTP {}",response.status().as_u16());
+        let expected=response.content_length();ensure!(expected.is_none_or(|n|n<=DOWNLOAD_LIMIT as u64),"Sync container exceeds limit");
+        let mut options=tokio::fs::OpenOptions::new();options.write(true).create_new(true);
+        #[cfg(unix)]options.mode(0o600);
+        let mut file=options.open(path).await?;let mut total=0usize;
+        while let Some(chunk)=tokio::select! {
+                result=response.chunk()=>result.map_err(|_|anyhow::anyhow!("Tải gói đồng bộ chưa hoàn tất"))?,
+                _=async {loop {if cancel.load(std::sync::atomic::Ordering::Acquire) || !session.is_active(){break;}tokio::time::sleep(Duration::from_millis(100)).await;}}=>anyhow::bail!("Đã dừng tải lịch sử")
+            } {
+            ensure!(session.is_active() && !cancel.load(std::sync::atomic::Ordering::Acquire),"Đã dừng tải lịch sử");
+            ensure!(chunk.len()<=DOWNLOAD_LIMIT.saturating_sub(total),"Sync container exceeds limit");
+            file.write_all(&chunk).await?;total+=chunk.len();progress(total as u64,expected);
+        }
+        ensure!(expected.is_none_or(|n|n==total as u64),"Sync container truncated");file.flush().await?;return Ok(());
     }
     anyhow::bail!("Too many sync redirects")
 }

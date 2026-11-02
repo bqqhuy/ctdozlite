@@ -1,6 +1,9 @@
 use super::*;
 
 pub enum WorkerCmd {
+    PrepareNotificationSound,
+    DownloadMedia {url:String,name:String,play:bool},
+    OpenDownloaded {path:std::path::PathBuf,folder:bool},
     Tools {
         owner: String,
         command: super::tools_panel::ToolsCommand,
@@ -121,13 +124,14 @@ pub enum WorkerCmd {
         is_group: bool,
     },
     AnswerCall {
+        call_id: Option<i64>,
         accept: bool,
     },
     SetCallMediaState {
         is_on_mic: bool,
         is_on_cam: bool,
     },
-    EndCall,
+    EndCall { call_id: Option<i64> },
     AddFriend {
         user_id: String,
         user_name: String,
@@ -358,14 +362,10 @@ async fn fetch_gui_image(
         ));
     }
     let bytes = if url.starts_with("https://") || url.starts_with("http://") {
-        let response = s
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await?;
-        anyhow::ensure!(response.status().is_success(), "Image download failed");
-        crate::limits::response_bytes(response, crate::limits::IMAGE_BYTES).await?
+        let _permit = crate::limits::image_network_permit(key.starts_with("ava_") || key.starts_with("stk_")).await?;
+        crate::crash_report::phase("media-network");
+        let response=crate::media_download::response(&url,Duration::from_secs(20)).await?;
+        crate::limits::response_bytes(response,crate::limits::IMAGE_BYTES).await?
     } else {
         let root = root.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -456,7 +456,7 @@ pub(super) fn spawn_session_worker(
                                 let _flight=flight;
                                 let background = key.starts_with("ava_") || key.starts_with("stk_");
                                 let Some(job) = admission.start().await else { return; };
-                                let Ok(_permit) = crate::limits::image_network_permit(background).await else { return; };
+                                let _background = background;
                                 match fetch_gui_image(&s, crate::storage::root(), &key, &url).await {
                                     Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { key,image,permit:job }); },
                                     Err(_) => { let _ = tx.send(GuiEvent::ImageUnavailable { key }); }
@@ -574,7 +574,7 @@ pub(super) fn spawn_session_worker(
                                                     )
                                                     .await;
                                                     persist_received(&s_snap, &ws_threads).await;
-                                                    if publish_live(&live_updates, ws_threads) {
+                                                    if publish_live(&s_snap, &live_updates, ws_threads) {
                                                         let _ = gui_tx_ws.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                                     }
                                                     ctx_ws.request_repaint();
@@ -742,6 +742,47 @@ pub(super) fn spawn_session_worker(
                             }
                         }
                         WorkerCmd::RetryOutgoing { .. } => {},
+                        WorkerCmd::OpenDownloaded{path,folder}=>{
+                            tokio::task::spawn_blocking(move||{if folder{if let Some(parent)=path.parent(){crate::platform::open_folder(parent);}}else{crate::platform::open_file(&path);}});
+                        }
+                        WorkerCmd::DownloadMedia{url,name,play}=>{
+                            static REQUESTS:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(4);
+                            let Ok(request_slot)=REQUESTS.try_acquire() else {let _=gui_tx.send(GuiEvent::StatusUpdate("Đang có nhiều yêu cầu tải; vui lòng chờ hoặc hủy bớt".into()));continue;};
+                            let account=session.lock().await.clone();if !account.is_active() || account.account_key().is_empty(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let _request_slot=request_slot;
+                                let name=crate::media_download::safe_name(&name);
+                                let id=crate::chat::next_client_message_id().to_string();
+                                let owner=account.account_key().to_owned();
+                                let destination=if play {
+                                    let root=account.history_path().with_extension("video-cache");let name=name.clone();let id=id.clone();
+                                    tokio::task::spawn_blocking(move||->anyhow::Result<_>{std::fs::create_dir_all(&root)?;Ok(root.join(format!("{id}-{name}")))}).await.ok().and_then(Result::ok)
+                                }else{
+                                    let name=name.clone();tokio::task::spawn_blocking(move||{
+                                        #[cfg(windows)]{rfd::FileDialog::new().set_title("Lưu tệp về máy").set_file_name(&name).save_file()}
+                                        #[cfg(not(windows))]{let _=name;None}
+                                    }).await.ok().flatten()
+                                };
+                                let Some(path)=destination else{return;};
+                                let cancel=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                                let _=tx.send(GuiEvent::MediaStarted{owner:owner.clone(),id:id.clone(),name:name.clone(),cancel:cancel.clone()});ctx.request_repaint();
+                                let result=crate::media_download::save(&url,&path,cancel.clone(),|bytes,total|{
+                                    if !account.is_active(){cancel.store(true,std::sync::atomic::Ordering::Release);}
+                                    let _=tx.send(GuiEvent::MediaProgress{owner:owner.clone(),id:id.clone(),bytes,total});ctx.request_repaint();
+                                }).await.map(|_|path.clone()).map_err(|e|e.to_string());
+                                let success=result.is_ok();let _=tx.send(GuiEvent::MediaFinished{owner,id,result});ctx.request_repaint();
+                                if success && play && account.is_active(){
+                                    let result=tokio::task::spawn_blocking(move||crate::video_player::play(&path,&name,||account.is_active())).await;
+                                    if !matches!(result,Ok(Ok(()))){let _=tx.send(GuiEvent::StatusUpdate("Không phát được video; kiểm tra codec hoặc thử lưu tệp".into()));ctx.request_repaint();}
+                                }
+                            });
+                        }
+                        WorkerCmd::PrepareNotificationSound=>{
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{
+                                if crate::notification_sound::prepare().await.is_err(){let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được âm báo Zalo; kiểm tra mạng rồi bật lại âm thanh".into()));ctx.request_repaint();}
+                            });
+                        }
                         WorkerCmd::ReadClipboardImage => {
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
@@ -1027,9 +1068,10 @@ pub(super) fn spawn_session_worker(
                             ctx.request_repaint();
                             tokio::spawn(async move {
                                 let _guard=PollGuard(running);
+                                let progress_tx=tx.clone();let progress_ctx=ctx.clone();
                                 let result=if let Some(transport)=transport {
                                     crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,
-                                        |message|{let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,message});ctx.request_repaint();},
+                                        move |message|{let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();},
                                         |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};
                                 let message=result.unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
@@ -1253,7 +1295,7 @@ pub(super) fn spawn_session_worker(
                                             )
                                             .await;
                                             persist_received(&s, &temp_threads).await;
-                                            if publish_live(&live_updates, temp_threads) {
+                                            if publish_live(&s, &live_updates, temp_threads) {
                                                 let _ = gui_tx_clone.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                             }
                                             ctx_clone.request_repaint();
@@ -1635,7 +1677,11 @@ pub(super) fn spawn_session_worker(
                                 };
                                 let s = session_clone.lock().await.clone();
                                 let owner = s.account_key().to_owned();
+                                static ATTACHMENT_QUEUE:std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
+                                let attachment_queue=ATTACHMENT_QUEUE.get_or_init(||std::sync::Arc::new(tokio::sync::Semaphore::new(16)));
                                 for path in paths {
+                                    let Ok(queued)=attachment_queue.clone().acquire_owned().await else{break;};
+                                    if !s.is_active(){break;}
                                     let stamp = crate::outgoing::FileStamp::read(&path).await.ok();
                                     let mut message = crate::outgoing::pending(format!("[Tệp] {}", path.file_name().unwrap_or_default().to_string_lossy()), is_group,
                                         crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp });
@@ -1647,6 +1693,7 @@ pub(super) fn spawn_session_worker(
                                     let owner = owner.clone();
                                     let tx = gui_tx_clone.clone(); let ctx = ctx_clone.clone(); let thread_id = to_id.clone();
                                     tokio::spawn(async move {
+                                        let _queued=queued;
                                         match crate::outgoing::send(&s, &thread_id, &message).await {
                                             Ok(sent) => message = sent,
                                             Err(error) => { message.delivery = crate::message_model::DeliveryState::Failed; if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); } }
@@ -1679,8 +1726,8 @@ pub(super) fn spawn_session_worker(
                             let _ = gui_tx.send(GuiEvent::StatusUpdate(status_msg));
                             egui_ctx.request_repaint();
                         }
-                        WorkerCmd::AnswerCall { accept } => {
-                            call_bridge.answer_call(accept);
+                        WorkerCmd::AnswerCall { accept, call_id } => {
+                            call_bridge.answer_call_for(accept,call_id);
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::SetCallMediaState {
@@ -1690,12 +1737,9 @@ pub(super) fn spawn_session_worker(
                             call_bridge.set_media_state(is_on_mic, is_on_cam);
                             egui_ctx.request_repaint();
                         }
-                        WorkerCmd::EndCall => {
-                            call_bridge.end_call();
-                            let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
-                            let _ = gui_tx.send(GuiEvent::StatusUpdate(
-                                "Đã kết thúc cuộc gọi".into(),
-                            ));
+                        WorkerCmd::EndCall { call_id } => {
+                            call_bridge.end_call_for(call_id);
+
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::CheckFriendStatus { user_id } => {
@@ -2266,17 +2310,25 @@ async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMess
     }
 }
 
-fn publish_live(updates: &crate::live_updates::LiveUpdates, threads: Vec<Thread>) -> bool {
-    let wake = updates.publish(threads);
-    #[cfg(windows)]
-    {
-        let alert = updates.take_notification();
-        if updates.has_unread() {
-            crate::tray::set_unread(true);
-        }
-        if alert {
-            crate::tray::note_background_unread(true);
-        }
+fn publish_live(session:&Session, updates: &crate::live_updates::LiveUpdates, threads: Vec<Thread>) -> bool {
+    if !session.is_active(){return false;}
+    let wake=updates.publish(threads);
+    #[cfg(windows)]{
+        crate::desktop_notice::count(session.account_key(),updates.total());
+        if let Some(mut notice)=updates.take_notice(){notice.owner=session.account_key().to_owned();if !crate::tray::previews_visible(){
+                if let Some(url)=notice.avatar.clone(){
+                    static AVATAR_LOADING:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+                    if !AVATAR_LOADING.swap(true,std::sync::atomic::Ordering::AcqRel){
+                        let account=session.clone();tokio::spawn(async move{
+                            struct Guard;impl Drop for Guard{fn drop(&mut self){AVATAR_LOADING.store(false,std::sync::atomic::Ordering::Release);}}let _guard=Guard;
+                            let key=format!("ava_{}",crate::crypto::md5_hex(&url));
+                            if let Ok(image)=fetch_gui_image(&account,crate::storage::root(),&key,&url).await{if account.is_active(){crate::desktop_notice::cache_avatar(account.account_key().into(),url,image);}}
+                        });
+                    }
+                }
+                crate::desktop_notice::publish(notice,updates.total());
+            }}
+        let _=updates.take_notification();
     }
     wake
 }

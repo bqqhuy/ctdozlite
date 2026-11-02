@@ -4,6 +4,7 @@ pub mod codec;
 mod import;
 mod plan;
 mod policy;
+mod pipeline;
 mod transfer;
 mod wire;
 pub(crate) use transfer::download;

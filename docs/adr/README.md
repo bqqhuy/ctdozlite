@@ -53,3 +53,6 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0011 — Visible media priority](0011-visible-media-priority.md)
 - [0012 — Account tools and schema 6](0012-account-tools.md)
 - [0013 — Selective upstream v0.0.6 port](0013-upstream-v006-selective-port.md)
+
+- [0014 — Conservative pipelined phone sync](0014-conservative-pipelined-phone-sync.md)
+- [0015 — Native notifications and safe media presentation](0015-native-notices-and-media-presentation.md)

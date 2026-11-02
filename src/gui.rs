@@ -28,6 +28,7 @@ mod stickers;
 mod theme;
 mod worker;
 mod tools_panel;
+mod download_panel;
 mod workspace;
 
 use messages::*;
@@ -49,6 +50,9 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    MediaStarted {owner:String,id:String,name:String,cancel:std::sync::Arc<std::sync::atomic::AtomicBool>},
+    MediaProgress {owner:String,id:String,bytes:u64,total:Option<u64>},
+    MediaFinished {owner:String,id:String,result:Result<std::path::PathBuf,String>},
     Tools {
         owner: String,
         result: Result<tools_panel::ToolsResult, String>,
@@ -188,6 +192,7 @@ pub enum GuiEvent {
     },
     SessionExpired(String),
     CallStateChanged(String),
+    CallIdentity { thread_id: String, call_id: i64 },
     IncomingCall {
         call_id: i64,
         caller_id: String,
@@ -207,6 +212,7 @@ pub enum GuiEvent {
 
 #[derive(Debug, Clone)]
 struct ActiveCallOverlay {
+    call_id: Option<i64>,
     partner_id: String,
     partner_name: String,
     is_video: bool,
@@ -225,6 +231,7 @@ struct ImageViewerModal {
     tex_key: String,
     hd_tex_key: Option<String>,
     full_url: String,
+    original_url: String,
     title: String,
     sender: String,
     time: String,
@@ -431,6 +438,9 @@ pub struct ZaloGuiApp {
     texture_budget: crate::media_resources::ResourceLru,
     loading_stickers: HashSet<String>,
     image_retry_at: HashMap<String, std::time::Instant>,
+    downloads: HashMap<String, download_panel::DownloadView>,
+    live_mailbox: Option<std::sync::Arc<crate::live_updates::LiveUpdates>>,
+    sound_prepared: bool,
     emoji_textures: HashMap<String, TextureHandle>,
     app_logo_texture: Option<TextureHandle>,
     sticker_store_packs: Vec<crate::chat::StickerPackInfo>,
@@ -466,6 +476,8 @@ pub struct ZaloGuiApp {
     allow_quit: bool,
     phone_sync_running: bool,
     phone_sync_status: String,
+    phone_download_status: String,
+    phone_import_status: String,
     history_sync_running: bool,
     history_sync_status: String,
     refresh_sync_running: bool,
@@ -578,6 +590,7 @@ impl ZaloGuiApp {
 
         // The launcher already read the account cache and SQLite before the GUI starts.
         let mut threads = initial_threads;
+        for thread in &mut threads{crate::message_view::remove_call_logs(thread);}
         if let Some(li) = session.login.as_ref() {
             if !li.send2me_id.is_empty() {
                 for t in threads.iter_mut() {
@@ -654,6 +667,9 @@ impl ZaloGuiApp {
             ),
             loading_stickers: HashSet::new(),
             image_retry_at: HashMap::new(),
+            downloads: HashMap::new(),
+            live_mailbox: None,
+            sound_prepared: false,
             emoji_textures: load_default_emoji_textures(ctx),
             app_logo_texture: load_app_logo_texture(ctx),
             sticker_store_packs: Vec::new(),
@@ -695,6 +711,8 @@ impl ZaloGuiApp {
             allow_quit: false,
             phone_sync_running: false,
             phone_sync_status: String::new(),
+            phone_download_status: String::new(),
+            phone_import_status: String::new(),
             history_sync_running: false,
             history_sync_status: String::new(),
             refresh_sync_running: false,
@@ -743,6 +761,8 @@ impl ZaloGuiApp {
                     app.phone_sync_running = true;
                     app.phone_sync_status =
                         "Chờ xác nhận trên điện thoại: mở Zalo và chọn Đồng bộ ngay…".into();
+                    app.phone_download_status="Tải về: lượt 1 • gói 2 • 128 / 512 KiB".into();
+                    app.phone_import_status="Nhập CSDL: 125 tin mới • đang nhập gói 1".into();
                 }
                 let now = crate::login::unix_now() * 1000;
                 app.threads = [
@@ -866,7 +886,7 @@ impl ZaloGuiApp {
                 app.selected_thread_index = 0;
                 app.input_message = "Dòng 1\nDòng 2\nDòng 3".into();
             }
-            if args.iter().any(|a| a == "--ui-smoke-photo") {
+            if args.iter().any(|a| a == "--ui-smoke-photo" || a == "--ui-smoke-media") {
                 app.settings_modal_open = false;
                 app.history_sync_running = false;
                 let url = "https://photo-stal-16.zdn.vn/fixture/photo.jpg";
@@ -882,13 +902,20 @@ impl ZaloGuiApp {
                         kind: crate::message_model::MessageKind::Link,
                         text: url.into(),
                         link_url: Some(url.into()),
-                        link_title: Some(url.into()),
+                        link_thumb: Some(url.into()),
+                        link_title: Some("Ảnh thử nghiệm".into()),
                         ts: crate::login::unix_now() * 1000,
                         ..Default::default()
                     }],
                     ..Default::default()
                 }];
                 app.selected_thread_index = 0;
+                if args.iter().any(|a|a=="--ui-smoke-media") {
+                    let t=&mut app.threads[0];t.is_group=true;t.name="Nhóm kiểm thử media".into();
+                    t.messages[0].sender="Nguyễn An".into();
+                    t.messages.push(ChatMessage{id:"fixture-video".into(),kind:crate::message_model::MessageKind::Video,text:"[Video]".into(),sender:"Trần Bình".into(),link_thumb:Some(url.into()),link_url:Some("https://video.zdn.vn/fixture/movie.mp4".into()),link_title:Some("Video thử nghiệm.mp4".into()),ts:crate::login::unix_now()*1000,..Default::default()});
+                    t.messages.push(ChatMessage{id:"fixture-file".into(),kind:crate::message_model::MessageKind::File,text:"[Tệp]".into(),sender:"Nguyễn An".into(),link_url:Some("https://file.zdn.vn/fixture/report.xlsx".into()),link_title:Some("Báo cáo.xlsx".into()),ts:crate::login::unix_now()*1000,..Default::default()});
+                }
             }
             if args.iter().any(|a| a == "--ui-smoke-outgoing") {
                 app.settings_modal_open = false;
@@ -1025,23 +1052,24 @@ impl ZaloGuiApp {
             }
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
             let event = match event {
-                GuiEvent::LiveThreadsReady(updates) => GuiEvent::ThreadsUpdated {
-                    threads: updates.take(),
-                    source: ThreadUpdateSource::Live,
-                },
+                GuiEvent::LiveThreadsReady(updates) => {self.live_mailbox=Some(updates.clone());GuiEvent::ThreadsUpdated {threads:updates.take(),source:ThreadUpdateSource::Live}},
                 GuiEvent::LocalCallRecord {
                     thread_id,
                     text,
                     msg_id,
-                } => GuiEvent::MessageSent {
-                    client_message_id: String::new(),
-                    thread_id,
-                    text,
-                    msg_id,
+                } => {
+                    let _ = (thread_id, text, msg_id);
+                    continue;
                 },
                 event => event,
             };
             match event {
+                GuiEvent::MediaStarted{owner,id,name,cancel}=>{
+                    if owner==self.user_uin && self.is_logged_in {self.downloads.insert(id,download_panel::DownloadView{name,bytes:0,total:None,cancel,result:None});}
+                    else{cancel.store(true,std::sync::atomic::Ordering::Release);}
+                }
+                GuiEvent::MediaProgress{owner,id,bytes,total}=>{if owner==self.user_uin{if let Some(d)=self.downloads.get_mut(&id){d.bytes=bytes;d.total=total;}}}
+                GuiEvent::MediaFinished{owner,id,result}=>{if owner==self.user_uin{if let Some(d)=self.downloads.get_mut(&id){d.result=Some(result);}}}
                 GuiEvent::ClipboardImageRead(image) => {
                     self.clipboard_read_pending = false;
                     if let Some((path, w, h, image)) = image {
@@ -1254,11 +1282,7 @@ impl ZaloGuiApp {
                                 "Zalo".to_string()
                             };
                             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
-                            if !is_focused {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                                    egui::UserAttentionType::Informational,
-                                ));
-                            }
+                            // Message badges replace flashing the taskbar for chat alerts.
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
 
@@ -1278,9 +1302,13 @@ impl ZaloGuiApp {
                         // Rewriting/cloning all histories per downloaded page amplified RAM/IO.
                         self.trim_resident_history();
                     }
+                    self.refresh_unread_title(ctx);
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.live_mailbox=None;
+                    crate::desktop_notice::account("");
+                    self.clear_downloads();
                     self.is_logged_in = false;
                     self.threads.clear();
                     self.user_uin.clear();
@@ -1313,6 +1341,9 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoggedOut => {
                     self.reset_sync_status();
+                    self.live_mailbox=None;
+                    crate::desktop_notice::account("");
+                    self.clear_downloads();
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
@@ -1812,10 +1843,14 @@ impl ZaloGuiApp {
                     self.phone_modal_open = true;
                     self.phone_lookup_error = Some(err);
                 }
+                GuiEvent::CallIdentity {thread_id,call_id} => {
+                    if let Some(call)=self.active_call.as_mut().filter(|c|c.partner_id==thread_id && c.call_id.is_none()) {call.call_id=Some(call_id);}
+                }
                 GuiEvent::CallStateChanged(state) => {
                     if state == "free" {
-                        // Keep modal open if there is a rejection reason so the user can read it
-                        let has_error = self
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Reset));
+                        // A terminal call always closes its incoming controls.
+                        let _has_error = self
                             .active_call
                             .as_ref()
                             .and_then(|c| c.error_reason.as_ref())
@@ -1823,9 +1858,7 @@ impl ZaloGuiApp {
                         self.sticker_textures.remove("call_remote_video");
                         self.sticker_textures.remove("call_remote_video_1");
                         self.sticker_textures.remove("call_local_video");
-                        if !has_error {
-                            self.active_call = None;
-                        }
+                        self.active_call = None;
                     } else if let Some(ref mut call) = self.active_call {
                         if state == "incall" || state == "connected" {
                             call.is_incoming_ringing = false;
@@ -1844,7 +1877,7 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::IncomingCall {
-                    call_id: _,
+                    call_id,
                     caller_id,
                     caller_name,
                     is_video,
@@ -1861,6 +1894,7 @@ impl ZaloGuiApp {
                         if is_video { "video" } else { "thoại" }
                     );
                     self.active_call = Some(ActiveCallOverlay {
+                        call_id: Some(call_id),
                         partner_id: caller_id,
                         partner_name: resolved_name,
                         is_video,
@@ -1896,6 +1930,11 @@ impl ZaloGuiApp {
                     self.sync_notice_dismissed = false;
                 }
                 GuiEvent::PhoneSyncStatus { running, message } => {
+                    if !running {self.phone_download_status=message.clone();}
+                    if message.starts_with("Tải về:"){self.phone_download_status=message.clone();}
+                    else if message.starts_with("Nhập CSDL:"){self.phone_import_status=message.clone();}
+                    else if running && !self.phone_sync_running {self.phone_download_status=message.clone();self.phone_import_status="Nhập CSDL: chờ dữ liệu".into();}
+
                     if !running || !self.phone_sync_running {
                         self.sync_cancel_requested = false;
                     }
@@ -1938,6 +1977,21 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let notice_owner = if self.is_logged_in{self.user_uin.as_str()}else{""};
+        let notice_account_changed = crate::desktop_notice::snapshot().owner != notice_owner;
+        crate::desktop_notice::account(notice_owner);
+        if self.is_logged_in && notice_account_changed {crate::desktop_notice::count(&self.user_uin,self.unread_counts.values().sum());}
+        crate::desktop_notice::configure(self.settings.enable_notifications,self.settings.play_notification_sound);
+        if self.settings.enable_notifications && self.settings.play_notification_sound && self.is_logged_in {
+            if !self.sound_prepared{if let Some(tx)=WORKER_TX.get(){self.sound_prepared=tx.send(WorkerCmd::PrepareNotificationSound).is_ok();}}
+        }else{self.sound_prepared=false;}
+
+        if let Some(notice)=crate::desktop_notice::take_activation(){
+            if self.is_logged_in && notice.owner==self.user_uin {
+                if let Some(index)=self.threads.iter().position(|t|t.id==notice.thread_id){self.selected_thread_index=index;self.filter_starred_only=false;self.in_chat_search_open=false;}
+                else{self.tools_command(tools_panel::ToolsCommand::OpenHit{thread:notice.thread_id,id:notice.message_id});}
+            }
+        }
         #[cfg(windows)]
         crate::tray::configure_notifications(
             self.settings.enable_notifications,
@@ -2378,7 +2432,8 @@ impl ZaloGuiApp {
     fn refresh_unread_title(&self, ctx: &egui::Context) {
         let total: usize = self.unread_counts.values().sum();
         #[cfg(windows)]
-        crate::tray::set_unread(total > 0);
+        crate::desktop_notice::count(&self.user_uin,total);
+        if let Some(mailbox)=&self.live_mailbox{mailbox.seed(&self.threads);}
         let title = if total > 0 {
             format!("({total}) Zalo Lite — Native Rust Client")
         } else {

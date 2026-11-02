@@ -131,6 +131,9 @@ try {
         @{ Size='480x360'; Scale='1.5'; Tab='phone-sync'; PhoneSync=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='quote-jump'; QuoteJump=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='photo'; Photo=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='media'; Media=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='contacts'; Contacts=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='rich-text'; RichText=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='outgoing'; Outgoing=$true },
         @{ Size='1020x700'; Scale='1'; Tab='tools-0'; ToolsTab=0 },
         @{ Size='1020x700'; Scale='1'; Tab='tools-1'; ToolsTab=1 },
@@ -158,6 +161,9 @@ try {
         if ($case.ContainsKey('ToolsTab')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-tools'); $process.StartInfo.ArgumentList.Add('--ui-smoke-tools-tab'); $process.StartInfo.ArgumentList.Add([string]$case.ToolsTab) }
         if ($case.ContainsKey('Outgoing')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-outgoing') }
         if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
+        if ($case.ContainsKey('Media')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-media') }
+        if ($case.ContainsKey('Contacts')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-contacts') }
+        if ($case.ContainsKey('RichText')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-rich-text') }
         if ($case.ContainsKey('QuoteJump')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-quote-jump') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }

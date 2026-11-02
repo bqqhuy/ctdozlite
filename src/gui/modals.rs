@@ -1958,7 +1958,7 @@ impl ZaloGuiApp {
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx
-                                                    .send(WorkerCmd::AnswerCall { accept: false });
+                                                    .send(WorkerCmd::AnswerCall { accept: false, call_id: call.call_id });
                                             }
                                             self.active_call = None;
                                         }
@@ -1993,7 +1993,7 @@ impl ZaloGuiApp {
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ =
-                                                    tx.send(WorkerCmd::AnswerCall { accept: true });
+                                                    tx.send(WorkerCmd::AnswerCall { accept: true, call_id: call.call_id });
                                             }
                                         }
                                         ui.label(
@@ -2182,7 +2182,7 @@ impl ZaloGuiApp {
             self.sticker_textures.remove("call_remote_video_1");
             self.sticker_textures.remove("call_local_video");
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall);
+                let _ = tx.send(WorkerCmd::EndCall { call_id: call.call_id });
             }
         } else if self.active_call.is_some() {
             self.active_call = Some(call);
@@ -2530,7 +2530,7 @@ impl ZaloGuiApp {
 
                                 if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
-                                        RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
+                                        RichText::new("Lưu bản gốc")
                                             .size(11.8)
                                             .color(pal.text_primary),
                                     )
@@ -2544,7 +2544,7 @@ impl ZaloGuiApp {
                                         .on_hover_text(&viewer.full_url)
                                         .clicked()
                                     {
-                                        open_external_url(&viewer.full_url);
+                                        if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url:viewer.original_url.clone(),name:viewer.title.clone(),play:false});}
                                     }
 
                                     let copy_btn = egui::Button::new(

@@ -87,3 +87,10 @@ pub fn startup_error(message: &str) {
         }
     }
 }
+
+/// Open an already downloaded local file through the OS association.
+pub fn open_file(path:&std::path::Path)->bool {
+    if !path.is_file(){return false;}
+    #[cfg(windows)]{shell_open(path.as_os_str())}
+    #[cfg(not(windows))]{false}
+}

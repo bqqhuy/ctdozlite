@@ -33,6 +33,10 @@ pub fn decode_image(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
             "Image exceeds size limit",
         )));
     }
+    let (width,height)=image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?.into_dimensions()?;
+    if (width as u64)*(height as u64)>16*1024*1024 {
+        return Err(image::ImageError::Limits(image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError)));
+    }
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(8192);
@@ -184,7 +188,9 @@ mod image_priority_tests {
         .await
         .expect("visible photo must not wait for background")
         .unwrap();
-        assert_eq!(IMAGE_JOBS.available_permits(), 1);
+        // Other image tests may concurrently use the global foreground slots.
+        // The contract is admission of this foreground request while background waits.
+        assert!(!waiting.is_finished());
         drop(foreground);
         drop(a);
         drop(b);

@@ -140,7 +140,7 @@ impl Tray {
             SetTimer(
                 timer_hwnd.cast(),
                 NOTIFICATION_TIMER,
-                250,
+                40,
                 Some(notification_tick),
             )
         } == 0
@@ -153,7 +153,7 @@ impl Tray {
                 normal: normal_icon,
                 unread: unread_icon,
                 shown: false,
-                popup: false,
+                desktop: crate::desktop_notice_windows::Desktop::new(hwnd).ok(),
             })
         });
         let control = Control {
@@ -208,7 +208,7 @@ impl Drop for Tray {
         HAS_UNREAD.store(false, Ordering::Release);
         POPUP_PENDING.store(false, Ordering::Release);
         if let Ok(mut dispatch) = DISPATCH.lock() {
-            if dispatch.as_ref().map_or(false, |state| {
+            if dispatch.as_ref().is_some_and(|state| {
                 Arc::ptr_eq(&state.control.quitting, &self.control.quitting)
             }) {
                 *dispatch = None;
@@ -329,7 +329,7 @@ struct NotificationIcon {
     normal: Icon,
     unread: Icon,
     shown: bool,
-    popup: bool,
+    desktop: Option<crate::desktop_notice_windows::Desktop>,
 }
 thread_local! {
     static NOTIFICATION_ICON: std::cell::RefCell<Option<NotificationIcon>> = const { std::cell::RefCell::new(None) };
@@ -358,13 +358,9 @@ unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _:
         let Some(icon) = slot.as_mut() else {
             return;
         };
-        if icon.popup && !NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
-            if icon.icon.show_notification("", "", false).is_ok() {
-                icon.popup = false;
-            }
-        }
+        if let Some(desktop)=icon.desktop.as_mut(){desktop.tick(!previews_visible());}
         let unread =
-            HAS_UNREAD.load(Ordering::Acquire) && NOTIFICATIONS_ENABLED.load(Ordering::Relaxed);
+            crate::desktop_notice::snapshot().count > 0;
         if unread != icon.shown {
             let image = if unread { &icon.unread } else { &icon.normal };
             if icon.icon.set_icon(Some(image.clone())).is_ok() {
@@ -382,17 +378,7 @@ unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _:
                 }
             }
         }
-        if POPUP_PENDING.swap(false, Ordering::AcqRel) && unread && !previews_visible() {
-            if let Err(error) = icon.icon.show_notification(
-                "ctdozlite",
-                "Bạn có tin nhắn mới. Mở ctdozlite để xem.",
-                NOTIFICATION_SOUND.load(Ordering::Relaxed),
-            ) {
-                crate::logger::log_error("Windows notification", &error.to_string());
-            } else {
-                icon.popup = true;
-            }
-        }
+
     });
 }
 pub(crate) fn configure_notifications(enabled: bool, sound: bool) {
@@ -410,4 +396,10 @@ pub(crate) fn note_background_unread(new_alert: bool) {
     if !previews_visible() && new_alert && NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
         POPUP_PENDING.store(true, Ordering::Release);
     }
+}
+
+/// A popup click owns the exact notification snapshot, independent of newer arrivals.
+pub(crate) fn open_notice(notice:crate::desktop_notice::Notice){
+    crate::desktop_notice::activate(notice);
+    if let Some(control)=DISPATCH.lock().ok().and_then(|s|s.as_ref().map(|d|d.control.clone())){control.open();}
 }

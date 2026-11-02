@@ -1,5 +1,6 @@
 pub mod call;
 pub mod chat;
+pub mod message_view;
 pub mod clock;
 pub mod crypto;
 pub mod endpoints;
@@ -68,3 +69,18 @@ pub mod rich_text;
 
 /// Optional outbound proxy for Zalo HTTP and WebSocket traffic.
 pub mod proxy;
+pub mod clipboard_image;
+pub mod crash_report;
+
+pub mod media_download;
+
+pub mod video_player;
+
+pub mod call_lifecycle;
+
+pub mod desktop_notice;
+
+#[cfg(windows)]
+mod desktop_notice_windows;
+
+pub mod notification_sound;

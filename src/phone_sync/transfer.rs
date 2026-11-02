@@ -34,23 +34,23 @@ struct Crypto {
     record: Option<Zeroizing<Vec<u8>>>,
 }
 #[derive(Clone)]
-struct Batch {
-    metadata: bool,
-    index: u64,
-    url: String,
+pub(super) struct Batch {
+    pub metadata: bool,
+    pub index: u64,
+    pub url: String,
 }
 #[derive(Default)]
 struct Round {
     batches: Vec<Batch>,
     seen: HashSet<(bool, u64)>,
     covered: HashSet<String>,
+    finished: HashSet<String>,
     last: bool,
     confirmed: bool,
 }
 impl Round {
     fn complete(&self, wanted: &[String]) -> bool {
-        let _ = wanted;
-        self.last
+        self.last || (!wanted.is_empty() && wanted.iter().all(|p|self.finished.contains(p)))
     }
     fn apply(&mut self, event: &WsEvent, id: &str) -> Result<bool> {
         if event.cmd == crate::socket::CMD_SYNC_REQUEST {
@@ -99,9 +99,15 @@ impl Round {
                     _ => {}
                 },
                 "upload_batch" => {
-                    self.last |= data
-                        .get("isLast")
-                        .is_some_and(|v| v.as_bool() == Some(true) || v.as_u64() == Some(1));
+                    let error=data.get("err").or_else(||data.get("errorCode")).and_then(|v|v.as_i64().or_else(||v.as_str()?.parse().ok())).unwrap_or(0);
+                    ensure!(error==0,"Điện thoại báo lỗi gói đồng bộ (mã {error}); đã dừng, không tự gửi lại");
+                    let is_last=data.get("isLast").is_some_and(|v|v.as_bool()==Some(true)||v.as_u64()==Some(1));
+                    let scopes=data.get("scopes").and_then(Value::as_array);
+                    if is_last {
+                        if scopes.is_none_or(|a|a.is_empty()) {self.last=true;}
+                        else {for scope in scopes.into_iter().flatten(){if let Some(p)=scope.get("partition").and_then(Value::as_str){self.finished.insert(p.to_owned());}}}
+                    }
+
                     for scope in data
                         .get("scopes")
                         .and_then(Value::as_array)
@@ -246,7 +252,7 @@ async fn round<F: FnMut(String)>(
                 event=events.recv()=>{
                     let event=event.map_err(|_|anyhow::anyhow!("Luồng đồng bộ điện thoại gián đoạn; thử lại sau khi kết nối ổn định"))?;
                     if state.apply(&event,&id)? {progress("Chờ xác nhận trên điện thoại: mở Zalo và chọn Đồng bộ ngay…".into());}
-                    if state.complete(&wanted_partitions) {
+                    if (wanted.is_empty() && state.batches.iter().any(|b|b.metadata) && !state.finished.is_empty()) || state.complete(&wanted_partitions) {
                         ensure!(state.confirmed || !state.batches.is_empty(),"Điện thoại chưa xác nhận đồng bộ");
                         state.batches.sort_by_key(|b|(!b.metadata,b.index));
                         return Ok(state.batches);
@@ -279,7 +285,7 @@ async fn round<F: FnMut(String)>(
 /// Request phone approval once, then import history without pausing the live-chat transport.
 /// # Errors
 /// Returns bounded download/decode/identity/store failures; committed pages remain available.
-pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
+pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread) + Send>(
     session: &Session,
     transport: SyncTransport,
     cancel: Arc<AtomicBool>,
@@ -302,6 +308,7 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .context("Account cache unavailable")?
         .to_owned();
     let bytes = guarded(assets::codec(&cache), session, &cancel, &transport, epoch).await?;
+    let codec_bytes = bytes.clone();
     let mut crypto = tokio::task::spawn_blocking(move || -> Result<Crypto> {
         assets::verify(&bytes)?;
         let mut codec = Codec::new(&bytes)?;
@@ -453,105 +460,64 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
     )
     .await??;
     let threads = Arc::new(threads);
-    let mut senders = Arc::new(senders);
-    let mut attempted_senders = HashSet::new();
-    let resumed = coverage.len();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
-    let mut inserted = 0usize;
-    let mut unmapped = 0usize;
-    let limit_path = session.history_path().with_extension("sync-limits.json");
-    let read_path = limit_path.clone();
-    let mut limits = tokio::task::spawn_blocking(move || policy::Limits::load(&read_path)).await?;
-    let jobs = plan::queries(&ordered, &coverage, now, recent_only);
-    let mut pending = policy::split(jobs, limits.count)?;
-    let mut completed_ranges = Vec::new();
-    let mut adjustments = 0usize;
-    let mut request_number = 0usize;
-    let mut last_request: Option<std::time::Instant> = None;
-    while let Some(wanted) = pending.pop_front() {
-        if let Some(last) = last_request {
-            tokio::time::sleep(Duration::from_secs(2).saturating_sub(last.elapsed())).await;
+    let senders = Arc::new(senders);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+    let limit_path=session.history_path().with_extension("sync-limits.json");
+    let read_path=limit_path.clone();
+    let mut limits=tokio::task::spawn_blocking(move||policy::Limits::load(&read_path)).await?;
+    let jobs=plan::queries(&ordered,&coverage,now,recent_only);
+    let mut pending=policy::split(jobs,Some(limits.count.unwrap_or(30).min(30)))?;
+    let progress=Arc::new(std::sync::Mutex::new(progress));
+    let emit=|text:String|{if let Ok(mut p)=progress.lock(){p(text);}};
+    let slots=Arc::new(tokio::sync::Semaphore::new(2));
+    let (tx,mut rx)=tokio::sync::mpsc::channel::<RoundWork>(1);
+    let identity=(crypto.identity.public.clone(),crypto.identity.private.clone());
+    drop(crypto);
+    let producer=async {
+        let mut adjustments=0;let mut number=0;let mut last:Option<std::time::Instant>=None;
+        while let Some(wanted)=pending.pop_front(){
+            let slot=slots.clone().acquire_owned().await?;
+            ensure!(!cancel.load(Ordering::Acquire) && session.is_active(),"Đã dừng đồng bộ");
+            if let Some(last)=last {tokio::time::sleep(Duration::from_secs(2).saturating_sub(last.elapsed())).await;}
+            last=Some(std::time::Instant::now());number+=1;
+            emit(format!("Tải về: lượt {number} • {} hội thoại • chờ điện thoại",wanted.len()));
+            let bytes=codec_bytes.clone();let public=identity.0.clone();let private=identity.1.clone();
+            let crypto=tokio::task::spawn_blocking(move||->Result<Crypto>{let mut codec=Codec::new(&bytes)?;let ephemeral=codec.key_pair()?;Ok(Crypto{codec,identity:KeyPair{public,private},ephemeral,record:None})}).await??;
+            let mut report=|text|emit(format!("Tải về: {text}"));
+            let batches=round(session,&transport,epoch,&cancel,&crypto,&wanted,&mut report).await;
+            let batches=match batches {
+                Ok(b)=>b,
+                Err(error)=>{
+                    let Some(limit)=error.downcast_ref::<policy::LimitRejection>()else{return Err(error);};
+                    ensure!(adjustments<4 && wanted.len()>1,"Đã dừng điều chỉnh giới hạn đồng bộ");
+                    let maximum=limit.0.unwrap_or(wanted.len().div_ceil(2)).min(wanted.len()-1).max(1);adjustments+=1;limits.count=Some(maximum);
+                    let mut remainder=wanted;remainder.extend(pending.into_iter().flatten());pending=policy::split(remainder,Some(maximum))?;continue;
+                }
+            };
+            if adjustments>0 {limits.observed_at=crate::login::unix_now() as u64;let path=limit_path.clone();let data=serde_json::to_vec(&limits)?;tokio::task::spawn_blocking(move||crate::storage::atomic_write(&path,&data)).await??;}
+            emit(format!("Tải về: lượt {number} • {} gói đã biết",batches.len()));
+            tx.send(RoundWork{crypto,batches,wanted,number,_slot:slot}).await.map_err(|_|anyhow::anyhow!("Đã dừng hàng đợi nhập lịch sử"))?;
         }
-        last_request = Some(std::time::Instant::now());
-        request_number += 1;
-        progress(format!("Điện thoại: yêu cầu lịch sử {request_number}, {} hội thoại; tiếp tục {resumed} hội thoại có checkpoint; đã lưu {inserted} tin mới…", wanted.len()));
-        crypto = tokio::task::spawn_blocking(move || -> Result<Crypto> {
-            crypto.ephemeral = crypto.codec.key_pair()?;
-            crypto.record = None;
-            Ok(crypto)
-        })
-        .await??;
-        let batches = round(
-            session,
-            &transport,
-            epoch,
-            &cancel,
-            &crypto,
-            &wanted,
-            &mut progress,
-        )
-        .await;
-        let batches = match batches {
-            Ok(batches) => batches,
-            Err(error) => {
-                let Some(limit) = error.downcast_ref::<policy::LimitRejection>() else {
-                    return Err(error);
-                };
-                ensure!(
-                    adjustments < 4 && wanted.len() > 1,
-                    "Đã dừng sau giới hạn điều chỉnh; không tự tạo thêm yêu cầu đồng bộ"
-                );
-                let maximum = limit
-                    .0
-                    .unwrap_or(wanted.len().div_ceil(2))
-                    .min(wanted.len() - 1)
-                    .max(1);
-                adjustments += 1;
-                limits.count = Some(maximum);
-                let mut remainder = wanted;
-                remainder.extend(pending.into_iter().flatten());
-                pending = policy::split(remainder, Some(maximum))?;
-                progress(format!("Máy chủ từ chối vì số hội thoại; điều chỉnh tối đa {maximum} hội thoại/yêu cầu ({adjustments}/4)"));
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                continue;
-            }
-        };
-        if adjustments > 0 {
-            limits.observed_at = crate::login::unix_now() as u64;
-            let path = limit_path.clone();
-            let bytes = serde_json::to_vec(&limits)?;
-            tokio::task::spawn_blocking(move || crate::storage::atomic_write(&path, &bytes))
-                .await??;
-        }
-        for (batch_index, batch) in batches.into_iter().enumerate() {
-            progress(format!(
-                "Điện thoại: yêu cầu {request_number}, gói {}; đã lưu {inserted} tin mới…",
-                batch_index + 1
-            ));
-            let data = guarded(
-                assets::download(&batch.url, 64 * 1024 * 1024),
-                session,
-                &cancel,
-                &transport,
-                epoch,
-            )
-            .await?;
-            let cancel_decode = cancel.clone();
-            let account_decode = session.clone();
-            let (next, objects) = tokio::task::spawn_blocking(move || {
-                decode_batch(
-                    crypto,
-                    data,
-                    batch.metadata,
-                    false,
-                    cancel_decode,
-                    account_decode,
-                )
-            })
-            .await??;
-            crypto = next;
+        drop(tx);emit("Tải về: đã nhận đủ mô tả gói; đang hoàn tất tải/nhập".into());Ok::<(),anyhow::Error>(())
+    };
+    let consumer=async {
+        let mut import_guard=ImportGuard {cancel:cancel.clone(),finished:false};
+        let writer=super::pipeline::Writer::start(session.clone(),threads.clone());
+        let mut senders=senders;let mut attempted_senders=HashSet::new();let mut inserted=0;let mut unmapped=0;let mut completed_ranges=Vec::new();
+        while let Some(work)=rx.recv().await {
+            let mut crypto=work.crypto;
+            let mut files=super::pipeline::start(session.clone(),work.batches,cancel.clone(),progress.clone(),work.number);let mut batch_index=0;
+            while let Some(staged)=files.recv().await {
+                let staged=staged?;batch_index+=1;
+                emit(format!("Tải về: lượt {} • đã tải gói {batch_index}",work.number));
+                emit(format!("Nhập CSDL: {inserted} tin mới • đang giải mã gói {batch_index}"));
+                let path=staged.path.clone();let metadata=staged.batch.metadata;
+                let cancel_decode=cancel.clone();let account_decode=session.clone();
+                let (next,objects)=tokio::task::spawn_blocking(move||{
+                    let data=crate::limits::read_file(&path,64*1024*1024)?;
+                    decode_batch(crypto,data,metadata,false,cancel_decode,account_decode)
+                }).await??;
+                crypto=next;drop(staged);
             for object in objects {
                 let unknown: Vec<_> = object
                     .get("partitions")
@@ -574,38 +540,24 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     .into_iter()
                     .collect();
                 for ids in unknown.chunks(50) {
-                    let resolved = guarded(
-                        crate::chat::resolve_sync_ids(session, ids),
-                        session,
-                        &cancel,
-                        &transport,
-                        epoch,
-                    )
-                    .await?;
+                    let resolved = crate::chat::resolve_sync_ids(session, ids).await.unwrap_or_default();
                     attempted_senders.extend(ids.iter().cloned());
                     Arc::make_mut(&mut senders).extend(resolved);
                 }
-                let account = session.clone();
-                let map = threads.clone();
-                let senders = senders.clone();
-                let imported = tokio::task::spawn_blocking(move || -> Result<import::Imported> {
-                    ensure!(account.is_active(), "Đã đăng xuất; dừng nhập lịch sử");
-                    let mut store = crate::store::MessageStore::open(account.history_path())?;
-                    import::save(&mut store, &object, &map, &senders, account.account_key())
-                })
-                .await??;
+                let imported=writer.save(object,senders.clone()).await?;
                 inserted += imported.inserted;
                 unmapped += imported.unmapped;
                 for preview in imported.previews {
                     page(preview);
                     // Bound UI event production even when a phone batch has many partitions.
-                    tokio::time::sleep(Duration::from_millis(16)).await;
+                    tokio::task::yield_now().await;
                 }
             }
         }
+                emit(format!("Nhập CSDL: {inserted} tin mới • hoàn tất gói {batch_index}"));
         // Advance only after every batch of this range was authenticated and imported.
         // Interrupted ranges replay safely; unmapped partitions are deliberately retried.
-        completed_ranges.extend(wanted.iter().cloned());
+        completed_ranges.extend(work.wanted.iter().cloned());
         plan::checkpoint_completed(&mut coverage, &mut completed_ranges, &owners)?;
         let completed: Vec<_> = coverage
             .iter()
@@ -620,8 +572,20 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
         })
         .await??;
     }
-    Ok(format!("Đã nhận lịch sử điện thoại: {inserted} tin mới, {} hội thoại được yêu cầu; {unmapped} tin chưa xác định hội thoại được giữ riêng. Đã lưu tiến độ; lần sau chỉ lấy phần mới và phần chưa hoàn tất. Chỉ khôi phục dữ liệu điện thoại còn giữ; tệp đính kèm phụ thuộc liên kết còn hạn.",partitions.len()))
+        emit(format!("Nhập CSDL: hoàn tất • {inserted} tin mới"));
+        import_guard.finished=true;
+        Ok::<_,anyhow::Error>((inserted,unmapped))
+    };
+    let (download_result,import_result)=tokio::join!(producer,consumer);
+    let (inserted,unmapped)=import_result?;download_result?;
+    Ok(format!("Đã hoàn tất tải và nhập lịch sử: {inserted} tin mới; {unmapped} tin chưa xác định hội thoại được giữ riêng. Đã lưu checkpoint."))
 }
+struct ImportGuard {cancel:Arc<AtomicBool>,finished:bool}
+impl Drop for ImportGuard {fn drop(&mut self){if !self.finished{self.cancel.store(true,Ordering::Release);}}}
+struct RoundWork {
+    crypto:Crypto,batches:Vec<Batch>,wanted:Vec<plan::Query>,number:usize,_slot:tokio::sync::OwnedSemaphorePermit,
+}
+
 fn decode_batch(
     mut state: Crypto,
     bytes: Vec<u8>,
@@ -746,4 +710,11 @@ mod range_request_tests {
             json!({"partition":"", "from":0, "to":999, "limit":2147483647})
         );
     }
+}
+
+#[cfg(test)]mod batch_completion_tests {
+    use super::*;
+    fn event(partition:&str,last:bool,err:i64)->WsEvent {WsEvent{cmd:601,sub_cmd:0,version:1,payload:json!({"controls":[{"content":{"act_type":"transfer_sync2","act":"upload_batch","data":{"syncId":"fixture","batchType":2,"idx":1,"scopes":[{"partition":partition}],"isLast":last,"err":err}}}]})}}
+    #[test]fn final_metadata_embedded_batch_completes_only_its_partition(){let mut r=Round::default();r.apply(&event("group/a",true,0),"fixture").unwrap();assert!(!r.complete(&["group/a".into(),"group/b".into()]));r.apply(&event("group/b",true,0),"fixture").unwrap();assert!(r.complete(&["group/a".into(),"group/b".into()]));}
+    #[test]fn failed_batch_never_completes_coverage(){let mut r=Round::default();assert!(r.apply(&event("group/a",true,42),"fixture").is_err());assert!(!r.complete(&["group/a".into()]));}
 }

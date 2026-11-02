@@ -68,112 +68,9 @@ pub(super) struct CallCardView {
 }
 
 /// Detect whether `msg` is a voice/video call log entry and parse its structured metadata.
-pub(super) fn extract_call_card_view(msg: &ChatMessage) -> Option<CallCardView> {
-    let raw = msg.text.trim();
-    let is_call_id = msg.id.starts_with("call_");
-    let is_call_text = raw == "Cuộc gọi"
-        || raw == "Cuộc gọi thoại"
-        || raw == "Cuộc gọi video"
-        || raw.starts_with("📞")
-        || raw.starts_with("📹")
-        || raw.starts_with("Cuộc gọi đi")
-        || raw.starts_with("Cuộc gọi đến")
-        || raw.starts_with("Cuộc gọi video");
-    if !is_call_id && !is_call_text {
-        return None;
-    }
-
-    let lower = raw.to_lowercase();
-    let is_video = lower.contains("video") || raw.starts_with("📹");
-    let is_incoming = lower.contains("gọi đến") || (!lower.contains("gọi đi") && !msg.is_outgoing);
-
-    // Parse optional duration `(Ns)`
-    let secs_opt: Option<u64> = raw.find('(').and_then(|open| {
-        let rest = &raw[open + 1..];
-        let close = rest.find("s)")?;
-        rest[..close].trim().parse::<u64>().ok()
-    });
-
-    // Parse optional failure/rejection reason after `—` or `-`
-    let raw_reason = raw
-        .split_once(" — ")
-        .or_else(|| raw.split_once(" - "))
-        .map(|(_, r)| r.trim().to_string())
-        .filter(|r| !r.is_empty());
-
-    let is_missed_or_failed = match secs_opt {
-        Some(0) => true,
-        Some(_) => raw_reason.is_some(),
-        None => raw_reason.is_some() || (!msg.is_outgoing && raw == "Cuộc gọi"),
-    };
-
-    let title = if is_video {
-        if is_incoming {
-            if is_missed_or_failed {
-                "Cuộc gọi video nhỡ".to_string()
-            } else {
-                "Cuộc gọi video đến".to_string()
-            }
-        } else {
-            "Cuộc gọi video đi".to_string()
-        }
-    } else if is_incoming {
-        if is_missed_or_failed {
-            "Cuộc gọi thoại nhỡ".to_string()
-        } else {
-            "Cuộc gọi thoại đến".to_string()
-        }
-    } else {
-        "Cuộc gọi thoại đi".to_string()
-    };
-
-    let arrow = if is_incoming { "↙" } else { "↗" };
-    let status_badge = match (is_missed_or_failed, secs_opt) {
-        // The title already names the missed/failed state; show the reason instead of repeating it.
-        (true, _) => {
-            let reason_txt = raw_reason
-                .as_deref()
-                .filter(|r| !r.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    if is_incoming {
-                        "Bạn đã bỏ lỡ cuộc gọi này".to_string()
-                    } else {
-                        "Người nhận không nghe máy".to_string()
-                    }
-                });
-            format!("{arrow} {reason_txt}")
-        }
-        (false, Some(s)) if s >= 60 => {
-            format!("{arrow} Thời lượng: {} phút {:02} giây", s / 60, s % 60)
-        }
-        (false, Some(s)) => format!("{arrow} Thời lượng: {s} giây"),
-        (false, None) => format!("{arrow} Đã kết thúc"),
-    };
-
-    // When the call is missed/failed the badge already carries the reason, so only surface a
-    // separate reason line for calls that otherwise look successful.
-    let reason = if is_missed_or_failed {
-        None
-    } else {
-        raw_reason.map(|r| {
-            if r.contains("gián đoạn") || r.contains("từ chối") {
-                "Người nhận từ chối hoặc kết nối gián đoạn".to_string()
-            } else if r.contains("đang bận") {
-                "Người nhận đang bận hoặc từ chối".to_string()
-            } else {
-                r
-            }
-        })
-    };
-
-    Some(CallCardView {
-        title,
-        status_badge,
-        reason,
-        is_video,
-        is_missed_or_failed,
-    })
+pub(super) fn extract_call_card_view(_msg: &ChatMessage) -> Option<CallCardView> {
+    // Call records are excluded from chat; active calls have their own overlay.
+    None
 }
 
 pub(super) fn render_call_card_widget(
@@ -413,6 +310,7 @@ pub(super) fn clipboard_has_image() -> bool {
             [
                 8,
                 15,
+                17,
                 RegisterClipboardFormatA(b"PNG\0".as_ptr()),
                 RegisterClipboardFormatA(b"image/png\0".as_ptr()),
             ]
@@ -430,210 +328,16 @@ pub(super) fn clipboard_has_image() -> bool {
 /// 1. Registered `"PNG"` / `"image/png"` streams (Snipping Tool, ShareX, Chrome/Edge, Discord)
 /// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
 /// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
-pub(super) fn read_clipboard_image_to_png(
-) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
-    #[cfg(target_os = "windows")]
+pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
+    crate::crash_report::phase("clipboard-copy");
+    #[cfg(windows)]
     {
-        const CF_DIB: u32 = 8;
-        const CF_HDROP: u32 = 15;
-        #[link(name = "user32")]
-        extern "system" {
-            fn IsClipboardFormatAvailable(format: u32) -> i32;
-            fn RegisterClipboardFormatA(lpsz_format: *const u8) -> u32;
-            fn OpenClipboard(h_wnd_new_owner: *mut std::ffi::c_void) -> i32;
-            fn CloseClipboard() -> i32;
-            fn GetClipboardData(u_format: u32) -> *mut std::ffi::c_void;
-        }
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GlobalLock(h_mem: *mut std::ffi::c_void) -> *const u8;
-            fn GlobalUnlock(h_mem: *mut std::ffi::c_void) -> i32;
-            fn GlobalSize(h_mem: *mut std::ffi::c_void) -> usize;
-        }
-        #[link(name = "shell32")]
-        extern "system" {
-            fn DragQueryFileW(
-                h_drop: *mut std::ffi::c_void,
-                i_file: u32,
-                lpsz_file: *mut u16,
-                cch: u32,
-            ) -> u32;
-        }
-
-        unsafe {
-            let cf_png = RegisterClipboardFormatA(b"PNG\0".as_ptr());
-            let cf_mime_png = RegisterClipboardFormatA(b"image/png\0".as_ptr());
-            let has_png = cf_png != 0 && IsClipboardFormatAvailable(cf_png) != 0;
-            let has_mime_png = cf_mime_png != 0 && IsClipboardFormatAvailable(cf_mime_png) != 0;
-            let has_dib = IsClipboardFormatAvailable(CF_DIB) != 0;
-            let has_hdrop = IsClipboardFormatAvailable(CF_HDROP) != 0;
-
-            if !has_png && !has_mime_png && !has_dib && !has_hdrop {
-                return None;
-            }
-
-            // Retry OpenClipboard briefly in case egui-winit/arboard or ShareX is releasing the lock
-            let mut opened = false;
-            for _ in 0..6 {
-                if OpenClipboard(std::ptr::null_mut()) != 0 {
-                    opened = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(8));
-            }
-            if !opened {
-                return None;
-            }
-
-            // 1. Try raw PNG stream first (preserves exact RGBA and avoids DIB header quirks)
-            for fmt in [cf_png, cf_mime_png] {
-                if fmt != 0 && IsClipboardFormatAvailable(fmt) != 0 {
-                    let hmem = GetClipboardData(fmt);
-                    if !hmem.is_null() {
-                        let ptr = GlobalLock(hmem);
-                        let len = GlobalSize(hmem);
-                        if !ptr.is_null() && len > 8 && len <= crate::limits::IMAGE_BYTES {
-                            let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
-                            GlobalUnlock(hmem);
-                            if let Ok(dyn_img) = crate::limits::decode_image(&bytes) {
-                                CloseClipboard();
-                                return finalize_clipboard_rgba_image(dyn_img.to_rgba8());
-                            }
-                        } else if !ptr.is_null() {
-                            GlobalUnlock(hmem);
-                        }
-                    }
-                }
-            }
-
-            // 2. Try CF_HDROP (copied image file in Windows Explorer or ShareX)
-            if has_hdrop {
-                let hdrop = GetClipboardData(CF_HDROP);
-                if !hdrop.is_null() {
-                    let mut buf = vec![0u16; 1024];
-                    let chars =
-                        DragQueryFileW(hdrop, 0, buf.as_mut_ptr(), buf.len() as u32) as usize;
-                    if chars > 0 && chars < buf.len() {
-                        let file_path =
-                            std::path::PathBuf::from(String::from_utf16_lossy(&buf[..chars]));
-                        if let Ok(dyn_img) =
-                            crate::limits::read_file(&file_path, crate::limits::IMAGE_BYTES)
-                                .and_then(|bytes| {
-                                    crate::limits::decode_image(&bytes).map_err(Into::into)
-                                })
-                        {
-                            CloseClipboard();
-                            let rgba = dyn_img.to_rgba8();
-                            let (width, height) = rgba.dimensions();
-                            let thumb = if width > 240 || height > 240 {
-                                image::imageops::thumbnail(&rgba, 240, 240)
-                            } else {
-                                rgba
-                            };
-                            let (tw, th) = thumb.dimensions();
-                            let col_img = egui::ColorImage::from_rgba_unmultiplied(
-                                [tw as usize, th as usize],
-                                thumb.as_raw(),
-                            );
-                            return Some((file_path, width, height, col_img));
-                        }
-                    }
-                }
-            }
-
-            // 3. Fallback to CF_DIB (24-bit BGR or 32-bit BGRA/BGRX, BI_RGB or BI_BITFIELDS)
-            if has_dib {
-                let hmem = GetClipboardData(CF_DIB);
-                if !hmem.is_null() {
-                    let ptr = GlobalLock(hmem);
-                    let len = GlobalSize(hmem);
-                    if !ptr.is_null() && len >= 40 {
-                        let slice = std::slice::from_raw_parts(ptr, len);
-                        let bi_size =
-                            u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
-                        let width_i = i32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
-                        let height_i =
-                            i32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
-                        let bit_count = u16::from_le_bytes([slice[14], slice[15]]);
-                        let compression =
-                            u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
-
-                        if width_i > 0
-                            && width_i <= 8192
-                            && height_i != 0
-                            && height_i.unsigned_abs() <= 8192
-                            && (width_i as u64) * (height_i.unsigned_abs() as u64)
-                                <= 32 * 1024 * 1024
-                            && (bit_count == 24 || bit_count == 32)
-                            && bi_size >= 40
-                            && bi_size <= slice.len()
-                        {
-                            let width = width_i as u32;
-                            let top_down = height_i < 0;
-                            let height = height_i.unsigned_abs();
-                            let mut offset = bi_size;
-                            if (compression == 3 || compression == 6) && bi_size == 40 {
-                                offset += if compression == 6 { 16 } else { 12 };
-                            }
-                            let bytes_per_px = (bit_count / 8) as usize;
-                            let row_stride = (width as usize * bytes_per_px + 3) & !3;
-                            let needed =
-                                offset.saturating_add(row_stride.saturating_mul(height as usize));
-                            if needed <= slice.len() {
-                                let mut rgba = image::RgbaImage::new(width, height);
-                                let mut any_nonzero_alpha = false;
-                                if bytes_per_px == 4 {
-                                    for y in 0..height {
-                                        let src_y =
-                                            if top_down { y } else { height - 1 - y } as usize;
-                                        let row = &slice[offset + src_y * row_stride..];
-                                        for x in 0..width {
-                                            if row[x as usize * 4 + 3] != 0 {
-                                                any_nonzero_alpha = true;
-                                                break;
-                                            }
-                                        }
-                                        if any_nonzero_alpha {
-                                            break;
-                                        }
-                                    }
-                                }
-                                for y in 0..height {
-                                    let src_y = if top_down { y } else { height - 1 - y } as usize;
-                                    let row = &slice[offset + src_y * row_stride..];
-                                    for x in 0..width {
-                                        let p = x as usize * bytes_per_px;
-                                        let b = row[p];
-                                        let g = row[p + 1];
-                                        let r = row[p + 2];
-                                        let a = if bytes_per_px == 4 && any_nonzero_alpha {
-                                            row[p + 3]
-                                        } else {
-                                            255
-                                        };
-                                        rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
-                                    }
-                                }
-                                GlobalUnlock(hmem);
-                                CloseClipboard();
-                                return finalize_clipboard_rgba_image(rgba);
-                            }
-                        }
-                    }
-                    if !ptr.is_null() {
-                        GlobalUnlock(hmem);
-                    }
-                }
-            }
-
-            CloseClipboard();
-            None
-        }
+        let rgba = crate::clipboard_image::read_windows().ok()??;
+        crate::crash_report::phase("clipboard-preview");
+        finalize_clipboard_rgba_image(rgba)
     }
     #[cfg(not(windows))]
-    {
-        None
-    }
+    { None }
 }
 
 /// Format a URL for clean UI display by stripping tracking query strings (`?_r=1&utm_...`)
@@ -920,176 +624,44 @@ pub(super) fn render_message_body(
         thread_name.to_string()
     };
 
-    // Dedicated inline Photo Card when the message is an uploaded/received Zalo photo
-    let is_zalo_photo = msg.is_photo();
-    if is_zalo_photo {
-        if let Some(thumb_url) = msg
-            .link_thumb
-            .as_deref()
-            .or(msg.link_url.as_deref())
-            .filter(|u| !u.is_empty())
-        {
-            let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-            if media_near_viewport(ui,300.0) && !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::FetchStickerImage {
-                        key: key.clone(),
-                        url: thumb_url.to_string(),
-                    });
-                }
-            }
-            let open_target = msg.link_url.as_deref().unwrap_or(thumb_url).to_string();
-            let title_label = "Hình ảnh".to_string();
-            if let Some(tex) = sticker_textures.get(&key) {
-                let [tw, th] = tex.size();
-                let tw_f = (tw.max(1)) as f32;
-                let th_f = (th.max(1)) as f32;
-                let max_w = max_text_width.clamp(160.0, 270.0);
-                let max_h = 260.0_f32;
-                let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-                let disp_w = (tw_f * scale).clamp(135.0, max_w);
-                let disp_h = (th_f * scale).clamp(95.0, max_h);
-                let img = egui::Image::new(tex)
-                    .fit_to_exact_size(Vec2::new(disp_w, disp_h))
-                    .rounding(Rounding::same(12.0))
-                    .sense(Sense::click());
-                let resp = ui
-                    .add(img)
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để phóng to hình ảnh");
-                ui.painter().rect_stroke(
-                    resp.rect,
-                    Rounding::same(12.0),
-                    Stroke::new(
-                        if resp.hovered() { 1.6_f32 } else { 1.0_f32 },
-                        if resp.hovered() {
-                            pal.primary
-                        } else {
-                            pal.border
-                        },
-                    ),
-                );
-                if resp.hovered() {
-                    ui.painter().rect_filled(
-                        resp.rect,
-                        Rounding::same(12.0),
-                        Color32::from_rgba_unmultiplied(6, 10, 20, 88),
-                    );
-                    let pill_r = Rect::from_center_size(resp.rect.center(), Vec2::new(108.0, 26.0));
-                    ui.painter().rect_filled(
-                        pill_r,
-                        Rounding::same(13.0),
-                        Color32::from_rgba_unmultiplied(15, 23, 42, 225),
-                    );
-                    ui.painter().text(
-                        pill_r.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Phóng to ảnh",
-                        FontId::proportional(11.5),
-                        Color32::WHITE,
-                    );
-                }
-                if resp.clicked() {
-                    body_action = Some(BubbleAction::OpenImagePopup {
-                        tex_key: key,
-                        full_url: open_target,
-                        title: title_label,
-                        sender: sender_label,
-                        time: msg.display_time(),
-                    });
-                }
-            } else {
-                let ph_frame = egui::Frame::none()
-                    .fill(text_col.linear_multiply(0.08))
-                    .rounding(Rounding::same(10.0))
-                    .inner_margin(Margin::symmetric(12.0, 10.0))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let (ir, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                            draw_icon_image(ui.painter(), ir.center(), 18.0, text_col);
-                            ui.label(
-                                RichText::new(&title_label)
-                                    .size(13.5)
-                                    .color(text_col)
-                                    .strong(),
-                            );
-                        });
-                    });
-                if ui
-                    .interact(
-                        ph_frame.response.rect,
-                        Id::new(("photo_ph_click", &msg.id, msg.ts)),
-                        Sense::click(),
-                    )
-                    .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("Bấm để xem hình ảnh")
-                    .clicked()
-                {
-                    body_action = Some(BubbleAction::OpenImagePopup {
-                        tex_key: key,
-                        full_url: open_target,
-                        title: title_label,
-                        sender: sender_label,
-                        time: msg.display_time(),
-                    });
-                }
-            }
-            if let Some(caption) = msg.photo_caption() {
-                ui.add_space(5.0);
-                ui.add(egui::Label::new(RichText::new(caption).color(text_col).size(14.2)).wrap());
-            }
-            return body_action;
+    let media = crate::message_view::media(msg);
+    if matches!(media.kind, crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video) {
+        let video = media.kind == crate::message_view::MediaKind::Video;
+        let thumb = media.thumbnail.as_deref().unwrap_or_default();
+        let key = format!("thumb_{}",crate::crypto::md5_hex(thumb));
+        let width=max_text_width.clamp(120.0,270.0);
+        let ratio=media.width.zip(media.height).map(|(w,h)|h as f32/w as f32).unwrap_or(0.67);
+        let height=(width*ratio).clamp(95.0,260.0);
+        let (rect,response)=ui.allocate_exact_size(Vec2::new(width,height),Sense::click());
+        if !thumb.is_empty() && rect.intersects(ui.clip_rect().expand(160.0)) && !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+            if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::FetchStickerImage{key:key.clone(),url:thumb.into()});}
         }
+        ui.painter().rect_filled(rect,Rounding::same(10.0),pal.bg_elevated);
+        if let Some(texture)=sticker_textures.get(&key){
+            let size=texture.size_vec2();let scale=(rect.width()/size.x).min(rect.height()/size.y);
+            let target=Rect::from_center_size(rect.center(),size*scale);
+            ui.painter().image(texture.id(),target,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);
+        } else {draw_icon_image(ui.painter(),rect.center(),24.0,pal.text_muted);}
+        if video {
+            ui.painter().circle_filled(rect.center(),20.0,Color32::from_black_alpha(150));
+            let c=rect.center();ui.painter().add(egui::Shape::convex_polygon(vec![c+Vec2::new(-5.0,-9.0),c+Vec2::new(10.0,0.0),c+Vec2::new(-5.0,9.0)],Color32::WHITE,Stroke::NONE));
+            if let Some(duration)=media.duration {ui.painter().text(rect.right_bottom()-Vec2::new(8.0,8.0),egui::Align2::RIGHT_BOTTOM,format!("{}:{:02}",duration/60,duration%60),FontId::proportional(12.0),Color32::WHITE);}
+        }
+        if response.clicked(){
+            if let Some(url)=if video {media.original.clone()}else{media.preview.clone()}{
+                if video {body_action=Some(BubbleAction::OpenVideo{url,name:media.name.clone()});}
+                else {body_action=Some(BubbleAction::OpenImagePopup{tex_key:key,full_url:url,title:"Hình ảnh".into(),sender:sender_label,time:msg.display_time()});}
+            }
+        }
+        if media.original.is_some() && ui.small_button("Lưu về máy").clicked(){body_action=Some(BubbleAction::SaveAttachment{url:media.original.clone().unwrap_or_default(),name:media.name.clone()});}
+        if !video {if let Some(caption)=msg.photo_caption(){ui.add(egui::Label::new(RichText::new(caption).color(text_col)).wrap());}}
+        return body_action;
     }
-    // Dedicated File / Video Attachment Card
-    let is_zalo_file_or_video = matches!(
-        msg.link_src.as_deref(),
-        Some("Tập tin Zalo") | Some("Video Zalo")
-    ) || trimmed_text.starts_with("[Tập tin]")
-        || trimmed_text.starts_with("[Video]")
-        || trimmed_text.starts_with("[Tin nhắn thoại]");
-    if is_zalo_file_or_video {
-        let is_vid =
-            msg.link_src.as_deref() == Some("Video Zalo") || trimmed_text.starts_with("[Video]");
-        let title_str = msg
-            .link_title
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(trimmed_text);
-        let sub_str = msg.link_src.as_deref().unwrap_or(if is_vid {
-            "Video đính kèm"
-        } else {
-            "Tập tin đính kèm"
-        });
-        let link_col = if pal.is_dark {
-            Color32::from_rgb(97, 175, 239)
-        } else {
-            pal.primary
-        };
-        let resp = ui
-            .add(
-                egui::Label::new(RichText::new(title_str).size(13.8).color(text_col).strong())
-                    .wrap()
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                open_external_url(url);
-            }
-        }
-        ui.add_space(2.0);
-        let dom_resp = ui
-            .add(
-                egui::Label::new(RichText::new(sub_str).size(12.5).color(link_col))
-                    .sense(Sense::click()),
-            )
-            .on_hover_cursor(CursorIcon::PointingHand);
-        if dom_resp.clicked() {
-            if let Some(url) = msg.link_url.as_deref().filter(|u| !u.is_empty()) {
-                open_external_url(url);
-            }
-        }
+    if media.kind == crate::message_view::MediaKind::File {
+        ui.add(egui::Label::new(RichText::new(&media.name).strong().color(text_col)).wrap());
+        if let Some(url)=media.original {
+            if ui.button("Lưu về máy…").clicked(){return Some(BubbleAction::SaveAttachment{url,name:media.name});}
+        }else{ui.label(RichText::new("Không còn đường dẫn tải tệp").color(pal.text_muted));}
         return None;
     }
 
@@ -1767,6 +1339,8 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    SaveAttachment {url:String,name:String},
+    OpenVideo {url:String,name:String},
     RetrySend,
     DoubleClickReply,
     Reply,
@@ -1794,7 +1368,7 @@ pub(super) fn bubble_context_menu(
     ui: &mut egui::Ui,
     bubble: &egui::Response,
     msg: &ChatMessage,
-    idx: usize,
+    _idx: usize,
     _pal: &ThemePalette,
     emoji_textures: &HashMap<String, TextureHandle>,
     _has_interactive_card: bool,
@@ -1809,7 +1383,7 @@ pub(super) fn bubble_context_menu(
     }
     let resp = ui.interact(
         bubble.rect,
-        Id::new(("bubble_ctx", idx, msg.ts, &msg.id)),
+        Id::new(("bubble_ctx", msg.ts, &msg.id)),
         Sense::click(),
     );
     let mut action = None;

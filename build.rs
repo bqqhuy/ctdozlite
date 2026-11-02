@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if target_os == "windows" && target_env == "msvc" {
         // Optional Windows N media components must not prevent the GUI from loading.
         // windows_video checks/loads System32 DLLs before calling delay imports.
-        for dll in ["mfplat.dll", "mfreadwrite.dll", "mf.dll"] {
+        for dll in ["mfplat.dll", "mfreadwrite.dll", "mf.dll", "mfplay.dll"] {
             println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
         }
         println!("cargo:rustc-link-arg=/DEFAULTLIB:delayimp");

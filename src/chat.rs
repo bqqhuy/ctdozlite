@@ -487,9 +487,6 @@ impl ChatMessage {
             None
         }) {
             self.link_src = Some(kind.into());
-            if kind == "Hình ảnh Zalo" && self.link_thumb.is_none() {
-                self.link_thumb = self.link_url.clone();
-            }
         }
         if self.link_src.as_deref() == Some("Hình ảnh Zalo") {
             self.kind = crate::message_model::MessageKind::Photo;
@@ -1119,9 +1116,11 @@ pub(crate) fn merge_sent_message(thread: &mut Thread, mut message: ChatMessage) 
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
     target: &mut Thread,
-    incoming: Thread,
+    mut incoming: Thread,
     incoming_id_is_authoritative: bool,
 ) {
+    crate::message_view::remove_call_logs(&mut incoming);
+    crate::message_view::remove_call_logs(target);
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
         target.id = incoming.id;
     }
@@ -4502,7 +4501,7 @@ fn extract_link_info(v: &Value) -> LinkInfo {
             };
             let thumb = o
                 .get("thumb")
-                .or_else(|| o.get("hd"))
+                .or_else(|| o.get("thumbUrl"))
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|t| {

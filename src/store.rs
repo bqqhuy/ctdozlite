@@ -790,10 +790,15 @@ impl MessageStore {
                     existing.is_pinned = existing.is_pinned || cm.is_pinned;
                     existing.is_starred = existing.is_starred || cm.is_starred;
                 } else {
+                    if crate::message_view::is_call_log(&cm) {
+                        if t.presentation.last_message_id==cm.id {t.presentation.last_message_ts=0;t.presentation.last_message_id.clear();t.preview.clear();t.time.clear();}
+                        continue;
+                    }
                     t.messages.push(cm);
                     loaded_count += 1;
                 }
             }
+            crate::message_view::remove_call_logs(t);
             if !t.messages.is_empty() {
                 t.messages.sort_by_key(|m| m.ts);
                 if let Some(newest) = t.messages.last() {

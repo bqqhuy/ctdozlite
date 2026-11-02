@@ -162,6 +162,12 @@ pub fn search(store: &MessageStore, query: &str, hidden: bool) -> Result<Vec<Sea
             | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
         move |ctx| Ok(fold(&ctx.get::<String>(0)?)),
     )?;
+    store.conn.create_scalar_function("ctdo_visible",2,rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC|rusqlite::functions::FunctionFlags::SQLITE_UTF8,|ctx|{
+        let id=ctx.get::<String>(0)?;if id.starts_with("call_"){return Ok(false);}
+        let raw=ctx.get::<String>(1)?;let mut m=ChatMessage{id,..Default::default()};
+        if raw.len()<=1024*1024 {if let Ok(v)=serde_json::from_str::<serde_json::Value>(&raw){if let Some(state)=v.get("message_state"){let _=m.restore_state(state);}else{m.history_source=Some(v);}}}
+        Ok(!crate::message_view::is_call_log(&m))
+    })?;
     let pattern = format!(
         "%{}%",
         needle
@@ -169,7 +175,7 @@ pub fn search(store: &MessageStore, query: &str, hidden: bool) -> Result<Vec<Sea
             .replace('%', "!%")
             .replace('_', "!_")
     );
-    let mut statement=store.conn.prepare("SELECT m.thread_id,m.msg_id,COALESCE(m.text,''),m.ts,COALESCE(t.name,m.thread_id) FROM messages m LEFT JOIN threads t ON t.thread_id=m.thread_id LEFT JOIN thread_preferences p ON p.thread_id=m.thread_id WHERE (?2 OR COALESCE(p.is_hidden,0)=0) AND ctdo_fold(COALESCE(m.text,'')) LIKE ?1 ESCAPE '!' ORDER BY m.ts DESC LIMIT 50")?;
+    let mut statement=store.conn.prepare("SELECT m.thread_id,m.msg_id,COALESCE(m.text,''),m.ts,COALESCE(t.name,m.thread_id) FROM messages m LEFT JOIN threads t ON t.thread_id=m.thread_id LEFT JOIN thread_preferences p ON p.thread_id=m.thread_id WHERE (?2 OR COALESCE(p.is_hidden,0)=0) AND m.msg_id NOT GLOB 'call_*' AND COALESCE(m.msg_type,'') NOT IN ('chat.call','call','voip') AND ctdo_visible(m.msg_id,COALESCE(m.raw_json,'')) AND ctdo_fold(COALESCE(m.text,'')) LIKE ?1 ESCAPE '!' ORDER BY m.ts DESC LIMIT 50")?;
     let rows = statement.query_map(params![pattern, hidden], |r| {
         Ok(SearchHit {
             thread_id: r.get(0)?,

@@ -22,6 +22,8 @@ impl ZaloGuiApp {
         self.quote_jump = None;
         self.phone_sync_running = false;
         self.phone_sync_status.clear();
+        self.phone_download_status.clear();
+        self.phone_import_status.clear();
         self.history_sync_running = false;
         self.history_sync_status.clear();
         self.refresh_sync_running = false;
@@ -57,13 +59,14 @@ impl ZaloGuiApp {
         }
         egui::TopBottomPanel::bottom("main_sync_status")
             .resizable(false)
+            .exact_height(92.0)
             .frame(
                 egui::Frame::none()
                     .fill(pal.bg_app)
                     .inner_margin(Margin::symmetric(12.0, 8.0)),
             )
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
+                ui.horizontal(|ui| {
                     if running {
                         ui.spinner();
                     }
@@ -94,18 +97,12 @@ impl ZaloGuiApp {
                         self.sync_notice_dismissed = true;
                     }
                 });
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(self.sync_status_message()).color(pal.text_primary),
-                    )
-                    .wrap(),
-                )
-                .on_hover_text(self.sync_status_message());
-                ui.label(
-                    RichText::new("Đồng bộ điện thoại cần xác nhận trên Zalo di động; chỉ lấy dữ liệu điện thoại còn giữ.")
-                        .size(11.5)
-                        .color(pal.text_muted),
-                );
+                let phone=self.phone_sync_running || (!self.phone_sync_status.is_empty() && !self.history_sync_running && !self.refresh_sync_running);
+                let download=if phone && !self.phone_download_status.is_empty(){self.phone_download_status.as_str()}else{self.sync_status_message()};
+                ui.add(egui::Label::new(RichText::new(download).color(pal.text_primary)).truncate()).on_hover_text(download);
+                let importing=if phone && !self.phone_import_status.is_empty(){self.phone_import_status.as_str()}else{"Tiến độ chi tiết nằm trong mục Đồng bộ"};
+                ui.add(egui::Label::new(RichText::new(importing).color(pal.text_secondary)).truncate()).on_hover_text(importing);
+
             });
     }
 
@@ -1050,16 +1047,7 @@ impl ZaloGuiApp {
                                     }
                                 }
 
-                                // Snippet with `Bạn:` prefix when latest message is outgoing
-                                let last_outgoing =
-                                    t.messages.last().map(|m| m.is_outgoing).unwrap_or(false);
-                                let raw_preview = if t.preview.is_empty() {
-                                    "Chưa có tin nhắn".to_string()
-                                } else if last_outgoing && !t.preview.starts_with("Bạn:") {
-                                    format!("Bạn: {}", t.preview)
-                                } else {
-                                    t.preview.clone()
-                                };
+                                let raw_preview = crate::message_view::preview(t);
                                 let unread_n = self.unread_counts.get(&t.id).copied().unwrap_or(0);
                                 let max_snip_chars = if is_compact_w {
                                     16
@@ -1291,7 +1279,7 @@ impl ZaloGuiApp {
 
         if show_info_drawer {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
-                let shared_photos: Vec<(String, String, String, String)> = self
+                let shared_photos: Vec<(String, crate::message_view::Media)> = self
                     .threads
                     .get(self.selected_thread_index)
                     .map(|t| {
@@ -1299,25 +1287,10 @@ impl ZaloGuiApp {
                             .iter()
                             .rev()
                             .filter_map(|m| {
-                                let is_photo = m.is_photo()
-                                    || m.text.trim() == "[Hình ảnh]"
-                                    || m.text.trim().starts_with("[Hình ảnh] ");
-                                if !is_photo {
-                                    return None;
-                                }
-                                let thumb = m
-                                    .link_thumb
-                                    .as_deref()
-                                    .or(m.link_url.as_deref())
-                                    .filter(|u| !u.is_empty())?;
-                                let full = m.link_url.as_deref().unwrap_or(thumb).to_string();
-                                let title = "Hình ảnh đã chia sẻ".to_string();
-                                Some((
-                                    format!("thumb_{}", crate::crypto::md5_hex(thumb)),
-                                    thumb.to_string(),
-                                    full,
-                                    title,
-                                ))
+                                let media=crate::message_view::media(m);
+                                if !matches!(media.kind,crate::message_view::MediaKind::Photo|crate::message_view::MediaKind::Video) {return None;}
+                                let thumb=media.thumbnail.as_deref().filter(|u|!u.is_empty())?;
+                                Some((format!("thumb_{}",crate::crypto::md5_hex(thumb)),media))
                             })
                             .take(9)
                             .collect()
@@ -1493,21 +1466,22 @@ impl ZaloGuiApp {
                                 } else {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                                        for (tkey, thumb_u, full_u, ptitle) in &shared_photos {
-                                            if !self.sticker_textures.contains_key(tkey)
+                                        for (tkey, media) in &shared_photos {
+                                            let (cell_r, cell_resp) = ui.allocate_exact_size(Vec2::splat(74.0), Sense::click());
+                                            let thumb_u=media.thumbnail.as_deref().unwrap_or_default();
+                                            let full_u=media.preview.as_deref().unwrap_or_default();
+                                            let ptitle=&media.name;
+                                            if ui.is_rect_visible(cell_r) && !self.sticker_textures.contains_key(tkey)
                                                 && self.loading_stickers.insert(tkey.clone())
                                             {
                                                 if let Some(tx) = WORKER_TX.get() {
                                                     let _ = tx.send(WorkerCmd::FetchStickerImage {
                                                         key: tkey.clone(),
-                                                        url: thumb_u.clone(),
+                                                        url: thumb_u.to_owned(),
                                                     });
                                                 }
                                             }
-                                            let (cell_r, cell_resp) = ui.allocate_exact_size(
-                                                Vec2::splat(74.0),
-                                                Sense::click(),
-                                            );
+
                                             ui.painter().rect_filled(
                                                 cell_r,
                                                 Rounding::same(8.0),
@@ -1531,6 +1505,10 @@ impl ZaloGuiApp {
                                                     pal.text_muted,
                                                 );
                                             }
+                                            if media.kind==crate::message_view::MediaKind::Video {
+                                                let c=cell_r.center();ui.painter().circle_filled(c,14.0,Color32::from_black_alpha(150));
+                                                ui.painter().add(egui::Shape::convex_polygon(vec![c+Vec2::new(-4.0,-7.0),c+Vec2::new(8.0,0.0),c+Vec2::new(-4.0,7.0)],Color32::WHITE,Stroke::NONE));
+                                            }
                                             ui.painter().rect_stroke(
                                                 cell_r,
                                                 Rounding::same(8.0),
@@ -1545,13 +1523,18 @@ impl ZaloGuiApp {
                                             );
                                             if cell_resp
                                                 .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text("Xem ảnh phóng to")
+                                                .on_hover_text(if media.kind==crate::message_view::MediaKind::Video {"Phát video"}else{"Xem ảnh phóng to"})
                                                 .clicked()
                                             {
+                                                if media.kind == crate::message_view::MediaKind::Video {
+                                                    if let (Some(tx),Some(url))=(WORKER_TX.get(),media.original.clone()) {let _=tx.send(WorkerCmd::DownloadMedia{url,name:media.name.clone(),play:true});}
+                                                    continue;
+                                                }
                                                 self.image_viewer = Some(ImageViewerModal {
                                                     tex_key: tkey.clone(),
                                                     hd_tex_key: None,
-                                                    full_url: full_u.clone(),
+                                                    full_url: full_u.to_owned(),
+                                                    original_url: media.original.clone().unwrap_or_default(),
                                                     title: ptitle.clone(),
                                                     sender: d_name.clone(),
                                                     time: String::new(),
@@ -1887,6 +1870,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         self.active_call = Some(ActiveCallOverlay {
+                                            call_id: None,
                                             partner_id: thread_id.clone(),
                                             partner_name: thread_name.clone(),
                                             is_video: true,
@@ -1938,6 +1922,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         self.active_call = Some(ActiveCallOverlay {
+                                            call_id: None,
                                             partner_id: thread_id.clone(),
                                             partner_name: thread_name.clone(),
                                             is_video: false,
@@ -2489,10 +2474,11 @@ impl ZaloGuiApp {
                     }
                     let render_limit = self.chat_render_window.1;
                     let msg_area_height =
-                        (ui.available_height() - 66.0 - picker_reserve - composer_extra_height(&self.input_message)).max(100.0);
+                        (ui.available_height() - 82.0 - picker_reserve - composer_extra_height(&self.input_message)).max(0.0);
 
                     egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
+                        .min_scrolled_height(0.0)
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
                         .stick_to_bottom(jump_index.is_none())
@@ -2564,6 +2550,7 @@ impl ZaloGuiApp {
                                                 .iter()
                                                 .enumerate()
                                                 .filter(|(_, m)| {
+                                                    if crate::message_view::is_call_log(m){return false;}
                                                     (!only_starred || m.is_starred)
                                                         && (in_chat_q.is_empty()
                                                             || matches_vn_query(
@@ -2702,6 +2689,12 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                BubbleAction::SaveAttachment {url,name} => {
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false});}
+                                }
+                                BubbleAction::OpenVideo {url,name} => {
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true});}
+                                }
                                 BubbleAction::RetrySend => {
                                     if let Some(tx) = WORKER_TX.get() {
                                         let thread_id = self.threads[self.selected_thread_index].id.clone();
@@ -2790,6 +2783,7 @@ impl ZaloGuiApp {
                                 }
                                 BubbleAction::CallAgain { is_video } => {
                                     self.active_call = Some(ActiveCallOverlay {
+                                            call_id: None,
                                         partner_id: thread_id.clone(),
                                         partner_name: thread_name.clone(),
                                         is_video,
@@ -2885,6 +2879,7 @@ impl ZaloGuiApp {
                                     self.image_viewer = Some(ImageViewerModal {
                                         tex_key,
                                         hd_tex_key,
+                                        original_url: crate::message_view::media(&m).original.unwrap_or_else(||full_url.clone()),
                                         full_url,
                                         title,
                                         sender,
@@ -3474,6 +3469,7 @@ impl ZaloGuiApp {
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
         self.render_tools_panel(ctx);
+        self.render_downloads(ctx);
     }
 }
 
