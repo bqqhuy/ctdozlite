@@ -49,6 +49,39 @@ if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'Cannot read package version'
 if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
     throw "Release tag must match Cargo version: expected v$version"
 }
+# Inspect embedded resources from the finished ARM64 PE, not source strings.
+$properties = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
+if ($properties.ProductVersion -ne $version -or $properties.OriginalFilename -ne 'ctdozlite.exe') {
+    throw 'Embedded version resource does not match the package'
+}
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class NativeManifestResources {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] public static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")] public static extern uint SizeofResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")] public static extern bool FreeLibrary(IntPtr module);
+}
+'@
+$module = [NativeManifestResources]::LoadLibraryExW($binary, [IntPtr]::Zero, 0x22)
+if ($module -eq [IntPtr]::Zero) { throw 'Cannot load PE resources for inspection' }
+try {
+    $resource = [NativeManifestResources]::FindResourceW($module, [IntPtr]1, [IntPtr]24)
+    if ($resource -eq [IntPtr]::Zero) { throw 'ARM64 application manifest is missing' }
+    $size = [NativeManifestResources]::SizeofResource($module, $resource)
+    $data = [NativeManifestResources]::LockResource([NativeManifestResources]::LoadResource($module, $resource))
+    if ($size -eq 0 -or $data -eq [IntPtr]::Zero) { throw 'Cannot read application manifest' }
+    $manifest = [System.Runtime.InteropServices.Marshal]::PtrToStringUTF8($data, [int]$size)
+    [xml]$manifestXml = $manifest
+    if ($manifestXml.assembly.assemblyIdentity.processorArchitecture -ne 'arm64' -or $manifest -notmatch 'level="asInvoker"') {
+        throw 'Application manifest must declare ARM64 and standard-user privileges'
+    }
+    Write-Host "ARM64 resources verified: version=$version, asInvoker"
+} finally { [void][NativeManifestResources]::FreeLibrary($module) }
+
 New-Item -ItemType Directory -Force dist | Out-Null
 # Start the real DX12 renderer with fixture data, capture pixels and require an exit.
 # The fixture explicitly bypasses account restore and all network workers.

@@ -1,7 +1,12 @@
 //! Embed `src/assets/app_icon.ico` into the Windows PE executable (`RT_ICON` + `RT_GROUP_ICON`)
 //! by emitting a standard COFF/Win32 `.res` file in `OUT_DIR` without requiring external `rc.exe`.
 
-fn main() {
+#[path = "build_support/windows_resources.rs"]
+mod windows_resources;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build_support/windows_resources.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
 
@@ -17,10 +22,9 @@ fn main() {
             println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
         }
         println!("cargo:rustc-link-arg=/DEFAULTLIB:delayimp");
-        if let Err(e) = embed_windows_icon() {
-            println!("cargo:warning=Could not embed Windows icon resource: {e}");
-        }
+        embed_windows_icon()?;
     }
+    Ok(())
 }
 
 fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,6 +78,16 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     // 3. Emit RT_GROUP_ICON (type = 14) with ordinal 1 ("MAINICON")
     write_res_header(&mut res, grp_dir.len() as u32, 14, 1, 0x1030);
     res.extend_from_slice(&grp_dir);
+    align4(&mut res);
+
+    let version = std::env::var("CARGO_PKG_VERSION")?;
+    let version_resource = windows_resources::build_vs_version_info(&version);
+    write_res_header(&mut res, version_resource.len() as u32, 16, 1, 0x0030);
+    res.extend_from_slice(&version_resource);
+    align4(&mut res);
+    let manifest = windows_resources::build_windows_manifest(&version);
+    write_res_header(&mut res, manifest.len() as u32, 24, 1, 0x1030);
+    res.extend_from_slice(manifest.as_bytes());
     align4(&mut res);
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);

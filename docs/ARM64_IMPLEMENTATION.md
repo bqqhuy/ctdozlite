@@ -126,3 +126,15 @@ Các khác biệt cần bảo toàn khi tích hợp tiếp:
 **Trở ngại native CI hiện tại:** yêu cầu chạy workflow trả HTTP 422, `Actions has been disabled for this repository.` API đọc quyền Actions trả 403 với kết nối hiện có. Chưa có native run hoặc bộ cài cho bản sửa sau `81a90d6`. Cần chủ repo bật GitHub Actions, sau đó chạy lại workflow `Windows ARM64 (native build)` trên nhánh `fix/windows-arm64-product`.
 
 Rà soát chi tiết 13 commit mới, các phát hiện và fixture tái hiện: [UPSTREAM_REVIEW_2026-11-02.md](UPSTREAM_REVIEW_2026-11-02.md).
+
+## Tích hợp chọn lọc relay/SFU, menu và metadata Windows
+
+Đã đưa phần sửa cuộc gọi nhóm từ upstream `23f06b7`/snapshot `20e742c` vào runtime, giữ Media Foundation và credential/session của fork. Chọn relay theo probe và `callSetting`, init/ping/end nhóm, SFU subscription/layer, RTP extensions; audio trộn theo SSRC, tối đa hai video từ xa có decoder riêng. Chỉ quảng bá tầng 320×240 đang encode. Khi mở phòng nhóm thất bại, không tự gọi 1-1 cho mọi thành viên. Đây là triển khai mã nguồn có fixture, **chưa chứng nhận cuộc gọi nhóm thật**, đặc biệt nhận cuộc gọi nhóm, NAT và thay đổi thành viên. Xem ADR-0003 và `re-notes/09_group_sfu_arm64.md`.
+
+Menu chuột phải hội thoại: ghim, tắt/bật thông báo, ẩn/hiện, đánh dấu đã đọc và xóa lịch sử sau xác nhận. Tùy chọn chỉ áp dụng trên máy này, lưu riêng tài khoản; công tắc hiện hội thoại đã ẩn cho phép phục hồi. Không phải khóa PIN hoặc thay đổi quyền riêng tư server. Schema SQLite lên 3; bản cũ chỉ hỗ trợ schema 2 sẽ từ chối DB mới. Không hạ schema hoặc xóa DB để rollback. Xem ADR-0004.
+
+Metadata Windows: version resource theo Cargo, tên file gốc, manifest `arm64`/`asInvoker`/Windows compatibility. Build giữ CRT tĩnh, DLL media delay-load và phát sinh resource theo target; lỗi tạo resource làm build thất bại. CI kiểm tra version/manifest đọc từ PE đã build. Chưa có bằng chứng metadata này loại bỏ cảnh báo Defender/SmartScreen; app vẫn chưa ký số.
+
+Đây là tích hợp chọn lọc, chưa nhập toàn bộ 13 commit upstream. Feed/updater/scheduler/REST-MCP vẫn ngoài bản tích hợp này.
+
+Kiểm chứng bản tích hợp chọn lọc: **172 unit + 32 integration đạt**, 2 unit cố ý ignore (benchmark/live-call); fmt và clippy strict đạt. Module video cùng test biên dịch qua target Windows ARM64. Chưa có kiểm chứng native runner cho commit này cho đến khi Actions chạy lại thành công.
