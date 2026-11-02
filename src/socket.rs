@@ -88,16 +88,6 @@ fn trace(msg: impl std::fmt::Display) {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
-    }
-}
-
 /// Encode one frame: `u8 version | u16 LE cmd | u8 subCmd | JSON body`.
 pub fn encode_frame(cmd: u16, sub_cmd: u8, version: u8, data: Option<&Value>) -> Vec<u8> {
     let body = data.map(|d| d.to_string()).unwrap_or_default();
@@ -478,7 +468,7 @@ async fn run_once(
     epoch: u64,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
-    trace(format!("connect {url}"));
+    trace(format!("connect {}", crate::session::redact_url(&url)));
 
     let mut req = url.clone().into_client_request()?;
     {
@@ -558,7 +548,7 @@ async fn run_once(
                 let buf = match incoming {
                     Message::Binary(b) => b,
                     Message::Text(t) => {
-                        trace(format!("<- text {}", truncate(t.as_str(), 200)));
+                        trace(format!("<- text {} bytes", t.len()));
                         continue;
                     }
                     Message::Ping(p) => {
@@ -577,8 +567,8 @@ async fn run_once(
                 let encrypt = envelope.get("encrypt").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let err = envelope.get("error_code").and_then(|v| v.as_i64());
                 trace(format!(
-                    "<- v{version} cmd={cmd} sub={sub_cmd} enc={encrypt} err={err:?} {}",
-                    truncate(&envelope.to_string(), 300)
+                    "<- v{version} cmd={cmd} sub={sub_cmd} enc={encrypt} err={err:?} {} bytes",
+                    buf.len()
                 ));
 
                 if cmd == CMD_AUTHEN {
@@ -594,10 +584,10 @@ async fn run_once(
                     let raw = envelope.get("data").and_then(|v| v.as_str()).unwrap_or_default();
                     let plain = decrypt_payload(cipher_key.as_deref(), encrypt, raw)?;
                     let text = String::from_utf8_lossy(&plain).into_owned();
-                    trace(format!("auth body {}", truncate(&text, 1200)));
+                    trace(format!("auth body {} bytes", text.len()));
                     let auth: Value = serde_json::from_str(&text)?;
                     if auth.get("error_code").and_then(|v| v.as_i64()) != Some(0) {
-                        return Err(anyhow!("auth rejected: {text}"));
+                        return Err(anyhow!("auth rejected"));
                     }
                     authed = true;
                     ready.send_replace(Some(epoch));
