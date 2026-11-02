@@ -1,40 +1,108 @@
-# ctdozlite — Windows 11 ARM64
+# ctdozlite · Windows 11 ARM64
 
-Fork dành riêng cho **Windows 11 ARM64** (Snapdragon / Windows on Arm), viết bằng Rust. Gói phát hành là PE ARM64 native, không chạy qua giả lập x64. Dựa trên [ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite); đây là client không chính thức, không được Zalo bảo trợ.
+Ứng dụng Zalo cộng đồng viết bằng **Rust**, dành riêng cho **Windows 11 trên ARM64**. Giao diện dùng egui và Direct3D 12; audio/video sử dụng các thành phần native của Windows.
 
-[Build Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/workflows/windows-arm64.yml) · [Releases](https://github.com/bqqhuy/ctdozlite/releases) · [Hướng dẫn](docs/WINDOWS_ARM64.md) · [Audit và giới hạn](docs/ARM64_IMPLEMENTATION.md)
+Dự án này là fork của **[ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite)**. Nền tảng mã nguồn, nghiên cứu giao thức và nhiều tính năng bắt nguồn từ upstream cùng các tác giả đóng góp. Fork do [bqqhuy](https://github.com/bqqhuy/ctdozlite) duy trì để hoàn thiện trải nghiệm Windows on Arm.
 
-## Cài đặt
+[GitHub Actions](https://github.com/bqqhuy/ctdozlite/actions/workflows/windows-arm64.yml) · [Releases](https://github.com/bqqhuy/ctdozlite/releases) · [Hướng dẫn Windows ARM64](docs/WINDOWS_ARM64.md) · [Audit kỹ thuật](docs/ARM64_IMPLEMENTATION.md)
 
-Yêu cầu Windows 11 ARM64, build 22000 trở lên. Chọn `*-setup-windows-arm64.exe` để cài hoặc `*-portable-windows-arm64.exe` để chạy trực tiếp. Kiểm tra SHA-256 trong `SHA256SUMS-windows-arm64.txt` đi kèm đúng bản phát hành. Artifact trên Actions là bản kiểm thử của commit/PR, chưa mặc nhiên là bản ổn định.
+## Mục tiêu của bản fork
 
-Khởi chạy GUI mặc định và đăng nhập bằng QR. Không cần Node.js, Electron, FFmpeg hay VC++ Redistributable riêng. Video sử dụng Media Foundation/H.264 của Windows; Windows N cần Media Feature Pack. Cho phép ứng dụng desktop truy cập microphone/camera trong Windows Settings → Privacy & security.
+Chạy ứng dụng ARM64 native trên máy Windows 11 dùng Snapdragon, với giao diện desktop, khay hệ thống, lịch sử theo tài khoản và media trong cùng tiến trình. Không cần cài Node.js, Electron, FFmpeg hoặc VC++ Redistributable riêng.
 
-## Chức năng và phạm vi
+Thiết bị đích được người dùng cung cấp: **Huawei MateBook E Go Gen 3 — Snapdragon 8cx Gen 3**. Kiểm thử CI hiện chưa thay thế được kiểm chứng GPU, camera, microphone và cuộc gọi trên thiết bị này.
 
-- Giao diện Rust/egui, renderer Direct3D 12; khung cửa sổ Windows hỗ trợ kéo, resize, Snap và Snap. X/Alt+F4 ẩn xuống tray; click trái hoặc phải icon để chọn **Mở Apps** / **Thoát Apps**.
-- Nhắn tin, nhóm, tệp/ảnh/sticker và lịch sử SQLite theo tài khoản; phiên đăng nhập được bảo vệ bằng Windows DPAPI.
-- Cập nhật hội thoại/tin gần đây tách riêng với tải lịch sử nhóm và Cloud theo trang. Có tiến độ, dừng và tiếp tục; không cam kết lấy lại dữ liệu server đã xóa hoặc toàn bộ lịch sử chat cá nhân từ điện thoại.
-- Audio WASAPI qua CPAL/Opus; camera và H.264 qua Media Foundation trong tiến trình ARM64. Cuộc gọi dùng giao thức riêng của Zalo; khả năng tương tác cuộc gọi đi/đến cần xác nhận với tài khoản và thiết bị thật. Gọi nhóm chưa được hỗ trợ.
-- Không hiển thị người khác online khi chưa có dữ liệu presence thực. Một số tùy chọn kế thừa chỉ lưu trên máy, chưa thay đổi thiết lập quyền riêng tư phía server; xem audit.
+## Tải và cài đặt
 
-Build/test tự động không thay thế kiểm tra đăng nhập, đồng bộ và cuộc gọi trên máy người dùng. Xem [ma trận kiểm chứng](docs/ARM64_IMPLEMENTATION.md) trước khi dùng làm client chính.
+**Yêu cầu:** Windows 11 ARM64, build 22000 trở lên. Windows N cần **Media Feature Pack** để dùng camera/video.
 
-## Build native
+- **Bản phát hành:** tải từ [Releases của fork](https://github.com/bqqhuy/ctdozlite/releases), đọc ghi chú của đúng phiên bản.
+- **Bản thử nghiệm:** vào [Actions](https://github.com/bqqhuy/ctdozlite/actions/workflows/windows-arm64.yml), chọn lần chạy thành công của nhánh/commit cần thử, tải artifact **`ctdozlite-windows-arm64`**.
 
-Trên Windows 11 ARM64: cài Visual Studio 2022 Build Tools với ARM64 MSVC + Windows SDK, Rust ARM64, CMake, LLVM và Inno Setup 6.7.1 trở lên. Toolchain Rust được ghim trong `rust-toolchain.toml`.
+Các thay đổi mới đang được tập hợp tại [PR #2](https://github.com/bqqhuy/ctdozlite/pull/2). Bản trong Releases có thể chưa chứa các thay đổi trên nhánh này.
+
+| Tệp trong gói | Cách dùng |
+| :--- | :--- |
+| `ctdozlite-<version>-setup-windows-arm64.exe` | Cài ứng dụng bằng trình hướng dẫn. |
+| `ctdozlite-<version>-portable-windows-arm64.exe` | Chạy trực tiếp. |
+| `SHA256SUMS-windows-arm64.txt` | Đối chiếu SHA-256 của các tệp đi kèm. |
+| `build-info-windows-arm64.json` | Xem commit, target, renderer và thông tin build. |
+
+Có thể kiểm tra checksum trong PowerShell:
 
 ```powershell
-rustup set default-host aarch64-pc-windows-msvc
-./scripts/build-windows-arm64.ps1
+Get-FileHash .\ctdozlite-<version>-setup-windows-arm64.exe -Algorithm SHA256
 ```
 
-Script chạy test, build release, kiểm tra PE `0xAA64`, dependency DLL, khởi chạy GUI kiểm thử và đóng gói vào `dist/`. Workflow duy nhất tạo bộ cài và portable Windows ARM64. Tài liệu giao thức và kiểm thử debug được giữ để bảo trì; chúng không phải nền tảng phát hành khác.
+Thay `<version>` bằng phiên bản đã tải và so sánh với tệp checksum cùng gói. Ứng dụng cài bên trong là **PE ARM64**; trình cài Inno Setup dùng bootstrap x86. Bộ cài hiện **chưa ký số**.
 
-## Mã nguồn và giấy phép
+## Bắt đầu sử dụng
 
-MIT hoặc Apache-2.0; giữ ghi nhận tác giả upstream trong Git history và các file giấy phép. [Giao thức](docs/GIAO_THUC_ZALO.md), `re-notes/` và công cụ đọc log phục vụ chẩn đoán; không đưa log chứa dữ liệu tài khoản lên issue công khai.
+1. Mở ứng dụng và đăng nhập bằng mã QR.
+2. Cho phép ứng dụng desktop truy cập camera/microphone trong **Windows Settings → Privacy & security** nếu cần gọi.
+3. Chọn thiết bị trong phần Cài đặt của ứng dụng.
+4. Chờ cập nhật hội thoại; dùng mục đồng bộ để theo dõi việc tải lịch sử nhóm và Cloud.
 
-Zalo và các nhãn hiệu liên quan thuộc VNG. Fork cộng đồng này độc lập, không phải ứng dụng chính thức và không được VNG bảo trợ. Ghi nhận tác giả dự án gốc: [ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite).
+**Đóng cửa sổ:** bấm **X** hoặc **Alt+F4** để ẩn xuống tray. Bấm chuột trái hoặc phải vào biểu tượng tray để mở menu **Mở Apps** / **Thoát Apps**. Chọn **Thoát Apps** để kết thúc ứng dụng.
 
-Ghi nhận đóng góp upstream của Thuong Tin và các tác giả khác; lịch sử Git được giữ nguyên.
+## Các chức năng hiện có
+
+| Phần | Hành vi |
+| :--- | :--- |
+| Giao diện | Renderer DX12, thanh tiêu đề Windows, kéo/đổi kích thước/Snap; Settings có cuộn và bố cục thích ứng. |
+| Tin nhắn | Hội thoại cá nhân/nhóm, gửi tin, ảnh/tệp/sticker; lưu lịch sử bằng SQLite theo tài khoản. |
+| Đồng bộ | Tự cập nhật sau đăng nhập; tải lịch sử nhóm/Cloud theo trang, có tiến độ, dừng và tiếp tục. |
+| Tên nhóm | Tải metadata nhóm và giữ tên đã lưu khi cập nhật gặp lỗi. |
+| Menu hội thoại | Ghim, tắt/bật thông báo, ẩn/hiện, đánh dấu đã đọc và xóa lịch sử có xác nhận. Các lựa chọn này áp dụng **trên máy này**. |
+| Phiên đăng nhập | Bảo vệ bằng Windows DPAPI, tùy chọn ghi nhớ đăng nhập, tách dữ liệu từng tài khoản. |
+| Audio/video | WASAPI/CPAL, Opus và Media Foundation/H.264 native; đã tích hợp relay/SFU nhóm, trộn audio theo nguồn và tối đa hai video từ xa. |
+| Tài nguyên | Giới hạn lịch sử giữ trong RAM, cache ảnh/texture và hàng đợi preview; lịch sử đầy đủ đã nhận vẫn ở SQLite. |
+
+Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đã ẩn**. Chức năng này không phải khóa PIN. Xóa lịch sử chỉ xóa bản lưu trên máy; đồng bộ sau đó có thể tải lại tin từ server.
+
+## Trạng thái kiểm chứng và giới hạn
+
+Bản mã nguồn tại [`7c1a416`](https://github.com/bqqhuy/ctdozlite/commit/7c1a416) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41370210700): **210 kiểm thử đạt**, kiểm tra PE/metadata, ảnh framebuffer DX12 và quy trình ẩn/mở/thoát từ tray. CI dùng GPU phần mềm Microsoft Basic Render Driver.
+
+Những điểm cần biết trước khi dùng:
+
+- **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
+- Chưa có API được kiểm chứng để tải lại toàn bộ lịch sử chat cá nhân cũ từ điện thoại. Không thể bảo đảm khôi phục dữ liệu server không còn cung cấp.
+- Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.
+- Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed, scheduler hoặc REST/MCP của upstream trong bản tích hợp này.
+- Database hiện dùng **schema 3**. Bản cũ chỉ hỗ trợ schema 2 sẽ từ chối mở; xem hướng dẫn rollback trong [ADR-0004](docs/adr/0004-local-conversation-menu.md).
+
+Đây là tích hợp có chọn lọc từ upstream, chưa phải bản sao đầy đủ mọi tính năng của upstream mới nhất. Chi tiết có trong [báo cáo đối chiếu commit](docs/UPSTREAM_REVIEW_2026-11-02.md) và [audit Windows ARM64](docs/ARM64_IMPLEMENTATION.md).
+
+## Build trên Windows 11 ARM64
+
+Chuẩn bị Visual Studio 2022 Build Tools với **ARM64 MSVC và Windows SDK**, Rust ARM64, CMake, LLVM và Inno Setup 6.7.1 trở lên. Phiên bản Rust được ghim trong [rust-toolchain.toml](rust-toolchain.toml).
+
+```powershell
+git clone https://github.com/bqqhuy/ctdozlite.git
+cd ctdozlite
+git switch fix/windows-arm64-product
+rustup set default-host aarch64-pc-windows-msvc
+.\scripts\build-windows-arm64.ps1
+```
+
+Script chạy kiểm thử, build release, kiểm tra PE ARM64 và metadata, thử renderer/tray rồi tạo gói trong `dist/`. Xem [hướng dẫn đầy đủ](docs/WINDOWS_ARM64.md) nếu cần cấu hình công cụ hoặc chẩn đoán lỗi build.
+
+## Báo lỗi và bảo vệ dữ liệu
+
+Tạo issue tại [repo của fork](https://github.com/bqqhuy/ctdozlite/issues), kèm commit/phiên bản, model máy, build Windows, cách tái hiện và tên/driver thiết bị liên quan. Với lỗi camera hoặc cuộc gọi, ghi rõ gọi đi hay gọi đến và loại mạng đang dùng.
+
+Không đưa session, cookie, IMEI, database hoặc log chứa nội dung chat lên issue công khai. DPAPI bảo vệ phiên đăng nhập; **database và cache chat chưa được mã hóa**. Đọc [SESSION_SECURITY.md](SESSION_SECURITY.md) trước khi chia sẻ thông tin chẩn đoán.
+
+## Credit và giấy phép
+
+**Cảm ơn dự án gốc [ctdoteam1110/ctdozlite](https://github.com/ctdoteam1110/ctdozlite) và các tác giả upstream.** Bản fork này phát triển tiếp trên công sức nghiên cứu giao thức, xây dựng client và cải thiện ứng dụng của cộng đồng upstream.
+
+- **ctdoteam1110 / thanhdo1110:** ghi nhận tác giả và bản quyền gốc theo [LICENSE-MIT](LICENSE-MIT); [thanhdo1110](https://github.com/thanhdo1110) có đóng góp về GUI và tái cấu trúc giao diện được upstream ghi nhận.
+- **[Thuong Tin / @thuongtin](https://github.com/thuongtin):** đóng góp upstream về thời gian, lưu phiên và các nền tảng xử lý message state, media/cache, updater. Phạm vi tích hợp vào fork được mô tả riêng trong audit.
+- **[Các tác giả và người đóng góp upstream](https://github.com/ctdoteam1110/ctdozlite/graphs/contributors):** nghiên cứu, mã nguồn, báo lỗi, kiểm thử và đề xuất tính năng. Lịch sử Git và các ghi nhận bản quyền được giữ nguyên.
+- **[bqqhuy](https://github.com/bqqhuy/ctdozlite):** duy trì fork chuyên Windows 11 ARM64 và các điều chỉnh dành cho Windows on Arm.
+
+Mã nguồn được phân phối theo **MIT hoặc Apache-2.0**: [LICENSE-MIT](LICENSE-MIT) · [LICENSE-APACHE](LICENSE-APACHE). Giấy phép và ghi nhận thư viện phụ thuộc nằm trong [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
+Zalo và các nhãn hiệu liên quan thuộc VNG. Đây là ứng dụng cộng đồng không chính thức, độc lập và không được Zalo/VNG bảo trợ.
