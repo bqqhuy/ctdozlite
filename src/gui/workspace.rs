@@ -1829,6 +1829,8 @@ impl ZaloGuiApp {
                                             .clicked()
                                         {
                                             self.info_drawer_open = !self.info_drawer_open;
+                                            self.settings.info_drawer_open=self.info_drawer_open;
+                                            if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PersistInfoDrawer{owner:self.user_uin.clone(),open:self.info_drawer_open});}
                                         }
                                     }
 
@@ -2473,8 +2475,18 @@ impl ZaloGuiApp {
                         );
                     }
                     let render_limit = self.chat_render_window.1;
+                    // Measure visual wrapping, not only explicit newlines: the info drawer
+                    // can leave a narrow editor even on a wide desktop window.
+                    let composer_compact=(ui.available_width()-44.0)<360.0;
+                    let composer_send_width=if composer_compact{52.0}else{76.0};
+                    let composer_schedule_width=if composer_compact{0.0}else{38.0};
+                    let composer_action_count=if ui.available_width()<230.0{0}else if ui.available_width()<300.0{1}else{3};
+                    let composer_spacing=match composer_action_count {0=>16.0,1=>24.0,_=>36.0};
+                    let composer_separator=if composer_action_count>0{8.0}else{0.0};
+                    let composer_input_width=(ui.available_width()-44.0-34.0*composer_action_count as f32-composer_separator-composer_send_width-composer_schedule_width-composer_spacing).max(32.0);
+                    let editor_height=composer_editor_height(ui,&self.input_message,composer_input_width);
                     let msg_area_height =
-                        (ui.available_height() - 82.0 - picker_reserve - composer_extra_height(&self.input_message)).max(0.0);
+                        (ui.available_height() - 48.0 - picker_reserve - editor_height).max(0.0);
 
                     egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
@@ -3053,10 +3065,11 @@ impl ZaloGuiApp {
                                 .stroke(Stroke::new(1.0_f32, pal.border))
                                 .inner_margin(Margin::symmetric(8.0, 5.0))
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_top(|ui| {
                                         ui.spacing_mut().item_spacing.x = 4.0;
 
-                                        // 1) Compact Sticker Icon Button
+                                        if composer_action_count==3 {
+                                        // Sticker and photo actions move into the send menu on narrow views.
                                         let (stk_rect, stk_resp) = ui.allocate_exact_size(
                                             Vec2::new(34.0, 34.0),
                                             Sense::click(),
@@ -3126,7 +3139,9 @@ impl ZaloGuiApp {
                                             }
                                         }
 
-                                        // 3) Compact File Upload Icon Button
+                                        }
+                                        if composer_action_count>0 {
+                                        // Keep a single attachment action when the full toolbar cannot fit.
                                         let (att_rect, att_resp) = ui.allocate_exact_size(
                                             Vec2::new(34.0, 34.0),
                                             Sense::click(),
@@ -3175,24 +3190,25 @@ impl ZaloGuiApp {
                                             [sep_r.center_top(), sep_r.center_bottom()],
                                             Stroke::new(1.0_f32, pal.border),
                                         );
-                                        // Responsive Borderless Input Field (shrinks gracefully down to 50px)
-                                        let send_btn_w = if is_narrow_w { 52.0 } else { 76.0 };
-                                        let input_w =
-                                            (ui.available_width() - send_btn_w - 12.0).max(50.0);
+                                        }
+                                        // Keep a usable editor and send action even at high DPI.
+                                        let send_btn_w = composer_send_width;
+                                        let input_w = composer_input_width;
                                         let composer_id = Id::new(("chat_composer_input", &thread_id));
                                         // Enter sends; Shift+Enter is left to the editor as a newline.
                                         // Only consumed while the composer owns focus, so other fields keep Enter.
-                                        let enter_send = ui.memory(|m| m.has_focus(composer_id))
+                                        let enter_send = self.quick_schedule.is_none() && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                                         let rows = composer_rows(&self.input_message);
                                         let text_edit =
                                             egui::TextEdit::multiline(&mut self.input_message)
+                                                .font(FontId::proportional(14.0))
                                                 .id(composer_id)
                                                 .frame(false)
-                                                .hint_text(format!(
+                                                .hint_text(if input_w<110.0 {"Nhập tin…".into()}else if input_w<180.0 {"Nhập tin nhắn…".into()}else{format!(
                                                     "Nhập tin nhắn tới {}...",
                                                     truncate_chars(&thread_name, 16)
-                                                ))
+                                                )})
                                                 .margin(Margin::symmetric(6.0, 7.0))
                                                 .desired_rows(rows)
                                                 .desired_width(input_w);
@@ -3202,7 +3218,8 @@ impl ZaloGuiApp {
                                             .max_width(input_w)
                                             .min_scrolled_width(input_w)
                                             .auto_shrink([false, true])
-                                            .max_height(COMPOSER_MAX_HEIGHT)
+                                            .min_scrolled_height(0.0)
+                                            .max_height(editor_height)
                                             .stick_to_bottom(true)
                                             .show(ui, |ui| ui.add(text_edit))
                                             .inner;
@@ -3263,6 +3280,14 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         }
+                                        if !composer_compact {
+                                            let (rect,button)=ui.allocate_exact_size(Vec2::splat(34.0),Sense::click());
+                                            let c=rect.center();let stroke=Stroke::new(1.6_f32,pal.text_secondary);
+                                            ui.painter().circle_stroke(c,8.0,stroke);
+                                            ui.painter().line_segment([c+Vec2::new(0.0,-5.0),c],stroke);
+                                            ui.painter().line_segment([c,c+Vec2::new(4.0,2.0)],stroke);
+                                            if button.on_hover_text("Hẹn giờ gửi tin nhắn").on_hover_cursor(CursorIcon::PointingHand).clicked(){self.open_quick_schedule();}
+                                        }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty()
                                             || self.pending_clipboard_image.is_some();
@@ -3270,6 +3295,9 @@ impl ZaloGuiApp {
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
                                         );
+                                        if self.smoke.is_some() && !ui.clip_rect().expand(1.0).contains_rect(send_rect) {
+                                            eprintln!("UI smoke failed: send button outside composer viewport");std::process::exit(3);
+                                        }
                                         let send_bg = if !can_send {
                                             pal.primary.linear_multiply(0.42)
                                         } else if send_resp.hovered() {
@@ -3282,7 +3310,7 @@ impl ZaloGuiApp {
                                             Rounding::same(8.0),
                                             send_bg,
                                         );
-                                        if !is_narrow_w {
+                                        if !composer_compact {
                                             ui.painter().text(
                                                 Pos2::new(
                                                     send_rect.left() + 15.0,
@@ -3312,6 +3340,17 @@ impl ZaloGuiApp {
                                         }
 
 
+                                        send_resp.context_menu(|ui|{
+                                            if ui.button("Nhãn dán…").clicked(){self.sticker_picker_open = !self.sticker_picker_open;ui.close_menu();}
+                                            for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
+                                                if ui.button(label).clicked(){
+                                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None});}
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                            if ui.button("Hẹn giờ gửi…").clicked(){self.open_quick_schedule();ui.close_menu();}
+                                            if ui.button("Quản lý lịch gửi").clicked(){self.tools.open=true;self.tools.tab=3;ui.close_menu();}
+                                        });
                                         let send_clicked = send_resp
                                             .on_hover_cursor(if can_send {
                                                 CursorIcon::PointingHand
@@ -3470,6 +3509,7 @@ impl ZaloGuiApp {
         self.render_settings_modal(ctx, pal);
         self.render_tools_panel(ctx);
         self.render_downloads(ctx);
+        self.render_quick_schedule(ctx,pal);
     }
 }
 
@@ -3670,8 +3710,7 @@ mod sync_and_order_tests {
     }
 }
 
-/// Highlight the exact resolved row and optionally center it in the message viewport.
-/// Composer grows with explicit lines up to five rows, then scrolls.
+/// Maximum explicit rows before the composer scrolls.
 const COMPOSER_MAX_ROWS: usize = 5;
 /// Approximate laid-out height of one 14px composer row.
 const COMPOSER_ROW_HEIGHT: f32 = 20.0;
@@ -3682,10 +3721,10 @@ fn composer_rows(text: &str) -> usize {
     text.split('\n').count().clamp(1, COMPOSER_MAX_ROWS)
 }
 
-/// Extra height the message list yields while the composer shows more than one row.
-fn composer_extra_height(text: &str) -> f32 {
-    let height = |rows: usize| (rows as f32 * COMPOSER_ROW_HEIGHT + 14.0).min(COMPOSER_MAX_HEIGHT);
-    height(composer_rows(text)) - height(1)
+/// Reserve visual wrapping too; explicit newline counts miss narrow editors.
+fn composer_editor_height(ui:&egui::Ui,text:&str,width:f32)->f32 {
+    let measured=ui.fonts(|f|f.layout(if text.is_empty(){" ".into()}else{text.to_owned()},FontId::proportional(14.0),Color32::WHITE,(width-12.0).max(1.0)).size().y);
+    (measured.max(COMPOSER_ROW_HEIGHT)+14.0).min(COMPOSER_MAX_HEIGHT)
 }
 
 fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
@@ -3813,11 +3852,19 @@ mod composer_tests {
         assert_eq!(composer_rows("một dòng"), 1);
         assert_eq!(composer_rows("a\nb\nc"), 3);
         assert_eq!(composer_rows("1\n2\n3\n4\n5\n6\n7"), 5);
-        assert_eq!(composer_extra_height("one"), 0.0);
-        assert!(composer_extra_height("a\nb") > 0.0);
-        assert_eq!(
-            composer_extra_height("1\n2\n3\n4\n5\n6"),
-            COMPOSER_MAX_HEIGHT - (COMPOSER_ROW_HEIGHT + 14.0)
-        );
+
     }
+    #[test]
+    fn wrapped_single_line_yields_message_space_and_stops_at_five_rows() {
+        let ctx=egui::Context::default();
+        let _=ctx.run(Default::default(),|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui| {
+                let short=composer_editor_height(ui,"Hi",200.0);
+                let wrapped=composer_editor_height(ui,&"Tiếng Việt có dấu và khoảng trắng. ".repeat(12),80.0);
+                assert!(wrapped>short);
+                assert_eq!(wrapped,COMPOSER_MAX_HEIGHT);
+            });
+        });
+    }
+
 }

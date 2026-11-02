@@ -30,6 +30,7 @@ pub(super) struct PresetSticker {
 
 /// Built-in featured Zalo sticker packs (`(cate_id, title)`).
 pub(super) const FEATURED_PACK_TABS: &[(u64, &str)] = &[
+    (crate::bundled_stickers::CATEGORY, "Mèo Ami Bụng Bự (GIF)"),
     (61900, "Zapy Dô Tri"),
     (12815, "Bé Hai"),
     (12748, "Cò Lõ Đi Làm"),
@@ -43,6 +44,9 @@ pub(super) const FEATURED_PACK_TABS: &[(u64, &str)] = &[
 ];
 
 pub(super) fn builtin_pack_stickers(cate_id: u64) -> Option<Vec<crate::chat::StickerItem>> {
+    if cate_id == crate::bundled_stickers::CATEGORY {
+        return Some(crate::bundled_stickers::ITEMS.iter().map(|item|crate::chat::StickerItem{sticker_id:item.id,cate_id,sticker_type:7,label:item.label.into()}).collect());
+    }
     let (name, ids): (&str, Vec<u64>) = match cate_id {
         61900 => ("Zapy Dô Tri", (98930..=98941).collect()),
         12815 => ("Bé Hai", (101001..=101030).collect()),
@@ -73,6 +77,10 @@ pub(super) fn builtin_pack_stickers(cate_id: u64) -> Option<Vec<crate::chat::Sti
 }
 
 pub(super) const POPULAR_STICKERS: &[PresetSticker] = &[
+    PresetSticker{sticker_id:999001,cate_id:crate::bundled_stickers::CATEGORY,sticker_type:7,label:"Mèo Ami Múa bụng"},
+    PresetSticker{sticker_id:999006,cate_id:crate::bundled_stickers::CATEGORY,sticker_type:7,label:"Mèo Ami Bắn tim"},
+    PresetSticker{sticker_id:999007,cate_id:crate::bundled_stickers::CATEGORY,sticker_type:7,label:"Mèo Ami Khóc"},
+    PresetSticker{sticker_id:999015,cate_id:crate::bundled_stickers::CATEGORY,sticker_type:7,label:"Mèo Ami Lắc mông"},
     PresetSticker {
         sticker_id: 18009,
         cate_id: 10130,
@@ -440,6 +448,9 @@ pub(super) fn instant_contextual_stickers_exact(
     let low = trimmed.to_lowercase();
     let folded = fold_vn_search(trimmed);
     let has_vn_diacritics = low != folded;
+    if matches!(low.as_str(),"mèo"|"mèo ami"|"mèo béo"|"mèo bụng bự"|"ami"|"meo"|"meo ami"|"meo beo"|"cat") {
+        return builtin_pack_stickers(crate::bundled_stickers::CATEGORY).map(|items|("mèo",items));
+    }
 
     // Match Zalo PC's `getSuggestionFromSentencesV2`:
     // - If input contains Vietnamese diacritics (`has_vn_diacritics == true`), only match exact accented

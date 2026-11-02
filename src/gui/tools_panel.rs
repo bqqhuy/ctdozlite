@@ -49,6 +49,7 @@ pub enum ToolsCommand {
         stickers: bool,
     },
     Schedule {
+        request: Option<u64>,
         thread: String,
         group: bool,
         text: String,
@@ -61,6 +62,7 @@ pub enum ToolsCommand {
 }
 
 pub enum ToolsResult {
+    ScheduleSaved {request:Option<u64>,thread:String,text:String,at:i64,result:Result<(),String>},
     Tasks {
         tasks: Vec<crate::tools::Scheduled>,
         paused: bool,
@@ -290,6 +292,7 @@ impl ZaloGuiApp {
                             }
                         } else {
                             ToolsCommand::Schedule {
+                                request: None,
                                 thread: id,
                                 group,
                                 text: self.tools.schedule_text.clone(),

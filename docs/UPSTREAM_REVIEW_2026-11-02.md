@@ -117,3 +117,7 @@ Upstream HEAD kiểm tra: **ed550f6** (v0.0.6), sau mốc `56ea374`. Commit iOS 
 - `ed550f6` sticker "Mèo Ami Bụng Bự", giao diện hẹn giờ mới: **không nhập** (bản quyền ảnh chưa rõ; fork đã có bộ hẹn giờ).
 
 Chi tiết quyết định: [ADR-0013](adr/0013-upstream-v006-selective-port.md).
+
+## Bổ sung theo yêu cầu ngày 03/11/2026
+
+Sau yêu cầu bổ sung `ed550f6`, nhận thêm bộ GIF Ami và UI hẹn giờ/persist drawer, nối vào upload/retry/scheduler hiện có của fork. Phần “không nhập” GIF/UI ở snapshot trên mô tả thời điểm trước yêu cầu mới; quyết định cập nhật ở [ADR-0016](adr/0016-upstream-v006-ui-and-bundled-gifs.md). Bảng trạng thái từng issue/PR, gồm cả các phần chưa đầy đủ, nằm trong [báo cáo 03/11](UPSTREAM_REQUEST_REVIEW_2026-11-03.md).

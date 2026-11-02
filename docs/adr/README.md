@@ -56,3 +56,4 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 
 - [0014 — Conservative pipelined phone sync](0014-conservative-pipelined-phone-sync.md)
 - [0015 — Native notifications and safe media presentation](0015-native-notices-and-media-presentation.md)
+- [0016 — Upstream v0.0.6 UI and bundled GIFs](0016-upstream-v006-ui-and-bundled-gifs.md)

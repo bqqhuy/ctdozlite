@@ -29,6 +29,7 @@ mod theme;
 mod worker;
 mod tools_panel;
 mod download_panel;
+mod schedule_modal;
 mod workspace;
 
 use messages::*;
@@ -271,6 +272,7 @@ struct AppSettings {
     // 3. Giao diện
     theme_mode: String, // "light" | "dark" | "system"
     use_avatar_as_wallpaper: bool,
+    info_drawer_open: bool,
     // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
@@ -319,6 +321,7 @@ impl Default for AppSettings {
             friend_src_card: true,
             theme_mode: "dark".into(),
             use_avatar_as_wallpaper: false,
+            info_drawer_open: true,
             enable_notifications: true,
             play_notification_sound: false,
             quick_messages_enabled: true,
@@ -501,6 +504,7 @@ pub struct ZaloGuiApp {
     #[allow(dead_code)]
     event_tx: Sender<GuiEvent>,
     quote_jump: Option<QuoteJump>,
+    quick_schedule: Option<schedule_modal::Draft>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -648,7 +652,7 @@ impl ZaloGuiApp {
             active_call: None,
             image_viewer: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
-            info_drawer_open: true,
+            info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
             toast_notice: None,
             phone_modal_open: false,
@@ -732,6 +736,7 @@ impl ZaloGuiApp {
             event_rx: rx,
             event_tx: tx.clone(),
             quote_jump: None,
+            quick_schedule: None,
         };
 
         if !bootstrap {
@@ -939,6 +944,21 @@ impl ZaloGuiApp {
                     ..Default::default()
                 }];
                 app.selected_thread_index = 0;
+            }
+            if args.iter().any(|a|a=="--ui-smoke-schedule" || a=="--ui-smoke-ami") {
+                app.settings_modal_open=false;app.history_sync_running=false;app.user_uin="fixture-owner".into();
+                app.threads=vec![Thread{id:"fixture-schedule".into(),name:"Nhóm thử nghiệm".into(),is_group:true,..Default::default()}];app.selected_thread_index=0;
+                app.input_message="Hẹn gửi báo cáo lúc 08:00. Giữ nguyên 2*3*4 và tiếng Việt.".into();
+                if args.iter().any(|a|a=="--ui-smoke-schedule"){app.open_quick_schedule();}
+                if args.iter().any(|a|a=="--ui-smoke-ami"){
+                    app.sticker_picker_open=true;app.sticker_tab=StickerTab::Pack(crate::bundled_stickers::CATEGORY);
+                    for item in crate::bundled_stickers::ITEMS {
+                        let image=crate::limits::decode_image(item.png).expect("bundled fixture").to_rgba8();
+                        let image=egui::ColorImage::from_rgba_unmultiplied([image.width() as usize,image.height() as usize],image.as_raw());
+                        let key=format!("stk_{}_{}",crate::bundled_stickers::CATEGORY,item.id);
+                        app.sticker_textures.insert(key.clone(),ctx.load_texture(key,image,Default::default()));
+                    }
+                }
             }
             if args.iter().any(|a|a=="--ui-smoke-tools") {
                 app.settings_modal_open=false;app.history_sync_running=false;app.user_uin="fixture-owner".into();
@@ -1340,6 +1360,7 @@ impl ZaloGuiApp {
                     self.show_toast("Đã đổi thư mục tải về");
                 }
                 GuiEvent::LoggedOut => {
+                    self.quick_schedule=None;
                     self.reset_sync_status();
                     self.live_mailbox=None;
                     crate::desktop_notice::account("");
@@ -1447,6 +1468,23 @@ impl ZaloGuiApp {
                             let index=self.threads.iter().position(|t|t.id==thread.id).unwrap_or_else(||{self.threads.push(Thread{id:thread.id.clone(),name:thread.name.clone(),is_group:thread.is_group,..Default::default()});self.threads.len()-1});
                             self.selected_thread_index=index;self.threads[index].messages=thread.messages;self.chat_render_window=(thread.id.clone(),150);
                             self.quote_jump=Some(QuoteJump{thread_id:thread.id,reference:id,highlight_until:std::time::Instant::now()+Duration::from_secs(3),scroll_pending:true});self.tools.open=false;
+                        }
+                        Ok(tools_panel::ToolsResult::ScheduleSaved {request,thread,text,at,result}) => {
+                            let matching=self.quick_schedule.as_ref().is_some_and(|draft|draft.matches_saved(request,&thread,&text,at));
+                            match result {
+                                Ok(())=>{
+                                    if matching {
+                                        if self.threads.get(self.selected_thread_index).is_some_and(|t|t.id==thread) && self.input_message==text {self.input_message.clear();}
+                                        self.quick_schedule=None;
+                                    }
+                                    self.tools.status="Đã lưu lịch gửi".into();self.show_toast("Đã lưu lịch gửi");
+                                    self.tools_command(tools_panel::ToolsCommand::Load);
+                                }
+                                Err(error)=>{
+                                    if matching {if let Some(draft)=&mut self.quick_schedule {draft.failed(error.clone());}}
+                                    self.tools.status=error.clone();self.show_toast(format!("Không lưu được lịch gửi: {error}"));
+                                }
+                            }
                         }
                         Ok(tools_panel::ToolsResult::Status(message)) => {
                             self.tools.status = message;

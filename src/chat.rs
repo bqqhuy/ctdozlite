@@ -2439,6 +2439,7 @@ pub(crate) async fn send_sticker_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    anyhow::ensure!(cate_id != crate::bundled_stickers::CATEGORY,"GIF cục bộ phải được gửi qua luồng attachment");
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }

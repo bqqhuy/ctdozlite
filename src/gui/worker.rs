@@ -1,6 +1,7 @@
 use super::*;
 
 pub enum WorkerCmd {
+    PersistInfoDrawer {owner:String,open:bool},
     PrepareNotificationSound,
     DownloadMedia {url:String,name:String,play:bool},
     OpenDownloaded {path:std::path::PathBuf,folder:bool},
@@ -327,6 +328,13 @@ async fn fetch_gui_image(
         s.is_active() && !s.account_key().is_empty(),
         "No active media account"
     );
+    if let Some(bytes)=crate::bundled_stickers::thumbnail(key) {
+        let key=key.to_owned();
+        return tokio::task::spawn_blocking(move|| {
+            let image=crate::limits::preview_image(bytes,&key)?;
+            Ok(egui::ColorImage::from_rgba_unmultiplied([image.width() as usize,image.height() as usize],image.as_raw()))
+        }).await?;
+    }
     let root = root.to_owned();
     let account = s.account_key().to_owned();
     let key = key.to_owned();
@@ -702,7 +710,12 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::Tools {owner,command}=>{
                             let s=session.lock().await.clone();if owner!=s.account_key() || owner.is_empty() || !s.is_active(){continue;}
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();
-                            tokio::spawn(async move{let result=account_tools(s,command).await.map_err(|e|e.to_string());let _=tx.send(GuiEvent::Tools{owner,result});ctx.request_repaint();});
+                            let schedule=match &command {super::tools_panel::ToolsCommand::Schedule{request,thread,text,at,..}=>Some((*request,thread.clone(),text.clone(),*at)),_=>None};
+                            tokio::spawn(async move{
+                                let mut result=account_tools(s,command).await.map_err(|e|e.to_string());
+                                if let (Err(error),Some((request,thread,text,at)))=(&result,schedule){result=Ok(super::tools_panel::ToolsResult::ScheduleSaved{request,thread,text,at,result:Err(error.clone())});}
+                                let _=tx.send(GuiEvent::Tools{owner,result});ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::RunAutomation=>{
                             let s=session.lock().await.clone();if !s.is_active() || s.account_key().is_empty(){continue;}
@@ -777,6 +790,17 @@ pub(super) fn spawn_session_worker(
                                     if !matches!(result,Ok(Ok(()))){let _=tx.send(GuiEvent::StatusUpdate("Không phát được video; kiểm tra codec hoặc thử lưu tệp".into()));ctx.request_repaint();}
                                 }
                             });
+                        }
+                        WorkerCmd::PersistInfoDrawer {owner,open}=>{
+                            let s=session.lock().await.clone();
+                            if owner.is_empty() || owner!=s.account_key() || !s.is_active(){continue;}
+                            // Await off-thread I/O so rapid toggles persist in command order.
+                            let result=tokio::task::spawn_blocking(move||->anyhow::Result<()> {
+                                anyhow::ensure!(s.is_active(),"Tài khoản đã đăng xuất");
+                                let mut settings=AppSettings::load();settings.info_drawer_open=open;
+                                settings.save()
+                            }).await;
+                            if !matches!(result,Ok(Ok(()))){let _=gui_tx.send(GuiEvent::StatusUpdate("Không lưu được trạng thái bảng thông tin hội thoại".into()));egui_ctx.request_repaint();}
                         }
                         WorkerCmd::PrepareNotificationSound=>{
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{
@@ -1981,6 +2005,16 @@ mod lifecycle_tests {
 mod image_pipeline_tests {
     use super::*;
     #[tokio::test]
+    async fn bundled_thumbnail_never_uses_network_or_private_disk_cache() {
+        let mut session=Session::new(false,false,false).unwrap();
+        session.login=Some(crate::session::LoginInfo{uin:"bundled-thumbnail-fixture".into(),..Default::default()});
+        let root=std::env::temp_dir().join(format!("ctdoz-no-cache-{}",crate::param_cipher::random_hex(16)));
+        let image=fetch_gui_image(&session,&root,"stk_99901_999001","https://untrusted.invalid/not-contacted").await.unwrap();
+        assert!(image.size[0]>0 && image.size[1]>0);
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
     async fn corrupt_cached_preview_is_replaced_and_account_cache_is_reused() {
         use std::io::{Cursor, Read, Write};
         let root = std::env::temp_dir().join(format!(
@@ -2428,12 +2462,10 @@ config,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate
 )}
 ,
             C::Schedule{
-thread,group,text,at}
+request,thread,group,text,at}
 =>{
-crate::tools::schedule(&store,session.account_key(),&thread,group,&text,at)?;
-Ok(R::Loaded{
-config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
-)}
+let result=crate::tools::schedule(&store,session.account_key(),&thread,group,&text,at).map_err(|e|e.to_string());
+Ok(R::ScheduleSaved{request,thread,text,at,result})}
 ,
             C::Edit{
 id,at}

@@ -133,6 +133,9 @@ try {
         @{ Size='1020x700'; Scale='1.5'; Tab='photo'; Photo=$true },
         @{ Size='1020x700'; Scale='1'; Tab='media'; Media=$true },
         @{ Size='1020x700'; Scale='1'; Tab='contacts'; Contacts=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='schedule'; Schedule=$true },
+        @{ Size='480x360'; Scale='1'; Tab='schedule-small'; Schedule=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='ami'; Ami=$true },
         @{ Size='1020x700'; Scale='1'; Tab='rich-text'; RichText=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='outgoing'; Outgoing=$true },
         @{ Size='1020x700'; Scale='1'; Tab='tools-0'; ToolsTab=0 },
@@ -163,6 +166,8 @@ try {
         if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
         if ($case.ContainsKey('Media')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-media') }
         if ($case.ContainsKey('Contacts')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-contacts') }
+        if ($case.ContainsKey('Schedule')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-schedule') }
+        if ($case.ContainsKey('Ami')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-ami') }
         if ($case.ContainsKey('RichText')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-rich-text') }
         if ($case.ContainsKey('QuoteJump')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-quote-jump') }
         try {

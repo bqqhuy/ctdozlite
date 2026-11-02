@@ -84,3 +84,5 @@ pub mod desktop_notice;
 mod desktop_notice_windows;
 
 pub mod notification_sound;
+
+mod bundled_stickers;
