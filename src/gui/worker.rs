@@ -162,14 +162,7 @@ impl Drop for PollGuard {
 }
 
 pub(super) fn extract_msg_id(resp: &serde_json::Value) -> String {
-    resp.get("data")
-        .and_then(|d| d.get("msgId"))
-        .and_then(|v| match v {
-            serde_json::Value::String(s) => Some(s.clone()),
-            serde_json::Value::Number(n) => Some(n.to_string()),
-            _ => None,
-        })
-        .unwrap_or_default()
+    crate::chat::sent_server_id(resp)
 }
 
 pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
@@ -1176,6 +1169,7 @@ pub(super) fn spawn_session_worker(
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
+                                let client_id = crate::chat::next_client_message_id();
                                 if let Some(found_url) = crate::chat::extract_first_url(&text) {
                                     let meta = crate::chat::parse_link_metadata(&s, &found_url)
                                         .await
@@ -1188,21 +1182,21 @@ pub(super) fn spawn_session_worker(
                                         });
                                     let _ =
                                         gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta.clone()));
-                                    match crate::chat::send_link_message(
-                                        &s, &to_id, &text, &meta, is_group,
-                                    )
+                                    match crate::chat::send_link_message_with_client_id(
+                                        &s, &to_id, &text, &meta, is_group, client_id)
                                     .await
                                     {
                                         Ok(resp) => {
                                             let msg_id = extract_msg_id(&resp);
                                             let now = crate::ui::clock();
                                             let final_id = if msg_id.is_empty() {
-                                                format!("out_{}_{}", crate::login::unix_now(), crate::param_cipher::random_hex(16))
+                                                format!("out_{client_id}")
                                             } else {
                                                 msg_id
                                             };
                                             let msg = ChatMessage {
                                                 id: final_id,
+                                                client_message_id: client_id.to_string(),
                                                 sender: "Tôi".into(),
                                                 text,
                                                 time: now,
@@ -1253,14 +1247,15 @@ pub(super) fn spawn_session_worker(
                                 }
 
                                 let res = if is_group {
-                                    crate::chat::send_group_message(&s, &to_id, &text).await
+                                    crate::chat::send_group_message_with_client_id(&s, &to_id, &text, client_id).await
                                 } else {
-                                    crate::chat::send_message(&s, &to_id, &text).await
+                                    crate::chat::send_message_with_client_id(&s, &to_id, &text, client_id).await
                                 };
                                 match res {
                                     Ok(resp) => {
                                         let msg_id = extract_msg_id(&resp);
                                         let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                            client_message_id: client_id.to_string(),
                                             thread_id: to_id,
                                             text,
                                             msg_id,
@@ -1301,13 +1296,14 @@ pub(super) fn spawn_session_worker(
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                match crate::chat::send_quote_message(
-                                    &s, &to_id, &text, &quoted, is_group,
-                                )
+                                let client_id = crate::chat::next_client_message_id();
+                                match crate::chat::send_quote_message_with_client_id(
+                                    &s, &to_id, &text, &quoted, is_group, client_id)
                                 .await
                                 {
                                     Ok(resp) => {
                                         let _ = gui_tx_clone.send(GuiEvent::QuoteSent {
+                                            client_message_id: client_id.to_string(),
                                             thread_id: to_id,
                                             text,
                                             msg_id: extract_msg_id(&resp),
@@ -1337,18 +1333,19 @@ pub(super) fn spawn_session_worker(
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let res = crate::chat::forward_message(
+                                let client_id = crate::chat::next_client_message_id();
+                                let res = crate::chat::forward_message_with_client_id(
                                     &s,
                                     &target_id,
                                     target_is_group,
-                                    &msg,
-                                )
+                                    &msg, client_id)
                                 .await;
                                 match res {
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
                                         let msg_id = extract_msg_id(&resp);
                                         if let Some(sid) = msg.sticker_id.filter(|v| *v > 0) {
                                             let _ = gui_tx_clone.send(GuiEvent::StickerSent {
+                                                client_message_id: client_id.to_string(),
                                                 thread_id: target_id,
                                                 msg_id,
                                                 sticker_id: sid,
@@ -1357,6 +1354,7 @@ pub(super) fn spawn_session_worker(
                                             });
                                         } else {
                                             let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                                client_message_id: client_id.to_string(),
                                                 thread_id: target_id,
                                                 text: msg.text.clone(),
                                                 msg_id,
@@ -1545,27 +1543,20 @@ pub(super) fn spawn_session_worker(
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                let res = crate::chat::send_sticker(
+                                let client_id = crate::chat::next_client_message_id();
+                                let res = crate::chat::send_sticker_with_client_id(
                                     &s,
                                     &to_id,
                                     sticker_id,
                                     cate_id,
                                     sticker_type,
-                                    is_group,
-                                )
+                                    is_group, client_id)
                                 .await;
                                 match res {
                                     Ok(resp) => {
-                                        let msg_id = resp
-                                            .get("data")
-                                            .and_then(|d| d.get("msgId"))
-                                            .and_then(|v| match v {
-                                                serde_json::Value::String(s) => Some(s.clone()),
-                                                serde_json::Value::Number(n) => Some(n.to_string()),
-                                                _ => None,
-                                            })
-                                            .unwrap_or_default();
+                                        let msg_id = extract_msg_id(&resp);
                                         let _ = gui_tx_clone.send(GuiEvent::StickerSent {
+                                            client_message_id: client_id.to_string(),
                                             thread_id: to_id,
                                             msg_id,
                                             sticker_id,

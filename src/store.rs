@@ -228,6 +228,62 @@ impl MessageStore {
         Ok(rows > 0)
     }
 
+    // Called only inside persist_snapshot's transaction, so ID promotion and the
+    // following metadata merge commit together. The client index bounds lookups.
+    fn reconcile_send_identity(
+        &self,
+        incoming: &ChatMessage,
+        row: &mut StoredMessage,
+    ) -> Result<()> {
+        let client = incoming.client_message_id.as_str();
+        if !incoming.is_outgoing || client.is_empty() || client == "0" {
+            return Ok(());
+        }
+        let mut statement=self.conn.prepare("SELECT msg_id,text,msg_type,ts,raw_json FROM messages WHERE thread_id=?1 AND is_outgoing=1 AND (CASE WHEN json_valid(raw_json) THEN json_extract(raw_json,'$.message_state.client_message_id') END)=?2 LIMIT 2")?;
+        let candidates = statement
+            .query_map(params![row.thread_id, client], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if candidates.len() != 1 {
+            return Ok(());
+        }
+        let (id, text, kind, ts, raw) = &candidates[0];
+        let mut existing = ChatMessage {
+            id: id.clone(),
+            text: text.clone(),
+            ts: *ts,
+            is_outgoing: true,
+            ..Default::default()
+        };
+        if let Some(state) = serde_json::from_str::<serde_json::Value>(raw)
+            .ok()
+            .and_then(|v| v.get("message_state").cloned())
+        {
+            existing.restore_state(&state)?;
+        }
+        if !crate::chat::same_message(&existing, incoming) {
+            return Ok(());
+        }
+        let local = |id: &str| id.starts_with("out_") || id.starts_with("local_");
+        if local(id) && !local(&row.msg_id) {
+            // Do not delete or merge ambiguous pre-existing duplicates from old builds.
+            self.conn.execute("UPDATE messages SET msg_id=?1,ts=CASE WHEN ?4>0 THEN ?4 ELSE ts END WHERE thread_id=?2 AND msg_id=?3 AND NOT EXISTS(SELECT 1 FROM messages WHERE thread_id=?2 AND msg_id=?1)",params![row.msg_id,row.thread_id,id,row.ts])?;
+        } else if !local(id) && local(&row.msg_id) {
+            row.msg_id = id.clone();
+            row.text = text.clone();
+            row.msg_type = kind.clone();
+            row.ts = *ts;
+        }
+        Ok(())
+    }
+
     /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
         let key = if msg_id.is_empty() {
@@ -719,6 +775,7 @@ fn persist_snapshot(
             if sm.msg_id.is_empty() {
                 sm.msg_id = format!("{}_{}", t.id, sm.ts);
             }
+            store.reconcile_send_identity(m, &mut sm)?;
             if store.upsert_message(&sm)? {
                 new_count += 1;
             }
@@ -1260,5 +1317,88 @@ mod conversation_menu_tests {
             assert_eq!(store.messages_for("b", 10).unwrap()[0].text, "b");
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod send_identity_tests {
+    use super::*;
+    fn thread(id: &str, client: &str) -> Thread {
+        Thread {
+            id: "thread-identity".into(),
+            messages: vec![ChatMessage {
+                id: id.into(),
+                client_message_id: client.into(),
+                text: "Repeated text".into(),
+                is_outgoing: true,
+                ts: 1000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn send_identity_is_idempotent_across_ack_push_order_and_rehydration() {
+        for server_first in [false, true] {
+            let mut store = MessageStore::open(":memory:").unwrap();
+            let pending = thread("out_client-1", "client-1");
+            let mut server = thread("server-1", "client-1");
+            server.messages[0].ts = 2000;
+            let (first, second) = if server_first {
+                (&server, &pending)
+            } else {
+                (&pending, &server)
+            };
+            persist_threads(&mut store, std::slice::from_ref(first)).unwrap();
+            persist_threads(&mut store, std::slice::from_ref(second)).unwrap();
+            let saved = store.messages_for("thread-identity", 20).unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].msg_id, "server-1");
+            assert_eq!(saved[0].ts, 2000);
+            let mut hydrated = vec![Thread {
+                id: "thread-identity".into(),
+                ..Default::default()
+            }];
+            store.hydrate_selected_threads(&mut hydrated, 20).unwrap();
+            assert_eq!(hydrated[0].messages.len(), 1);
+            assert_eq!(hydrated[0].messages[0].id, "server-1");
+        }
+    }
+    #[test]
+    fn promotion_preserves_local_flags_and_rolls_back_with_snapshot() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let mut pending = thread("out_client-1", "client-1");
+        pending.messages[0].is_starred = true;
+        persist_local_threads(&mut store, &[pending]).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER reject_fixture BEFORE INSERT ON messages WHEN NEW.msg_id='fail' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        let mut batch = thread("server-1", "client-1");
+        batch.messages.push(ChatMessage {
+            id: "fail".into(),
+            ..Default::default()
+        });
+        assert!(persist_threads(&mut store, &[batch]).is_err());
+        assert_eq!(
+            store.messages_for("thread-identity", 20).unwrap()[0].msg_id,
+            "out_client-1"
+        );
+        persist_threads(&mut store, &[thread("server-1", "client-1")]).unwrap();
+        let saved = store.messages_for("thread-identity", 20).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&saved[0].raw_json).unwrap()["is_starred"],
+            true
+        );
+    }
+    #[test]
+    fn matching_text_or_ambiguous_client_ids_cannot_promote_saved_rows() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        persist_threads(
+            &mut store,
+            &[thread("out_a", "shared"), thread("out_b", "shared")],
+        )
+        .unwrap();
+        persist_threads(&mut store, &[thread("server-a", "shared")]).unwrap();
+        persist_threads(&mut store, &[thread("server-b", "other")]).unwrap();
+        assert_eq!(store.messages_for("thread-identity", 20).unwrap().len(), 4);
     }
 }

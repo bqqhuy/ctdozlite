@@ -42,6 +42,10 @@ pub enum ThreadUpdateSource {
     History,
 }
 
+fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
+    crate::chat::merge_sent_message(thread, message);
+}
+
 pub enum GuiEvent {
     ConversationPreferences {
         owner: String,
@@ -86,11 +90,13 @@ pub enum GuiEvent {
         msg_id: String,
     },
     MessageSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
     },
     StickerSent {
+        client_message_id: String,
         thread_id: String,
         msg_id: String,
         sticker_id: u64,
@@ -141,6 +147,7 @@ pub enum GuiEvent {
         status: crate::chat::FriendshipStatus,
     },
     QuoteSent {
+        client_message_id: String,
         thread_id: String,
         text: String,
         msg_id: String,
@@ -324,6 +331,23 @@ impl AppSettings {
     }
 }
 
+/// A loaded-message jump stays bound to its conversation and exact reference.
+struct QuoteJump {
+    thread_id: String,
+    reference: String,
+    highlight_until: std::time::Instant,
+    scroll_pending: bool,
+}
+
+impl QuoteJump {
+    fn target_index(&self, thread_id: &str, messages: &[ChatMessage]) -> Option<usize> {
+        if self.thread_id != thread_id || std::time::Instant::now() >= self.highlight_until {
+            return None;
+        }
+        crate::message_navigation::unique_reference_index(messages, &self.reference)
+    }
+}
+
 struct UiSmoke {
     path: std::path::PathBuf,
     frames: u32,
@@ -446,7 +470,7 @@ pub struct ZaloGuiApp {
     event_rx: Receiver<GuiEvent>,
     #[allow(dead_code)]
     event_tx: Sender<GuiEvent>,
-    // Background poll trigger
+    quote_jump: Option<QuoteJump>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -661,6 +685,7 @@ impl ZaloGuiApp {
             scanner_findings: Vec::new(),
             event_rx: rx,
             event_tx: tx.clone(),
+            quote_jump: None,
         };
 
         if !bootstrap {
@@ -736,6 +761,37 @@ impl ZaloGuiApp {
                 .and_then(|n| n.parse::<f32>().ok())
             {
                 ctx.set_pixels_per_point(scale.clamp(1.0, 2.0));
+            }
+            if args.iter().any(|a| a == "--ui-smoke-quote-jump") {
+                app.settings_modal_open = false;
+                let mut messages: Vec<_> = (0..200)
+                    .map(|i| ChatMessage {
+                        id: format!("fixture-row-{i}"),
+                        client_message_id: format!("fixture-client-{i}"),
+                        sender: "Người dùng thử".into(),
+                        text: format!("Tin thử nghiệm số {i}"),
+                        ts: 1_700_000_000_000 + i * 60_000,
+                        time: "10:00".into(),
+                        ..Default::default()
+                    })
+                    .collect();
+                messages[8].text = "TIN GỐC ĐƯỢC TRÍCH DẪN — đã cuộn tới đúng ID".into();
+                messages[199].reply_to_id = Some("fixture-row-8".into());
+                messages[199].reply_to_text = Some(messages[8].text.clone());
+                app.threads = vec![Thread {
+                    id: "fixture-quote".into(),
+                    name: "Kiểm thử trích dẫn".into(),
+                    messages,
+                    ..Default::default()
+                }];
+                app.selected_thread_index = 0;
+                app.chat_render_window = ("fixture-quote".into(), 150);
+                app.quote_jump = Some(QuoteJump {
+                    thread_id: "fixture-quote".into(),
+                    reference: "fixture-row-8".into(),
+                    highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                    scroll_pending: true,
+                });
             }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
@@ -829,6 +885,19 @@ impl ZaloGuiApp {
                 ctx.request_repaint();
             }
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
+            let event = match event {
+                GuiEvent::LocalCallRecord {
+                    thread_id,
+                    text,
+                    msg_id,
+                } => GuiEvent::MessageSent {
+                    client_message_id: String::new(),
+                    thread_id,
+                    text,
+                    msg_id,
+                },
+                event => event,
+            };
             match event {
                 GuiEvent::QrReady { qr_image, .. } => {
                     self.qr_texture =
@@ -1073,11 +1142,7 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::MessageSent {
-                    thread_id,
-                    text,
-                    msg_id,
-                }
-                | GuiEvent::LocalCallRecord {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -1087,35 +1152,28 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!(
-                                "out_{}_{}",
-                                crate::login::unix_now(),
-                                crate::param_cipher::random_hex(8)
-                            )
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t
-                            .messages
-                            .iter()
-                            .any(|m| !m.id.is_empty() && m.id == final_id)
-                        {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
                                 delivery: if server_ack {
                                     crate::message_model::DeliveryState::ServerAccepted
                                 } else {
                                     crate::message_model::DeliveryState::Unknown
                                 },
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
                                 is_outgoing: true,
                                 ts: (crate::login::unix_now() * 1000),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = if server_ack {
@@ -1125,6 +1183,7 @@ impl ZaloGuiApp {
                     };
                 }
                 GuiEvent::StickerSent {
+                    client_message_id,
                     thread_id,
                     msg_id,
                     sticker_id,
@@ -1136,21 +1195,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!(
-                                "out_{}_{}",
-                                crate::login::unix_now(),
-                                crate::param_cipher::random_hex(8)
-                            )
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t
-                            .messages
-                            .iter()
-                            .any(|m| !m.id.is_empty() && m.id == final_id)
-                        {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text: "[Nhãn dán]".into(),
                                 time: now,
@@ -1160,9 +1213,8 @@ impl ZaloGuiApp {
                                 sticker_cate_id: Some(cate_id),
                                 sticker_type: Some(sticker_type),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi nhãn dán lúc {}", crate::ui::clock());
@@ -1171,19 +1223,13 @@ impl ZaloGuiApp {
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.preview = msg.text.clone();
                         t.time = msg.time.clone();
-                        if !t
-                            .messages
-                            .iter()
-                            .any(|m| !m.id.is_empty() && m.id == msg.id)
-                        {
-                            t.messages.push(msg);
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                        merge_sent_message(t, msg);
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi đính kèm lúc {}", crate::ui::clock());
                 }
                 GuiEvent::QuoteSent {
+                    client_message_id,
                     thread_id,
                     text,
                     msg_id,
@@ -1194,21 +1240,15 @@ impl ZaloGuiApp {
                         let now = crate::ui::clock();
                         t.time = now.clone();
                         let final_id = if msg_id.is_empty() {
-                            format!(
-                                "out_{}_{}",
-                                crate::login::unix_now(),
-                                crate::param_cipher::random_hex(8)
-                            )
+                            format!("out_{client_message_id}")
                         } else {
                             msg_id
                         };
-                        if !t
-                            .messages
-                            .iter()
-                            .any(|m| !m.id.is_empty() && m.id == final_id)
-                        {
-                            t.messages.push(ChatMessage {
+                        merge_sent_message(
+                            t,
+                            ChatMessage {
                                 id: final_id,
+                                client_message_id,
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
@@ -1218,9 +1258,8 @@ impl ZaloGuiApp {
                                 reply_to_sender: Some(quoted.sender.clone()),
                                 reply_to_text: Some(quoted.text.clone()),
                                 ..Default::default()
-                            });
-                            t.messages.sort_by_key(|m| m.ts);
-                        }
+                            },
+                        );
                         self.persist_threads_async();
                     }
                     self.status_msg = format!("Đã gửi trả lời lúc {}", crate::ui::clock());
@@ -1555,6 +1594,9 @@ impl ZaloGuiApp {
                     self.history_sync_running = running;
                     self.status_msg = message.clone();
                     self.history_sync_status = message;
+                }
+                GuiEvent::LocalCallRecord { .. } => {
+                    unreachable!("local call record normalized before dispatch")
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
@@ -2340,5 +2382,50 @@ mod conversation_menu_event_tests {
             .unwrap();
         app.check_events(&ctx);
         assert_eq!(app.conversation_preferences, values);
+    }
+}
+
+#[cfg(test)]
+mod send_ack_order_tests {
+    use super::*;
+    #[test]
+    fn sent_ack_keeps_server_clock_and_distinct_identical_sends() {
+        let mut thread = Thread {
+            messages: vec![
+                ChatMessage {
+                    id: "server-a".into(),
+                    client_message_id: "client-a".into(),
+                    text: "ok".into(),
+                    is_outgoing: true,
+                    ts: 1000,
+                    ..Default::default()
+                },
+                ChatMessage {
+                    id: "server-b".into(),
+                    client_message_id: "client-b".into(),
+                    text: "ok".into(),
+                    is_outgoing: true,
+                    ts: 2000,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        for id in ["out_client-a", "server-a"] {
+            merge_sent_message(
+                &mut thread,
+                ChatMessage {
+                    id: id.into(),
+                    client_message_id: "client-a".into(),
+                    text: "ok".into(),
+                    is_outgoing: true,
+                    ts: 3000,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(thread.messages.len(), 2);
+            assert_eq!(thread.messages[0].id, "server-a");
+            assert_eq!(thread.messages[0].ts, 1000);
+        }
     }
 }

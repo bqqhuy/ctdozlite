@@ -100,3 +100,7 @@ Upstream HEAD kiểm tra trực tiếp: **56ea37409edf734011de22626a817eba97c602
 - Các commit còn lại cập nhật tài liệu/credit/.mailmap. Giữ credit upstream gốc trong README, không nhập landing page hoặc số liệu đóng góp không áp dụng cho fork.
 
 Không có bằng chứng trong 13 commit mới này cho một luồng đồng bộ điện thoại của upstream có thể dùng thay triển khai ADR-0005. Trạng thái upstream có thể tiếp tục thay đổi sau thời điểm kiểm tra; SHA trên là mốc đã đọc.
+
+## Tích hợp tiếp #61 và #60
+
+Đã port có chọn lọc `c65e82e` (định danh/đối soát tin) và `7529696` (điều hướng trích dẫn đã nạp), giữ kiến trúc ARM64 của fork. Bổ sung đối soát SQLite trong transaction, kiểm thử hydrate/rollback và alias self của lịch sử điện thoại. Những dòng “chưa port” ở phần snapshot trên là trạng thái trước đợt tích hợp này. Phạm vi và giới hạn cuối cùng nằm trong [ADR-0006](adr/0006-exact-message-identity-and-quote-navigation.md); không có nghĩa đã merge toàn bộ v0.0.5.

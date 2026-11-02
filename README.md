@@ -60,6 +60,8 @@ Thay `<version>` bằng phiên bản đã tải và so sánh với tệp checksu
 
 Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đã ẩn**. Chức năng này không phải khóa PIN. Xóa lịch sử chỉ xóa bản lưu trên máy; đồng bộ sau đó có thể tải lại tin từ server.
 
+Đối soát tin gửi dùng server/client ID thay vì nội dung/thời gian, tránh gộp nhầm các tin giống nhau. Có thể bấm khối trích dẫn để cuộn tới tin gốc **đã nạp** trong hội thoại; tin chưa nạp hoặc ID không duy nhất sẽ được báo rõ. Xem [ADR-0006](docs/adr/0006-exact-message-identity-and-quote-navigation.md).
+
 ## Trạng thái kiểm chứng và giới hạn
 
 Bản mã nguồn tại [`7c1a416`](https://github.com/bqqhuy/ctdozlite/commit/7c1a416) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41370210700): **210 kiểm thử đạt**, kiểm tra PE/metadata, ảnh framebuffer DX12 và quy trình ẩn/mở/thoát từ tray. CI dùng GPU phần mềm Microsoft Basic Render Driver.

@@ -689,8 +689,10 @@ impl<'a> TuiApp<'a> {
 
         let now = crate::ui::clock();
         let ts = unix_now_ms();
+        let client_id = chat::next_client_message_id();
         let msg = ChatMessage {
-            id: format!("local_{ts}"),
+            id: format!("local_{client_id}"),
+            client_message_id: client_id.to_string(),
             sender: "Toi".into(),
             text: String::new(),
             time: now.clone(),
@@ -714,13 +716,14 @@ impl<'a> TuiApp<'a> {
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            match chat::send_sticker(
+            match chat::send_sticker_with_client_id(
                 &session,
                 &to_id,
                 item.sticker_id,
                 item.cate_id,
                 item.sticker_type,
                 is_group,
+                client_id,
             )
             .await
             {
@@ -797,8 +800,10 @@ impl<'a> TuiApp<'a> {
         let reply = self.reply_target.take();
         let now = crate::ui::clock();
         let ts = unix_now_ms();
+        let client_id = chat::next_client_message_id();
         let msg = ChatMessage {
-            id: format!("local_{ts}"),
+            id: format!("local_{client_id}"),
+            client_message_id: client_id.to_string(),
             sender: "Toi".into(),
             text: text.clone(),
             time: now.clone(),
@@ -824,18 +829,26 @@ impl<'a> TuiApp<'a> {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = match (&reply, is_group) {
-                (Some(q), true) => chat::send_quote_message(&session, &to_id, &text, q, true)
-                    .await
-                    .map(|_| ()),
-                (Some(q), false) => chat::send_quote_message(&session, &to_id, &text, q, false)
-                    .await
-                    .map(|_| ()),
-                (None, true) => chat::send_group_message(&session, &to_id, &text)
-                    .await
-                    .map(|_| ()),
-                (None, false) => chat::send_message(&session, &to_id, &text)
-                    .await
-                    .map(|_| ()),
+                (Some(q), true) => chat::send_quote_message_with_client_id(
+                    &session, &to_id, &text, q, true, client_id,
+                )
+                .await
+                .map(|_| ()),
+                (Some(q), false) => chat::send_quote_message_with_client_id(
+                    &session, &to_id, &text, q, false, client_id,
+                )
+                .await
+                .map(|_| ()),
+                (None, true) => {
+                    chat::send_group_message_with_client_id(&session, &to_id, &text, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                (None, false) => {
+                    chat::send_message_with_client_id(&session, &to_id, &text, client_id)
+                        .await
+                        .map(|_| ())
+                }
             };
             match result {
                 Ok(()) => {
