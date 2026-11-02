@@ -87,3 +87,16 @@ Trong snapshot cuối, `should_failover_candidate` không retry HTTP 5xx như ch
 - Chưa chạy native Windows, camera/call thật hoặc quét AV cho upstream v0.0.4. Không dùng credential/chat/contact thật. Bộ 194 test của fork không được coi là kiểm chứng cho các tính năng upstream chưa nhập.
 
 Kết luận áp dụng: nhập có chọn lọc và giữ các bảo vệ ARM64 hiện tại. Không merge toàn bộ v0.0.4 chỉ dựa vào tiêu đề “resolve all issues”.
+
+## Kiểm tra tiếp sau triển khai đồng bộ điện thoại
+
+Upstream HEAD kiểm tra trực tiếp: **56ea37409edf734011de22626a817eba97c60288** (v0.0.5); có **13 commit mới** sau snapshot `20e742c098ec546515701dcf1efe6b92fe9ea8ee`. Fork chưa đồng nhất toàn bộ với upstream này; không merge toàn bộ vì khác kiến trúc và phạm vi nền tảng.
+
+- `9d86331` (#63): sửa trùng tên làm gộp nhầm contact/nhảy chat. Fork đã giữ định danh thread chính xác, không cho tên/avatar làm bằng chứng di chuyển lịch sử; giữ chính sách chặt hơn cả ngoại lệ Cloud của upstream.
+- `c65e82e` / `f347d0e` (#61): chỉ gộp tin theo server/client identity, cấp client ID trước khi gửi, giữ thời gian server khi nhận acknowledgement. Đây là thay đổi rộng trên chat/GUI/worker/call cần port riêng cùng test, chưa nhận nguyên khối trong lần đồng bộ điện thoại. Với dữ liệu điện thoại mới, fork chặn đối chiếu pending theo text/time, dùng server ID hoặc fallback client ID có namespace sender; khi đối chiếu cache phải duy nhất và cùng chiều/sender. Không coi hai nội dung giống nhau là một tin.
+- `7529696` / `99113eb` (#60): bấm quote để cuộn tới đúng tin **đã nạp**, không tải lại toàn bộ lịch sử. Hữu ích nhưng chưa port UI trong lần này; không đánh dấu đã có tính năng khi chưa nối rendering.
+- `563ad44` / `069f594` (#59): quyền notification macOS; không nhận vào sản phẩm Windows ARM64.
+- `df05579`: v0.0.5 và đọc changelog GitHub Releases. Không nhận bộ updater chưa phân biệt ARM64/x64 của upstream.
+- Các commit còn lại cập nhật tài liệu/credit/.mailmap. Giữ credit upstream gốc trong README, không nhập landing page hoặc số liệu đóng góp không áp dụng cho fork.
+
+Không có bằng chứng trong 13 commit mới này cho một luồng đồng bộ điện thoại của upstream có thể dùng thay triển khai ADR-0005. Trạng thái upstream có thể tiếp tục thay đổi sau thời điểm kiểm tra; SHA trên là mốc đã đọc.
