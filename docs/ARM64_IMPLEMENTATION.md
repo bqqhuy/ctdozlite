@@ -118,9 +118,11 @@ Phần chênh lệch có Social Feed, scheduler, REST/MCP/auto-reply, theme/stic
 Các khác biệt cần bảo toàn khi tích hợp tiếp:
 
 - History upstream mới dùng `zalo_history.db` tương đối và suy cursor từ message ID. Fork giữ DB từng tài khoản và checkpoint `lastMsgId` của server; không thay bằng cơ chế upstream này.
-- Failover upstream mới thử HTTP 5xx; fork giữ chính sách không retry mutation sau lỗi có thể đã được server xử lý, tránh gửi trùng.
+- Changelog upstream nói failover HTTP 5xx, nhưng snapshot mã cuối không thực thi 5xx; vẫn có retry transport/timeout chung cho GET/POST. Fork giữ chính sách không retry mutation sau lỗi có thể đã được server xử lý, tránh gửi trùng.
 - Updater mới truy vấn Releases của upstream. Chưa bật để tránh đề xuất/cài artifact ngoài fork ARM64.
 - Cuộc gọi nhóm có thêm nâng session và packet SFU; chưa có bằng chứng kiểm thử tài khoản/thiết bị ở fork để tuyên bố đã hỗ trợ. Không đưa toàn bộ giao thức mới vào bản đang chờ native CI.
 - Multi-platform workflows, landing và packaging mới vẫn ngoài phạm vi sản phẩm.
 
 **Trở ngại native CI hiện tại:** yêu cầu chạy workflow trả HTTP 422, `Actions has been disabled for this repository.` API đọc quyền Actions trả 403 với kết nối hiện có. Chưa có native run hoặc bộ cài cho bản sửa sau `81a90d6`. Cần chủ repo bật GitHub Actions, sau đó chạy lại workflow `Windows ARM64 (native build)` trên nhánh `fix/windows-arm64-product`.
+
+Rà soát chi tiết 13 commit mới, các phát hiện và fixture tái hiện: [UPSTREAM_REVIEW_2026-11-02.md](UPSTREAM_REVIEW_2026-11-02.md).
