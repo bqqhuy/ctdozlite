@@ -27,3 +27,26 @@ Unknown group identity stays quarantined, never guessed by display name. User gl
 ## Range scheduling follow-up (2026-11-02)
 
 The original implementation always requested `from:0`. The public wire schema already has `from`/`to`; the public reference carries `win.from` into message queries. The recent-first implementation now sends explicit ranges without changing command IDs, cipher calls or approval. A synthetic request test checks exact bounds and partition order. User reports confirm the original full transfer works; range filtering/resume on the real phone still needs manual verification. Coverage is recorded only after all batches in a completed round are imported, never inferred from existing min/max message timestamps. See ADR-0007 for overlap, cancellation and legacy database limits.
+
+## Minimal-request policy follow-up (2026-11-02)
+
+The previous “at most 30 per round” describes the reference/client batching policy,
+not a demonstrated server ceiling. The maintainer explicitly requested grouped
+queries, separating one sync initiation from multiple upload_batch/CDN files.
+The client now groups ranges with a local 64 KiB serialized-payload budget and
+uses the existing queries schema. It does not add commands or change crypto.
+
+No captured numeric Zalo business code for “too many partitions” is available.
+Tests use explicitly synthetic nonzero responses with reason strings
+`too_many_partitions`, `too many partitions`, `too_many_conversations`,
+`too many conversations`, or `payload_too_large`, optionally maxPartitions or
+maxConversations. Only a pre-acceptance rejection in this allowlist can split;
+auth/protocol errors, 429, generic errors and timeout cannot. This conservative
+recognizer is not a claim that the live service emits those particular strings.
+Actual device verification must record a redacted real rejection before adding
+any new mapping. Rate-limit delay/cooldown uses retryAfter when supplied.
+
+For larger grouped ranges, scopes alone no longer imply transfer completeness;
+`isLast` for the matching syncId is required before checkpointing. Device testing
+must verify this final marker and the allowed query count/payload. A missing final
+marker stops at the existing timeout without checkpointing or auto-restarting.

@@ -49,7 +49,10 @@ pub fn is_expired_error(message: &str) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domains {
+    // Worker snapshots share endpoint preferences. This short lock never covers I/O.
     #[serde(skip)]
+    winners: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    #[serde(default)]
     pub service_fallbacks: std::collections::BTreeMap<String, Vec<String>>,
     /// `wpa.zaloapp.com` — `reqqr`, password login.
     pub auth: String,
@@ -122,6 +125,7 @@ fn default_ws() -> Vec<String> {
 impl Default for Domains {
     fn default() -> Self {
         Self {
+            winners: Default::default(),
             service_fallbacks: Default::default(),
             auth: crate::endpoints::AUTH.into(),
             wpa_chat: crate::endpoints::WPA_CHAT.into(),
@@ -146,6 +150,11 @@ impl Domains {
     /// Keep verified REST hosts first; service discovery may advertise a PC host
     /// which returns 404 for a Web/QR session. Long-poll and WS stay dynamic.
     fn prefer_verified_rest(&mut self) {
+        self.service_fallbacks.retain(|key,values| {
+            let known=["chat","friend","conversation","profile","group","file","group_cloud_message","voice_call","sticker"].iter().filter_map(|key|crate::endpoints::service(key)).any(|host|host==key);
+            if !known{return false;}
+            let mut seen=std::collections::HashSet::new();values.retain(|host|trusted_service_url(host) && seen.insert(host.clone()));values.truncate(16);true
+        });
         for (key, slot) in [
             ("chat", &mut self.chat),
             ("friend", &mut self.friend),
@@ -658,6 +667,41 @@ impl Session {
             .get("zpw_service_map_v3")
             .or_else(|| data.get("zpw_service_map_new"))
         {
+            for key in [
+                "chat",
+                "friend",
+                "conversation",
+                "profile",
+                "group",
+                "file",
+                "group_cloud_message",
+                "voice_call",
+                "sticker",
+            ] {
+                if let Some(verified) = crate::endpoints::service(key) {
+                    let candidates = self
+                        .domains
+                        .service_fallbacks
+                        .entry(verified.into())
+                        .or_default();
+                    let values = map
+                        .get(key)
+                        .map(|v| v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]))
+                        .unwrap_or_default();
+                    for value in values {
+                        if let Some(host) = value.as_str().map(|s| s.trim_end_matches('/')) {
+                            if trusted_service_url(host)
+                                && host != verified
+                                && !candidates.iter().any(|h| h == host)
+                                && candidates.len() < 16
+                            {
+                                candidates.push(host.into());
+                            }
+                        }
+                    }
+                }
+            }
+
             for (key, slot) in [
                 ("chat", &mut self.domains.chat),
                 ("friend", &mut self.domains.friend),
@@ -845,16 +889,42 @@ impl Session {
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
         let mut urls = vec![url.to_string()];
+        let mut service = None;
         for (verified, fallbacks) in &self.domains.service_fallbacks {
             if let Some(suffix) = url.strip_prefix(&format!("{verified}/")) {
                 urls.extend(fallbacks.iter().map(|base| format!("{base}/{suffix}")));
+                service = Some((verified.clone(), suffix.to_owned()));
+                if let Some(winner) = self
+                    .domains
+                    .winners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(verified)
+                    .filter(|w| *w == verified || fallbacks.contains(w))
+                    .cloned()
+                {
+                    let preferred = format!("{winner}/{suffix}");
+                    urls.retain(|u| u != &preferred);
+                    urls.insert(0, preferred);
+                }
                 break;
             }
         }
         let mut last = None;
         for candidate in urls {
             match self.send_once(m.clone(), &candidate, body.clone()).await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    if let Some((service, suffix)) = &service {
+                        if let Some(host) = candidate.strip_suffix(&format!("/{suffix}")) {
+                            self.domains
+                                .winners
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(service.clone(), host.into());
+                        }
+                    }
+                    return Ok(response);
+                }
                 Err(e) => {
                     // Retry GET on transport failure, or any method on a definite
                     // 404. Never replay a possibly delivered mutation after timeout.
@@ -1292,5 +1362,77 @@ mod credential_destination_tests {
             .await
             .unwrap();
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod candidate_persistence_tests {
+    use super::*;
+    #[test]
+    fn discovery_retains_all_trusted_candidates_and_saved_candidates_are_sanitized() {
+        let mut s=Session::new(false,false,false).unwrap();
+        s.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"chat":["https://fallback-one.zalo.me","https://fallback-two.zaloapp.com","https://attacker.invalid"]}}));
+        let primary=crate::endpoints::service("chat").unwrap();
+        assert_eq!(s.domains.service_fallbacks[primary].len(),2);
+        let mut restored:Domains=serde_json::from_value(serde_json::to_value(&s.domains).unwrap()).unwrap();
+        restored.service_fallbacks.get_mut(primary).unwrap().push("https://attacker.invalid".into());restored.prefer_verified_rest();
+        assert_eq!(restored.service_fallbacks[primary].len(),2);
+        assert!(restored.winners.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remembered_host_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn serve(status: &'static str) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(800), listener.accept()).await
+            {
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = "{\"error_code\":0,\"data\":{}}";
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                count += 1;
+            }
+            count
+        });
+        (url, task)
+    }
+    #[tokio::test]
+    async fn next_request_starts_at_the_host_that_previously_succeeded() {
+        let (primary, first) = serve("404 Not Found").await;
+        let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.domains
+            .service_fallbacks
+            .insert(primary.clone(), vec![fallback.clone()]);
+        for _ in 0..2 {
+            s.get(&format!("{primary}/api/fixture")).await.unwrap();
+        }
+        assert_eq!(
+            s.domains.winners.lock().unwrap().get(&primary),
+            Some(&fallback)
+        );
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 2);
     }
 }

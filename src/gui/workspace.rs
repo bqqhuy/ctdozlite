@@ -805,6 +805,20 @@ impl ZaloGuiApp {
                 self.sort_conversation_indices(&mut filtered_indices);
 
                 // Also search message contents across all conversations when `query` is non-empty!
+                if query.len() >= 2
+                    && ui
+                        .small_button("Tìm trong toàn bộ lịch sử đã lưu")
+                        .clicked()
+                {
+                    self.tools.open = true;
+                    self.tools.tab = 0;
+                    self.tools.query = self.search_query.clone();
+                    self.tools.last_query = self.search_query.clone();
+                    self.tools_command(super::tools_panel::ToolsCommand::Search {
+                        query: self.search_query.clone(),
+                        hidden: self.show_hidden_conversations,
+                    });
+                }
                 let msg_hits: Vec<(usize, String, String, String, bool)> = if query.len() >= 2 {
                     let mut hits = Vec::new();
                     for (t_idx, t) in self.threads.iter().enumerate() {
@@ -3428,6 +3442,7 @@ impl ZaloGuiApp {
         self.render_image_viewer_modal(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
+        self.render_tools_panel(ctx);
     }
 }
 

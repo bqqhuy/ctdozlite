@@ -26,6 +26,7 @@ mod modals;
 mod stickers;
 mod theme;
 mod worker;
+mod tools_panel;
 mod workspace;
 
 use messages::*;
@@ -47,6 +48,10 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    Tools {
+        owner: String,
+        result: Result<tools_panel::ToolsResult, String>,
+    },
     ClipboardImageRead(Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>),
     /// A single wake-up represents any number of live deltas while hidden.
     LiveThreadsReady(std::sync::Arc<crate::live_updates::LiveUpdates>),
@@ -119,6 +124,9 @@ pub enum GuiEvent {
         key: String,
         image: egui::ColorImage,
         permit: crate::media_resources::MediaJobPermit,
+    },
+    ImageBusy {
+        key: String,
     },
     ImageUnavailable {
         key: String,
@@ -358,6 +366,7 @@ struct UiSmoke {
 }
 
 pub struct ZaloGuiApp {
+    tools: tools_panel::ToolsPanel,
     #[cfg(windows)]
     tray: Option<crate::tray::Tray>,
     smoke: Option<UiSmoke>,
@@ -687,6 +696,7 @@ impl ZaloGuiApp {
             last_sync_was_history: true,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
+            tools: tools_panel::ToolsPanel::default(),
             settings: loaded_settings,
             dev_mode,
             dev_panel_open: false,
@@ -850,6 +860,14 @@ impl ZaloGuiApp {
                 }];
                 app.selected_thread_index = 0;
             }
+            if args.iter().any(|a|a=="--ui-smoke-tools") {
+                app.settings_modal_open=false;app.history_sync_running=false;app.user_uin="fixture-owner".into();
+                app.tools=tools_panel::ToolsPanel{open:true,loaded_for:"fixture-owner".into(),tab:args.iter().position(|a|a=="--ui-smoke-tools-tab").and_then(|i|args.get(i+1)).and_then(|v|v.parse::<usize>().ok()).unwrap_or(0).min(4),..Default::default()};
+                app.tools.config.rules.push(crate::tools::ReplyRule{id:"fixture-rule".into(),keyword:"Xin chào".into(),reply_text:"Chào bạn, tôi sẽ trả lời sớm.".into(),mode:"contains".into(),scope:"direct".into(),enabled:false,enabled_since:0});
+                app.tools.query="lịch sử".into();app.tools.hits.push(crate::tools::SearchHit{thread_id:"fixture-chat".into(),message_id:"fixture-result".into(),thread_name:"Hội thoại thử nghiệm".into(),text:"Nội dung lịch sử từ SQLite, chưa cần nạp cả hội thoại vào RAM.".into(),time:crate::login::unix_now()*1000});
+                app.threads=vec![Thread{id:"fixture-chat".into(),name:"Hội thoại thử nghiệm".into(),..Default::default()}];app.selected_thread_index=0;
+                app.tools.tasks.push(crate::tools::Scheduled{id:"fixture-task".into(),owner:"fixture-owner".into(),thread_id:"fixture-chat".into(),deliver_at:crate::login::unix_now()+900,message:crate::outgoing::pending("Tin hẹn giờ thử nghiệm".into(),false,crate::outgoing::Payload::Text),status:"pending".into(),error:String::new()});
+            }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
         }
@@ -881,11 +899,13 @@ impl ZaloGuiApp {
     }
 
     fn palette(&self) -> ThemePalette {
-        if self.dark_mode {
+        let mut palette = if self.dark_mode {
             ThemePalette::dark()
         } else {
             ThemePalette::light()
-        }
+        };
+        palette.apply_tools_theme(&self.tools.config.theme);
+        palette
     }
 
     fn request_clipboard_image(&mut self) {
@@ -1295,6 +1315,63 @@ impl ZaloGuiApp {
                         Err(e) => self.show_toast(format!("Không thể tạo phiên mới: {e}")),
                     }
                 }
+                GuiEvent::Tools { owner, result } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        continue;
+                    }
+                    match result {
+                        Ok(tools_panel::ToolsResult::Tasks{tasks,paused})=>{self.tools.tasks=tasks;self.tools.paused=paused;},
+                        Ok(tools_panel::ToolsResult::Loaded { config, tasks,paused }) => {
+                            for old in &self.tools.config.stickers {
+                                self.sticker_pack_items.remove(&old.cate_id);
+                                self.pinned_sticker_packs.retain(|(id,_)| *id!=old.cate_id);
+                            }
+                            self.tools.config = config;
+                            self.tools.tasks = tasks;
+                            self.tools.paused=paused;
+                            self.theme_dirty = true;
+                            for pack in &self.tools.config.stickers {
+                                self.sticker_pack_items.insert(
+                                    pack.cate_id,
+                                    pack.sticker_ids
+                                        .iter()
+                                        .map(|id| crate::chat::StickerItem {
+                                            sticker_id: *id,
+                                            cate_id: pack.cate_id,
+                                            sticker_type: pack.sticker_type,
+                                            label: pack.name.clone(),
+                                        })
+                                        .collect(),
+                                );
+                                if !self
+                                    .pinned_sticker_packs
+                                    .iter()
+                                    .any(|(id, _)| *id == pack.cate_id)
+                                {
+                                    self.pinned_sticker_packs
+                                        .push((pack.cate_id, pack.name.clone()));
+                                }
+                            }
+                        }
+                        Ok(tools_panel::ToolsResult::Search { query, hits }) => {
+                            if query == self.tools.last_query {
+                                self.tools.hits = hits;
+                            }
+                        }
+                        Ok(tools_panel::ToolsResult::Hit{thread,id})=>{
+                            self.replying_to=None;self.filter_starred_only=false;self.in_chat_search_query.clear();self.in_chat_search_open=false;
+                            let index=self.threads.iter().position(|t|t.id==thread.id).unwrap_or_else(||{self.threads.push(Thread{id:thread.id.clone(),name:thread.name.clone(),is_group:thread.is_group,..Default::default()});self.threads.len()-1});
+                            self.selected_thread_index=index;self.threads[index].messages=thread.messages;self.chat_render_window=(thread.id.clone(),150);
+                            self.quote_jump=Some(QuoteJump{thread_id:thread.id,reference:id,highlight_until:std::time::Instant::now()+Duration::from_secs(3),scroll_pending:true});self.tools.open=false;
+                        }
+                        Ok(tools_panel::ToolsResult::Status(message)) => {
+                            self.tools.status = message;
+                        }
+                        Err(error) => {
+                            self.tools.status = error;
+                        }
+                    }
+                }
                 GuiEvent::OutgoingState {
                     owner,
                     thread_id,
@@ -1508,6 +1585,15 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
+                }
+                GuiEvent::ImageBusy { key } => {
+                    if self.image_retry_at.len() < 1024 {
+                        self.image_retry_at
+                            .insert(key, std::time::Instant::now() + Duration::from_millis(250));
+                    } else {
+                        self.loading_stickers.remove(&key);
+                    }
+                    ctx.request_repaint_after(Duration::from_millis(250));
                 }
                 GuiEvent::ImageUnavailable { key } => {
                     if self.image_retry_at.len() >= 1024 {
@@ -1911,6 +1997,17 @@ impl eframe::App for ZaloGuiApp {
         }
 
         self.check_events(ctx);
+        if self.is_logged_in && self.tools.loaded_for != self.user_uin && self.smoke.is_none() {
+            self.tools = tools_panel::ToolsPanel {
+                loaded_for: self.user_uin.clone(),
+                ..Default::default()
+            };
+            self.tools_command(tools_panel::ToolsCommand::Load);
+        }
+        if !self.is_logged_in && !self.tools.loaded_for.is_empty() {
+            self.tools = Default::default();
+            self.theme_dirty = true;
+        }
         self.trim_resident_history();
         let now = std::time::Instant::now();
         self.image_retry_at.retain(|key, deadline| {

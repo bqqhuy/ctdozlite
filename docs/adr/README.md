@@ -49,3 +49,6 @@ What we will do, in one paragraph, present tense.
 Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 
 - [0009 — Outgoing retry, streaming uploads and Windows popups](0009-outgoing-retry-streaming-and-windows-popup.md)
+- [0010 — Minimal-request phone sync](0010-minimal-request-phone-sync.md)
+- [0011 — Visible media priority](0011-visible-media-priority.md)
+- [0012 — Account tools and schema 6](0012-account-tools.md)

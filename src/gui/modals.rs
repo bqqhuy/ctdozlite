@@ -987,7 +987,7 @@ impl ZaloGuiApp {
                                                                 }
                                                             }
                                                         }
-                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Chỉ cập nhật tin gần đây")).on_hover_text("Lấy phần mới từ checkpoint; nếu chưa có mốc thì lấy 7 ngày quanh hoạt động gần nhất, chưa tải lịch sử cũ hơn").clicked() {
+                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Chỉ cập nhật tin gần đây")).on_hover_text("Lấy phần mới từ checkpoint; nếu chưa có mốc thì lấy 7 ngày gần nhất, chưa tải lịch sử cũ hơn").clicked() {
                                                             if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::SyncPhoneRecent).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị lấy tin gần đây…".into();self.sync_notice_dismissed=false;}}
                                                         }
                                                         if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Quét lại toàn bộ lịch sử điện thoại")).on_hover_text("Bỏ mốc tiến độ để kiểm tra lại lịch sử; không xóa tin đã lưu").clicked() {
@@ -1235,6 +1235,7 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Utilities => {
+                                            if ui.button("Tìm lịch sử, nhập dữ liệu, theme/sticker, hẹn giờ & tự trả lời").clicked() { self.tools.open=true; }
                                             ui.label(RichText::new("Gợi ý Sticker").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()

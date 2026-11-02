@@ -1500,7 +1500,9 @@ impl ZaloGuiApp {
                             )
                         };
 
-                        if !self.sticker_textures.contains_key(&key)
+                        let (cell_rect, cell_resp) =
+                            ui.allocate_exact_size(Vec2::new(68.0, 68.0), Sense::click());
+                        if ui.clip_rect().expand(100.0).intersects(cell_rect) && !self.sticker_textures.contains_key(&key)
                             && self.loading_stickers.insert(key.clone())
                         {
                             if let Some(tx) = WORKER_TX.get() {
@@ -1511,8 +1513,7 @@ impl ZaloGuiApp {
                             }
                         }
 
-                        let (cell_rect, cell_resp) =
-                            ui.allocate_exact_size(Vec2::new(68.0, 68.0), Sense::click());
+
                         if cell_resp.hovered() {
                             ui.painter().rect_filled(
                                 cell_rect,

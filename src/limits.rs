@@ -1,5 +1,7 @@
 //! Limits apply before allocating/decoding untrusted network data.
 use std::io::{Cursor, Read};
+/// Background avatars/stickers leave two network slots for visible photos.
+pub static BACKGROUND_IMAGE_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 pub static IMAGE_JOBS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// At most two files stream concurrently; additional files await a permit.
@@ -144,5 +146,86 @@ mod tests {
             .unwrap();
         assert!(response_bytes(response, 8).await.is_err());
         server.await.unwrap();
+    }
+}
+
+/// A bounded network slot; background work leaves capacity for visible media.
+pub struct ImageNetworkPermit {
+    _background: Option<tokio::sync::SemaphorePermit<'static>>,
+    _active: tokio::sync::SemaphorePermit<'static>,
+}
+/// Acquire background capacity before a shared slot so waiting background jobs
+/// cannot occupy the capacity reserved for foreground photos.
+pub async fn image_network_permit(
+    background: bool,
+) -> Result<ImageNetworkPermit, tokio::sync::AcquireError> {
+    let permit = if background {
+        Some(BACKGROUND_IMAGE_JOBS.acquire().await?)
+    } else {
+        None
+    };
+    Ok(ImageNetworkPermit {
+        _background: permit,
+        _active: IMAGE_JOBS.acquire().await?,
+    })
+}
+#[cfg(test)]
+mod image_priority_tests {
+    use super::*;
+    #[tokio::test]
+    async fn slow_background_requests_leave_foreground_capacity() {
+        let a = image_network_permit(true).await.unwrap();
+        let b = image_network_permit(true).await.unwrap();
+        let waiting = tokio::spawn(async { image_network_permit(true).await.unwrap() });
+        let foreground = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            image_network_permit(false),
+        )
+        .await
+        .expect("visible photo must not wait for background")
+        .unwrap();
+        assert_eq!(IMAGE_JOBS.available_permits(), 1);
+        drop(foreground);
+        drop(a);
+        drop(b);
+        drop(waiting.await.unwrap());
+    }
+    #[tokio::test]
+    #[ignore = "manual controlled image queue latency measurement; no network"]
+    async fn measure_visible_image_queue_latency() {
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            let old = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+            let mut held = Vec::new();
+            for _ in 0..4 {
+                held.push(old.clone().acquire_owned().await.unwrap());
+            }
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                drop(held);
+            });
+            let start = std::time::Instant::now();
+            let permit = old.acquire().await.unwrap();
+            before.push(start.elapsed().as_secs_f64() * 1000.0);
+            drop(permit);
+            release.await.unwrap();
+            let a = image_network_permit(true).await.unwrap();
+            let b = image_network_permit(true).await.unwrap();
+            let start = std::time::Instant::now();
+            let fg = image_network_permit(false).await.unwrap();
+            after.push(start.elapsed().as_secs_f64() * 1000.0);
+            drop((fg, a, b));
+        }
+        for (task, mut values) in [
+            ("fifo_background_before", before),
+            ("foreground_reserved_after", after),
+        ] {
+            values.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                serde_json::json!({"task":task,"iterations":values.len(),"min_ms":values[0],"avg_ms":values.iter().sum::<f64>()/values.len() as f64,"p50_ms":values[2],"p95_ms":values[4],"p99_ms":values[4],"dataset":"4 background slots, simulated 50 ms service, no network","platform":std::env::consts::OS})
+            );
+        }
     }
 }

@@ -131,7 +131,12 @@ try {
         @{ Size='480x360'; Scale='1.5'; Tab='phone-sync'; PhoneSync=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='quote-jump'; QuoteJump=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='photo'; Photo=$true },
-        @{ Size='1020x700'; Scale='1.5'; Tab='outgoing'; Outgoing=$true }
+        @{ Size='1020x700'; Scale='1.5'; Tab='outgoing'; Outgoing=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='tools-0'; ToolsTab=0 },
+        @{ Size='1020x700'; Scale='1'; Tab='tools-1'; ToolsTab=1 },
+        @{ Size='1020x700'; Scale='1'; Tab='tools-2'; ToolsTab=2 },
+        @{ Size='1020x700'; Scale='1'; Tab='tools-3'; ToolsTab=3 },
+        @{ Size='1020x700'; Scale='1'; Tab='tools-4'; ToolsTab=4 }
     )) {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
@@ -150,6 +155,7 @@ try {
         if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
         if ($case.ContainsKey('WorkspaceSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-workspace-sync') }
         if ($case.ContainsKey('PhoneSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-phone-sync') }
+        if ($case.ContainsKey('ToolsTab')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-tools'); $process.StartInfo.ArgumentList.Add('--ui-smoke-tools-tab'); $process.StartInfo.ArgumentList.Add([string]$case.ToolsTab) }
         if ($case.ContainsKey('Outgoing')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-outgoing') }
         if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
         if ($case.ContainsKey('QuoteJump')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-quote-jump') }

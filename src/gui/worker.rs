@@ -1,6 +1,11 @@
 use super::*;
 
 pub enum WorkerCmd {
+    Tools {
+        owner: String,
+        command: super::tools_panel::ToolsCommand,
+    },
+    RunAutomation,
     RetryOutgoing {
         thread_id: String,
         message: ChatMessage,
@@ -148,14 +153,32 @@ pub enum WorkerCmd {
 }
 
 // Replaceable mailbox: each logout tears down the old worker runtime and event channel.
-pub(super) struct WorkerMailbox(
-    std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<WorkerCmd>>>,
-);
+#[derive(Clone)]
+pub(super) struct WorkerSender {
+    commands: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
+    images: tokio::sync::mpsc::Sender<(String, String)>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+}
+impl WorkerSender {
+    pub(super) fn send(&self, command: WorkerCmd) -> Result<(), ()> {
+        if let WorkerCmd::FetchStickerImage { key, url } = command {
+            if self.images.try_send((key.clone(), url)).is_err() {
+                let _ = self.events.send(GuiEvent::ImageBusy { key });
+                self.ctx.request_repaint();
+            }
+            Ok(())
+        } else {
+            self.commands.send(command).map_err(|_| ())
+        }
+    }
+}
+pub(super) struct WorkerMailbox(std::sync::Mutex<Option<WorkerSender>>);
 impl WorkerMailbox {
-    pub(super) fn get(&self) -> Option<tokio::sync::mpsc::UnboundedSender<WorkerCmd>> {
+    pub(super) fn get(&self) -> Option<WorkerSender> {
         self.0.lock().ok()?.clone()
     }
-    fn set(&self, sender: tokio::sync::mpsc::UnboundedSender<WorkerCmd>) {
+    fn set(&self, sender: WorkerSender) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     }
 }
@@ -198,7 +221,13 @@ pub(super) fn is_session_expired_error(err_str: &str) -> bool {
 /// Immediately decode any disk-cached sticker thumbnails (`stickers_cache/stk_{cid}_{sid}.png`)
 /// and push `GuiEvent::StickerImageReady` *before* sending sticker list metadata, returning any
 /// missing `(key, url, cache_path)` entries for concurrent network prefetching.
-pub(super) fn preload_disk_sticker_thumbnails(
+pub(super) async fn preload_disk_sticker_thumbnails(items:&[crate::chat::StickerItem],gui_tx:&Sender<GuiEvent>,limit:usize)->Vec<(String,String,std::path::PathBuf)> {
+    let items=items.to_vec();let tx=gui_tx.clone();
+    match tokio::task::spawn_blocking(move||preload_disk_sticker_inner(&items,&tx,limit)).await {
+        Ok(missing)=>missing,Err(_)=>{crate::logger::log_error("sticker cache","Thumbnail cache worker failed");Vec::new()}
+    }
+}
+fn preload_disk_sticker_inner(
     items: &[crate::chat::StickerItem],
     gui_tx: &Sender<GuiEvent>,
     limit: usize,
@@ -210,7 +239,7 @@ pub(super) fn preload_disk_sticker_thumbnails(
     for item in items.iter().take(limit) {
         let key = format!("stk_{}_{}", item.cate_id, item.sticker_id);
         let cache_path = cache_dir.join(format!("{key}.png"));
-        if let Ok(disk_bytes) = std::fs::read(&cache_path) {
+        if let Ok(disk_bytes) = crate::limits::read_file(&cache_path,crate::limits::IMAGE_BYTES) {
             if let Ok(dyn_img) = crate::limits::decode_image(&disk_bytes) {
                 let rgba = dyn_img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
@@ -244,47 +273,10 @@ pub(super) fn preload_disk_sticker_thumbnails(
 /// Concurrently download, cache, and decode missing sticker thumbnails so the popover and search
 /// grid render smoothly without waiting for frame-by-frame lazy requests.
 async fn prefetch_missing_sticker_thumbnails(
-    http: &reqwest::Client,
-    missing: Vec<(String, String, std::path::PathBuf)>,
-    gui_tx: &Sender<GuiEvent>,
-    egui_ctx: &egui::Context,
+    requests:&tokio::sync::mpsc::Sender<(String,String)>,
+    missing:Vec<(String,String,std::path::PathBuf)>, gui_tx:&Sender<GuiEvent>, ctx:&egui::Context,
 ) {
-    if missing.is_empty() {
-        return;
-    }
-    let futs = missing.into_iter().map(|(key, url, cache_path)| {
-        let client = http.clone();
-        let tx = gui_tx.clone();
-        let ctx = egui_ctx.clone();
-        async move {
-            let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else {
-                return;
-            };
-            if let Ok(resp) = client.get(&url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(b) =
-                        crate::limits::response_bytes(resp, crate::limits::IMAGE_BYTES).await
-                    {
-                        let vec = b.to_vec();
-                        if let Ok(dyn_img) = crate::limits::decode_image(&vec) {
-                            let _ = std::fs::write(&cache_path, &vec);
-                            let rgba = dyn_img.to_rgba8();
-                            let size = [rgba.width() as usize, rgba.height() as usize];
-                            let pixels = rgba.as_flat_samples();
-                            let color_img =
-                                egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                            let _ = tx.send(GuiEvent::StickerImageReady {
-                                key,
-                                image: color_img,
-                            });
-                            ctx.request_repaint();
-                        }
-                    }
-                }
-            }
-        }
-    });
-    futures_util::future::join_all(futs).await;
+    for(key,url,_)in missing {if requests.send((key.clone(),url)).await.is_err(){let _=gui_tx.send(GuiEvent::ImageUnavailable{key});ctx.request_repaint();}}
 }
 
 // Hidden viewports may stop rendering. Persist worker deltas before notifying UI
@@ -309,6 +301,7 @@ async fn persist_received(session: &Session, threads: &[Thread]) {
         }
         let mut store = crate::store::MessageStore::open(session.history_path())?;
         crate::store::persist_threads(&mut store, &threads)?;
+        crate::tools::auto_reply(&store, session.account_key(), &threads)?;
         Ok(())
     })
     .await;
@@ -385,10 +378,12 @@ async fn fetch_gui_image(
     };
     let rgba = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let image = crate::limits::preview_image(&bytes, &key)?;
-        if crate::storage::atomic_write(&path, &bytes).is_err() || cache.prune().is_err() {
+        if crate::storage::atomic_write(&path, &bytes).is_err() {
             // Rendering may proceed when a full/read-only cache cannot be updated.
             crate::logger::log_error("image cache", "Cannot save/prune preview cache");
         }
+        // Cache pruning is coalesced and detached from image delivery.
+        tokio_cache_prune(cache);
         Ok(image)
     })
     .await??;
@@ -408,7 +403,13 @@ pub(super) fn spawn_session_worker(
     let live_updates = std::sync::Arc::new(crate::live_updates::LiveUpdates::default());
     let image_jobs = crate::media_resources::MediaJobQueue::default();
     let commands = cmd_tx.downgrade();
-    WORKER_TX.set(cmd_tx);
+    let (image_tx, mut image_rx) = tokio::sync::mpsc::channel::<(String, String)>(128);
+    WORKER_TX.set(WorkerSender {
+        commands: cmd_tx,
+        images: image_tx.clone(),
+        events: gui_tx.clone(),
+        ctx: egui_ctx.clone(),
+    });
 
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -435,6 +436,33 @@ pub(super) fn spawn_session_worker(
                 .unwrap();
 
             rt.block_on(async move {
+                {
+                    let shared = session.clone(); let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                    let visible = crate::media_resources::MediaJobQueue::default();
+                    let flights=std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+                    tokio::spawn(async move {
+                        while let Some((key,url)) = image_rx.recv().await {
+                            let s = shared.lock().await.clone();
+                            let Some(flight)=ImageFlight::start(flights.clone(),s.account_key(),&key)else{continue;};
+                            let queue = if key.starts_with("ava_") || key.starts_with("stk_") { &image_jobs } else { &visible };
+                            let Some(admission) = queue.try_admit() else {
+                                let _ = tx.send(GuiEvent::ImageBusy { key }); ctx.request_repaint(); continue;
+                            };
+                            let tx = tx.clone(); let ctx = ctx.clone();
+                            tokio::spawn(async move {
+                                let _flight=flight;
+                                let background = key.starts_with("ava_") || key.starts_with("stk_");
+                                let Some(job) = admission.start().await else { return; };
+                                let Ok(_permit) = crate::limits::image_network_permit(background).await else { return; };
+                                match fetch_gui_image(&s, crate::storage::root(), &key, &url).await {
+                                    Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { key,image,permit:job }); },
+                                    Err(_) => { let _ = tx.send(GuiEvent::ImageUnavailable { key }); }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                    });
+                }
                 {
                     let s = session.lock().await.clone();
                     let cached_session = s.clone();
@@ -617,6 +645,12 @@ pub(super) fn spawn_session_worker(
                     });
                 }
 
+                {
+                    let commands=commands.clone();
+                    tokio::spawn(async move {let mut tick=tokio::time::interval(Duration::from_secs(2));loop{tick.tick().await;let Some(tx)=commands.upgrade()else{break;};if tx.send(WorkerCmd::RunAutomation).is_err(){break;}}});
+                }
+                let mut recovered_accounts=HashSet::new();
+                let automation_running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
                     if let Some((thread_id, mut message)) = outgoing_command(&cmd) {
                         let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
@@ -652,6 +686,48 @@ pub(super) fn spawn_session_worker(
                         continue;
                     }
                     match cmd {
+                        WorkerCmd::Tools {owner,command}=>{
+                            let s=session.lock().await.clone();if owner!=s.account_key() || owner.is_empty() || !s.is_active(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{let result=account_tools(s,command).await.map_err(|e|e.to_string());let _=tx.send(GuiEvent::Tools{owner,result});ctx.request_repaint();});
+                        }
+                        WorkerCmd::RunAutomation=>{
+                            let s=session.lock().await.clone();if !s.is_active() || s.account_key().is_empty(){continue;}
+                            if automation_running.swap(true,std::sync::atomic::Ordering::AcqRel){continue;}
+                            let automation_guard=PollGuard(automation_running.clone());
+                            let recover=!recovered_accounts.contains(s.account_key());
+                            let account=s.clone();let owner=s.account_key().to_owned();
+                            let due=tokio::task::spawn_blocking(move ||->anyhow::Result<_>{
+                                if !account.is_active(){return Ok(None);}
+                                let store=crate::store::MessageStore::open(account.history_path())?;
+                                if recover{crate::tools::recover(&store,&owner)?;}
+                                crate::tools::claim(&store,&owner,crate::login::unix_now())
+                            }).await;
+                            if matches!(&due,Ok(Ok(_))){recovered_accounts.insert(s.account_key().to_owned());}
+                            else {crate::logger::log_error("scheduler","Cannot read due jobs");}
+                            if let Ok(Ok(Some(task)))=due {
+                                let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                                tokio::spawn(async move{
+                                    let _automation=automation_guard;
+                                    let Some(active)=crate::outgoing::Active::start(&task.message.client_message_id)else{
+                                        let account=s.clone();let id=task.id.clone();let owner=task.owner.clone();
+                                        let _=tokio::task::spawn_blocking(move||->anyhow::Result<()>{let store=crate::store::MessageStore::open(account.history_path())?;crate::tools::finish(&store,&owner,&id,"uncertain","Một lần gửi khác đang xử lý; kiểm tra hội thoại trước khi thử lại")}).await;
+                                        return;
+                                    };
+                                    persist_outgoing(&s,&task.thread_id,&task.message).await;
+                                    let _=tx.send(GuiEvent::OutgoingState{owner:task.owner.clone(),thread_id:task.thread_id.clone(),message:task.message.clone()});ctx.request_repaint();
+                                    let (message,status,error)=match crate::outgoing::send(&s,&task.thread_id,&task.message).await {
+                                        Ok(message)=>(message,"sent",String::new()),
+                                        Err(error)=>{let error=crate::outgoing::failure_message(&error);let mut message=task.message.clone();message.delivery=crate::message_model::DeliveryState::Failed;if let Some(job)=message.outgoing_job.as_mut(){job.error=error.clone();}(message,"uncertain",error)}
+                                    };
+                                    persist_outgoing(&s,&task.thread_id,&message).await;
+                                    let account=s.clone();let id=task.id.clone();let owner=task.owner.clone();
+                                    let result=tokio::task::spawn_blocking(move ||->anyhow::Result<_>{anyhow::ensure!(account.is_active(),"Đã đăng xuất");let store=crate::store::MessageStore::open(account.history_path())?;crate::tools::finish(&store,&owner,&id,status,&error)?;Ok(super::tools_panel::ToolsResult::Tasks{tasks:crate::tools::scheduled(&store,&owner)?,paused:crate::tools::paused(&store)?})}).await;
+                                    match result {Ok(Ok(result))=>{let _=tx.send(GuiEvent::Tools{owner:task.owner.clone(),result:Ok(result)});},_=>crate::logger::log_error("scheduler","Cannot finalize scheduled delivery")};
+                                    drop(active);let _=tx.send(GuiEvent::OutgoingState{owner:task.owner,thread_id:task.thread_id,message});ctx.request_repaint();
+                                });
+                            }
+                        }
                         WorkerCmd::RetryOutgoing { .. } => {},
                         WorkerCmd::ReadClipboardImage => {
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
@@ -1370,21 +1446,7 @@ pub(super) fn spawn_session_worker(
                                 ctx_clone.request_repaint();
                             });
                         }
-                        WorkerCmd::FetchStickerImage { key, url } => {
-                            let Some(admission)=image_jobs.try_admit() else {
-                                let _=gui_tx.send(GuiEvent::ImageUnavailable {key});egui_ctx.request_repaint();continue;
-                            };
-                            let s=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let Some(job)=admission.start().await else {return;};
-                                let Ok(_permit)=crate::limits::IMAGE_JOBS.acquire().await else {return;};
-                                match fetch_gui_image(&s,crate::storage::root(),&key,&url).await {
-                                    Ok(image)=>{let _=tx.send(GuiEvent::PreviewImageReady {key,image,permit:job});},
-                                    Err(_)=>{let _=tx.send(GuiEvent::ImageUnavailable {key});}
-                                }
-                                ctx.request_repaint();
-                            });
-                        }
+                        WorkerCmd::FetchStickerImage { .. } => {},
                         WorkerCmd::FetchStickerStore => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -1443,6 +1505,7 @@ pub(super) fn spawn_session_worker(
                             });
                         }
                         WorkerCmd::SearchStickers { keyword } => {
+                            let image_requests=image_tx.clone();
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -1454,14 +1517,14 @@ pub(super) fn spawn_session_worker(
                                             &items,
                                             &gui_tx_clone,
                                             24,
-                                        );
+                                        ).await;
                                         let _ = gui_tx_clone.send(GuiEvent::StickerSearchResults {
                                             keyword,
                                             items,
                                         });
                                         ctx_clone.request_repaint();
                                         prefetch_missing_sticker_thumbnails(
-                                            &s.http,
+                                            &image_requests,
                                             missing,
                                             &gui_tx_clone,
                                             &ctx_clone,
@@ -1483,6 +1546,7 @@ pub(super) fn spawn_session_worker(
                             });
                         }
                         WorkerCmd::SuggestComposerStickers { keyword } => {
+                            let image_requests=image_tx.clone();
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
@@ -1492,7 +1556,7 @@ pub(super) fn spawn_session_worker(
                                     .await
                                     .unwrap_or_default();
                                 let missing =
-                                    preload_disk_sticker_thumbnails(&items, &gui_tx_clone, 16);
+                                    preload_disk_sticker_thumbnails(&items, &gui_tx_clone, 16).await;
                                 let _ =
                                     gui_tx_clone.send(GuiEvent::ComposerStickerSuggestions {
                                         keyword,
@@ -1500,7 +1564,7 @@ pub(super) fn spawn_session_worker(
                                     });
                                 ctx_clone.request_repaint();
                                 prefetch_missing_sticker_thumbnails(
-                                    &s.http,
+                                    &image_requests,
                                     missing,
                                     &gui_tx_clone,
                                     &ctx_clone,
@@ -2045,4 +2109,257 @@ fn publish_live(updates: &crate::live_updates::LiveUpdates, threads: Vec<Thread>
         }
     }
     wake
+}
+
+fn tokio_cache_prune(cache: crate::media_resources::PrivateMediaCache) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+
+    if last.is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+        || RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return;
+    }
+
+    *last = Some(std::time::Instant::now());
+
+    drop(last);
+
+    std::thread::spawn(move || {
+        if cache.prune().is_err() {
+            crate::logger::log_error("image cache", "Cannot prune cache");
+        }
+
+        RUNNING.store(false, std::sync::atomic::Ordering::Release);
+    });
+}
+
+async fn account_tools(
+    session: Session,
+    command: super::tools_panel::ToolsCommand,
+) -> anyhow::Result<super::tools_panel::ToolsResult> {
+    use super::tools_panel::{ToolsCommand as C, ToolsResult as R};
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<R> {
+
+        anyhow::ensure!(session.is_active() && !session.account_key().is_empty(),"Phiên làm việc đã đóng");
+
+        let mut store=crate::store::MessageStore::open(session.history_path())?;
+
+        match command {
+
+            C::OpenHit{
+thread,id}
+=>Ok(R::Hit{
+thread:Box::new(crate::tools::open_hit(&store,&thread,&id)?),id}
+),
+            C::Resume=>{
+crate::tools::resume(&store)?;
+Ok(R::Loaded{
+config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:false}
+)}
+,
+            C::Update{
+id,text,at}
+=>{
+crate::tools::update_pending(&store,session.account_key(),&id,&text,at)?;
+Ok(R::Loaded{
+config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+)}
+,
+            C::Search{
+query,hidden}
+=>Ok(R::Search{
+hits:crate::tools::search(&store,&query,hidden)?,query}
+),
+            C::Import{
+directory,confirmed}
+=>{
+
+                let path=if directory {
+super::messages::pick_native_folder_dialog()}
+else{
+tools_file(false,"Nhập lịch sử", &["db","sqlite","sqlite3","json"])}
+;
+
+                let Some(path)=path else{
+return Ok(R::Status("Đã hủy chọn nguồn".into()));
+}
+;
+
+                let n=crate::tools::import_history(&mut store,&path,session.account_key(),confirmed,&||session.is_active())?;
+
+                Ok(R::Status(format!("Đã nhập {n} tin mới. Tìm trong toàn bộ lịch sử để xem tin cũ.")))
+            }
+
+            C::Load=>Ok(R::Loaded{
+config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+),
+            C::Save(config)=>{
+anyhow::ensure!(session.is_active(),"Đã đăng xuất");
+let config=crate::tools::save_preferences(&store,config)?;
+Ok(R::Loaded{
+config,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+)}
+,
+            C::Schedule{
+thread,group,text,at}
+=>{
+crate::tools::schedule(&store,session.account_key(),&thread,group,&text,at)?;
+Ok(R::Loaded{
+config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+)}
+,
+            C::Edit{
+id,at}
+=>{
+crate::tools::edit_job(&store,session.account_key(),&id,at)?;
+Ok(R::Loaded{
+config:crate::tools::preferences(&store)?,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+)}
+,
+            C::ReadConfig{
+stickers}
+=>{
+
+                let Some(path)=tools_file(false,"Chọn cấu hình JSON",&["json"])else{
+return Ok(R::Status("Đã hủy".into()));
+}
+;
+
+                let bytes=crate::limits::read_file(&path,1024*1024)?;
+let mut config=crate::tools::preferences(&store)?;
+
+                if stickers {
+config.stickers=serde_json::from_slice(&bytes)?;
+}
+else{
+config.theme=serde_json::from_slice(&bytes)?;
+}
+
+                anyhow::ensure!(session.is_active(),"Đã đăng xuất");
+let config=crate::tools::save_preferences(&store,config)?;
+Ok(R::Loaded{
+config,tasks:crate::tools::scheduled(&store,session.account_key())?,paused:crate::tools::paused(&store)?}
+)
+            }
+
+            C::ExportConfig{
+stickers}
+=>{
+
+                let Some(path)=tools_file(true,"Xuất cấu hình JSON",&["json"])else{
+return Ok(R::Status("Đã hủy".into()));
+}
+;
+
+                let config=crate::tools::preferences(&store)?;
+
+                let value=if stickers {
+if config.stickers.is_empty(){
+serde_json::json!([{
+"cate_id":61900,"name":"Sticker của tôi","sticker_ids":[98930,98931],"sticker_type":7}
+])}
+else{
+serde_json::to_value(&config.stickers)?}
+}
+else if config.theme.is_null(){
+serde_json::json!({
+"dark":{
+"primary":"#528BFF","bg_sidebar":"#21252B"}
+,"light":{
+"primary":"#0068FF","bg_sidebar":"#FFFFFF"}
+}
+)}
+else{
+config.theme}
+;
+
+                let mut file=crate::media_resources::AtomicPrivateFile::create(&path,&crate::param_cipher::random_hex(12))?;
+file.write_all(&serde_json::to_vec_pretty(&value)?)?;
+file.commit()?;
+Ok(R::Status("Đã xuất cấu hình JSON".into()))
+            }
+
+        }
+
+    }
+).await?
+}
+
+fn tools_file(save: bool, title: &str, extensions: &[&str]) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        let picker = rfd::FileDialog::new()
+            .set_title(title)
+            .add_filter("Dữ liệu", extensions);
+
+        if save {
+            picker.save_file()
+        } else {
+            picker.pick_file()
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (save, title, extensions);
+
+        None
+    }
+}
+
+type ImageFlights = std::sync::Arc<std::sync::Mutex<HashSet<(String, String)>>>;
+
+struct ImageFlight {
+    owner: String,
+    key: String,
+    flights: ImageFlights,
+}
+
+impl ImageFlight {
+    fn start(flights: ImageFlights, owner: &str, key: &str) -> Option<Self> {
+        let inserted = flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((owner.into(), key.into()));
+
+        inserted.then(|| Self {
+            owner: owner.into(),
+            key: key.into(),
+            flights,
+        })
+    }
+}
+
+impl Drop for ImageFlight {
+    fn drop(&mut self) {
+        self.flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(self.owner.clone(), self.key.clone()));
+    }
+}
+
+#[cfg(test)]
+mod image_flight_tests {
+
+    use super::*;
+
+    #[test]
+    fn duplicate_prefetch_and_visible_request_share_an_account_flight() {
+        let flights = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+
+        let first = ImageFlight::start(flights.clone(), "owner", "thumb_1").unwrap();
+
+        assert!(ImageFlight::start(flights.clone(), "owner", "thumb_1").is_none());
+
+        assert!(ImageFlight::start(flights.clone(), "other", "thumb_1").is_some());
+
+        drop(first);
+        assert!(ImageFlight::start(flights, "owner", "thumb_1").is_some());
+    }
 }

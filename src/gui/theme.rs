@@ -33,6 +33,48 @@ pub(super) struct ThemePalette {
 }
 
 impl ThemePalette {
+    pub(super) fn apply_tools_theme(&mut self, value: &serde_json::Value) {
+        let section = value
+            .get(if self.is_dark { "dark" } else { "light" })
+            .unwrap_or(value);
+        for (name, target) in [
+            ("bg_app", &mut self.bg_app),
+            ("bg_sidebar", &mut self.bg_sidebar),
+            ("bg_chat_canvas", &mut self.bg_chat_canvas),
+            ("bg_elevated", &mut self.bg_elevated),
+            ("bg_hover", &mut self.bg_hover),
+            ("bg_selected", &mut self.bg_selected),
+            ("bg_input", &mut self.bg_input),
+            ("border", &mut self.border),
+            ("text_primary", &mut self.text_primary),
+            ("text_secondary", &mut self.text_secondary),
+            ("text_muted", &mut self.text_muted),
+            ("primary", &mut self.primary),
+            ("primary_hover", &mut self.primary_hover),
+            ("accent_online", &mut self.accent_online),
+            ("danger", &mut self.danger),
+            ("warning", &mut self.warning),
+            ("bubble_out_bg", &mut self.bubble_out_bg),
+            ("bubble_out_text", &mut self.bubble_out_text),
+            ("bubble_out_meta", &mut self.bubble_out_meta),
+            ("bubble_in_bg", &mut self.bubble_in_bg),
+            ("bubble_in_border", &mut self.bubble_in_border),
+            ("bubble_in_text", &mut self.bubble_in_text),
+            ("bubble_in_meta", &mut self.bubble_in_meta),
+        ] {
+            if let Some(hex) = section
+                .get(name)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix('#'))
+                .filter(|s| s.len() == 6 && s.is_ascii())
+            {
+                if let Ok(value) = u32::from_str_radix(hex, 16) {
+                    *target =
+                        Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8);
+                }
+            }
+        }
+    }
     pub(super) fn dark() -> Self {
         // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
@@ -282,7 +324,7 @@ fn paint_single_circle_avatar(
             );
             return;
         }
-        if loading.insert(key.clone()) {
+        if painter.clip_rect().expand(64.0).intersects(Rect::from_center_size(center,Vec2::splat(radius*2.0))) && loading.insert(key.clone()) {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchStickerImage {
                     key,

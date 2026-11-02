@@ -70,7 +70,7 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 5, "Database requires a newer application version");
+        anyhow::ensure!(schema <= 6, "Database requires a newer application version");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -147,6 +147,17 @@ impl MessageStore {
         if schema < 5 {
             let migration = conn.unchecked_transaction()?;
             migration.execute_batch("CREATE TABLE IF NOT EXISTS phone_sync_ranges(partition_id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,from_ts INTEGER NOT NULL CHECK(from_ts>=0),to_ts INTEGER NOT NULL CHECK(to_ts>=from_ts)); PRAGMA user_version=5;")?;
+            migration.commit()?;
+        }
+        if schema < 6 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch("CREATE TABLE IF NOT EXISTS tool_config(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS scheduled_messages(id TEXT PRIMARY KEY,owner TEXT NOT NULL,thread_id TEXT NOT NULL,deliver_at INTEGER NOT NULL,message_json TEXT NOT NULL,status TEXT NOT NULL,error TEXT NOT NULL,started_at INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS scheduled_due ON scheduled_messages(owner,status,deliver_at);
+                CREATE INDEX IF NOT EXISTS scheduled_recent ON scheduled_messages(owner,deliver_at);
+                CREATE INDEX IF NOT EXISTS scheduled_attempts ON scheduled_messages(owner,started_at);
+                CREATE TABLE IF NOT EXISTS auto_reply_seen(thread_id TEXT NOT NULL,msg_id TEXT NOT NULL,seen_at INTEGER NOT NULL,PRIMARY KEY(thread_id,msg_id));
+                PRAGMA user_version=6;")?;
             migration.commit()?;
         }
         Ok(Self { conn })
@@ -308,7 +319,7 @@ impl MessageStore {
 
     // Called only inside persist_snapshot's transaction, so ID promotion and the
     // following metadata merge commit together. The client index bounds lookups.
-    fn reconcile_send_identity(
+    pub(crate) fn reconcile_send_identity(
         &self,
         incoming: &ChatMessage,
         row: &mut StoredMessage,
@@ -1403,7 +1414,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                5
+                6
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -1575,7 +1586,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            5
+            6
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,

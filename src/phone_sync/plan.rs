@@ -60,50 +60,27 @@ pub(super) fn queries(
     conversations: &[Conversation],
     coverage: &HashMap<String, PhoneSyncRange>,
     now: i64,
-    phase: usize,
+    recent_only: bool,
 ) -> Vec<Query> {
     conversations
         .iter()
         .filter_map(|c| {
-            let anchor = if c.activity > 0 {
-                c.activity.min(now)
-            } else {
-                now
-            };
             let saved = coverage.get(&c.partition);
-            let (from, to) = match phase {
-                0 => {
-                    if let Some(saved) = saved {
-                        (
-                            saved
-                                .to_ts
-                                .saturating_sub(OVERLAP)
-                                .max(saved.from_ts)
-                                .min(now),
-                            now,
-                        )
-                    } else {
-                        (anchor.saturating_sub(7 * DAY).max(0), now)
-                    }
-                }
-                1 | 2 => {
-                    let saved = saved?;
-                    let target = if phase == 1 {
-                        anchor.saturating_sub(90 * DAY).max(0)
-                    } else {
-                        0
-                    };
-                    if saved.from_ts <= target {
-                        return None;
-                    }
-                    (target, saved.from_ts.saturating_add(OVERLAP).min(now))
-                }
-                _ => return None,
+            let from = if recent_only {
+                saved
+                    .map(|s| s.to_ts.saturating_sub(OVERLAP).max(s.from_ts))
+                    .unwrap_or(now.saturating_sub(7 * DAY))
+                    .max(now.saturating_sub(7 * DAY))
+                    .max(0)
+            } else if let Some(saved) = saved.filter(|s| s.from_ts == 0) {
+                saved.to_ts.saturating_sub(OVERLAP).max(0).min(now)
+            } else {
+                0
             };
-            (to >= from).then(|| Query {
+            (now >= from).then(|| Query {
                 partition: c.partition.clone(),
                 from,
-                to,
+                to: now,
             })
         })
         .collect()
@@ -136,64 +113,76 @@ pub(super) fn extend(
     }
     Ok(())
 }
+/// Merge authenticated completed ranges only when they touch durable coverage.
+/// Disconnected recent ranges wait until a later phase fills the gap; a crash
+/// may replay those ranges but can never mark the intervening history complete.
+pub(super) fn checkpoint_completed(
+    coverage: &mut HashMap<String, PhoneSyncRange>,
+    pending: &mut Vec<Query>,
+    owners: &HashMap<String, String>,
+) -> Result<()> {
+    while let Some(index) = pending.iter().position(|q| {
+        coverage
+            .get(&q.partition)
+            .is_none_or(|saved| q.from <= saved.to_ts && q.to >= saved.from_ts)
+    }) {
+        let query = pending.remove(index);
+        extend(coverage, &[query], owners)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     #[test]
-    fn activity_orders_groups_and_direct_before_older_partitions() {
-        let c = conversations(&[
-            json!({"convId":"a","lastTs":"1700000000000"}),
-            json!({"convId":"z","convType":2,"lastTs":"1700000300000"}),
-            json!({"convId":"a","lastTs":"1690000000000"}),
-        ])
-        .unwrap();
-        assert_eq!(c.len(), 2);
-        assert_eq!(c[0].partition, "group/z");
-    }
-    #[test]
-    fn recent_then_backfill_resume_without_ever_claiming_a_missing_interval() {
+    fn full_transfer_is_one_window_and_resume_is_delta_only_after_complete_coverage() {
         let now = 1_800_000_000_000;
         let c = vec![Conversation {
-            partition: "oneone/fake".into(),
-            activity: now,
+            partition: "group/test".into(),
+            activity: now - 100 * DAY,
         }];
-        let owners = HashMap::from([("oneone/fake".into(), "123".into())]);
         let mut saved = HashMap::new();
-        let recent = queries(&c, &saved, now, 0);
-        assert_eq!(recent[0].from, now - 7 * DAY);
-        extend(&mut saved, &recent, &owners).unwrap();
-        let retry = queries(&c, &saved, now + DAY, 0);
-        assert!(retry[0].from > now - 3 * 60_000);
-        let old = queries(&c, &saved, now, 1);
-        assert_eq!(old[0].from, now - 90 * DAY);
-        extend(&mut saved, &old, &owners).unwrap();
-        assert!(queries(&c, &saved, now, 1).is_empty());
-        let oldest = queries(&c, &saved, now, 2);
-        assert_eq!(oldest[0].from, 0);
-        extend(&mut saved, &oldest, &owners).unwrap();
-        assert!(queries(&c, &saved, now, 2).is_empty());
-        assert!(queries(&c, &saved, now + DAY, 0)[0].from > 0);
-        assert!(extend(
+        assert_eq!(queries(&c, &saved, now, false)[0].from, 0);
+        let owner = HashMap::from([("group/test".into(), "test".into())]);
+        extend(
             &mut saved,
-            &[Query {
-                partition: "oneone/fake".into(),
-                from: now + DAY,
-                to: now + 2 * DAY
-            }],
-            &owners
+            &queries(&c, &HashMap::new(), now, false),
+            &owner,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(queries(&c, &saved, now + DAY, false)[0].from, now - OVERLAP);
+        assert_eq!(
+            queries(&c, &HashMap::new(), now, true)[0].from,
+            now - 7 * DAY
+        );
     }
     #[test]
-    fn inactive_conversation_recent_window_is_anchored_at_its_last_activity() {
-        let now = 1_800_000_000_000;
-        let c = vec![Conversation {
-            partition: "group/fake".into(),
-            activity: now - 1000 * DAY,
+    fn disconnected_completed_ranges_do_not_claim_missing_history() {
+        let owners = HashMap::new();
+        let mut saved = HashMap::from([(
+            "p".into(),
+            PhoneSyncRange {
+                thread_id: String::new(),
+                from_ts: 0,
+                to_ts: 10,
+            },
+        )]);
+        let mut pending = vec![Query {
+            partition: "p".into(),
+            from: 20,
+            to: 30,
         }];
-        let q = queries(&c, &HashMap::new(), now, 0);
-        assert_eq!(q[0].from, now - 1007 * DAY);
-        assert_eq!(q[0].to, now);
+        checkpoint_completed(&mut saved, &mut pending, &owners).unwrap();
+        assert_eq!(saved["p"].to_ts, 10);
+        assert_eq!(pending.len(), 1);
+        pending.push(Query {
+            partition: "p".into(),
+            from: 10,
+            to: 20,
+        });
+        checkpoint_completed(&mut saved, &mut pending, &owners).unwrap();
+        assert_eq!(saved["p"].to_ts, 30);
+        assert!(pending.is_empty());
     }
 }

@@ -2,7 +2,7 @@
 use super::{
     assets,
     codec::{Codec, KeyPair},
-    import, plan, wire,
+    import, plan, policy, wire,
 };
 use crate::{
     chat::Thread,
@@ -49,17 +49,22 @@ struct Round {
 }
 impl Round {
     fn complete(&self, wanted: &[String]) -> bool {
-        self.last || (!wanted.is_empty() && wanted.iter().all(|p| self.covered.contains(p)))
+        let _ = wanted;
+        self.last
     }
     fn apply(&mut self, event: &WsEvent, id: &str) -> Result<bool> {
         if event.cmd == crate::socket::CMD_SYNC_REQUEST {
             if let Some(code) = event
                 .payload
                 .get("error_code")
-                .and_then(Value::as_i64)
+                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
                 .filter(|code| *code != 0)
             {
-                anyhow::bail!("Máy chủ từ chối yêu cầu đồng bộ điện thoại (mã {code})");
+                let _ = code;
+                return Err(policy::rejection(
+                    &event.payload,
+                    self.confirmed || !self.batches.is_empty(),
+                ));
             }
         }
         let controls = event
@@ -135,7 +140,10 @@ impl Round {
                     }
                 }
                 _ if act.to_ascii_lowercase().contains("error") => {
-                    anyhow::bail!("Điện thoại hoặc máy chủ từ chối đồng bộ")
+                    return Err(policy::rejection(
+                        &data,
+                        self.confirmed || !self.batches.is_empty(),
+                    ))
                 }
                 _ => {}
             }
@@ -214,11 +222,21 @@ async fn round<F: FnMut(String)>(
     wanted: &[plan::Query],
     progress: &mut F,
 ) -> Result<Vec<Batch>> {
+    let limit_path = session.history_path().with_extension("sync-limits.json");
+    let path = limit_path.clone();
+    let cooldown =
+        tokio::task::spawn_blocking(move || policy::Limits::load(&path).cooldown_until).await?;
+    ensure!(
+        cooldown <= crate::login::unix_now() as u64,
+        "Đồng bộ đang trong thời gian chờ do giới hạn tần suất; hãy thử lại sau"
+    );
     let id = sync_id()?;
     let mut events = transport.subscribe();
     let wanted_partitions: Vec<_> = wanted.iter().map(|q| q.partition.clone()).collect();
     let outcome=guarded(async {
-        transport.request(epoch,request(&id,crypto,wanted)).await?;
+        let packet=request(&id,crypto,wanted);
+        ensure!(serde_json::to_vec(&packet)?.len()<=policy::PAYLOAD_BUDGET,"Yêu cầu đồng bộ vượt giới hạn payload cục bộ");
+        transport.request(epoch,packet).await?;
         let mut state=Round::default();
         let timeout=tokio::time::sleep(Duration::from_secs(if wanted.is_empty(){180}else{600}));
         tokio::pin!(timeout);
@@ -241,6 +259,19 @@ async fn round<F: FnMut(String)>(
     // A disconnected socket cannot send disposal; never replay it on a new epoch.
     if transport.dispose(epoch, &id).await.is_err() {
         crate::logger::log_error("phone sync cleanup", "Transfer disposal could not be sent");
+    }
+    if let Some(rate) = outcome
+        .as_ref()
+        .err()
+        .and_then(|e| e.downcast_ref::<policy::RateLimited>())
+    {
+        let delay = rate.0;
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut limits = policy::Limits::load(&limit_path);
+            limits.cooldown_until = (crate::login::unix_now() as u64).saturating_add(delay);
+            crate::storage::atomic_write(&limit_path, &serde_json::to_vec(&limits)?)
+        })
+        .await??;
     }
     outcome
 }
@@ -430,134 +461,164 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .as_millis() as i64;
     let mut inserted = 0usize;
     let mut unmapped = 0usize;
-    for phase in 0..if recent_only { 1 } else { 3 } {
-        let jobs = plan::queries(&ordered, &coverage, now, phase);
-        let total = jobs.len().div_ceil(30);
-        let phase_name = match phase {
-            0 => "tin mới / 7 ngày gần hoạt động nhất",
-            1 => "lịch sử 90 ngày",
-            _ => "lịch sử cũ còn lại",
+    let limit_path = session.history_path().with_extension("sync-limits.json");
+    let read_path = limit_path.clone();
+    let mut limits = tokio::task::spawn_blocking(move || policy::Limits::load(&read_path)).await?;
+    let jobs = plan::queries(&ordered, &coverage, now, recent_only);
+    let mut pending = policy::split(jobs, limits.count)?;
+    let mut completed_ranges = Vec::new();
+    let mut adjustments = 0usize;
+    let mut request_number = 0usize;
+    let mut last_request: Option<std::time::Instant> = None;
+    while let Some(wanted) = pending.pop_front() {
+        if let Some(last) = last_request {
+            tokio::time::sleep(Duration::from_secs(2).saturating_sub(last.elapsed())).await;
+        }
+        last_request = Some(std::time::Instant::now());
+        request_number += 1;
+        progress(format!("Điện thoại: yêu cầu lịch sử {request_number}, {} hội thoại; tiếp tục {resumed} hội thoại có checkpoint; đã lưu {inserted} tin mới…", wanted.len()));
+        crypto = tokio::task::spawn_blocking(move || -> Result<Crypto> {
+            crypto.ephemeral = crypto.codec.key_pair()?;
+            crypto.record = None;
+            Ok(crypto)
+        })
+        .await??;
+        let batches = round(
+            session,
+            &transport,
+            epoch,
+            &cancel,
+            &crypto,
+            &wanted,
+            &mut progress,
+        )
+        .await;
+        let batches = match batches {
+            Ok(batches) => batches,
+            Err(error) => {
+                let Some(limit) = error.downcast_ref::<policy::LimitRejection>() else {
+                    return Err(error);
+                };
+                ensure!(
+                    adjustments < 4 && wanted.len() > 1,
+                    "Đã dừng sau giới hạn điều chỉnh; không tự tạo thêm yêu cầu đồng bộ"
+                );
+                let maximum = limit
+                    .0
+                    .unwrap_or(wanted.len().div_ceil(2))
+                    .min(wanted.len() - 1)
+                    .max(1);
+                adjustments += 1;
+                limits.count = Some(maximum);
+                let mut remainder = wanted;
+                remainder.extend(pending.into_iter().flatten());
+                pending = policy::split(remainder, Some(maximum))?;
+                progress(format!("Máy chủ từ chối vì số hội thoại; điều chỉnh tối đa {maximum} hội thoại/yêu cầu ({adjustments}/4)"));
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
         };
-        for (index, wanted) in jobs.chunks(30).enumerate() {
-            progress(format!("Điện thoại: {phase_name}, đợt {}/{total}; tiếp tục {resumed} hội thoại có checkpoint; đã lưu {inserted} tin mới…",index+1));
-            crypto = tokio::task::spawn_blocking(move || -> Result<Crypto> {
-                crypto.ephemeral = crypto.codec.key_pair()?;
-                crypto.record = None;
-                Ok(crypto)
-            })
-            .await??;
-            let batches = round(
+        if adjustments > 0 {
+            limits.observed_at = crate::login::unix_now() as u64;
+            let path = limit_path.clone();
+            let bytes = serde_json::to_vec(&limits)?;
+            tokio::task::spawn_blocking(move || crate::storage::atomic_write(&path, &bytes))
+                .await??;
+        }
+        for (batch_index, batch) in batches.into_iter().enumerate() {
+            progress(format!(
+                "Điện thoại: yêu cầu {request_number}, gói {}; đã lưu {inserted} tin mới…",
+                batch_index + 1
+            ));
+            let data = guarded(
+                assets::download(&batch.url, 64 * 1024 * 1024),
                 session,
+                &cancel,
                 &transport,
                 epoch,
-                &cancel,
-                &crypto,
-                wanted,
-                &mut progress,
             )
             .await?;
-            for (batch_index, batch) in batches.into_iter().enumerate() {
-                progress(format!(
-                    "Điện thoại: {phase_name}, đợt {}/{total}, gói {}; đã lưu {inserted} tin mới…",
-                    index + 1,
-                    batch_index + 1
-                ));
-                let data = guarded(
-                    assets::download(&batch.url, 64 * 1024 * 1024),
-                    session,
-                    &cancel,
-                    &transport,
-                    epoch,
+            let cancel_decode = cancel.clone();
+            let account_decode = session.clone();
+            let (next, objects) = tokio::task::spawn_blocking(move || {
+                decode_batch(
+                    crypto,
+                    data,
+                    batch.metadata,
+                    false,
+                    cancel_decode,
+                    account_decode,
                 )
-                .await?;
-                let cancel_decode = cancel.clone();
-                let account_decode = session.clone();
-                let (next, objects) = tokio::task::spawn_blocking(move || {
-                    decode_batch(
-                        crypto,
-                        data,
-                        batch.metadata,
-                        false,
-                        cancel_decode,
-                        account_decode,
-                    )
-                })
-                .await??;
-                crypto = next;
-                for object in objects {
-                    let unknown: Vec<_> = object
-                        .get("partitions")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .flat_map(|p| {
-                            p.get("messages")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                        })
-                        .map(|m| import::number(m, "senderId"))
-                        .filter(|id| {
-                            !id.is_empty()
-                                && !senders.contains_key(id)
-                                && !attempted_senders.contains(id)
-                        })
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    for ids in unknown.chunks(50) {
-                        let resolved = guarded(
-                            crate::chat::resolve_sync_ids(session, ids),
-                            session,
-                            &cancel,
-                            &transport,
-                            epoch,
-                        )
-                        .await?;
-                        attempted_senders.extend(ids.iter().cloned());
-                        Arc::make_mut(&mut senders).extend(resolved);
-                    }
-                    let account = session.clone();
-                    let map = threads.clone();
-                    let senders = senders.clone();
-                    let imported =
-                        tokio::task::spawn_blocking(move || -> Result<import::Imported> {
-                            ensure!(account.is_active(), "Đã đăng xuất; dừng nhập lịch sử");
-                            let mut store =
-                                crate::store::MessageStore::open(account.history_path())?;
-                            import::save(&mut store, &object, &map, &senders, account.account_key())
-                        })
-                        .await??;
-                    inserted += imported.inserted;
-                    unmapped += imported.unmapped;
-                    for preview in imported.previews {
-                        page(preview);
-                        // Bound UI event production even when a phone batch has many partitions.
-                        tokio::time::sleep(Duration::from_millis(16)).await;
-                    }
-                }
-            }
-            // Advance only after every batch of this range was authenticated and imported.
-            // Interrupted ranges replay safely; unmapped partitions are deliberately retried.
-            plan::extend(&mut coverage, wanted, &owners)?;
-            let completed: Vec<_> = wanted
-                .iter()
-                .filter(|q| owners.contains_key(&q.partition))
-                .filter_map(|q| {
-                    coverage
-                        .get(&q.partition)
-                        .cloned()
-                        .map(|range| (q.partition.clone(), range))
-                })
-                .collect();
-            let account = session.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                ensure!(account.is_active(), "Đã đăng xuất; không ghi checkpoint");
-                crate::store::MessageStore::open(account.history_path())?
-                    .save_phone_sync_ranges(&completed)
             })
             .await??;
+            crypto = next;
+            for object in objects {
+                let unknown: Vec<_> = object
+                    .get("partitions")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|p| {
+                        p.get("messages")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .map(|m| import::number(m, "senderId"))
+                    .filter(|id| {
+                        !id.is_empty()
+                            && !senders.contains_key(id)
+                            && !attempted_senders.contains(id)
+                    })
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                for ids in unknown.chunks(50) {
+                    let resolved = guarded(
+                        crate::chat::resolve_sync_ids(session, ids),
+                        session,
+                        &cancel,
+                        &transport,
+                        epoch,
+                    )
+                    .await?;
+                    attempted_senders.extend(ids.iter().cloned());
+                    Arc::make_mut(&mut senders).extend(resolved);
+                }
+                let account = session.clone();
+                let map = threads.clone();
+                let senders = senders.clone();
+                let imported = tokio::task::spawn_blocking(move || -> Result<import::Imported> {
+                    ensure!(account.is_active(), "Đã đăng xuất; dừng nhập lịch sử");
+                    let mut store = crate::store::MessageStore::open(account.history_path())?;
+                    import::save(&mut store, &object, &map, &senders, account.account_key())
+                })
+                .await??;
+                inserted += imported.inserted;
+                unmapped += imported.unmapped;
+                for preview in imported.previews {
+                    page(preview);
+                    // Bound UI event production even when a phone batch has many partitions.
+                    tokio::time::sleep(Duration::from_millis(16)).await;
+                }
+            }
         }
+        // Advance only after every batch of this range was authenticated and imported.
+        // Interrupted ranges replay safely; unmapped partitions are deliberately retried.
+        completed_ranges.extend(wanted.iter().cloned());
+        plan::checkpoint_completed(&mut coverage, &mut completed_ranges, &owners)?;
+        let completed: Vec<_> = coverage
+            .iter()
+            .filter(|(partition, _)| owners.contains_key(*partition))
+            .map(|(partition, range)| (partition.clone(), range.clone()))
+            .collect();
+        let account = session.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            ensure!(account.is_active(), "Đã đăng xuất; không ghi checkpoint");
+            crate::store::MessageStore::open(account.history_path())?
+                .save_phone_sync_ranges(&completed)
+        })
+        .await??;
     }
     Ok(format!("Đã nhận lịch sử điện thoại: {inserted} tin mới, {} hội thoại được yêu cầu; {unmapped} tin chưa xác định hội thoại được giữ riêng. Đã lưu tiến độ; lần sau chỉ lấy phần mới và phần chưa hoàn tất. Chỉ khôi phục dữ liệu điện thoại còn giữ; tệp đính kèm phụ thuộc liên kết còn hạn.",partitions.len()))
 }
@@ -626,7 +687,7 @@ mod tests {
         assert!(routing_id("123456789"));
     }
     #[test]
-    fn completion_requires_all_requested_scopes_and_matching_session() {
+    fn completion_requires_explicit_last_and_matching_session() {
         let mut state = Round::default();
         let event = |id: &str, partition: &str| WsEvent {
             cmd: 601,
@@ -643,8 +704,16 @@ mod tests {
         state
             .apply(&event("current", "group/b"), "current")
             .unwrap();
-        assert!(state.complete(&["oneone/a".into(), "group/b".into()]));
+        assert!(!state.complete(&["oneone/a".into(), "group/b".into()]));
         assert!(!state.complete(&[]));
+        let last = WsEvent {
+            cmd: 601,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({"data":{"controls":[{"content":{"act_type":"transfer_sync2","act":"upload_batch","data":{"syncId":"current","isLast":1}}}]}}),
+        };
+        state.apply(&last, "current").unwrap();
+        assert!(state.complete(&["oneone/a".into(), "group/b".into()]));
     }
 }
 

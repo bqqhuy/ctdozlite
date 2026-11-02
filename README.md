@@ -64,9 +64,9 @@ Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đ�
 
 Ảnh nhận được hiển thị thumbnail và chú thích (nếu có), ẩn URL vận chuyển. Bấm ảnh để mở trình xem ảnh trong ứng dụng. Giờ tin mới, tin đồng bộ và mốc ngày dùng chung múi giờ Windows.
 
-Đồng bộ điện thoại ưu tiên hội thoại hoạt động gần nhất: tải khoảng 7 ngày quanh lần hoạt động cuối, rồi mở rộng 90 ngày và lịch sử còn lại. **Đồng bộ từ điện thoại** tiếp tục theo checkpoint đã lưu, chỉ yêu cầu phần mới và phần chưa hoàn tất; **Chỉ cập nhật tin gần đây** bỏ qua hai lượt lịch sử cũ. **Quét lại toàn bộ lịch sử điện thoại** đặt lại tiến độ, giữ nguyên tin đã lưu. Mỗi lần vẫn cần điện thoại chấp thuận.
+Đồng bộ điện thoại gom tất cả khoảng lịch sử còn thiếu vào ít yêu cầu nhất, sau bước lấy danh sách hội thoại. Không chia ba lượt thời gian hay mặc định 30 hội thoại/yêu cầu. Chỉ tách khi payload vượt giới hạn cục bộ, đã có giới hạn được ghi nhớ, hoặc điện thoại từ chối rõ vì quá nhiều hội thoại/payload. Timeout và lỗi không rõ kết quả dừng lượt, không tự gửi lại. Phản hồi giới hạn tần suất tạo thời gian chờ theo tài khoản. **Chỉ cập nhật tin gần đây** lấy phần mới (tối đa cửa sổ 7 ngày khi chưa có tiến độ); **Quét lại toàn bộ lịch sử điện thoại** đặt lại tiến độ, giữ tin đã lưu. Mỗi lần vẫn cần điện thoại chấp thuận.
 
-Bản cũ chưa ghi checkpoint nên không thể suy ra đợt tải đã hoàn tất từ số tin hiện có. Với dữ liệu từ bản cũ, dùng chế độ cập nhật gần đây nếu chưa muốn tải lại phần lịch sử cũ. Thứ tự gói do điện thoại quyết định; ưu tiên này áp dụng cho khoảng thời gian được yêu cầu, không bảo đảm từng tin đến đúng thứ tự mới → cũ. Xem [ADR-0007](docs/adr/0007-recent-first-resumable-phone-sync.md).
+Bản cũ chưa ghi checkpoint nên không thể suy ra đợt tải đã hoàn tất từ số tin hiện có. Với dữ liệu từ bản cũ, dùng chế độ cập nhật gần đây nếu chưa muốn tải lại phần lịch sử cũ. Thứ tự gói do điện thoại quyết định, không bảo đảm từng tin đến đúng thứ tự mới → cũ. Mỗi yêu cầu có thể nhận nhiều gói dữ liệu từ điện thoại; nhận thêm gói không phát sinh yêu cầu sync mới. Khoảng tiếp tục có chồng lấn 2 phút để tránh bỏ sót tin ở ranh giới. Xem [ADR-0010](docs/adr/0010-minimal-request-phone-sync.md).
 
 ## Trạng thái kiểm chứng và giới hạn
 
@@ -81,8 +81,8 @@ Những điểm cần biết trước khi dùng:
 - **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
 - Đã bổ sung **Settings → Đồng bộ → Đồng bộ từ điện thoại**: cần mở Zalo di động và xác nhận. Tiến độ và nút dừng hiện ở cửa sổ chính. Người dùng đã xác nhận luồng đồng bộ ban đầu hoạt động với điện thoại thật; cơ chế ưu tiên khoảng thời gian và tiếp tục mới vẫn cần kiểm chứng trên thiết bị; chỉ lấy được dữ liệu điện thoại còn giữ, không bảo đảm media cũ còn hạn. Xem [ADR-0005](docs/adr/0005-phone-approved-history-sync.md).
 - Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.
-- Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed, scheduler hoặc REST/MCP của upstream trong bản tích hợp này.
-- Database hiện dùng **schema 5**, bổ sung checkpoint đồng bộ điện thoại. Bản cũ hỗ trợ schema 2/3/4 sẽ từ chối mở; xem rollback trong [ADR-0007](docs/adr/0007-recent-first-resumable-phone-sync.md).
+- Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed hoặc REST/MCP của upstream trong bản tích hợp này.
+- Database hiện dùng **schema 6**, bổ sung cấu hình tiện ích, lịch gửi và chống lặp trả lời tự động. Bản cũ hỗ trợ schema 2/3/4/5 sẽ từ chối mở; xem rollback trong [ADR-0012](docs/adr/0012-account-tools.md).
 
 Đây là tích hợp có chọn lọc từ upstream, chưa phải bản sao đầy đủ mọi tính năng của upstream mới nhất. Chi tiết có trong [báo cáo đối chiếu commit](docs/UPSTREAM_REVIEW_2026-11-02.md) và [audit Windows ARM64](docs/ARM64_IMPLEMENTATION.md).
 
@@ -118,3 +118,15 @@ Không đưa session, cookie, IMEI, database hoặc log chứa nội dung chat l
 Mã nguồn được phân phối theo **MIT hoặc Apache-2.0**: [LICENSE-MIT](LICENSE-MIT) · [LICENSE-APACHE](LICENSE-APACHE). Giấy phép và ghi nhận thư viện phụ thuộc nằm trong [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 
 Zalo và các nhãn hiệu liên quan thuộc VNG. Đây là ứng dụng cộng đồng không chính thức, độc lập và không được Zalo/VNG bảo trợ.
+
+### Tiện ích mới theo tài khoản
+
+Mở **Cài đặt → Tiện ích → Tìm lịch sử, nhập dữ liệu, theme/sticker, hẹn giờ & tự trả lời**.
+
+- Tìm toàn bộ SQLite (không dấu, tối đa 50 kết quả mới nhất), bấm kết quả để mở ngữ cảnh cục bộ.
+- Nhập SQLite/JSON tương thích từ tập tin/thư mục, nguồn chỉ đọc và cần xác nhận đúng tài khoản. JSON tối đa 32 MiB; lịch sử lớn dùng SQLite. Chưa hỗ trợ JSONL hoặc giải mã backup Zalo PC. Thư mục nhận các DB và `threads_cache.json`/`export.json`, bỏ qua cấu hình/phiên đăng nhập.
+- Nạp/xuất theme JSON và danh sách sticker theo ID Zalo; cấu hình lưu riêng từng tài khoản.
+- Hẹn giờ tương đối hoặc `YYYY-MM-DD HH:MM` theo giờ máy, sửa tin chưa từng gửi, hủy và gửi lại thủ công. App cần đang chạy/đăng nhập; tin quá giờ sẽ gửi khi mở/đăng nhập lại, nhưng không tự gửi lại tin đã bị gián đoạn. Lịch gửi tạm dừng sau lỗi và chỉ tiếp tục khi người dùng yêu cầu.
+- Quy tắc tự trả lời mặc định tắt, có khớp chính xác/chứa/tiền tố và phạm vi cá nhân/nhóm. Chỉ áp dụng tin mới sau lúc bật, chống trùng bền vững và tối đa 5 trả lời/phút. Thay cấu hình hủy các trả lời tự động còn chờ.
+
+Các phần này tiếp nhận có chọn lọc từ upstream `8e16464`, giữ định danh tin, bảo vệ tài khoản, native Windows ARM64 và đường gửi có xác nhận của fork. REST/MCP và updater tự động chưa bật.
