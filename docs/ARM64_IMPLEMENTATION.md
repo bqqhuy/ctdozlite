@@ -138,3 +138,11 @@ Metadata Windows: version resource theo Cargo, tên file gốc, manifest `arm64`
 Đây là tích hợp chọn lọc, chưa nhập toàn bộ 13 commit upstream. Feed/updater/scheduler/REST-MCP vẫn ngoài bản tích hợp này.
 
 Kiểm chứng bản tích hợp chọn lọc: **172 unit + 32 integration đạt**, 2 unit cố ý ignore (benchmark/live-call); fmt và clippy strict đạt. Module video cùng test biên dịch qua target Windows ARM64. Chưa có kiểm chứng native runner cho commit này cho đến khi Actions chạy lại thành công.
+
+## Thứ tự hội thoại và trạng thái đồng bộ trên GUI chính
+
+Danh sách dùng thời gian mới nhất từ cả message trong RAM và metadata sidebar, chuẩn hóa giây/millisecond; tin lịch sử cũ tải thêm không làm hội thoại tụt xuống. Bỏ ghim Cloud ngầm định; giữ ưu tiên các hội thoại người dùng chủ động ghim. Việc sắp xếp chỉ đổi thứ tự hiển thị, không chuyển hội thoại đang mở.
+
+Thanh trạng thái đồng bộ nằm trên màn hình chính, hiển thị cả cập nhật hội thoại/tin gần đây và tải lịch sử nhóm/Cloud, spinner khi chạy và tiến độ thực do worker cung cấp. Có Dừng cho tác vụ tải lịch sử, Chi tiết và Ẩn sau khi kết thúc. Trạng thái lỗi/dừng vẫn được giữ để đọc; xóa khi đổi tài khoản. Không hiển thị phần trăm giả khi chưa biết tổng số trang.
+
+Đồng bộ điện thoại là tính năng fork chưa triển khai đầy đủ, không kết luận bất khả thi do bảo mật. [Zalo Help](https://help.zalo.me/tai-zalo/) xác nhận chức năng đồng bộ của client chính thức; ghi chép `re-notes/02_chat_data.md` chỉ ra lớp worker/binary sync-v2 riêng. Fork hiện dùng các phần đọc/poll đã xác minh và lịch sử nhóm/Cloud, chưa tái hiện đầy đủ quy trình chuyển lịch sử từ điện thoại. Xem `re-notes/10_phone_sync_scope.md`.

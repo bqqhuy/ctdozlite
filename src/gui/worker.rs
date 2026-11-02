@@ -175,6 +175,23 @@ pub(super) fn resp_error_code(resp: &serde_json::Value) -> Option<i64> {
         .filter(|c| *c != 0)
 }
 
+// A terminal refresh event is required on every exit, including transport errors
+// and cancelled tasks. The guard owns no locks or blocking resources.
+struct RefreshNotice {
+    sender: Sender<GuiEvent>,
+    ctx: egui::Context,
+    message: String,
+}
+impl Drop for RefreshNotice {
+    fn drop(&mut self) {
+        let _ = self.sender.send(GuiEvent::ConversationRefreshStatus {
+            running: false,
+            message: std::mem::take(&mut self.message),
+        });
+        self.ctx.request_repaint();
+    }
+}
+
 pub(super) fn is_session_expired_error(err_str: &str) -> bool {
     crate::session::is_expired_error(err_str)
 }
@@ -839,7 +856,7 @@ pub(super) fn spawn_session_worker(
                             let cancel = history_sync_cancel.clone();
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
-                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang đồng bộ lịch sử từ máy chủ…".into() });
+                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang tải lịch sử nhóm và Cloud từ máy chủ…".into() });
                             ctx.request_repaint();
                             tokio::spawn(async move {
                                 let result = crate::history_sync::download(&s, threads, cancel,
@@ -872,15 +889,19 @@ pub(super) fn spawn_session_worker(
                             let auto_history_started = auto_history_started.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
+                                let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into()};
+                                let _=gui_tx_clone.send(GuiEvent::ConversationRefreshStatus {running:true,message:"Đang cập nhật hội thoại và tin nhắn gần đây…".into()});
+                                ctx_clone.request_repaint();
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
                                     let status = s.validate_session().await;
                                     if let crate::session::SessionStatus::Unreachable(reason) = &status {
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Chưa thể kết nối; giữ phiên và lịch sử cục bộ: {reason}")));
+                                        notice.message=format!("Chưa thể kết nối; giữ phiên và lịch sử cục bộ: {reason}");
                                         ctx_clone.request_repaint();
                                         return;
                                     }
                                     if status == crate::session::SessionStatus::Expired {
+                                        notice.message="Phiên đã hết hạn; cần đăng nhập lại để đồng bộ".into();
                                         if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
                                         {
                                             let mut sl = session_clone.lock().await;
@@ -920,7 +941,7 @@ pub(super) fn spawn_session_worker(
                                     let mut list = match crate::chat::get_friends(&s).await {
                                         Ok(list) => list,
                                         Err(e) => {
-                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Cập nhật hội thoại thất bại: {e}")));
+                                            notice.message=format!("Cập nhật hội thoại thất bại: {e}");
                                             ctx_clone.request_repaint();
                                             return;
                                         }
@@ -930,12 +951,10 @@ pub(super) fn spawn_session_worker(
                                         &mut list,
                                         crate::store::MessageStore::PRELOAD_MSGS,
                                     );
-                                    {
+                                    let recent_result={
                                         let mut ps = poll_clone.lock().await;
-                                        let _ =
-                                            crate::chat::poll_new_messages(&s, &mut ps, &mut list)
-                                                .await;
-                                    }
+                                        crate::chat::poll_new_messages(&s, &mut ps, &mut list).await
+                                    };
                                     persist_received(&s, &list).await;
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                     let eligible = list.iter().any(|t| t.is_group || s.login.as_ref().is_some_and(|li| !li.send2me_id.is_empty() && li.send2me_id == t.id));
@@ -946,7 +965,10 @@ pub(super) fn spawn_session_worker(
                                     }
                                     let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Đã cập nhật {count} hội thoại và tin gần đây; chưa tải toàn bộ lịch sử")));
+                                    notice.message=match recent_result {
+                                        Ok(_) => format!("Đã cập nhật {count} hội thoại và tin gần đây; không phải toàn bộ lịch sử điện thoại"),
+                                        Err(error) => format!("Đã cập nhật {count} hội thoại; chưa lấy được tin gần đây: {error}"),
+                                    };
                                     ctx_clone.request_repaint();
                                 }
                             });
@@ -2102,5 +2124,25 @@ mod image_pipeline_tests {
         .unwrap();
         assert_eq!(second.size, [512, 256]);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod refresh_notice_tests {
+    use super::*;
+    #[test]
+    fn refresh_guard_always_reports_terminal_failure_when_work_exits_early() {
+        let (tx, rx) = channel();
+        {
+            let mut notice = RefreshNotice {
+                sender: tx,
+                ctx: egui::Context::default(),
+                message: "Chưa hoàn tất".into(),
+            };
+            notice.message = "Không thể kết nối máy chủ".into();
+        }
+        assert!(
+            matches!(rx.try_recv().unwrap(),GuiEvent::ConversationRefreshStatus {running:false,message} if message=="Không thể kết nối máy chủ")
+        );
     }
 }

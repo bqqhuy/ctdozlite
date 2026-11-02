@@ -1,6 +1,104 @@
 use super::*;
 
 impl ZaloGuiApp {
+    fn sort_conversation_indices(&self, indices: &mut [usize]) {
+        // Compute each activity timestamp once: history may be evicted or delivered out of order.
+        // Cloud has no implicit pin; explicitly pinned threads retain the user's chosen priority.
+        indices.sort_by_cached_key(|&index| {
+            let thread = &self.threads[index];
+            (
+                std::cmp::Reverse(
+                    self.conversation_preferences
+                        .get(&thread.id)
+                        .is_some_and(|p| p.pinned),
+                ),
+                std::cmp::Reverse(thread.sidebar_activity_ts()),
+                thread.id.as_str(),
+            )
+        });
+    }
+
+    pub(super) fn reset_sync_status(&mut self) {
+        self.history_sync_running = false;
+        self.history_sync_status.clear();
+        self.refresh_sync_running = false;
+        self.refresh_sync_status.clear();
+        self.sync_cancel_requested = false;
+        self.sync_notice_dismissed = false;
+        self.last_sync_was_history = true;
+    }
+
+    fn sync_status_message(&self) -> &str {
+        if self.history_sync_running {
+            &self.history_sync_status
+        } else if self.refresh_sync_running || !self.last_sync_was_history {
+            &self.refresh_sync_status
+        } else {
+            &self.history_sync_status
+        }
+    }
+
+    pub(super) fn render_sync_status_bar(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let running = self.history_sync_running || self.refresh_sync_running;
+        if !self.is_logged_in
+            || (!running && (self.sync_notice_dismissed || self.sync_status_message().is_empty()))
+        {
+            return;
+        }
+        egui::TopBottomPanel::bottom("main_sync_status")
+            .resizable(false)
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.bg_app)
+                    .inner_margin(Margin::symmetric(12.0, 8.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if running {
+                        ui.spinner();
+                    }
+                    ui.strong("Đồng bộ từ máy chủ");
+                    if self.history_sync_running
+                        && ui
+                            .add_enabled(
+                                !self.sync_cancel_requested,
+                                egui::Button::new(if self.sync_cancel_requested {
+                                    "Đang dừng…"
+                                } else {
+                                    "Dừng"
+                                }),
+                            )
+                            .clicked()
+                    {
+                        if let Some(tx) = WORKER_TX.get() {
+                            if tx.send(WorkerCmd::CancelHistorySync).is_ok() {
+                                self.sync_cancel_requested = true;
+                            }
+                        }
+                    }
+                    if ui.button("Chi tiết").clicked() {
+                        self.settings_tab = SettingsTab::Sync;
+                        self.settings_modal_open = true;
+                    }
+                    if !running && ui.button("Ẩn trạng thái").clicked() {
+                        self.sync_notice_dismissed = true;
+                    }
+                });
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(self.sync_status_message()).color(pal.text_primary),
+                    )
+                    .wrap(),
+                )
+                .on_hover_text(self.sync_status_message());
+                ui.label(
+                    RichText::new("Đồng bộ lịch sử từ điện thoại chưa được hỗ trợ trong bản này.")
+                        .size(11.5)
+                        .color(pal.text_muted),
+                );
+            });
+    }
+
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
@@ -694,37 +792,7 @@ impl ZaloGuiApp {
                     .map(|(i, _)| i)
                     .collect();
 
-                filtered_indices.sort_by(|&a, &b| {
-                    let ta = &self.threads[a];
-                    let tb = &self.threads[b];
-                    let a_cloud = ta.name.contains("Cloud của tôi");
-                    let b_cloud = tb.name.contains("Cloud của tôi");
-                    if a_cloud != b_cloud {
-                        return b_cloud.cmp(&a_cloud);
-                    }
-                    let a_pinned = self
-                        .conversation_preferences
-                        .get(&ta.id)
-                        .is_some_and(|p| p.pinned);
-                    let b_pinned = self
-                        .conversation_preferences
-                        .get(&tb.id)
-                        .is_some_and(|p| p.pinned);
-                    if a_pinned != b_pinned {
-                        return b_pinned.cmp(&a_pinned);
-                    }
-                    let ts_a = ta
-                        .messages
-                        .last()
-                        .map(|m| normalize_ts_ms(m.ts))
-                        .unwrap_or(0);
-                    let ts_b = tb
-                        .messages
-                        .last()
-                        .map(|m| normalize_ts_ms(m.ts))
-                        .unwrap_or(0);
-                    ts_b.cmp(&ts_a)
-                });
+                self.sort_conversation_indices(&mut filtered_indices);
 
                 // Also search message contents across all conversations when `query` is non-empty!
                 let msg_hits: Vec<(usize, String, String, String, bool)> = if query.len() >= 2 {
@@ -775,11 +843,10 @@ impl ZaloGuiApp {
                         for &i in &filtered_indices {
                             let t = &self.threads[i];
                             let is_selected = i == self.selected_thread_index;
-                            let is_pinned_cloud = t.name.contains("Cloud của tôi")
-                                || self
-                                    .conversation_preferences
-                                    .get(&t.id)
-                                    .is_some_and(|p| p.pinned);
+                            let is_user_pinned = self
+                                .conversation_preferences
+                                .get(&t.id)
+                                .is_some_and(|p| p.pinned);
 
                             let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                             let row_width = (ui.available_width() - 8.0).max(44.0);
@@ -940,7 +1007,7 @@ impl ZaloGuiApp {
                                         FontId::proportional(11.0),
                                         pal.text_muted,
                                     );
-                                    if is_pinned_cloud {
+                                    if is_user_pinned {
                                         draw_icon_pin(
                                             ui.painter(),
                                             Pos2::new(time_right - tw - 9.0, row_rect.top() + 19.5),
@@ -3309,5 +3376,185 @@ impl ZaloGuiApp {
         self.render_image_viewer_modal(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
+    }
+}
+
+#[cfg(test)]
+mod sync_and_order_tests {
+    use super::*;
+    fn app_and_context() -> (ZaloGuiApp, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.is_logged_in = true;
+        (app, ctx)
+    }
+    fn thread(id: &str, group: bool, metadata: i64, times: &[i64]) -> Thread {
+        Thread {
+            id: id.into(),
+            name: if id == "cloud" {
+                "Cloud của tôi".into()
+            } else {
+                id.into()
+            },
+            is_group: group,
+            messages: times
+                .iter()
+                .enumerate()
+                .map(|(i, &ts)| ChatMessage {
+                    id: format!("fixture-{i}"),
+                    ts,
+                    ..Default::default()
+                })
+                .collect(),
+            presentation: crate::chat::SidebarPresentation {
+                last_message_ts: metadata,
+                ..Default::default()
+            },
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            unread: Default::default(),
+        }
+    }
+    #[test]
+    fn latest_group_or_direct_sorts_first_even_with_evicted_or_out_of_order_history() {
+        let (mut app, _) = app_and_context();
+        app.threads = vec![
+            thread("cloud", false, 1_700_000_000, &[]),
+            thread("group", true, 1_700_000_300_000, &[1_700_000_100]),
+            thread("direct", false, 0, &[1_700_000_200_000, 1_700_000_050_000]),
+        ];
+        app.selected_thread_index = 2;
+        let mut order = vec![0, 1, 2];
+        app.sort_conversation_indices(&mut order);
+        assert_eq!(order, vec![1, 2, 0]);
+        assert_eq!(
+            app.selected_thread_index, 2,
+            "sorting the sidebar must not switch the open chat"
+        );
+        // Appending an older history page cannot demote the latest conversation.
+        app.threads[1].messages.push(ChatMessage {
+            id: "old-history".into(),
+            ts: 1_600_000_000,
+            ..Default::default()
+        });
+        app.sort_conversation_indices(&mut order);
+        assert_eq!(order, vec![1, 2, 0]);
+        app.threads[2].messages.push(ChatMessage {
+            id: "new-live".into(),
+            ts: 1_700_000_400,
+            ..Default::default()
+        });
+        app.sort_conversation_indices(&mut order);
+        assert_eq!(order, vec![2, 1, 0]);
+    }
+    #[test]
+    fn explicit_pins_keep_priority_without_implicitly_pinning_cloud() {
+        let (mut app, _) = app_and_context();
+        app.threads = vec![
+            thread("cloud", false, 1_700_000_000, &[]),
+            thread("latest", true, 1_700_000_300, &[]),
+        ];
+        let mut order = vec![0, 1];
+        app.sort_conversation_indices(&mut order);
+        assert_eq!(order, vec![1, 0]);
+        app.conversation_preferences.insert(
+            "cloud".into(),
+            crate::store::ConversationPreference {
+                pinned: true,
+                ..Default::default()
+            },
+        );
+        app.sort_conversation_indices(&mut order);
+        assert_eq!(order, vec![0, 1]);
+    }
+    #[test]
+    fn main_status_tracks_progress_cancel_error_and_account_reset_without_settings() {
+        let (mut app, ctx) = app_and_context();
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        tx.send(GuiEvent::ConversationRefreshStatus {
+            running: true,
+            message: "Đang cập nhật hội thoại".into(),
+        })
+        .unwrap();
+        tx.send(GuiEvent::HistorySyncStatus {
+            running: true,
+            message: "Nhóm thử — trang 2, 50 tin mới".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.sync_status_message(), "Nhóm thử — trang 2, 50 tin mới");
+        assert!(!app.settings_modal_open);
+        app.sync_cancel_requested = true;
+        tx.send(GuiEvent::HistorySyncStatus {
+            running: true,
+            message: "Nhóm thử — trang 3, 100 tin mới".into(),
+        })
+        .unwrap();
+        tx.send(GuiEvent::ConversationRefreshStatus {
+            running: false,
+            message: "Đã cập nhật hội thoại".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_cancel_requested);
+        assert_eq!(app.sync_status_message(), "Nhóm thử — trang 3, 100 tin mới");
+        tx.send(GuiEvent::HistorySyncStatus {
+            running: false,
+            message: "Lỗi tải lịch sử: mất kết nối".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.history_sync_running);
+        assert!(!app.sync_cancel_requested);
+        assert_eq!(app.sync_status_message(), "Lỗi tải lịch sử: mất kết nối");
+        app.reset_sync_status();
+        assert!(app.sync_status_message().is_empty());
+        assert!(!app.refresh_sync_running);
+    }
+    #[test]
+    fn main_status_bar_fits_small_and_scaled_workspaces() {
+        let (mut app, ctx) = app_and_context();
+        app.history_sync_running = true;
+        app.history_sync_status = "Lịch sử 2/4: Nhóm thử nghiệm — trang 3, 125 tin mới".into();
+        for scale in [1.0, 1.5, 2.0] {
+            for size in [
+                Vec2::new(320.0, 240.0),
+                Vec2::new(480.0, 360.0),
+                Vec2::new(1020.0, 700.0),
+            ] {
+                for _ in 0..2 {
+                    let mut input = egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                        ..Default::default()
+                    };
+                    input
+                        .viewports
+                        .get_mut(&egui::ViewportId::ROOT)
+                        .unwrap()
+                        .native_pixels_per_point = Some(scale);
+                    let _ = ctx.run(input, |ctx| {
+                        app.render_sync_status_bar(ctx, &app.palette());
+                        assert!(
+                            ctx.available_rect().height() > 0.0,
+                            "sync notice must leave room for chat"
+                        );
+                        assert!(
+                            ctx.available_rect().width() <= size.x + 1.0,
+                            "scale={scale} size={size:?} screen={:?} available={:?}",
+                            ctx.screen_rect(),
+                            ctx.available_rect()
+                        );
+                    });
+                }
+            }
+        }
     }
 }

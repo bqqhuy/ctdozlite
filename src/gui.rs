@@ -51,6 +51,10 @@ pub enum GuiEvent {
         owner: String,
         thread_id: String,
     },
+    ConversationRefreshStatus {
+        running: bool,
+        message: String,
+    },
     HistorySyncStatus {
         running: bool,
         message: String,
@@ -416,6 +420,11 @@ pub struct ZaloGuiApp {
     allow_quit: bool,
     history_sync_running: bool,
     history_sync_status: String,
+    refresh_sync_running: bool,
+    refresh_sync_status: String,
+    sync_notice_dismissed: bool,
+    sync_cancel_requested: bool,
+    last_sync_was_history: bool,
     settings_modal_open: bool,
     settings_tab: SettingsTab,
     settings: AppSettings,
@@ -536,7 +545,7 @@ impl ZaloGuiApp {
         let selected_thread_index = threads
             .iter()
             .enumerate()
-            .max_by_key(|(_, t)| t.messages.last().map(|m| m.ts).unwrap_or(0))
+            .max_by_key(|(_, t)| t.sidebar_activity_ts())
             .map(|(idx, _)| idx)
             .unwrap_or(0);
 
@@ -629,6 +638,11 @@ impl ZaloGuiApp {
             allow_quit: false,
             history_sync_running: false,
             history_sync_status: String::new(),
+            refresh_sync_running: false,
+            refresh_sync_status: String::new(),
+            sync_notice_dismissed: false,
+            sync_cancel_requested: false,
+            last_sync_was_history: true,
             settings_modal_open: false,
             settings_tab: SettingsTab::General,
             settings: loaded_settings,
@@ -656,7 +670,39 @@ impl ZaloGuiApp {
             });
             app.is_logged_in = true;
             app.user_name = "ARM64 UI fixture".into();
-            app.settings_modal_open = true;
+            app.settings_modal_open = !args.iter().any(|a| a == "--ui-smoke-workspace-sync");
+            if !app.settings_modal_open {
+                app.history_sync_running = true;
+                app.history_sync_status =
+                    "Lịch sử 2/4: Nhóm thử nghiệm — trang 3, 125 tin mới".into();
+                let now = crate::login::unix_now() * 1000;
+                app.threads = [
+                    (
+                        "fixture-direct",
+                        "Trò chuyện thử nghiệm",
+                        false,
+                        now - 120000,
+                    ),
+                    ("fixture-group", "Nhóm thử nghiệm", true, now),
+                    ("fixture-cloud", "Cloud của tôi", false, now - 3600000),
+                ]
+                .into_iter()
+                .map(|(id, name, is_group, ts)| Thread {
+                    id: id.into(),
+                    name: name.into(),
+                    preview: "Dữ liệu giả phục vụ kiểm thử giao diện".into(),
+                    time: crate::clock::message_time(ts),
+                    avatar: None,
+                    is_group,
+                    messages: Vec::new(),
+                    presentation: crate::chat::SidebarPresentation {
+                        last_message_ts: ts,
+                        ..Default::default()
+                    },
+                    unread: Default::default(),
+                })
+                .collect();
+            }
             app.settings_tab = match args
                 .iter()
                 .position(|a| a == "--ui-smoke-tab")
@@ -780,6 +826,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
                     if self.user_uin != uin {
+                        self.reset_sync_status();
                         self.threads.clear();
                         self.selected_thread_index = 0;
                         self.unread_counts.clear();
@@ -956,6 +1003,7 @@ impl ZaloGuiApp {
                     self.show_toast("Đã đổi thư mục tải về");
                 }
                 GuiEvent::LoggedOut => {
+                    self.reset_sync_status();
                     self.is_logged_in = false;
                     self.user_name.clear();
                     self.user_uin.clear();
@@ -1460,7 +1508,19 @@ impl ZaloGuiApp {
                         call.error_reason = Some(reason);
                     }
                 }
+                GuiEvent::ConversationRefreshStatus { running, message } => {
+                    self.refresh_sync_running = running;
+                    self.refresh_sync_status = message.clone();
+                    self.status_msg = message;
+                    self.last_sync_was_history = false;
+                    self.sync_notice_dismissed = false;
+                }
                 GuiEvent::HistorySyncStatus { running, message } => {
+                    if !running || !self.history_sync_running {
+                        self.sync_cancel_requested = false;
+                    }
+                    self.last_sync_was_history = true;
+                    self.sync_notice_dismissed = false;
                     self.history_sync_running = running;
                     self.status_msg = message.clone();
                     self.history_sync_status = message;
@@ -1668,6 +1728,7 @@ impl eframe::App for ZaloGuiApp {
                     self.render_login_screen(ui, &pal);
                 });
         } else {
+            self.render_sync_status_bar(ctx, &pal);
             self.render_chat_workspace(ctx, &pal);
         }
 

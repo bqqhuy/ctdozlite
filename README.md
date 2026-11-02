@@ -51,7 +51,7 @@ Thay `<version>` bằng phiên bản đã tải và so sánh với tệp checksu
 | :--- | :--- |
 | Giao diện | Renderer DX12, thanh tiêu đề Windows, kéo/đổi kích thước/Snap; Settings có cuộn và bố cục thích ứng. |
 | Tin nhắn | Hội thoại cá nhân/nhóm, gửi tin, ảnh/tệp/sticker; lưu lịch sử bằng SQLite theo tài khoản. |
-| Đồng bộ | Tự cập nhật sau đăng nhập; tải lịch sử nhóm/Cloud theo trang, có tiến độ, dừng và tiếp tục. |
+| Đồng bộ | Cập nhật hội thoại/tin gần đây sau đăng nhập; tải lịch sử nhóm/Cloud theo trang. Thanh trạng thái và nút dừng hiển thị ngay trên GUI chính. |
 | Tên nhóm | Tải metadata nhóm và giữ tên đã lưu khi cập nhật gặp lỗi. |
 | Menu hội thoại | Ghim, tắt/bật thông báo, ẩn/hiện, đánh dấu đã đọc và xóa lịch sử có xác nhận. Các lựa chọn này áp dụng **trên máy này**. |
 | Phiên đăng nhập | Bảo vệ bằng Windows DPAPI, tùy chọn ghi nhớ đăng nhập, tách dữ liệu từng tài khoản. |
@@ -67,7 +67,7 @@ Bản mã nguồn tại [`7c1a416`](https://github.com/bqqhuy/ctdozlite/commit/7
 Những điểm cần biết trước khi dùng:
 
 - **Cuộc gọi còn cần kiểm chứng thực tế:** codec và gói giao thức đã có kiểm thử; gọi đi/đến, gọi nhóm, NAT, Bluetooth và camera trên MateBook chưa được xác nhận đầy đủ với client Zalo chính thức.
-- Chưa có API được kiểm chứng để tải lại toàn bộ lịch sử chat cá nhân cũ từ điện thoại. Không thể bảo đảm khôi phục dữ liệu server không còn cung cấp.
+- Đồng bộ lịch sử cũ từ điện thoại như client chính thức chưa được triển khai trong fork; đây là phần giao thức cần nghiên cứu thêm. Không thể bảo đảm khôi phục dữ liệu server không còn cung cấp.
 - Chưa có nguồn presence đáng tin cậy để hiển thị trạng thái online của mọi liên hệ.
 - Một số Settings kế thừa chưa có hành vi đầy đủ; chưa bật updater tự động, Social Feed, scheduler hoặc REST/MCP của upstream trong bản tích hợp này.
 - Database hiện dùng **schema 3**. Bản cũ chỉ hỗ trợ schema 2 sẽ từ chối mở; xem hướng dẫn rollback trong [ADR-0004](docs/adr/0004-local-conversation-menu.md).

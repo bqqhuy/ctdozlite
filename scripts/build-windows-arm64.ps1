@@ -93,7 +93,9 @@ try {
         @{ Size='480x360'; Scale='1'; Tab='general' },
         @{ Size='1020x700'; Scale='1.5'; Tab='appearance' },
         @{ Size='1280x900'; Scale='2'; Tab='sync' },
-        @{ Size='800x600'; Scale='1'; Tab='general'; Tray=$true }
+        @{ Size='800x600'; Scale='1'; Tab='general'; Tray=$true },
+        @{ Size='480x360'; Scale='1'; Tab='workspace-sync'; WorkspaceSync=$true },
+        @{ Size='1020x700'; Scale='1.5'; Tab='workspace-sync'; WorkspaceSync=$true }
     )) {
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
@@ -110,6 +112,7 @@ try {
             $process.StartInfo.ArgumentList.Add($argument)
         }
         if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
+        if ($case.ContainsKey('WorkspaceSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-workspace-sync') }
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }
             $outTask = $process.StandardOutput.ReadToEndAsync()
