@@ -29,6 +29,17 @@ pub struct StoredThread {
     pub last_ts: i64,
 }
 
+/// Local-only conversation presentation controls, isolated by account database.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConversationPreference {
+    /// Pinned conversations sort before ordinary conversations.
+    pub pinned: bool,
+    /// Suppress desktop attention for this thread while still receiving messages.
+    pub muted: bool,
+    /// Hide from the normal list; recover through the hidden-conversations toggle.
+    pub hidden: bool,
+}
+
 pub struct MessageStore {
     pub conn: Connection,
 }
@@ -51,7 +62,7 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 2, "Database requires a newer application version");
+        anyhow::ensure!(schema <= 3, "Database requires a newer application version");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -101,6 +112,16 @@ impl MessageStore {
             let migration = conn.unchecked_transaction()?;
             migration.execute("DELETE FROM messages WHERE text = 'sendBubbleMessage'", [])?;
             migration.pragma_update(None, "user_version", 2)?;
+            migration.commit()?;
+        }
+        if schema < 3 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch(
+                "CREATE TABLE IF NOT EXISTS thread_preferences (
+                thread_id TEXT PRIMARY KEY, is_pinned INTEGER NOT NULL DEFAULT 0,
+                is_muted INTEGER NOT NULL DEFAULT 0, is_hidden INTEGER NOT NULL DEFAULT 0);
+                PRAGMA user_version=3;",
+            )?;
             migration.commit()?;
         }
         Ok(Self { conn })
@@ -206,6 +227,59 @@ impl MessageStore {
             "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
             params![thread_id, key],
         )?;
+        Ok(())
+    }
+
+    /// Read local conversation choices without loading message bodies.
+    /// # Errors
+    /// Returns SQLite errors; preferences belong to this account database only.
+    pub fn conversation_preferences(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ConversationPreference>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT thread_id,is_pinned,is_muted,is_hidden FROM thread_preferences")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                ConversationPreference {
+                    pinned: r.get(1)?,
+                    muted: r.get(2)?,
+                    hidden: r.get(3)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Persist one explicit local menu change; network snapshots cannot overwrite it.
+    /// # Errors
+    /// Rejects missing identity or a SQLite write failure.
+    pub fn set_conversation_preference(
+        &self,
+        id: &str,
+        value: ConversationPreference,
+    ) -> Result<()> {
+        anyhow::ensure!(!id.trim().is_empty(), "Missing thread identity");
+        self.conn.execute("INSERT INTO thread_preferences(thread_id,is_pinned,is_muted,is_hidden) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(thread_id) DO UPDATE SET is_pinned=excluded.is_pinned,is_muted=excluded.is_muted,is_hidden=excluded.is_hidden",
+            params![id,value.pinned,value.muted,value.hidden])?;
+        Ok(())
+    }
+
+    /// Delete local messages and history checkpoint atomically, retaining thread identity/preferences.
+    /// # Errors
+    /// Propagates SQLite failures; a later explicit sync may download history again.
+    pub fn clear_thread_history(&mut self, id: &str) -> Result<()> {
+        anyhow::ensure!(!id.trim().is_empty(), "Missing thread identity");
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE thread_id=?1", params![id])?;
+        tx.execute("DELETE FROM history_sync WHERE thread_id=?1", params![id])?;
+        tx.execute(
+            "UPDATE threads SET last_ts=0 WHERE thread_id=?1",
+            params![id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1071,5 +1145,108 @@ mod durable_state_tests {
             crate::message_model::MessageKind::Recall
         );
         assert!(loaded[0].messages[0].link_url.is_none());
+    }
+}
+
+#[cfg(test)]
+mod conversation_menu_tests {
+    use super::*;
+    #[test]
+    fn preferences_are_isolated_and_survive_network_snapshot_writes() {
+        let mut account_a = MessageStore::open(":memory:").unwrap();
+        let account_b = MessageStore::open(":memory:").unwrap();
+        let value = ConversationPreference {
+            pinned: true,
+            muted: true,
+            hidden: true,
+        };
+        account_a
+            .set_conversation_preference("group-fixture", value)
+            .unwrap();
+        persist_threads(
+            &mut account_a,
+            &[Thread {
+                id: "group-fixture".into(),
+                name: "Fixture".into(),
+                presentation: Default::default(),
+                preview: String::new(),
+                time: String::new(),
+                avatar: None,
+                is_group: true,
+                messages: Vec::new(),
+                unread: Default::default(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            account_a.conversation_preferences().unwrap()["group-fixture"],
+            value
+        );
+        assert!(account_b.conversation_preferences().unwrap().is_empty());
+        account_a
+            .set_conversation_preference("group-fixture", ConversationPreference::default())
+            .unwrap();
+        assert_eq!(
+            account_a.conversation_preferences().unwrap()["group-fixture"],
+            ConversationPreference::default()
+        );
+    }
+    #[test]
+    fn clear_history_is_transactional_and_does_not_touch_another_thread() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch("INSERT INTO messages(thread_id,msg_id,text,is_outgoing,ts) VALUES('a','same','private-a',0,0),('b','same','private-b',0,0);
+            INSERT INTO history_sync(thread_id,cursor) VALUES('a','cursor-a'),('b','cursor-b');
+            CREATE TRIGGER block_clear BEFORE DELETE ON history_sync BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+        assert!(store.clear_thread_history("a").is_err());
+        assert_eq!(store.messages_for("a", 10).unwrap().len(), 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER block_clear")
+            .unwrap();
+        store.clear_thread_history("a").unwrap();
+        assert!(store.messages_for("a", 10).unwrap().is_empty());
+        assert_eq!(store.messages_for("b", 10).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT cursor FROM history_sync WHERE thread_id='b'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "cursor-b"
+        );
+    }
+    #[test]
+    fn schema_two_upgrade_preserves_composite_message_identity() {
+        let directory = std::env::temp_dir().join(format!(
+            "ctdoz-menu-migration-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("fixture.db");
+        {
+            let store = MessageStore::open(&path).unwrap();
+            store.conn.execute_batch("INSERT INTO messages(thread_id,msg_id,text,is_outgoing,ts) VALUES('a','same','a',0,0),('b','same','b',0,0);DROP TABLE thread_preferences;PRAGMA user_version=2;").unwrap();
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
+                    .unwrap(),
+                3
+            );
+            assert!(store.conversation_preferences().unwrap().is_empty());
+            assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
+            assert_eq!(store.messages_for("b", 10).unwrap()[0].text, "b");
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

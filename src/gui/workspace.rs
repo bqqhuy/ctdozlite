@@ -665,6 +665,12 @@ impl ZaloGuiApp {
                         });
                 }
 
+                if self.conversation_preferences.values().any(|p| p.hidden) {
+                    ui.checkbox(
+                        &mut self.show_hidden_conversations,
+                        "Hiện cả hội thoại đã ẩn",
+                    );
+                }
                 let mut filtered_indices: Vec<usize> = self
                     .threads
                     .iter()
@@ -676,6 +682,11 @@ impl ZaloGuiApp {
                             ThreadFilter::Groups => t.is_group,
                         };
                         pass_filter
+                            && (self.show_hidden_conversations
+                                || !self
+                                    .conversation_preferences
+                                    .get(&t.id)
+                                    .is_some_and(|p| p.hidden))
                             && (query.is_empty()
                                 || matches_vn_query(&t.name, &query, &query_folded)
                                 || t.id.contains(&query))
@@ -690,6 +701,17 @@ impl ZaloGuiApp {
                     let b_cloud = tb.name.contains("Cloud của tôi");
                     if a_cloud != b_cloud {
                         return b_cloud.cmp(&a_cloud);
+                    }
+                    let a_pinned = self
+                        .conversation_preferences
+                        .get(&ta.id)
+                        .is_some_and(|p| p.pinned);
+                    let b_pinned = self
+                        .conversation_preferences
+                        .get(&tb.id)
+                        .is_some_and(|p| p.pinned);
+                    if a_pinned != b_pinned {
+                        return b_pinned.cmp(&a_pinned);
                     }
                     let ts_a = ta
                         .messages
@@ -708,6 +730,14 @@ impl ZaloGuiApp {
                 let msg_hits: Vec<(usize, String, String, String, bool)> = if query.len() >= 2 {
                     let mut hits = Vec::new();
                     for (t_idx, t) in self.threads.iter().enumerate() {
+                        if !self.show_hidden_conversations
+                            && self
+                                .conversation_preferences
+                                .get(&t.id)
+                                .is_some_and(|p| p.hidden)
+                        {
+                            continue;
+                        }
                         for m in t.messages.iter().rev() {
                             if matches_vn_query(&m.text, &query, &query_folded) {
                                 hits.push((
@@ -731,6 +761,9 @@ impl ZaloGuiApp {
                     Vec::new()
                 };
 
+                let mut preference_action = None;
+                let mut clear_history_action = None;
+                let mut read_action = None;
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut clicked_msg_hit: Option<(usize, String)> = None;
 
@@ -742,7 +775,11 @@ impl ZaloGuiApp {
                         for &i in &filtered_indices {
                             let t = &self.threads[i];
                             let is_selected = i == self.selected_thread_index;
-                            let is_pinned_cloud = t.name.contains("Cloud của tôi");
+                            let is_pinned_cloud = t.name.contains("Cloud của tôi")
+                                || self
+                                    .conversation_preferences
+                                    .get(&t.id)
+                                    .is_some_and(|p| p.pinned);
 
                             let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                             let row_width = (ui.available_width() - 8.0).max(44.0);
@@ -751,6 +788,75 @@ impl ZaloGuiApp {
                                 Sense::click(),
                             );
                             let row_rect = row_rect.translate(Vec2::new(4.0, 0.0));
+                            let preference = self
+                                .conversation_preferences
+                                .get(&t.id)
+                                .copied()
+                                .unwrap_or_default();
+                            row_resp.context_menu(|ui| {
+                                ui.label("Hội thoại trên máy này");
+                                if ui
+                                    .button(if preference.pinned {
+                                        "Bỏ ghim hội thoại"
+                                    } else {
+                                        "Ghim hội thoại"
+                                    })
+                                    .clicked()
+                                {
+                                    preference_action = Some((
+                                        t.id.clone(),
+                                        crate::store::ConversationPreference {
+                                            pinned: !preference.pinned,
+                                            ..preference
+                                        },
+                                    ));
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(if preference.muted {
+                                        "Bật thông báo"
+                                    } else {
+                                        "Tắt thông báo"
+                                    })
+                                    .clicked()
+                                {
+                                    preference_action = Some((
+                                        t.id.clone(),
+                                        crate::store::ConversationPreference {
+                                            muted: !preference.muted,
+                                            ..preference
+                                        },
+                                    ));
+                                    ui.close_menu();
+                                }
+                                if ui
+                                    .button(if preference.hidden {
+                                        "Hiện hội thoại"
+                                    } else {
+                                        "Ẩn khỏi danh sách"
+                                    })
+                                    .clicked()
+                                {
+                                    preference_action = Some((
+                                        t.id.clone(),
+                                        crate::store::ConversationPreference {
+                                            hidden: !preference.hidden,
+                                            ..preference
+                                        },
+                                    ));
+                                    ui.close_menu();
+                                }
+                                if ui.button("Đánh dấu đã đọc trên máy này").clicked() {
+                                    read_action = Some(t.id.clone());
+                                    ui.close_menu();
+                                }
+                                ui.separator();
+                                if ui.button("Xóa lịch sử trên máy này…").clicked() {
+                                    clear_history_action = Some(t.id.clone());
+                                    ui.close_menu();
+                                }
+                            });
+
                             if !ui.is_rect_visible(row_rect) {
                                 continue;
                             }
@@ -1005,6 +1111,51 @@ impl ZaloGuiApp {
                         }
                     });
 
+                if let Some((thread_id, value)) = preference_action {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::SetConversationPreference {
+                            owner: self.user_uin.clone(),
+                            thread_id,
+                            value,
+                        });
+                    }
+                }
+                if let Some(id) = read_action {
+                    self.unread_counts.remove(&id);
+                    self.refresh_unread_title(ctx);
+                }
+                if let Some(id) = clear_history_action {
+                    self.clear_history_confirmation = Some(id);
+                }
+                if let Some(id) = self.clear_history_confirmation.clone() {
+                    let mut confirmed = false;
+                    let mut cancelled = false;
+                    egui::Window::new("Xóa lịch sử trên máy này?")
+                        .id(Id::new("clear_thread_history"))
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(ctx, |ui| {
+                            ui.label(
+                                "Chỉ xóa bản lưu trên máy này, không thu hồi tin của người khác.",
+                            );
+                            ui.label("Đồng bộ sau đó có thể tải lại lịch sử từ máy chủ.");
+                            ui.horizontal(|ui| {
+                                confirmed = ui.button("Xóa lịch sử").clicked();
+                                cancelled = ui.button("Hủy").clicked();
+                            });
+                        });
+                    if confirmed {
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::ClearThreadHistory {
+                                owner: self.user_uin.clone(),
+                                thread_id: id,
+                            });
+                        }
+                    }
+                    if confirmed || cancelled {
+                        self.clear_history_confirmation = None;
+                    }
+                }
                 if let Some((idx, q_str)) = clicked_msg_hit {
                     self.selected_thread_index = idx;
                     self.in_chat_search_open = true;

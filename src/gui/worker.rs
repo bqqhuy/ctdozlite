@@ -8,6 +8,15 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
+    SetConversationPreference {
+        owner: String,
+        thread_id: String,
+        value: crate::store::ConversationPreference,
+    },
+    ClearThreadHistory {
+        owner: String,
+        thread_id: String,
+    },
     SyncHistory {
         threads: Vec<Thread>,
     },
@@ -580,6 +589,43 @@ pub(super) fn spawn_session_worker(
 
                 while let Some(cmd) = cmd_rx.recv().await {
                     match cmd {
+                        WorkerCmd::SetConversationPreference { owner, thread_id, value } => {
+                            let s = session.lock().await.clone();
+                            if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
+                            let owner = owner.clone();
+                            let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
+                                let store=crate::store::MessageStore::open(s.history_path())?;
+                                store.set_conversation_preference(&thread_id,value)?;
+                                store.conversation_preferences()
+                            }).await;
+                            match result {
+                                Ok(Ok(values)) => { let _ = gui_tx.send(GuiEvent::ConversationPreferences { owner, values }); }
+                                _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); }
+                            }
+                            egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::ClearThreadHistory { owner, thread_id } => {
+                            let s = session.lock().await.clone();
+                            if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
+                            let id=thread_id.clone();
+                            let result=tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
+                                let mut store=crate::store::MessageStore::open(s.history_path())?;
+                                store.clear_thread_history(&id)?;
+                                let mut cache=crate::chat::load_threads_cache(&s);
+                                if let Some(thread)=cache.iter_mut().find(|t|t.id==id) {
+                                    thread.messages.clear(); thread.preview.clear(); thread.time.clear(); thread.presentation=Default::default();
+                                }
+                                crate::chat::save_threads_cache(&s,&cache);
+                                Ok(())
+                            }).await;
+                            match result {
+                                Ok(Ok(())) => { let _ = gui_tx.send(GuiEvent::ThreadHistoryCleared { owner, thread_id }); }
+                                _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể xóa lịch sử trên máy này".into())); }
+                            }
+                            egui_ctx.request_repaint();
+                        }
                         WorkerCmd::PersistThreads { owner, threads } => {
                             let s = session.lock().await.clone();
                             if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
@@ -806,6 +852,15 @@ pub(super) fn spawn_session_worker(
                             });
                         }
                         WorkerCmd::RefreshThreads => {
+                            let s_pref=session.lock().await.clone();
+                            if !s_pref.account_key().is_empty() && s_pref.is_active() {
+                                let owner=s_pref.account_key().to_owned();
+                                match tokio::task::spawn_blocking(move || crate::store::MessageStore::open(s_pref.history_path())?.conversation_preferences()).await {
+                                    Ok(Ok(values)) => { let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
+                                    _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể đọc tùy chọn hội thoại".into())); }
+                                }
+                            }
+
                             if refresh_in_flight.swap(true, std::sync::atomic::Ordering::SeqCst) { continue; }
                             let refresh_guard = PollGuard(refresh_in_flight.clone());
                             let session_clone = session.clone();

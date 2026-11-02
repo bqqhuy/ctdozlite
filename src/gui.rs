@@ -43,6 +43,14 @@ pub enum ThreadUpdateSource {
 }
 
 pub enum GuiEvent {
+    ConversationPreferences {
+        owner: String,
+        values: HashMap<String, crate::store::ConversationPreference>,
+    },
+    ThreadHistoryCleared {
+        owner: String,
+        thread_id: String,
+    },
     HistorySyncStatus {
         running: bool,
         message: String,
@@ -397,6 +405,9 @@ pub struct ZaloGuiApp {
     composer_focus_pending: bool,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
     unread_counts: HashMap<String, usize>,
+    conversation_preferences: HashMap<String, crate::store::ConversationPreference>,
+    show_hidden_conversations: bool,
+    clear_history_confirmation: Option<String>,
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     dismissed_link_preview_for: String,
@@ -607,6 +618,9 @@ impl ZaloGuiApp {
             composer_focus_pending: false,
             pending_clipboard_image: None,
             unread_counts: HashMap::new(),
+            conversation_preferences: HashMap::new(),
+            show_hidden_conversations: false,
+            clear_history_confirmation: None,
             link_metadata_cache: HashMap::new(),
             loading_link_previews: HashSet::new(),
             dismissed_link_preview_for: String::new(),
@@ -769,6 +783,9 @@ impl ZaloGuiApp {
                         self.threads.clear();
                         self.selected_thread_index = 0;
                         self.unread_counts.clear();
+                        self.conversation_preferences.clear();
+                        self.show_hidden_conversations = false;
+                        self.clear_history_confirmation = None;
                         self.sticker_textures.clear();
                         self.texture_budget = crate::media_resources::ResourceLru::new(
                             crate::media_resources::TEXTURE_BUDGET,
@@ -790,6 +807,26 @@ impl ZaloGuiApp {
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
+                }
+                GuiEvent::ConversationPreferences { owner, values } => {
+                    if self.is_logged_in && owner == self.user_uin {
+                        self.conversation_preferences = values;
+                    }
+                }
+                GuiEvent::ThreadHistoryCleared { owner, thread_id } => {
+                    if self.is_logged_in && owner == self.user_uin {
+                        if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                            thread.messages.clear();
+                            thread.preview.clear();
+                            thread.time.clear();
+                            thread.presentation = Default::default();
+                        }
+                        self.unread_counts.remove(&thread_id);
+                        self.refresh_unread_title(ctx);
+                        self.show_toast(
+                            "Đã xóa lịch sử trên máy này; đồng bộ có thể tải lại tin từ máy chủ",
+                        );
+                    }
                 }
                 GuiEvent::ThreadsUpdated {
                     threads: updates,
@@ -838,7 +875,10 @@ impl ZaloGuiApp {
                                     let count =
                                         self.unread_counts.entry(existing.id.clone()).or_insert(0);
                                     *count = count.saturating_add(inc_cnt);
-                                    new_incoming_alert = true;
+                                    new_incoming_alert |= !self
+                                        .conversation_preferences
+                                        .get(&existing.id)
+                                        .is_some_and(|p| p.muted);
                                 }
                             } else if let Some(existing) = self.threads.iter_mut().find(|t| {
                                 !live_ids.contains(&t.id)
@@ -944,6 +984,9 @@ impl ZaloGuiApp {
                     self.dismissed_sticker_suggest_for.clear();
                     self.last_composer_text.clear();
                     self.unread_counts.clear();
+                    self.conversation_preferences.clear();
+                    self.show_hidden_conversations = false;
+                    self.clear_history_confirmation = None;
                     self.sticker_textures.clear();
                     self.texture_budget = crate::media_resources::ResourceLru::new(
                         crate::media_resources::TEXTURE_BUDGET,
@@ -1353,6 +1396,7 @@ impl ZaloGuiApp {
                             .and_then(|c| c.error_reason.as_ref())
                             .is_some();
                         self.sticker_textures.remove("call_remote_video");
+                        self.sticker_textures.remove("call_remote_video_1");
                         self.sticker_textures.remove("call_local_video");
                         if !has_error {
                             self.active_call = None;
@@ -1859,6 +1903,16 @@ impl ZaloGuiApp {
         });
     }
 
+    fn refresh_unread_title(&self, ctx: &egui::Context) {
+        let total: usize = self.unread_counts.values().sum();
+        let title = if total > 0 {
+            format!("({total}) Zalo Lite — Native Rust Client")
+        } else {
+            "Zalo Lite — Native Rust Client".into()
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+
     fn show_toast(&mut self, msg: impl Into<String>) {
         let text = msg.into();
         self.status_msg = text.clone();
@@ -2149,5 +2203,50 @@ mod history_residency_benchmark {
             "{}",
             serde_json::json!({"task":"100_history_pages_50_messages","iterations":samples.len(),"min_ms":samples[0],"avg_ms":samples.iter().sum::<f64>()/samples.len() as f64,"p50_ms":samples[10],"p95_ms":samples[18],"p99_ms":samples[19],"resident_messages":resident,"arch":std::env::consts::ARCH,"os":std::env::consts::OS,"profile":"debug"})
         );
+    }
+}
+
+#[cfg(test)]
+mod conversation_menu_event_tests {
+    use super::*;
+    #[test]
+    fn preferences_reject_stale_account_events_and_survive_history_refresh() {
+        let ctx = egui::Context::default();
+        let session = Session::new(false, false, false).unwrap();
+        let mut app = ZaloGuiApp::from_context(&ctx, session, false, Vec::new(), false);
+        app.is_logged_in = true;
+        app.user_uin = "fixture-owner".into();
+        let (sender, receiver) = channel();
+        app.event_rx = receiver;
+        let values = HashMap::from([(
+            "fixture-thread".into(),
+            crate::store::ConversationPreference {
+                pinned: true,
+                muted: true,
+                hidden: true,
+            },
+        )]);
+        sender
+            .send(GuiEvent::ConversationPreferences {
+                owner: "different-owner".into(),
+                values: values.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.conversation_preferences.is_empty());
+        sender
+            .send(GuiEvent::ConversationPreferences {
+                owner: "fixture-owner".into(),
+                values: values.clone(),
+            })
+            .unwrap();
+        sender
+            .send(GuiEvent::ThreadsUpdated {
+                threads: Vec::new(),
+                source: ThreadUpdateSource::History,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.conversation_preferences, values);
     }
 }
