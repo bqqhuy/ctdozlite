@@ -23,6 +23,10 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+fn routing_id(id: &str) -> bool {
+    !id.is_empty() && id != "0" && id.bytes().all(|b| b.is_ascii_digit())
+}
+
 struct Crypto {
     codec: Codec,
     identity: KeyPair,
@@ -48,6 +52,16 @@ impl Round {
         self.last || (!wanted.is_empty() && wanted.iter().all(|p| self.covered.contains(p)))
     }
     fn apply(&mut self, event: &WsEvent, id: &str) -> Result<bool> {
+        if event.cmd == crate::socket::CMD_SYNC_REQUEST {
+            if let Some(code) = event
+                .payload
+                .get("error_code")
+                .and_then(Value::as_i64)
+                .filter(|code| *code != 0)
+            {
+                anyhow::bail!("Máy chủ từ chối yêu cầu đồng bộ điện thoại (mã {code})");
+            }
+        }
         let controls = event
             .payload
             .pointer("/data/controls")
@@ -274,7 +288,7 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
     .await?;
     let mut threads: HashMap<String, Thread> = fresh
         .iter()
-        .filter(|t| !t.presentation.global_id.is_empty())
+        .filter(|t| routing_id(&t.id) && !t.presentation.global_id.is_empty())
         .map(|t| {
             let mut t = t.clone();
             t.messages.clear();
@@ -290,7 +304,7 @@ pub(crate) async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .collect();
     let mut senders: HashMap<String, String> = fresh
         .iter()
-        .filter(|t| !t.is_group && !t.presentation.global_id.is_empty())
+        .filter(|t| !t.is_group && routing_id(&t.id) && !t.presentation.global_id.is_empty())
         .map(|t| (t.presentation.global_id.clone(), t.id.clone()))
         .collect();
     progress("Đang gửi yêu cầu đồng bộ; hãy mở Zalo trên điện thoại và xác nhận…".into());
@@ -540,6 +554,27 @@ fn decode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn server_rejection_does_not_wait_for_phone_timeout() {
+        let event = WsEvent {
+            cmd: crate::socket::CMD_SYNC_REQUEST,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({"error_code":114}),
+        };
+        assert!(Round::default()
+            .apply(&event, "synthetic")
+            .unwrap_err()
+            .to_string()
+            .contains("114"));
+    }
+    #[test]
+    fn opaque_roster_fallback_is_not_a_routing_id() {
+        assert!(!routing_id("global-opaque-partition"));
+        assert!(!routing_id("0"));
+        assert!(!routing_id(""));
+        assert!(routing_id("123456789"));
+    }
     #[test]
     fn completion_requires_all_requested_scopes_and_matching_session() {
         let mut state = Round::default();
