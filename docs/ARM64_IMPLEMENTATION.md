@@ -4,7 +4,7 @@ Phạm vi: mã nguồn Rust, worker/session/network, lưu trữ, GUI, audio/vide
 
 ## Đối chiếu upstream
 
-Đã tích hợp upstream `main` tại `aad565c2d8a6528239f4b7b1990377c5e5a1348f` (dòng **v0.0.3**, 57 commit sau nền v0.0.2; đối chiếu 2026-11-01 15:21 UTC). Phần runtime Windows được giữ khi có triển khai chồng lấn: DPAPI, dữ liệu từng tài khoản, DX12, Media Foundation và tray. Các thay đổi hiệu năng, giờ địa phương, font và tên binary v0.0.3 đã được đưa vào. Không nhập self-updater đa nền tảng trỏ tới artifact upstream; xem [ADR-0001](adr/0001-windows-arm64-runtime.md) để biết phạm vi khác biệt. `origin/main` vẫn ở `3f28d2f`; các bản sửa nằm trên PR #2, chưa đồng nghĩa đã phát hành.
+Đã tích hợp upstream `main` tại `541ecb52cc43f671af41efc0c74c3c5502e93292` (dòng **v0.0.3**, đã nhập thêm 7 commit sau snapshot aad565c). Phần runtime Windows được giữ khi có triển khai chồng lấn: DPAPI, dữ liệu từng tài khoản, DX12, Media Foundation và tray. Các thay đổi hiệu năng, giờ địa phương, font và tên binary v0.0.3 đã được đưa vào. Không nhập self-updater đa nền tảng trỏ tới artifact upstream; xem [ADR-0001](adr/0001-windows-arm64-runtime.md) để biết phạm vi khác biệt. `origin/main` vẫn ở `3f28d2f`; các bản sửa nằm trên PR #2, chưa đồng nghĩa đã phát hành.
 
 Những sửa đổi mới nằm trên nhánh `fix/windows-arm64-product`; không đồng nghĩa đã có trong `main` hoặc bản Release đang tải. Các PR upstream đang mở không được coi là code đã merge.
 
@@ -67,7 +67,7 @@ Rà soát nơi đọc giá trị ngoài panel Settings cho thấy nhiều tùy c
 | Hiện trạng thái online | Chỉ là dấu phiên cục bộ trong dock; không thay privacy/presence trên server. |
 | Danh bạ toàn bộ, đổi ngôn ngữ, autostart, avatar làm wallpaper | Chưa có hành vi runtime đầy đủ. Autostart đang bị vô hiệu hóa trong UI. |
 | Sinh nhật/đã xem/ai được nhắn-gọi/tìm qua số điện thoại/nguồn kết bạn | Chưa tích hợp server; đã gỡ các nút privacy giả và hướng dẫn dùng app chính thức. |
-| Tin nhanh, PIN ẩn chat, chia priority, chế độ dán Excel, double-click reply, typing | Giá trị kế thừa được lưu nhưng chưa thực thi tương ứng đầy đủ. |
+| Tin nhanh, PIN ẩn chat, chia priority, chế độ dán Excel, typing | Giá trị kế thừa được lưu nhưng chưa thực thi tương ứng đầy đủ. |
 | Gợi ý mention và tìm GIF | Chưa có pipeline runtime tương ứng với các công tắc. |
 
 Không nên phát hành như một bản “đầy đủ mọi tính năng thiết kế” khi các mục này và kiểm thử cuộc gọi thật chưa được hoàn tất.
@@ -94,3 +94,17 @@ Huawei MateBook E Go Gen 3 / Snapdragon 8cx Gen 3. Đồng bộ tự bắt đầ
 Dữ liệu giả: 1.000 tin đang có + 1.000 tin đến, trùng 500 ID, nội dung lặp; 20 lượt trên Linux x86_64 trong cloud, profile debug. Trước tối ưu index: min 12,799 ms, trung bình 13,067 ms, p50 13,035 ms, p95 13,262 ms, p99 14,198 ms. Sau: min 2,183 ms, trung bình 2,344 ms, p50 2,232 ms, p95 2,586 ms, p99 3,559 ms. Chạy lại bằng `cargo run --locked --example history_bench`; đây không phải số đo trên Snapdragon 8cx Gen 3.
 
 Bổ sung từ upstream sau `1345f5d`: các module nền tảng message/reaction/unread và chuẩn hóa timestamp đã được đưa vào cùng kiểm thử. Chưa coi các module này là bằng chứng trạng thái đọc/reaction đã đồng bộ đầy đủ từ mạng qua SQLite và UI. Cơ chế ghi phiên nguyên tử của upstream đã có triển khai tương đương trên DPAPI của fork, nên không thay bằng session JSON.
+
+## Hoàn thiện tiếp sau 81a90d6
+
+- Đã nhập upstream tới `541ecb5`, giữ tài liệu và pipeline chỉ Windows ARM64. Module updater upstream chỉ là nền tảng có kiểm thử, chưa có cập nhật ứng dụng tự động.
+- RAM: hội thoại nền chỉ giữ 20 tin gần đây, hội thoại đang mở giữ cửa sổ lịch sử có giới hạn; toàn bộ tin vẫn ở SQLite. Tải lịch sử không tạo unread/thông báo giả. Worker không ghi lại mọi hội thoại từ UI sau mỗi trang.
+- Đo dữ liệu giả 100 trang × 50 tin, 20 lượt debug Linux x86_64: trung bình trước **456,545 ms**, sau **17,689 ms**; resident message của hội thoại nền giảm 5.000 → 20. Chạy test bị ignore `history_residency_benchmark` riêng để đo lại. Không phải số đo RAM/RSS hoặc benchmark Snapdragon.
+- Cache texture có ngân sách 128 MiB, preview có giới hạn kích thước; job ảnh giữ permit đến khi UI nhận để giới hạn cả hàng đợi thành công. Cache riêng tài khoản có giới hạn đĩa 512 MiB; cache lỗi thử tải lại, lỗi ghi cache không chặn ảnh hợp lệ. Preview video chỉ giữ một frame mỗi hướng/generation và bỏ công việc hiển thị khi cửa sổ ẩn.
+- Camera tự ưu tiên RGB hơn IR/Hello, thương lượng NV12 không ép driver phải xuất 15 fps. Chuẩn hóa stride, scale/letterbox về 320×240; nhịp gửi vẫn 15 fps. Đọc buffer 2D loại bỏ padding phần cứng, camera treo có timeout. Chưa chứng nhận driver MateBook.
+- Audio giải mã theo độ dài Opus thực (10/20/40/60 ms), giới hạn backlog loa; resampling giữ pha giữa callback và hỗ trợ nguồn 8 kHz Bluetooth. Lỗi mic/loa được báo riêng thay vì dừng toàn bộ video.
+- SQLite lưu metadata trạng thái gửi/reaction/wire ID; recall là tombstone không bị trang cũ phục hồi nội dung. Tin mạng không xóa pin/star cục bộ; UI hiển thị trạng thái giao nhận theo dữ liệu hiện có. Chưa đồng nghĩa read receipt/reaction mạng đã hoàn thiện toàn bộ.
+- Double-click reply đã đọc và áp dụng setting. Credential chỉ gắn cho HTTPS host Zalo hợp lệ; cookie Secure. Diagnostic mặc định che dữ liệu nhạy cảm trước khi ghi. `--dump-raw` vẫn là chế độ opt-in nhạy cảm.
+- Kiểm thử local: **164 unit pass, 2 ignore** (benchmark thủ công và live-call), **30 integration pass**; fmt và clippy strict đạt. Kiểm tra biên dịch riêng module video cùng test cho `aarch64-pc-windows-msvc` đạt; CI native phải xác nhận lại toàn bộ trước khi dùng artifact mới.
+
+Quyết định và giới hạn: [ADR-0002](adr/0002-bounded-media-and-durable-message-state.md). Các giới hạn cuộc gọi thật, lịch sử 1-1, updater và Settings liệt kê ở trên vẫn còn hiệu lực.

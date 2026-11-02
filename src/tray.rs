@@ -260,3 +260,17 @@ mod tests {
         *DISPATCH.lock().unwrap() = None;
     }
 }
+
+/// Suppress GPU preview work when the window is hidden or minimized.
+pub(crate) fn previews_visible() -> bool {
+    let control = DISPATCH
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.control.clone()));
+    control.is_none_or(|c| {
+        !c.hidden.load(Ordering::SeqCst) && c.visible() && {
+            // SAFETY: user32 validates the live root HWND and permits cross-thread queries.
+            unsafe { IsIconic(c.hwnd as *mut _) == 0 }
+        }
+    })
+}

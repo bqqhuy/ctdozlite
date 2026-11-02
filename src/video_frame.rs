@@ -5,6 +5,15 @@ pub(crate) const OUTPUT_WIDTH: usize = 320;
 pub(crate) const OUTPUT_HEIGHT: usize = 240;
 pub(crate) const OUTPUT_FPS: i64 = 15;
 
+/// Prefer a color camera over IR/Hello/depth devices in automatic selection.
+pub(crate) fn camera_preference(name: &str) -> u8 {
+    u8::from(name.split(|c: char| !c.is_alphanumeric()).any(|word| {
+        ["ir", "infrared", "hello", "depth"]
+            .iter()
+            .any(|special| word.eq_ignore_ascii_case(special))
+    }))
+}
+
 /// Validate an NV12 buffer before accessing its padded Y/UV planes.
 pub(crate) fn validate_layout(
     width: usize,
@@ -102,6 +111,13 @@ impl CaptureCadence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn automatic_selection_prefers_color_without_matching_ir_inside_other_words() {
+        assert_eq!(camera_preference("Huawei Color Camera"), 0);
+        assert_eq!(camera_preference("Huawei IR Camera"), 1);
+        assert_eq!(camera_preference("Windows Hello (Infrared)"), 1);
+        assert_eq!(camera_preference("First Camera"), 0);
+    }
     #[test]
     fn padded_frame_is_packed_without_padding_bytes() {
         let (w, h, stride) = (320, 240, 336);

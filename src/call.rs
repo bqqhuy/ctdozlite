@@ -266,7 +266,7 @@ pub fn trace_line(tag: &str, body: impl AsRef<str>) {
     if !crate::voip_log::diagnostics_enabled() {
         return;
     }
-    let body = body.as_ref();
+    let body = crate::diagnostics::trace(body.as_ref());
     crate::voip_log::append_diagnostic(
         "call_trace.log",
         &format!("{} {tag} {body}\n", crate::login::unix_now()),
@@ -276,10 +276,10 @@ pub fn trace_line(tag: &str, body: impl AsRef<str>) {
 /// Execute the exact Zalo signaling HTTP endpoint for a native `sendSignal` command (`handleSendSignal`).
 /// Every request/response pair is mirrored into `call_trace.log`.
 pub async fn dispatch_send_signal(s: &Session, command: i64, n: &Value) -> Result<Value> {
-    trace_line("SIG>", format!("cmd={command} {}", n));
+    trace_line("SIG>", json!({"command":command,"payload":n}).to_string());
     let result = dispatch_send_signal_inner(s, command, n).await;
     match &result {
-        Ok(v) => trace_line("SIG<", format!("cmd={command} {v}")),
+        Ok(v) => trace_line("SIG<", json!({"command":command,"payload":v}).to_string()),
         Err(e) => trace_line("SIG!", format!("cmd={command} err={e}")),
     }
     result
@@ -1819,7 +1819,7 @@ impl CallBridge {
                                                 code: status,
                                                 reason: reason.clone(),
                                             });
-                                            let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                            let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
                                                 thread_id: partner_id,
                                                 text: format!(
                                                     "📞 Cuộc gọi nhóm (0s) — {reason} (Mã {status})"
@@ -1914,7 +1914,7 @@ impl CallBridge {
                                     code: status_401,
                                     reason: reason.clone(),
                                 });
-                                let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
                                     thread_id: partner_id,
                                     text: format!(
                                         "📞 Cuộc gọi đi (0s) — {reason} (Mã {status_401})"
@@ -2170,7 +2170,7 @@ impl CallBridge {
                                     *guard = None;
                                     let _ = gui_tx_clone
                                         .send(GuiEvent::CallStateChanged("free".into()));
-                                    let _ = gui_tx_clone.send(GuiEvent::MessageSent {
+                                    let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
                                         thread_id: partner_id,
                                         text: "📞 Cuộc gọi đến (Đã từ chối)".into(),
                                         msg_id: format!("call_{}", crate::login::unix_now()),
@@ -2263,7 +2263,7 @@ impl CallBridge {
                                 } else {
                                     format!("📞 Cuộc gọi đến ({duration_sec}s)")
                                 };
-                                let _ = gui_tx.send(GuiEvent::MessageSent {
+                                let _ = gui_tx.send(GuiEvent::LocalCallRecord {
                                     thread_id: partner_id.clone(),
                                     text: label,
                                     msg_id: format!("call_{}", crate::login::unix_now()),
@@ -2545,7 +2545,7 @@ impl CallBridge {
                                         reason: reason.into(),
                                     });
                                     if let Some(st) = taken {
-                                        let _ = gui_tx.send(GuiEvent::MessageSent {
+                                        let _ = gui_tx.send(GuiEvent::LocalCallRecord {
                                             thread_id: st.partner_id.clone(),
                                             text: format!("📞 Cuộc gọi đi (0s) — {reason}"),
                                             msg_id: format!("call_{}", crate::login::unix_now()),
@@ -2575,7 +2575,7 @@ impl CallBridge {
                                     } else {
                                         "📞 Cuộc gọi nhỡ".to_string()
                                     };
-                                    let _ = gui_tx.send(GuiEvent::MessageSent {
+                                    let _ = gui_tx.send(GuiEvent::LocalCallRecord {
                                         thread_id: st.partner_id.clone(),
                                         text: label,
                                         msg_id: format!("call_{}", crate::login::unix_now()),

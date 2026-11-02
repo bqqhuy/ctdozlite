@@ -2226,8 +2226,8 @@ impl ZaloGuiApp {
         }
 
         let screen_rect = ctx.screen_rect();
-        // Start below the 32px custom frameless title bar so window controls stay accessible
-        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
+        // Windows owns the native caption outside the client area.
+        let viewer_top = screen_rect.top();
         let toolbar_h = 46.0_f32;
         let toolbar_rect = Rect::from_min_max(
             Pos2::new(screen_rect.left(), viewer_top),

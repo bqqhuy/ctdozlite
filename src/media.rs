@@ -2,7 +2,7 @@
 //!
 //! v1: captures mic, encodes Opus, sends RTP to `rtp_addr`; receives RTP,
 //! decodes Opus, plays to speaker. Simple blocking loop with 20 ms frames.
-//! No jitter buffer / resampling / echo cancellation yet.
+//! Streaming linear resampling; adaptive jitter buffering and echo cancellation remain unimplemented.
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -37,6 +37,67 @@ fn decode_audio<'a>(
 ) -> Result<&'a [f32]> {
     let count = decoder.decode_float(payload, pcm, false)?;
     Ok(&pcm[..count])
+}
+
+// Preserve phase across driver callbacks, including 8 kHz Bluetooth microphones
+// and callback sizes that are not divisible by the 48 kHz -> 16 kHz ratio.
+struct CaptureResampler {
+    step: f64,
+    next: f64,
+    previous: Option<f32>,
+}
+impl CaptureResampler {
+    fn new(source: u32, target: u32) -> Self {
+        Self {
+            step: source as f64 / target as f64,
+            next: 0.0,
+            previous: None,
+        }
+    }
+    fn push(&mut self, sample: f32, mut output: impl FnMut(f32)) {
+        let Some(previous) = self.previous else {
+            self.previous = Some(sample);
+            self.next = self.step;
+            output(sample);
+            return;
+        };
+        while self.next <= 1.0 {
+            output(previous + (sample - previous) * self.next as f32);
+            self.next += self.step;
+        }
+        self.next -= 1.0;
+        self.previous = Some(sample);
+    }
+}
+struct PlaybackResampler {
+    step: f64,
+    position: f64,
+}
+impl PlaybackResampler {
+    fn new(source: u32, target: u32) -> Self {
+        Self {
+            step: source as f64 / target as f64,
+            position: 0.0,
+        }
+    }
+    fn next(&mut self, input: &[f32]) -> f32 {
+        let index = self.position as usize;
+        let Some(&first) = input.get(index) else {
+            return 0.0;
+        };
+        let second = input.get(index + 1).copied().unwrap_or(first);
+        let sample = first + (second - first) * (self.position - index as f64) as f32;
+        self.position += self.step;
+        sample
+    }
+    fn finish(&mut self, input: &mut Vec<f32>) {
+        let count = (self.position as usize).min(input.len());
+        input.drain(..count);
+        self.position -= count as f64;
+        if input.is_empty() {
+            self.position = 0.0;
+        }
+    }
 }
 
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
@@ -161,6 +222,7 @@ impl MediaHandle {
             None
         };
 
+        let generation = crate::video_preview::start();
         let stop_t = stop.clone();
         let mute_t = mic_muted.clone();
         let cam_t = cam_enabled.clone();
@@ -181,6 +243,7 @@ impl MediaHandle {
                 is_video,
                 gui_tx,
                 egui_ctx,
+                generation,
             );
         });
         threads.push(t);
@@ -691,6 +754,7 @@ fn spawn_camera_capture_thread(
     cam_au_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
     gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     egui_ctx: Option<eframe::egui::Context>,
+    generation: u64,
 ) {
     #[cfg(windows)]
     {
@@ -703,6 +767,7 @@ fn spawn_camera_capture_thread(
                     cam_au_tx.clone(),
                     gui_tx.clone(),
                     egui_ctx.clone(),
+                    generation,
                 ) {
                     Ok(()) => break,
                     Err(e) => {
@@ -732,6 +797,7 @@ fn spawn_camera_capture_thread(
             cam_au_tx,
             gui_tx,
             egui_ctx,
+            generation,
         );
     }
 }
@@ -881,6 +947,7 @@ fn run_media_loop(
     is_video: bool,
     gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     egui_ctx: Option<eframe::egui::Context>,
+    generation: u64,
 ) {
     // Stop camera/decoder tasks on every early return (missing mic, codec or device).
     struct StopOnExit(Arc<AtomicBool>);
@@ -900,7 +967,7 @@ fn run_media_loop(
         let synced_v = video_synced.clone();
         decoder_active = true;
         thread::spawn(move || {
-            run_native_h264_decoder(stop_v, h264_rx, tx, ctx, synced_v);
+            run_native_h264_decoder(stop_v, h264_rx, tx, ctx, synced_v, generation);
         });
     }
     spawn_camera_capture_thread(
@@ -910,6 +977,7 @@ fn run_media_loop(
         cam_au_tx,
         gui_tx.clone(),
         egui_ctx.clone(),
+        generation,
     );
     let mut fu_a_buf: Vec<u8> = Vec::with_capacity(65536);
     let host = cpal::default_host();
@@ -977,33 +1045,30 @@ fn run_media_loop(
 
     // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
     macro_rules! capture_stream {
-        ($sample:ty, $device:ident, $config:ident) => {
+        ($sample:ty,$device:ident,$config:ident) => {{
+            let mut resampler = CaptureResampler::new(in_rate, SAMPLE_RATE);
             $device.build_input_stream(
                 &$config.clone().into(),
                 move |data: &[$sample], _| {
-                    if let Ok(mut b) = ib.lock() {
-                        let total_frames = data.len() / in_channels;
-                        let step = (in_rate as f32 / SAMPLE_RATE as f32).max(1.0);
-                        let out_frames = (total_frames as f32 / step) as usize;
-                        for i in 0..out_frames {
-                            let src_idx =
-                                ((i as f32 * step) as usize).min(total_frames.saturating_sub(1));
-                            let mut sum = 0.0_f32;
-                            for ch in 0..in_channels {
-                                sum += data[src_idx * in_channels + ch].to_sample::<f32>();
-                            }
-                            b.push(sum / in_channels as f32);
+                    if let Ok(mut buffer) = ib.lock() {
+                        for frame in data.chunks_exact(in_channels) {
+                            let mono = frame
+                                .iter()
+                                .map(|sample| sample.to_sample::<f32>())
+                                .sum::<f32>()
+                                / in_channels as f32;
+                            resampler.push(mono, |sample| buffer.push(sample));
                         }
-                        if b.len() > FRAME_SAMPLES * 25 {
-                            let drop_n = b.len() - FRAME_SAMPLES * 25;
-                            b.drain(0..drop_n);
+                        if buffer.len() > FRAME_SAMPLES * 25 {
+                            let drop = buffer.len() - FRAME_SAMPLES * 25;
+                            buffer.drain(..drop);
                         }
                     }
                 },
                 |e| eprintln!("input stream err {e}"),
                 None,
             )
-        };
+        }};
     }
     let input_stream = input_setup.and_then(|(input_dev, in_cfg)| {
         let result = match in_cfg.sample_format() {
@@ -1032,40 +1097,24 @@ fn run_media_loop(
     // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
     let ob2 = output_buf.clone();
     macro_rules! playback_stream {
-        ($sample:ty, $device:ident, $config:ident) => {
+        ($sample:ty,$device:ident,$config:ident) => {{
+            let mut resampler = PlaybackResampler::new(SAMPLE_RATE, out_rate);
             $device.build_output_stream(
                 &$config.clone().into(),
                 move |data: &mut [$sample], _| {
-                    if let Ok(mut b) = ob2.lock() {
-                        let out_frames = data.len() / out_channels;
-                        let step = SAMPLE_RATE as f32 / out_rate as f32;
-                        let mut consumed = 0usize;
-                        for i in 0..out_frames {
-                            let src_idx = (i as f32 * step) as usize;
-                            let sample = if src_idx < b.len() {
-                                consumed = consumed.max(src_idx + 1);
-                                b[src_idx]
-                            } else {
-                                0.0
-                            };
-                            for ch in 0..out_channels {
-                                data[i * out_channels + ch] = sample.to_sample::<$sample>();
-                            }
+                    if let Ok(mut buffer) = ob2.lock() {
+                        for frame in data.chunks_exact_mut(out_channels) {
+                            frame.fill(resampler.next(&buffer).to_sample::<$sample>());
                         }
-                        if consumed > 0 {
-                            let drain_n = consumed.min(b.len());
-                            b.drain(0..drain_n);
-                        }
+                        resampler.finish(&mut buffer);
                     } else {
-                        for s in data.iter_mut() {
-                            *s = 0.0_f32.to_sample::<$sample>();
-                        }
+                        data.fill(0f32.to_sample::<$sample>());
                     }
                 },
                 |e| eprintln!("output stream err {e}"),
                 None,
             )
-        };
+        }};
     }
     let output_stream = output_setup.and_then(|(output_dev, out_cfg)| {
         let result = match out_cfg.sample_format() {
@@ -1621,12 +1670,18 @@ fn run_native_h264_decoder(
     gui_tx: std::sync::mpsc::Sender<crate::gui::GuiEvent>,
     egui_ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
+    generation: u64,
 ) {
     #[cfg(windows)]
     {
-        if let Err(e) =
-            crate::windows_video::decode(stop, h264_rx, gui_tx.clone(), egui_ctx.clone(), synced)
-        {
+        if let Err(e) = crate::windows_video::decode(
+            stop,
+            h264_rx,
+            gui_tx.clone(),
+            egui_ctx.clone(),
+            synced,
+            generation,
+        ) {
             let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(format!(
                 "Video decode: {e:#}"
             )));
@@ -1636,7 +1691,7 @@ fn run_native_h264_decoder(
     }
     #[cfg(not(windows))]
     {
-        let _ = (stop, h264_rx, gui_tx, egui_ctx, synced);
+        let _ = (stop, h264_rx, gui_tx, egui_ctx, synced, generation);
     }
 }
 
@@ -2052,5 +2107,58 @@ mod audio_playback_tests {
         );
         queue_playback(&mut buffer, &vec![3.0; PLAYBACK_BUFFER_SAMPLES * 2]);
         assert_eq!(buffer, vec![3.0; PLAYBACK_BUFFER_SAMPLES]);
+    }
+}
+
+#[cfg(test)]
+mod resampling_tests {
+    use super::*;
+    #[test]
+    fn capture_preserves_duration_across_irregular_callbacks_and_bluetooth_rates() {
+        for source in [8000, 44100, 48000] {
+            let input: Vec<f32> = (0..source).map(|n| (n as f32 * 0.001).sin()).collect();
+            let process = |chunk: usize| {
+                let mut resampler = CaptureResampler::new(source, SAMPLE_RATE);
+                let mut output = Vec::new();
+                for block in input.chunks(chunk) {
+                    for &sample in block {
+                        resampler.push(sample, |sample| output.push(sample));
+                    }
+                }
+                output
+            };
+            let whole = process(input.len());
+            let split = process(127);
+            assert_eq!(whole, split);
+            assert!(
+                whole.len().abs_diff(SAMPLE_RATE as usize) <= 1,
+                "{source}: {}",
+                whole.len()
+            );
+        }
+    }
+    #[test]
+    fn speaker_callback_boundaries_do_not_drop_fractional_audio_samples() {
+        let original: Vec<f32> = (0..2000).map(|n| n as f32 * 0.001).collect();
+        let render = |chunk: usize| {
+            let mut buffer = original.clone();
+            let mut resampler = PlaybackResampler::new(SAMPLE_RATE, 48000);
+            let mut output = Vec::new();
+            let mut left = 1800;
+            while left > 0 {
+                let n = left.min(chunk);
+                for _ in 0..n {
+                    output.push(resampler.next(&buffer));
+                }
+                resampler.finish(&mut buffer);
+                left -= n;
+            }
+            output
+        };
+        let whole = render(1800);
+        let split = render(127);
+        for (a, b) in whole.iter().zip(split.iter()) {
+            assert!((a - b).abs() < 0.0001);
+        }
     }
 }

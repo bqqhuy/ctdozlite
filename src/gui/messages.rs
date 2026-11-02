@@ -1555,7 +1555,24 @@ pub(super) fn render_chat_bubble(
                             if show_timestamp && !has_sticker && !is_frameless_photo {
                                 ui.add_space(3.5);
                                 let ts_txt = if is_latest_outgoing {
-                                    format!("{} · Đã nhận", msg.time)
+                                    match msg.delivery {
+                                        crate::message_model::DeliveryState::ServerAccepted => {
+                                            format!("{} · Đã gửi", msg.time)
+                                        }
+                                        crate::message_model::DeliveryState::Delivered => {
+                                            format!("{} · Đã nhận", msg.time)
+                                        }
+                                        crate::message_model::DeliveryState::Read => {
+                                            format!("{} · Đã xem", msg.time)
+                                        }
+                                        crate::message_model::DeliveryState::Pending => {
+                                            format!("{} · Đang gửi", msg.time)
+                                        }
+                                        crate::message_model::DeliveryState::Failed => {
+                                            format!("{} · Gửi lỗi", msg.time)
+                                        }
+                                        _ => msg.time.clone(),
+                                    }
                                 } else {
                                     msg.time.clone()
                                 };
@@ -1566,7 +1583,7 @@ pub(super) fn render_chat_bubble(
                         });
                     });
                 if fr.response.double_clicked() {
-                    return Some(BubbleAction::Reply);
+                    return Some(BubbleAction::DoubleClickReply);
                 }
                 card_action.or_else(|| {
                     bubble_context_menu(
@@ -1692,7 +1709,7 @@ pub(super) fn render_chat_bubble(
                         });
                     });
                 if fr.response.double_clicked() {
-                    return Some(BubbleAction::Reply);
+                    return Some(BubbleAction::DoubleClickReply);
                 }
                 card_action.or_else(|| {
                     bubble_context_menu(
@@ -1714,6 +1731,7 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    DoubleClickReply,
     Reply,
     Forward,
     React(&'static str),

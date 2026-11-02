@@ -29,11 +29,11 @@ Không có nguồn presence đã xác minh, nên ứng dụng không gắn chấ
 
 ## Microphone, camera và video
 
-Audio dùng WASAPI qua CPAL, mã hóa Opus native, hỗ trợ F32/I16/U16/I32/F64. Camera, H.264 encode/decode và preview dùng **Windows Media Foundation**, không gọi FFmpeg hoặc ZaloCall.exe.
+Audio dùng WASAPI qua CPAL, mã hóa Opus native, hỗ trợ các kiểu mẫu số nguyên và số thực của CPAL. Camera, H.264 encode/decode và preview dùng **Windows Media Foundation**, không gọi FFmpeg hoặc ZaloCall.exe.
 
 Trong Windows Settings → Privacy & security → Camera/Microphone, bật quyền truy cập và **Let desktop apps access…**. Chọn thiết bị trong Settings của ứng dụng. Đóng ứng dụng khác đang giữ camera. Nếu lỗi, cấp quyền/chọn thiết bị rồi bật camera lại.
 
-Windows N cần cài Media Feature Pack. Thiếu thành phần media sẽ báo lỗi chức năng camera/video; các DLL media được delay-load để không chặn khởi động GUI. Bộ mã hóa yêu cầu đầu ra camera NV12 320×240, 15 fps qua Source Reader video processing; thiết bị/driver không chuyển được định dạng này sẽ báo lỗi.
+Windows N cần cài Media Feature Pack. Thiếu thành phần media sẽ báo lỗi chức năng camera/video; các DLL media được delay-load để không chặn khởi động GUI. Camera ưu tiên RGB thay cho IR/Hello, thương lượng NV12 ở độ phân giải driver hỗ trợ rồi chuẩn hóa stride, scale/letterbox về 320×240. Nhịp gửi 15 fps được giới hạn sau capture, không ép camera phải có mode 15 fps. Camera không trả frame trong 5 giây sẽ báo lỗi; chưa xác nhận driver máy đích. Audio giữ pha resampling giữa callback và giải mã theo số mẫu Opus thực tế; lỗi mic/loa được báo riêng để video vẫn có thể hoạt động.
 
 Cuộc gọi nhóm chưa hỗ trợ. Gọi 1-1 không bị khóa tài khoản thử nghiệm mặc định. Chỉ bật `ZALO_CALL_TEST_LOCK=1` khi chủ động dùng allowlist chẩn đoán. Test codec tự động không chứng minh cuộc gọi tới ứng dụng Zalo chính thức hoạt động trên mọi mạng/thiết bị.
 

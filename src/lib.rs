@@ -36,3 +36,12 @@ pub mod unread;
 
 #[cfg(any(windows, test))]
 mod video_frame;
+
+/// Bounded media resources and admission control.
+pub mod media_resources;
+/// Release download validation and transactional file replacement.
+pub mod updater;
+
+mod video_preview;
+
+mod diagnostics;

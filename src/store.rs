@@ -123,11 +123,74 @@ impl MessageStore {
                 msg.raw_json,
             ],
         )?;
-        if rows == 0 && !msg.raw_json.is_empty() {
-            self.conn.execute(
-                "UPDATE messages SET raw_json = ?1, msg_type = ?2, text = ?4 WHERE msg_id = ?3 AND thread_id = ?5",
-                params![msg.raw_json, msg.msg_type, msg.msg_id, msg.text, msg.thread_id],
+        if rows == 0 {
+            let (old_text, old_raw): (String, String) = self.conn.query_row(
+                "SELECT text,raw_json FROM messages WHERE thread_id=?1 AND msg_id=?2",
+                params![msg.thread_id, msg.msg_id],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    ))
+                },
             )?;
+            let old = serde_json::from_str::<serde_json::Value>(&old_raw)
+                .unwrap_or(serde_json::json!({}));
+            let mut new = serde_json::from_str::<serde_json::Value>(&msg.raw_json)
+                .unwrap_or(serde_json::json!({}));
+            // Network deltas omit local flags and older media details. Only an
+            // explicit UI snapshot may change local pin/star choices.
+            if let (Some(old_map), Some(new_map)) = (old.as_object(), new.as_object_mut()) {
+                for (key, value) in old_map {
+                    if key == "is_pinned" || key == "is_starred" || !new_map.contains_key(key) {
+                        new_map.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            let mut state = ChatMessage::default();
+            if let Some(value) = old.get("message_state") {
+                state.restore_state(value)?;
+            }
+            if let Some(value) = serde_json::from_str::<serde_json::Value>(&msg.raw_json)
+                .ok()
+                .and_then(|v| v.get("message_state").cloned())
+            {
+                state.restore_state(&value)?;
+            }
+            let recalled =
+                old_text == "[Tin nhắn đã thu hồi]" || msg.text == "[Tin nhắn đã thu hồi]";
+            if recalled {
+                state.mark_recalled();
+            }
+            if !new.is_object() {
+                new = serde_json::json!({});
+            }
+            new["message_state"] = state.durable_state();
+            if recalled {
+                for key in [
+                    "stickerId",
+                    "cateId",
+                    "type",
+                    "link_url",
+                    "link_title",
+                    "link_desc",
+                    "link_thumb",
+                    "link_src",
+                    "reply_to_id",
+                    "reply_to_text",
+                    "reply_to_sender",
+                ] {
+                    new.as_object_mut().unwrap().remove(key);
+                }
+            }
+            let text = if recalled {
+                "[Tin nhắn đã thu hồi]"
+            } else {
+                &msg.text
+            };
+            self.conn.execute(
+                "UPDATE messages SET raw_json=?1,msg_type=?2,text=?3 WHERE thread_id=?4 AND msg_id=?5",
+                params![new.to_string(),msg.msg_type,text,msg.thread_id,msg.msg_id])?;
         }
         Ok(rows > 0)
     }
@@ -303,8 +366,10 @@ impl MessageStore {
                 let mut link_desc = None;
                 let mut link_thumb = None;
                 let mut link_src = None;
+                let mut saved_state = None;
                 if !sm.raw_json.is_empty() {
                     if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
+                        saved_state = val.get("message_state").cloned();
                         sticker_id = val
                             .get("stickerId")
                             .or_else(|| val.get("id"))
@@ -362,7 +427,7 @@ impl MessageStore {
                             .map(str::to_string);
                     }
                 }
-                let cm = ChatMessage {
+                let mut cm = ChatMessage {
                     id: sm.msg_id,
                     sender: if !sm.sender_name.is_empty() {
                         sm.sender_name
@@ -390,11 +455,23 @@ impl MessageStore {
 
                     ..Default::default()
                 };
+                if let Some(state) = saved_state {
+                    if cm.restore_state(&state).is_err() {
+                        crate::logger::log_error(
+                            "history metadata",
+                            "Invalid optional message state; retained base message",
+                        );
+                    }
+                }
+                if cm.text == "[Tin nhắn đã thu hồi]" {
+                    cm.mark_recalled();
+                }
                 if let Some(existing) = t
                     .messages
                     .iter_mut()
                     .find(|existing| crate::chat::same_message(existing, &cm))
                 {
+                    existing.merge_reaction_metadata(&cm);
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
                         existing.sticker_cate_id = cm.sticker_cate_id;
@@ -442,6 +519,14 @@ impl MessageStore {
 
 impl From<&ChatMessage> for StoredMessage {
     fn from(m: &ChatMessage) -> Self {
+        let recalled = (m.text == "[Tin nhắn đã thu hồi]"
+            || m.kind == crate::message_model::MessageKind::Recall)
+            .then(|| {
+                let mut message = m.clone();
+                message.mark_recalled();
+                message
+            });
+        let m = recalled.as_ref().unwrap_or(m);
         let mut meta = serde_json::Map::new();
         let msg_type = if let Some(sid) = m.sticker_id {
             let cid = m.sticker_cate_id.unwrap_or(0);
@@ -486,6 +571,7 @@ impl From<&ChatMessage> for StoredMessage {
         if let Some(lsrc) = &m.link_src {
             meta.insert("link_src".into(), serde_json::json!(lsrc));
         }
+        meta.insert("message_state".into(), m.durable_state());
         let raw_json = if meta.is_empty() {
             String::new()
         } else {
@@ -515,6 +601,20 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    persist_snapshot(store, threads, false)
+}
+
+/// Persist an explicit UI edit, including local-only pin/star flags.
+/// # Errors
+/// Returns database failures and rolls back the entire snapshot.
+pub fn persist_local_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    persist_snapshot(store, threads, true)
+}
+fn persist_snapshot(
+    store: &mut MessageStore,
+    threads: &[Thread],
+    local_flags: bool,
+) -> Result<usize> {
     let transaction = store.conn.unchecked_transaction()?;
     let mut new_count = 0;
     for t in threads {
@@ -535,6 +635,10 @@ pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<u
             }
             if store.upsert_message(&sm)? {
                 new_count += 1;
+            }
+            if local_flags {
+                store.conn.execute("UPDATE messages SET raw_json=json_set(raw_json,'$.is_starred',json(?1),'$.is_pinned',json(?2)) WHERE thread_id=?3 AND msg_id=?4",
+                    params![if m.is_starred {"true"} else {"false"},if m.is_pinned {"true"} else {"false"},t.id,sm.msg_id])?;
             }
         }
     }
@@ -873,5 +977,99 @@ mod identity_tests {
         assert!(store.upsert_message(&message("b")).unwrap());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod durable_state_tests {
+    use super::*;
+    fn thread(message: ChatMessage) -> Thread {
+        Thread {
+            id: "thread-1".into(),
+            name: "Example".into(),
+            is_group: true,
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            presentation: Default::default(),
+            unread: Default::default(),
+            messages: vec![message],
+        }
+    }
+    fn message() -> ChatMessage {
+        ChatMessage {
+            id: "msg-1".into(),
+            text: "old-private-content".into(),
+            ts: 1000,
+            kind: crate::message_model::MessageKind::Photo,
+            delivery: crate::message_model::DeliveryState::Read,
+            wire_ref: crate::message_model::WireMessageRef::from_raw(
+                &serde_json::json!({"msgId":"18446744073709550000","content":"old-private-content"}),
+            ),
+            link_url: Some("https://example.invalid/private.png".into()),
+            is_starred: true,
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn metadata_roundtrip_keeps_large_wire_ids_receipts_and_local_flags() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        persist_local_threads(&mut store, &[thread(message())]).unwrap();
+        persist_threads(
+            &mut store,
+            &[thread(ChatMessage {
+                id: "msg-1".into(),
+                text: "old-private-content".into(),
+                ts: 1000,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        let mut loaded = Vec::new();
+        store.hydrate_threads(&mut loaded, 20).unwrap();
+        let restored = &loaded[0].messages[0];
+        assert_eq!(restored.delivery, crate::message_model::DeliveryState::Read);
+        assert_eq!(
+            restored.wire_ref.server_id,
+            Some(serde_json::json!("18446744073709550000"))
+        );
+        assert!(restored.is_starred);
+        assert!(restored.link_url.is_some());
+        let mut edited = loaded[0].clone();
+        edited.messages[0].is_starred = false;
+        persist_local_threads(&mut store, &[edited]).unwrap();
+        let mut loaded = Vec::new();
+        store.hydrate_threads(&mut loaded, 20).unwrap();
+        assert!(
+            !loaded[0].messages[0].is_starred,
+            "Explicit local unstar must be applied"
+        );
+    }
+    #[test]
+    fn old_history_cannot_resurrect_recalled_content_or_attachments() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        persist_threads(&mut store, &[thread(message())]).unwrap();
+        persist_threads(
+            &mut store,
+            &[thread(ChatMessage {
+                id: "msg-1".into(),
+                text: "[Tin nhắn đã thu hồi]".into(),
+                ts: 1000,
+                ..Default::default()
+            })],
+        )
+        .unwrap();
+        persist_threads(&mut store, &[thread(message())]).unwrap();
+        let saved = store.messages_for("thread-1", 20).unwrap();
+        assert_eq!(saved[0].text, "[Tin nhắn đã thu hồi]");
+        assert!(!saved[0].raw_json.contains("old-private-content"));
+        assert!(!saved[0].raw_json.contains("private.png"));
+        let mut loaded = Vec::new();
+        store.hydrate_threads(&mut loaded, 20).unwrap();
+        assert_eq!(
+            loaded[0].messages[0].kind,
+            crate::message_model::MessageKind::Recall
+        );
+        assert!(loaded[0].messages[0].link_url.is_none());
     }
 }

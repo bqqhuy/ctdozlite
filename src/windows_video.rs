@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use windows::{
-    core::GUID,
+    core::{Interface, GUID},
     Win32::{Media::MediaFoundation::*, System::Com::*},
 };
 
@@ -104,7 +104,12 @@ pub fn camera_names() -> Result<Vec<String>> {
     // a fresh MTA rather than failing with RPC_E_CHANGED_MODE after listing mics.
     std::thread::spawn(|| -> Result<Vec<String>> {
         let _runtime = Runtime::new()?;
-        unsafe { Ok(devices()?.into_iter().map(|(name, _)| name).collect()) }
+        // SAFETY: this fresh media thread owns the MTA runtime and COM activations.
+        unsafe {
+            let mut names: Vec<String> = devices()?.into_iter().map(|(name, _)| name).collect();
+            names.sort_by_key(|name| crate::video_frame::camera_preference(name));
+            Ok(names)
+        }
     })
     .join()
     .map_err(|_| anyhow::anyhow!("Camera enumeration thread failed"))?
@@ -168,6 +173,34 @@ unsafe fn bytes(sample: &IMFSample) -> Result<Vec<u8>> {
     };
     buffer.Unlock()?;
     result
+}
+
+// Camera/decoder surfaces may have a hardware pitch that differs from the
+// media type's default stride. IMF2DBuffer supplies a packed contiguous copy.
+unsafe fn nv12_sample(
+    sample: &IMFSample,
+    w: usize,
+    h: usize,
+    default_stride: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let buffer = sample.ConvertToContiguousBuffer()?;
+    if let Ok(planar) = buffer.cast::<IMF2DBuffer>() {
+        let size = planar.GetContiguousLength()? as usize;
+        anyhow::ensure!(size <= 16 * 1024 * 1024, "Camera surface exceeds limit");
+        let mut packed = vec![0; size];
+        planar.ContiguousCopyTo(&mut packed)?;
+        crate::video_frame::validate_layout(w, h, w, packed.len())?;
+        Ok((packed, w))
+    } else {
+        let data = bytes(sample)?;
+        let stride = if data.len() == w * h * 3 / 2 {
+            w
+        } else {
+            default_stride
+        };
+        crate::video_frame::validate_layout(w, h, stride, data.len())?;
+        Ok((data, stride))
+    }
 }
 
 struct Codec {
@@ -285,6 +318,7 @@ fn nv12_rgba(input: &[u8], w: usize, h: usize, stride: usize) -> Result<Vec<u8>>
     }
     Ok(rgba)
 }
+#[allow(clippy::too_many_arguments)]
 fn show_frame(
     data: &[u8],
     w: usize,
@@ -293,14 +327,25 @@ fn show_frame(
     key: &str,
     tx: &std::sync::mpsc::Sender<crate::gui::GuiEvent>,
     ctx: &eframe::egui::Context,
+    generation: u64,
 ) -> Result<()> {
-    let rgba = nv12_rgba(data, w, h, stride)?;
-    tx.send(crate::gui::GuiEvent::StickerImageReady {
-        key: key.into(),
-        image: eframe::egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
-    })?;
-    ctx.request_repaint();
-    Ok(())
+    if !crate::video_preview::claim(generation, key) {
+        return Ok(());
+    }
+    let result = (|| -> Result<()> {
+        let rgba = nv12_rgba(data, w, h, stride)?;
+        tx.send(crate::gui::GuiEvent::VideoFrameReady {
+            generation,
+            key: key.into(),
+            image: eframe::egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba),
+        })?;
+        ctx.request_repaint();
+        Ok(())
+    })();
+    if result.is_err() {
+        crate::video_preview::consumed(generation, key);
+    }
+    result
 }
 pub fn readiness() -> Result<()> {
     let _runtime = Runtime::new()?;
@@ -316,6 +361,7 @@ pub fn decode(
     tx: std::sync::mpsc::Sender<crate::gui::GuiEvent>,
     ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
+    generation: u64,
 ) -> Result<()> {
     let _runtime = Runtime::new()?;
     unsafe {
@@ -337,15 +383,19 @@ pub fn decode(
                     let mt = codec.transform.GetOutputCurrentType(0)?;
                     let (w, h) = dimensions(&mt)?;
                     let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
-                    show_frame(
-                        &bytes(&output)?,
-                        w,
-                        h,
-                        stride,
-                        "call_remote_video",
-                        &tx,
-                        &ctx,
-                    )?;
+                    if crate::tray::previews_visible() {
+                        let (raw, stride) = nv12_sample(&output, w, h, stride)?;
+                        show_frame(
+                            &raw,
+                            w,
+                            h,
+                            stride,
+                            "call_remote_video",
+                            &tx,
+                            &ctx,
+                            generation,
+                        )?;
+                    }
                     synced.store(true, Ordering::Relaxed);
                 }
                 Ok(())
@@ -414,6 +464,40 @@ unsafe fn select_camera_output(reader: &IMFSourceReader, stream: u32) -> Result<
     anyhow::bail!("Camera không có định dạng NV12/chuyển đổi phù hợp; thử camera khác hoặc cập nhật driver Huawei")
 }
 
+// An automatic choice may encounter an IR/unsupported camera before the color
+// camera. Explicit user selections never silently switch to another device.
+unsafe fn open_camera(desired: &str) -> Result<(Source, IMFSourceReader)> {
+    let mut all = devices()?;
+    if desired.is_empty() {
+        all.sort_by_key(|(name, _)| crate::video_frame::camera_preference(name));
+    }
+    let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+    let mut last_error =
+        anyhow::anyhow!("Không tìm thấy camera; kiểm tra quyền Camera cho desktop apps");
+    for (_, device) in all
+        .into_iter()
+        .filter(|(name, _)| desired.is_empty() || name == desired)
+    {
+        let result = (|| -> Result<(Source, IMFSourceReader)> {
+            let source = Source(device.ActivateObject::<IMFMediaSource>().context(
+                "Không mở được camera; kiểm tra quyền Camera hoặc ứng dụng đang chiếm camera",
+            )?);
+            let attrs = attributes()?;
+            attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
+            let reader = MFCreateSourceReaderFromMediaSource(&source.0, &attrs)?;
+            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+            reader.SetStreamSelection(stream, true)?;
+            select_camera_output(&reader, stream)?;
+            Ok((source, reader))
+        })();
+        match result {
+            Ok(camera) => return Ok(camera),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
 pub fn capture(
     stop: Arc<AtomicBool>,
     enabled: Arc<AtomicBool>,
@@ -421,6 +505,7 @@ pub fn capture(
     au_tx: SyncSender<Vec<u8>>,
     tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     ctx: Option<eframe::egui::Context>,
+    generation: u64,
 ) -> Result<()> {
     let _runtime = Runtime::new()?;
     while !stop.load(Ordering::Relaxed) {
@@ -430,22 +515,8 @@ pub fn capture(
         }
         let desired = crate::media::selected_camera_device();
         unsafe {
-            let all = devices()?;
-            let (_, device) = all
-                .into_iter()
-                .find(|(name, _)| desired.is_empty() || name == &desired)
-                .context(
-                    "Không tìm thấy camera; kiểm tra Settings > Privacy & security > Camera",
-                )?;
-            let source = Source(device.ActivateObject::<IMFMediaSource>().context(
-                "Không mở được camera; kiểm tra quyền Camera cho desktop apps và ứng dụng đang chiếm camera")?);
-            let attrs = attributes()?;
-            attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
-            let reader = MFCreateSourceReaderFromMediaSource(&source.0, &attrs)?;
+            let (source, reader) = open_camera(&desired)?;
             let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
-            reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
-            reader.SetStreamSelection(stream, true)?;
-            select_camera_output(&reader, stream)?;
             let mut encoder = Codec::encoder(320, 240)?;
             // Shutdown interrupts ReadSample even when a camera/driver stops producing.
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -525,7 +596,7 @@ pub fn capture(
                     let mt = reader.GetCurrentMediaType(stream)?;
                     let (w, h) = dimensions(&mt)?;
                     let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
-                    let raw = bytes(&sample)?;
+                    let (raw, stride) = nv12_sample(&sample, w, h, stride)?;
                     let normalized = crate::video_frame::normalize_nv12(&raw, w, h, stride)?;
                     let encoded_sample =
                         self::sample(&normalized, frame_number * (10_000_000 / 15))?;
@@ -535,7 +606,16 @@ pub fn capture(
                         encoder = Codec::encoder(320, 240)?;
                     }
                     if let (Some(tx), Some(ctx)) = (&tx, &ctx) {
-                        show_frame(&normalized, 320, 240, 320, "call_local_video", tx, ctx)?;
+                        show_frame(
+                            &normalized,
+                            320,
+                            240,
+                            320,
+                            "call_local_video",
+                            tx,
+                            ctx,
+                            generation,
+                        )?;
                     }
                     encoder.input(&encoded_sample)?;
                     while let Some(output) = encoder.output()? {
@@ -566,6 +646,26 @@ pub fn capture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn two_dimensional_nv12_surface_is_copied_without_hardware_padding() {
+        let _runtime = Runtime::new().unwrap();
+        // SAFETY: the test owns an MTA runtime and the sample/buffer references.
+        unsafe {
+            let (w, h) = (322usize, 242usize);
+            let buffer =
+                MFCreate2DMediaBuffer(w as u32, h as u32, u32::from_le_bytes(*b"NV12"), false)
+                    .unwrap();
+            let planar = buffer.cast::<IMF2DBuffer>().unwrap();
+            let mut packed = vec![100; w * h * 3 / 2];
+            packed[w * h..].fill(128);
+            planar.ContiguousCopyFrom(&packed).unwrap();
+            let sample = MFCreateSample().unwrap();
+            sample.AddBuffer(&buffer).unwrap();
+            let (actual, stride) = nv12_sample(&sample, w, h, 384).unwrap();
+            assert_eq!(stride, w);
+            assert_eq!(actual, packed);
+        }
+    }
     #[test]
     fn nv12_stride_and_truncation() {
         let black = vec![16, 16, 0, 0, 16, 16, 0, 0, 128, 128, 0, 0];

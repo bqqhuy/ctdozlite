@@ -301,7 +301,7 @@ impl Session {
         ];
         for host in hosts {
             if let Ok(url) = reqwest::Url::parse(host) {
-                let cookie = format!("zpw_sek={v}; Path=/");
+                let cookie = format!("zpw_sek={v}; Path=/; Secure; HttpOnly");
                 self.jar.add_cookie_str(&cookie, &url);
             }
         }
@@ -723,7 +723,7 @@ impl Session {
                 format!("multipart/form-data; boundary={boundary}"),
             );
         if let Some(sek) = &self.zpw_sek {
-            if !sek.is_empty() {
+            if !sek.is_empty() && credential_target(url) {
                 rb = rb
                     .header("Cookie", format!("zpw_sek={sek}; _zlang=vi"))
                     .header("zpw_sek", sek)
@@ -804,25 +804,14 @@ impl Session {
                 }
             );
             if let Some(b) = &body {
-                eprintln!("  body: {}", truncate(b, 400));
+                eprintln!("  body: {}", crate::diagnostics::preview(b));
             }
         }
         let method = m.as_str().to_string();
         let mut rb = self.http.request(m, url);
         if let Some(ref sek) = self.zpw_sek {
             if !sek.is_empty() {
-                let is_zalo_host = reqwest::Url::parse(url)
-                    .map(|u| {
-                        u.host_str()
-                            .map(|h| {
-                                h == "zalo.me"
-                                    || h.ends_with(".zalo.me")
-                                    || h == "zaloapp.com"
-                                    || h.ends_with(".zaloapp.com")
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or_else(|_| url.contains("zalo.me") || url.contains("zaloapp.com"));
+                let is_zalo_host = credential_target(url);
                 if is_zalo_host {
                     rb = rb.header("Cookie", format!("zpw_sek={sek}; _zlang=vi"));
                     rb = rb.header("zpw_sek", sek);
@@ -860,7 +849,7 @@ impl Session {
             crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if self.verbose {
-            eprintln!("← {status} {}", truncate(&text, 400));
+            eprintln!("← {status} response_bytes={}", text.len());
         }
         if self.dump {
             self.dump_exchange(&method, url, status.as_u16(), &text);
@@ -943,10 +932,7 @@ impl Session {
                 }
                 Err(e) => {
                     if self.verbose {
-                        eprintln!(
-                            "  data decrypted but not JSON: {e} / {}",
-                            truncate(&pt, 200)
-                        );
+                        eprintln!("  data decrypted but not JSON: {e}");
                     }
                     v
                 }
@@ -959,6 +945,20 @@ impl Session {
             }
         }
     }
+}
+
+/// Session headers are only sent over TLS to an actual Zalo host, never a
+/// lookalike URL, plaintext media URL or an arbitrary multipart destination.
+fn credential_target(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| {
+                h == "zalo.me"
+                    || h.ends_with(".zalo.me")
+                    || h == "zaloapp.com"
+                    || h.ends_with(".zaloapp.com")
+            })
+    })
 }
 
 /// Build `{a:1,b:"x"}` maps tersely.
@@ -1127,5 +1127,88 @@ mod validation_tests {
             assert_eq!(s.zpw_sek.as_deref(), Some("fixture"));
             server.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod credential_destination_tests {
+    use super::*;
+    #[test]
+    fn only_secure_actual_zalo_hosts_receive_credentials() {
+        assert!(credential_target("https://tt-profile-wpa.chat.zalo.me/api"));
+        for url in [
+            "http://tt-profile-wpa.chat.zalo.me/api",
+            "https://zalo.me.evil.invalid/path",
+            "https://zalo.me@evil.invalid/",
+            "https://evil.invalid/?next=zalo.me",
+            "invalid-zalo.me",
+        ] {
+            assert!(!credential_target(url), "{url}");
+        }
+    }
+    #[tokio::test]
+    async fn multipart_never_forwards_session_to_external_destination() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let len: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            while request.len() < header_end + len {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            assert!(!header.to_ascii_lowercase().contains("zpw_sek"));
+            assert!(!header.to_ascii_lowercase().contains("cookie:"));
+            let body = r#"{"error_code":0,"data":{}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(LoginInfo::default());
+        session.set_zpw_sek("fixture-token".into());
+        session.http = reqwest::Client::builder()
+            .no_proxy()
+            .cookie_provider(session.jar.clone())
+            .build()
+            .unwrap();
+        session
+            .post_multipart(
+                &format!("http://{address}/upload"),
+                "fileContent",
+                "fixture.bin",
+                "application/octet-stream",
+                b"fixture",
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
     }
 }

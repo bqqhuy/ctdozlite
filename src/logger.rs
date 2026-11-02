@@ -88,6 +88,8 @@ pub fn log_request(
 
     let is_error = status.map(|s| s >= 400).unwrap_or(false) || error_msg.is_some();
 
+    let payload_preview = crate::diagnostics::preview(payload_preview);
+    let decrypted_preview = decrypted_preview.map(crate::diagnostics::preview);
     if let Ok(mut state) = LOGGER.lock() {
         state.counter += 1;
         let entry = LogEntry {
@@ -97,8 +99,8 @@ pub fn log_request(
             url: crate::session::redact_url(url),
             status,
             latency_ms,
-            payload_preview: crate::session::truncate(payload_preview, 16 * 1024),
-            decrypted_preview: decrypted_preview.map(|s| crate::session::truncate(s, 16 * 1024)),
+            payload_preview,
+            decrypted_preview,
             is_error,
             error_msg: error_msg.map(str::to_string),
         };

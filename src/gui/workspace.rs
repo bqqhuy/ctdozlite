@@ -2438,6 +2438,7 @@ impl ZaloGuiApp {
                         if let Some(m) = target {
                             match action {
                                 BubbleAction::Reply => self.replying_to = Some(m),
+                                BubbleAction::DoubleClickReply => { if self.settings.double_click_to_reply {self.replying_to=Some(m);} },
                                 BubbleAction::Forward => {
                                     self.forward_msg = Some(m);
                                     self.forward_filter.clear();
@@ -2566,7 +2567,7 @@ impl ZaloGuiApp {
                                             && !lower_u.starts_with("https://"));
                                     let hd_tex_key = if !full_url.is_empty() && is_direct_img {
                                         let hk = format!(
-                                            "thumb_{}",
+                                            "full_{}",
                                             crate::crypto::md5_hex(&full_url)
                                         );
                                         if hk != tex_key

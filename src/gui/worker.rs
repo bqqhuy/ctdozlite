@@ -292,12 +292,95 @@ async fn persist_received(session: &Session, threads: &[Thread]) {
     }
 }
 
+async fn fetch_gui_image(
+    s: &Session,
+    root: &std::path::Path,
+    key: &str,
+    url: &str,
+) -> anyhow::Result<egui::ColorImage> {
+    use crate::media_resources::{MediaKey, MediaQuality, PrivateMediaCache};
+    anyhow::ensure!(
+        s.is_active() && !s.account_key().is_empty(),
+        "No active media account"
+    );
+    let root = root.to_owned();
+    let account = s.account_key().to_owned();
+    let key = key.to_owned();
+    let url = url.to_owned();
+    let media_key = MediaKey {
+        account: account.clone(),
+        thread: "ui-preview".into(),
+        message: key.clone(),
+        quality: if key.starts_with("full_") {
+            MediaQuality::Preview
+        } else {
+            MediaQuality::Thumbnail
+        },
+    };
+    let directory = root.join("private-media");
+    let (cache, path) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let cache = PrivateMediaCache::new(&directory, &account)?;
+        let path = cache.path_for(&media_key)?;
+        Ok((cache, path))
+    })
+    .await??;
+    let cached_path = path.clone();
+    let cached_key = key.clone();
+    if let Ok(Ok(image)) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let bytes = crate::limits::read_file(&cached_path, crate::limits::IMAGE_BYTES)?;
+        crate::limits::preview_image(&bytes, &cached_key)
+    })
+    .await
+    {
+        return Ok(egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        ));
+    }
+    let bytes = if url.starts_with("https://") || url.starts_with("http://") {
+        let response = s
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await?;
+        anyhow::ensure!(response.status().is_success(), "Image download failed");
+        crate::limits::response_bytes(response, crate::limits::IMAGE_BYTES).await?
+    } else {
+        let root = root.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let path = std::path::Path::new(&url).canonicalize()?;
+            anyhow::ensure!(
+                path.starts_with(root.canonicalize()?),
+                "Local preview is outside application data"
+            );
+            crate::limits::read_file(&path, crate::limits::IMAGE_BYTES)
+        })
+        .await??
+    };
+    let rgba = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let image = crate::limits::preview_image(&bytes, &key)?;
+        if crate::storage::atomic_write(&path, &bytes).is_err() || cache.prune().is_err() {
+            // Rendering may proceed when a full/read-only cache cannot be updated.
+            crate::logger::log_error("image cache", "Cannot save/prune preview cache");
+        }
+        Ok(image)
+    })
+    .await??;
+    anyhow::ensure!(s.is_active(), "Media account was logged out");
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    ))
+}
+
 pub(super) fn spawn_session_worker(
     session: Session,
     gui_tx: Sender<GuiEvent>,
     egui_ctx: egui::Context,
 ) {
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+    let image_jobs = crate::media_resources::MediaJobQueue::default();
     let commands = cmd_tx.downgrade();
     WORKER_TX.set(cmd_tx);
 
@@ -417,7 +500,7 @@ pub(super) fn spawn_session_worker(
                                                     .await;
                                                     persist_received(&s_snap, &ws_threads).await;
                                                     if deliver_thread_updates() {
-                                                        let _ = gui_tx_ws.send(GuiEvent::ThreadsUpdated(ws_threads));
+                                                        let _ = gui_tx_ws.send(GuiEvent::ThreadsUpdated {threads:ws_threads,source:ThreadUpdateSource::Live});
                                                     }
                                                     ctx_ws.request_repaint();
                                                 }
@@ -504,7 +587,7 @@ pub(super) fn spawn_session_worker(
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 if !s.is_active() { return Ok(()); }
                                 let mut store = crate::store::MessageStore::open(s.history_path())?;
-                                crate::store::persist_threads(&mut store, &threads)?;
+                                crate::store::persist_local_threads(&mut store, &threads)?;
                                 crate::chat::save_threads_cache(&s, &threads);
                                 Ok(())
                             }).await;
@@ -715,7 +798,7 @@ pub(super) fn spawn_session_worker(
                             tokio::spawn(async move {
                                 let result = crate::history_sync::download(&s, threads, cancel,
                                     |message| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); } },
-                                    |thread| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::ThreadsUpdated(vec![thread])); ctx.request_repaint(); } }).await;
+                                    |thread| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::ThreadsUpdated {threads:vec![thread],source:ThreadUpdateSource::History}); ctx.request_repaint(); } }).await;
                                 running.store(false, std::sync::atomic::Ordering::SeqCst);
                                 let message = result.unwrap_or_else(|e| format!("Lỗi tải lịch sử: {e}"));
                                 let _ = tx.send(GuiEvent::HistorySyncStatus { running: false, message });
@@ -807,7 +890,7 @@ pub(super) fn spawn_session_worker(
                                         }
                                     }
                                     let count = list.len();
-                                    let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(list));
+                                    let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Đã cập nhật {count} hội thoại và tin gần đây; chưa tải toàn bộ lịch sử")));
                                     ctx_clone.request_repaint();
                                 }
@@ -898,7 +981,7 @@ pub(super) fn spawn_session_worker(
                                             .await;
                                             persist_received(&s, &temp_threads).await;
                                             if deliver_thread_updates() {
-                                                let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(temp_threads));
+                                                let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:temp_threads,source:ThreadUpdateSource::Live});
                                             }
                                             ctx_clone.request_repaint();
                                         }
@@ -966,7 +1049,7 @@ pub(super) fn spawn_session_worker(
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
                                         persist_received(&s, std::slice::from_ref(&t)).await;
-                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated(vec![t]));
+                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:vec![t],source:ThreadUpdateSource::History});
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ"
                                         )));
@@ -1408,100 +1491,18 @@ pub(super) fn spawn_session_worker(
                             });
                         }
                         WorkerCmd::FetchStickerImage { key, url } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
+                            let Some(admission)=image_jobs.try_admit() else {
+                                let _=gui_tx.send(GuiEvent::ImageUnavailable {key});egui_ctx.request_repaint();continue;
+                            };
+                            let s=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             tokio::spawn(async move {
-                                let Ok(_permit) = crate::limits::IMAGE_JOBS.acquire().await else { return; };
-                                let cache_dir = crate::storage::cache_dir();
-                                let _ = std::fs::create_dir_all(&cache_dir);
-                                let cache_path = cache_dir.join(format!("{key}.png"));
-
-                                let bytes_opt = if let Ok(disk_bytes) = std::fs::read(&cache_path) {
-                                    if crate::limits::decode_image(&disk_bytes).is_ok() {
-                                        Some(disk_bytes)
-                                    } else {
-                                        let _ = std::fs::remove_file(&cache_path);
-                                        None
-                                    }
-                                } else if !url.starts_with("http://") && !url.starts_with("https://") {
-                                    std::fs::read(&url).ok()
-                                } else {
-                                    let client = { session_clone.lock().await.clone().http };
-                                    if let Ok(resp) = client.get(&url).send().await {
-                                        if resp.status().is_success() {
-                                            if let Ok(b) = crate::limits::response_bytes(resp, crate::limits::IMAGE_BYTES).await {
-                                                let vec = b.to_vec();
-                                                if crate::limits::decode_image(&vec).is_ok() {
-                                                    let _ = std::fs::write(&cache_path, &vec);
-                                                    Some(vec)
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        } else {
-                                            None
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                };
-
-                                if let Some(bytes) = bytes_opt {
-                                    if let Ok(dyn_img) = crate::limits::decode_image(&bytes) {
-                                        let mut rgba = dyn_img.to_rgba8();
-                                        // Apply smooth anti-aliased circular alpha mask for avatar textures (`ava_*`)
-                                        if key.starts_with("ava_") {
-                                            let side = rgba.width().min(rgba.height()).clamp(32, 160);
-                                            let x0 = (rgba.width() - side) / 2;
-                                            let y0 = (rgba.height() - side) / 2;
-                                            let cropped = image::imageops::crop_imm(
-                                                &rgba, x0, y0, side, side,
-                                            )
-                                            .to_image();
-                                            rgba = if side > 128 {
-                                                image::imageops::resize(
-                                                    &cropped,
-                                                    128,
-                                                    128,
-                                                    image::imageops::FilterType::Triangle,
-                                                )
-                                            } else {
-                                                cropped
-                                            };
-                                            let w = rgba.width() as f32;
-                                            let h = rgba.height() as f32;
-                                            let cx = (w - 1.0) * 0.5;
-                                            let cy = (h - 1.0) * 0.5;
-                                            let r = w.min(h) * 0.5;
-                                            for (x, y, px) in rgba.enumerate_pixels_mut() {
-                                                let dx = x as f32 - cx;
-                                                let dy = y as f32 - cy;
-                                                let dist = (dx * dx + dy * dy).sqrt();
-                                                if dist > r {
-                                                    px[3] = 0;
-                                                } else if dist > r - 1.4 {
-                                                    let cov = ((r - dist) / 1.4).clamp(0.0, 1.0);
-                                                    px[3] = (px[3] as f32 * cov) as u8;
-                                                }
-                                            }
-                                        }
-                                        let size =
-                                            [rgba.width() as usize, rgba.height() as usize];
-                                        let pixels = rgba.as_flat_samples();
-                                        let color_img = egui::ColorImage::from_rgba_unmultiplied(
-                                            size,
-                                            pixels.as_slice(),
-                                        );
-                                        let _ = gui_tx_clone.send(GuiEvent::StickerImageReady {
-                                            key,
-                                            image: color_img,
-                                        });
-                                        ctx_clone.request_repaint();
-                                    }
+                                let Some(job)=admission.start().await else {return;};
+                                let Ok(_permit)=crate::limits::IMAGE_JOBS.acquire().await else {return;};
+                                match fetch_gui_image(&s,crate::storage::root(),&key,&url).await {
+                                    Ok(image)=>{let _=tx.send(GuiEvent::PreviewImageReady {key,image,permit:job});},
+                                    Err(_)=>{let _=tx.send(GuiEvent::ImageUnavailable {key});}
                                 }
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::FetchStickerStore => {
@@ -1971,5 +1972,80 @@ mod lifecycle_tests {
         task.abort();
         let _ = task.await;
         assert!(!flag.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod image_pipeline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn corrupt_cached_preview_is_replaced_and_account_cache_is_reused() {
+        use std::io::{Cursor, Read, Write};
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-image-test-{}",
+            crate::param_cipher::random_hex(20)
+        ));
+        let mut image = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1024, 512)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = image.into_inner();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                bytes.len()
+            )
+            .unwrap();
+            stream.write_all(&bytes).unwrap();
+        });
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: "account-fixture".into(),
+            ..Default::default()
+        });
+        session.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cache = crate::media_resources::PrivateMediaCache::new(
+            &root.join("private-media"),
+            session.account_key(),
+        )
+        .unwrap();
+        let key = crate::media_resources::MediaKey {
+            account: session.account_key().into(),
+            thread: "ui-preview".into(),
+            message: "fixture-image".into(),
+            quality: crate::media_resources::MediaQuality::Thumbnail,
+        };
+        let cache_path = cache.path_for(&key).unwrap();
+        std::fs::write(&cache_path, b"broken cache").unwrap();
+        let first = fetch_gui_image(
+            &session,
+            &root,
+            "fixture-image",
+            &format!("http://{address}/fixture"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.size, [512, 256]);
+        server.join().unwrap();
+        // The fixture server is closed: success now proves a valid cache hit.
+        let second = fetch_gui_image(
+            &session,
+            &root,
+            "fixture-image",
+            &format!("http://{address}/fixture"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.size, [512, 256]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

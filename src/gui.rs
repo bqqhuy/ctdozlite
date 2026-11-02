@@ -35,6 +35,13 @@ pub use theme::{emoji_to_tex_key, load_app_icon, lucide, REACTION_LIST};
 pub use worker::WorkerCmd;
 use worker::*;
 
+/// Whether an update represents live delivery or a historical/cache read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ThreadUpdateSource {
+    Live,
+    History,
+}
+
 pub enum GuiEvent {
     HistorySyncStatus {
         running: bool,
@@ -53,7 +60,15 @@ pub enum GuiEvent {
         avatar: Option<String>,
     },
     LoginFailed(String),
-    ThreadsUpdated(Vec<Thread>),
+    ThreadsUpdated {
+        threads: Vec<Thread>,
+        source: ThreadUpdateSource,
+    },
+    LocalCallRecord {
+        thread_id: String,
+        text: String,
+        msg_id: String,
+    },
     MessageSent {
         thread_id: String,
         text: String,
@@ -69,6 +84,19 @@ pub enum GuiEvent {
     AttachmentSent {
         thread_id: String,
         msg: ChatMessage,
+    },
+    PreviewImageReady {
+        key: String,
+        image: egui::ColorImage,
+        permit: crate::media_resources::MediaJobPermit,
+    },
+    ImageUnavailable {
+        key: String,
+    },
+    VideoFrameReady {
+        generation: u64,
+        key: String,
+        image: egui::ColorImage,
     },
     StickerImageReady {
         key: String,
@@ -343,7 +371,9 @@ pub struct ZaloGuiApp {
     sticker_picker_open: bool,
     sticker_tab: StickerTab,
     sticker_textures: HashMap<String, TextureHandle>,
+    texture_budget: crate::media_resources::ResourceLru,
     loading_stickers: HashSet<String>,
+    image_retry_at: HashMap<String, std::time::Instant>,
     emoji_textures: HashMap<String, TextureHandle>,
     app_logo_texture: Option<TextureHandle>,
     sticker_store_packs: Vec<crate::chat::StickerPackInfo>,
@@ -543,7 +573,11 @@ impl ZaloGuiApp {
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
+            texture_budget: crate::media_resources::ResourceLru::new(
+                crate::media_resources::TEXTURE_BUDGET,
+            ),
             loading_stickers: HashSet::new(),
+            image_retry_at: HashMap::new(),
             emoji_textures: load_default_emoji_textures(ctx),
             app_logo_texture: load_app_logo_texture(ctx),
             sticker_store_packs: Vec::new(),
@@ -675,8 +709,50 @@ impl ZaloGuiApp {
         }
     }
 
+    fn trim_resident_history(&mut self) {
+        for (index, thread) in self.threads.iter_mut().enumerate() {
+            let keep = if index == self.selected_thread_index {
+                self.chat_render_window.1.max(500)
+            } else {
+                crate::store::MessageStore::PRELOAD_MSGS
+            };
+            let drop = thread.messages.len().saturating_sub(keep);
+            if drop > 0 {
+                thread.messages.drain(..drop);
+            }
+            if thread.messages.capacity() > keep.saturating_mul(2) {
+                thread.messages.shrink_to_fit();
+            }
+        }
+    }
+
+    fn store_texture(&mut self, ctx: &egui::Context, key: String, image: egui::ColorImage) {
+        let bytes = image.pixels.len() as u64 * 4;
+        if bytes > crate::media_resources::TEXTURE_BUDGET {
+            return;
+        }
+        for evicted in self.texture_budget.insert(key.clone(), bytes) {
+            self.sticker_textures.remove(&evicted);
+        }
+        if let Some(texture) = self.sticker_textures.get_mut(&key) {
+            texture.set(image, TextureOptions::LINEAR);
+        } else {
+            self.sticker_textures.insert(
+                key.clone(),
+                ctx.load_texture(key, image, TextureOptions::LINEAR),
+            );
+        }
+    }
+
     fn check_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.event_rx.try_recv() {
+        for index in 0..64 {
+            let Ok(event) = self.event_rx.try_recv() else {
+                break;
+            };
+            if index == 63 {
+                ctx.request_repaint();
+            }
+            let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
             match event {
                 GuiEvent::QrReady { qr_image, .. } => {
                     self.qr_texture =
@@ -694,7 +770,11 @@ impl ZaloGuiApp {
                         self.selected_thread_index = 0;
                         self.unread_counts.clear();
                         self.sticker_textures.clear();
+                        self.texture_budget = crate::media_resources::ResourceLru::new(
+                            crate::media_resources::TEXTURE_BUDGET,
+                        );
                         self.loading_stickers.clear();
+                        self.image_retry_at.clear();
                     }
                     self.is_logged_in = true;
                     self.user_name = name;
@@ -711,7 +791,10 @@ impl ZaloGuiApp {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
                 }
-                GuiEvent::ThreadsUpdated(updates) => {
+                GuiEvent::ThreadsUpdated {
+                    threads: updates,
+                    source,
+                } => {
                     if self.is_logged_in && !updates.is_empty() {
                         let prev_selected_id = self
                             .threads
@@ -734,24 +817,28 @@ impl ZaloGuiApp {
                         for nt in updates {
                             if let Some(existing) = self.threads.iter_mut().find(|t| t.id == nt.id)
                             {
-                                let old_len = existing.messages.len();
-                                crate::chat::merge_thread_into(existing, nt, true);
-                                let added = existing.messages.len().saturating_sub(old_len);
-                                if added > 0 {
-                                    let inc_cnt = existing
-                                        .messages
+                                let old_last = existing.messages.last().map_or(0, |m| m.ts);
+                                let inc_cnt = if source == ThreadUpdateSource::Live {
+                                    let known: HashSet<&str> =
+                                        existing.messages.iter().map(|m| m.id.as_str()).collect();
+                                    nt.messages
                                         .iter()
-                                        .rev()
-                                        .take(added)
-                                        .filter(|m| !m.is_outgoing)
-                                        .count();
-                                    if inc_cnt > 0 && (existing.id != active_tid || !is_focused) {
-                                        *self
-                                            .unread_counts
-                                            .entry(existing.id.clone())
-                                            .or_insert(0) += inc_cnt;
-                                        new_incoming_alert = true;
-                                    }
+                                        .filter(|m| {
+                                            !m.is_outgoing
+                                                && !m.id.is_empty()
+                                                && !known.contains(m.id.as_str())
+                                                && m.ts >= old_last
+                                        })
+                                        .count()
+                                } else {
+                                    0
+                                };
+                                crate::chat::merge_thread_into(existing, nt, true);
+                                if inc_cnt > 0 && (existing.id != active_tid || !is_focused) {
+                                    let count =
+                                        self.unread_counts.entry(existing.id.clone()).or_insert(0);
+                                    *count = count.saturating_add(inc_cnt);
+                                    new_incoming_alert = true;
                                 }
                             } else if let Some(existing) = self.threads.iter_mut().find(|t| {
                                 !live_ids.contains(&t.id)
@@ -791,7 +878,9 @@ impl ZaloGuiApp {
                         if self.selected_thread_index >= self.threads.len() {
                             self.selected_thread_index = self.threads.len().saturating_sub(1);
                         }
-                        self.persist_threads_async();
+                        // Every worker delivery is already committed before this event.
+                        // Rewriting/cloning all histories per downloaded page amplified RAM/IO.
+                        self.trim_resident_history();
                     }
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
@@ -856,7 +945,11 @@ impl ZaloGuiApp {
                     self.last_composer_text.clear();
                     self.unread_counts.clear();
                     self.sticker_textures.clear();
+                    self.texture_budget = crate::media_resources::ResourceLru::new(
+                        crate::media_resources::TEXTURE_BUDGET,
+                    );
                     self.loading_stickers.clear();
+                    self.image_retry_at.clear();
                     self.composer_sticker_cache.clear();
                     self.link_metadata_cache.clear();
                     let (tx, rx) = channel();
@@ -873,6 +966,11 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::MessageSent {
+                    thread_id,
+                    text,
+                    msg_id,
+                }
+                | GuiEvent::LocalCallRecord {
                     thread_id,
                     text,
                     msg_id,
@@ -897,6 +995,11 @@ impl ZaloGuiApp {
                         {
                             t.messages.push(ChatMessage {
                                 id: final_id,
+                                delivery: if server_ack {
+                                    crate::message_model::DeliveryState::ServerAccepted
+                                } else {
+                                    crate::message_model::DeliveryState::Unknown
+                                },
                                 sender: "Tôi".into(),
                                 text,
                                 time: now,
@@ -908,7 +1011,11 @@ impl ZaloGuiApp {
                         }
                         self.persist_threads_async();
                     }
-                    self.status_msg = format!("Đã gửi tin nhắn lúc {}", crate::ui::clock());
+                    self.status_msg = if server_ack {
+                        format!("Đã gửi tin nhắn lúc {}", crate::ui::clock())
+                    } else {
+                        "Đã cập nhật nhật ký cuộc gọi".into()
+                    };
                 }
                 GuiEvent::StickerSent {
                     thread_id,
@@ -1054,10 +1161,7 @@ impl ZaloGuiApp {
                             (!msg_id.is_empty() && m.id == msg_id)
                                 || (msg_id.is_empty() && m.ts == ts)
                         }) {
-                            m.text = "[Tin nhắn đã thu hồi]".into();
-                            m.sticker_id = None;
-                            m.link_url = None;
-                            m.link_thumb = None;
+                            m.mark_recalled();
                         }
                         if let Some(last) = t.messages.last() {
                             t.preview = last.text.clone();
@@ -1066,14 +1170,41 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
                 }
+                GuiEvent::ImageUnavailable { key } => {
+                    if self.image_retry_at.len() >= 1024 {
+                        if let Some(oldest) = self
+                            .image_retry_at
+                            .iter()
+                            .min_by_key(|(_, deadline)| **deadline)
+                            .map(|(key, _)| key.clone())
+                        {
+                            self.image_retry_at.remove(&oldest);
+                            self.loading_stickers.remove(&oldest);
+                        }
+                    }
+                    self.image_retry_at
+                        .insert(key, std::time::Instant::now() + Duration::from_secs(10));
+                }
+                GuiEvent::VideoFrameReady {
+                    generation,
+                    key,
+                    image,
+                } => {
+                    crate::video_preview::consumed(generation, &key);
+                    if self.active_call.is_some() && crate::video_preview::current(generation) {
+                        self.store_texture(ctx, key, image);
+                    }
+                }
+                GuiEvent::PreviewImageReady { key, image, permit } => {
+                    self.loading_stickers.remove(&key);
+                    self.image_retry_at.remove(&key);
+                    self.store_texture(ctx, key, image);
+                    drop(permit);
+                }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
-                    if let Some(texture) = self.sticker_textures.get_mut(&key) {
-                        texture.set(image, TextureOptions::LINEAR);
-                    } else {
-                        let texture = ctx.load_texture(&key, image, TextureOptions::LINEAR);
-                        self.sticker_textures.insert(key, texture);
-                    }
+                    self.image_retry_at.remove(&key);
+                    self.store_texture(ctx, key, image);
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;
@@ -1415,6 +1546,16 @@ impl eframe::App for ZaloGuiApp {
         }
 
         self.check_events(ctx);
+        self.trim_resident_history();
+        let now = std::time::Instant::now();
+        self.image_retry_at.retain(|key, deadline| {
+            if *deadline <= now {
+                self.loading_stickers.remove(key);
+                false
+            } else {
+                true
+            }
+        });
         ensure_cjk_font(
             ctx,
             self.threads.iter().map(|t| t.name.as_str()).chain(
@@ -1777,5 +1918,236 @@ mod settings_layout_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod history_residency_tests {
+    use super::*;
+    fn thread(id: &str, start: i64, count: usize) -> Thread {
+        Thread {
+            id: id.into(),
+            name: id.into(),
+            preview: String::new(),
+            time: String::new(),
+            avatar: None,
+            is_group: true,
+            presentation: Default::default(),
+            unread: Default::default(),
+            messages: (0..count)
+                .map(|i| ChatMessage {
+                    id: format!("m{}", start + i as i64),
+                    ts: start + i as i64,
+                    text: "Synthetic history".into(),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn history_pages_do_not_create_unread_and_resident_eviction_preserves_sqlite() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("selected", 1, 1)],
+            false,
+        );
+        app.is_logged_in = true;
+        let mut store = crate::store::MessageStore::open(":memory:").unwrap();
+        let page = thread("background", 1, 2000);
+        crate::store::persist_threads(&mut store, std::slice::from_ref(&page)).unwrap();
+        app.event_tx
+            .send(GuiEvent::ThreadsUpdated {
+                threads: vec![page],
+                source: ThreadUpdateSource::History,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        let background = app.threads.iter().find(|t| t.id == "background").unwrap();
+        assert_eq!(
+            background.messages.len(),
+            crate::store::MessageStore::PRELOAD_MSGS
+        );
+        assert!(background.messages.capacity() <= 40);
+        assert!(
+            app.unread_counts.is_empty(),
+            "Downloading old pages is not live delivery"
+        );
+        assert_eq!(
+            store.messages_for("background", 3000).unwrap().len(),
+            2000,
+            "Resident eviction must not delete stored history"
+        );
+        app.event_tx
+            .send(GuiEvent::ThreadsUpdated {
+                threads: vec![thread("background", 2001, 1)],
+                source: ThreadUpdateSource::Live,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.unread_counts.get("background"), Some(&1));
+        app.event_tx
+            .send(GuiEvent::ThreadsUpdated {
+                threads: vec![thread("background", 2001, 1)],
+                source: ThreadUpdateSource::Live,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(
+            app.unread_counts.get("background"),
+            Some(&1),
+            "Replay must not count twice"
+        );
+    }
+    #[tokio::test]
+    async fn paused_gui_keeps_image_decode_permits_until_consumed() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        let queue = crate::media_resources::MediaJobQueue::default();
+        for index in 0..crate::media_resources::ACTIVE_JOBS {
+            app.event_tx
+                .send(GuiEvent::PreviewImageReady {
+                    key: format!("image-{index}"),
+                    image: egui::ColorImage::new([4, 4], Color32::WHITE),
+                    permit: queue.acquire().await.unwrap(),
+                })
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), queue.acquire())
+                .await
+                .is_err()
+        );
+        app.check_events(&ctx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), queue.acquire())
+                .await
+                .is_ok()
+        );
+    }
+    #[test]
+    fn texture_evictions_release_actual_gui_handles() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.texture_budget = crate::media_resources::ResourceLru::new(1024);
+        for id in ["first", "second", "third"] {
+            app.store_texture(
+                &ctx,
+                id.into(),
+                egui::ColorImage::new([16, 16], Color32::WHITE),
+            );
+        }
+        assert_eq!(app.texture_budget.used(), 1024);
+        assert_eq!(app.sticker_textures.len(), 1);
+        assert!(app.sticker_textures.contains_key("third"));
+    }
+    #[test]
+    fn selected_history_window_is_bounded_and_can_be_expanded() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("selected", 1, 2000)],
+            false,
+        );
+        app.trim_resident_history();
+        assert_eq!(app.threads[0].messages.len(), 500);
+        app.threads[0] = thread("selected", 1, 2000);
+        app.chat_render_window.1 = 800;
+        app.trim_resident_history();
+        assert_eq!(app.threads[0].messages.len(), 800);
+        assert_eq!(app.threads[0].messages[0].ts, 1201);
+    }
+}
+
+#[cfg(test)]
+mod history_residency_benchmark {
+    use super::*;
+    #[test]
+    #[ignore = "manual synthetic performance measurement"]
+    fn measure_history_event_processing() {
+        let mut samples = Vec::new();
+        let mut resident = 0;
+        for _ in 0..20 {
+            let ctx = egui::Context::default();
+            let selected = Thread {
+                id: "selected".into(),
+                name: "Selected".into(),
+                preview: String::new(),
+                time: String::new(),
+                is_group: false,
+                avatar: None,
+                presentation: Default::default(),
+                unread: Default::default(),
+                messages: Vec::new(),
+            };
+            let mut app = ZaloGuiApp::from_context(
+                &ctx,
+                Session::new(false, false, false).unwrap(),
+                false,
+                vec![selected],
+                false,
+            );
+            app.is_logged_in = true;
+            let start = std::time::Instant::now();
+            for page in 0..100 {
+                let thread = Thread {
+                    id: "background".into(),
+                    name: "Background".into(),
+                    preview: String::new(),
+                    time: String::new(),
+                    is_group: true,
+                    avatar: None,
+                    presentation: Default::default(),
+                    unread: Default::default(),
+                    messages: (0..50)
+                        .map(|i| {
+                            let n = 5000 - page * 50 - i;
+                            ChatMessage {
+                                id: format!("msg-{n}"),
+                                text: "Synthetic history".into(),
+                                ts: n,
+                                ..Default::default()
+                            }
+                        })
+                        .collect(),
+                };
+                app.event_tx
+                    .send(GuiEvent::ThreadsUpdated {
+                        threads: vec![thread],
+                        source: ThreadUpdateSource::History,
+                    })
+                    .unwrap();
+                app.check_events(&ctx);
+            }
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            resident = app
+                .threads
+                .iter()
+                .find(|t| t.id == "background")
+                .unwrap()
+                .messages
+                .len();
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            serde_json::json!({"task":"100_history_pages_50_messages","iterations":samples.len(),"min_ms":samples[0],"avg_ms":samples.iter().sum::<f64>()/samples.len() as f64,"p50_ms":samples[10],"p95_ms":samples[18],"p99_ms":samples[19],"resident_messages":resident,"arch":std::env::consts::ARCH,"os":std::env::consts::OS,"profile":"debug"})
+        );
     }
 }

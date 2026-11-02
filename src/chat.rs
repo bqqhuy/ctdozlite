@@ -2,7 +2,7 @@
 //!
 //! Notes: `re-notes/02_chat_data.md`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use crate::session::{obj, Session};
@@ -72,6 +72,84 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    /// Durable wire/receipt/reaction metadata, separate from searchable message columns.
+    pub(crate) fn durable_state(&self) -> Value {
+        json!({"kind":self.kind,"wire_ref":self.wire_ref,"unread_policy":self.unread_policy,
+            "delivery":self.delivery,"client_message_id":self.client_message_id,
+            "reaction_summaries":self.reaction_summaries,"reaction_snapshot":self.reaction_snapshot,
+            "reaction_authoritative_snapshot":self.reaction_authoritative_snapshot,
+            "reaction_snapshot_provenance":self.reaction_snapshot_provenance,
+            "reaction_versions":self.reaction_versions,"history_source":self.history_source,
+            "resolved_mention_uids":self.resolved_mention_uids})
+    }
+
+    /// Merge only known metadata keys; persisted content cannot overwrite row identity.
+    /// # Errors
+    /// Returns malformed metadata errors without modifying the message.
+    pub(crate) fn restore_state(&mut self, state: &Value) -> Result<()> {
+        anyhow::ensure!(state.is_object(), "Invalid message metadata");
+        let mut candidate = serde_json::to_value(&*self)?;
+        for key in [
+            "kind",
+            "wire_ref",
+            "unread_policy",
+            "delivery",
+            "client_message_id",
+            "reaction_summaries",
+            "reaction_snapshot",
+            "reaction_authoritative_snapshot",
+            "reaction_snapshot_provenance",
+            "reaction_versions",
+            "history_source",
+            "resolved_mention_uids",
+        ] {
+            if let Some(value) = state.get(key) {
+                candidate[key] = value.clone();
+            }
+        }
+        let restored: Self = serde_json::from_value(candidate)?;
+        self.merge_reaction_metadata(&restored);
+        Ok(())
+    }
+
+    /// Remove recalled content while preserving the original routing/message identifiers.
+    pub(crate) fn mark_recalled(&mut self) {
+        self.text = "[Tin nhắn đã thu hồi]".into();
+        self.kind = crate::message_model::MessageKind::Recall;
+        self.sticker_id = None;
+        self.sticker_cate_id = None;
+        self.sticker_type = None;
+        self.link_url = None;
+        self.link_title = None;
+        self.link_desc = None;
+        self.link_thumb = None;
+        self.link_src = None;
+        self.reply_to_text = None;
+        self.reply_to_sender = None;
+        self.reply_to_id = None;
+        self.history_source = None;
+        self.resolved_mention_uids.clear();
+        self.wire_ref.fields.retain(|key, _| {
+            [
+                "msgId",
+                "globalMsgId",
+                "lastMsgId",
+                "id",
+                "cliMsgId",
+                "clientId",
+                "uidFrom",
+                "fromUid",
+                "fromId",
+                "idTo",
+                "toId",
+                "grid",
+                "groupId",
+                "ts",
+            ]
+            .contains(&key.as_str())
+        });
+    }
+
     pub fn merge_message_metadata(&mut self, incoming: &Self) -> bool {
         let previous_mentions = self.resolved_mention_uids.clone();
         self.resolved_mention_uids
@@ -83,7 +161,9 @@ impl ChatMessage {
             self.delivery,
             self.history_source.clone(),
         );
-        if incoming.kind != crate::message_model::MessageKind::Unknown {
+        if incoming.kind != crate::message_model::MessageKind::Unknown
+            && self.kind != crate::message_model::MessageKind::Recall
+        {
             self.kind = incoming.kind;
         }
         if !incoming.wire_ref.fields.is_empty() {
@@ -764,6 +844,7 @@ pub fn merge_thread_into(
             });
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
+            existing_msg.merge_reaction_metadata(&msg);
             let old_key = (
                 existing_msg.text.clone(),
                 pending_message_id(&existing_msg.id),
@@ -780,11 +861,10 @@ pub fn merge_thread_into(
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
             }
-            if msg.text.trim() == "[Tin nhắn đã thu hồi]" {
-                existing_msg.text = "[Tin nhắn đã thu hồi]".to_string();
-                existing_msg.sticker_id = None;
-                existing_msg.link_url = None;
-                existing_msg.link_thumb = None;
+            let recalled = existing_msg.text.trim() == "[Tin nhắn đã thu hồi]"
+                || msg.text.trim() == "[Tin nhắn đã thu hồi]";
+            if recalled {
+                existing_msg.mark_recalled();
             }
             if existing_msg.sticker_id.is_none() && msg.sticker_id.is_some() {
                 existing_msg.sticker_id = msg.sticker_id;
@@ -808,6 +888,9 @@ pub fn merge_thread_into(
             }
             if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
                 existing_msg.reactions = msg.reactions;
+            }
+            if recalled {
+                existing_msg.mark_recalled();
             }
             existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
             existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
@@ -993,8 +1076,8 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
         Some(r) => r,
         None => return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("get_friends failed"))),
     };
-    let data_root = resp.get("data").unwrap_or(&resp);
-    let mut threads: Vec<Thread> = match data_root {
+    let data_root = response_data(resp)?;
+    let mut threads: Vec<Thread> = match &data_root {
         Value::Array(items) => items.iter().filter_map(parse_thread).collect(),
         Value::Object(o) if o.contains_key("friends") => o["friends"]
             .as_array()
@@ -1004,7 +1087,7 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             .as_array()
             .map(|a| a.iter().filter_map(parse_thread).collect())
             .unwrap_or_default(),
-        _ => Vec::new(),
+        _ => anyhow::bail!("Phản hồi danh bạ không có danh sách hợp lệ; giữ lịch sử cục bộ"),
     };
 
     // If Cloud của tôi (send2me) is available, place it at the top
@@ -1089,6 +1172,28 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+// HTTP 200 (including an empty long-poll-style response) is not a send receipt.
+// Keep the server error marker used by session expiry classification, without
+// copying arbitrary server text or decrypted payloads into diagnostics.
+fn confirmed_send(mut response: Value) -> Result<Value> {
+    let code = response
+        .get("error_code")
+        .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
+        .context("Máy chủ chưa xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại")?;
+    anyhow::ensure!(code == 0, "server error {code}: yêu cầu gửi tin bị từ chối");
+    if let Some(text) = response.get("data").and_then(Value::as_str) {
+        response["data"] = serde_json::from_str(text)
+            .context("Không đọc được xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại")?;
+    }
+    anyhow::ensure!(
+        response
+            .get("data")
+            .is_some_and(|v| v.is_object() || v.is_array()),
+        "Máy chủ chưa xác nhận gửi tin; kiểm tra hội thoại trước khi gửi lại"
+    );
+    Ok(response)
+}
+
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
     if s.login.is_none() {
@@ -1119,16 +1224,7 @@ pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value>
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
-        if code != 0 {
-            let msg = resp
-                .get("error_message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
-        }
-    }
-    Ok(resp)
+    confirmed_send(resp)
 }
 
 /// Send a group text message: `POST {domains.group}/api/group/sendmsg?{common}`
@@ -1160,16 +1256,7 @@ pub async fn send_group_message(s: &Session, grid: &str, text: &str) -> Result<V
     let form = format!("params={params}");
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    if let Some(code) = resp.get("error_code").and_then(Value::as_i64) {
-        if code != 0 {
-            let msg = resp
-                .get("error_message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            anyhow::bail!("server error {code}: {msg}");
-        }
-    }
-    Ok(resp)
+    confirmed_send(resp)
 }
 
 /// Format a byte count into a human-readable size string (e.g. `"1.4 MB"`, `"320 KB"`).
@@ -4156,6 +4243,15 @@ fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         };
 
     Some(ChatMessage {
+        kind: if is_undo_type {
+            crate::message_model::MessageKind::Recall
+        } else {
+            crate::message_model::MessageKind::from_wire_name(&msg_type)
+        },
+        wire_ref: crate::message_model::WireMessageRef::from_raw(it),
+        unread_policy: crate::message_model::UnreadPolicy::from_raw(it),
+        client_message_id: pick_str(it, &["cliMsgId", "clientId"]).unwrap_or_default(),
+        reaction_summaries: crate::reactions::parse_reactions(it),
         id: msg_id,
         sender: display_sender,
         text: content,
@@ -5644,5 +5740,45 @@ mod message_state_defaults_tests {
             serde_json::from_value(serde_json::to_value(&thread).unwrap()).unwrap();
         assert_eq!(restored.presentation, thread.presentation);
         assert_eq!(restored.unread, thread.unread);
+    }
+}
+
+#[cfg(test)]
+mod send_ack_tests {
+    use super::*;
+    #[test]
+    fn invalid_and_unconfirmed_sends_do_not_appear_successful() {
+        for response in [
+            Value::Null,
+            json!({}),
+            json!({"error_code":0,"data":null}),
+            json!({"error_code":0,"data":"not-json-or-undeciphered"}),
+            json!({"error_code":114,"data":{}}),
+        ] {
+            assert!(confirmed_send(response).is_err());
+        }
+        assert!(confirmed_send(json!({"error_code":0,"data":{"msgId":"msg-1"}})).is_ok());
+        let response =
+            confirmed_send(json!({"error_code":"0","data":"{\"msgId\":\"msg-1\"}"})).unwrap();
+        assert_eq!(response["data"]["msgId"], "msg-1");
+        assert!(crate::session::is_expired_error(
+            &confirmed_send(json!({"error_code":"600"}))
+                .unwrap_err()
+                .to_string()
+        ));
+    }
+    #[test]
+    fn persisted_metadata_cannot_change_message_routing_identity() {
+        let mut message = ChatMessage {
+            id: "msg-1".into(),
+            sender: "user-1".into(),
+            text: "hello".into(),
+            ..Default::default()
+        };
+        message.restore_state(&json!({"id":"other-id","sender":"other-user","text":"different","delivery":"read"})).unwrap();
+        assert_eq!(message.id, "msg-1");
+        assert_eq!(message.sender, "user-1");
+        assert_eq!(message.text, "hello");
+        assert_eq!(message.delivery, crate::message_model::DeliveryState::Read);
     }
 }

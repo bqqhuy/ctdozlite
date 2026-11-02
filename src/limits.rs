@@ -38,6 +38,55 @@ pub fn decode_image(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
     reader.decode()
 }
 
+/// Bound file reads before allocation, including local clipboard/cache previews.
+/// # Errors
+/// Returns an I/O/size error and never reads more than limit+1 bytes.
+pub fn read_file(path: &std::path::Path, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.len() <= limit as u64,
+        "Image file exceeds size limit"
+    );
+    let mut bytes = Vec::new();
+    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() <= limit, "Image file exceeds size limit");
+    Ok(bytes)
+}
+
+/// Build a bounded GUI preview. Saved/downloaded originals are not modified.
+pub fn preview_image(bytes: &[u8], key: &str) -> anyhow::Result<image::RgbaImage> {
+    let image = decode_image(bytes)?;
+    let maximum = if key.starts_with("full_") {
+        2048
+    } else if key.starts_with("ava_") {
+        256
+    } else {
+        512
+    };
+    let mut rgba = image.thumbnail(maximum, maximum).to_rgba8();
+    if key.starts_with("ava_") {
+        let side = rgba.width().min(rgba.height());
+        anyhow::ensure!(side > 0, "Empty avatar");
+        let square = image::imageops::crop_imm(
+            &rgba,
+            (rgba.width() - side) / 2,
+            (rgba.height() - side) / 2,
+            side,
+            side,
+        )
+        .to_image();
+        rgba = image::imageops::resize(&square, 128, 128, image::imageops::FilterType::Triangle);
+        let center = 63.5f32;
+        let radius = 64f32;
+        for (x, y, pixel) in rgba.enumerate_pixels_mut() {
+            let distance = ((x as f32 - center).powi(2) + (y as f32 - center).powi(2)).sqrt();
+            let alpha = (radius + 0.8 - distance).clamp(0.0, 1.0);
+            pixel[3] = (pixel[3] as f32 * alpha) as u8;
+        }
+    }
+    Ok(rgba)
+}
+
 pub fn read_inflated(reader: impl Read) -> anyhow::Result<Vec<u8>> {
     let mut output = Vec::new();
     reader.take(INFLATED_BYTES + 1).read_to_end(&mut output)?;
