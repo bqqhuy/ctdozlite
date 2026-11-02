@@ -1358,7 +1358,10 @@ impl ZaloGuiApp {
         let mut retry_clicked = false;
 
         let has_err = call.error_reason.is_some();
-        let is_video_stage = call.is_video && !has_err;
+        let is_video_stage = (call.is_video
+            || self.sticker_textures.contains_key("call_remote_video")
+            || self.sticker_textures.contains_key("call_remote_video_1"))
+            && !has_err;
         let default_w = if is_video_stage { 860.0 } else { 440.0 };
         let default_h = if is_video_stage { 660.0 } else { 470.0 };
         let win_title = if call.is_video {
@@ -1632,6 +1635,32 @@ impl ZaloGuiApp {
                                 Vec2::new(pip_w, pip_h),
                             );
                             painter.rect_filled(pip_rect, Rounding::same(12.0), pal.bg_elevated);
+                            if call.is_group {
+                                if let Some(texture) =
+                                    self.sticker_textures.get("call_remote_video_1")
+                                {
+                                    let width = (stage_rect.width() * 0.32).clamp(80.0, 220.0);
+                                    let height = width * texture.size_vec2().y
+                                        / texture.size_vec2().x.max(1.0);
+                                    let rect = Rect::from_min_size(
+                                        stage_rect.left_top() + Vec2::new(14.0, 14.0),
+                                        Vec2::new(width, height.min(stage_rect.height() * 0.4)),
+                                    );
+                                    painter.image(
+                                        texture.id(),
+                                        rect,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                    painter.text(
+                                        rect.left_bottom() + Vec2::new(0.0, 3.0),
+                                        egui::Align2::LEFT_TOP,
+                                        "Thành viên nhóm",
+                                        FontId::proportional(11.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
                             if call.cam_enabled {
                                 if let Some(ltex) = self.sticker_textures.get("call_local_video") {
                                     let inner_pip = pip_rect.shrink(2.0);
@@ -2088,7 +2117,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         call.cam_enabled = !call.cam_enabled;
-                                        call.is_video = call.cam_enabled;
+                                        call.is_video |= call.cam_enabled;
                                         if !call.cam_enabled {
                                             self.sticker_textures.remove("call_local_video");
                                         }
@@ -2128,6 +2157,7 @@ impl ZaloGuiApp {
         } else if hangup_clicked {
             self.active_call = None;
             self.sticker_textures.remove("call_remote_video");
+            self.sticker_textures.remove("call_remote_video_1");
             self.sticker_textures.remove("call_local_video");
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::EndCall);

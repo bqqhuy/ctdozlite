@@ -355,6 +355,7 @@ pub fn readiness() -> Result<()> {
     }
     Ok(())
 }
+#[allow(clippy::too_many_arguments)]
 pub fn decode(
     stop: Arc<AtomicBool>,
     rx: Receiver<Vec<u8>>,
@@ -362,6 +363,7 @@ pub fn decode(
     ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
     generation: u64,
+    texture_key: &'static str,
 ) -> Result<()> {
     let _runtime = Runtime::new()?;
     unsafe {
@@ -385,16 +387,7 @@ pub fn decode(
                     let stride = mt.GetUINT32(&MF_MT_DEFAULT_STRIDE).unwrap_or(w as u32) as usize;
                     if crate::tray::previews_visible() {
                         let (raw, stride) = nv12_sample(&output, w, h, stride)?;
-                        show_frame(
-                            &raw,
-                            w,
-                            h,
-                            stride,
-                            "call_remote_video",
-                            &tx,
-                            &ctx,
-                            generation,
-                        )?;
+                        show_frame(&raw, w, h, stride, texture_key, &tx, &ctx, generation)?;
                     }
                     synced.store(true, Ordering::Relaxed);
                 }

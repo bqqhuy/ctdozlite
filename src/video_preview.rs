@@ -3,18 +3,18 @@ use std::sync::Mutex;
 
 struct Gate {
     generation: u64,
-    pending: [bool; 2],
+    pending: [bool; 3],
 }
 impl Gate {
     const fn new() -> Self {
         Self {
             generation: 0,
-            pending: [false; 2],
+            pending: [false; 3],
         }
     }
     fn start(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
-        self.pending = [false; 2];
+        self.pending = [false; 3];
         self.generation
     }
     #[cfg(any(windows, test))]
@@ -38,6 +38,7 @@ fn index(key: &str) -> Option<usize> {
     match key {
         "call_local_video" => Some(0),
         "call_remote_video" => Some(1),
+        "call_remote_video_1" => Some(2),
         _ => None,
     }
 }
@@ -78,6 +79,8 @@ mod tests {
             assert!(!gate.claim(old, 0));
         }
         assert!(gate.claim(old, 1));
+        assert!(gate.claim(old, 2));
+        assert!(!gate.claim(old, 2));
         let new = gate.start();
         assert!(gate.claim(new, 0));
         gate.consumed(old, 0);

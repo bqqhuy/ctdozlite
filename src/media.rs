@@ -39,6 +39,69 @@ fn decode_audio<'a>(
     Ok(&pcm[..count])
 }
 
+// SFU peers have independent Opus prediction state and clocks. Mixing packet
+// arrivals into one decoder/queue serializes speakers and corrupts their state.
+struct GroupAudioSource {
+    decoder: Decoder,
+    samples: VecDeque<f32>,
+    last_seen: std::time::Instant,
+}
+#[derive(Default)]
+struct GroupAudioMixer {
+    sources: std::collections::HashMap<u32, GroupAudioSource>,
+}
+impl GroupAudioMixer {
+    fn push(&mut self, ssrc: u32, packet: &[u8]) {
+        self.sources
+            .retain(|_, source| source.last_seen.elapsed() < Duration::from_secs(5));
+        if !self.sources.contains_key(&ssrc) {
+            if self.sources.len() >= 32 {
+                return;
+            }
+            let Ok(decoder) = Decoder::new(SAMPLE_RATE, OpusChannels::Mono) else {
+                return;
+            };
+            self.sources.insert(
+                ssrc,
+                GroupAudioSource {
+                    decoder,
+                    samples: VecDeque::new(),
+                    last_seen: std::time::Instant::now(),
+                },
+            );
+        }
+        let source = self.sources.get_mut(&ssrc).expect("source was inserted");
+        let mut pcm = [0.0; MAX_OPUS_SAMPLES];
+        if let Ok(samples) = decode_audio(&mut source.decoder, packet, &mut pcm) {
+            source.last_seen = std::time::Instant::now();
+            source.samples.extend(samples);
+            let excess = source.samples.len().saturating_sub(PLAYBACK_BUFFER_SAMPLES);
+            source.samples.drain(..excess);
+        }
+    }
+    fn take_frame(&mut self) -> Option<[f32; FRAME_SAMPLES]> {
+        let active = self
+            .sources
+            .values()
+            .filter(|source| !source.samples.is_empty())
+            .count();
+        if active == 0 {
+            return None;
+        }
+        let mut frame = [0.0; FRAME_SAMPLES];
+        for source in self.sources.values_mut() {
+            for sample in &mut frame {
+                *sample += source.samples.pop_front().unwrap_or(0.0);
+            }
+        }
+        let gain = 1.0 / (active as f32).sqrt();
+        for sample in &mut frame {
+            *sample = (*sample * gain).clamp(-1.0, 1.0);
+        }
+        Some(frame)
+    }
+}
+
 // Preserve phase across driver callbacks, including 8 kHz Bluetooth microphones
 // and callback sizes that are not divisible by the 48 kHz -> 16 kHz ratio.
 struct CaptureResampler {
@@ -190,6 +253,7 @@ impl MediaHandle {
             None,
             local_port,
             false,
+            false,
             None,
             None,
         )
@@ -207,6 +271,7 @@ impl MediaHandle {
         udp_rtcp_sock: Option<Arc<tokio::net::UdpSocket>>,
         local_port: u16,
         is_video: bool,
+        is_group: bool,
         gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
         egui_ctx: Option<eframe::egui::Context>,
     ) -> Result<Self> {
@@ -241,6 +306,7 @@ impl MediaHandle {
                 is_caller,
                 relay_token,
                 is_video,
+                is_group,
                 gui_tx,
                 egui_ctx,
                 generation,
@@ -404,6 +470,76 @@ fn build_rtp_packet(pt: u8, marker: bool, seq: u16, ts: u32, ssrc: u32, payload:
     p.extend_from_slice(&seq.to_be_bytes());
     p.extend_from_slice(&ts.to_be_bytes());
     p.extend_from_slice(&ssrc.to_be_bytes());
+    p.extend_from_slice(payload);
+    p
+}
+
+/// Build an RTP v2 audio packet with RFC 5285 one-byte header extensions (`0xBEDE`, 3 words = 12 bytes)
+/// matching `ZaloCall.exe` group audio packets (`0x20` audio level + `0xD6` 64-bit NTP timestamp).
+fn build_group_audio_rtp_packet(
+    pt: u8,
+    seq: u16,
+    ts: u32,
+    ssrc: u32,
+    ntp: (u32, u32),
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(28 + payload.len());
+    p.push(0x90); // V=2, P=0, X=1, CC=0
+    p.push(pt);
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&ts.to_be_bytes());
+    p.extend_from_slice(&ssrc.to_be_bytes());
+    p.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x03]);
+    p.extend_from_slice(&[0x20, 0x4A]); // ID=2 (audio level), len=1
+    p.push(0xD6); // ID=13 (Zalo NTP timestamp), len=7 (24-bitntp_sec + 32-bitntp_frac)
+    let (ntp_sec, ntp_frac) = ntp;
+    let sec_be = ntp_sec.to_be_bytes();
+    p.extend_from_slice(&[sec_be[1], sec_be[2], sec_be[3]]);
+    p.extend_from_slice(&ntp_frac.to_be_bytes());
+    p.extend_from_slice(&[0x00, 0x00]); // 2 padding bytes -> 12 bytes (3 words)
+    p.extend_from_slice(payload);
+    p
+}
+
+/// Build an RTP v2 video packet with RFC 5285 one-byte header extensions (`0xBEDE`, 5 words = 20 bytes)
+/// required by Zalo's Group Call SFU (`RtpHeaderExtensionMap` at `0x00A77943..0x00A77ED1` in `ZaloCall.exe`):
+/// - Extension ID 3 (`abs-send-time`, len=3): `0x32, t2, t1, t0`
+/// - Extension ID 5 (`transport-wide-cc-02`, len=2): `0x51, twcc_hi, twcc_lo`
+/// - Extension ID 12 (`Zalo simulcast layer info`, len=3): `0xC2, layer_byte, pic_hi, pic_lo`
+/// - Extension ID 13 (`Zalo 56-bit NTP timestamp`, len=7): `0xD6, sec24_be[0..3], frac32_be[0..4], 0x00`
+#[allow(clippy::too_many_arguments)]
+fn build_group_video_rtp_packet(
+    pt: u8,
+    marker: bool,
+    seq: u16,
+    ts: u32,
+    ssrc: u32,
+    pic_id: u16,
+    layer_byte: u8,
+    ntp: (u32, u32),
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut p = Vec::with_capacity(36 + payload.len());
+    p.push(0x90); // V=2, P=0, X=1 (header extension present), CC=0
+    p.push(if marker { 0x80 | pt } else { pt });
+    p.extend_from_slice(&seq.to_be_bytes());
+    p.extend_from_slice(&ts.to_be_bytes());
+    p.extend_from_slice(&ssrc.to_be_bytes());
+    // RFC 5285 1-byte header extension profile 0xBEDE, length = 5 (20 bytes)
+    p.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x05]);
+    let abs_send_24 = (((ntp.0 & 0x3F) << 18) | (ntp.1 >> 14)).to_be_bytes();
+    p.extend_from_slice(&[0x32, abs_send_24[1], abs_send_24[2], abs_send_24[3]]);
+    let twcc = seq.wrapping_add(1).to_be_bytes();
+    p.extend_from_slice(&[0x51, twcc[0], twcc[1]]);
+    let pic = pic_id.to_be_bytes();
+    p.extend_from_slice(&[0xC2, layer_byte, pic[0], pic[1]]);
+    p.push(0xD6);
+    let (ntp_sec, ntp_frac) = ntp;
+    let sec_be = ntp_sec.to_be_bytes();
+    p.extend_from_slice(&[sec_be[1], sec_be[2], sec_be[3]]);
+    p.extend_from_slice(&ntp_frac.to_be_bytes());
+    p.push(0x00); // 1 padding byte -> 20 bytes (5 words)
     p.extend_from_slice(payload);
     p
 }
@@ -945,6 +1081,7 @@ fn run_media_loop(
     is_caller: bool,
     relay_token: u32,
     is_video: bool,
+    is_group: bool,
     gui_tx: Option<std::sync::mpsc::Sender<crate::gui::GuiEvent>>,
     egui_ctx: Option<eframe::egui::Context>,
     generation: u64,
@@ -967,7 +1104,15 @@ fn run_media_loop(
         let synced_v = video_synced.clone();
         decoder_active = true;
         thread::spawn(move || {
-            run_native_h264_decoder(stop_v, h264_rx, tx, ctx, synced_v, generation);
+            run_native_h264_decoder(
+                stop_v,
+                h264_rx,
+                tx,
+                ctx,
+                synced_v,
+                generation,
+                "call_remote_video",
+            );
         });
     }
     spawn_camera_capture_thread(
@@ -1200,7 +1345,21 @@ fn run_media_loop(
     );
     let vid_ssrc = ssrc.wrapping_add(1);
     let mut nego_seq: u32 = 1;
+    let gui_tx_extra = gui_tx.clone();
+    let egui_ctx_extra = egui_ctx.clone();
+    let mut primary_video_ssrc: u32 = 0;
+    let mut secondary_video_ssrc: u32 = 0;
+    let secondary_video_synced = Arc::new(AtomicBool::new(false));
+    let mut fu_a_buf_secondary: Vec<u8> = Vec::with_capacity(65536);
+    let mut h264_tx_secondary: Option<std::sync::mpsc::SyncSender<Vec<u8>>> = None;
+    let mut room_partners: Vec<u32> = Vec::new();
+    let mut tx_layer_byte: u8 = 0x00;
+    if partner_uid_u32 != 0 && partner_uid_u32 != from_uid_u32 {
+        room_partners.push(partner_uid_u32);
+    }
 
+    let mut group_audio = GroupAudioMixer::default();
+    let mut last_group_playout = std::time::Instant::now();
     let mut decoded_pcm = [0.0_f32; MAX_OPUS_SAMPLES];
     while !stop.load(Ordering::Relaxed) {
         // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
@@ -1223,16 +1382,21 @@ fn run_media_loop(
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
                 Ok(n) => {
-                    // Build inner RTP header (12 bytes, PT=112 matching Zalo's opus/16000/1 codec)
-                    let mut rtp_pkt = Vec::with_capacity(12 + n);
-                    rtp_pkt.push(0x80); // V=2, P=0, X=0, CC=0
-                    rtp_pkt.push(112); // payload type 112 (opus/16000/1)
-                    rtp_pkt.extend_from_slice(&seq.to_be_bytes());
-                    rtp_pkt.extend_from_slice(&ts.to_be_bytes());
-                    rtp_pkt.extend_from_slice(&ssrc.to_be_bytes());
-                    rtp_pkt.extend_from_slice(&out[..n]);
+                    let is_group_sfu = is_group;
+                    let rtp_pkt = if is_group_sfu {
+                        build_group_audio_rtp_packet(112, seq, ts, ssrc, ntp_now(), &out[..n])
+                    } else {
+                        let mut p = Vec::with_capacity(12 + n);
+                        p.push(0x80); // V=2, P=0, X=0, CC=0
+                        p.push(112); // payload type 112 (opus/16000/1)
+                        p.extend_from_slice(&seq.to_be_bytes());
+                        p.extend_from_slice(&ts.to_be_bytes());
+                        p.extend_from_slice(&ssrc.to_be_bytes());
+                        p.extend_from_slice(&out[..n]);
+                        p
+                    };
 
-                    if let (Some(ref tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
+                    if let (Some(tsock), Some(target)) = (&udp_rtp_sock, rtp_sock_addr) {
                         if relay_token != 0 {
                             let type_byte: u8 = 0x03; // `ZRTPPacket::initZRTPPacketAudio` (`isRtcp=false`)
                             let mut wire = Vec::with_capacity(5 + rtp_pkt.len());
@@ -1245,7 +1409,7 @@ fn run_media_loop(
                             send_dgram(tsock, &rtp_pkt, target, &mut txs);
                             wl.rtp(">", rtp_pkt[0], rtp_pkt.len(), &rtp_addr, &rtp_pkt);
                         }
-                    } else if let Some(ref fsock) = fallback_sock {
+                    } else if let Some(fsock) = &fallback_sock {
                         let _ = fsock.send_to(&rtp_pkt, &rtp_addr);
                     }
                     seq = seq.wrapping_add(1);
@@ -1272,10 +1436,27 @@ fn run_media_loop(
                 Vec::new()
             };
 
+            let is_group_sfu = is_group;
             let payloads = packetize_zalo_au(&au_bytes, RTP_MAX_PAYLOAD);
             let last = payloads.len().saturating_sub(1);
+            let pic_id = (vid_frame_no as u16).wrapping_add(1);
+            let cur_ntp = ntp_now();
             for (i, (vpt, payload)) in payloads.iter().enumerate() {
-                let vpkt = build_rtp_packet(*vpt, i == last, vid_seq, vid_ts, vid_ssrc, payload);
+                let vpkt = if is_group_sfu {
+                    build_group_video_rtp_packet(
+                        *vpt,
+                        i == last,
+                        vid_seq,
+                        vid_ts,
+                        vid_ssrc,
+                        pic_id,
+                        tx_layer_byte,
+                        cur_ntp,
+                        payload,
+                    )
+                } else {
+                    build_rtp_packet(*vpt, i == last, vid_seq, vid_ts, vid_ssrc, payload)
+                };
                 vid_seq = vid_seq.wrapping_add(1);
                 vid_pkts_tx = vid_pkts_tx.wrapping_add(1);
                 vid_octets_tx = vid_octets_tx.wrapping_add(payload.len() as u32);
@@ -1342,15 +1523,40 @@ fn run_media_loop(
                         );
                         nego_seq = nego_seq.wrapping_add(1);
                         send_dgram(tsock, &nego_pkt, rtarget, &mut txs);
+                        if is_group {
+                            let lay_pkt = crate::call::build_zrtp_group_video_layers_packet(
+                                from_uid_u32,
+                                relay_token,
+                                nego_seq,
+                            );
+                            nego_seq = nego_seq.wrapping_add(1);
+                            send_dgram(tsock, &lay_pkt, rtarget, &mut txs);
+                            if !room_partners.is_empty() {
+                                let sub_pkt = crate::call::build_zrtp_group_subscribe_video_packet(
+                                    from_uid_u32,
+                                    relay_token,
+                                    nego_seq,
+                                    &room_partners,
+                                );
+                                nego_seq = nego_seq.wrapping_add(1);
+                                send_dgram(tsock, &sub_pkt, rtarget, &mut txs);
+                            }
+                        }
                     }
                 }
+                let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
                 for (rtcp_type, rtcp_pkt) in pkts {
                     if relay_token != 0 {
                         let mut wire = Vec::with_capacity(5 + rtcp_pkt.len());
                         wire.push(rtcp_type);
                         wire.extend_from_slice(&relay_token.to_le_bytes());
                         wire.extend_from_slice(&rtcp_pkt);
-                        send_dgram(rtcp_s, &wire, target, &mut txs);
+                        send_dgram(rtcp_sender, &wire, target, &mut txs);
+                        if let Some(rtarget) = rtp_sock_addr {
+                            if rtarget != target {
+                                send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
+                            }
+                        }
                         wl.rtcp(
                             ">",
                             crate::voip_log::Via::RtcpSock,
@@ -1360,7 +1566,7 @@ fn run_media_loop(
                             &rtcp_pkt,
                         );
                     } else {
-                        send_dgram(rtcp_s, &rtcp_pkt, target, &mut txs);
+                        send_dgram(rtcp_sender, &rtcp_pkt, target, &mut txs);
                         wl.rtcp(
                             ">",
                             crate::voip_log::Via::RtcpSock,
@@ -1400,6 +1606,118 @@ fn run_media_loop(
         }
         for (via, peer_s, raw_pkt) in incoming_dgrams {
             let n = raw_pkt.len();
+            // Parse `CMD_ZAVI_ROOM_UPDATED` (`0x02 0x7E ... cmd=0x0032` at `0x0092B922` in `ZaloCall.exe`)
+            if is_group
+                && n >= 29
+                && unwrap_zalo_relay_rtp(&raw_pkt).is_none()
+                && matches!(raw_pkt[0], 0x01 | 0x02)
+                && matches!(raw_pkt[1], 0x00 | 0x7E)
+                && u16::from_le_bytes([raw_pkt[18], raw_pkt[19]]) == 0x0032
+            {
+                let res_code =
+                    i32::from_le_bytes([raw_pkt[21], raw_pkt[22], raw_pkt[23], raw_pkt[24]]);
+                if res_code == 0 {
+                    let mut idx = 25usize;
+                    let mut added = false;
+                    while idx + 4 <= n {
+                        let p_uid = u32::from_le_bytes([
+                            raw_pkt[idx],
+                            raw_pkt[idx + 1],
+                            raw_pkt[idx + 2],
+                            raw_pkt[idx + 3],
+                        ]);
+                        idx += 4;
+                        if p_uid != 0
+                            && p_uid != from_uid_u32
+                            && room_partners.len() < 32
+                            && !room_partners.contains(&p_uid)
+                        {
+                            room_partners.push(p_uid);
+                            added = true;
+                        }
+                    }
+                    crate::call::trace_line(
+                        "ZRTP",
+                        format!("CMD_ZAVI_ROOM_UPDATED partners={room_partners:?}"),
+                    );
+                    if (added || !room_partners.is_empty()) && relay_token != 0 {
+                        if let (Some(tsock), Some(rtarget)) = (&udp_rtp_sock, rtp_sock_addr) {
+                            let sub_pkt = crate::call::build_zrtp_group_subscribe_video_packet(
+                                from_uid_u32,
+                                relay_token,
+                                nego_seq,
+                                &room_partners,
+                            );
+                            nego_seq = nego_seq.wrapping_add(1);
+                            send_dgram(tsock, &sub_pkt, rtarget, &mut txs);
+                        }
+                        want_keyframe.store(true, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+            // Parse group SFU `cmd = 0x0020` control packets (`0x00924325` in `ZaloCall.exe`):
+            // - `sub_cmd = 0x0C` (spatial layers announcement from a partner or our own echo)
+            // - `sub_cmd = 0x0D` (video subscription request from a partner or our own echo)
+            if is_group
+                && n >= 21
+                && matches!(raw_pkt[0], 0x01 | 0x02)
+                && raw_pkt[1] == 0x01
+                && u16::from_le_bytes([raw_pkt[18], raw_pkt[19]]) == 0x0020
+            {
+                let sub_cmd_20 = raw_pkt[20];
+                let sender_uid =
+                    u32::from_le_bytes([raw_pkt[10], raw_pkt[11], raw_pkt[12], raw_pkt[13]]);
+                if sender_uid != 0
+                    && sender_uid != from_uid_u32
+                    && room_partners.len() < 32
+                    && !room_partners.contains(&sender_uid)
+                {
+                    room_partners.push(sender_uid);
+                }
+                if sub_cmd_20 == 0x0C
+                    && sender_uid != 0
+                    && sender_uid != from_uid_u32
+                    && relay_token != 0
+                {
+                    // Partner just announced video spatial layers: immediately subscribe to their video!
+                    if let (Some(tsock), Some(rtarget)) = (&udp_rtp_sock, rtp_sock_addr) {
+                        let sub_pkt = crate::call::build_zrtp_group_subscribe_video_packet(
+                            from_uid_u32,
+                            relay_token,
+                            nego_seq,
+                            &room_partners,
+                        );
+                        nego_seq = nego_seq.wrapping_add(1);
+                        send_dgram(tsock, &sub_pkt, rtarget, &mut txs);
+                    }
+                } else if sub_cmd_20 == 0x0D && sender_uid != from_uid_u32 {
+                    // Parse requested quality_id for our UID (`0x009246DD` in `ZaloCall.exe`):
+                    // payload @ 21: `[u16_len][count: u8]([uid: u32 LE][quality_id: u8])*`
+                    if n >= 24 {
+                        let cnt = raw_pkt[23] as usize;
+                        let mut off = 24usize;
+                        for _ in 0..cnt {
+                            if off + 5 <= n {
+                                let req_uid = u32::from_le_bytes([
+                                    raw_pkt[off],
+                                    raw_pkt[off + 1],
+                                    raw_pkt[off + 2],
+                                    raw_pkt[off + 3],
+                                ]);
+                                let req_q = raw_pkt[off + 4];
+                                off += 5;
+                                if (req_uid == from_uid_u32 || cnt == 1) && req_q != 0xFF {
+                                    tx_layer_byte = 0; // Only the encoded base layer is advertised.
+                                }
+                            }
+                        }
+                    }
+                    // A partner subscribed to our video stream: force an immediate IDR keyframe!
+                    want_keyframe.store(true, Ordering::Relaxed);
+                }
+                continue;
+            }
             if unwrap_zalo_relay_rtp(&raw_pkt).is_none() {
                 wl.unknown(via, n, &peer_s, &raw_pkt);
             }
@@ -1442,15 +1760,62 @@ fn run_media_loop(
                 }
                 if pt == 112 {
                     if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
-                        if let Ok(samples) = decode_audio(&mut decoder, payload, &mut decoded_pcm) {
+                        if is_group {
+                            if let Some(header) = crate::voip_log::parse_rtp(inner_rtp) {
+                                group_audio.push(header.ssrc, payload);
+                            }
+                        } else if let Ok(samples) =
+                            decode_audio(&mut decoder, payload, &mut decoded_pcm)
+                        {
                             if let Ok(mut buffer) = output_buf.lock() {
                                 queue_playback(&mut buffer, samples);
                             }
                         }
                     }
                 } else if pt == 96 || pt == 97 || pt == VIDEO_PT_FRAG || raw_pkt[0] == 0x0E {
-                    if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
-                        depacketize_h264(payload, &mut fu_a_buf, &h264_tx);
+                    let pkt_ssrc = crate::voip_log::parse_rtp(inner_rtp)
+                        .map(|h| h.ssrc)
+                        .unwrap_or(0);
+                    if primary_video_ssrc == 0 || pkt_ssrc == 0 || pkt_ssrc == primary_video_ssrc {
+                        if pkt_ssrc != 0 {
+                            primary_video_ssrc = pkt_ssrc;
+                        }
+                        if let Some(payload) = extract_rtp_opus_payload(inner_rtp) {
+                            depacketize_h264(payload, &mut fu_a_buf, &h264_tx);
+                        }
+                    } else if is_group {
+                        if secondary_video_ssrc == 0 {
+                            secondary_video_ssrc = pkt_ssrc;
+                        }
+                        if pkt_ssrc == secondary_video_ssrc {
+                            if h264_tx_secondary.is_none() {
+                                if let (Some(tx), Some(ctx)) =
+                                    (gui_tx_extra.clone(), egui_ctx_extra.clone())
+                                {
+                                    let (tx2, rx2) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                                    let stop_v2 = stop.clone();
+                                    let synced_v2 = secondary_video_synced.clone();
+                                    thread::spawn(move || {
+                                        run_native_h264_decoder(
+                                            stop_v2,
+                                            rx2,
+                                            tx,
+                                            ctx,
+                                            synced_v2,
+                                            generation,
+                                            "call_remote_video_1",
+                                        );
+                                    });
+                                    h264_tx_secondary = Some(tx2);
+                                }
+                            }
+                            if let (Some(payload), Some(tx2)) = (
+                                extract_rtp_opus_payload(inner_rtp),
+                                h264_tx_secondary.as_ref(),
+                            ) {
+                                depacketize_h264(payload, &mut fu_a_buf_secondary, tx2);
+                            }
+                        }
                     }
                 }
             }
@@ -1459,47 +1824,73 @@ fn run_media_loop(
         // --- PLI towards the peer: its video is undecodable until a keyframe (SPS/IDR) reaches the decoder ---
         // Live log (call at 18:28 UTC): the peer sent only P frames, no SPS/IDR ever arrived, ffmpeg printed
         // "non-existing PPS 0 referenced" for all of them and decoded 0 frames; we never sent a PLI back.
-        if is_video
+        if (is_video || rx_video.started)
             && decoder_active
-            && rx_video.started
+            && (rx_video.started || rx_audio.started)
             && peer_ssrc != 0
-            && (!video_synced.load(Ordering::Relaxed) || pli_gap)
+            && (!video_synced.load(Ordering::Relaxed)
+                || (secondary_video_ssrc != 0 && !secondary_video_synced.load(Ordering::Relaxed))
+                || pli_gap)
             && last_pli.elapsed() >= Duration::from_millis(500)
         {
             last_pli = std::time::Instant::now();
             pli_gap = false;
             if let (Some(ref rtcp_s), Some(target)) = (&udp_rtcp_sock, rtcp_sock_addr) {
-                // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
-                let mut pkt = vec![0x80u8, 201, 0, 1];
-                pkt.extend_from_slice(&ssrc.to_be_bytes());
-                pkt.extend_from_slice(&build_pli(ssrc, peer_ssrc));
-                if relay_token != 0 {
-                    let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
-                    let mut wire = Vec::with_capacity(5 + pkt.len());
-                    wire.push(rtcp_type);
-                    wire.extend_from_slice(&relay_token.to_le_bytes());
-                    wire.extend_from_slice(&pkt);
-                    send_dgram(rtcp_s, &wire, target, &mut txs);
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        rtcp_type,
-                        wire.len(),
-                        &rtcp_addr,
-                        &pkt,
-                    );
+                let rtcp_sender = udp_rtp_sock.as_ref().unwrap_or(rtcp_s);
+                let primary_ssrc = if primary_video_ssrc != 0 {
+                    primary_video_ssrc
                 } else {
-                    send_dgram(rtcp_s, &pkt, target, &mut txs);
-                    wl.rtcp(
-                        ">",
-                        crate::voip_log::Via::RtcpSock,
-                        pkt[0],
-                        pkt.len(),
-                        &rtcp_addr,
-                        &pkt,
-                    );
+                    peer_ssrc
+                };
+                for media_ssrc in [primary_ssrc, secondary_video_ssrc]
+                    .into_iter()
+                    .filter(|value| *value != 0)
+                {
+                    // Compound packet: empty RR first (RFC 3550 6.1), then the PLI.
+                    let mut pkt = vec![0x80u8, 201, 0, 1];
+                    pkt.extend_from_slice(&ssrc.to_be_bytes());
+                    pkt.extend_from_slice(&build_pli(ssrc, media_ssrc));
+                    if relay_token != 0 {
+                        let rtcp_type: u8 = 0x0F; // `ZRTPPacket::initZRTPPacketVideo` (`isRtcp=true`)
+                        let mut wire = Vec::with_capacity(5 + pkt.len());
+                        wire.push(rtcp_type);
+                        wire.extend_from_slice(&relay_token.to_le_bytes());
+                        wire.extend_from_slice(&pkt);
+                        send_dgram(rtcp_sender, &wire, target, &mut txs);
+                        if let Some(rtarget) = rtp_sock_addr {
+                            if rtarget != target {
+                                send_dgram(rtcp_sender, &wire, rtarget, &mut txs);
+                            }
+                        }
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            rtcp_type,
+                            wire.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
+                    } else {
+                        send_dgram(rtcp_sender, &pkt, target, &mut txs);
+                        wl.rtcp(
+                            ">",
+                            crate::voip_log::Via::RtcpSock,
+                            pkt[0],
+                            pkt.len(),
+                            &rtcp_addr,
+                            &pkt,
+                        );
+                    }
+                    pli_sent += 1;
                 }
-                pli_sent += 1;
+            }
+        }
+        if is_group && last_group_playout.elapsed() >= Duration::from_millis(20) {
+            last_group_playout = std::time::Instant::now();
+            if let Some(frame) = group_audio.take_frame() {
+                if let Ok(mut buffer) = output_buf.lock() {
+                    queue_playback(&mut buffer, &frame);
+                }
             }
         }
         // --- send-side health: result counters of every UDP send + longest stall of this loop ---
@@ -1664,6 +2055,7 @@ fn trim_black_borders(rgba: &[u8], w: usize, h: usize) -> (usize, usize, Vec<u8>
     (cw, ch, out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_native_h264_decoder(
     stop: Arc<AtomicBool>,
     h264_rx: std::sync::mpsc::Receiver<Vec<u8>>,
@@ -1671,6 +2063,7 @@ fn run_native_h264_decoder(
     egui_ctx: eframe::egui::Context,
     synced: Arc<AtomicBool>,
     generation: u64,
+    texture_key: &'static str,
 ) {
     #[cfg(windows)]
     {
@@ -1681,6 +2074,7 @@ fn run_native_h264_decoder(
             egui_ctx.clone(),
             synced,
             generation,
+            texture_key,
         ) {
             let _ = gui_tx.send(crate::gui::GuiEvent::StatusUpdate(format!(
                 "Video decode: {e:#}"
@@ -1691,7 +2085,15 @@ fn run_native_h264_decoder(
     }
     #[cfg(not(windows))]
     {
-        let _ = (stop, h264_rx, gui_tx, egui_ctx, synced, generation);
+        let _ = (
+            stop,
+            h264_rx,
+            gui_tx,
+            egui_ctx,
+            synced,
+            generation,
+            texture_key,
+        );
     }
 }
 
@@ -2048,6 +2450,43 @@ mod tests {
             &[0, 0, 0, 7, 2, 0x0B, 0x02, 0xD0, 0x1E, 0x29, 0x01]
         );
 
+        let gvid = build_group_video_rtp_packet(
+            97,
+            true,
+            42,
+            9000,
+            0x19F5F926,
+            0x0102,
+            0x33,
+            (0xEBBC_BFBF, 0x8F85_C177),
+            &[0x65, 0x88],
+        );
+        assert_eq!(gvid[0], 0x90);
+        assert_eq!(gvid[1], 0x80 | 97);
+        assert_eq!(&gvid[12..16], &[0xBE, 0xDE, 0x00, 0x05]);
+        assert_eq!(&gvid[23..27], &[0xC2, 0x33, 0x01, 0x02]);
+        assert_eq!(
+            &gvid[27..36],
+            &[0xD6, 0xBC, 0xBF, 0xBF, 0x8F, 0x85, 0xC1, 0x77, 0x00]
+        );
+
+        let gaud = build_group_audio_rtp_packet(
+            112,
+            10,
+            1600,
+            0x19F5F926,
+            (0xEBBC_BFBF, 0x6151_770A),
+            &[0xAA, 0xBB],
+        );
+        assert_eq!(gaud[0], 0x90);
+        assert_eq!(gaud[1], 112);
+        assert_eq!(&gaud[12..16], &[0xBE, 0xDE, 0x00, 0x03]);
+        assert_eq!(&gaud[16..18], &[0x20, 0x4A]);
+        assert_eq!(
+            &gaud[18..28],
+            &[0xD6, 0xBC, 0xBF, 0xBF, 0x61, 0x51, 0x77, 0x0A, 0x00, 0x00]
+        );
+
         let mut fake_stream = H264_AUD.to_vec();
         fake_stream.extend_from_slice(&[0, 0, 0, 1, 0x67, 1, 2, 3]);
         let second_offset = fake_stream.len();
@@ -2160,5 +2599,59 @@ mod resampling_tests {
         for (a, b) in whole.iter().zip(split.iter()) {
             assert!((a - b).abs() < 0.0001);
         }
+    }
+}
+
+#[cfg(test)]
+mod group_media_tests {
+    use super::*;
+    #[test]
+    fn sfu_extensions_preserve_payload_and_use_wall_clock_absolute_send_time() {
+        let payload = [0x41, 0x22, 0x33];
+        let ntp = (0x21, 0x80000000);
+        let video = build_group_video_rtp_packet(97, true, 7, 123, 1001, 9, 0, ntp, &payload);
+        assert_eq!(extract_rtp_opus_payload(&video), Some(payload.as_slice()));
+        assert_eq!(&video[12..16], &[0xBE, 0xDE, 0, 5]);
+        let abs = (((ntp.0 & 0x3F) << 18) | (ntp.1 >> 14)).to_be_bytes();
+        assert_eq!(&video[17..20], &abs[1..4]);
+        let header = crate::voip_log::parse_rtp(&video).unwrap();
+        assert_eq!(header.ssrc, 1001);
+        assert_eq!(header.seq, 7);
+        let audio = build_group_audio_rtp_packet(112, 8, 320, 1002, ntp, &payload);
+        assert_eq!(extract_rtp_opus_payload(&audio), Some(payload.as_slice()));
+        assert_eq!(&audio[12..16], &[0xBE, 0xDE, 0, 3]);
+    }
+    #[test]
+    fn simultaneous_opus_sources_mix_into_one_frame_with_independent_decoders() {
+        let mut mixer = GroupAudioMixer::default();
+        let mut expected = vec![0.0; FRAME_SAMPLES];
+        for (ssrc, freq) in [(1001, 440.0_f32), (1002, 660.0)] {
+            let pcm: Vec<f32> = (0..FRAME_SAMPLES)
+                .map(|i| 0.1 * (i as f32 * freq * std::f32::consts::TAU / SAMPLE_RATE as f32).sin())
+                .collect();
+            let mut encoder =
+                Encoder::new(SAMPLE_RATE, OpusChannels::Mono, opus::Application::Voip).unwrap();
+            let mut bytes = [0; 4000];
+            let count = encoder.encode_float(&pcm, &mut bytes).unwrap();
+            let mut decoder = Decoder::new(SAMPLE_RATE, OpusChannels::Mono).unwrap();
+            let mut decoded = [0.0; MAX_OPUS_SAMPLES];
+            for (out, sample) in expected
+                .iter_mut()
+                .zip(decode_audio(&mut decoder, &bytes[..count], &mut decoded).unwrap())
+            {
+                *out += *sample / (2.0_f32).sqrt();
+            }
+            mixer.push(ssrc, &bytes[..count]);
+        }
+        let frame = mixer.take_frame().unwrap();
+        assert!(frame
+            .iter()
+            .zip(expected)
+            .all(|(a, b)| (a - b).abs() < 0.00001));
+        assert!(
+            mixer.take_frame().is_none(),
+            "two peers must not double playback latency"
+        );
+        assert_eq!(mixer.sources.len(), 2);
     }
 }

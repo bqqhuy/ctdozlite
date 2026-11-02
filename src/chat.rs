@@ -3390,6 +3390,51 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
     Ok(groups)
 }
 
+/// Fetch bounded zero-version group metadata for call membership and display names.
+///
+/// # Errors
+/// Propagates transport, authentication and malformed-envelope errors.
+pub async fn fetch_group_profiles(
+    s: &Session,
+    group_ids: &[String],
+) -> Result<(
+    serde_json::Map<String, Value>,
+    std::collections::HashSet<String>,
+)> {
+    anyhow::ensure!(s.login.is_some() && s.is_active(), "Chưa đăng nhập");
+    anyhow::ensure!(group_ids.len() <= 50, "Chỉ tải tối đa 50 nhóm mỗi lần");
+    let versions: serde_json::Map<String, Value> = group_ids
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| (id.clone(), json!(0)))
+        .collect();
+    let params = s.encoded_params(&json!({"gridVerMap": serde_json::to_string(&versions)?}))?;
+    let url = format!(
+        "{}/api/group/getmg-v2?{}",
+        s.domains.group,
+        s.common_params()
+    );
+    let response = s.post_form(&url, format!("params={params}")).await?;
+    let data = response_data(s.maybe_decrypt(response, s.session_key_bytes()).await)?;
+    let raw = data
+        .get("gridInfoMap")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Metadata nhóm thiếu gridInfoMap"))?;
+    let mut profiles = serde_json::Map::new();
+    for (id, value) in raw {
+        profiles.insert(id.clone(), response_data(value.clone())?);
+    }
+    let removed = data
+        .get("removedsGroup")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Ok((profiles, removed))
+}
+
 /// Resolve names for known group IDs without reloading all memberships.
 async fn resolve_group_metadata(
     s: &Session,
