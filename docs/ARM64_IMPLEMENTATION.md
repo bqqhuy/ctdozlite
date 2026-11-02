@@ -108,3 +108,19 @@ Bổ sung từ upstream sau `1345f5d`: các module nền tảng message/reaction
 - Kiểm thử local: **164 unit pass, 2 ignore** (benchmark thủ công và live-call), **30 integration pass**; fmt và clippy strict đạt. Kiểm tra biên dịch riêng module video cùng test cho `aarch64-pc-windows-msvc` đạt; CI native phải xác nhận lại toàn bộ trước khi dùng artifact mới.
 
 Quyết định và giới hạn: [ADR-0002](adr/0002-bounded-media-and-durable-message-state.md). Các giới hạn cuộc gọi thật, lịch sử 1-1, updater và Settings liệt kê ở trên vẫn còn hiệu lực.
+
+## Đối chiếu cuối — upstream mới hơn, chưa nhập
+
+Upstream `main` hiện ở `20e742c098ec546515701dcf1efe6b92fe9ea8ee`, mới hơn snapshot đã nhập `541ecb5` thêm **13 commit** (54 file, khoảng 9.667 dòng thêm/1.362 dòng xóa). Vì vậy **nhánh sửa chưa đồng bộ toàn bộ upstream mới nhất**. Upstream đã chuyển manifest sang v0.0.4; fork hiện vẫn v0.0.3.
+
+Phần chênh lệch có Social Feed, scheduler, REST/MCP/auto-reply, theme/sticker tùy biến, nhập lịch sử, thông báo cập nhật, và giao thức cuộc gọi nhóm/SFU. Chưa nhập các tính năng mới này. Nhãn issue “closed” và changelog không thay thế kiểm thử runtime.
+
+Các khác biệt cần bảo toàn khi tích hợp tiếp:
+
+- History upstream mới dùng `zalo_history.db` tương đối và suy cursor từ message ID. Fork giữ DB từng tài khoản và checkpoint `lastMsgId` của server; không thay bằng cơ chế upstream này.
+- Failover upstream mới thử HTTP 5xx; fork giữ chính sách không retry mutation sau lỗi có thể đã được server xử lý, tránh gửi trùng.
+- Updater mới truy vấn Releases của upstream. Chưa bật để tránh đề xuất/cài artifact ngoài fork ARM64.
+- Cuộc gọi nhóm có thêm nâng session và packet SFU; chưa có bằng chứng kiểm thử tài khoản/thiết bị ở fork để tuyên bố đã hỗ trợ. Không đưa toàn bộ giao thức mới vào bản đang chờ native CI.
+- Multi-platform workflows, landing và packaging mới vẫn ngoài phạm vi sản phẩm.
+
+**Trở ngại native CI hiện tại:** yêu cầu chạy workflow trả HTTP 422, `Actions has been disabled for this repository.` API đọc quyền Actions trả 403 với kết nối hiện có. Chưa có native run hoặc bộ cài cho bản sửa sau `81a90d6`. Cần chủ repo bật GitHub Actions, sau đó chạy lại workflow `Windows ARM64 (native build)` trên nhánh `fix/windows-arm64-product`.
