@@ -29,6 +29,46 @@ static JOURNAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Incremented by the user's "wake the phone" action; each active round reacts once.
 static WAKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Last time any round of the running sync received a new batch, and which round it was.
+/// Only one sync runs at a time (`SYNC_OWNER`), so this is scoped to that run.
+static PEER_BATCH: std::sync::Mutex<Option<(std::time::Instant, usize)>> =
+    std::sync::Mutex::new(None);
+/// An Idle round waits this long while another round is served before it is woken.
+const IDLE_PEER_WAIT: Duration = Duration::from_secs(60);
+/// After that wake-up, a still Idle round gets this long before it is retried.
+const IDLE_PEER_GRACE: Duration = Duration::from_secs(60);
+
+/// What an Idle round should do while the phone serves other rounds.
+#[derive(Debug, PartialEq, Eq)]
+enum IdleAction {
+    Wait,
+    Wake,
+    Retry,
+}
+/// Decide for an Idle round. `idle_for` is how long it has been Idle, `peer_served` whether
+/// another round received a batch since it became Idle and `woken_for` how long ago this
+/// rule already woke it. One wake-up only; the retry reopens the range after disposal.
+fn idle_action(idle_for: Duration, peer_served: bool, woken_for: Option<Duration>) -> IdleAction {
+    match woken_for {
+        Some(after) if after >= IDLE_PEER_GRACE => IdleAction::Retry,
+        Some(_) => IdleAction::Wait,
+        None if peer_served && idle_for >= IDLE_PEER_WAIT => IdleAction::Wake,
+        None => IdleAction::Wait,
+    }
+}
+fn note_peer_batch(round: usize) {
+    if let Ok(mut last) = PEER_BATCH.lock() {
+        *last = Some((std::time::Instant::now(), round));
+    }
+}
+fn peer_served_since(round: usize, since: std::time::Instant) -> bool {
+    PEER_BATCH
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|(at, other)| other != round && at > since)
+}
+
 /// Message sessions open at once (Zalo PC `max_number_of_concurrent_sync_items`).
 const PARALLEL_ROUNDS: usize = 4;
 /// Recent conversations fetched first with a short page (Zalo PC `sync_recent_chat`).
@@ -540,6 +580,7 @@ impl RunningRound {
             let mut last_wake: Option<std::time::Instant> = None;
             let mut auto_woken = false;
             let mut wake_grace: Option<std::time::Instant> = None;
+            let mut idle_woken: Option<std::time::Instant> = None;
             let wake_reply = crate::socket::wake_request_id(&sync);
             loop {
                 tokio::select! {
@@ -557,6 +598,20 @@ impl RunningRound {
                             None=>ensure!(active_wait<AWAIT_CONFIRM,"Điện thoại chưa xác nhận đồng bộ; mở Zalo trên điện thoại rồi thử lại"),
                         }
                         if idle_since.is_some_and(|since|now.duration_since(since)>=IDLE_LIMIT) {return Err(Stalled.into());}
+                        if let Some(since)=idle_since.filter(|_|state.idle) {
+                            match idle_action(now.duration_since(since),peer_served_since(number,since),idle_woken.map(|at|now.duration_since(at))) {
+                                IdleAction::Wait=>{}
+                                IdleAction::Wake=>{
+                                    let written=transfer.wake(epoch,&sync).await.is_ok();
+                                    crate::transfer_diagnostics::wake(&sync,true,written,None);
+                                    idle_woken=Some(now);
+                                    last_wake=Some(now);
+                                    if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • điện thoại đang gửi lượt khác; đã đánh thức lượt này"));}
+                                    last_display=now;
+                                }
+                                IdleAction::Retry=>return Err(Stalled.into()),
+                            }
+                        }
                         let seq=WAKE_SEQ.load(Ordering::Acquire);
                         let manual=seq!=wake_seq;
                         wake_seq=seq;
@@ -588,7 +643,7 @@ impl RunningRound {
                         let waiting=state.apply(&event,&sync)?;
                         if state.idle && !was_idle {idle_since=Some(std::time::Instant::now());}
                         if !state.idle {idle_since=None;}
-                        if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();}
+                        if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();idle_woken=None;if !state.seen.is_empty(){note_peer_batch(number);}}
                         if waiting{if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}}
                         for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
                         if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
@@ -1993,6 +2048,29 @@ mod resilience_tests {
         assert!(round
             .apply(&batch(1, "https://a.zdn.vn/one", true), "s")
             .is_err());
+    }
+
+    #[test]
+    fn idle_round_is_woken_once_while_peers_are_served_then_retried() {
+        let s = Duration::from_secs;
+        assert_eq!(idle_action(s(120), false, None), IdleAction::Wait);
+        assert_eq!(idle_action(s(59), true, None), IdleAction::Wait);
+        assert_eq!(idle_action(s(60), true, None), IdleAction::Wake);
+        assert_eq!(idle_action(s(90), true, Some(s(30))), IdleAction::Wait);
+        assert_eq!(idle_action(s(120), true, Some(s(60))), IdleAction::Retry);
+        assert_eq!(idle_action(s(120), false, Some(s(60))), IdleAction::Retry);
+    }
+
+    #[test]
+    fn peer_activity_ignores_the_round_itself_and_older_batches() {
+        let before = std::time::Instant::now();
+        note_peer_batch(7);
+        assert!(!peer_served_since(7, before));
+        assert!(peer_served_since(8, before));
+        assert!(!peer_served_since(
+            8,
+            std::time::Instant::now() + Duration::from_secs(1)
+        ));
     }
 
     #[test]
