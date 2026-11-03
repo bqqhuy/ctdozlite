@@ -18,8 +18,9 @@ Tài liệu tổng hợp cấu trúc tham số, bảng phân bổ domain và cá
 |---|---|---|
 | **Auth** | `https://wpa.zaloapp.com` | `/api/login/reqqr`, `/api/login/loginByPasswv2` |
 | **WPA Session** | `https://wpa.chat.zalo.me` | `/api/login/getServerInfo`, `/api/login/getLoginInfo` |
-| **Profile & Danh bạ** | `https://tt-profile-wpa.zaloapp.com` | `/api/social/friend/getfriends`, `/api/social/profile/getminiprofiles` |
-| **Hội thoại** | `https://tt-convers-wpa.api.zaloapp.com` | `/api/message/get-last-msgs`, `/api/pinconvers/list` |
+| **Danh bạ** | `https://tt-friend-wpa.chat.zalo.me` | `/api/social/friend/getfriends` |
+| **Profile** | `https://tt-profile-wpa.chat.zalo.me` | `/api/social/profile/me-v2`, `/api/social/profile/getminiprofiles` |
+| **Hội thoại** | `https://tt-convers-wpa.chat.zalo.me` | `/api/message/get-last-msgs`, `/api/pinconvers/list` |
 | **Nhóm chat** | `https://tt-group-wpa.zaloapp.com` | `/api/group/getlg/v4`, `/api/group/sendmsg`, `/api/group/history` |
 | **Tin nhắn 1-1** | `https://tt-chat3-wpa.api.zaloapp.com` | `/api/message/sms`, `/api/message/sticker`, `/api/message/quote` |
 | **Sticker API** | `https://tt-sticker-wpa.chat.zalo.me` | `/api/message/sticker/suggest/keywords`, `/api/message/sticker/suggest/stickers`, `/api/message/sticker/search`, `/api/message/sticker/sticker_detail` |

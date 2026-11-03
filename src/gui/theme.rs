@@ -33,30 +33,72 @@ pub(super) struct ThemePalette {
 }
 
 impl ThemePalette {
+    pub(super) fn apply_tools_theme(&mut self, value: &serde_json::Value) {
+        let section = value
+            .get(if self.is_dark { "dark" } else { "light" })
+            .unwrap_or(value);
+        for (name, target) in [
+            ("bg_app", &mut self.bg_app),
+            ("bg_sidebar", &mut self.bg_sidebar),
+            ("bg_chat_canvas", &mut self.bg_chat_canvas),
+            ("bg_elevated", &mut self.bg_elevated),
+            ("bg_hover", &mut self.bg_hover),
+            ("bg_selected", &mut self.bg_selected),
+            ("bg_input", &mut self.bg_input),
+            ("border", &mut self.border),
+            ("text_primary", &mut self.text_primary),
+            ("text_secondary", &mut self.text_secondary),
+            ("text_muted", &mut self.text_muted),
+            ("primary", &mut self.primary),
+            ("primary_hover", &mut self.primary_hover),
+            ("accent_online", &mut self.accent_online),
+            ("danger", &mut self.danger),
+            ("warning", &mut self.warning),
+            ("bubble_out_bg", &mut self.bubble_out_bg),
+            ("bubble_out_text", &mut self.bubble_out_text),
+            ("bubble_out_meta", &mut self.bubble_out_meta),
+            ("bubble_in_bg", &mut self.bubble_in_bg),
+            ("bubble_in_border", &mut self.bubble_in_border),
+            ("bubble_in_text", &mut self.bubble_in_text),
+            ("bubble_in_meta", &mut self.bubble_in_meta),
+        ] {
+            if let Some(hex) = section
+                .get(name)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.strip_prefix('#'))
+                .filter(|s| s.len() == 6 && s.is_ascii())
+            {
+                if let Ok(value) = u32::from_str_radix(hex, 16) {
+                    *target =
+                        Color32::from_rgb((value >> 16) as u8, (value >> 8) as u8, value as u8);
+                }
+            }
+        }
+    }
     pub(super) fn dark() -> Self {
         // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
             is_dark: true,
-            bg_app: Color32::from_rgb(24, 26, 31),          // #181A1F Activity Bar & Title Bar
-            bg_sidebar: Color32::from_rgb(33, 37, 43),      // #21252B Tree-View / Sidebar / Header
-            bg_chat_canvas: Color32::from_rgb(40, 44, 52),  // #282C34 Atom One Dark Editor Canvas
-            bg_elevated: Color32::from_rgb(44, 49, 58),     // #2C313A Elevated Card / Modal / Popover
-            bg_hover: Color32::from_rgb(50, 56, 66),        // #323842 List Hover Surface
-            bg_selected: Color32::from_rgb(58, 63, 75),     // #3A3F4B Active Selection Row
-            bg_input: Color32::from_rgb(29, 31, 35),        // #1D1F23 Input / Search Well
-            border: Color32::from_rgb(52, 57, 66),          // #343942 Subtle Panel Divider
+            bg_app: Color32::from_rgb(24, 26, 31), // #181A1F Activity Bar & Title Bar
+            bg_sidebar: Color32::from_rgb(33, 37, 43), // #21252B Tree-View / Sidebar / Header
+            bg_chat_canvas: Color32::from_rgb(40, 44, 52), // #282C34 Atom One Dark Editor Canvas
+            bg_elevated: Color32::from_rgb(44, 49, 58), // #2C313A Elevated Card / Modal / Popover
+            bg_hover: Color32::from_rgb(50, 56, 66), // #323842 List Hover Surface
+            bg_selected: Color32::from_rgb(58, 63, 75), // #3A3F4B Active Selection Row
+            bg_input: Color32::from_rgb(29, 31, 35), // #1D1F23 Input / Search Well
+            border: Color32::from_rgb(52, 57, 66), // #343942 Subtle Panel Divider
             text_primary: Color32::from_rgb(215, 218, 224), // #D7DAE0 Bright Foreground
             text_secondary: Color32::from_rgb(171, 178, 191), // #ABB2BF Atom @mono-1
-            text_muted: Color32::from_rgb(118, 126, 142),   // #767E8E Atom @mono-3 (readable muted)
-            primary: Color32::from_rgb(82, 139, 255),       // #528BFF Atom UI Accent Blue
+            text_muted: Color32::from_rgb(118, 126, 142), // #767E8E Atom @mono-3 (readable muted)
+            primary: Color32::from_rgb(82, 139, 255), // #528BFF Atom UI Accent Blue
             primary_hover: Color32::from_rgb(97, 175, 239), // #61AFEF Atom @hue-2 Cyan-Blue
             accent_online: Color32::from_rgb(152, 195, 121), // #98C379 Atom @hue-4 Green
-            danger: Color32::from_rgb(224, 108, 117),       // #E06C75 Atom @hue-5 Coral Red
-            warning: Color32::from_rgb(229, 192, 123),      // #E5C07B Atom @hue-62 Warm Gold
-            bubble_out_bg: Color32::from_rgb(37, 55, 77),   // #25374D Zalo Dark Slate-Navy Outgoing Bubble
+            danger: Color32::from_rgb(224, 108, 117), // #E06C75 Atom @hue-5 Coral Red
+            warning: Color32::from_rgb(229, 192, 123), // #E5C07B Atom @hue-62 Warm Gold
+            bubble_out_bg: Color32::from_rgb(37, 55, 77), // #25374D Zalo Dark Slate-Navy Outgoing Bubble
             bubble_out_text: Color32::from_rgb(235, 240, 246), // #EBF0F6
             bubble_out_meta: Color32::from_rgb(154, 171, 192), // #9AABC0
-            bubble_in_bg: Color32::from_rgb(50, 56, 66),    // #323842 Atom Elevated Incoming Bubble
+            bubble_in_bg: Color32::from_rgb(50, 56, 66),  // #323842 Atom Elevated Incoming Bubble
             bubble_in_border: Color32::from_rgb(62, 68, 81), // #3E4451 Atom Gutter Border
             bubble_in_text: Color32::from_rgb(215, 218, 224), // #D7DAE0
             bubble_in_meta: Color32::from_rgb(142, 150, 165), // #8E96A5
@@ -66,22 +108,22 @@ impl ThemePalette {
     pub(super) fn light() -> Self {
         Self {
             is_dark: false,
-            bg_app: Color32::from_rgb(255, 255, 255),      // #FFFFFF
-            bg_sidebar: Color32::from_rgb(255, 255, 255),  // #FFFFFF
+            bg_app: Color32::from_rgb(255, 255, 255), // #FFFFFF
+            bg_sidebar: Color32::from_rgb(255, 255, 255), // #FFFFFF
             bg_chat_canvas: Color32::from_rgb(235, 240, 247), // Authentic Zalo PC cool blue-gray canvas
-            bg_elevated: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            bg_hover: Color32::from_rgb(241, 245, 249),    // #F1F5F9
-            bg_selected: Color32::from_rgb(229, 241, 255), // #E5F1FF Zalo active row
-            bg_input: Color32::from_rgb(248, 250, 252),    // #F8FAFC
-            border: Color32::from_rgb(226, 232, 240),      // #E2E8F0
-            text_primary: Color32::from_rgb(15, 23, 42),   // #0F172A (16.1:1 contrast)
-            text_secondary: Color32::from_rgb(71, 85, 105), // #475569 (7.2:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),  // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),       // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(37, 99, 235), // #2563EB
-            accent_online: Color32::from_rgb(5, 150, 105), // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),        // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),       // #D97706
+            bg_elevated: Color32::from_rgb(255, 255, 255),    // #FFFFFF
+            bg_hover: Color32::from_rgb(241, 245, 249),       // #F1F5F9
+            bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF Zalo active row
+            bg_input: Color32::from_rgb(248, 250, 252),       // #F8FAFC
+            border: Color32::from_rgb(226, 232, 240),         // #E2E8F0
+            text_primary: Color32::from_rgb(15, 23, 42),      // #0F172A (16.1:1 contrast)
+            text_secondary: Color32::from_rgb(71, 85, 105),   // #475569 (7.2:1 contrast)
+            text_muted: Color32::from_rgb(100, 116, 139),     // #64748B (4.6:1 contrast)
+            primary: Color32::from_rgb(0, 104, 255),          // #0068FF Zalo Blue
+            primary_hover: Color32::from_rgb(37, 99, 235),    // #2563EB
+            accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
+            danger: Color32::from_rgb(220, 38, 38),           // #DC2626
+            warning: Color32::from_rgb(217, 119, 6),          // #D97706
             bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
             bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
             bubble_out_meta: Color32::from_rgb(71, 92, 122),
@@ -93,7 +135,15 @@ impl ThemePalette {
     }
 
     pub(super) fn apply_to_ctx(&self, ctx: &egui::Context) {
-        let mut style = (*ctx.style()).clone();
+        // egui stores separate light/dark styles. A late native system-theme
+        // event must not switch to an unconfigured style behind our painted UI.
+        let theme = if self.is_dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        ctx.set_theme(theme);
+        let mut style = (*ctx.style_of(theme)).clone();
         let mut visuals = if self.is_dark {
             egui::Visuals::dark()
         } else {
@@ -105,7 +155,9 @@ impl ThemePalette {
         visuals.extreme_bg_color = self.bg_input;
         visuals.faint_bg_color = self.bg_hover;
         visuals.override_text_color = Some(self.text_primary);
-        visuals.selection.bg_fill = self.primary.linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
+        visuals.selection.bg_fill =
+            self.primary
+                .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
         visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
 
         let r = Rounding::same(8.0);
@@ -137,7 +189,7 @@ impl ThemePalette {
         style.spacing.scroll = egui::style::ScrollStyle::solid();
         style.spacing.scroll.bar_width = 6.0;
         style.visuals = visuals;
-        ctx.set_style(style);
+        ctx.set_style_of(theme, style);
     }
 }
 
@@ -147,14 +199,14 @@ impl ThemePalette {
 
 pub(super) fn avatar_color_for(name: &str, is_group: bool) -> Color32 {
     const PALETTE: &[Color32] = &[
-        Color32::from_rgb(64, 120, 192),  // Atom Blue (#4078C0)
-        Color32::from_rgb(56, 148, 160),  // Atom Cyan (#3894A0)
-        Color32::from_rgb(152, 88, 178),  // Atom Purple (#9858B2)
-        Color32::from_rgb(190, 80, 70),   // Atom Red (#BE5046)
-        Color32::from_rgb(184, 118, 62),  // Atom Orange (#B8763E)
-        Color32::from_rgb(98, 148, 72),   // Atom Green (#629448)
-        Color32::from_rgb(82, 116, 196),  // Atom Indigo
-        Color32::from_rgb(72, 138, 182),  // Atom Cerulean
+        Color32::from_rgb(64, 120, 192), // Atom Blue (#4078C0)
+        Color32::from_rgb(56, 148, 160), // Atom Cyan (#3894A0)
+        Color32::from_rgb(152, 88, 178), // Atom Purple (#9858B2)
+        Color32::from_rgb(190, 80, 70),  // Atom Red (#BE5046)
+        Color32::from_rgb(184, 118, 62), // Atom Orange (#B8763E)
+        Color32::from_rgb(98, 148, 72),  // Atom Green (#629448)
+        Color32::from_rgb(82, 116, 196), // Atom Indigo
+        Color32::from_rgb(72, 138, 182), // Atom Cerulean
     ];
     let mut hash: usize = if is_group { 3 } else { 0 };
     for b in name.bytes() {
@@ -171,23 +223,30 @@ pub(super) fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::C
     }
 }
 
-/// Extract up to 2 uppercase initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
+/// Extract up to 2 uppercase alphanumeric initials from a display name (e.g. `"Nguyễn An"` -> `"NA"`, `"Hoang"` -> `"H"`).
 pub(super) fn avatar_initials(name: &str) -> String {
-    let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
-    if words.len() >= 2 {
-        let c1 = words[0].chars().next().unwrap_or('Z').to_uppercase();
-        let c2 = words[words.len() - 1]
+    let clean_words: Vec<&str> = name
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    if clean_words.len() >= 2 {
+        let c1 = clean_words[0].chars().next().unwrap_or('Z').to_uppercase();
+        let c2 = clean_words[clean_words.len() - 1]
             .chars()
             .next()
             .unwrap_or('U')
             .to_uppercase();
         format!("{c1}{c2}")
-    } else {
-        name.chars()
+    } else if let Some(first) = clean_words.first() {
+        first
+            .chars()
             .next()
             .unwrap_or('Z')
             .to_uppercase()
             .to_string()
+    } else {
+        "Z".to_string()
     }
 }
 
@@ -200,11 +259,15 @@ pub(super) fn fold_vn_search(s: &str) -> String {
             let mapped = match c {
                 'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
                 | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => 'e',
+                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
+                    'e'
+                }
                 'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
                 'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
                 | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
-                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => 'u',
+                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
+                    'u'
+                }
                 'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
                 'đ' => 'd',
                 other => other,
@@ -226,10 +289,50 @@ pub(super) fn matches_vn_query(haystack: &str, query_lower: &str, query_folded: 
     !query_folded.is_empty() && fold_vn_search(haystack).contains(query_folded)
 }
 
-/// Paint a circular user or group avatar: uses the real circular-masked Zalo profile image when
-/// `avatar_url` is available (fetching it asynchronously via `FetchStickerImage`), and falls back
-/// to a colored circle with initials while loading or when no URL exists.
-pub(super) fn paint_user_avatar(
+/// Centre-crop the texture to a square, then draw it inside a circle so non-square
+/// avatars are neither stretched nor shown with corners.
+fn paint_circular_image(painter: &egui::Painter, center: Pos2, radius: f32, tex: &TextureHandle) {
+    let (uv_min, uv_max) = square_crop(tex.size());
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    let steps = 40u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: Pos2::new((uv_min.x + uv_max.x) * 0.5, (uv_min.y + uv_max.y) * 0.5),
+        color: Color32::WHITE,
+    });
+    for i in 0..=steps {
+        let angle = i as f32 / steps as f32 * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(center.x + radius * cos, center.y + radius * sin),
+            uv: Pos2::new(
+                uv_min.x + (cos * 0.5 + 0.5) * (uv_max.x - uv_min.x),
+                uv_min.y + (sin * 0.5 + 0.5) * (uv_max.y - uv_min.y),
+            ),
+            color: Color32::WHITE,
+        });
+        if i > 0 {
+            mesh.indices.extend_from_slice(&[0, i, i + 1]);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+/// UV rectangle of the centred square inside a `[width, height]` texture.
+fn square_crop([w, h]: [usize; 2]) -> (Pos2, Pos2) {
+    if w == h || w == 0 || h == 0 {
+        (Pos2::ZERO, Pos2::new(1.0, 1.0))
+    } else if w > h {
+        let crop = (w - h) as f32 / (2.0 * w as f32);
+        (Pos2::new(crop, 0.0), Pos2::new(1.0 - crop, 1.0))
+    } else {
+        let crop = (h - w) as f32 / (2.0 * h as f32);
+        (Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
+    }
+}
+
+// Rendering arguments describe one immediate-mode paint operation.
+#[allow(clippy::too_many_arguments)]
+fn paint_single_circle_avatar(
     painter: &egui::Painter,
     center: Pos2,
     radius: f32,
@@ -239,19 +342,16 @@ pub(super) fn paint_user_avatar(
     textures: &HashMap<String, TextureHandle>,
     loading: &mut HashSet<String>,
 ) {
-    if let Some(url) = avatar_url
-        .map(str::trim)
-        .filter(|u| !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")))
-    {
-        let key = format!("ava_{}", crate::crypto::md5_hex(url));
+    if let Some(url) = avatar_url.map(str::trim).filter(|u| {
+        !u.is_empty()
+            && !u.ends_with("/default")
+            && (u.starts_with("http://") || u.starts_with("https://"))
+    }) {
+        let file_or_base = crate::chat::avatar_file_key(Some(url))
+            .unwrap_or_else(|| url.split('?').next().unwrap_or(url).to_string());
+        let key = format!("ava_{}", crate::crypto::md5_hex(&file_or_base));
         if let Some(tex) = textures.get(&key) {
-            let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
-            painter.image(
-                tex.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            paint_circular_image(painter, center, radius, tex);
             painter.circle_stroke(
                 center,
                 radius,
@@ -259,7 +359,12 @@ pub(super) fn paint_user_avatar(
             );
             return;
         }
-        if loading.insert(key.clone()) {
+        if painter
+            .clip_rect()
+            .expand(64.0)
+            .intersects(Rect::from_center_size(center, Vec2::splat(radius * 2.0)))
+            && loading.insert(key.clone())
+        {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchStickerImage {
                     key,
@@ -271,10 +376,11 @@ pub(super) fn paint_user_avatar(
 
     let av_col = avatar_color_for(name, is_group);
     painter.circle_filled(center, radius, av_col);
-    let initial = if radius >= 18.0 {
+    let initial = if radius >= 15.5 {
         avatar_initials(name)
     } else {
-        name.chars()
+        name.trim_matches(|c: char| !c.is_alphanumeric())
+            .chars()
             .next()
             .unwrap_or('Z')
             .to_uppercase()
@@ -284,9 +390,200 @@ pub(super) fn paint_user_avatar(
         center,
         egui::Align2::CENTER_CENTER,
         initial,
-        FontId::proportional((radius * 0.72).max(11.0)),
+        FontId::proportional((radius * 0.76).max(8.5)),
         Color32::WHITE,
     );
+}
+
+/// Paint a circular user or group avatar:
+/// - For 1-1 contacts or groups with a custom uploaded group photo (`http(s)://...`), renders the circular image.
+/// - For groups without a single custom photo (`multi:...` or `None`), renders Zalo PC's `zavatar-multi`
+///   composite layout (3-member triangle or 2x2 member grid with optional member count badge).
+// Rendering arguments describe one immediate-mode paint operation.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paint_user_avatar(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    name: &str,
+    is_group: bool,
+    avatar_url: Option<&str>,
+    textures: &HashMap<String, TextureHandle>,
+    loading: &mut HashSet<String>,
+) {
+    let raw_ava = avatar_url.map(str::trim).unwrap_or("");
+    let has_single_custom_photo = !raw_ava.is_empty()
+        && !raw_ava.starts_with("multi:")
+        && !raw_ava.ends_with("/default")
+        && (raw_ava.starts_with("http://") || raw_ava.starts_with("https://"));
+
+    if !is_group || has_single_custom_photo {
+        paint_single_circle_avatar(
+            painter, center, radius, name, is_group, avatar_url, textures, loading,
+        );
+        return;
+    }
+
+    // Parse composite group member slots (`multi:<total>;<name1>|<url1>;<name2>|<url2>;...`)
+    // or derive member slots from comma-separated group name (`"Đỗ Thành, Đtc, Hoang"`).
+    let mut slots: Vec<(String, String)> = Vec::new();
+    let mut total_members: usize = 0;
+    if let Some(rest) = raw_ava.strip_prefix("multi:") {
+        for (idx, part) in rest.split(';').enumerate() {
+            if idx == 0 && !part.contains('|') {
+                total_members = part.trim().parse::<usize>().unwrap_or(0);
+                continue;
+            }
+            if let Some((m_name, m_url)) = part.split_once('|') {
+                slots.push((m_name.trim().to_string(), m_url.trim().to_string()));
+            } else if !part.trim().is_empty() {
+                slots.push((part.trim().to_string(), String::new()));
+            }
+        }
+    }
+    if slots.is_empty() {
+        let comma_parts: Vec<&str> = name
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if comma_parts.len() >= 2 {
+            for p in comma_parts.iter().take(4) {
+                slots.push(((*p).to_string(), String::new()));
+            }
+            total_members = comma_parts.len();
+        } else {
+            let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
+            if words.len() >= 3 {
+                for w in words.iter().take(3) {
+                    slots.push(((*w).to_string(), String::new()));
+                }
+            } else {
+                slots.push((name.to_string(), String::new()));
+                slots.push(("TV".to_string(), String::new()));
+                slots.push(("N".to_string(), String::new()));
+            }
+            total_members = slots.len();
+        }
+    }
+    if total_members < slots.len() {
+        total_members = slots.len();
+    }
+
+    let border_col = Color32::from_rgb(24, 27, 34);
+    let n_slots = slots.len();
+    if n_slots == 2 {
+        let sub_r = (radius * 0.61).max(6.0);
+        let p1 = Pos2::new(center.x + radius - sub_r, center.y - radius + sub_r);
+        let p0 = Pos2::new(center.x - radius + sub_r, center.y + radius - sub_r);
+        for &(pos, idx) in &[(p1, 1usize), (p0, 0usize)] {
+            painter.circle_filled(pos, sub_r + 1.2, border_col);
+            let (ref m_name, ref m_url) = slots[idx];
+            paint_single_circle_avatar(
+                painter,
+                pos,
+                sub_r,
+                m_name,
+                false,
+                if m_url.is_empty() {
+                    None
+                } else {
+                    Some(m_url.as_str())
+                },
+                textures,
+                loading,
+            );
+        }
+    } else if n_slots == 3 && total_members <= 3 {
+        // Zalo PC `zavatar-multi.zavatar-3`: 1 top-center (z=4), 1 bottom-left (z=3), 1 bottom-right (z=2)
+        let sub_r = (radius * 0.56).max(5.5);
+        let p_top = Pos2::new(center.x, center.y - radius + sub_r);
+        let p_bl = Pos2::new(
+            center.x - radius + sub_r + 0.5,
+            center.y + radius - sub_r - 0.5,
+        );
+        let p_br = Pos2::new(
+            center.x + radius - sub_r - 0.5,
+            center.y + radius - sub_r - 0.5,
+        );
+        for &(pos, idx) in &[(p_br, 2usize), (p_bl, 1usize), (p_top, 0usize)] {
+            painter.circle_filled(pos, sub_r + 1.2, border_col);
+            let (ref m_name, ref m_url) = slots[idx];
+            paint_single_circle_avatar(
+                painter,
+                pos,
+                sub_r,
+                m_name,
+                false,
+                if m_url.is_empty() {
+                    None
+                } else {
+                    Some(m_url.as_str())
+                },
+                textures,
+                loading,
+            );
+        }
+    } else {
+        // Zalo PC `zavatar-multi.zavatar-4`: 2x2 grid (with member count badge in bottom-right if total_members >= 4)
+        let sub_r = (radius * 0.52).max(5.0);
+        let p_tl = Pos2::new(center.x - radius + sub_r, center.y - radius + sub_r);
+        let p_tr = Pos2::new(center.x + radius - sub_r, center.y - radius + sub_r);
+        let p_bl = Pos2::new(center.x - radius + sub_r, center.y + radius - sub_r);
+        let p_br = Pos2::new(center.x + radius - sub_r, center.y + radius - sub_r);
+        let show_counter = total_members > 4 || n_slots < 4;
+        if show_counter {
+            painter.circle_filled(p_br, sub_r + 1.2, border_col);
+            painter.circle_filled(p_br, sub_r, Color32::from_rgb(56, 65, 82));
+            let cnt_txt = if total_members > 99 {
+                "99+".to_string()
+            } else {
+                total_members.to_string()
+            };
+            painter.text(
+                p_br,
+                egui::Align2::CENTER_CENTER,
+                cnt_txt,
+                FontId::proportional((sub_r * 0.76).max(8.0)),
+                Color32::from_rgb(218, 226, 240),
+            );
+        } else if let Some((ref m_name, ref m_url)) = slots.get(3) {
+            painter.circle_filled(p_br, sub_r + 1.2, border_col);
+            paint_single_circle_avatar(
+                painter,
+                p_br,
+                sub_r,
+                m_name,
+                false,
+                if m_url.is_empty() {
+                    None
+                } else {
+                    Some(m_url.as_str())
+                },
+                textures,
+                loading,
+            );
+        }
+        for &(pos, idx) in &[(p_bl, 2usize), (p_tr, 1usize), (p_tl, 0usize)] {
+            if let Some((ref m_name, ref m_url)) = slots.get(idx) {
+                painter.circle_filled(pos, sub_r + 1.2, border_col);
+                paint_single_circle_avatar(
+                    painter,
+                    pos,
+                    sub_r,
+                    m_name,
+                    false,
+                    if m_url.is_empty() {
+                        None
+                    } else {
+                        Some(m_url.as_str())
+                    },
+                    textures,
+                    loading,
+                );
+            }
+        }
+    }
 }
 
 pub mod lucide {
@@ -341,7 +638,13 @@ pub mod lucide {
     pub const USER: &str = "\u{e19f}";
 }
 
-pub(super) fn draw_lucide_icon(painter: &egui::Painter, center: Pos2, icon: &str, size: f32, color: Color32) {
+pub(super) fn draw_lucide_icon(
+    painter: &egui::Painter,
+    center: Pos2,
+    icon: &str,
+    size: f32,
+    color: Color32,
+) {
     painter.text(
         center,
         egui::Align2::CENTER_CENTER,
@@ -379,7 +682,12 @@ pub(super) fn draw_icon_image(painter: &egui::Painter, center: Pos2, size: f32, 
     draw_lucide_icon(painter, center, lucide::IMAGE, size, color);
 }
 
-pub(super) fn draw_icon_attachment(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+pub(super) fn draw_icon_attachment(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
     draw_lucide_icon(painter, center, lucide::PAPERCLIP, size, color);
 }
 
@@ -411,7 +719,12 @@ pub(super) fn draw_icon_copy(painter: &egui::Painter, center: Pos2, size: f32, c
     draw_lucide_icon(painter, center, lucide::COPY, size, color);
 }
 
-pub(super) fn draw_icon_user_plus(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+pub(super) fn draw_icon_user_plus(
+    painter: &egui::Painter,
+    center: Pos2,
+    size: f32,
+    color: Color32,
+) {
     draw_lucide_icon(painter, center, lucide::USER_PLUS, size, color);
 }
 
@@ -452,7 +765,8 @@ pub fn load_app_icon() -> Option<egui::IconData> {
 pub(super) fn load_app_logo_texture(ctx: &egui::Context) -> Option<TextureHandle> {
     let img = image::load_from_memory(APP_ICON_PNG).ok()?.into_rgba8();
     let (w, h) = img.dimensions();
-    let color_img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
+    let color_img =
+        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw());
     Some(ctx.load_texture("zalo_app_logo", color_img, TextureOptions::LINEAR))
 }
 
@@ -461,7 +775,10 @@ pub(super) fn load_default_emoji_textures(ctx: &egui::Context) -> HashMap<String
         ("like", include_bytes!("../assets/emojis/like.png")),
         ("heart", include_bytes!("../assets/emojis/heart.png")),
         ("smile", include_bytes!("../assets/emojis/smile.png")),
-        ("surprised", include_bytes!("../assets/emojis/surprised.png")),
+        (
+            "surprised",
+            include_bytes!("../assets/emojis/surprised.png"),
+        ),
         ("cry", include_bytes!("../assets/emojis/cry.png")),
         ("rage", include_bytes!("../assets/emojis/rage.png")),
     ];
@@ -470,10 +787,8 @@ pub(super) fn load_default_emoji_textures(ctx: &egui::Context) -> HashMap<String
         if let Ok(img) = image::load_from_memory(bytes) {
             let rgba = img.to_rgba8();
             let (w, h) = rgba.dimensions();
-            let color_img = egui::ColorImage::from_rgba_unmultiplied(
-                [w as usize, h as usize],
-                rgba.as_raw(),
-            );
+            let color_img =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
             let tex = ctx.load_texture(
                 format!("zalo_emoji_{name}"),
                 color_img,
@@ -485,9 +800,12 @@ pub(super) fn load_default_emoji_textures(ctx: &egui::Context) -> HashMap<String
     map
 }
 
-
 /// Render an iOS/Zalo PC style rounded Toggle Switch in pure egui.
-pub(super) fn render_toggle_switch(ui: &mut egui::Ui, value: &mut bool, pal: &ThemePalette) -> egui::Response {
+pub(super) fn render_toggle_switch(
+    ui: &mut egui::Ui,
+    value: &mut bool,
+    pal: &ThemePalette,
+) -> egui::Response {
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
     if resp.clicked() {
         *value = !*value;
@@ -518,8 +836,30 @@ pub(super) fn render_toggle_switch(ui: &mut egui::Ui, value: &mut bool, pal: &Th
     resp
 }
 
+static CJK_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF | 0x3040..=0x30FF | 0x3130..=0x318F | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF)
+}
+
+/// Load the CJK fallback the first time Han / Kana / Hangul text shows up. msyh.ttc alone is
+/// ~20 MB held in memory for the whole run, which a Vietnamese-only user never needs.
+pub(super) fn ensure_cjk_font<'a>(ctx: &egui::Context, mut texts: impl Iterator<Item = &'a str>) {
+    use std::sync::atomic::Ordering;
+    if CJK_LOADED.load(Ordering::Relaxed) || !texts.any(|t| t.chars().any(is_cjk)) {
+        return;
+    }
+    CJK_LOADED.store(true, Ordering::Relaxed);
+    build_fonts(ctx, true);
+}
 
 pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
+    build_fonts(ctx, CJK_LOADED.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     let mut fonts = egui::FontDefinitions::default();
 
     // 1. Embed official Lucide Icon Font (vector glyphs for all UI icons)
@@ -529,46 +869,106 @@ pub(super) fn setup_custom_fonts(ctx: &egui::Context) {
         egui::FontData::from_static(LUCIDE_BYTES),
     );
 
-    // 2. Load system Vietnamese sans-serif font
-    let font_candidates = [
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\arial.ttf",
-        "C:\\Windows\\Fonts\\tahoma.ttf",
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/System/Library/Fonts/Supplemental/Tahoma.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-    ];
-
-    for path in font_candidates {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "vietnamese_font".to_owned(),
-                egui::FontData::from_owned(font_data),
-            );
+    // Bundled OFL font guarantees Vietnamese coverage without depending on the host.
+    fonts.font_data.insert(
+        "bundled_sans".into(),
+        egui::FontData::from_static(include_bytes!("../assets/fonts/BeVietnamPro-Regular.ttf")),
+    );
+    // Read installed Windows fonts; do not redistribute proprietary font files.
+    let font_dir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("Fonts");
+    for name in ["segoeui.ttf", "arial.ttf", "tahoma.ttf"] {
+        if let Ok(data) = std::fs::read(font_dir.join(name)) {
+            fonts
+                .font_data
+                .insert("vietnamese_font".into(), egui::FontData::from_owned(data));
             break;
         }
     }
-
-    // Fallback order: Proportional text prefers Vietnamese sans, then Lucide for icon glyphs
-    let prop = fonts.families.entry(egui::FontFamily::Proportional).or_default();
-    if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(0, "vietnamese_font".to_owned());
-        prop.push("lucide_font".to_owned());
-    } else {
-        prop.insert(0, "lucide_font".to_owned());
+    if with_cjk {
+        for name in ["msyh.ttc", "simsun.ttc", "meiryo.ttc", "malgun.ttf"] {
+            if let Ok(data) = std::fs::read(font_dir.join(name)) {
+                fonts
+                    .font_data
+                    .insert("cjk_font".into(), egui::FontData::from_owned(data));
+                break;
+            }
+        }
     }
 
-    let mono = fonts.families.entry(egui::FontFamily::Monospace).or_default();
+    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
+    let prop = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    prop.insert(0, "bundled_sans".to_owned());
+    if fonts.font_data.contains_key("vietnamese_font") {
+        prop.insert(1, "vietnamese_font".to_owned());
+    }
+    if fonts.font_data.contains_key("cjk_font") {
+        prop.push("cjk_font".to_owned());
+    }
+    prop.push("lucide_font".to_owned());
+
+    let mono = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    mono.push("bundled_sans".to_owned());
     if fonts.font_data.contains_key("vietnamese_font") {
         mono.push("vietnamese_font".to_owned());
+    }
+    if fonts.font_data.contains_key("cjk_font") {
+        mono.push("cjk_font".to_owned());
     }
     mono.push("lucide_font".to_owned());
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    #[test]
+    fn selected_palette_survives_opposite_system_theme_arriving() {
+        for (palette, system_theme) in [
+            (ThemePalette::dark(), egui::Theme::Light),
+            (ThemePalette::light(), egui::Theme::Dark),
+        ] {
+            let ctx = egui::Context::default();
+            palette.apply_to_ctx(&ctx);
+            let _ = ctx.run(
+                egui::RawInput {
+                    system_theme: Some(system_theme),
+                    ..Default::default()
+                },
+                |ctx| {
+                    assert_eq!(
+                        ctx.style().visuals.override_text_color,
+                        Some(palette.text_primary)
+                    );
+                    assert_eq!(
+                        ctx.style().visuals.widgets.inactive.bg_fill,
+                        palette.bg_elevated
+                    );
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod avatar_crop_tests {
+    use super::*;
+    #[test]
+    fn crop_keeps_the_centred_square() {
+        assert_eq!(square_crop([100, 100]), (Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        let (min, max) = square_crop([200, 100]);
+        assert!((min.x - 0.25).abs() < 1e-6 && (max.x - 0.75).abs() < 1e-6);
+        assert_eq!((min.y, max.y), (0.0, 1.0));
+        let (min, max) = square_crop([100, 400]);
+        assert!((min.y - 0.375).abs() < 1e-6 && (max.y - 0.625).abs() < 1e-6);
+    }
 }

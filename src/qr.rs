@@ -149,10 +149,17 @@ pub async fn request_qr(s: &Session, language: &str) -> Result<QrLogin> {
 
     let (status, text, _) = get_raw(s, &url).await?;
     if status != 200 {
-        bail!("reqqr: HTTP {status}: {}", crate::session::truncate(&text, 200));
+        bail!(
+            "reqqr: HTTP {status}: {}",
+            crate::session::truncate(&text, 200)
+        );
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("reqqr: không phải JSON ({e}): {}", crate::session::truncate(&text, 200)))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "reqqr: không phải JSON ({e}): {}",
+            crate::session::truncate(&text, 200)
+        )
+    })?;
     let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
     if code != 0 {
         let msg = v.get("error_message").and_then(Value::as_str).unwrap_or("");
@@ -234,7 +241,10 @@ pub async fn wait_for_scan(s: &Session, q: &QrLogin) -> Result<Value> {
                 }
                 tokio::time::sleep(Duration::from_millis(800)).await;
             }
-            other => bail!("waiting scan: HTTP {other}: {}", crate::session::truncate(&text, 200)),
+            other => bail!(
+                "waiting scan: HTTP {other}: {}",
+                crate::session::truncate(&text, 200)
+            ),
         }
     }
 }
@@ -259,11 +269,18 @@ pub async fn confirm(s: &Session, q: &QrLogin) -> Result<Value> {
             continue;
         }
         if status != 200 {
-            bail!("pc-status: HTTP {status}: {}", crate::session::truncate(&text, 200));
+            bail!(
+                "pc-status: HTTP {status}: {}",
+                crate::session::truncate(&text, 200)
+            );
         }
 
-        let mut v: Value = serde_json::from_str(&text)
-            .map_err(|e| anyhow::anyhow!("pc-status: không phải JSON ({e}): {}", crate::session::truncate(&text, 200)))?;
+        let mut v: Value = serde_json::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "pc-status: không phải JSON ({e}): {}",
+                crate::session::truncate(&text, 200)
+            )
+        })?;
         let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
         if code == 0 {
             if let Some(sek) = cookie_sek {
@@ -291,9 +308,9 @@ pub async fn login_via_qr(s: &mut Session, language: &str) -> Result<Value> {
         Ok(art) => println!("{art}"),
         Err(e) => {
             eprintln!("! không vẽ được QR trong terminal: {e}");
-            let path = "qr.png";
-            save_png(&q, path)?;
-            println!("  ảnh QR đã lưu: {path}");
+            let path = crate::storage::root().join("qr.png");
+            save_png(&q, &path.to_string_lossy())?;
+            println!("  ảnh QR đã lưu: {}", path.display());
         }
     }
     println!("Quét mã bằng Zalo trên điện thoại…");
@@ -340,12 +357,21 @@ pub fn extract_zpw_sek(v: &Value) -> Option<String> {
                 return Some(s.to_string());
             }
         }
-        if let Some(s) = v.get("data").and_then(|d| d.get(key)).and_then(Value::as_str) {
+        if let Some(s) = v
+            .get("data")
+            .and_then(|d| d.get(key))
+            .and_then(Value::as_str)
+        {
             if !s.is_empty() && s != "EXPIRED" {
                 return Some(s.to_string());
             }
         }
-        if let Some(s) = v.get("data").and_then(|d| d.get("account")).and_then(|a| a.get(key)).and_then(Value::as_str) {
+        if let Some(s) = v
+            .get("data")
+            .and_then(|d| d.get("account"))
+            .and_then(|a| a.get(key))
+            .and_then(Value::as_str)
+        {
             if !s.is_empty() && s != "EXPIRED" {
                 return Some(s.to_string());
             }
@@ -372,12 +398,16 @@ async fn get_raw(s: &Session, url: &str) -> Result<(u16, String, Option<String>)
         }
     }
 
-    let text = resp.text().await?;
+    let bytes = crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
     if s.verbose {
         eprintln!("→ GET {}", crate::session::redact_url(url));
         eprintln!("← {status} {}", crate::session::truncate(&text, 200));
         if let Some(ref k) = sek {
-            eprintln!("  Captured zpw_sek cookie: {}", crate::session::redact_secret(k));
+            eprintln!(
+                "  Captured zpw_sek cookie: {}",
+                crate::session::redact_secret(k)
+            );
         }
     }
     Ok((status, text, sek))
@@ -424,7 +454,11 @@ mod tests {
         let lines: Vec<&str> = art.lines().collect();
         // A version-6 code is 41 modules + a 4-module quiet zone; two rows per line.
         assert!(lines.len() >= 20, "rows = {}", lines.len());
-        assert!(lines[0].chars().count() >= 40, "cols = {}", lines[0].chars().count());
+        assert!(
+            lines[0].chars().count() >= 40,
+            "cols = {}",
+            lines[0].chars().count()
+        );
         assert!(
             art.contains('█') || art.contains('▀') || art.contains('▄'),
             "the code must use block characters"

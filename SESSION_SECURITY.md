@@ -1,9 +1,9 @@
 # Session Security Notice
 
-`session.json` contains live authentication credentials, session tokens (`zpw_sek`, `zpw_enk`), encryption keys, and hardware identifiers (IMEI) for your Zalo account.
+The default session is now `session.dat` under the per-user data directory. It is protected with current-user Windows DPAPI. SQLite history remains unencrypted at the application layer.
 
-**Security Requirements:**
-- **Never commit** `session.json` to version control (ensure it remains in `.gitignore`).
-- **Never share** the file or its contents with anyone or paste it into issue trackers or public chats.
-- Anyone with access to this file can access your active Zalo chat session without re-authenticating.
-- If this file is accidentally exposed, log out of Zalo immediately from your mobile app (Settings > Account & Security > Login History / Active Sessions) to invalidate all session keys and cookies.
+Never commit or share session files, history databases, media caches or diagnostic logs. DPAPI does not protect against malicious processes running as the same Windows user. Disabling remember-login removes the saved session and prevents subsequent authentication/refresh paths from persisting it.
+
+Local logout removes the saved session, invalidates in-process session snapshots and separates the next account from the previous account's history. It does not revoke the server-side session. If credentials were exposed, revoke the affected session from the official Zalo mobile application's account security settings.
+
+Legacy session.json and unscoped history are not imported automatically. Keep them private, reauthenticate, and verify account ownership before any manual migration.

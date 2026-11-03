@@ -72,7 +72,7 @@ impl ZaloGuiApp {
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::RefreshThreads);
                             }
-                            self.show_toast("Đang đồng bộ 20 hội thoại ngầm…");
+                            self.show_toast("Đang cập nhật hội thoại và tin gần đây…");
                             close_menu = true;
                         }
 
@@ -180,6 +180,7 @@ impl ZaloGuiApp {
         }
 
         if do_logout {
+            self.flush_composer_before_logout();
             self.is_logged_in = false;
             self.user_name.clear();
             self.user_uin.clear();
@@ -189,11 +190,8 @@ impl ZaloGuiApp {
             self.login_status_msg.clear();
             self.qr_status = "Đang xin mã QR mới…".into();
             self.status_msg = "Đã đăng xuất".into();
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
-                let _ = tx.send(WorkerCmd::RequestQr);
             }
         }
         if close_menu {
@@ -213,7 +211,10 @@ impl ZaloGuiApp {
         let screen = ctx.screen_rect();
         egui::Area::new(Id::new("floating_toast_notice"))
             .order(egui::Order::Tooltip)
-            .fixed_pos(Pos2::new((screen.right() - 320.0).max(80.0), screen.bottom() - 54.0))
+            .fixed_pos(Pos2::new(
+                (screen.right() - 320.0).max(80.0),
+                screen.bottom() - 54.0,
+            ))
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::none()
@@ -266,9 +267,11 @@ impl ZaloGuiApp {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Nhập số điện thoại để tìm tài khoản Zalo (VD: 0912345678 hoặc +84...):")
-                        .size(12.2)
-                        .color(pal.text_secondary),
+                    RichText::new(
+                        "Nhập số điện thoại để tìm tài khoản Zalo (VD: 0912345678 hoặc +84...):",
+                    )
+                    .size(12.2)
+                    .color(pal.text_secondary),
                 );
                 ui.add_space(6.0);
 
@@ -370,10 +373,9 @@ impl ZaloGuiApp {
                                             crate::chat::FriendshipStatus::OutgoingPending => {
                                                 ("Đã gửi lời mời", pal.warning)
                                             }
-                                            crate::chat::FriendshipStatus::Stranger => (
-                                                "Chưa kết bạn",
-                                                Color32::from_rgb(249, 115, 22),
-                                            ),
+                                            crate::chat::FriendshipStatus::Stranger => {
+                                                ("Chưa kết bạn", Color32::from_rgb(249, 115, 22))
+                                            }
                                             crate::chat::FriendshipStatus::Unknown => {
                                                 ("Đang kiểm tra…", pal.text_muted)
                                             }
@@ -529,6 +531,8 @@ impl ZaloGuiApp {
                 self.threads.insert(
                     0,
                     Thread {
+                        presentation: Default::default(),
+                        unread: Default::default(),
                         id: prof.user_id.clone(),
                         name: prof.display_name.clone(),
                         preview: format!("SĐT: {}", prof.phone),
@@ -570,21 +574,24 @@ impl ZaloGuiApp {
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.settings_modal_open = false;
-            self.settings.save();
+            self.save_settings();
             return;
         }
 
+        let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
-        let win_w = (screen.width() * 0.88).clamp(620.0, 780.0);
-        let win_h = (screen.height() * 0.82).clamp(480.0, 600.0);
+        let win_w = (screen.width() - 16.0).clamp(160.0, 900.0);
+        let win_h = (screen.height() - 16.0).clamp(160.0, 680.0);
+        let compact = win_w < 700.0;
+        let sidebar_w = if compact { 48.0 } else { 200.0 };
 
         let mut theme_switched = false;
         let mut trigger_sync = false;
         let mut pick_dl_dir = false;
         let mut open_dl_dir = false;
 
-        egui::Window::new("settings_window_modal")
+        let response = egui::Window::new("settings_window_modal")
             .title_bar(false)
             .collapsible(false)
             .resizable(false)
@@ -601,12 +608,13 @@ impl ZaloGuiApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
 
+                    if !compact {
                     // Left Tabs Navigation Sidebar (200px)
                     egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(10.0, 16.0))
                         .show(ui, |ui| {
-                            ui.set_width(200.0);
+                            ui.set_width(sidebar_w);
                             ui.set_height(win_h - 32.0);
                             ui.vertical(|ui| {
                                 ui.add_space(4.0);
@@ -637,7 +645,7 @@ impl ZaloGuiApp {
                                     };
 
                                     let (rect, resp) = ui.allocate_exact_size(
-                                        Vec2::new(196.0, 36.0),
+                                        Vec2::new(sidebar_w - 4.0, 36.0),
                                         Sense::click(),
                                     );
                                     if is_active || resp.hovered() {
@@ -659,6 +667,7 @@ impl ZaloGuiApp {
                                         14.5,
                                         text_col,
                                     );
+                                    if !compact {
                                     let text_pt = Pos2::new(rect.left() + 38.0, rect.center().y);
                                     ui.painter().text(
                                         text_pt,
@@ -672,6 +681,8 @@ impl ZaloGuiApp {
                                         },
                                     );
 
+                                    }
+
                                     if resp
                                         .on_hover_cursor(CursorIcon::PointingHand)
                                         .clicked()
@@ -683,12 +694,16 @@ impl ZaloGuiApp {
                             });
                         });
 
+                    }
                     // Right Content Panel
-                    let content_w = win_w - 220.0;
+                    let content_w = (win_w - if compact { 0.0 } else { sidebar_w + 20.0 } - 48.0).max(64.0);
                     egui::Frame::none()
                         .fill(pal.bg_chat_canvas)
                         .inner_margin(Margin::symmetric(24.0, 16.0))
                         .show(ui, |ui| {
+                            // The surrounding row is horizontal. Explicitly stack
+                            // the page header and scroll viewport vertically.
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             ui.set_width(content_w);
                             ui.set_height(win_h - 32.0);
 
@@ -702,12 +717,29 @@ impl ZaloGuiApp {
                                     SettingsTab::Messages => "Cài đặt tin nhắn",
                                     SettingsTab::Utilities => "Tiện ích & Gợi ý",
                                 };
+                                if compact {
+                                    egui::ComboBox::from_id_salt("settings_compact_tab")
+                                        .width((content_w - 70.0).max(40.0))
+                                        .selected_text(tab_title)
+                                        .show_ui(ui, |ui| {
+                                            for (tab, title) in [
+                                                (SettingsTab::General,"Cài đặt chung"),
+                                                (SettingsTab::Privacy,"Quyền riêng tư"),
+                                                (SettingsTab::Sync,"Lịch sử tin nhắn"),
+                                                (SettingsTab::Appearance,"Giao diện"),
+                                                (SettingsTab::Notifications,"Thông báo"),
+                                                (SettingsTab::Messages,"Tin nhắn"),
+                                                (SettingsTab::Utilities,"Tiện ích"),
+                                            ] { ui.selectable_value(&mut self.settings_tab,tab,title); }
+                                        });
+                                } else {
                                 ui.label(
                                     RichText::new(tab_title)
                                         .size(15.5)
                                         .color(pal.text_primary)
                                         .strong(),
                                 );
+                                }
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     let (cr, c_resp) = ui.allocate_exact_size(
                                         Vec2::splat(26.0),
@@ -744,7 +776,10 @@ impl ZaloGuiApp {
                             ui.separator();
                             ui.add_space(8.0);
 
-                            egui::ScrollArea::vertical()
+                            egui::ScrollArea::both()
+                                .max_width(content_w)
+                                .min_scrolled_width(0.0)
+                                .max_height((win_h - 100.0).max(32.0))
                                 .auto_shrink([false, false])
                                 .show(ui, |ui| {
                                     match self.settings_tab {
@@ -800,7 +835,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new("Khởi động Zalo khi mở máy").color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal);
+                                                            ui.add_enabled_ui(false, |ui| { render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal); }).response.on_hover_text("Chưa hỗ trợ tự khởi động");
                                                         });
                                                     });
                                                     ui.add_space(8.0);
@@ -841,7 +876,9 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
-                                                    let (mics, cams) = crate::media::list_media_devices(false);
+                                                    let (mics, cams) = if self.smoke.is_some() {
+                                                        (vec!["Fixture microphone".into()], vec!["Fixture camera".into()])
+                                                    } else { crate::media::list_media_devices(false) };
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(format!("{} Đầu vào Mic:", lucide::MIC)).color(pal.text_primary).size(13.0));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -857,13 +894,13 @@ impl ZaloGuiApp {
                                                                     if ui.selectable_label(self.settings.selected_mic_device.is_empty(), "Mặc định hệ thống").clicked() {
                                                                         self.settings.selected_mic_device.clear();
                                                                         crate::media::set_selected_mic_device("");
-                                                                        self.settings.save();
+                                                                        self.save_settings();
                                                                     }
                                                                     for m in &mics {
                                                                         if ui.selectable_label(self.settings.selected_mic_device == *m, m).clicked() {
                                                                             self.settings.selected_mic_device = m.clone();
                                                                             crate::media::set_selected_mic_device(m);
-                                                                            self.settings.save();
+                                                                            self.save_settings();
                                                                         }
                                                                     }
                                                                 });
@@ -885,13 +922,13 @@ impl ZaloGuiApp {
                                                                     if ui.selectable_label(self.settings.selected_camera_device.is_empty(), "Tự động (Camera đầu tiên)").clicked() {
                                                                         self.settings.selected_camera_device.clear();
                                                                         crate::media::set_selected_camera_device("");
-                                                                        self.settings.save();
+                                                                        self.save_settings();
                                                                     }
                                                                     for c in &cams {
                                                                         if ui.selectable_label(self.settings.selected_camera_device == *c, c).clicked() {
                                                                             self.settings.selected_camera_device = c.clone();
                                                                             crate::media::set_selected_camera_device(c);
-                                                                            self.settings.save();
+                                                                            self.save_settings();
                                                                         }
                                                                     }
                                                                 });
@@ -908,106 +945,12 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Privacy => {
-                                            ui.label(RichText::new("Cá nhân").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiện ngày sinh").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_bday_combo")
-                                                                .selected_text(&self.settings.show_birthday)
-                                                                .width(170.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Không hiện".into(), "Không hiện");
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Hiện ngày, tháng, năm".into(), "Hiện ngày, tháng, năm");
-                                                                    ui.selectable_value(&mut self.settings.show_birthday, "Hiện ngày, tháng".into(), "Hiện ngày, tháng");
-                                                                });
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiển thị trạng thái truy cập").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.show_online_status, pal);
-                                                        });
-                                                    });
-                                                });
-                                            ui.add_space(14.0);
-
-                                            ui.label(RichText::new("Tin nhắn và cuộc gọi").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Hiện trạng thái \"Đã xem\"").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.show_seen_status, pal);
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép nhắn tin").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_msg_stranger_combo")
-                                                                .selected_text(&self.settings.allow_message_from)
-                                                                .width(170.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.allow_message_from, "Tất cả mọi người".into(), "Tất cả mọi người");
-                                                                    ui.selectable_value(&mut self.settings.allow_message_from, "Chỉ bạn bè".into(), "Chỉ bạn bè");
-                                                                });
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép gọi điện").color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            egui::ComboBox::from_id_salt("setting_call_stranger_combo")
-                                                                .selected_text(&self.settings.allow_call_from)
-                                                                .width(220.0)
-                                                                .show_ui(ui, |ui| {
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Bạn bè và người lạ từng liên hệ".into(), "Bạn bè và người lạ từng liên hệ");
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Tất cả mọi người".into(), "Tất cả mọi người");
-                                                                    ui.selectable_value(&mut self.settings.allow_call_from, "Chỉ bạn bè".into(), "Chỉ bạn bè");
-                                                                });
-                                                        });
-                                                    });
-                                                });
-                                            ui.add_space(14.0);
-
-                                            ui.label(RichText::new("Nguồn tìm kiếm").color(pal.text_primary).size(13.5).strong());
-                                            ui.add_space(6.0);
-                                            egui::Frame::none()
-                                                .fill(pal.bg_elevated)
-                                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                                .rounding(Rounding::same(8.0))
-                                                .inner_margin(Margin::symmetric(14.0, 10.0))
-                                                .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new("Cho phép người lạ tìm thấy và kết bạn qua số điện thoại").color(pal.text_primary).size(13.0));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.allow_search_by_phone, pal);
-                                                        });
-                                                    });
-                                                    ui.add_space(8.0);
-                                                    ui.separator();
-                                                    ui.add_space(6.0);
-                                                    ui.label(RichText::new("Cho phép người lạ kết bạn").color(pal.text_secondary).size(12.2));
-                                                    ui.add_space(4.0);
-                                                    ui.checkbox(&mut self.settings.friend_src_qr, "Mã QR của tôi");
-                                                    ui.checkbox(&mut self.settings.friend_src_group, "Nhóm chung");
-                                                    ui.checkbox(&mut self.settings.friend_src_card, "Danh thiếp Zalo");
-                                                });
+                                            ui.heading("Quyền riêng tư tài khoản");
+                                            ui.label("Các thiết lập quyền riêng tư trên máy chủ chưa được tích hợp. Hãy thay đổi trên ứng dụng Zalo chính thức; các nút cũ chỉ lưu cục bộ nên đã được gỡ để tránh hiểu nhầm.");
                                         }
                                         SettingsTab::Sync => {
+                                            if ui.button("Nhập / Xuất lịch sử…").clicked(){self.tools.open=true;self.tools.tab=1;open=false;}
+
                                             ui.label(RichText::new("Đồng bộ tin nhắn").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
@@ -1017,14 +960,67 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::same(14.0))
                                                 .show(ui, |ui| {
                                                     ui.vertical(|ui| {
-                                                        ui.label(RichText::new("Zalo lưu trữ và đồng bộ dữ liệu lịch sử tin nhắn với đám mây Zalo và SQLite cục bộ (zalo_history.db).").color(pal.text_primary).size(13.0));
+                                                        ui.label(RichText::new("Đồng bộ từ điện thoại yêu cầu xác nhận trong Zalo di động. Lịch sử được lưu vào SQLite theo tài khoản; chỉ khôi phục dữ liệu điện thoại còn giữ, không bảo đảm tệp đính kèm cũ còn hạn.").color(pal.text_primary).size(13.0));
                                                         ui.add_space(4.0);
                                                         let total_msgs: usize = self.threads.iter().map(|t| t.messages.len()).sum();
                                                         ui.label(RichText::new(format!("Hiện có {} hội thoại ({total_msgs} tin nhắn) trong bộ nhớ.", self.threads.len())).color(pal.text_secondary).size(12.2));
                                                         ui.add_space(10.0);
-                                                        if ui.button(RichText::new(format!("{} Đồng bộ ngay", lucide::REFRESH)).size(13.0).strong()).clicked() {
+                                                        if ui.button(RichText::new(format!("{} Cập nhật hội thoại", lucide::REFRESH)).size(13.0).strong()).clicked() {
                                                             trigger_sync = true;
                                                         }
+                                                        ui.add_space(8.0);
+                                                        ui.label("Tải dữ liệu máy chủ còn cung cấp: lịch sử nhóm và Cloud của tôi (tối đa 200 trang/hội thoại mỗi lượt). Máy chủ thường chỉ trả tin từ sau lần đăng nhập đầu tiên trên thiết bị này; tin cũ và chat cá nhân cần Đồng bộ từ điện thoại.");
+                                                        let mut history_command = None;
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            if ui.button(if self.history_sync_running { "Dừng tải" } else { "Tải dữ liệu máy chủ còn cung cấp" }).clicked() {
+                                                                history_command = Some(if self.history_sync_running { WorkerCmd::CancelHistorySync }
+                                                                    else { WorkerCmd::SyncHistory { threads: self.threads.clone(), retry_filtered: false } });
+                                                            }
+                                                            if !self.history_sync_running && ui.button("Thử lại hội thoại bị giới hạn").on_hover_text("Hỏi lại máy chủ cả những hội thoại vừa bị giới hạn trong 24 giờ qua").clicked() {
+                                                                history_command = Some(WorkerCmd::SyncHistory { threads: self.threads.clone(), retry_filtered: true });
+                                                            }
+                                                        });
+                                                        if let (Some(command), Some(tx)) = (history_command, WORKER_TX.get()) {
+                                                            let cancel = matches!(command, WorkerCmd::CancelHistorySync);
+                                                            if tx.send(command).is_ok() {
+                                                                if cancel { self.sync_cancel_requested=true; }
+                                                                else { self.history_sync_running=true; self.history_sync_status="Đang bắt đầu tải dữ liệu máy chủ…".into(); self.sync_notice_dismissed=false; }
+                                                            }
+                                                        }
+                                                        ui.label(&self.history_sync_status);
+                                                        ui.separator();
+                                                        ui.horizontal(|ui| {
+                                                            ui.label("Khoảng lịch sử:");
+                                                            let label = |days: u32| match days { 0 => "Toàn bộ", 365 => "1 năm", 90 => "90 ngày", _ => "30 ngày" };
+                                                            egui::ComboBox::from_id_salt("phone_sync_range")
+                                                                .selected_text(label(self.settings.phone_sync_range_days))
+                                                                .show_ui(ui, |ui| {
+                                                                    for days in [0u32, 365, 90, 30] {
+                                                                        ui.selectable_value(&mut self.settings.phone_sync_range_days, days, label(days));
+                                                                    }
+                                                                });
+                                                        });
+                                                        if ui.button(if self.phone_sync_running {"Dừng đồng bộ điện thoại"}else{"Đồng bộ từ điện thoại"}).clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {
+                                                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::SyncPhoneHistory{range_days:self.settings.phone_sync_range_days}}).is_ok() {
+                                                                    if self.phone_sync_running {self.sync_cancel_requested=true;}
+                                                                    else {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị đồng bộ điện thoại…".into();self.sync_notice_dismissed=false;}
+                                                                }
+                                                            }
+                                                        }
+                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Chỉ cập nhật tin gần đây")).on_hover_text("Lấy phần mới từ checkpoint; nếu chưa có mốc thì lấy 7 ngày gần nhất, chưa tải lịch sử cũ hơn").clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::SyncPhoneRecent).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị lấy tin gần đây…".into();self.sync_notice_dismissed=false;}}
+                                                        }
+                                                        if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Quét lại toàn bộ lịch sử điện thoại")).on_hover_text("Bỏ mốc tiến độ để kiểm tra lại lịch sử; không xóa tin đã lưu").clicked() {
+                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::RescanPhoneHistory{range_days:self.settings.phone_sync_range_days}).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị quét lại lịch sử điện thoại…".into();self.sync_notice_dismissed=false;}}
+                                                        }
+                                                        ui.label("Ưu tiên hội thoại hoạt động gần đây; lấy khoảng tin mới trước rồi mới tải lịch sử cũ. Lần sau tiếp tục từ mốc đã hoàn tất.");
+                                                        if self.phone_sync_running && ui.button("Đánh thức điện thoại").on_hover_text("Gửi lại thông báo tới Zalo trên điện thoại khi việc gửi lịch sử bị đứng").clicked() {
+                                                            crate::phone_sync::request_wake();
+                                                        }
+                                                        ui.label(&self.phone_sync_status);
+                                                        ui.label("Mở Zalo trên điện thoại, chọn Đồng bộ ngay khi được hỏi. Có thể dừng và chạy lại; các tin đã lưu không bị mất.");
+
                                                     });
                                                 });
                                         }
@@ -1038,15 +1034,15 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(18.0, 16.0))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 18.0;
+                                                        ui.spacing_mut().item_spacing.x = 8.0;
                                                         for (mode_key, label, is_dark_val) in [
                                                             ("light", "Sáng", false),
                                                             ("dark", "Tối", true),
                                                             ("system", "Hệ Thống", true),
                                                         ] {
                                                             let selected = self.settings.theme_mode == mode_key;
-                                                            ui.vertical_centered(|ui| {
-                                                                let (card_r, c_resp) = ui.allocate_exact_size(Vec2::new(132.0, 84.0), Sense::click());
+                                                            ui.vertical(|ui| {
+                                                                let (card_r, c_resp) = ui.allocate_exact_size(Vec2::new(((content_w - 52.0) / 3.0).clamp(60.0, 132.0), 84.0), Sense::click());
                                                                 let stroke_col = if selected {
                                                                     pal.primary_hover
                                                                 } else if c_resp.hovered() {
@@ -1081,7 +1077,7 @@ impl ZaloGuiApp {
                                                                 let r_clicked = ui.radio(selected, label).clicked();
                                                                 if c_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() || r_clicked {
                                                                     self.settings.theme_mode = mode_key.into();
-                                                                    self.dark_mode = is_dark_val;
+                                                                    self.dark_mode = if mode_key == "system" { ctx.system_theme() != Some(egui::Theme::Light) } else { is_dark_val };
                                                                     theme_switched = true;
                                                                 }
                                                             });
@@ -1176,6 +1172,28 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.quick_messages_enabled, pal);
                                                         });
                                                     });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Hiện khi người khác đang soạn tin").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.show_typing, pal);
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Cho người khác biết khi tôi đang soạn tin").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.send_typing, pal);
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Gửi ảnh ở chất lượng gốc").color(pal.text_primary).size(13.2))
+                                                            .on_hover_text("Tắt để gửi bản HD (cạnh dài tối đa 2560 px), nhẹ và nhanh hơn");
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.send_photo_original, pal);
+                                                        });
+                                                    });
                                                 });
                                             ui.add_space(14.0);
 
@@ -1263,6 +1281,13 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Utilities => {
+                                            ui.label(format!("Phiên bản {} • Windows ARM64",env!("CARGO_PKG_VERSION")));
+                                            if ui.add_enabled(!self.update_busy,egui::Button::new("Kiểm tra cập nhật")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::CheckUpdate).is_ok(){self.update_busy=true;self.update_status="Đang kiểm tra bản phát hành của fork…".into();}}}
+                                            if let Some(release)=self.update_offer.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new(format!("Tải bộ cài {}",release.tag))).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::PrepareUpdate(release)).is_ok(){self.update_busy=true;self.update_status="Đang tải và kiểm tra bản cập nhật…".into();}}}}
+                                            if let Some(ready)=self.update_ready.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new("Mở bộ cài và đóng ứng dụng")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::LaunchUpdate(ready)).is_ok(){self.update_busy=true;}}}}
+                                            ui.label(&self.update_status);ui.separator();
+
+                                            if ui.button("Tìm lịch sử, nhập dữ liệu, theme/sticker, hẹn giờ & tự trả lời").clicked() { self.tools.open=true; }
                                             ui.label(RichText::new("Gợi ý Sticker").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
@@ -1333,13 +1358,27 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 });
+                            });
                         });
                 });
             });
 
+        if self.smoke.as_ref().is_some_and(|smoke| smoke.frames >= 3) {
+            if let Some(response) = response {
+                let rect = response.response.rect;
+                assert!(
+                    screen.expand(1.0).contains_rect(rect),
+                    "Settings outside screen: {rect:?}, screen={screen:?}"
+                );
+            }
+        }
+
+        if self.settings.remember_login != previous_remember {
+            self.save_settings();
+        }
         if theme_switched {
             self.theme_dirty = true;
-            self.settings.save();
+            self.save_settings();
             self.show_toast(if self.dark_mode {
                 "Đã chuyển sang giao diện Tối (Atom One Dark)"
             } else {
@@ -1350,38 +1389,31 @@ impl ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::RefreshThreads);
             }
-            self.show_toast("Đang đồng bộ dữ liệu hội thoại từ máy chủ Zalo…");
+            self.show_toast("Đang cập nhật hội thoại và tin gần đây…");
         }
         if pick_dl_dir {
-            if let Some(dir_path) = pick_native_folder_dialog() {
-                self.settings.download_dir = dir_path.display().to_string();
-                self.settings.save();
-                self.show_toast(format!("Đã đổi thư mục lưu file: {}", self.settings.download_dir));
-            }
+            let tx = self.event_tx.clone();
+            let context = ctx.clone();
+            std::thread::spawn(move || {
+                if let Some(path) = pick_native_folder_dialog() {
+                    let _ = tx.send(GuiEvent::DownloadFolderPicked(path));
+                    context.request_repaint();
+                }
+            });
         }
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
             let _ = std::fs::create_dir_all(&p);
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("explorer").arg(&p).spawn();
-            }
-            #[cfg(target_os = "macos")]
-            {
-                let _ = std::process::Command::new("open").arg(&p).spawn();
-            }
-            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            {
-                let _ = std::process::Command::new("xdg-open").arg(&p).spawn();
+            if !crate::platform::open_folder(std::path::Path::new(&p)) {
+                self.show_toast("Không mở được thư mục tải về");
             }
         }
 
         if !open {
             self.settings_modal_open = false;
-            self.settings.save();
+            self.save_settings();
         }
     }
-
 
     pub(super) fn render_call_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut call) = self.active_call.clone() else {
@@ -1400,7 +1432,10 @@ impl ZaloGuiApp {
         let mut retry_clicked = false;
 
         let has_err = call.error_reason.is_some();
-        let is_video_stage = call.is_video && !has_err;
+        let is_video_stage = (call.is_video
+            || self.sticker_textures.contains_key("call_remote_video")
+            || self.sticker_textures.contains_key("call_remote_video_1"))
+            && !has_err;
         let default_w = if is_video_stage { 860.0 } else { 440.0 };
         let default_h = if is_video_stage { 660.0 } else { 470.0 };
         let win_title = if call.is_video {
@@ -1478,12 +1513,14 @@ impl ZaloGuiApp {
                                         });
 
                                     let (mics, cams) = crate::media::list_media_devices(false);
-                                    let cur_mic_lbl = if self.settings.selected_mic_device.is_empty()
-                                    {
-                                        mics.first().map(String::as_str).unwrap_or("Mic mặc định")
-                                    } else {
-                                        &self.settings.selected_mic_device
-                                    };
+                                    let cur_mic_lbl =
+                                        if self.settings.selected_mic_device.is_empty() {
+                                            mics.first()
+                                                .map(String::as_str)
+                                                .unwrap_or("Mic mặc định")
+                                        } else {
+                                            &self.settings.selected_mic_device
+                                        };
                                     egui::ComboBox::from_id_salt("call_vp_mic_combo")
                                         .selected_text(format!(
                                             "{} {}",
@@ -1501,7 +1538,7 @@ impl ZaloGuiApp {
                                             {
                                                 self.settings.selected_mic_device.clear();
                                                 crate::media::set_selected_mic_device("");
-                                                self.settings.save();
+                                                self.save_settings();
                                             }
                                             for m in &mics {
                                                 if ui
@@ -1513,7 +1550,7 @@ impl ZaloGuiApp {
                                                 {
                                                     self.settings.selected_mic_device = m.clone();
                                                     crate::media::set_selected_mic_device(m);
-                                                    self.settings.save();
+                                                    self.save_settings();
                                                 }
                                             }
                                         });
@@ -1543,7 +1580,7 @@ impl ZaloGuiApp {
                                             {
                                                 self.settings.selected_camera_device.clear();
                                                 crate::media::set_selected_camera_device("");
-                                                self.settings.save();
+                                                self.save_settings();
                                             }
                                             for c in &cams {
                                                 if ui
@@ -1556,7 +1593,7 @@ impl ZaloGuiApp {
                                                     self.settings.selected_camera_device =
                                                         c.clone();
                                                     crate::media::set_selected_camera_device(c);
-                                                    self.settings.save();
+                                                    self.save_settings();
                                                 }
                                             }
                                         });
@@ -1579,10 +1616,8 @@ impl ZaloGuiApp {
                         if is_video_stage {
                             let stage_w = avail_w.max(320.0);
                             let stage_h = (avail_h - 156.0).max(240.0);
-                            let (stage_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(stage_w, stage_h),
-                                Sense::hover(),
-                            );
+                            let (stage_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(stage_w, stage_h), Sense::hover());
                             let painter = ui.painter();
                             painter.rect_filled(
                                 stage_rect,
@@ -1610,8 +1645,7 @@ impl ZaloGuiApp {
                                 } else {
                                     Vec2::new(inner.width(), inner.width() / tex_aspect)
                                 };
-                                let draw_rect =
-                                    Rect::from_center_size(inner.center(), draw_size);
+                                let draw_rect = Rect::from_center_size(inner.center(), draw_size);
                                 painter.rect_filled(
                                     draw_rect.expand(2.0),
                                     Rounding::same(12.0),
@@ -1632,12 +1666,9 @@ impl ZaloGuiApp {
                                     ),
                                 );
                             } else {
-                                let center = Pos2::new(
-                                    stage_rect.center().x,
-                                    stage_rect.center().y - 16.0,
-                                );
-                                let pulse =
-                                    ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+                                let center =
+                                    Pos2::new(stage_rect.center().x, stage_rect.center().y - 16.0);
+                                let pulse = ((elapsed_f * 2.6).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
                                 painter.circle_filled(
                                     center,
                                     46.0 + pulse * 6.0,
@@ -1677,11 +1708,33 @@ impl ZaloGuiApp {
                                 ),
                                 Vec2::new(pip_w, pip_h),
                             );
-                            painter.rect_filled(
-                                pip_rect,
-                                Rounding::same(12.0),
-                                pal.bg_elevated,
-                            );
+                            painter.rect_filled(pip_rect, Rounding::same(12.0), pal.bg_elevated);
+                            if call.is_group {
+                                if let Some(texture) =
+                                    self.sticker_textures.get("call_remote_video_1")
+                                {
+                                    let width = (stage_rect.width() * 0.32).clamp(80.0, 220.0);
+                                    let height = width * texture.size_vec2().y
+                                        / texture.size_vec2().x.max(1.0);
+                                    let rect = Rect::from_min_size(
+                                        stage_rect.left_top() + Vec2::new(14.0, 14.0),
+                                        Vec2::new(width, height.min(stage_rect.height() * 0.4)),
+                                    );
+                                    painter.image(
+                                        texture.id(),
+                                        rect,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                    painter.text(
+                                        rect.left_bottom() + Vec2::new(0.0, 3.0),
+                                        egui::Align2::LEFT_TOP,
+                                        "Thành viên nhóm",
+                                        FontId::proportional(11.0),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
                             if call.cam_enabled {
                                 if let Some(ltex) = self.sticker_textures.get("call_local_video") {
                                     let inner_pip = pip_rect.shrink(2.0);
@@ -1695,18 +1748,19 @@ impl ZaloGuiApp {
                                     let uv = if laspect > paspect {
                                         let frac = paspect / laspect;
                                         let m = (1.0 - frac) * 0.5;
-                                        Rect::from_min_max(Pos2::new(m, 0.0), Pos2::new(1.0 - m, 1.0))
+                                        Rect::from_min_max(
+                                            Pos2::new(m, 0.0),
+                                            Pos2::new(1.0 - m, 1.0),
+                                        )
                                     } else {
                                         let frac = laspect / paspect;
                                         let m = (1.0 - frac) * 0.5;
-                                        Rect::from_min_max(Pos2::new(0.0, m), Pos2::new(1.0, 1.0 - m))
+                                        Rect::from_min_max(
+                                            Pos2::new(0.0, m),
+                                            Pos2::new(1.0, 1.0 - m),
+                                        )
                                     };
-                                    painter.image(
-                                        ltex.id(),
-                                        inner_pip,
-                                        uv,
-                                        Color32::WHITE,
-                                    );
+                                    painter.image(ltex.id(), inner_pip, uv, Color32::WHITE);
                                 } else {
                                     let self_disp = if self.user_name.is_empty() {
                                         "Tôi"
@@ -1868,9 +1922,7 @@ impl ZaloGuiApp {
                                                 .color(Color32::from_rgb(203, 213, 225)),
                                         );
                                         ui.label(
-                                            RichText::new("·")
-                                                .size(13.0)
-                                                .color(pal.text_muted),
+                                            RichText::new("·").size(13.0).color(pal.text_muted),
                                         );
                                         ui.label(
                                             RichText::new(&timer_str)
@@ -1937,10 +1989,8 @@ impl ZaloGuiApp {
                                 ui.horizontal_centered(|ui| {
                                     ui.spacing_mut().item_spacing.x = 44.0;
                                     ui.vertical_centered(|ui| {
-                                        let (dec_r, dec_resp) = ui.allocate_exact_size(
-                                            Vec2::splat(52.0),
-                                            Sense::click(),
-                                        );
+                                        let (dec_r, dec_resp) = ui
+                                            .allocate_exact_size(Vec2::splat(52.0), Sense::click());
                                         ui.painter().circle_filled(
                                             dec_r.center(),
                                             25.0,
@@ -1959,8 +2009,10 @@ impl ZaloGuiApp {
                                             .clicked()
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx
-                                                    .send(WorkerCmd::AnswerCall { accept: false });
+                                                let _ = tx.send(WorkerCmd::AnswerCall {
+                                                    accept: false,
+                                                    call_id: call.call_id,
+                                                });
                                             }
                                             self.active_call = None;
                                         }
@@ -1972,10 +2024,8 @@ impl ZaloGuiApp {
                                     });
 
                                     ui.vertical_centered(|ui| {
-                                        let (acc_r, acc_resp) = ui.allocate_exact_size(
-                                            Vec2::splat(52.0),
-                                            Sense::click(),
-                                        );
+                                        let (acc_r, acc_resp) = ui
+                                            .allocate_exact_size(Vec2::splat(52.0), Sense::click());
                                         ui.painter().circle_filled(
                                             acc_r.center(),
                                             25.0,
@@ -1996,8 +2046,10 @@ impl ZaloGuiApp {
                                             call.is_incoming_ringing = false;
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx
-                                                    .send(WorkerCmd::AnswerCall { accept: true });
+                                                let _ = tx.send(WorkerCmd::AnswerCall {
+                                                    accept: true,
+                                                    call_id: call.call_id,
+                                                });
                                             }
                                         }
                                         ui.label(
@@ -2143,7 +2195,7 @@ impl ZaloGuiApp {
                                         .clicked()
                                     {
                                         call.cam_enabled = !call.cam_enabled;
-                                        call.is_video = call.cam_enabled;
+                                        call.is_video |= call.cam_enabled;
                                         if !call.cam_enabled {
                                             self.sticker_textures.remove("call_local_video");
                                         }
@@ -2183,9 +2235,12 @@ impl ZaloGuiApp {
         } else if hangup_clicked {
             self.active_call = None;
             self.sticker_textures.remove("call_remote_video");
+            self.sticker_textures.remove("call_remote_video_1");
             self.sticker_textures.remove("call_local_video");
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall);
+                let _ = tx.send(WorkerCmd::EndCall {
+                    call_id: call.call_id,
+                });
             }
         } else if self.active_call.is_some() {
             self.active_call = Some(call);
@@ -2281,12 +2336,15 @@ impl ZaloGuiApp {
         }
 
         let screen_rect = ctx.screen_rect();
-        // Start below the 32px custom frameless title bar so window controls stay accessible
-        let viewer_top = (screen_rect.top() + 32.0).min(screen_rect.bottom());
+        // Windows owns the native caption outside the client area.
+        let viewer_top = screen_rect.top();
         let toolbar_h = 46.0_f32;
         let toolbar_rect = Rect::from_min_max(
             Pos2::new(screen_rect.left(), viewer_top),
-            Pos2::new(screen_rect.right(), (viewer_top + toolbar_h).min(screen_rect.bottom())),
+            Pos2::new(
+                screen_rect.right(),
+                (viewer_top + toolbar_h).min(screen_rect.bottom()),
+            ),
         );
         let stage_area_rect = Rect::from_min_max(
             Pos2::new(screen_rect.left(), toolbar_rect.bottom()),
@@ -2370,11 +2428,7 @@ impl ZaloGuiApp {
                         Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
-                    painter.rect_stroke(
-                        img_rect,
-                        Rounding::ZERO,
-                        Stroke::new(1.0_f32, pal.border),
-                    );
+                    painter.rect_stroke(img_rect, Rounding::ZERO, Stroke::new(1.0_f32, pal.border));
 
                     if bg_resp.dragged_by(egui::PointerButton::Primary) {
                         viewer.pan += bg_resp.drag_delta();
@@ -2412,7 +2466,13 @@ impl ZaloGuiApp {
                     painter.text(
                         img_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Đang tải hình ảnh…",
+                        viewer
+                            .hd_tex_key
+                            .as_ref()
+                            .and_then(|k| self.image_failures.get(k))
+                            .or_else(|| self.image_failures.get(&viewer.tex_key))
+                            .map(|e| e.failure.message())
+                            .unwrap_or("Đang tải hình ảnh…"),
                         FontId::proportional(13.0),
                         pal.text_primary,
                     );
@@ -2423,13 +2483,12 @@ impl ZaloGuiApp {
             });
         // 3. Clean Unified Top Toolbar Bar (docked under custom title bar, matching Atom One Dark pal.bg_sidebar)
         let clean_title = {
-            let mut t = viewer
-                .title
-                .trim()
-                .trim_start_matches(lucide::IMAGE)
-                .trim();
+            let mut t = viewer.title.trim().trim_start_matches(lucide::IMAGE).trim();
             if let Some(paren_idx) = t.rfind(" (") {
-                if t[paren_idx..].contains('×') || t[paren_idx..].contains("KB") || t[paren_idx..].contains("MB") {
+                if t[paren_idx..].contains('×')
+                    || t[paren_idx..].contains("KB")
+                    || t[paren_idx..].contains("MB")
+                {
                     t = t[..paren_idx].trim();
                 }
             }
@@ -2461,11 +2520,8 @@ impl ZaloGuiApp {
                             // Left: Subtle icon badge + filename + sender/time/dimensions
                             let (badge_r, _) =
                                 ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            ui.painter().rect_filled(
-                                badge_r,
-                                Rounding::same(6.0),
-                                pal.bg_elevated,
-                            );
+                            ui.painter()
+                                .rect_filled(badge_r, Rounding::same(6.0), pal.bg_elevated);
                             draw_icon_image(
                                 ui.painter(),
                                 badge_r.center(),
@@ -2488,13 +2544,12 @@ impl ZaloGuiApp {
                                 let sub = if viewer.time.is_empty() {
                                     format!("{}{dim_str}", viewer.sender)
                                 } else {
-                                    format!("Gửi bởi {} lúc {}{dim_str}", viewer.sender, viewer.time)
+                                    format!(
+                                        "Gửi bởi {} lúc {}{dim_str}",
+                                        viewer.sender, viewer.time
+                                    )
                                 };
-                                ui.label(
-                                    RichText::new(sub)
-                                        .size(11.0)
-                                        .color(pal.text_muted),
-                                );
+                                ui.label(RichText::new(sub).size(11.0).color(pal.text_muted));
                             });
 
                             // Right: Unified Zoom + Actions + Close
@@ -2502,10 +2557,8 @@ impl ZaloGuiApp {
                                 ui.spacing_mut().item_spacing.x = 6.0;
 
                                 // Close button (30x28, Atom One Dark style)
-                                let (close_r, close_resp) = ui.allocate_exact_size(
-                                    Vec2::new(30.0, 28.0),
-                                    Sense::click(),
-                                );
+                                let (close_r, close_resp) =
+                                    ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
                                 ui.painter().rect_filled(
                                     close_r,
                                     Rounding::same(6.0),
@@ -2541,7 +2594,7 @@ impl ZaloGuiApp {
 
                                 if !viewer.full_url.is_empty() {
                                     let ext_btn = egui::Button::new(
-                                        RichText::new(format!("{} Mở gốc", lucide::EXTERNAL_LINK))
+                                        RichText::new("Lưu bản gốc")
                                             .size(11.8)
                                             .color(pal.text_primary),
                                     )
@@ -2555,7 +2608,43 @@ impl ZaloGuiApp {
                                         .on_hover_text(&viewer.full_url)
                                         .clicked()
                                     {
-                                        open_external_url(&viewer.full_url);
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let context = self
+                                                .threads
+                                                .get(self.selected_thread_index)
+                                                .and_then(|thread| {
+                                                    thread
+                                                        .messages
+                                                        .iter()
+                                                        .find(|message| {
+                                                            crate::media_recovery::image_key(
+                                                                &thread.id,
+                                                                &message.id,
+                                                                0,
+                                                                false,
+                                                            ) == viewer.tex_key
+                                                        })
+                                                        .map(|message| super::worker::ChatImage {
+                                                            thread: thread.id.clone(),
+                                                            group: thread.is_group,
+                                                            message: message.clone(),
+                                                            preview: false,
+                                                        })
+                                                });
+                                            let url = context
+                                                .as_ref()
+                                                .and_then(|context| {
+                                                    crate::message_view::media(&context.message)
+                                                        .original
+                                                })
+                                                .unwrap_or_else(|| viewer.original_url.clone());
+                                            let _ = tx.send(WorkerCmd::DownloadMedia {
+                                                url,
+                                                name: viewer.title.clone(),
+                                                play: false,
+                                                context,
+                                            });
+                                        }
                                     }
 
                                     let copy_btn = egui::Button::new(
@@ -2651,7 +2740,6 @@ impl ZaloGuiApp {
         }
     }
 
-
     /// Detect an `http://` or `https://` URL in `self.input_message` and asynchronously fetch its
     /// OpenGraph / Zalo `parselink` metadata (`title`, `desc`, `thumb`, `src`).
     pub(super) fn resolve_composer_link_preview(
@@ -2705,7 +2793,10 @@ impl ZaloGuiApp {
     ) {
         let strip_h = 72.0_f32;
         let strip_w = composer_rect.width().max(220.0);
-        let pos = Pos2::new(composer_rect.left(), (composer_rect.top() - strip_h).max(48.0));
+        let pos = Pos2::new(
+            composer_rect.left(),
+            (composer_rect.top() - strip_h).max(48.0),
+        );
         let mut dismiss_clicked = false;
 
         egui::Area::new(Id::new("zalo_composer_link_preview_popover"))
@@ -2771,11 +2862,7 @@ impl ZaloGuiApp {
                                 } else {
                                     clean_display_url(&meta.url, 48)
                                 };
-                                ui.label(
-                                    RichText::new(sub)
-                                        .size(11.3)
-                                        .color(pal.text_secondary),
-                                );
+                                ui.label(RichText::new(sub).size(11.3).color(pal.text_secondary));
                             });
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if ui
@@ -2796,7 +2883,6 @@ impl ZaloGuiApp {
         }
     }
 
-
     pub(super) fn render_dev_logs(&mut self, ui: &mut egui::Ui) {
         let entries = logger::get_entries();
         ui.horizontal(|ui| {
@@ -2806,8 +2892,10 @@ impl ZaloGuiApp {
                     .id_salt("dev_logs_list_scroll")
                     .show(ui, |ui| {
                         for e in entries.iter().rev() {
-                            let st_str =
-                                e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
+                            let st_str = e
+                                .status
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "ERR".into());
                             let row = ui.selectable_label(
                                 self.selected_log
                                     .as_ref()

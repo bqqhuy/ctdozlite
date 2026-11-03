@@ -34,11 +34,58 @@ pub const STAT_INTERVAL: Duration = Duration::from_secs(5);
 
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
+pub fn diagnostics_enabled() -> bool {
+    crate::logger::is_dev_mode() || std::env::var("ZALO_DIAGNOSTICS").ok().as_deref() == Some("1")
+}
+
 fn log_path() -> Option<String> {
+    if !diagnostics_enabled() {
+        return None;
+    }
     match std::env::var("ZALO_VOIP_LOG") {
         Ok(v) if v.eq_ignore_ascii_case("off") || v == "0" => None,
         Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => Some("voip.log".to_string()),
+        _ => Some(
+            crate::storage::root()
+                .join("diagnostics/voip.log")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    }
+}
+
+pub fn append_diagnostic(name: &str, text: &str) {
+    let path = crate::storage::root().join("diagnostics").join(name);
+    append_to_path(&path, text);
+}
+
+fn append_to_path(path: &std::path::Path, text: &str) {
+    let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parent) = path.parent() {
+        if crate::storage::private_dir(parent).is_err() {
+            return;
+        }
+    }
+    if std::fs::metadata(path)
+        .map(|m| m.len() >= ROTATE_BYTES)
+        .unwrap_or(false)
+    {
+        let previous = path.with_file_name(format!(
+            "{}.1",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&previous);
+        let _ = std::fs::rename(path, previous);
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut f) = options.open(path) {
+        let _ = f.write_all(text.as_bytes());
     }
 }
 
@@ -75,15 +122,7 @@ pub fn line(tag: &str, body: impl AsRef<str>) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let text = format!("{}\t{} {}\n", format_ts(now), tag, body.as_ref());
-    let _guard = FILE_LOCK.lock();
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() >= ROTATE_BYTES {
-            let _ = std::fs::rename(&path, format!("{path}.1"));
-        }
-    }
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = f.write_all(text.as_bytes());
-    }
+    append_to_path(std::path::Path::new(&path), &text);
 }
 
 /// Lower-case hex of the first `max` bytes, with `..` appended if truncated.
@@ -288,7 +327,14 @@ pub fn describe_rtcp(rtcp: &[u8]) -> (String, bool) {
                 if b + 24 > end {
                     break;
                 }
-                let u32at = |o: usize| u32::from_be_bytes([rtcp[b + o], rtcp[b + o + 1], rtcp[b + o + 2], rtcp[b + o + 3]]);
+                let u32at = |o: usize| {
+                    u32::from_be_bytes([
+                        rtcp[b + o],
+                        rtcp[b + o + 1],
+                        rtcp[b + o + 2],
+                        rtcp[b + o + 3],
+                    ])
+                };
                 let cum = u32at(4) & 0x00FF_FFFF;
                 d.push_str(&format!(
                     ",blk[ssrc={:#010x},fl={},lost={},hi={},jit={},lsr={:#x},dlsr={}]",
@@ -428,7 +474,7 @@ impl WireLog {
             .entry(format!("{dir}{}", h.pt))
             .or_default();
         *n += 1;
-        if *n <= DETAIL_FIRST || *n % DETAIL_EVERY == 0 {
+        if *n <= DETAIL_FIRST || (*n).is_multiple_of(DETAIL_EVERY) {
             line(
                 if dir == "<" { "RTP<" } else { "RTP>" },
                 format!(
@@ -448,7 +494,15 @@ impl WireLog {
     }
 
     /// Record an RTCP datagram (sent `">"` or received `"<"`). Returns true if it contains PLI/FIR.
-    pub fn rtcp(&mut self, dir: &str, via: Via, outer: u8, wire_len: usize, peer: &str, inner: &[u8]) -> bool {
+    pub fn rtcp(
+        &mut self,
+        dir: &str,
+        via: Via,
+        outer: u8,
+        wire_len: usize,
+        peer: &str,
+        inner: &[u8],
+    ) -> bool {
         let (desc, kf) = describe_rtcp(inner);
         if dir == "<" {
             self.max_wire_rx = self.max_wire_rx.max(wire_len);
@@ -474,7 +528,7 @@ impl WireLog {
     pub fn unknown(&mut self, via: Via, wire_len: usize, peer: &str, wire: &[u8]) {
         self.max_wire_rx = self.max_wire_rx.max(wire_len);
         self.unk_lines += 1;
-        if self.unk_lines <= 40 || self.unk_lines % 100 == 0 {
+        if self.unk_lines <= 40 || self.unk_lines.is_multiple_of(100) {
             line(
                 "UNK<",
                 format!(
@@ -572,7 +626,10 @@ mod tests {
     #[test]
     fn parses_rtp_header_with_csrc_and_extension() {
         let h = parse_rtp(&rtp(97, true, 7, &[0x65, 1, 2])).unwrap();
-        assert_eq!((h.pt, h.marker, h.seq, h.ts, h.ssrc), (97, true, 7, 1000, 0xAABBCCDD));
+        assert_eq!(
+            (h.pt, h.marker, h.seq, h.ts, h.ssrc),
+            (97, true, 7, 1000, 0xAABBCCDD)
+        );
         assert_eq!((h.payload_off, h.payload_len), (12, 3));
         // X bit + 1 extension word + 1 CSRC
         let mut p = vec![0x91, 96, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
@@ -580,7 +637,10 @@ mod tests {
         p.extend_from_slice(&[0xBE, 0xDE, 0, 1, 1, 2, 3, 4]); // ext header + 1 word
         p.extend_from_slice(&[0x41, 0x9A]);
         let h = parse_rtp(&p).unwrap();
-        assert_eq!((h.csrc, h.ext, h.payload_off, h.payload_len), (1, true, 24, 2));
+        assert_eq!(
+            (h.csrc, h.ext, h.payload_off, h.payload_len),
+            (1, true, 24, 2)
+        );
         assert!(parse_rtp(&[0x40; 20]).is_none());
         assert!(parse_rtp(&[0x80; 5]).is_none());
     }
@@ -597,7 +657,10 @@ mod tests {
         assert_eq!(describe_h264_payload(&stap), "stapA[7,8]");
         assert_eq!(describe_h264_payload(&[]), "empty");
         // Zalo format as captured
-        assert_eq!(describe_h264_payload(&[0, 0, 0, 1, 0x21, 0xE1]), "annexb[1]");
+        assert_eq!(
+            describe_h264_payload(&[0, 0, 0, 1, 0x21, 0xE1]),
+            "annexb[1]"
+        );
         assert_eq!(
             describe_h264_payload(&[0x1C, 0x80, 0, 0, 0, 1, 0x27, 0x42, 0, 0, 1, 0x28]),
             "zfrag/S/annexb[7,8]"
@@ -640,17 +703,42 @@ mod tests {
     fn stats_track_loss_marker_nal_and_mtu_hint() {
         std::env::set_var("ZALO_VOIP_LOG", "off");
         let mut w = WireLog::new();
-        w.rtp("<", 0x0E, 1201, "1.2.3.4:5", &rtp(97, false, 10, &[0x7C, 0x85, 1]));
-        w.rtp("<", 0x0E, 1500, "1.2.3.4:5", &rtp(97, false, 11, &[0x7C, 0x05, 1]));
+        w.rtp(
+            "<",
+            0x0E,
+            1201,
+            "1.2.3.4:5",
+            &rtp(97, false, 10, &[0x7C, 0x85, 1]),
+        );
+        w.rtp(
+            "<",
+            0x0E,
+            1500,
+            "1.2.3.4:5",
+            &rtp(97, false, 11, &[0x7C, 0x05, 1]),
+        );
         // seq 12, 13 lost
-        w.rtp("<", 0x0E, 300, "1.2.3.4:5", &rtp(97, true, 14, &[0x7C, 0x45, 1]));
+        w.rtp(
+            "<",
+            0x0E,
+            300,
+            "1.2.3.4:5",
+            &rtp(97, true, 14, &[0x7C, 0x45, 1]),
+        );
         let st = w.streams.values().next().unwrap();
         assert_eq!((st.pkts, st.lost, st.marker), (3, 2, 1));
         assert_eq!((st.min_len, st.max_len), (300, 1500));
         assert_eq!(st.nal.get("fuA/nal5/S"), Some(&1));
         assert_eq!(w.max_wire_rx, 1500);
         assert_eq!(w.max_wire_tx, 0);
-        assert!(w.rtcp("<", Via::RtcpSock, 0x04, 40, "p", &[0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]));
+        assert!(w.rtcp(
+            "<",
+            Via::RtcpSock,
+            0x04,
+            40,
+            "p",
+            &[0x81, 206, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]
+        ));
     }
 
     #[test]

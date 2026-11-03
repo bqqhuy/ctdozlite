@@ -3,7 +3,10 @@
 //! Mirrors the `_get` / `_post` / `_getCommonParams` / `getEncodedParams` helpers from
 //! `compact-app-pc-*.js`. See `re-notes/02_chat_data.md` §2–§4.
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{bail, Result};
 use reqwest::cookie::Jar;
@@ -26,8 +29,31 @@ pub const CONFIG_DOMAIN: &str = "zaloapp.com";
 /// flavours differ, and using the wrong set yields nginx 404s.
 ///
 /// [`Session::apply_server_info`] re-applies them from the login payload each run.
+/// Only explicit authentication errors expire a saved login. Offline/HTTP/parse
+/// failures must leave the protected session and local history intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionStatus {
+    Valid,
+    Expired,
+    Unreachable(String),
+}
+
+pub fn is_expired_error(message: &str) -> bool {
+    message.split("server error ").skip(1).any(|part| {
+        matches!(
+            part.split(|c: char| !c.is_ascii_digit() && c != '-').next(),
+            Some("600" | "-102")
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Domains {
+    // Worker snapshots share endpoint preferences. This short lock never covers I/O.
+    #[serde(skip)]
+    winners: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
+    #[serde(default)]
+    pub service_fallbacks: std::collections::BTreeMap<String, Vec<String>>,
     /// `wpa.zaloapp.com` — `reqqr`, password login.
     pub auth: String,
     /// `wpa.chat.zalo.me` — `getServerInfo` / `getLoginInfo` once a session exists.
@@ -99,10 +125,12 @@ fn default_ws() -> Vec<String> {
 impl Default for Domains {
     fn default() -> Self {
         Self {
+            winners: Default::default(),
+            service_fallbacks: Default::default(),
             auth: crate::endpoints::AUTH.into(),
             wpa_chat: crate::endpoints::WPA_CHAT.into(),
-            chat: crate::endpoints::MSG_CHAT.into(),
-            conversation: crate::endpoints::CONVERS_CTL.into(),
+            chat: crate::endpoints::service("chat").unwrap().into(),
+            conversation: crate::endpoints::service("conversation").unwrap().into(),
             lp_chat: default_lp_chat(),
             lp_control: default_lp_control(),
             friend: "https://tt-friend-wpa.chat.zalo.me".into(),
@@ -116,6 +144,86 @@ impl Default for Domains {
             ws: default_ws(),
         }
     }
+}
+
+impl Domains {
+    /// Keep verified REST hosts first; service discovery may advertise a PC host
+    /// which returns 404 for a Web/QR session. Long-poll and WS stay dynamic.
+    fn prefer_verified_rest(&mut self) {
+        self.service_fallbacks.retain(|key, values| {
+            let known = [
+                "chat",
+                "friend",
+                "conversation",
+                "profile",
+                "group",
+                "file",
+                "group_cloud_message",
+                "voice_call",
+                "sticker",
+            ]
+            .iter()
+            .filter_map(|key| crate::endpoints::service(key))
+            .any(|host| host == key);
+            if !known {
+                return false;
+            }
+            let mut seen = std::collections::HashSet::new();
+            values.retain(|host| trusted_service_url(host) && seen.insert(host.clone()));
+            values.truncate(16);
+            true
+        });
+        for (key, slot) in [
+            ("chat", &mut self.chat),
+            ("friend", &mut self.friend),
+            ("conversation", &mut self.convers_api),
+            ("profile", &mut self.profile),
+            ("group", &mut self.group),
+            ("file", &mut self.file),
+            ("voice_call", &mut self.voice_call),
+            ("sticker", &mut self.sticker),
+        ] {
+            if let Some(verified) = crate::endpoints::service(key) {
+                if slot != verified && trusted_service_url(slot) {
+                    let fallback = self.service_fallbacks.entry(verified.into()).or_default();
+                    if !fallback.contains(slot) {
+                        fallback.push(slot.clone());
+                    }
+                }
+                *slot = verified.into();
+            }
+        }
+        self.conversation = self.convers_api.clone();
+    }
+}
+fn trusted_service_url(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .map(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port().is_none()
+                && url.path() == "/"
+                && url.query().is_none()
+                && url.fragment().is_none()
+                && url
+                    .host_str()
+                    .is_some_and(|h| h.ends_with(".zalo.me") || h.ends_with(".zaloapp.com"))
+        })
+        .unwrap_or(false)
+}
+#[derive(Debug)]
+struct HttpFailure(u16);
+impl std::fmt::Display for HttpFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}", self.0)
+    }
+}
+impl std::error::Error for HttpFailure {}
+
+/// Extract a typed HTTP failure without parsing or exposing its original error text.
+pub(crate) fn http_failure_status(error: &anyhow::Error) -> Option<u16> {
+    error.downcast_ref::<HttpFailure>().map(|failure| failure.0)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -144,6 +252,7 @@ pub struct SavedSession {
 
 #[derive(Clone)]
 pub struct Session {
+    active: Arc<AtomicBool>,
     pub http: Client,
     pub jar: Arc<Jar>,
     pub domains: Domains,
@@ -166,16 +275,11 @@ impl Session {
     pub fn new(verbose: bool, dump: bool, dump_raw: bool) -> Result<Self> {
         let jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            REFERER,
-            HeaderValue::from_static("https://chat.zalo.me/"),
-        );
-        default_headers.insert(
-            ORIGIN,
-            HeaderValue::from_static("https://chat.zalo.me"),
-        );
-        let http = Client::builder()
+        default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
+        default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
+        let http = crate::proxy::apply(Client::builder())?
             .cookie_provider(Arc::clone(&jar))
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(35))
@@ -185,6 +289,7 @@ impl Session {
             )
             .build()?;
         Ok(Self {
+            active: Arc::new(AtomicBool::new(true)),
             http,
             jar,
             domains: Domains::default(),
@@ -228,7 +333,7 @@ impl Session {
         ];
         for host in hosts {
             if let Ok(url) = reqwest::Url::parse(host) {
-                let cookie = format!("zpw_sek={v}; Path=/");
+                let cookie = format!("zpw_sek={v}; Path=/; Secure; HttpOnly");
                 self.jar.add_cookie_str(&cookie, &url);
             }
         }
@@ -238,33 +343,32 @@ impl Session {
         }
     }
 
-    /// Check whether the current session is valid on the server.
-    pub async fn validate_session(&self) -> bool {
+    /// Check the server without treating a transient network failure as logout.
+    pub async fn validate_session(&self) -> SessionStatus {
         if self.login.is_none() || self.zpw_sek.is_none() {
-            return false;
+            return SessionStatus::Expired;
         }
-        let body = serde_json::json!({
-            "avatar_size": 160,
-            "imei": self.imei,
-        });
-        let url = match self.encoded_params(&body) {
-            Ok(enc) => format!(
-                "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
-                self.domains.profile,
-                self.common_params()
-            ),
-            Err(_) => format!(
-                "{}/api/social/profile/me-v2?{}",
-                self.domains.profile,
-                self.common_params()
-            ),
+        let body = serde_json::json!({ "avatar_size": 160, "imei": self.imei });
+        let enc = match self.encoded_params(&body) {
+            Ok(enc) => enc,
+            Err(e) => return SessionStatus::Unreachable(e.to_string()),
         };
+        let url = format!(
+            "{}/api/social/profile/me-v2?{}&params={enc}&os=8",
+            self.domains.profile,
+            self.common_params()
+        );
         match self.get(&url).await {
             Ok(resp) => {
-                let code = resp.get("error_code").and_then(serde_json::Value::as_i64).unwrap_or(-1);
-                code == 0
+                let resp = self.maybe_decrypt(resp, self.session_key_bytes()).await;
+                match resp.get("error_code").and_then(Value::as_i64) {
+                    Some(0) => SessionStatus::Valid,
+                    Some(600 | -102) => SessionStatus::Expired,
+                    _ => SessionStatus::Unreachable("Không đọc được phản hồi xác thực".into()),
+                }
             }
-            Err(_) => false,
+            Err(e) if is_expired_error(&e.to_string()) => SessionStatus::Expired,
+            Err(e) => SessionStatus::Unreachable(e.to_string()),
         }
     }
 
@@ -323,22 +427,23 @@ impl Session {
 
     /// Clear all session credentials, tokens, keys, and cookies.
     pub fn logout(&mut self) {
+        let _lock = crate::storage::SESSION_IO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.active.store(false, Ordering::SeqCst);
+        self.active = Arc::new(AtomicBool::new(true));
         self.login = None;
         self.zpw_sek = None;
         self.secret_key = None;
         self.session_key = None;
         self.jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(
-            REFERER,
-            HeaderValue::from_static("https://chat.zalo.me/"),
-        );
-        default_headers.insert(
-            ORIGIN,
-            HeaderValue::from_static("https://chat.zalo.me"),
-        );
-        if let Ok(c) = Client::builder()
+        default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
+        default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
+        if let Ok(c) = crate::proxy::apply(Client::builder()).and_then(|builder| {
+            Ok(builder
             .cookie_provider(Arc::clone(&self.jar))
+            .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(35))
@@ -346,34 +451,76 @@ impl Session {
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36",
             )
-            .build()
-        {
+            .build()?)
+        }) {
             self.http = c;
         }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    pub fn account_key(&self) -> &str {
+        self.login
+            .as_ref()
+            .map(|l| {
+                if !l.uin.is_empty() {
+                    l.uin.as_str()
+                } else {
+                    l.send2me_id.as_str()
+                }
+            })
+            .unwrap_or("")
+    }
+
+    pub fn history_path(&self) -> std::path::PathBuf {
+        crate::storage::account_file(self.account_key(), "zalo_history.db")
+    }
+
+    pub fn cache_path(&self) -> std::path::PathBuf {
+        crate::storage::account_file(self.account_key(), "threads_cache.json")
     }
 
     /// Save the authenticated session to disk so subsequent runs can restore it without re-authenticating.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         use base64::Engine;
+        let _lock = crate::storage::SESSION_IO
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock poisoned"))?;
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
+        if !crate::storage::remember_login()? {
+            crate::storage::remove_session_unlocked()?;
+            return Ok(());
+        }
         let saved = SavedSession {
             imei: self.imei.clone(),
             computer_name: self.computer_name.clone(),
-            secret_key_b64: self.secret_key.as_ref().map(|k| base64::engine::general_purpose::STANDARD.encode(k)),
+            secret_key_b64: self
+                .secret_key
+                .as_ref()
+                .map(|k| base64::engine::general_purpose::STANDARD.encode(k)),
             session_key: self.session_key.clone(),
             zpw_sek: self.zpw_sek.clone(),
             login: self.login.clone(),
             domains: self.domains.clone(),
         };
         let text = serde_json::to_string_pretty(&saved)?;
-        std::fs::write(path, text)?;
+        let protected = crate::storage::protect(text.as_bytes())?;
+        crate::storage::atomic_write(&crate::storage::session_path(path), &protected)?;
         Ok(())
     }
 
     /// Load a previously saved session from disk and restore cookies, keys, and endpoints.
     pub fn load_from_file(&mut self, path: &str) -> Result<()> {
         use base64::Engine;
-        let text = std::fs::read_to_string(path)?;
-        let saved: SavedSession = serde_json::from_str(&text)?;
+        if !crate::storage::remember_login()? {
+            crate::storage::remove_session()?;
+            anyhow::bail!("Remember login is disabled");
+        }
+        let bytes = std::fs::read(crate::storage::session_path(path))?;
+        let text = crate::storage::unprotect(&bytes)?;
+        let saved: SavedSession = serde_json::from_slice(&text)?;
 
         self.imei = if saved.imei.len() == 69 {
             saved.imei
@@ -382,8 +529,12 @@ impl Session {
         };
         self.computer_name = saved.computer_name;
         self.domains = saved.domains;
+        self.domains.prefer_verified_rest();
         // Auto-heal older session.json files where `zpw_chts_new` / `zpw_ctrs_new` overwrote REST domains
-        if self.domains.chat.contains("-msg-chat.") || self.domains.chat.contains("tt-chat2-wpa") || self.domains.chat.is_empty() {
+        if self.domains.chat.contains("-msg-chat.")
+            || self.domains.chat.contains("tt-chat2-wpa")
+            || self.domains.chat.is_empty()
+        {
             if self.domains.chat.contains("-msg-chat.") && self.domains.lp_chat.is_empty() {
                 self.domains.lp_chat = self.domains.chat.clone();
             }
@@ -391,8 +542,11 @@ impl Session {
                 .unwrap_or("https://tt-chat3-wpa.api.zaloapp.com")
                 .into();
         }
-        if self.domains.conversation.contains("-ctl-chat.") || self.domains.conversation.is_empty() {
-            if self.domains.conversation.contains("-ctl-chat.") && self.domains.lp_control.is_empty() {
+        if self.domains.conversation.contains("-ctl-chat.") || self.domains.conversation.is_empty()
+        {
+            if self.domains.conversation.contains("-ctl-chat.")
+                && self.domains.lp_control.is_empty()
+            {
                 self.domains.lp_control = self.domains.conversation.clone();
             }
             self.domains.conversation = crate::endpoints::service("conversation")
@@ -433,7 +587,8 @@ impl Session {
     ///
     /// Credentials are redacted; the point is the response *shape*, not the content.
     fn dump_exchange(&self, method: &str, url: &str, status: u16, body: &str) {
-        let dir = std::path::Path::new("dump");
+        let dump_dir = crate::storage::root().join("diagnostics/dump");
+        let dir = dump_dir.as_path();
         if let Err(e) = std::fs::create_dir_all(dir) {
             eprintln!("! dump dir: {e}");
             return;
@@ -453,8 +608,8 @@ impl Session {
 
         // Parse to a real JSON object so the dump nests properly instead of holding a
         // double-encoded string.
-        let body_json = serde_json::from_str::<Value>(body)
-            .unwrap_or_else(|_| Value::String(body.to_string()));
+        let body_json =
+            serde_json::from_str::<Value>(body).unwrap_or_else(|_| Value::String(body.to_string()));
 
         let doc = serde_json::json!({
             "method": method,
@@ -536,6 +691,41 @@ impl Session {
             .get("zpw_service_map_v3")
             .or_else(|| data.get("zpw_service_map_new"))
         {
+            for key in [
+                "chat",
+                "friend",
+                "conversation",
+                "profile",
+                "group",
+                "file",
+                "group_cloud_message",
+                "voice_call",
+                "sticker",
+            ] {
+                if let Some(verified) = crate::endpoints::service(key) {
+                    let candidates = self
+                        .domains
+                        .service_fallbacks
+                        .entry(verified.into())
+                        .or_default();
+                    let values = map
+                        .get(key)
+                        .map(|v| v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]))
+                        .unwrap_or_default();
+                    for value in values {
+                        if let Some(host) = value.as_str().map(|s| s.trim_end_matches('/')) {
+                            if trusted_service_url(host)
+                                && host != verified
+                                && !candidates.iter().any(|h| h == host)
+                                && candidates.len() < 16
+                            {
+                                candidates.push(host.into());
+                            }
+                        }
+                    }
+                }
+            }
+
             for (key, slot) in [
                 ("chat", &mut self.domains.chat),
                 ("friend", &mut self.domains.friend),
@@ -555,6 +745,7 @@ impl Session {
                 self.domains.conversation = v;
             }
         }
+        self.domains.prefer_verified_rest();
     }
 
     pub async fn get(&self, url: &str) -> Result<Value> {
@@ -575,6 +766,7 @@ impl Session {
         mime_type: &str,
         file_bytes: &[u8],
     ) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let boundary = format!(
             "----WebKitFormBoundary{}",
             crate::param_cipher::random_hex(16)
@@ -589,6 +781,85 @@ impl Session {
         body.extend_from_slice(file_bytes);
         body.extend_from_slice(tail.as_bytes());
 
+        self.send_multipart_body(
+            url,
+            field_name,
+            &safe_name,
+            &boundary,
+            reqwest::Body::from(body),
+            file_bytes.len() as u64,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn post_multipart_file(
+        &self,
+        url: &str,
+        field_name: &str,
+        file_name: &str,
+        mime: &str,
+        file: tokio::fs::File,
+        size: u64,
+    ) -> Result<Value> {
+        use futures_util::StreamExt;
+        let boundary = format!("----ctdozlite{}", crate::param_cipher::random_hex(16));
+        let safe_name = file_name.replace(['"', '\r', '\n'], "_");
+        let head = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{field_name}\"; filename=\"{safe_name}\"\r\nContent-Type: {mime}\r\n\r\n");
+        let tail = format!("\r\n--{boundary}--\r\n");
+        let length = size
+            .checked_add(head.len() as u64)
+            .and_then(|n| n.checked_add(tail.len() as u64))
+            .ok_or_else(|| anyhow::anyhow!("Tệp quá lớn"))?;
+        let first =
+            futures_util::stream::once(
+                async move { Ok::<Vec<u8>, std::io::Error>(head.into_bytes()) },
+            );
+        let chunks =
+            futures_util::stream::try_unfold((file, size), |(mut file, remaining)| async move {
+                use tokio::io::AsyncReadExt;
+                if remaining == 0 {
+                    return Ok(None);
+                }
+                let mut chunk = vec![0; remaining.min(crate::upload::CHUNK as u64) as usize];
+                file.read_exact(&mut chunk).await?;
+                Ok::<_, std::io::Error>(Some((
+                    chunk,
+                    (
+                        file,
+                        remaining - crate::upload::CHUNK.min(remaining as usize) as u64,
+                    ),
+                )))
+            });
+        let last =
+            futures_util::stream::once(
+                async move { Ok::<Vec<u8>, std::io::Error>(tail.into_bytes()) },
+            );
+        let body = reqwest::Body::wrap_stream(first.chain(chunks).chain(last));
+        self.send_multipart_body(
+            url,
+            field_name,
+            &safe_name,
+            &boundary,
+            body,
+            size,
+            Some(length),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_multipart_body(
+        &self,
+        url: &str,
+        field_name: &str,
+        safe_name: &str,
+        boundary: &str,
+        body: reqwest::Body,
+        size: u64,
+        length: Option<u64>,
+    ) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         let mut rb = self
             .http
@@ -599,7 +870,7 @@ impl Session {
                 format!("multipart/form-data; boundary={boundary}"),
             );
         if let Some(sek) = &self.zpw_sek {
-            if !sek.is_empty() {
+            if !sek.is_empty() && credential_target(url) {
                 rb = rb
                     .header("Cookie", format!("zpw_sek={sek}; _zlang=vi"))
                     .header("zpw_sek", sek)
@@ -607,16 +878,21 @@ impl Session {
                     .header("Referer", "https://chat.zalo.me/");
             }
         }
+        if let Some(length) = length {
+            rb = rb.header("Content-Length", length);
+        }
         let resp = rb.body(body).send().await?;
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
-        let text = resp.text().await?;
+        let bytes =
+            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         crate::logger::log_request(
             "POST(multipart)",
             url,
             Some(status.as_u16()),
             latency_ms,
-            &format!("[{field_name}: {safe_name} ({} bytes)]", file_bytes.len()),
+            &format!("[{field_name}: {safe_name} ({} bytes)]", size),
             Some(&text),
             if status.is_success() {
                 None
@@ -625,7 +901,7 @@ impl Session {
             },
         );
         if !status.is_success() {
-            anyhow::bail!("HTTP {status} from {url}: {}", truncate(&text, 300));
+            return Err(HttpFailure(status.as_u16()).into());
         }
         if text.trim().is_empty() {
             return Ok(serde_json::json!({ "error_code": 0, "data": null }));
@@ -636,29 +912,82 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        let mut urls = vec![url.to_string()];
+        let mut service = None;
+        for (verified, fallbacks) in &self.domains.service_fallbacks {
+            if let Some(suffix) = url.strip_prefix(&format!("{verified}/")) {
+                urls.extend(fallbacks.iter().map(|base| format!("{base}/{suffix}")));
+                service = Some((verified.clone(), suffix.to_owned()));
+                if let Some(winner) = self
+                    .domains
+                    .winners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(verified)
+                    .filter(|w| *w == verified || fallbacks.contains(w))
+                    .cloned()
+                {
+                    let preferred = format!("{winner}/{suffix}");
+                    urls.retain(|u| u != &preferred);
+                    urls.insert(0, preferred);
+                }
+                break;
+            }
+        }
+        let mut last = None;
+        for candidate in urls {
+            match self.send_once(m.clone(), &candidate, body.clone()).await {
+                Ok(response) => {
+                    if let Some((service, suffix)) = &service {
+                        if let Some(host) = candidate.strip_suffix(&format!("/{suffix}")) {
+                            self.domains
+                                .winners
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(service.clone(), host.into());
+                        }
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    // Retry GET on transport failure, or any method on a definite
+                    // 404. Never replay a possibly delivered mutation after timeout.
+                    let retry = e.downcast_ref::<HttpFailure>().is_some_and(|e| e.0 == 404)
+                        || (m == Method::GET
+                            && e.downcast_ref::<reqwest::Error>()
+                                .is_some_and(|e| e.is_connect() || e.is_timeout()));
+                    if !retry {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("No service endpoint")))
+    }
+
+    async fn send_once(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         if self.verbose {
-            eprintln!("→ {} {}", m, if self.dump_raw { url.to_string() } else { redact_url(url) });
+            eprintln!(
+                "→ {} {}",
+                m,
+                if self.dump_raw {
+                    url.to_string()
+                } else {
+                    redact_url(url)
+                }
+            );
             if let Some(b) = &body {
-                eprintln!("  body: {}", truncate(b, 400));
+                eprintln!("  body: {}", crate::diagnostics::preview(b));
             }
         }
         let method = m.as_str().to_string();
         let mut rb = self.http.request(m, url);
         if let Some(ref sek) = self.zpw_sek {
             if !sek.is_empty() {
-                let is_zalo_host = reqwest::Url::parse(url)
-                    .map(|u| {
-                        u.host_str()
-                            .map(|h| {
-                                h == "zalo.me"
-                                    || h.ends_with(".zalo.me")
-                                    || h == "zaloapp.com"
-                                    || h.ends_with(".zaloapp.com")
-                            })
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or_else(|_| url.contains("zalo.me") || url.contains("zaloapp.com"));
+                let is_zalo_host = credential_target(url);
                 if is_zalo_host {
                     rb = rb.header("Cookie", format!("zpw_sek={sek}; _zlang=vi"));
                     rb = rb.header("zpw_sek", sek);
@@ -687,14 +1016,16 @@ impl Session {
                     None,
                     Some(&e.to_string()),
                 );
-                return Err(e.into());
+                return Err(e.without_url().into());
             }
         };
 
         let status = resp.status();
-        let text = resp.text().await?;
+        let bytes =
+            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         if self.verbose {
-            eprintln!("← {status} {}", truncate(&text, 400));
+            eprintln!("← {status} response_bytes={}", text.len());
         }
         if self.dump {
             self.dump_exchange(&method, url, status.as_u16(), &text);
@@ -718,7 +1049,7 @@ impl Session {
         );
 
         if is_err {
-            bail!("HTTP {status} from {url}: {}", truncate(&text, 300));
+            return Err(HttpFailure(status.as_u16()).into());
         }
         if text.trim().is_empty() {
             // Long-polling endpoints (`p4-msg-chat.zaloapp.com`) return HTTP 200 with an empty body `""`
@@ -732,7 +1063,10 @@ impl Session {
         });
         let code = v.get("error_code").and_then(|c| c.as_i64()).unwrap_or(0);
         if code != 0 {
-            let msg = v.get("error_message").and_then(|m| m.as_str()).unwrap_or("");
+            let msg = v
+                .get("error_message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
             crate::logger::log_request(
                 &method,
                 url,
@@ -742,7 +1076,7 @@ impl Session {
                 Some(&text),
                 Some(&format!("server error {code}: {msg}")),
             );
-            bail!("server error {code}: {msg} (from {url})");
+            bail!("server error {code}: {msg}");
         }
         Ok(v)
     }
@@ -774,7 +1108,7 @@ impl Session {
                 }
                 Err(e) => {
                     if self.verbose {
-                        eprintln!("  data decrypted but not JSON: {e} / {}", truncate(&pt, 200));
+                        eprintln!("  data decrypted but not JSON: {e}");
                     }
                     v
                 }
@@ -787,6 +1121,20 @@ impl Session {
             }
         }
     }
+}
+
+/// Session headers are only sent over TLS to an actual Zalo host, never a
+/// lookalike URL, plaintext media URL or an arbitrary multipart destination.
+fn credential_target(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some_and(|h| {
+                h == "zalo.me"
+                    || h.ends_with(".zalo.me")
+                    || h == "zaloapp.com"
+                    || h.ends_with(".zaloapp.com")
+            })
+    })
 }
 
 /// Build `{a:1,b:"x"}` maps tersely.
@@ -826,7 +1174,8 @@ pub fn redact_secret(s: &str) -> String {
     format!("{prefix}…<redacted>")
 }
 
-pub fn urlencode(s: &str) -> String {    let mut out = String::with_capacity(s.len() * 3);
+pub fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -877,5 +1226,243 @@ mod tests {
         assert_eq!(redact_secret("1234567890abcdef"), "12345678…<redacted>");
         assert_eq!(redact_secret("short"), "short…<redacted>");
         assert_eq!(redact_secret(""), "…<redacted>");
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn expiry_requires_exact_server_code() {
+        for text in ["server error 600: expired", "server error -102: expired"] {
+            assert!(is_expired_error(text));
+        }
+        for text in [
+            "server error 6000",
+            "HTTP 404",
+            "zpw_sek missing in response",
+            "timeout",
+            "server error -1020",
+        ] {
+            assert!(!is_expired_error(text));
+        }
+    }
+    #[test]
+    fn discovery_preserves_verified_rest_and_dynamic_polling() {
+        let mut s = Session::new(false, false, false).unwrap();
+        let verified = s.domains.profile.clone();
+        s.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"profile":["https://tt-profile-wpa.zaloapp.com"],"friend":["https://attacker.example"]},
+            "zpw_chts_new":["https://p9-msg-chat.zaloapp.com"]
+        }));
+        assert_eq!(s.domains.profile, verified);
+        assert_eq!(
+            s.domains.service_fallbacks[&verified],
+            vec!["https://tt-profile-wpa.zaloapp.com"]
+        );
+        assert_eq!(s.domains.lp_chat, "https://p9-msg-chat.zaloapp.com");
+        assert!(!s
+            .domains
+            .service_fallbacks
+            .values()
+            .flatten()
+            .any(|v| v.contains("attacker")));
+        assert!(!s.domains.chat.contains("-msg-chat"));
+    }
+    #[tokio::test]
+    async fn validation_distinguishes_expiry_from_server_and_parse_failures() {
+        use std::io::{Read, Write};
+        for (status, body, expected) in [
+            (200, r#"{"error_code":0,"data":{}}"#, 0),
+            (200, r#"{"error_code":600}"#, 1),
+            (200, r#"{"error_code":-102}"#, 1),
+            (404, "not found", 2),
+            (503, "offline", 2),
+            (200, "not json", 2),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request);
+                write!(stream,"HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            });
+            let mut s = Session::new(false, false, false).unwrap();
+            s.http = reqwest::Client::builder().no_proxy().build().unwrap();
+            s.domains.profile = format!("http://{addr}");
+            s.login = Some(LoginInfo::default());
+            s.secret_key = Some(vec![0; 32]);
+            s.set_zpw_sek("fixture".into());
+            let result = s.validate_session().await;
+            match expected {
+                0 => assert_eq!(result, SessionStatus::Valid),
+                1 => assert_eq!(result, SessionStatus::Expired),
+                _ => assert!(matches!(result, SessionStatus::Unreachable(_))),
+            }
+            assert_eq!(s.zpw_sek.as_deref(), Some("fixture"));
+            server.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_destination_tests {
+    use super::*;
+    #[test]
+    fn only_secure_actual_zalo_hosts_receive_credentials() {
+        assert!(credential_target("https://tt-profile-wpa.chat.zalo.me/api"));
+        for url in [
+            "http://tt-profile-wpa.chat.zalo.me/api",
+            "https://zalo.me.evil.invalid/path",
+            "https://zalo.me@evil.invalid/",
+            "https://evil.invalid/?next=zalo.me",
+            "invalid-zalo.me",
+        ] {
+            assert!(!credential_target(url), "{url}");
+        }
+    }
+    #[tokio::test]
+    async fn multipart_never_forwards_session_to_external_destination() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break end + 4;
+                }
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let len: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|s| s.trim().parse().unwrap())
+                })
+                .unwrap();
+            while request.len() < header_end + len {
+                let mut buf = [0; 2048];
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0);
+                request.extend_from_slice(&buf[..n]);
+            }
+            assert!(!header.to_ascii_lowercase().contains("zpw_sek"));
+            assert!(!header.to_ascii_lowercase().contains("cookie:"));
+            let body = r#"{"error_code":0,"data":{}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(LoginInfo::default());
+        session.set_zpw_sek("fixture-token".into());
+        session.http = reqwest::Client::builder()
+            .no_proxy()
+            .cookie_provider(session.jar.clone())
+            .build()
+            .unwrap();
+        session
+            .post_multipart(
+                &format!("http://{address}/upload"),
+                "fileContent",
+                "fixture.bin",
+                "application/octet-stream",
+                b"fixture",
+            )
+            .await
+            .unwrap();
+        server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod candidate_persistence_tests {
+    use super::*;
+    #[test]
+    fn discovery_retains_all_trusted_candidates_and_saved_candidates_are_sanitized() {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"chat":["https://fallback-one.zalo.me","https://fallback-two.zaloapp.com","https://attacker.invalid"]}}));
+        let primary = crate::endpoints::service("chat").unwrap();
+        assert_eq!(s.domains.service_fallbacks[primary].len(), 2);
+        let mut restored: Domains =
+            serde_json::from_value(serde_json::to_value(&s.domains).unwrap()).unwrap();
+        restored
+            .service_fallbacks
+            .get_mut(primary)
+            .unwrap()
+            .push("https://attacker.invalid".into());
+        restored.prefer_verified_rest();
+        assert_eq!(restored.service_fallbacks[primary].len(), 2);
+        assert!(restored.winners.lock().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remembered_host_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn serve(status: &'static str) -> (String, tokio::task::JoinHandle<usize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut count = 0;
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(800), listener.accept()).await
+            {
+                let mut bytes = Vec::new();
+                loop {
+                    let mut buffer = [0; 1024];
+                    let n = stream.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = "{\"error_code\":0,\"data\":{}}";
+                stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+                count += 1;
+            }
+            count
+        });
+        (url, task)
+    }
+    #[tokio::test]
+    async fn next_request_starts_at_the_host_that_previously_succeeded() {
+        let (primary, first) = serve("404 Not Found").await;
+        let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.domains
+            .service_fallbacks
+            .insert(primary.clone(), vec![fallback.clone()]);
+        for _ in 0..2 {
+            s.get(&format!("{primary}/api/fixture")).await.unwrap();
+        }
+        assert_eq!(
+            s.domains.winners.lock().unwrap().get(&primary),
+            Some(&fallback)
+        );
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 2);
     }
 }

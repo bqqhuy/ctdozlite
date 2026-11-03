@@ -40,7 +40,14 @@ use crate::session::Session;
 const POLL_SECS: u64 = 4;
 
 /// Quick-reaction palette for keys `1`..`6`, same order as the GUI picker.
-const QUICK_REACTIONS: [&str; 6] = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F606}", "\u{1F62E}", "\u{1F622}", "\u{1F620}"];
+const QUICK_REACTIONS: [&str; 6] = [
+    "\u{1F44D}",
+    "\u{2764}\u{FE0F}",
+    "\u{1F606}",
+    "\u{1F62E}",
+    "\u{1F622}",
+    "\u{1F620}",
+];
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Focus {
@@ -117,6 +124,8 @@ struct StickerState {
     loaded_name: String,
 }
 
+// These infrequent terminal events retain the existing TUI ownership boundary.
+#[allow(clippy::large_enum_variant)]
 enum BgEvent {
     PollDone {
         threads: Vec<Thread>,
@@ -189,7 +198,7 @@ pub struct TuiApp<'a> {
 
 impl<'a> TuiApp<'a> {
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
-        let store = crate::store::MessageStore::open("zalo_history.db").ok();
+        let store = crate::store::MessageStore::open(session.history_path()).ok();
         if let Some(ref st) = store {
             let _ = st.hydrate_threads(&mut threads, 200);
         }
@@ -283,7 +292,11 @@ impl<'a> TuiApp<'a> {
 
         let pos = preferred
             .as_ref()
-            .and_then(|id| self.filtered.iter().position(|&i| self.threads[i].id == *id))
+            .and_then(|id| {
+                self.filtered
+                    .iter()
+                    .position(|&i| self.threads[i].id == *id)
+            })
             .unwrap_or(0)
             .min(self.filtered.len() - 1);
         let idx = self.filtered[pos];
@@ -302,7 +315,8 @@ impl<'a> TuiApp<'a> {
         let pos = self.filtered.iter().position(|&i| i == thread_idx);
         self.list_state.select(pos);
         self.selected_thread = thread_idx;
-        if let Some(t) = self.threads.get(thread_idx) {
+        if let Some(t) = self.threads.get_mut(thread_idx) {
+            t.unread.read_visible(&t.messages);
             self.unread.remove(&t.id);
             self.selected_msg = t.messages.len().checked_sub(1);
         } else {
@@ -402,7 +416,11 @@ impl<'a> TuiApp<'a> {
     }
 
     fn move_message(&mut self, delta: isize) {
-        let Some(len) = self.threads.get(self.selected_thread).map(|t| t.messages.len()) else {
+        let Some(len) = self
+            .threads
+            .get(self.selected_thread)
+            .map(|t| t.messages.len())
+        else {
             return;
         };
         if len == 0 {
@@ -459,7 +477,7 @@ impl<'a> TuiApp<'a> {
     fn persist_snapshot(&mut self, threads: &[Thread]) {
         if let Some(ref mut st) = self.store {
             let _ = crate::store::persist_threads(st, threads);
-        } else if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+        } else if let Ok(mut st) = crate::store::MessageStore::open(self.session.history_path()) {
             let _ = crate::store::persist_threads(&mut st, threads);
             self.store = Some(st);
         }
@@ -483,9 +501,13 @@ impl<'a> TuiApp<'a> {
 
     fn persist_async(&self) {
         let snapshot = self.threads.clone();
+        let account = self.session.clone();
         tokio::spawn(async move {
             let _ = tokio::task::spawn_blocking(move || {
-                if let Ok(mut st) = crate::store::MessageStore::open("zalo_history.db") {
+                if !account.is_active() {
+                    return;
+                }
+                if let Ok(mut st) = crate::store::MessageStore::open(account.history_path()) {
                     let _ = crate::store::persist_threads(&mut st, &snapshot);
                 }
             })
@@ -668,8 +690,10 @@ impl<'a> TuiApp<'a> {
 
         let now = crate::ui::clock();
         let ts = unix_now_ms();
+        let client_id = chat::next_client_message_id();
         let msg = ChatMessage {
-            id: format!("local_{ts}"),
+            id: format!("local_{client_id}"),
+            client_message_id: client_id.to_string(),
             sender: "Toi".into(),
             text: String::new(),
             time: now.clone(),
@@ -688,18 +712,19 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            match chat::send_sticker(
+            match chat::send_sticker_with_client_id(
                 &session,
                 &to_id,
                 item.sticker_id,
                 item.cate_id,
                 item.sticker_type,
                 is_group,
+                client_id,
             )
             .await
             {
@@ -776,8 +801,10 @@ impl<'a> TuiApp<'a> {
         let reply = self.reply_target.take();
         let now = crate::ui::clock();
         let ts = unix_now_ms();
+        let client_id = chat::next_client_message_id();
         let msg = ChatMessage {
-            id: format!("local_{ts}"),
+            id: format!("local_{client_id}"),
+            client_message_id: client_id.to_string(),
             sender: "Toi".into(),
             text: text.clone(),
             time: now.clone(),
@@ -796,25 +823,33 @@ impl<'a> TuiApp<'a> {
         self.selected_msg = None;
         self.follow_tail = true;
         self.persist_current_snapshot();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
         self.bump_thread(&to_id);
 
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = match (&reply, is_group) {
-                (Some(q), true) => chat::send_quote_message(&session, &to_id, &text, q, true)
-                    .await
-                    .map(|_| ()),
-                (Some(q), false) => chat::send_quote_message(&session, &to_id, &text, q, false)
-                    .await
-                    .map(|_| ()),
-                (None, true) => chat::send_group_message(&session, &to_id, &text)
-                    .await
-                    .map(|_| ()),
-                (None, false) => chat::send_message(&session, &to_id, &text)
-                    .await
-                    .map(|_| ()),
+                (Some(q), true) => chat::send_quote_message_with_client_id(
+                    &session, &to_id, &text, q, true, client_id,
+                )
+                .await
+                .map(|_| ()),
+                (Some(q), false) => chat::send_quote_message_with_client_id(
+                    &session, &to_id, &text, q, false, client_id,
+                )
+                .await
+                .map(|_| ()),
+                (None, true) => {
+                    chat::send_group_message_with_client_id(&session, &to_id, &text, client_id)
+                        .await
+                        .map(|_| ())
+                }
+                (None, false) => {
+                    chat::send_message_with_client_id(&session, &to_id, &text, client_id)
+                        .await
+                        .map(|_| ())
+                }
             };
             match result {
                 Ok(()) => {
@@ -833,7 +868,11 @@ impl<'a> TuiApp<'a> {
     }
 
     fn react_quick(&mut self, key: char) {
-        let Some(idx) = key.to_digit(10).map(|d| d as usize).and_then(|d| d.checked_sub(1)) else {
+        let Some(idx) = key
+            .to_digit(10)
+            .map(|d| d as usize)
+            .and_then(|d| d.checked_sub(1))
+        else {
             return;
         };
         let Some(emoji) = QUICK_REACTIONS.get(idx).copied() else {
@@ -942,8 +981,11 @@ impl<'a> TuiApp<'a> {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
             ConfirmKind::Logout => {
-                let _ = std::fs::remove_file("session.json");
-                let _ = std::fs::remove_file("threads_cache.json");
+                if let Err(e) = crate::storage::remove_session() {
+                    self.status = format!("Không thể xóa phiên: {e}");
+                    return;
+                }
+                self.store = None;
                 self.session.logout();
                 self.threads.clear();
                 self.filtered.clear();
@@ -972,7 +1014,8 @@ impl<'a> TuiApp<'a> {
                         }
                         Err(e) => {
                             logger::log_error("tui::delete_message_for_me", &e.to_string());
-                            let _ = tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
+                            let _ =
+                                tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
                         }
                     }
                 });
@@ -1218,10 +1261,8 @@ impl<'a> TuiApp<'a> {
                 KeyCode::Backspace => {
                     self.input_text.pop();
                 }
-                KeyCode::Char(c) => {
-                    if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) {
-                        self.input_text.push(c);
-                    }
+                KeyCode::Char(c) if !c.is_control() && !mods.contains(KeyModifiers::CONTROL) => {
+                    self.input_text.push(c);
                 }
                 _ => {}
             },
@@ -1278,6 +1319,8 @@ impl<'a> TuiApp<'a> {
                         .iter()
                         .filter(|m| {
                             !m.is_outgoing
+                                && m.unread_policy.counts_unread()
+                                && m.kind != crate::message_model::MessageKind::System
                                 && !m.id.is_empty()
                                 && !m.id.starts_with("local_")
                                 && !prev_ids.contains(&m.id)
@@ -1295,15 +1338,30 @@ impl<'a> TuiApp<'a> {
 
         // Merge into the live threads instead of replacing them, so optimistic
         // messages and history loaded while the poll was in flight survive.
-        for incoming in polled {
+        for mut incoming in polled {
             if let Some(pos) = self.threads.iter().position(|x| x.id == incoming.id) {
                 chat::merge_thread_into(&mut self.threads[pos], incoming, false);
             } else {
+                incoming.unread.advance_seen("0");
+                incoming.unread.observe(&incoming.messages);
                 self.threads.push(incoming);
                 changed = true;
             }
         }
 
+        for thread in &mut self.threads {
+            if thread.unread.last_seen_id.is_some() {
+                thread.unread.observe(&thread.messages);
+                if current_id.as_deref() == Some(&thread.id) {
+                    thread.unread.read_visible(&thread.messages);
+                }
+                if thread.unread.count() == 0 {
+                    self.unread.remove(&thread.id);
+                } else {
+                    self.unread.insert(thread.id.clone(), thread.unread.count());
+                }
+            }
+        }
         if let Some(id) = &current_id {
             self.unread.remove(id);
         }
@@ -1325,7 +1383,7 @@ impl<'a> TuiApp<'a> {
             }
         }
         self.rebuild_filter();
-        chat::save_threads_cache(&self.threads);
+        chat::save_threads_cache(self.session, &self.threads);
         self.persist_async();
     }
 
@@ -1337,7 +1395,7 @@ impl<'a> TuiApp<'a> {
                     let changed = self.apply_polled(threads, state);
                     self.status = format!("Cap nhat {}", crate::ui::clock());
                     if changed {
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.persist_async();
                     }
                 }
@@ -1358,7 +1416,7 @@ impl<'a> TuiApp<'a> {
                     }
                     if count > 0 {
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.selected_msg = None;
                         self.follow_tail = true;
                         self.status = format!("Da tai lich su nhom ({count} tin)");
@@ -1390,7 +1448,7 @@ impl<'a> TuiApp<'a> {
                     if appended {
                         self.bump_thread(&thread_id);
                         self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(&self.threads);
+                        chat::save_threads_cache(self.session, &self.threads);
                         self.follow_tail = true;
                         self.status = "Da gui tep dinh kem".into();
                     }
@@ -1423,7 +1481,7 @@ impl<'a> TuiApp<'a> {
                     }
                     self.selected_msg = None;
                     self.persist_thread_by_id(&thread_id);
-                    chat::save_threads_cache(&self.threads);
+                    chat::save_threads_cache(self.session, &self.threads);
                     self.status = "Da xoa tin nhan".into();
                 }
                 BgEvent::StickerPacks(packs) => {
@@ -1564,7 +1622,9 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Span::raw(" | Chua doc: "),
         Span::styled(
             total_unread.to_string(),
-            Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | "),
         Span::styled(&app.status, Style::default().fg(Color::Yellow)),
@@ -1705,12 +1765,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
 
     let (name, id, is_group, msg_count) = match app.threads.get(app.selected_thread) {
         Some(t) => (t.name.clone(), t.id.clone(), t.is_group, t.messages.len()),
-        None => (
-            "Chua chon hoi thoai".to_string(),
-            String::new(),
-            false,
-            0,
-        ),
+        None => ("Chua chon hoi thoai".to_string(), String::new(), false, 0),
     };
     let kind = if is_group { "Nhom" } else { "Ca nhan" };
     let chat_header = Paragraph::new(Line::from(vec![
@@ -1768,7 +1823,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     app.chat_view_h = inner_h;
 
     let pct = if lines.len() <= inner_h {
-        format!("100%")
+        "100%".to_string()
     } else {
         format!(
             "{}%",
@@ -1798,7 +1853,11 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         let quote = format!(
             " {}: {}",
             q.sender,
-            q.text.replace('\n', " ").chars().take(120).collect::<String>()
+            q.text
+                .replace('\n', " ")
+                .chars()
+                .take(120)
+                .collect::<String>()
         );
         let reply = Paragraph::new(quote)
             .block(
@@ -2012,7 +2071,10 @@ fn build_chat_lines(
         for (ci, chunk) in chunks.iter().enumerate() {
             if ci == 0 {
                 let mut spans = prefix.clone();
-                spans.push(Span::styled(chunk.clone(), Style::default().fg(Color::White)));
+                spans.push(Span::styled(
+                    chunk.clone(),
+                    Style::default().fg(Color::White),
+                ));
                 lines.push(Line::from(spans));
             } else {
                 lines.push(Line::from(vec![
@@ -2133,23 +2195,7 @@ fn unix_now_ms() -> i64 {
 }
 
 fn open_external_url(url: &str) {
-    let trimmed = url.trim();
-    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
-        return;
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", trimmed])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
-    }
+    let _ = crate::platform::open_url(url);
 }
 
 fn help_line(keys: &str, desc: &str) -> Line<'static> {
@@ -2164,6 +2210,8 @@ fn help_line(keys: &str, desc: &str) -> Line<'static> {
     ])
 }
 
+// Sequential pushes keep the key/description pairs readable beside their styles.
+#[allow(clippy::vec_init_then_push)]
 fn render_help(f: &mut Frame, area: Rect) {
     let modal_area = centered_rect(80, 80, area);
     f.render_widget(Clear, modal_area);
@@ -2176,15 +2224,23 @@ fn render_help(f: &mut Frame, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )));
     content.push(Line::raw(""));
-    content.push(help_line("Tab / BackTab", "Chuyen vung: Danh sach -> Tin nhan -> Soan tin"));
+    content.push(help_line(
+        "Tab / BackTab",
+        "Chuyen vung: Danh sach -> Tin nhan -> Soan tin",
+    ));
     content.push(help_line("F1 / ?", "Mo tro giup nay"));
     content.push(help_line("q / Ctrl+C", "Thoat (q chi khi khong go tin)"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Danh sach hoi thoai --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
-    content.push(help_line("Up/Down j/k", "Chon hoi thoai (cuon chuot cung duoc)"));
+    content.push(help_line(
+        "Up/Down j/k",
+        "Chon hoi thoai (cuon chuot cung duoc)",
+    ));
     content.push(help_line("PgUp/PgDn", "Nhay 10 hoi thoai"));
     content.push(help_line("Home / End", "Hoi thoai dau / cuoi"));
     content.push(help_line("/", "Tim theo ten, ID, noi dung, tin nhan"));
@@ -2196,25 +2252,35 @@ fn render_help(f: &mut Frame, area: Rect) {
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Tin nhan --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
     content.push(help_line("Up/Down j/k", "Chon tin nhan"));
     content.push(help_line("PgUp/PgDn", "Cuon nhanh"));
     content.push(help_line("Home / End", "Dau / cuoi hoi thoai"));
-    content.push(help_line("1 .. 6", "Tha cam xuc nhanh (Thich, Yeu, Haha, Wow, Buon, Phan no)"));
+    content.push(help_line(
+        "1 .. 6",
+        "Tha cam xuc nhanh (Thich, Yeu, Haha, Wow, Buon, Phan no)",
+    ));
     content.push(help_line("y", "Tra loi tin dang chon"));
     content.push(help_line("d", "Xoa tin nhan (chi phia ban)"));
     content.push(help_line("o", "Mo lien ket cua tin nhan"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
         "-- Soan tin / dinh kem --",
-        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
     )));
     content.push(help_line("Enter", "Gui tin nhan"));
     content.push(help_line("Ctrl+U", "Xoa toan bo o soan"));
     content.push(help_line("Ctrl+X", "Huy tra loi"));
     content.push(help_line("Esc", "Lui ve vung truoc"));
-    content.push(help_line("F2", "Kho nhan dan: Enter chon bo, Enter lan 2 de gui"));
+    content.push(help_line(
+        "F2",
+        "Kho nhan dan: Enter chon bo, Enter lan 2 de gui",
+    ));
     content.push(help_line("F3", "Gui tep dinh kem bang duong dan"));
     content.push(help_line("l", "Dev log inspector (chi che do --dev)"));
     content.push(Line::raw(""));
@@ -2243,7 +2309,11 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(modal_area);
 
-    let loading = if app.sticker.loading { " (dang tai...)" } else { "" };
+    let loading = if app.sticker.loading {
+        " (dang tai...)"
+    } else {
+        ""
+    };
     let packs_title = if app.sticker.stage == 0 {
         format!(
             " Kho nhan dan ({} bo){loading} [DANG CHON] — Enter de mo bo ",
@@ -2261,10 +2331,7 @@ fn render_sticker_overlay(f: &mut Frame, area: Rect, app: &TuiApp<'_>) {
         .iter()
         .map(|p| {
             ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", p.name),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(format!(" {} ", p.name), Style::default().fg(Color::White)),
                 Span::styled(
                     format!("({} sticker)", p.total_image),
                     Style::default().fg(Color::DarkGray),
@@ -2483,7 +2550,10 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
     )]));
     for e in entries.iter().rev() {
         let status_color = if e.is_error { Color::Red } else { Color::Green };
-        let status_str = e.status.map(|s| s.to_string()).unwrap_or_else(|| "ERR".into());
+        let status_str = e
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "ERR".into());
 
         content.push(Line::from(vec![
             Span::styled(
@@ -2496,7 +2566,10 @@ fn render_log_modal(f: &mut Frame, area: Rect, scroll: usize) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("{:<3} ", status_str), Style::default().fg(status_color)),
+            Span::styled(
+                format!("{:<3} ", status_str),
+                Style::default().fg(status_color),
+            ),
             Span::styled(
                 format!("({}ms) ", e.latency_ms),
                 Style::default().fg(Color::DarkGray),
@@ -2558,7 +2631,10 @@ mod tests {
 
     #[test]
     fn wraps_words_to_width() {
-        assert_eq!(wrap_text("a b c", 3), vec!["a b".to_string(), "c".to_string()]);
+        assert_eq!(
+            wrap_text("a b c", 3),
+            vec!["a b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -2580,6 +2656,8 @@ mod tests {
         let mut session = crate::session::Session::new(false, false, false).unwrap();
         let (tx, rx) = channel();
         let thread = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
             id: "u1".into(),
             name: "Test".into(),
             preview: "xin chao".into(),

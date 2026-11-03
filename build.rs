@@ -1,7 +1,12 @@
 //! Embed `src/assets/app_icon.ico` into the Windows PE executable (`RT_ICON` + `RT_GROUP_ICON`)
 //! by emitting a standard COFF/Win32 `.res` file in `OUT_DIR` without requiring external `rc.exe`.
 
-fn main() {
+#[path = "build_support/windows_resources.rs"]
+mod windows_resources;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build_support/windows_resources.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
 
@@ -11,17 +16,25 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     if target_os == "windows" && target_env == "msvc" {
-        if let Err(e) = embed_windows_icon() {
-            println!("cargo:warning=Could not embed Windows icon resource: {e}");
+        // Optional Windows N media components must not prevent the GUI from loading.
+        // windows_video checks/loads System32 DLLs before calling delay imports.
+        for dll in ["mfplat.dll", "mfreadwrite.dll", "mf.dll", "mfplay.dll"] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
         }
+        println!("cargo:rustc-link-arg=/DEFAULTLIB:delayimp");
+        embed_windows_icon()?;
     }
+    Ok(())
 }
 
 fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     use std::path::PathBuf;
 
     let ico = std::fs::read("src/assets/app_icon.ico")?;
-    if ico.len() < 6 || u16::from_le_bytes([ico[0], ico[1]]) != 0 || u16::from_le_bytes([ico[2], ico[3]]) != 1 {
+    if ico.len() < 6
+        || u16::from_le_bytes([ico[0], ico[1]]) != 0
+        || u16::from_le_bytes([ico[2], ico[3]]) != 1
+    {
         return Err("Invalid ICO header".into());
     }
     let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
@@ -67,15 +80,31 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     res.extend_from_slice(&grp_dir);
     align4(&mut res);
 
+    let version = std::env::var("CARGO_PKG_VERSION")?;
+    let version_resource = windows_resources::build_vs_version_info(&version);
+    write_res_header(&mut res, version_resource.len() as u32, 16, 1, 0x0030);
+    res.extend_from_slice(&version_resource);
+    align4(&mut res);
+    let manifest = windows_resources::build_windows_manifest(&version);
+    write_res_header(&mut res, manifest.len() as u32, 24, 1, 0x1030);
+    res.extend_from_slice(manifest.as_bytes());
+    align4(&mut res);
+
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let res_path = out_dir.join("app_icon.res");
     std::fs::write(&res_path, &res)?;
 
-    println!("cargo:rustc-link-arg-bin=zalo-rust={}", res_path.display());
+    println!("cargo:rustc-link-arg-bin=ctdozlite={}", res_path.display());
     Ok(())
 }
 
-fn write_res_header(buf: &mut Vec<u8>, data_size: u32, res_type: u16, res_name: u16, mem_flags: u16) {
+fn write_res_header(
+    buf: &mut Vec<u8>,
+    data_size: u32,
+    res_type: u16,
+    res_name: u16,
+    mem_flags: u16,
+) {
     buf.extend_from_slice(&data_size.to_le_bytes());
     buf.extend_from_slice(&32u32.to_le_bytes()); // HeaderSize = 32
     buf.extend_from_slice(&0xFFFFu16.to_le_bytes());
@@ -90,7 +119,7 @@ fn write_res_header(buf: &mut Vec<u8>, data_size: u32, res_type: u16, res_name: 
 }
 
 fn align4(buf: &mut Vec<u8>) {
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }

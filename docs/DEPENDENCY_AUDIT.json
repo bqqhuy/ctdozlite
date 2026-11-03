@@ -1,0 +1,31 @@
+{
+  "packages": 326,
+  "findings": [
+    {
+      "package": "audiopus_sys",
+      "version": "0.2.2",
+      "ids": [
+        "RUSTSEC-2026-0150"
+      ]
+    },
+    {
+      "package": "paste",
+      "version": "1.0.15",
+      "ids": [
+        "RUSTSEC-2024-0436"
+      ]
+    },
+    {
+      "package": "ttf-parser",
+      "version": "0.25.1",
+      "ids": [
+        "RUSTSEC-2026-0192"
+      ]
+    }
+  ],
+  "checked_at_utc": "2026-11-02T05:23:32.667859+00:00",
+  "target": "aarch64-pc-windows-msvc",
+  "cargo_lock_sha256": "8531cd11cab0586947ec93fd729c065d5316a9a579995475f6ff28ab5c7d95c1",
+  "source": "https://api.osv.dev/v1/querybatch",
+  "scope": "Registry packages on normal/build dependency graph; local lru compatibility export is not a registry implementation."
+}

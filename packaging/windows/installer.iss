@@ -1,21 +1,18 @@
 #define MyAppName "ctdozlite"
-#define MyAppVersion "0.0.1"
-#define MyAppPublisher "ctdoteam1110"
-#define MyAppURL "https://github.com/ctdoteam1110/ctdozlite"
-#define MyAppExeName "zalo-rust.exe"
-; Build with: iscc /DArch=arm64 installer.iss  (default: x64)
-#ifndef Arch
-  #define Arch "x64"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.3"
 #endif
-#if Arch == "arm64"
-  #define ArchSuffix "arm64"
-  #define ArchAllowed "arm64"
-#else
-  #define ArchSuffix "x86_64"
-  #define ArchAllowed "x64compatible"
+#ifndef BuildDir
+  #define BuildDir "..\..\target\aarch64-pc-windows-msvc\release"
 #endif
+#define MyAppPublisher "bqqhuy"
+#define MyAppURL "https://github.com/bqqhuy/ctdozlite"
+#define MyAppExeName "ctdozlite.exe"
+#define ArchSuffix "arm64"
+#define ArchAllowed "arm64"
 
 [Setup]
+MinVersion=10.0.22000
 AppId={{8F4E2D1A-9C3B-4E7F-A6D5-1B2C3D4E5F60}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
@@ -44,12 +41,16 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\docs\WINDOWS_ARM64.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--gui"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--gui"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--gui"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--gui"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent

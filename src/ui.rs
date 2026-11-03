@@ -47,14 +47,9 @@ pub fn prompt_password(label: &str) -> Result<String> {
     Ok(s.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// Return the current time in the operating system timezone.
 pub fn clock() -> String {
-    let secs = crate::login::unix_now();
-    format!(
-        "{:02}:{:02}:{:02}",
-        (secs / 3600) % 24,
-        (secs / 60) % 60,
-        secs % 60
-    )
+    crate::clock::now_clock()
 }
 
 /// Repaint the thread list and wait for one key.
@@ -85,7 +80,10 @@ pub fn draw(threads: &[Thread], selected: usize, status: &str) -> Result<Action>
     }
 
     writeln!(out, "{}", "─".repeat(64))?;
-    writeln!(out, "\x1b[90m↑/↓ chọn (mỗi dòng một phím) · r làm mới · q thoát\x1b[0m")?;
+    writeln!(
+        out,
+        "\x1b[90m↑/↓ chọn (mỗi dòng một phím) · r làm mới · q thoát\x1b[0m"
+    )?;
     out.flush()?;
 
     // Line-buffered read: no terminal mode juggling, so it can never hang the console.

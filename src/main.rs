@@ -4,37 +4,49 @@
 
 #![allow(dead_code)]
 
-mod audio;
-mod call;
-mod chat;
-mod crypto;
-mod endpoints;
-mod gui;
-mod logger;
-mod login;
-mod media;
-mod param_cipher;
-mod qr;
-mod session;
-mod socket;
-mod store;
-mod tui;
-mod ui;
-mod voip_log;
+use zalo_rust::{chat, gui, logger, login, platform, qr, session, storage, store, tui, ui, video};
+
+#[cfg(all(not(debug_assertions), not(all(windows, target_arch = "aarch64"))))]
+compile_error!("Production builds of this fork require Windows ARM64 (aarch64-pc-windows-msvc)");
 
 use anyhow::Result;
 use session::Session;
-
-pub const POLL_SECS: u64 = 4;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (zalo-rust)", env!("CARGO_PKG_VERSION"));
+        println!("ctdozlite v{} (Windows ARM64)", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    let dev_mode = args.iter().any(|a| a == "--dev" || a == "-v" || a == "--verbose");
+    if args.iter().any(|a| a == "--licenses") {
+        println!("{}", include_str!("../THIRD_PARTY_NOTICES.txt"));
+        return Ok(());
+    }
+    let smoke = args.iter().any(|a| a == "--ui-smoke-test");
+    anyhow::ensure!(
+        !args.iter().any(|a| a == "--tray-smoke-test") || smoke,
+        "--tray-smoke-test requires --ui-smoke-test"
+    );
+    if smoke && std::env::var_os("CTDOZ_DATA_DIR").is_none() {
+        anyhow::bail!("--ui-smoke-test requires an isolated CTDOZ_DATA_DIR");
+    }
+    let profile = storage::profile_from_args(&args)?;
+    storage::init_profile(args.iter().any(|a| a == "--portable"), profile.as_deref())?;
+    let proxy = zalo_rust::proxy::from_args(&args, std::env::var("CTDOZ_PROXY").ok())?;
+    if let Some(config) = &proxy {
+        println!("Proxy: {}", config.redacted());
+    }
+    zalo_rust::proxy::init(proxy)?;
+    zalo_rust::crash_report::install();
+    let _instance = if args.iter().any(|a| a == "--doctor") {
+        None
+    } else {
+        Some(storage::lock_instance()?)
+    };
+    let dev_mode = args
+        .iter()
+        .any(|a| a == "--dev" || a == "-v" || a == "--verbose");
     let dump = args.iter().any(|a| a == "-d" || a == "--dump");
     let dump_raw = args.iter().any(|a| a == "--dump-raw");
     let force_tui = args.iter().any(|a| a == "--tui");
@@ -43,9 +55,8 @@ async fn main() -> Result<()> {
     let force_logout = args.iter().any(|a| a == "--logout");
 
     if force_logout {
-        let _ = std::fs::remove_file("session.json");
-        let _ = std::fs::remove_file("threads_cache.json");
-        println!("✓ Đã đăng xuất và xóa phiên lưu trữ cũ (session.json, threads_cache.json).");
+        storage::remove_session()?;
+        println!("✓ Đã đăng xuất. Lịch sử được giữ riêng cho tài khoản đã đăng nhập.");
         if !force_gui && !force_tui && !force_qr {
             return Ok(());
         }
@@ -54,19 +65,40 @@ async fn main() -> Result<()> {
     logger::init(dev_mode);
 
     if dev_mode {
-        println!("🔧 [DEV MODE ACTIVATED] – Quét log, chẩn đoán giao thức và trace chi tiết được bật.");
+        println!(
+            "🔧 [DEV MODE ACTIVATED] – Quét log, chẩn đoán giao thức và trace chi tiết được bật."
+        );
     } else {
         println!("🔒 [PRODUCTION MODE] – Toàn bộ nhật ký và dev inspector được ẩn.");
     }
 
+    if args.iter().any(|a| a == "--doctor") {
+        println!("Architecture: {}", std::env::consts::ARCH);
+        println!("Data directory: {}", storage::root().display());
+        if let Some(name) = &profile {
+            println!("Profile: {name}");
+        }
+        match video::readiness() {
+            Ok(path) => println!("Video ready: {path}"),
+            Err(e) => println!("Video unavailable: {e}"),
+        }
+        return Ok(());
+    }
     let mut s = Session::new(dev_mode, dump, dump_raw)?;
 
     // Attempt to restore persistent session from disk
-    let session_restored = if !force_logout {
-        if let Ok(_) = s.load_from_file("session.json") {
+    let session_restored = if !force_logout && !smoke {
+        if s.load_from_file("session.json").is_ok() {
             if let Some(li) = &s.login {
-                let name = if li.display_name.is_empty() { "Zalo User" } else { &li.display_name };
-                println!("✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})", li.uin);
+                let name = if li.display_name.is_empty() {
+                    "Zalo User"
+                } else {
+                    &li.display_name
+                };
+                println!(
+                    "✓ Đã khôi phục phiên từ session.json: {name} (UIN: {})",
+                    li.uin
+                );
                 true
             } else {
                 false
@@ -102,16 +134,47 @@ async fn main() -> Result<()> {
             }
         }
         let mut viewport = eframe::egui::ViewportBuilder::default()
-            .with_decorations(false)
+            .with_decorations(true)
             .with_inner_size([1020.0, 700.0])
             .with_min_inner_size([480.0, 360.0])
             .with_title("Zalo");
+        if smoke {
+            let size = args
+                .iter()
+                .position(|a| a == "--ui-smoke-size")
+                .and_then(|i| args.get(i + 1))
+                .map(|s| {
+                    s.split('x')
+                        .filter_map(|n| n.parse::<f32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![480.0, 360.0]);
+            anyhow::ensure!(
+                size.len() == 2
+                    && size
+                        .iter()
+                        .all(|n| n.is_finite() && *n >= 360.0 && *n <= 1920.0),
+                "Invalid smoke size"
+            );
+            viewport = viewport.with_inner_size([size[0], size[1]]);
+        }
         if let Some(icon) = gui::load_app_icon() {
             viewport = viewport.with_icon(std::sync::Arc::new(icon));
         }
-        let mut initial_threads = chat::load_threads_cache();
-        store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+        let mut initial_threads = chat::load_threads_cache(&s);
+        store::load_history_into_threads(
+            s.history_path(),
+            &mut initial_threads,
+            store::MessageStore::PRELOAD_MSGS,
+        );
 
+        #[cfg(all(windows, target_arch = "aarch64"))]
+        if dev_mode {
+            eprintln!(
+                "Compiled graphics backends: {:?}",
+                eframe::wgpu::Instance::enabled_backend_features()
+            );
+        }
         let renderers = gui_renderer_order();
         let mut last_err = None;
         for (i, renderer) in renderers.iter().enumerate() {
@@ -121,6 +184,11 @@ async fn main() -> Result<()> {
             let native_options = eframe::NativeOptions {
                 viewport: viewport.clone(),
                 renderer: *renderer,
+                #[cfg(all(windows, target_arch = "aarch64"))]
+                wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+                    supported_backends: eframe::wgpu::Backends::DX12,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let app_session = s.clone();
@@ -129,7 +197,17 @@ async fn main() -> Result<()> {
                 "Zalo - Rust Native Client",
                 native_options,
                 Box::new(move |cc| {
-                    Ok(Box::new(gui::ZaloGuiApp::new(cc, app_session, dev_mode, threads)))
+                    #[cfg(all(windows, target_arch = "aarch64"))]
+                    if let Some(state) = &cc.wgpu_render_state {
+                        let info = state.adapter.get_info();
+                        eprintln!("Graphics: {} ({:?})", info.name, info.backend);
+                    }
+                    Ok(Box::new(gui::ZaloGuiApp::new(
+                        cc,
+                        app_session,
+                        dev_mode,
+                        threads,
+                    )))
                 }),
             ) {
                 Ok(()) => return Ok(()),
@@ -144,10 +222,14 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        return Err(anyhow::anyhow!(
+        let message = format!(
             "Không thể khởi chạy GUI: {}",
             last_err.map(|e| e.to_string()).unwrap_or_default()
-        ));
+        );
+        if !smoke {
+            platform::startup_error(&message);
+        }
+        return Err(anyhow::anyhow!(message));
     }
 
     // 1. Initial server info check for TUI mode
@@ -156,7 +238,10 @@ async fn main() -> Result<()> {
             s.apply_server_info(d);
         }
         if dev_mode {
-            println!("✓ getServerInfo: chat {} • convers {}", s.domains.chat, s.domains.conversation);
+            println!(
+                "✓ getServerInfo: chat {} • convers {}",
+                s.domains.chat, s.domains.conversation
+            );
         }
     }
 
@@ -165,12 +250,13 @@ async fn main() -> Result<()> {
 
     // Validate session on server to avoid getting stuck in an expired session
     let session_restored = if session_restored {
-        if s.validate_session().await {
+        if s.validate_session().await != session::SessionStatus::Expired {
             true
         } else {
-            println!("⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…");
-            let _ = std::fs::remove_file("session.json");
-            let _ = std::fs::remove_file("threads_cache.json");
+            println!(
+                "⚠️ Phiên đăng nhập trong session.json đã hết hạn. Đang chuyển sang đăng nhập mới…"
+            );
+            storage::remove_session()?;
             s.logout();
             false
         }
@@ -216,9 +302,19 @@ async fn main() -> Result<()> {
         }
     }
 
+    if s.login.is_some() {
+        if let Err(e) = s.save_to_file("session.json") {
+            eprintln!("Không thể lưu phiên: {e}");
+        }
+    }
+
     // Fetch initial threads and hydrate with local SQLite history
-    let mut initial_threads = chat::load_threads_cache();
-    store::load_history_into_threads("zalo_history.db", &mut initial_threads, 200);
+    let mut initial_threads = chat::load_threads_cache(&s);
+    store::load_history_into_threads(
+        s.history_path(),
+        &mut initial_threads,
+        store::MessageStore::PRELOAD_MSGS,
+    );
     if s.login.is_some() {
         match chat::get_friends(&s).await {
             Ok(list) => {
@@ -233,7 +329,9 @@ async fn main() -> Result<()> {
                     }
                 }
                 let mut poll_state = chat::PollState::default();
-                if let Err(e) = chat::poll_new_messages(&s, &mut poll_state, &mut initial_threads).await {
+                if let Err(e) =
+                    chat::poll_new_messages(&s, &mut poll_state, &mut initial_threads).await
+                {
                     crate::logger::log_error("main::poll_new_messages", &e.to_string());
                     eprintln!("! Lỗi tải tin nhắn gần nhất: {e}");
                 }

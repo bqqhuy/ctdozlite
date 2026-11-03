@@ -42,3 +42,41 @@ pub fn service(key: &str) -> Option<&'static str> {
         .find(|(k, _)| *k == key)
         .map(|(_, v)| *v)
 }
+
+/// Public, version-pinned Zalo Web crypto module; verified before instantiation.
+pub const PHONE_SYNC_CODEC: &str =
+    "https://chat.zalo.me/libs/libzproto_wasm_bg.ecc0555ba9d0f8867a4699ce943ec745.wasm";
+/// Signed transfer download families, validated again after every redirect.
+pub const SYNC_DOWNLOAD_DOMAINS: &[&str] = &["zalo.me", "zaloapp.com", "zdn.vn"];
+
+/// CDN families serving direct chat photo files.
+pub const PHOTO_CDN_DOMAINS: &[&str] = &["zdn.vn", "zadn.vn", "zalo.me", "zaloapp.com"];
+
+/// Credential-free media families confirmed in PC connect_src_rgx and upstream PR #70.
+pub const MEDIA_DOWNLOAD_DOMAINS: &[&str] = &[
+    "zdn.vn",
+    "zadn.vn",
+    "zalo.me",
+    "zaloapp.com",
+    "dlmd.me",
+    "dlfl.vn",
+];
+
+/// Public media requests carry no authenticated session cookie.
+pub const WEB_ORIGIN: &str = "https://chat.zalo.me/";
+
+/// Zalo PC 26.11.10 playNoti public asset.
+pub const NOTIFICATION_SOUND: &str = "https://stc-chat.zdn.vn/sound/noti.mp3";
+
+/// Fork-owned release discovery; never query upstream for an ARM64 update.
+pub const RELEASE_LATEST: &str = "https://api.github.com/repos/bqqhuy/ctdozlite/releases/latest";
+/// Asset URLs must stay under this repository before following GitHub asset redirects.
+pub const RELEASE_ASSET_PREFIX: &str = "https://github.com/bqqhuy/ctdozlite/releases/download/";
+
+/// Credential-free GitHub release redirect allowlist.
+pub const RELEASE_REDIRECT_HOSTS: &[&str] = &[
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "api.github.com",
+];
