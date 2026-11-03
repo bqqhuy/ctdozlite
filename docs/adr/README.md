@@ -62,3 +62,4 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0019 — History tools and ARM64 updater](0019-history-tools-and-arm64-updater.md)
 - [0020 — Bounded queue catch-up](0020-bounded-queue-catchup.md)
 - [0021 — Drafts and delete replay markers](0021-drafts-and-delete-replay-markers.md)
+- [0022 — Resumable control queue drain](0022-resumable-control-queue-drain.md)

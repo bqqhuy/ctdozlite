@@ -203,6 +203,11 @@ impl std::fmt::Display for HttpFailure {
 }
 impl std::error::Error for HttpFailure {}
 
+/// Extract a typed HTTP failure without parsing or exposing its original error text.
+pub(crate) fn http_failure_status(error: &anyhow::Error) -> Option<u16> {
+    error.downcast_ref::<HttpFailure>().map(|failure| failure.0)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LoginInfo {
     pub uin: String,

@@ -86,7 +86,8 @@ Những điểm cần biết trước khi dùng:
 - Một số Settings kế thừa chưa có hành vi đầy đủ. Cài đặt → Tiện ích có kiểm tra/tải cập nhật thủ công từ release fork, kiểm SHA-256 và payload ARM64 trước khi cho mở bộ cài. Chưa bật Social Feed hoặc REST/MCP.
 - Database hiện dùng **schema 8**: thêm bản nháp theo hội thoại và dấu định danh chống nhập lại tin đã xóa; giữ tin nhắn/cấu hình/coverage hợp lệ từ schema 7. Khi nâng từ engine cũ, migration 7 vẫn vô hiệu hóa coverage điện thoại nghi sai một lần. Binary chỉ hiểu schema 7 trở xuống sẽ từ chối mở; sao lưu trước khi thử. Xem [ADR-0021](docs/adr/0021-drafts-and-delete-replay-markers.md).
 - Composer lưu bản nháp văn bản theo tài khoản/hội thoại qua worker sau 500 ms; kết quả đọc muộn không ghi đè nội dung đang gõ. Chưa lưu đính kèm/quote chưa gửi.
-- HTTP/WS ngừng lấy trang tiếp khi cursor đứng yên/quay vòng, giới hạn chuỗi và nghỉ 30 giây; không tăng cursor giả hoặc tự chạy sync điện thoại. Xem [ADR-0020](docs/adr/0020-bounded-queue-catchup.md).
+- HTTP/WS tiếp tục khi cursor còn tiến, không cắt sau 64 trang. Queue WS do server cấp có timer đọc lại hữu hạn khi thiếu/lặp cursor hoặc hết thời gian chờ; lịch hủy theo kết nối. Không tăng cursor giả hay tự chạy lại sync điện thoại. Xem [ADR-0022](docs/adr/0022-resumable-control-queue-drain.md).
+- Sync điện thoại hiện rõ số mô tả gói, idx lớn nhất, lỗ hổng và chờ dấu cuối; nhập xong chuyển sang chờ gói tiếp. Log `diagnostics/sync-media.jsonl` ghi từng stage và quyết định queue, không chứa URL/khóa/nội dung tin. Mốc chờ gói thử nghiệm là 5 phút hoạt động; điều kiện hoàn tất vẫn nhận đủ idx rồi nhập thành công, schema giữ nguyên 8.
 
 Đây là tích hợp có chọn lọc từ upstream, chưa phải bản sao đầy đủ mọi tính năng của upstream mới nhất. Chi tiết có trong [báo cáo đối chiếu commit](docs/UPSTREAM_REVIEW_2026-11-02.md) và [audit Windows ARM64](docs/ARM64_IMPLEMENTATION.md).
 

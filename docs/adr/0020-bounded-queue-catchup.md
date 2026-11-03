@@ -1,6 +1,6 @@
 # ADR-0020: Giới hạn lấy tiếp hàng đợi khi cursor không tiến
 
-- **Status:** accepted
+- **Status:** superseded by ADR-0022
 - **Date:** 2026-11-03
 - **Deciders:** Yêu cầu bổ sung bản thử ARM64
 

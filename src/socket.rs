@@ -17,6 +17,8 @@
 //! HTTP long-polling only ever carries durable actions; live VoIP invites are socket-only,
 //! which is why a polling-only callee sees `act:"answer" status:5` and never `act:"request"`.
 
+pub(crate) mod queue_receiver;
+
 use aes::{Aes128, Aes256};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::AesGcm;
@@ -328,6 +330,20 @@ fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
     out
 }
 
+fn phone_only_controls(payload: &Value) -> bool {
+    payload
+        .pointer("/data/controls")
+        .or_else(|| payload.get("controls"))
+        .and_then(Value::as_array)
+        .is_some_and(|controls| {
+            !controls.is_empty()
+                && controls.iter().all(|control| {
+                    control.pointer("/content/act_type").and_then(Value::as_str)
+                        == Some("transfer_sync2")
+                })
+        })
+}
+
 fn continuation_cursor(last: Option<&Value>, ids: &Value) -> Option<String> {
     let scalar = |value: &Value| match value {
         Value::String(s) => Some(s.clone()),
@@ -336,12 +352,15 @@ fn continuation_cursor(last: Option<&Value>, ids: &Value) -> Option<String> {
     };
     let last = last
         .and_then(scalar)
-        .filter(|id| !id.is_empty() && id != "0")?;
+        .filter(|id| !id.is_empty() && id != "0" && id.len() <= 128)?;
     let values = ids.as_array()?;
     if values.len() > 1024 {
         return None;
     }
     let mut ids = values.iter().map(scalar).collect::<Option<Vec<_>>>()?;
+    if ids.iter().any(|id| id.len() > 128) {
+        return None;
+    }
     ids.sort();
     ids.dedup();
     Some(json!([last, ids]).to_string())
@@ -401,12 +420,15 @@ impl SyncTransport {
     /// Dispose a known phone session with the official cancellation/success/error/outdated reason.
     pub(crate) async fn dispose_reason(&self, epoch: u64, id: &str, reason: u8) -> Result<()> {
         anyhow::ensure!(reason <= 3, "Invalid sync disposal reason");
-        self.write(
-            epoch,
-            CMD_SYNC_DISPOSE,
-            json!({"data":{"syncId":id,"toDevice":0,"reason":reason},"reqId":"req_dispose"}),
-        )
-        .await
+        let result = self
+            .write(
+                epoch,
+                CMD_SYNC_DISPOSE,
+                json!({"data":{"syncId":id,"toDevice":0,"reason":reason},"reqId":"req_dispose"}),
+            )
+            .await;
+        crate::transfer_diagnostics::dispose(id, reason, result.is_ok());
+        result
     }
     async fn write(&self, epoch: u64, command: u16, body: Value) -> Result<()> {
         anyhow::ensure!(self.epoch() == Some(epoch), "Phone sync connection changed");
@@ -552,12 +574,20 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
-    let mut catchups =
-        std::collections::HashMap::<(u16, u8), crate::queue_catchup::CatchupGuard>::new();
+    let mut catchups = queue_receiver::PullQueues::new(epoch);
+    let mut pull_tick = tokio::time::interval(Duration::from_millis(100));
+    pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut writes_open = true;
     loop {
         tokio::select! {
             _ = tx.closed() => return Ok("receiver closed".into()),
+            _=pull_tick.tick(),if authed=>{
+                for pull in catchups.due(std::time::Instant::now()) {
+                    let id=format!("req_{req_id}");req_id+=1;
+                    tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(pull.key.0,pull.key.1,&id,pull.last,pull.ids)))).await??;
+                    catchups.sent(pull.key,id,std::time::Instant::now());
+                }
+            },
             _ = ping.tick() => {
                 if !sess.is_active() { return Ok("session revoked".into()); }
                 if authed {
@@ -633,10 +663,13 @@ async fn run_once(
                     ready.send_replace(Some(epoch));
                     tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() }).await?;
 
-                    for (qcmd, qsub) in queues_from_auth(&auth) {
+                    let queues=queues_from_auth(&auth);
+                    anyhow::ensure!(queues.len()<=256,"Server advertised too many queues");
+                    for (qcmd, qsub) in queues {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        ws.send(Message::Binary(pull_frame(qcmd, qsub, &id))).await?;
+                        tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_frame(qcmd, qsub, &id)))).await??;
+                        catchups.register((qcmd,qsub),id.clone(),std::time::Instant::now());
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));
                     }
                     continue;
@@ -674,25 +707,17 @@ async fn run_once(
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
-                if matches!(cmd,CMD_PULL_MSG_1_1|CMD_PULL_MSG_GROUP|CMD_PULL_MSG_513|CMD_PULL_MSG_514|CMD_PULL_MSG_515|CMD_PULL_MSG_517|CMD_PULL_MSG_518|CMD_CTRL_PULL_CTRL|CMD_CTRL_PULL_VOIP) {
-                    let qkey = format!("{cmd}_{sub_cmd}");
-                    let more=payload.pointer("/data/more").and_then(Value::as_i64)==Some(1);
-                    let last_id=payload.pointer("/data/lastActionId")
-                        .or_else(||payload.pointer(&format!("/data/queueStatus/{qkey}/lastId"))).cloned();
-                    let pre_ids=payload.pointer(&format!("/data/queueStatus/{qkey}/ids")).cloned().unwrap_or_else(||json!([]));
-                    let guard=catchups.entry((cmd,sub_cmd)).or_default();
-                    // Boundary IDs are part of the cursor; their order and JSON scalar type are not.
-                    let cursor=continuation_cursor(last_id.as_ref(),&pre_ids);
-                    if guard.observe(cursor,more,std::time::Instant::now()) {
-                        if let Some(last_id)=last_id {
-                            let id=format!("req_{req_id}");req_id+=1;
-                            ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,last_id,pre_ids))).await?;
-                        }
-                    }
+                if let Some(pull)=catchups.page((cmd,sub_cmd),&payload,std::time::Instant::now()) {
+                    let id=format!("req_{req_id}");req_id+=1;
+                    tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,pull.last,pull.ids)))).await??;
+                    catchups.sent((cmd,sub_cmd),id,std::time::Instant::now());
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE) {
                     // Broadcast is bounded and never waits for phone decoding or disk writes.
                     let _=controls.send(WsEvent{cmd,sub_cmd,version,payload:payload.clone()});
+                    // Phone-only controls have their own bounded receiver. Do not let slow
+                    // GUI history/profile work stall the authoritative phone transport.
+                    if phone_only_controls(&payload){continue;}
                 }
                 tx.send(WsEvent { cmd, sub_cmd, version, payload }).await?;
             }
@@ -791,5 +816,24 @@ mod tests {
     fn gcm_rejects_short_blob() {
         let err = gcm_decrypt(&[0u8; 32], &[0u8; 16]).unwrap_err().to_string();
         assert!(err.contains("too short"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod phone_forwarding_tests {
+    use super::*;
+    #[test]
+    fn phone_only_controls_bypass_ui_but_mixed_call_or_message_controls_do_not() {
+        let control = json!({"content":{"act_type":"transfer_sync2","act":"upload_batch"}});
+        assert!(phone_only_controls(
+            &json!({"data":{"controls":[control.clone()]}})
+        ));
+        assert!(phone_only_controls(
+            &json!({"controls":[control.clone(),control.clone()]})
+        ));
+        assert!(!phone_only_controls(
+            &json!({"data":{"controls":[control,{"content":{"act_type":"voip"}}]}})
+        ));
+        assert!(!phone_only_controls(&json!({"data":{"controls":[]}})));
     }
 }

@@ -3,6 +3,7 @@ use crate::{
     chat::ChatMessage,
     message_view::{Media, MediaKind},
     session::Session,
+    transfer_diagnostics::{self as diag, RenewPhase},
 };
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
@@ -79,19 +80,70 @@ async fn renew_once(
     group: bool,
     message: &ChatMessage,
 ) -> Result<Media> {
-    ensure!(s.is_active(), "Đã đăng xuất");
-    let params = s.encoded_params(&payload(s, thread, group, message)?)?;
+    let tag = reference_tag(s, thread, message);
+    let params = (|| -> Result<String> {
+        ensure!(s.is_active(), "Đã đăng xuất");
+        s.encoded_params(&payload(s, thread, group, message)?)
+    })();
+    let params = params.inspect_err(|_| {
+        diag::renewal(tag, RenewPhase::PreparationFailed, None);
+    })?;
     let endpoint = format!(
         "{}/api/message/renewlink?{}",
         s.domains.file,
         s.common_params()
     );
+    diag::renewal(tag, RenewPhase::RequestSent, None);
     let response = s
         .post_form(&endpoint, format!("params={params}"))
         .await
-        .map_err(|_| anyhow::anyhow!("Không thể yêu cầu phục hồi đường dẫn media"))?;
+        .map_err(|error| {
+            if let Some(status) = crate::session::http_failure_status(&error) {
+                diag::renewal_http(tag, status);
+            } else {
+                diag::renewal(tag, RenewPhase::NetworkFailed, None);
+            }
+            anyhow::anyhow!("Không thể yêu cầu phục hồi đường dẫn media")
+        })?;
     let response = s.maybe_decrypt(response, s.session_key_bytes()).await;
-    parse(&response, crate::message_view::media(message))
+    let code = reply_code(&response);
+    diag::renewal(tag, RenewPhase::ServerReply, code);
+    let result = parse(&response, crate::message_view::media(message));
+    diag::renewal(
+        tag,
+        if result.is_ok() {
+            RenewPhase::Finished
+        } else if code.is_some_and(|code| code != 0) {
+            RenewPhase::ServerRejected
+        } else {
+            RenewPhase::ParseFailed
+        },
+        code,
+    );
+    result
+}
+fn reply_code(response: &Value) -> Option<i64> {
+    let number = |v: &Value| v.as_i64().or_else(|| v.as_str()?.parse().ok());
+    let outer = response.get("error_code").and_then(number)?;
+    if outer != 0 {
+        return Some(outer);
+    }
+    response
+        .pointer("/data/error_code")
+        .and_then(number)
+        .or(Some(outer))
+}
+fn reference_tag(s: &Session, thread: &str, message: &ChatMessage) -> u64 {
+    // Length-delimited identities avoid cross-account correlation and concatenation collisions.
+    diag::tag(&format!(
+        "{}:{}{}:{}{}:{}",
+        s.account_key().len(),
+        s.account_key(),
+        thread.len(),
+        thread,
+        message.id.len(),
+        message.id
+    ))
 }
 fn parse(response: &Value, mut media: Media) -> Result<Media> {
     ensure!(
@@ -159,8 +211,10 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
     static FLIGHTS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, Renewal>>,
     > = std::sync::OnceLock::new();
+    let tag = reference_tag(s, thread, message);
+    diag::renewal(tag, RenewPhase::Entered, None);
     let identity = serde_json::to_string(&(s.account_key(), thread, &message.id))?;
-    let cell = {
+    let cell = (|| -> Result<Renewal> {
         let mut map = FLIGHTS
             .get_or_init(Default::default)
             .lock()
@@ -172,13 +226,26 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
             map.len() < 128 || map.contains_key(&identity),
             "Đang có nhiều yêu cầu phục hồi media"
         );
-        map.entry(identity)
+        Ok(map
+            .entry(identity)
             .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(None)))
-            .clone()
-    };
+            .clone())
+    })()
+    .inspect_err(|_| {
+        diag::renewal(tag, RenewPhase::PreparationFailed, None);
+    })?;
     let mut state = cell.lock().await;
     if let Some((at, result)) = &*state {
         if at.elapsed() < std::time::Duration::from_secs(60) {
+            diag::renewal(
+                tag,
+                if result.is_ok() {
+                    RenewPhase::CacheHitSuccess
+                } else {
+                    RenewPhase::CacheHitFailure
+                },
+                None,
+            );
             return result.clone().map_err(anyhow::Error::msg);
         }
     }
@@ -236,5 +303,26 @@ mod request_tests {
         };
         let got=parse(&json!({"error_code":0,"data":{"fileUrl":"https://file-stal-3.dlfl.vn/file/renewMedia.doc"}}),old).unwrap();
         assert_eq!(got.name, "Báo cáo.doc");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_code_tests {
+    use super::*;
+    #[test]
+    fn outer_and_nested_api_codes_remain_numeric_without_recording_response_text() {
+        assert_eq!(
+            reply_code(&json!({"error_code":"120","error_message":"private server text"})),
+            Some(120)
+        );
+        assert_eq!(
+            reply_code(&json!({"error_code":0,"data":{"error_code":"15"}})),
+            Some(15)
+        );
+        assert_eq!(reply_code(&json!({"error_code":0,"data":{}})), Some(0));
+        assert_eq!(
+            reply_code(&json!({"error_message":"not an envelope"})),
+            None
+        );
     }
 }

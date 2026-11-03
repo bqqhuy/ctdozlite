@@ -73,9 +73,13 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
     progress: Arc<std::sync::Mutex<F>>,
     round: usize,
     ready: tokio::sync::watch::Receiver<bool>,
-) -> tokio::sync::mpsc::Receiver<Result<Staged>> {
+    sync_id: String,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<Staged>>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = tokio::sync::mpsc::channel(2);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let directory = session.history_path().with_extension("phone-staging");
         let create = directory.clone();
         let prepared = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -101,6 +105,7 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                 let session = session.clone();
                 let cancel = cancel.clone();
                 let progress = progress.clone();
+                let sync_id = sync_id.clone();
                 async move {
                     let batch = batch?;
                     ensure!(
@@ -112,6 +117,12 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                         path: directory
                             .join(format!("{}.part", crate::chat::next_client_message_id())),
                     };
+                    let mut trace = crate::transfer_diagnostics::BatchWork::start(
+                        &sync_id,
+                        round,
+                        staged.batch.index,
+                        crate::transfer_diagnostics::BatchStage::Download,
+                    );
                     let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
                     assets::download_to(
                         &staged.batch.url,
@@ -135,6 +146,7 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                         },
                     )
                     .await?;
+                    trace.finish(0);
                     Ok(staged)
                 }
             })
@@ -147,7 +159,7 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
             }
         }
     });
-    rx
+    (rx, task)
 }
 
 struct ImportWork {

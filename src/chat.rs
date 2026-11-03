@@ -4112,7 +4112,7 @@ fn max_action_id(a: &str, b: &str) -> String {
 }
 
 impl PollState {
-    /// Whether the current automatic catch-up chain has not stalled or exceeded its page budget.
+    /// Whether the periodic HTTP receiver may issue a request after a stalled cursor cooldown.
     pub(crate) fn catchup_ready(&mut self) -> bool {
         self.catchup.ready(std::time::Instant::now())
     }
@@ -4124,8 +4124,21 @@ impl PollState {
         let data = outer.get("data").filter(|v| v.is_object()).unwrap_or(outer);
         let more = data.get("more").and_then(Value::as_i64) == Some(1)
             || pick_str(data, &["resetLastActionId"]).is_some_and(|r| r != "0" && !r.is_empty());
-        self.catchup
-            .observe(Some(self.encode_params()), more, std::time::Instant::now());
+        let continuing =
+            self.catchup
+                .observe(Some(self.encode_params()), more, std::time::Instant::now());
+        crate::transfer_diagnostics::queue(
+            0,
+            (0, 0),
+            if !more {
+                crate::transfer_diagnostics::QueueDecision::Complete
+            } else if continuing {
+                crate::transfer_diagnostics::QueueDecision::Continue
+            } else {
+                crate::transfer_diagnostics::QueueDecision::Repeated
+            },
+            0,
+        );
     }
 
     pub fn encode_params(&self) -> String {

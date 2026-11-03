@@ -43,6 +43,7 @@ pub(super) struct Batch {
 }
 #[derive(Default)]
 struct Round {
+    number: usize,
     batches: Vec<Batch>,
     seen: HashMap<u64, (bool, String, i64)>,
     failed: HashSet<String>,
@@ -52,6 +53,41 @@ struct Round {
     activity: u64,
 }
 impl Round {
+    fn progress(&self, wait: u64) -> String {
+        let received = self.seen.len();
+        if received == 0 {
+            return format!(
+                "Tải về: lượt {} • {} • chờ {} giây",
+                self.number,
+                if self.confirmed {
+                    "điện thoại đã xác nhận; chờ gói đầu"
+                } else {
+                    "chờ xác nhận trên điện thoại"
+                },
+                wait
+            );
+        }
+        let max = self.seen.keys().max().copied().unwrap_or(0);
+        let missing = (0..=self.last_index.unwrap_or(max))
+            .filter(|idx| !self.seen.contains_key(idx))
+            .count();
+        let count=match self.last_index {Some(last)=>format!("{received}/{} mô tả gói • còn thiếu {missing} idx",last+1),None=>format!("{received} mô tả gói • idx lớn nhất {max} • thiếu {missing} idx trong 0–{max} • chưa nhận dấu cuối")};
+        format!(
+            "Tải về: lượt {} • {count} • {} {wait} giây",
+            self.number,
+            if self.idle {
+                "điện thoại tạm nghỉ; đã chờ"
+            } else {
+                "chờ gói tiếp"
+            }
+        )
+    }
+
+    fn trace(&self,id:&str,wait:u64) {
+        let max=self.seen.keys().max().copied();
+        let missing=self.last_index.or(max).map_or(0,|last|(0..=last).filter(|idx|!self.seen.contains_key(idx)).count());
+        crate::transfer_diagnostics::round(id,crate::transfer_diagnostics::RoundSummary{round:self.number,received:self.seen.len(),max_index:max,final_index:self.last_index,missing,confirmed:self.confirmed,idle:self.idle,active_wait_seconds:wait});
+    }
     fn complete(&self, _wanted: &[String]) -> bool {
         self.last_index
             .is_some_and(|last| (0..=last).all(|idx| self.seen.contains_key(&idx)))
@@ -117,6 +153,9 @@ impl Round {
                     error,
                     status,
                     batch_type: data.get("batchType").and_then(integer).unwrap_or(0),
+                    command: event.cmd,
+                    sub_command: event.sub_cmd,
+                    round: self.number,
                 },
             );
             match act {
@@ -286,11 +325,18 @@ struct RunningRound {
     files: tokio::sync::mpsc::Receiver<Result<super::pipeline::Staged>>,
     decoder_ready: tokio::sync::watch::Sender<bool>,
     receiver: Option<tokio::task::JoinHandle<Result<HashSet<String>>>>,
+    downloader: Option<tokio::task::JoinHandle<()>>,
     stop: tokio::sync::watch::Sender<bool>,
 }
 impl Drop for RunningRound {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+        if let Some(task) = &self.receiver {
+            task.abort();
+        }
+        if let Some(task) = &self.downloader {
+            task.abort();
+        }
     }
 }
 impl RunningRound {
@@ -322,24 +368,29 @@ impl RunningRound {
         }
         let (batch_tx, batch_rx) = tokio::sync::mpsc::channel(2048);
         let (decoder_ready, ready) = tokio::sync::watch::channel(false);
-        let files = super::pipeline::start(
+        let (files, downloader) = super::pipeline::start(
             session.clone(),
             batch_rx,
             cancel.clone(),
             progress.clone(),
             number,
             ready,
+            id.clone(),
         );
         let account = session.clone();
         let transfer = transport.clone();
         let sync = id.clone();
         let (stop, mut stopped) = tokio::sync::watch::channel(false);
         let receiver = tokio::spawn(async move {
-            let mut state = Round::default();
+            let mut state = Round {
+                number,
+                ..Default::default()
+            };
             let started = std::time::Instant::now();
             let mut active_wait = Duration::ZERO;
             let mut previous = std::time::Instant::now();
             let mut tick = tokio::time::interval(Duration::from_millis(200));
+            let mut last_display = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _=stopped.changed()=>anyhow::bail!("Đã dừng nhận lịch sử"),
@@ -348,17 +399,18 @@ impl RunningRound {
                         ensure!(transfer.epoch()==Some(epoch),"Mất kết nối khi đồng bộ điện thoại; dữ liệu đã lưu được giữ");
                         let now=std::time::Instant::now();if !state.idle{active_wait+=now.duration_since(previous);}previous=now;
                         ensure!(started.elapsed()<Duration::from_secs(1800),"Phiên đồng bộ quá lâu; đã dừng và giữ dữ liệu đã nhập");
-                        ensure!(active_wait<Duration::from_secs(if state.confirmed || !state.seen.is_empty(){120}else{180}),"Hết thời gian chờ điện thoại gửi gói tiếp theo; dữ liệu đã nhập được giữ");
+                        ensure!(active_wait<Duration::from_secs(if state.confirmed || !state.seen.is_empty(){300}else{180}),"Chưa đầy đủ: hết thời gian chờ điện thoại gửi gói tiếp theo; dữ liệu đã nhập được giữ");
+                        if last_display.elapsed()>=Duration::from_secs(1){state.trace(&sync,active_wait.as_secs());if let Ok(mut p)=progress.lock(){p(state.progress(active_wait.as_secs()));}last_display=now;}
                     },
                     event=events.recv()=>{
-                        let event=event.map_err(|_|anyhow::anyhow!("Luồng nhận lịch sử gián đoạn"))?;
+                        let event=event.map_err(|error|match error {tokio::sync::broadcast::error::RecvError::Lagged(n)=>anyhow::anyhow!("Luồng control bỏ lỡ {n} sự kiện; không thể xác nhận lịch sử đầy đủ"),_=>anyhow::anyhow!("Luồng nhận lịch sử gián đoạn")})?;
                         let before=state.activity;
                         let waiting=state.apply(&event,&sync)?;
                         if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();}
                         if waiting{if let Ok(mut p)=progress.lock(){p("Tải về: chờ xác nhận trên điện thoại…".into());}}
                         for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
-                        if state.activity!=before {if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • {} / {} gói • {}",state.seen.len(),state.last_index.map(|n|(n+1).to_string()).unwrap_or_else(||"?".into()),if state.idle{"điện thoại tạm nghỉ; mở lại Zalo"}else{"đang nhận"}));}}
-                        if state.complete(&[]){return Ok(state.failed);}
+                        if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
+                        if state.complete(&[]){state.trace(&sync,0);return Ok(state.failed);}
                     }
                 }
             }
@@ -368,9 +420,36 @@ impl RunningRound {
             files,
             decoder_ready,
             receiver: Some(receiver),
+            downloader: Some(downloader),
             stop,
         })
     }
+    async fn stop_tasks(&mut self) -> Result<HashSet<String>> {
+        let _ = self.stop.send(true);
+        self.files.close();
+        while self.files.try_recv().is_ok() {}
+        if let Some(mut task) = self.downloader.take() {
+            if tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        match self.receiver.take() {
+            Some(mut task) => match tokio::time::timeout(Duration::from_secs(5), &mut task).await {
+                Ok(result) => result.map_err(anyhow::Error::from).and_then(|r| r),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    anyhow::bail!("Đã buộc dừng tác vụ nhận lịch sử cũ");
+                }
+            },
+            None => Ok(HashSet::new()),
+        }
+    }
+
     async fn dispose(
         &mut self,
         session: &Session,
@@ -379,11 +458,7 @@ impl RunningRound {
         success: bool,
         cancel: &AtomicBool,
     ) -> Result<HashSet<String>> {
-        let _ = self.stop.send(true);
-        let received = match self.receiver.take() {
-            Some(task) => task.await.map_err(anyhow::Error::from).and_then(|r| r),
-            None => Ok(HashSet::new()),
-        };
+        let received = self.stop_tasks().await;
         let reason = if cancel.load(Ordering::Acquire) {
             0
         } else if success && received.as_ref().is_ok_and(|failed| failed.is_empty()) {
@@ -454,17 +529,29 @@ async fn decoded_file(
     conversations: bool,
     cancel: Arc<AtomicBool>,
     session: Session,
+    sync_id: String,
+    round: usize,
 ) -> Result<(Crypto, Vec<Value>)> {
     tokio::task::spawn_blocking(move || {
+        let mut trace = crate::transfer_diagnostics::BatchWork::start(
+            &sync_id,
+            round,
+            staged.batch.index,
+            crate::transfer_diagnostics::BatchStage::Decode,
+        );
         let bytes = crate::limits::read_file(&staged.path, 64 * 1024 * 1024)?;
-        decode_batch(
+        let result = decode_batch(
             crypto,
             bytes,
             staged.batch.metadata,
             conversations,
             cancel,
             session,
-        )
+        );
+        if let Ok((_, objects)) = &result {
+            trace.finish(objects.len());
+        }
+        result
     })
     .await?
 }
@@ -579,8 +666,16 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             }
             pending.push_front(file);
             while let Some(file) = pending.pop_front() {
-                let (next, objects) =
-                    decoded_file(crypto, file, true, cancel.clone(), session.clone()).await?;
+                let (next, objects) = decoded_file(
+                    crypto,
+                    file,
+                    true,
+                    cancel.clone(),
+                    session.clone(),
+                    run.id.clone(),
+                    0,
+                )
+                .await?;
                 crypto = next;
                 if crypto.record.is_some() {
                     let _ = run.decoder_ready.send(true);
@@ -762,18 +857,21 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                 }
                 waiting.push_front(staged);
                 while let Some(staged) = waiting.pop_front() {
+                    let batch_index=staged.batch.index;
                     emit(format!(
                         "Nhập CSDL: {inserted} tin mới • đang giải mã gói {}",
                         staged.batch.index
                     ));
                     let (next, objects) =
-                        decoded_file(crypto, staged, false, cancel.clone(), session.clone())
+                        decoded_file(crypto, staged, false, cancel.clone(), session.clone(),run.id.clone(),number)
                             .await?;
                     crypto = next;
                     if crypto.record.is_some() {
                         let _ = run.decoder_ready.send(true);
                     }
+                    emit(format!("Nhập CSDL: {inserted} tin mới • đang nhập gói {batch_index}"));
                     for object in objects {
+                        ensure!(session.is_active() && !cancel.load(Ordering::Acquire),"Đã dừng nhập lịch sử; dữ liệu đã lưu được giữ");
                         let unknown: Vec<_> = object
                             .get("partitions")
                             .and_then(Value::as_array)
@@ -794,6 +892,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                             .collect::<HashSet<_>>()
                             .into_iter()
                             .collect();
+                        let mut resolving=if unknown.is_empty(){None}else{
+                            emit(format!("Nhập CSDL: {inserted} tin mới • đang xác định người gửi cho gói {batch_index}"));
+                            Some(crate::transfer_diagnostics::BatchWork::start(&run.id,number,batch_index,crate::transfer_diagnostics::BatchStage::ResolveSenders))
+                        };
                         for ids in unknown.chunks(50) {
                             let resolved = crate::chat::resolve_sync_ids(session, ids)
                                 .await
@@ -801,7 +903,11 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                             attempted_senders.extend(ids.iter().cloned());
                             Arc::make_mut(&mut senders).extend(resolved);
                         }
+                        if let Some(trace)=&mut resolving{trace.finish(unknown.len());}
+                        emit(format!("Nhập CSDL: {inserted} tin mới • đang nhập gói {batch_index}"));
+                        let mut trace=crate::transfer_diagnostics::BatchWork::start(&run.id,number,batch_index,crate::transfer_diagnostics::BatchStage::Import);
                         let imported = writer.save(object, senders.clone()).await?;
+                        trace.finish(imported.inserted);
                         inserted += imported.inserted;
                         unmapped += imported.unmapped;
                         for preview in imported.previews {
@@ -810,6 +916,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                             tokio::task::yield_now().await;
                         }
                     }
+                    emit(format!("Nhập CSDL: {inserted} tin mới • đã nhập gói {batch_index} • chờ gói tiếp theo"));
                 }
             }
             ensure!(waiting.is_empty(), "Không nhận được metadata giải mã");
@@ -1068,5 +1175,118 @@ pub(crate) async fn clean_after_connect(session: Session, transport: SyncTranspo
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod transport_round_tests {
+    use super::*;
+    #[test]
+    fn six_hundred_out_of_order_batches_across_300_control_pages_complete_only_with_every_idx() {
+        let mut queues = crate::socket::queue_receiver::PullQueues::new(1);
+        let now = std::time::Instant::now();
+        let key = (crate::socket::CMD_CTRL_PULL_CTRL, 1);
+        queues.register(key, "initial".into(), now);
+        let mut round = Round::default();
+        for page in 0..300u64 {
+            let indexes = [page * 2 + 1, page * 2];
+            let controls:Vec<_>=indexes.into_iter().map(|idx|json!({"content":{"act_type":"transfer_sync2","act":"upload_batch","data":{"syncId":"fixture","idx":idx,"isLast":idx==599,"batchType":if idx==0{2}else{1},"scopes":[{"partition":"oneone/fake"}],"msgUrl":format!("https://example.invalid/{idx}")}}})).collect();
+            let payload = json!({"data":{"lastActionId":page+2,"more":if page<299{1}else{0},"controls":controls}});
+            let wire = crate::socket::encode_frame(key.0, key.1, 1, Some(&payload));
+            let (version, cmd, sub_cmd, decoded) = crate::socket::decode_frame(&wire).unwrap();
+            let event = WsEvent {
+                cmd,
+                sub_cmd,
+                version,
+                payload: decoded,
+            };
+            round.apply(&event, "fixture").unwrap();
+            let next = queues.page(key, &event.payload, now);
+            assert_eq!(next.is_some(), page < 299);
+            if page < 299 {
+                queues.sent(key, format!("req-{page}"), now);
+                assert!(!round.complete(&[]));
+            }
+            round.batches.clear();
+        }
+        assert_eq!(round.seen.len(), 600);
+        assert!(round.complete(&[]));
+        assert!(queues.due(now + Duration::from_secs(90)).is_empty());
+    }
+    #[test]
+    fn received_descriptors_never_imply_completion_without_a_final_marker() {
+        let mut round = Round::default();
+        for index in 0..220u64 {
+            let event = WsEvent {
+                cmd: 603,
+                sub_cmd: 1,
+                version: 1,
+                payload: json!({"controls":[{"content":{"act_type":"transfer_sync2","act":"upload_batch","data":{"syncId":"fixture","idx":index,"batchType":1,"msgUrl":"https://example.invalid/file"}}}]}),
+            };
+            round.apply(&event, "fixture").unwrap();
+        }
+        assert!(!round.complete(&[]));
+        let progress = round.progress(80);
+        assert!(progress.contains("220 mô tả"));
+        assert!(progress.contains("chưa nhận dấu cuối"));
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    fn running(receiver_done: Arc<AtomicBool>, download_done: Arc<AtomicBool>) -> RunningRound {
+        let (tx, files) = tokio::sync::mpsc::channel(2);
+        let (decoder_ready, _) = tokio::sync::watch::channel(false);
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        let receiver = tokio::spawn(async move {
+            let _ = stopped.changed().await;
+            receiver_done.store(true, Ordering::Release);
+            Ok(HashSet::new())
+        });
+        let downloader = tokio::spawn(async move {
+            tx.closed().await;
+            download_done.store(true, Ordering::Release);
+        });
+        RunningRound {
+            id: "fixture".into(),
+            files,
+            decoder_ready,
+            receiver: Some(receiver),
+            downloader: Some(downloader),
+            stop,
+        }
+    }
+    #[tokio::test]
+    async fn cancelling_and_restarting_joins_both_old_tasks_before_the_next_round() {
+        for _ in 0..2 {
+            let received = Arc::new(AtomicBool::new(false));
+            let downloaded = Arc::new(AtomicBool::new(false));
+            let mut round = running(received.clone(), downloaded.clone());
+            round.stop_tasks().await.unwrap();
+            assert!(received.load(Ordering::Acquire));
+            assert!(downloaded.load(Ordering::Acquire));
+            assert!(round.receiver.is_none());
+            assert!(round.downloader.is_none());
+        }
+    }
+    #[test]
+    fn late_idx_74_does_not_replace_the_max_idx_or_hide_the_32_missing_descriptors() {
+        let missing = [
+            75, 76, 79, 80, 82, 83, 84, 85, 88, 92, 94, 102, 108, 110, 114, 115, 117, 133, 136,
+            138, 142, 144, 145, 146, 147, 151, 154, 159, 164, 166, 169, 172,
+        ];
+        let mut round = Round::default();
+        for idx in (0..186u64)
+            .filter(|idx| !missing.contains(idx) && *idx != 74)
+            .chain(std::iter::once(74))
+        {
+            round.seen.insert(idx, (false, String::new(), 0));
+        }
+        assert_eq!(round.seen.len(), 154);
+        let status = round.progress(120);
+        assert!(status.contains("idx lớn nhất 185"));
+        assert!(status.contains("thiếu 32 idx"));
+        assert!(!round.complete(&[]));
     }
 }

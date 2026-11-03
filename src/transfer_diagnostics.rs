@@ -17,6 +17,9 @@ pub(crate) struct PhoneControl {
     pub error: i64,
     pub status: i64,
     pub batch_type: i64,
+    pub command: u16,
+    pub sub_command: u8,
+    pub round: usize,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,9 +29,107 @@ enum Phase {
     Failed,
     Cancelled,
 }
+/// Pagination decisions contain no cursor or payload data.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QueueDecision {
+    Initial,
+    Continue,
+    Complete,
+    Repeated,
+    Missing,
+    Resume,
+    Exhausted,
+    Stale,
+}
+/// Receiver counters let support distinguish actual descriptor gaps from dropped log events.
+#[derive(Serialize)]
+pub(crate) struct RoundSummary {
+    pub round: usize,
+    pub received: usize,
+    pub max_index: Option<u64>,
+    pub final_index: Option<u64>,
+    pub missing: usize,
+    pub confirmed: bool,
+    pub idle: bool,
+    pub active_wait_seconds: u64,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum QueueTransport {
+    Http,
+    WebSocket,
+}
+/// Independent stages distinguish network waiting from codec and database work.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BatchStage {
+    Download,
+    Decode,
+    ResolveSenders,
+    Import,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkState {
+    Started,
+    Finished,
+    Aborted,
+}
+/// Renewal phases distinguish local admission failures from actual server responses.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RenewPhase {
+    Entered,
+    PreparationFailed,
+    RequestSent,
+    NetworkFailed,
+    HttpRejected,
+    ServerReply,
+    ServerRejected,
+    ParseFailed,
+    Finished,
+    CacheHitSuccess,
+    CacheHitFailure,
+}
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event {
+    DiagnosticDropped {
+        count: u64,
+    },
+    PhoneRoundSummary {
+        session_tag: u64,
+        summary: RoundSummary,
+    },
+    QueuePage {
+        transport: QueueTransport,
+        epoch: u64,
+        command: u16,
+        sub_command: u8,
+        decision: QueueDecision,
+        retries: u8,
+    },
+    BatchWork {
+        session_tag: u64,
+        round: usize,
+        index: u64,
+        stage: BatchStage,
+        state: WorkState,
+        elapsed_ms: u64,
+        rows: usize,
+    },
+    PhoneDispose {
+        session_tag: u64,
+        reason: u8,
+        socket_write_ack: bool,
+    },
+    MediaRenewal {
+        reference_tag: u64,
+        phase: RenewPhase,
+        server_code: Option<i64>,
+        http_status: Option<u16>,
+    },
     PhoneControl {
         session_tag: u64,
         control: PhoneControl,
@@ -40,13 +141,17 @@ enum Event {
         phase: Phase,
     },
 }
-fn control_event(id: &str, control: PhoneControl) -> Event {
+/// Correlate diagnostic events without retaining the underlying identifier.
+pub(crate) fn tag(id: &str) -> u64 {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(id.as_bytes());
     let mut tag = [0; 8];
     tag.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(tag)
+}
+fn control_event(id: &str, control: PhoneControl) -> Event {
     Event::PhoneControl {
-        session_tag: u64::from_le_bytes(tag),
+        session_tag: tag(id),
         control,
     }
 }
@@ -59,6 +164,100 @@ pub(crate) fn media(failure: &crate::media_recovery::Failure) {
     record(Event::MediaFailure {
         failure: failure.clone(),
     });
+}
+
+/// Record connection-scoped pagination decisions without raw cursor values.
+pub(crate) fn queue(epoch: u64, key: (u16, u8), decision: QueueDecision, retries: u8) {
+    record(Event::QueuePage {
+        transport: if key == (0, 0) {
+            QueueTransport::Http
+        } else {
+            QueueTransport::WebSocket
+        },
+        epoch,
+        command: key.0,
+        sub_command: key.1,
+        decision,
+        retries,
+    });
+}
+/// Record the runtime's own counters, independent of individual diagnostic admission.
+pub(crate) fn round(id: &str, summary: RoundSummary) {
+    record(Event::PhoneRoundSummary {
+        session_tag: tag(id),
+        summary,
+    });
+}
+/// A socket write ACK is not an acknowledgement that the phone stopped its work.
+pub(crate) fn dispose(id: &str, reason: u8, socket_write_ack: bool) {
+    record(Event::PhoneDispose {
+        session_tag: tag(id),
+        reason,
+        socket_write_ack,
+    });
+}
+/// Record only a classified renewal phase and numeric server code.
+pub(crate) fn renewal(reference_tag: u64, phase: RenewPhase, server_code: Option<i64>) {
+    record(Event::MediaRenewal {
+        reference_tag,
+        phase,
+        server_code,
+        http_status: None,
+    });
+}
+/// Record typed HTTP failures separately from JSON API error codes.
+pub(crate) fn renewal_http(reference_tag: u64, http_status: u16) {
+    record(Event::MediaRenewal {
+        reference_tag,
+        phase: RenewPhase::HttpRejected,
+        server_code: None,
+        http_status: Some(http_status),
+    });
+}
+/// RAII stage tracing records aborted work even when a task exits through `?`.
+pub(crate) struct BatchWork {
+    session_tag: u64,
+    round: usize,
+    index: u64,
+    stage: BatchStage,
+    started: std::time::Instant,
+    done: bool,
+}
+impl BatchWork {
+    pub fn start(id: &str, round: usize, index: u64, stage: BatchStage) -> Self {
+        let work = Self {
+            session_tag: tag(id),
+            round,
+            index,
+            stage,
+            started: std::time::Instant::now(),
+            done: false,
+        };
+        work.emit(WorkState::Started, 0);
+        work
+    }
+    pub fn finish(&mut self, rows: usize) {
+        self.done = true;
+        self.emit(WorkState::Finished, rows);
+    }
+    fn emit(&self, state: WorkState, rows: usize) {
+        record(Event::BatchWork {
+            session_tag: self.session_tag,
+            round: self.round,
+            index: self.index,
+            stage: self.stage,
+            state,
+            elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            rows,
+        });
+    }
+}
+impl Drop for BatchWork {
+    fn drop(&mut self) {
+        if !self.done {
+            self.emit(WorkState::Aborted, 0);
+        }
+    }
 }
 
 /// Record terminal outcomes even when the transfer returns early with an error.
@@ -100,6 +299,8 @@ impl Drop for PhoneRun {
 }
 
 #[cfg(not(test))]
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(test))]
 fn record(event: Event) {
     use std::sync::{mpsc, OnceLock};
     static CHANNEL: OnceLock<Option<mpsc::SyncSender<Event>>> = OnceLock::new();
@@ -113,6 +314,10 @@ fn record(event: Event) {
                     return;
                 }
                 while let Ok(event) = rx.recv() {
+                    let count = DROPPED.swap(0, Ordering::AcqRel);
+                    if count > 0 {
+                        let _ = append(&root, &Event::DiagnosticDropped { count });
+                    }
                     // Diagnostics are best effort and may never fail a chat/transfer operation.
                     let _ = append(&root, &event);
                 }
@@ -120,7 +325,9 @@ fn record(event: Event) {
             .ok()
             .map(|_| tx)
     }) {
-        let _ = sender.try_send(event);
+        if sender.try_send(event).is_err() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 #[cfg(test)]
@@ -166,6 +373,11 @@ mod tests {
     use super::*;
     #[test]
     fn production_log_contains_typed_counts_without_raw_session_or_keys_and_rotates() {
+        assert!(
+            serde_json::to_string(&Event::DiagnosticDropped { count: 7 })
+                .unwrap()
+                .contains("diagnostic_dropped")
+        );
         let id = "private-session-do-not-record";
         let event = control_event(
             id,
@@ -176,6 +388,9 @@ mod tests {
                 error: 0,
                 status: 4,
                 batch_type: 2,
+                command: 603,
+                sub_command: 1,
+                round: 2,
             },
         );
         let text = serde_json::to_string(&event).unwrap();
