@@ -114,7 +114,13 @@ struct Round {
     /// The phone reported Active after Idle and has not sent a batch since.
     resumed: bool,
     activity: u64,
+    /// Last diagnostic summary written: when, and the counters it carried.
+    traced: Option<(std::time::Instant, TraceKey)>,
 }
+/// Counters whose change is worth a new diagnostic summary line.
+type TraceKey = (usize, Option<u64>, Option<u64>, usize, bool, bool);
+/// Unchanged round summaries are repeated at most this often.
+const TRACE_EVERY: Duration = Duration::from_secs(10);
 impl Round {
     fn progress(&self, wait: u64) -> String {
         let base = self.progress_counts(wait);
@@ -159,23 +165,51 @@ impl Round {
         )
     }
 
-    fn trace(&self, id: &str, wait: u64) {
+    /// Counters for the diagnostic summary.
+    fn trace_key(&self) -> TraceKey {
         let max = self.seen.keys().max().copied();
         let missing = self.last_index.or(max).map_or(0, |last| {
             (0..=last)
                 .filter(|idx| !self.seen.contains_key(idx))
                 .count()
         });
+        (
+            self.seen.len(),
+            max,
+            self.last_index,
+            missing,
+            self.confirmed,
+            self.idle,
+        )
+    }
+    /// Whether a summary is due: counters changed, `TRACE_EVERY` passed, or `force`.
+    fn trace_due(&mut self, now: std::time::Instant, force: bool) -> bool {
+        let key = self.trace_key();
+        let due = force
+            || self.traced.as_ref().is_none_or(|(at, previous)| {
+                *previous != key || now.duration_since(*at) >= TRACE_EVERY
+            });
+        if due {
+            self.traced = Some((now, key));
+        }
+        due
+    }
+    /// Write a round summary when it carries news (see `trace_due`).
+    fn trace(&mut self, id: &str, wait: u64, force: bool) {
+        if !self.trace_due(std::time::Instant::now(), force) {
+            return;
+        }
+        let (received, max_index, final_index, missing, confirmed, idle) = self.trace_key();
         crate::transfer_diagnostics::round(
             id,
             crate::transfer_diagnostics::RoundSummary {
                 round: self.number,
-                received: self.seen.len(),
-                max_index: max,
-                final_index: self.last_index,
+                received,
+                max_index,
+                final_index,
                 missing,
-                confirmed: self.confirmed,
-                idle: self.idle,
+                confirmed,
+                idle,
                 active_wait_seconds: wait,
             },
         );
@@ -536,7 +570,7 @@ impl RunningRound {
                             last_display=now;
                         }
                         if engaged && active_wait>=STALL_AFTER && wake_grace.is_none_or(|until|now>=until) {return Err(Stalled.into());}
-                        if last_display.elapsed()>=Duration::from_secs(1){state.trace(&sync,active_wait.as_secs());if let Ok(mut p)=progress.lock(){p(state.progress(active_wait.as_secs()));}last_display=now;}
+                        if last_display.elapsed()>=Duration::from_secs(1){state.trace(&sync,active_wait.as_secs(),false);if let Ok(mut p)=progress.lock(){p(state.progress(active_wait.as_secs()));}last_display=now;}
                     },
                     event=events.recv()=>{
                         let event=event.map_err(|error|match error {tokio::sync::broadcast::error::RecvError::Lagged(n)=>anyhow::anyhow!("Luồng control bỏ lỡ {n} sự kiện; không thể xác nhận lịch sử đầy đủ"),_=>anyhow::anyhow!("Luồng nhận lịch sử gián đoạn")})?;
@@ -558,7 +592,7 @@ impl RunningRound {
                         if waiting{if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}}
                         for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
                         if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
-                        if state.complete(&[]){state.trace(&sync,0);return Ok(state.failed);}
+                        if state.complete(&[]){state.trace(&sync,0,true);return Ok(state.failed);}
                     }
                 }
             }
@@ -1001,6 +1035,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     let shared = std::sync::Mutex::new(Shared {
         senders: Arc::new(senders),
         attempted: HashSet::new(),
+        read: 0,
         inserted: 0,
         unmapped: 0,
     });
@@ -1212,16 +1247,25 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         "Đã dừng đồng bộ điện thoại; giữ dữ liệu đã lưu"
     );
     diagnostic.finish();
-    let (inserted, unmapped) = shared
+    let (read, inserted, unmapped) = shared
         .lock()
-        .map(|s| (s.inserted, s.unmapped))
-        .unwrap_or((0, 0));
+        .map(|s| (s.read, s.inserted, s.unmapped))
+        .unwrap_or((0, 0, 0));
+    crate::transfer_diagnostics::phone_totals(crate::transfer_diagnostics::PhoneTotals {
+        read,
+        inserted,
+        existing: read.saturating_sub(inserted),
+        unmapped,
+        skipped_rounds: skipped,
+        failed_conversations: failures,
+    });
     let tail = if skipped > 0 || failures > 0 {
         format!(" {skipped} lượt chưa hoàn tất, {failures} hội thoại cần đồng bộ lại để lấy bù.")
     } else {
         String::new()
     };
-    Ok(format!("Đã hoàn tất tải và nhập lịch sử: {inserted} tin mới; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail}"))
+    let existing = read.saturating_sub(inserted);
+    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail}"))
 }
 
 /// One message round to run, retried at most once when the phone stalls.
@@ -1236,6 +1280,7 @@ struct Job {
 struct Shared {
     senders: Arc<HashMap<String, String>>,
     attempted: HashSet<String>,
+    read: usize,
     inserted: usize,
     unmapped: usize,
 }
@@ -1471,6 +1516,7 @@ where
                         trace.finish(imported.inserted);
                         let inserted = {
                             let mut shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
+                            shared.read += imported.read;
                             shared.inserted += imported.inserted;
                             shared.unmapped += imported.unmapped;
                             shared.inserted
@@ -1863,6 +1909,19 @@ mod resilience_tests {
         assert!(round
             .apply(&batch(1, "https://a.zdn.vn/one", true), "s")
             .is_err());
+    }
+
+    #[test]
+    fn round_summaries_are_written_on_change_or_every_ten_seconds() {
+        let mut round = Round::default();
+        let start = std::time::Instant::now();
+        assert!(round.trace_due(start, false));
+        assert!(!round.trace_due(start + Duration::from_secs(1), false));
+        assert!(!round.trace_due(start + Duration::from_secs(9), false));
+        assert!(round.trace_due(start + TRACE_EVERY, false));
+        round.apply(&status(5), "s").unwrap();
+        assert!(round.trace_due(start + TRACE_EVERY + Duration::from_secs(1), false));
+        assert!(round.trace_due(start + TRACE_EVERY + Duration::from_secs(1), true));
     }
 
     #[test]

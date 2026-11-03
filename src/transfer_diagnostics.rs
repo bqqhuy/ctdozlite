@@ -60,6 +60,19 @@ pub(crate) struct RoundSummary {
     pub idle: bool,
     pub active_wait_seconds: u64,
 }
+/// Totals for one phone sync run; counts only, no identities.
+#[derive(Serialize)]
+pub(crate) struct PhoneTotals {
+    /// Messages read for conversations that could be mapped.
+    pub read: usize,
+    pub inserted: usize,
+    /// Read but already stored (deduplicated).
+    pub existing: usize,
+    /// Kept in quarantine because the conversation was not recognised.
+    pub unmapped: usize,
+    pub skipped_rounds: usize,
+    pub failed_conversations: usize,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum QueueTransport {
@@ -161,6 +174,9 @@ enum Event {
         reconnects: u8,
         epoch: u64,
     },
+    PhoneTotals {
+        totals: PhoneTotals,
+    },
     DiagnosticDropped {
         count: u64,
     },
@@ -255,6 +271,10 @@ pub(crate) fn round(id: &str, summary: RoundSummary) {
         session_tag: tag(id),
         summary,
     });
+}
+/// Record the totals of one phone sync run.
+pub(crate) fn phone_totals(totals: PhoneTotals) {
+    record(Event::PhoneTotals { totals });
 }
 /// Record how a socket generation ended, with the numeric close code only.
 pub(crate) fn socket_closed(epoch: u64, end: SocketEnd, code: Option<u16>) {
@@ -447,6 +467,8 @@ fn record(event: Event) {
 #[cfg(test)]
 fn record(_event: Event) {}
 
+/// Rotate the diagnostic log at this size, keeping one previous file (2 × 4 MiB).
+const ROTATE_BYTES: u64 = 4 * 1024 * 1024;
 fn append(root: &Path, event: &Event) -> std::io::Result<()> {
     use std::io::Write;
     let path = root.join("sync-media.jsonl");
@@ -456,7 +478,7 @@ fn append(root: &Path, event: &Event) -> std::io::Result<()> {
     {
         return Err(std::io::Error::other("Diagnostic path is a symlink"));
     }
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= 1024 * 1024) {
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() >= ROTATE_BYTES) {
         match std::fs::remove_file(&previous) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -519,7 +541,13 @@ mod tests {
             crate::chat::next_client_message_id()
         ));
         std::fs::create_dir(&root).unwrap();
-        std::fs::write(root.join("sync-media.jsonl"), vec![b' '; 1024 * 1024]).unwrap();
+        std::fs::write(
+            root.join("sync-media.jsonl"),
+            vec![b' '; ROTATE_BYTES as usize - 1],
+        )
+        .unwrap();
+        append(&root, &event).unwrap();
+        assert!(!root.join("sync-media.previous.jsonl").exists());
         append(&root, &event).unwrap();
         assert!(root.join("sync-media.previous.jsonl").exists());
         let current = std::fs::read_to_string(root.join("sync-media.jsonl")).unwrap();

@@ -89,6 +89,8 @@ fn message(
 }
 
 pub(super) struct Imported {
+    /// Messages read from the batch for mapped conversations.
+    pub read: usize,
     pub inserted: usize,
     pub unmapped: usize,
     pub previews: Vec<Thread>,
@@ -106,6 +108,7 @@ pub(super) fn save(
         .map(|t| (t.id.clone(), t.name.clone()))
         .collect();
     let mut result = Imported {
+        read: 0,
         inserted: 0,
         unmapped: 0,
         previews: Vec::new(),
@@ -157,6 +160,7 @@ pub(super) fn save(
                     }
                 }
             }
+            result.read += thread.messages.len();
             result.inserted += crate::store::persist_threads(store, std::slice::from_ref(&thread))?;
             // Read back the bounded latest page, including durable local/recall state.
             thread.messages.clear();
