@@ -4574,6 +4574,15 @@ pub struct PollState {
     catchup: crate::queue_catchup::CatchupGuard,
 }
 
+/// Cursor equality; the runtime catch-up guard is not part of the saved state.
+impl PartialEq for PollState {
+    fn eq(&self, other: &Self) -> bool {
+        self.last_action_id == other.last_action_id
+            && self.last_action_id_other == other.last_action_id_other
+            && self.queues == other.queues
+    }
+}
+
 impl Default for PollState {
     fn default() -> Self {
         let mut queues = std::collections::BTreeMap::new();

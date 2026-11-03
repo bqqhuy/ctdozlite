@@ -43,10 +43,16 @@ impl PullQueues {
             ..Default::default()
         }
     }
-    /// Register an initial pull only after its write succeeds.
-    pub fn register(&mut self, key: Key, request: String, now: Instant) {
-        let last = json!(1);
-        let ids = json!([]);
+    /// Register an initial pull only after its write succeeds; `start` is the saved cursor
+    /// the pull was sent with, if any.
+    pub fn register(
+        &mut self,
+        key: Key,
+        request: String,
+        now: Instant,
+        start: Option<(Value, Value)>,
+    ) {
+        let (last, ids) = start.unwrap_or_else(|| (json!(1), json!([])));
         let mut guard = CatchupGuard::default();
         if let Some(cursor) = continuation_cursor(Some(&last), &ids) {
             guard.seed(cursor);
@@ -237,7 +243,7 @@ mod tests {
         let now = Instant::now();
         let mut queues = PullQueues::new(7);
         for key in [(603, 1), (604, 0), (510, 0), (511, 1), (610, 1)] {
-            queues.register(key, "initial".into(), now);
+            queues.register(key, "initial".into(), now, None);
             for n in 2..402 {
                 let pull = queues.page(key, &page(n, true), now).unwrap();
                 assert_eq!(pull.last, json!(n));
@@ -253,7 +259,7 @@ mod tests {
         let now = Instant::now();
         let mut queues = PullQueues::new(1);
         let key = (603, 1);
-        queues.register(key, "initial".into(), now);
+        queues.register(key, "initial".into(), now, None);
         let pull = queues.page(key, &page(2, true), now).unwrap();
         assert_eq!(pull.last, json!(2));
         queues.sent(key, "r1".into(), now);
@@ -274,7 +280,7 @@ mod tests {
         let now = Instant::now();
         let mut queues = PullQueues::new(1);
         let key = (603, 1);
-        queues.register(key, "old".into(), now);
+        queues.register(key, "old".into(), now, None);
         assert!(queues.due(now + WAIT - Duration::from_millis(1)).is_empty());
         assert_eq!(queues.due(now + WAIT).len(), 1);
         queues.sent(key, "new".into(), now + WAIT);
@@ -288,7 +294,7 @@ mod tests {
         let now = Instant::now();
         let key = (603, 1);
         let mut old = PullQueues::new(1);
-        old.register(key, "old".into(), now);
+        old.register(key, "old".into(), now, None);
         assert!(old.page(key, &page(1, true), now).is_none());
         let mut next = PullQueues::new(2);
         assert!(next.due(now + Duration::from_secs(60)).is_empty());
@@ -303,7 +309,7 @@ mod tests {
         let now = Instant::now();
         let key = (603, 1);
         let mut queues = PullQueues::new(1);
-        queues.register(key, "first".into(), now);
+        queues.register(key, "first".into(), now, None);
         assert!(queues.page(key, &json!({"data":{"more":1}}), now).is_none());
         let retry = queues.due(now + WAIT);
         assert_eq!(retry.len(), 1);
@@ -315,7 +321,7 @@ mod tests {
         let now = Instant::now();
         let key = (603, 1);
         let mut queues = PullQueues::new(1);
-        queues.register(key, "first".into(), now);
+        queues.register(key, "first".into(), now, None);
         queues.page(key, &page(1, true), now);
         assert_eq!(queues.due(now + WAIT).len(), 1);
         queues.sent(key, "retry".into(), now + WAIT);

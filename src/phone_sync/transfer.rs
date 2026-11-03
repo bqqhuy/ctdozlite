@@ -1943,7 +1943,7 @@ mod transport_round_tests {
         let mut queues = crate::socket::queue_receiver::PullQueues::new(1);
         let now = std::time::Instant::now();
         let key = (crate::socket::CMD_CTRL_PULL_CTRL, 1);
-        queues.register(key, "initial".into(), now);
+        queues.register(key, "initial".into(), now, None);
         let mut round = Round::default();
         for page in 0..300u64 {
             let indexes = [page * 2 + 1, page * 2];

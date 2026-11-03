@@ -102,6 +102,8 @@ mod queue_catchup;
 pub mod photo_quality;
 /// Typing indicators and delivery/read receipts.
 pub mod presence;
+/// Queue cursors kept across app starts.
+pub mod queue_cursors;
 /// Region screenshot for the composer (Windows snipping overlay).
 pub mod screen_capture;
 /// Correlates async file uploads with their processed-URL notifications.

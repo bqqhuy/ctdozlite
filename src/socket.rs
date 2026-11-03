@@ -394,12 +394,15 @@ fn continuation_cursor(last: Option<&Value>, ids: &Value) -> Option<String> {
     Some(json!([last, ids]).to_string())
 }
 
-fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str) -> Vec<u8> {
+/// First pull of a queue: from the saved cursor when there is one, otherwise from the start
+/// (Zalo PC `doGetOffline` with `getLastActionIdsForSocket`).
+fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str, start: Option<&(Value, Value)>) -> Vec<u8> {
+    let (last, pre) = start.cloned().unwrap_or_else(|| (json!(1), json!([])));
     let data = json!({
         "first": true,
         "reqId": req_id,
-        "lastId": 1,
-        "preIds": [],
+        "lastId": last,
+        "preIds": pre,
     });
     encode_frame(cmd, sub_cmd, 1, Some(&data))
 }
@@ -743,8 +746,9 @@ async fn run_once(
                     for (qcmd, qsub) in queues {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_frame(qcmd, qsub, &id)))).await??;
-                        catchups.register((qcmd,qsub),id.clone(),std::time::Instant::now());
+                        let start = crate::queue_cursors::socket_start(sess, qcmd, qsub);
+                        tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_frame(qcmd, qsub, &id, start.as_ref())))).await??;
+                        catchups.register((qcmd,qsub),id.clone(),std::time::Instant::now(),start);
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));
                     }
                     continue;
@@ -806,6 +810,21 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_pull_resumes_from_a_saved_cursor() {
+        let fresh = decode_frame(&pull_frame(510, 0, "req_1", None)).unwrap().3;
+        assert_eq!(
+            (fresh["lastId"].clone(), fresh["preIds"].clone()),
+            (json!(1), json!([]))
+        );
+        let saved = (json!("8399086511016"), json!(["8399086511015"]));
+        let resumed = decode_frame(&pull_frame(510, 0, "req_2", Some(&saved)))
+            .unwrap()
+            .3;
+        assert_eq!(resumed["lastId"], "8399086511016");
+        assert_eq!(resumed["preIds"], json!(["8399086511015"]));
+        assert_eq!(resumed["first"], true);
+    }
 
     #[test]
     fn continuation_cursor_normalizes_ids_but_keeps_boundary_progress() {

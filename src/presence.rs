@@ -53,26 +53,36 @@ fn clean_id(id: String) -> String {
         .trim_start_matches('g')
         .to_owned()
 }
+const LIST_KEYS: [&str; 4] = ["actions", "delivereds", "seens", "groupSeens"];
+
 /// Find the payload level that carries the lists (`data` may be nested or a JSON string).
-fn body(payload: &Value) -> Value {
-    let mut node = payload.clone();
+/// Borrows whenever possible: this runs for every realtime frame, including large pull
+/// pages, and a JSON string is only parsed when it mentions one of the lists.
+fn body(payload: &Value) -> std::borrow::Cow<'_, Value> {
+    use std::borrow::Cow;
+    let mut node: &Value = payload;
     for _ in 0..3 {
-        let next = match node.get("data") {
-            Some(Value::String(raw)) => serde_json::from_str(raw).ok(),
-            Some(inner @ Value::Object(_)) => Some(inner.clone()),
-            _ => None,
-        };
-        match next {
-            Some(inner) if !has_lists(&node) => node = inner,
+        if has_lists(node) {
+            return Cow::Borrowed(node);
+        }
+        match node.get("data") {
+            Some(inner @ Value::Object(_)) => node = inner,
+            Some(Value::String(raw)) if LIST_KEYS.iter().any(|k| raw.contains(k)) => {
+                return match serde_json::from_str::<Value>(raw) {
+                    Ok(parsed) => match body(&parsed) {
+                        Cow::Borrowed(inner) => Cow::Owned(inner.clone()),
+                        Cow::Owned(inner) => Cow::Owned(inner),
+                    },
+                    Err(_) => Cow::Borrowed(node),
+                };
+            }
             _ => break,
         }
     }
-    node
+    Cow::Borrowed(node)
 }
 fn has_lists(v: &Value) -> bool {
-    ["actions", "delivereds", "seens", "groupSeens"]
-        .iter()
-        .any(|k| v.get(*k).is_some())
+    LIST_KEYS.iter().any(|k| v.get(*k).is_some())
 }
 
 /// Parse typing actions; `self_id` filters the account's own devices.
@@ -148,18 +158,18 @@ pub fn receipts(payload: &Value) -> Vec<Receipt> {
     let list = |key: &str| {
         body.get(key)
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     };
     for item in list("delivereds") {
-        let msg_ids = ids(&item);
+        let msg_ids = ids(item);
         if msg_ids.is_empty() {
             continue;
         }
-        let (thread_id, is_group) = match field(&item, &["groupId"]) {
+        let (thread_id, is_group) = match field(item, &["groupId"]) {
             Some(group) => (clean_id(group), true),
             None => (
-                field(&item, &["threadId", "idTo"])
+                field(item, &["threadId", "idTo"])
                     .or_else(|| {
                         item.get("deliveredUids")
                             .and_then(Value::as_array)
@@ -182,14 +192,14 @@ pub fn receipts(payload: &Value) -> Vec<Receipt> {
     }
     for (key, is_group) in [("seens", false), ("groupSeens", true)] {
         for item in list(key) {
-            let msg_ids = ids(&item);
+            let msg_ids = ids(item);
             if msg_ids.is_empty() {
                 continue;
             }
             let thread_id = if is_group {
-                field(&item, &["groupId", "grid"]).map(clean_id)
+                field(item, &["groupId", "grid"]).map(clean_id)
             } else {
-                field(&item, &["idTo", "threadId", "uidFrom"])
+                field(item, &["idTo", "threadId", "uidFrom"])
             };
             out.push(Receipt {
                 thread_id: thread_id.unwrap_or_default(),

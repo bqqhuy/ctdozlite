@@ -405,33 +405,41 @@ fn deliver_thread_updates() -> bool {
     }
 }
 
-async fn persist_received(session: &Session, threads: &mut Vec<Thread>) {
+/// Store a received batch. Returns `true` only when it reached SQLite, which is the
+/// condition for advancing persisted queue cursors.
+async fn persist_received(session: &Session, threads: &mut Vec<Thread>) -> bool {
     let session = session.clone();
     let mut batch = threads.clone();
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Thread>> {
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Thread>, bool)> {
         anyhow::ensure!(session.is_active(), "Account changed");
         let mut store = crate::store::MessageStore::open(session.history_path())?;
         store.filter_deleted(&mut batch)?;
         // Once deletion filtering succeeds, a cache-write or automation failure must
         // not suppress otherwise valid live delivery (history persistence is fail-open).
-        match crate::store::persist_threads(&mut store, &batch) {
+        let stored = match crate::store::persist_threads(&mut store, &batch) {
             Ok(_) => {
                 if crate::tools::auto_reply(&store, session.account_key(), &batch).is_err() {
                     eprintln!("Cannot evaluate auto reply for received batch");
                 }
+                true
             }
             Err(_) => {
-                eprintln!("Cannot persist received message batch; delivering filtered messages")
+                eprintln!("Cannot persist received message batch; delivering filtered messages");
+                false
             }
-        }
-        Ok(batch)
+        };
+        Ok((batch, stored))
     })
     .await;
     match result {
-        Ok(Ok(batch)) => *threads = batch,
+        Ok(Ok((batch, stored))) => {
+            *threads = batch;
+            stored
+        }
         _ => {
             eprintln!("Cannot persist or filter received message batch");
             threads.clear();
+            false
         }
     }
 }
@@ -719,17 +727,22 @@ pub(super) fn spawn_session_worker(
                                                     &ev.payload,
                                                 );
                                                 ws_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
+                                                let mut stored = true;
                                                 if !ws_threads.is_empty() {
                                                     crate::chat::resolve_thread_names(
                                                         &s_snap,
                                                         &mut ws_threads,
                                                     )
                                                     .await;
-                                                    persist_received(&s_snap, &mut ws_threads).await;
+                                                    stored = persist_received(&s_snap, &mut ws_threads).await;
                                                     if publish_live(&s_snap, &live_updates, ws_threads) {
                                                         let _ = gui_tx_ws.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                                     }
                                                     ctx_ws.request_repaint();
+                                                }
+                                                // Like Zalo PC, a queue cursor advances only after its page is stored.
+                                                if stored {
+                                                    crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload);
                                                 }
                                             }
                                         }
@@ -1120,6 +1133,7 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::Logout => {
                             if let Some(task) = current_qr_task.take() { task.abort(); }
                             call_bridge.end_call();
+                            crate::queue_cursors::flush_all();
                             let account = session.lock().await.account_key().to_owned();
                             if !account.is_empty() {
                                 let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&account)).await;
@@ -1467,9 +1481,18 @@ pub(super) fn spawn_session_worker(
                                     );
                                     let recent_result={
                                         let mut ps = poll_clone.lock().await;
+                                        // Resume lp_chat where this account stopped (Zalo PC `init`).
+                                        if *ps == crate::chat::PollState::default() {
+                                            if let Some(saved) = crate::queue_cursors::poll_start(&s) {
+                                                *ps = saved;
+                                            }
+                                        }
                                         crate::chat::poll_new_messages(&s, &mut ps, &mut list).await
                                     };
-                                    persist_received(&s, &mut list).await;
+                                    if persist_received(&s, &mut list).await {
+                                        let state = poll_clone.lock().await.clone();
+                                        crate::queue_cursors::commit_poll(&s, &state);
+                                    }
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                     // Startup refreshes live/offline queues; historical backfill is explicit.
                                     let count = list.len();
@@ -1547,31 +1570,37 @@ pub(super) fn spawn_session_worker(
                                         }
                                     }
 
-                                    if let Some(err_s) = poll_err {
-                                        if is_session_expired_error(&err_s) {
-                                            if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
-                                            {
-                                                let mut sl = session_clone.lock().await;
-                                                sl.logout();
-                                            }
-                                            let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                                "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
-                                            ));
-                                            ctx_clone.request_repaint();
+                                    let expired = poll_err.as_deref().is_some_and(is_session_expired_error);
+                                    if expired {
+                                        if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
+                                        {
+                                            let mut sl = session_clone.lock().await;
+                                            sl.logout();
                                         }
+                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
+                                            "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
+                                        ));
+                                        ctx_clone.request_repaint();
                                     } else {
+                                        // Pages received before a later poll failed are stored too: the
+                                        // in-memory cursor has already moved past them.
                                         temp_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
+                                        let mut stored = true;
                                         if !temp_threads.is_empty() {
                                             crate::chat::resolve_thread_names(
                                                 &s,
                                                 &mut temp_threads,
                                             )
                                             .await;
-                                            persist_received(&s, &mut temp_threads).await;
+                                            stored = persist_received(&s, &mut temp_threads).await;
                                             if publish_live(&s, &live_updates, temp_threads) {
                                                 let _ = gui_tx_clone.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                             }
                                             ctx_clone.request_repaint();
+                                        }
+                                        if stored {
+                                            let state = poll_clone.lock().await.clone();
+                                            crate::queue_cursors::commit_poll(&s, &state);
                                         }
                                     }
                                 }
