@@ -788,7 +788,7 @@ async fn run_once(
                     catchups.sent((cmd,sub_cmd),id,std::time::Instant::now());
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL) {
-                    crate::upload_events::deliver(&payload);
+                    crate::upload_events::deliver(sess.account_key(), &payload);
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE|CMD_SYNC_WAKE) {
                     // Broadcast is bounded and never waits for phone decoding or disk writes.

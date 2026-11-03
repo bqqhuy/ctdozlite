@@ -109,7 +109,12 @@ pub enum GuiEvent {
     },
     ClipboardImageRead(Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>),
     /// A region capture ready to preview, or why there is none.
-    ScreenCaptureFinished(Result<(std::path::PathBuf, u32, u32, egui::ColorImage), String>),
+    ScreenCaptureFinished {
+        owner: String,
+        thread_id: String,
+        is_group: bool,
+        result: Result<(std::path::PathBuf, u32, u32, egui::ColorImage), String>,
+    },
     /// A single wake-up represents any number of live deltas while hidden.
     LiveThreadsReady(std::sync::Arc<crate::live_updates::LiveUpdates>),
     ConversationPreferences {
@@ -1313,14 +1318,24 @@ impl ZaloGuiApp {
         self.group_members.clear();
         self.group_members_state.clear();
         self.group_member_search.clear();
+        self.screen_capture_pending = false;
     }
 
     fn request_screen_capture(&mut self) {
         if self.screen_capture_pending {
             return;
         }
+        let Some(thread) = self.threads.get(self.selected_thread_index) else {
+            return;
+        };
         if let Some(tx) = WORKER_TX.get() {
-            self.screen_capture_pending = tx.send(WorkerCmd::CaptureScreen).is_ok();
+            self.screen_capture_pending = tx
+                .send(WorkerCmd::CaptureScreen {
+                    owner: self.user_uin.clone(),
+                    thread_id: thread.id.clone(),
+                    is_group: thread.is_group,
+                })
+                .is_ok();
             if self.screen_capture_pending {
                 self.show_toast("Chọn vùng màn hình cần chụp…");
             }
@@ -1468,8 +1483,35 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::ScreenCaptureFinished(result) => {
+                GuiEvent::ScreenCaptureFinished {
+                    owner,
+                    thread_id,
+                    is_group,
+                    result,
+                } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        if let Ok((path, ..)) = result {
+                            // Best-effort cleanup of a capture whose account was closed.
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_file(path);
+                            });
+                        }
+                        continue;
+                    }
                     self.screen_capture_pending = false;
+                    if !self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .is_some_and(|t| t.id == thread_id && t.is_group == is_group)
+                    {
+                        if let Ok((path, ..)) = result {
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_file(path);
+                            });
+                        }
+                        self.show_toast("Đã đổi hội thoại; hãy chụp lại để đính kèm đúng nơi");
+                        continue;
+                    }
                     match result {
                         Ok((path, w, h, image)) => {
                             let texture = ctx.load_texture(
@@ -3719,5 +3761,50 @@ mod outgoing_ui_tests {
         assert_eq!(app.threads[1].messages.len(), 1);
         assert!(app.threads[1].messages[0].outgoing_job.is_none());
         assert_eq!(app.threads[1].messages[0].id, "server-ack");
+    }
+}
+
+#[cfg(test)]
+mod capture_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn capture_does_not_attach_to_a_different_conversation() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "current-thread".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "test-account".into();
+        app.screen_capture_pending = true;
+        app.event_tx
+            .send(GuiEvent::ScreenCaptureFinished {
+                owner: "test-account".into(),
+                thread_id: "previous-thread".into(),
+                is_group: false,
+                result: Ok((
+                    std::env::temp_dir().join(format!(
+                        "absent-capture-{}.png",
+                        crate::chat::next_client_message_id()
+                    )),
+                    1,
+                    1,
+                    egui::ColorImage::new([1, 1], Color32::WHITE),
+                )),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.pending_clipboard_image.is_none());
+        assert!(!app.screen_capture_pending);
+        app.screen_capture_pending = true;
+        app.clear_presence_state();
+        assert!(!app.screen_capture_pending);
     }
 }

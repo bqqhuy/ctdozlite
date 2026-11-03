@@ -144,6 +144,8 @@ pub(super) struct Planned {
     pub unchanged: usize,
     /// Unrecognised conversations postponed with an unchanged `lastTs`.
     pub deferred: usize,
+    /// Existing messages alone do not prove a completed phone-history range.
+    pub uncheckpointed: usize,
 }
 
 /// Inputs that decide which conversations an update run may leave out.
@@ -192,21 +194,33 @@ impl Update<'_> {
                 }
                 continue;
             }
-            if recent_only || !trusted_activity(last, self.now) {
+            if !trusted_activity(last, self.now) {
                 planned.queries.push(query);
                 continue;
             }
+            let requested_floor = if recent_only {
+                self.floor.max(self.now.saturating_sub(7 * DAY)).max(0)
+            } else {
+                self.floor
+            };
             let covered = self
                 .coverage
                 .get(&query.partition)
-                .is_some_and(|saved| saved.from_ts <= self.floor && saved.to_ts >= last);
-            if covered || last < query.from.max(self.floor) {
+                .is_some_and(|saved| saved.from_ts <= requested_floor && saved.to_ts >= last);
+            if covered || last < query.from.max(requested_floor) {
                 planned.unchanged += 1;
                 continue;
             }
             query.to = query.to.min(last.saturating_add(OVERLAP));
             planned.queries.push(query);
         }
+        planned.uncheckpointed = planned
+            .queries
+            .iter()
+            .filter(|q| {
+                self.owners.contains_key(&q.partition) && !self.coverage.contains_key(&q.partition)
+            })
+            .count();
         planned
     }
 }
@@ -334,6 +348,90 @@ mod update_tests {
     }
     fn owners(ids: &[&str]) -> HashMap<String, String> {
         ids.iter().map(|p| (p.to_string(), "t".into())).collect()
+    }
+
+    #[test]
+    fn recent_only_skips_covered_threads_without_claiming_full_history() {
+        let coverage = HashMap::from([("group/a".into(), range(NOW - 7 * DAY, NOW - DAY))]);
+        let owners = owners(&["group/a"]);
+        let deferred = Deferred::default();
+        let update = Update {
+            coverage: &coverage,
+            owners: &owners,
+            deferred: &deferred,
+            now: NOW,
+            floor: 0,
+            full_rescan: false,
+        };
+        let conversations = [conv("group/a", NOW - 2 * DAY)];
+        assert!(update.plan(&conversations, true).queries.is_empty());
+        // Recent coverage is not proof of older history requested by the full mode.
+        assert_eq!(update.plan(&conversations, false).queries.len(), 1);
+        let new = update.plan(&[conv("group/a", NOW)], true);
+        assert_eq!(new.queries.len(), 1);
+        assert_eq!(new.queries[0].from, NOW - DAY - OVERLAP);
+    }
+
+    #[test]
+    fn covered_recent_workload_eliminates_repeated_requests() {
+        let conversations: Vec<_> = (0..1000)
+            .map(|n| conv(&format!("group/{n}"), NOW - DAY))
+            .collect();
+        let coverage: HashMap<_, _> = conversations
+            .iter()
+            .map(|c| (c.partition.clone(), range(NOW - 8 * DAY, NOW)))
+            .collect();
+        let owners: HashMap<_, _> = conversations
+            .iter()
+            .map(|c| (c.partition.clone(), "thread".into()))
+            .collect();
+        let deferred = Deferred::default();
+        let update = Update {
+            coverage: &coverage,
+            owners: &owners,
+            deferred: &deferred,
+            now: NOW,
+            floor: 0,
+            full_rescan: false,
+        };
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..40 {
+            let start = std::time::Instant::now();
+            assert_eq!(queries(&conversations, &coverage, NOW, true, 0).len(), 1000);
+            before.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = std::time::Instant::now();
+            let planned = update.plan(&conversations, true);
+            assert!(planned.queries.is_empty());
+            assert_eq!(planned.unchanged, 1000);
+            after.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            serde_json::json!({"task":"covered_recent_update_plan", "iterations":40, "conversations":1000,
+            "before_queries":1000,"after_queries":0,
+            "before_ms":{"min":before[0],"avg":before.iter().sum::<f64>()/40.0,"p50":before[20],"p95":before[37],"p99":before[39]},
+            "after_ms":{"min":after[0],"avg":after.iter().sum::<f64>()/40.0,"p50":after[20],"p95":after[37],"p99":after[39]}})
+        );
+    }
+    #[test]
+    fn no_checkpoint_means_verify_history_instead_of_assuming_rows_are_complete() {
+        let coverage = HashMap::new();
+        let owners = owners(&["group/a"]);
+        let deferred = Deferred::default();
+        let update = Update {
+            coverage: &coverage,
+            owners: &owners,
+            deferred: &deferred,
+            now: NOW,
+            floor: 0,
+            full_rescan: false,
+        };
+        let plan = update.plan(&[conv("group/a", NOW)], false);
+        assert_eq!(plan.uncheckpointed, 1);
+        assert_eq!(plan.queries[0].from, 0);
     }
     #[test]
     fn covered_conversations_are_skipped_and_others_stop_at_last_activity() {

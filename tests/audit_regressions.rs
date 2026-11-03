@@ -388,3 +388,82 @@ async fn forward_message_body_matches_zalo_pc_forward_message() {
     );
     assert!(body.get("toId").is_none());
 }
+
+#[tokio::test]
+async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let mut paths = Vec::new();
+        while let Ok(Ok((mut stream, _))) =
+            tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+        {
+            let mut request = Vec::new();
+            loop {
+                let mut block = [0; 8192];
+                let n = stream.read(&mut block).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&block[..n]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let length = String::from_utf8_lossy(&request[..end])
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")?
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            paths.push(
+                String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned(),
+            );
+            let body = match paths.len() {
+                1 => Some(
+                    r#"{"error_code":0,"data":{"normal":"https://photo.zdn.vn/copy","thumb":"https://photo.zdn.vn/thumb"}}"#,
+                ),
+                2 => None, // The send reached the server, but its acknowledgement was lost.
+                _ => Some(r#"{"error_code":1,"data":{}}"#),
+            };
+            if let Some(body) = body {
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }
+        paths
+    });
+    let mut original = ChatMessage {
+        id: "42".into(),
+        kind: zalo_rust::message_model::MessageKind::Photo,
+        // A re-upload would fail validation locally, then try renewing the source.
+        link_url: Some("https://unsupported.invalid/image".into()),
+        ..Default::default()
+    };
+    chat::set_forward_source(&mut original, "789", false);
+    let pending = zalo_rust::outgoing::pending(
+        "forward".into(),
+        false,
+        zalo_rust::outgoing::Payload::Forward(Box::new(original)),
+    );
+    assert!(zalo_rust::outgoing::send(&session(&url), "456", &pending)
+        .await
+        .is_err());
+    let paths = server.await.unwrap();
+    assert_eq!(
+        paths.len(),
+        2,
+        "A send failure must not restart media preparation"
+    );
+    assert!(paths[0].starts_with("POST /api/message/renewlink"));
+    assert!(paths[1].starts_with("POST /api/message/forward"));
+}

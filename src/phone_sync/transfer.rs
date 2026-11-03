@@ -1154,6 +1154,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         shared: &shared,
         page: &page,
         board: &board,
+        next_start: std::sync::Mutex::new(tokio::time::Instant::now()),
     };
     let emit = |text: String| {
         if let Ok(mut p) = progress.lock() {
@@ -1169,7 +1170,6 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     let mut adjustments = 0usize;
     let mut disconnected = false;
     let mut fatal: Option<anyhow::Error> = None;
-    let mut last_start = std::time::Instant::now() - ROUND_START_GAP;
     loop {
         while fatal.is_none()
             && !disconnected
@@ -1178,8 +1178,6 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             && session.is_active()
             && !cancel.load(Ordering::Acquire)
         {
-            tokio::time::sleep(ROUND_START_GAP.saturating_sub(last_start.elapsed())).await;
-            last_start = std::time::Instant::now();
             if transport.epoch() != Some(epoch) {
                 disconnected = true;
                 break;
@@ -1397,6 +1395,12 @@ fn plan_line(planned: &plan::Planned, unmapped_checks: usize) -> String {
     if planned.unchanged > 0 {
         line.push_str(&format!(" • {} hội thoại không đổi", planned.unchanged));
     }
+    if planned.uncheckpointed > 0 {
+        line.push_str(&format!(
+            " • {} hội thoại chưa có checkpoint hoàn tất, cần kiểm tra lịch sử",
+            planned.uncheckpointed
+        ));
+    }
     if unmapped_checks > 0 {
         line.push_str(&format!(" • {unmapped_checks} chưa nhận diện (thử lại)"));
     }
@@ -1493,6 +1497,7 @@ struct RoundCtx<'a, F, G> {
     shared: &'a std::sync::Mutex<Shared>,
     page: &'a std::sync::Mutex<G>,
     board: &'a Arc<std::sync::Mutex<Board<F>>>,
+    next_start: std::sync::Mutex<tokio::time::Instant>,
 }
 
 fn classify(
@@ -1557,6 +1562,17 @@ fn round_progress<F: FnMut(String) + Send + 'static>(
     }
 }
 
+/// Reserve one launch slot under a short lock; sleep happens after releasing it.
+fn reserve_round_start(
+    next: &std::sync::Mutex<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    let mut next = next.lock().unwrap_or_else(|e| e.into_inner());
+    let at = (*next).max(now);
+    *next = at + ROUND_START_GAP;
+    at
+}
+
 async fn run_round<F, G>(
     ctx: &RoundCtx<'_, F, G>,
     job: Job,
@@ -1583,6 +1599,10 @@ where
         .await??;
         let progress = Arc::new(std::sync::Mutex::new(round_progress(ctx.board.clone(), job.number)));
         let limit = if job.priority { PRIORITY_MESSAGES } else { UNLIMITED };
+        // FuturesUnordered is lazy: pacing insertion does not pace actual requests.
+        let start = reserve_round_start(&ctx.next_start, tokio::time::Instant::now());
+        tokio::time::sleep_until(start).await;
+        ensure!(ctx.session.is_active() && !ctx.cancel.load(Ordering::Acquire), "Đã dừng đồng bộ điện thoại");
         let mut run = RunningRound::open(
             ctx.session,
             ctx.transport,
@@ -2030,6 +2050,29 @@ mod cleanup_tests {
 
 #[cfg(test)]
 mod resilience_tests {
+    #[tokio::test]
+    async fn lazily_polled_rounds_reserve_separate_launch_slots() {
+        use futures_util::{stream::FuturesUnordered, StreamExt};
+        let now = tokio::time::Instant::now();
+        let next = std::sync::Mutex::new(now);
+        let mut pending = FuturesUnordered::new();
+        for _ in 0..PARALLEL_ROUNDS {
+            let next = &next;
+            pending.push(async move { reserve_round_start(next, now) });
+        }
+        let mut starts = Vec::new();
+        while let Some(at) = pending.next().await {
+            starts.push(at);
+        }
+        starts.sort();
+        for pair in starts.windows(2) {
+            assert_eq!(pair[1] - pair[0], ROUND_START_GAP);
+        }
+        // A new wave after an idle period starts immediately, without replaying old slots.
+        let later = now + Duration::from_secs(10);
+        assert_eq!(reserve_round_start(&next, later), later);
+    }
+
     use super::*;
 
     fn control(data: Value) -> WsEvent {

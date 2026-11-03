@@ -131,6 +131,85 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Backfill position and the newest message observed in that server traversal.
+/// Message identity is a stopping boundary, never a pagination cursor.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct HistoryCheckpoint {
+    next: Option<String>,
+    old: bool,
+    head: String,
+    stop: String,
+    complete: bool,
+}
+impl HistoryCheckpoint {
+    fn decode(raw: Option<&str>) -> Self {
+        let valid_cursor = |id: &str| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && id.parse::<u64>().is_ok_and(|id| id > 0)
+        };
+        if let Some(raw) = raw {
+            if let Ok(saved) = serde_json::from_str::<Self>(raw) {
+                if saved.next.as_deref().is_none_or(valid_cursor) {
+                    return saved;
+                }
+            }
+            if let Some((kind, id)) = raw.split_once(':') {
+                if matches!(kind, "old" | "recent") && valid_cursor(id) {
+                    return Self {
+                        next: Some(id.into()),
+                        old: kind == "old",
+                        ..Self::default()
+                    };
+                }
+            }
+        }
+        Self::default()
+    }
+    fn advance(&self, page: &Page, messages: &[crate::chat::ChatMessage]) -> Option<Self> {
+        if page.filtered {
+            return None;
+        }
+        let stop = if self.complete {
+            self.head.clone()
+        } else {
+            self.stop.clone()
+        };
+        let reached = !stop.is_empty() && messages.iter().any(|m| m.id == stop);
+        let mut head = if self.complete {
+            String::new()
+        } else {
+            self.head.clone()
+        };
+        if head.is_empty() {
+            head = messages
+                .iter()
+                .max_by_key(|m| (m.ts, m.id.parse::<u64>().unwrap_or(0)))
+                .map(|m| m.id.clone())
+                .unwrap_or_default();
+        }
+        let next = if reached { None } else { page.cursor.clone() };
+        Some(Self {
+            complete: next.is_none(),
+            stop: if next.is_some() { stop } else { String::new() },
+            next,
+            old: page.old,
+            head,
+        })
+    }
+    fn start(&self) -> (String, bool) {
+        if self.complete {
+            (NEWEST_CURSOR.into(), false)
+        } else {
+            (
+                self.next.clone().unwrap_or_else(|| NEWEST_CURSOR.into()),
+                self.old,
+            )
+        }
+    }
+}
+
 /// Download the group and Cloud history the server still provides.
 /// `retry_filtered` ignores the memo of conversations the server recently limited.
 pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
@@ -168,6 +247,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     let skipped = threads.len() - total;
     let mut store = MessageStore::open(session.history_path())?;
     let mut inserted = 0;
+    let mut downloaded_pages = 0;
     let mut failed = 0;
     let mut filtered = 0;
     for (index, mut thread) in threads
@@ -188,12 +268,8 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 |row| row.get(0),
             )
             .ok();
-        // Legacy cursors were derived from individual rows and cannot be trusted.
-        let saved = checkpoint.as_deref().and_then(|s| s.split_once(':'));
-        let mut cursor = saved
-            .map(|(_, id)| id.to_owned())
-            .unwrap_or_else(|| NEWEST_CURSOR.into());
-        let mut old = saved.is_some_and(|(kind, _)| kind == "old");
+        let mut checkpoint = HistoryCheckpoint::decode(checkpoint.as_deref());
+        let (mut cursor, mut old) = checkpoint.start();
         for page in 0..200 {
             if canceled.load(Ordering::Relaxed) || !session.is_active() {
                 if memo_changed && session.is_active() {
@@ -216,6 +292,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     anyhow::bail!("server error {code}");
                 }
                 let metadata = page_metadata(&response)?;
+                downloaded_pages += 1;
                 if let Some(next) = &metadata.cursor {
                     anyhow::ensure!(next.parse::<u64>()? < cursor.parse::<u64>()?,
                         "Máy chủ không trả trang cũ hơn; đã dừng để tránh lặp");
@@ -223,12 +300,14 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 thread.messages.clear();
                 crate::chat::merge_group_history(&mut thread, &response);
                 inserted += crate::store::persist_threads(&mut store, std::slice::from_ref(&thread))?;
-                // Persist messages before advancing. An interrupted checkpoint can
-                // replay one page safely because message IDs are unique in SQLite.
-                if let Some(next) = &metadata.cursor {
-                    let checkpoint = format!("{}:{next}", if metadata.old { "old" } else { "recent" });
+                let updated = checkpoint.advance(&metadata, &thread.messages);
+                let next = updated.as_ref().and_then(|state| state.next.clone());
+                // Persist data before progress. Completed history only needs the new prefix;
+                // unfinished history keeps both its cursor and stopping boundary on restart.
+                if let Some(updated) = updated {
                     store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
-                        rusqlite::params![thread.id, checkpoint])?;
+                        rusqlite::params![thread.id, serde_json::to_string(&updated)?])?;
+                    checkpoint = updated;
                 }
                 if !metadata.filtered && memo.forget(&thread.id) {
                     memo_changed = true;
@@ -241,7 +320,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     memo_changed = true;
                     progress(format!("{}: máy chủ giới hạn lịch sử cho phiên này; dữ liệu cũ chưa được tải đầy đủ", thread.name));
                 }
-                Ok::<_,anyhow::Error>(metadata.cursor.map(|next| (next, metadata.old)))
+                Ok::<_,anyhow::Error>(next.map(|next| (next, metadata.old)))
             }.await;
             match result {
                 Ok(Some((next, next_old))) => {
@@ -282,11 +361,85 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     } else {
         String::new()
     };
-    Ok(format!("Đã lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị máy chủ giới hạn lịch sử cho thiết bị này; {skipped} chat cá nhân không có lịch sử trên máy chủ (dùng Đồng bộ từ điện thoại).{remembered} Đây là dữ liệu máy chủ còn cung cấp, chưa chắc là toàn bộ lịch sử."))
+    Ok(format!("Đã kiểm tra {downloaded_pages} trang, lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị máy chủ giới hạn lịch sử cho thiết bị này; {skipped} chat cá nhân không có lịch sử trên máy chủ (dùng Đồng bộ từ điện thoại).{remembered} Đây là dữ liệu máy chủ còn cung cấp, chưa chắc là toàn bộ lịch sử."))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn message(id: &str) -> crate::chat::ChatMessage {
+        crate::chat::ChatMessage {
+            id: id.into(),
+            ts: id.parse().unwrap(),
+            ..Default::default()
+        }
+    }
+    fn history_page(cursor: Option<&str>, filtered: bool) -> Page {
+        Page {
+            cursor: cursor.map(str::to_owned),
+            more: cursor.is_some(),
+            old: false,
+            filtered,
+        }
+    }
+    #[test]
+    fn completed_history_checks_only_new_prefix_after_restart() {
+        let first = HistoryCheckpoint::default()
+            .advance(
+                &history_page(Some("900"), false),
+                &[message("100"), message("99")],
+            )
+            .unwrap();
+        let complete = first
+            .advance(&history_page(None, false), &[message("1")])
+            .unwrap();
+        let persisted = serde_json::to_string(&complete).unwrap();
+        let restored = HistoryCheckpoint::decode(Some(&persisted));
+        assert!(restored.complete);
+        assert_eq!(restored.start(), (NEWEST_CURSOR.into(), false));
+        // The server still has older pages, but they were already traversed successfully.
+        let next = restored
+            .advance(
+                &history_page(Some("800"), false),
+                &[message("101"), message("100")],
+            )
+            .unwrap();
+        assert!(next.complete && next.next.is_none());
+        assert_eq!(next.head, "101");
+    }
+    #[test]
+    fn interrupted_update_keeps_its_cursor_and_prior_stopping_boundary() {
+        let completed = HistoryCheckpoint {
+            complete: true,
+            head: "100".into(),
+            ..Default::default()
+        };
+        let partial = completed
+            .advance(&history_page(Some("500"), false), &[message("200")])
+            .unwrap();
+        let restored = HistoryCheckpoint::decode(Some(&serde_json::to_string(&partial).unwrap()));
+        assert_eq!(restored.start(), ("500".into(), false));
+        assert_eq!(restored.stop, "100");
+        let next = restored
+            .advance(&history_page(Some("400"), false), &[message("100")])
+            .unwrap();
+        assert!(next.complete && next.next.is_none());
+        assert!(next.stop.is_empty());
+        assert_eq!(next.head, "200");
+        assert!(completed.advance(&history_page(None, true), &[]).is_none());
+    }
+    #[test]
+    fn legacy_cursors_resume_without_claiming_complete_history() {
+        let saved = HistoryCheckpoint::decode(Some("old:123"));
+        assert_eq!(saved.start(), ("123".into(), true));
+        assert!(!saved.complete);
+        for raw in ["bad:123", "recent:0", "old:bad", "not-json"] {
+            assert_eq!(
+                HistoryCheckpoint::decode(Some(raw)).start().0,
+                NEWEST_CURSOR
+            );
+        }
+    }
     #[test]
     fn filtered_memo_is_per_session_expires_and_survives_damage() {
         let root = std::env::temp_dir().join(format!(

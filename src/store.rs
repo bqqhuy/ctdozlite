@@ -52,27 +52,6 @@ pub struct MessageStore {
     pub conn: Connection,
 }
 
-/// Whether a stored thread is the conversation a receipt names. Group IDs may be stored
-/// with or without the `g` / `group_` prefix; a recorded thread kind must agree.
-fn receipt_matches(
-    receipt: &crate::presence::Receipt,
-    thread: &str,
-    is_group: Option<bool>,
-) -> bool {
-    if is_group.is_some_and(|group| group != receipt.is_group) {
-        return false;
-    }
-    let bare = if receipt.is_group {
-        thread
-            .strip_prefix("group_")
-            .or_else(|| thread.strip_prefix('g'))
-            .unwrap_or(thread)
-    } else {
-        thread
-    };
-    bare == receipt.thread_id
-}
-
 impl MessageStore {
     /// Initial history window; deeper reads occur when opening a thread.
     pub const PRELOAD_MSGS: usize = 20;
@@ -309,10 +288,14 @@ impl MessageStore {
         let mut changed = Vec::new();
         let transaction = self.conn.unchecked_transaction()?;
         {
-            let mut select = transaction.prepare_cached(
-                "SELECT m.thread_id,m.raw_json,t.is_group FROM messages m \
+            let mut scoped = transaction.prepare_cached(
+                "SELECT m.thread_id,m.raw_json FROM messages m \
                  LEFT JOIN threads t ON t.thread_id=m.thread_id \
-                 WHERE m.msg_id=?1 AND m.is_outgoing=1 LIMIT 8",
+                 WHERE m.thread_id IN (?1,?2,?3) AND m.msg_id=?4 AND m.is_outgoing=1 \
+                 AND (t.is_group IS NULL OR t.is_group=?5) LIMIT 3",
+            )?;
+            let mut unscoped = transaction.prepare_cached(
+                "SELECT thread_id,raw_json FROM messages WHERE msg_id=?1 AND is_outgoing=1 LIMIT 2",
             )?;
             let mut update = transaction.prepare_cached(
                 "UPDATE messages SET raw_json=?1 WHERE thread_id=?2 AND msg_id=?3",
@@ -324,27 +307,39 @@ impl MessageStore {
                     DeliveryState::Delivered
                 };
                 for id in receipt.msg_ids.iter().take(8) {
-                    let rows = select
-                        .query_map(params![id], |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, String>(1)?,
-                                r.get::<_, Option<bool>>(2)?,
-                            ))
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    let rows: Vec<_> = if receipt.thread_id.is_empty() {
-                        if rows.len() == 1 {
-                            rows
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        rows.into_iter()
-                            .filter(|(thread, _, group)| receipt_matches(receipt, thread, *group))
-                            .collect()
+                    let row = |r: &rusqlite::Row<'_>| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
                     };
-                    for (thread, raw, _) in rows {
+                    let rows = if receipt.thread_id.is_empty() {
+                        unscoped
+                            .query_map(params![id], row)?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    } else {
+                        let group = if receipt.is_group {
+                            format!("g{}", receipt.thread_id)
+                        } else {
+                            receipt.thread_id.clone()
+                        };
+                        let prefixed = if receipt.is_group {
+                            format!("group_{}", receipt.thread_id)
+                        } else {
+                            receipt.thread_id.clone()
+                        };
+                        scoped
+                            .query_map(
+                                params![receipt.thread_id, group, prefixed, id, receipt.is_group],
+                                row,
+                            )?
+                            .collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    // An unscoped receipt must resolve uniquely; scoped filtering happens in
+                    // SQLite before LIMIT so collisions in other threads cannot hide its row.
+                    let rows = if receipt.thread_id.is_empty() && rows.len() != 1 {
+                        Vec::new()
+                    } else {
+                        rows
+                    };
+                    for (thread, raw) in rows {
                         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
                             continue;
                         };
@@ -1434,6 +1429,46 @@ mod tests {
         store.hydrate_selected_threads(&mut selected, 500).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "Name thread-1");
+    }
+
+    #[test]
+    fn scoped_receipt_finds_its_row_after_many_message_id_collisions() {
+        let store = MessageStore::open(":memory:").unwrap();
+        for index in 0..20 {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: "shared-id".into(),
+                    thread_id: format!("thread-{index:02}"),
+                    sender_id: "me".into(),
+                    sender_name: String::new(),
+                    text: String::new(),
+                    msg_type: "chat.text".into(),
+                    ts: 1,
+                    is_outgoing: true,
+                    raw_json: serde_json::json!({"message_state":{"delivery":"server_accepted"}})
+                        .to_string(),
+                })
+                .unwrap();
+        }
+        let changed = store
+            .apply_receipts(&[crate::presence::Receipt {
+                thread_id: "thread-19".into(),
+                is_group: false,
+                msg_ids: vec!["shared-id".into()],
+                read: true,
+            }])
+            .unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, "thread-19");
+        assert!(store
+            .apply_receipts(&[crate::presence::Receipt {
+                thread_id: String::new(),
+                is_group: false,
+                msg_ids: vec!["shared-id".into()],
+                read: true,
+            }])
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn receipts_only_raise_outgoing_delivery_state() {

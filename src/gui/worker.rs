@@ -41,7 +41,11 @@ pub enum WorkerCmd {
     },
     ReadClipboardImage,
     /// Open the Windows region picker and attach the capture like a pasted image.
-    CaptureScreen,
+    CaptureScreen {
+        owner: String,
+        thread_id: String,
+        is_group: bool,
+    },
     RequestQr,
     PersistSession,
     LoginPassword {
@@ -782,7 +786,6 @@ pub(super) fn spawn_session_worker(
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let is_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let known_threads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<(String, String, bool)>::new()));
-                let auto_history_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 {
                     let commands = commands.clone();
                     let session = session.clone();
@@ -985,29 +988,33 @@ pub(super) fn spawn_session_worker(
                                 if crate::notification_sound::prepare().await.is_err(){let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được âm báo Zalo; kiểm tra mạng rồi bật lại âm thanh".into()));ctx.request_repaint();}
                             });
                         }
-                        WorkerCmd::CaptureScreen => {
+                        WorkerCmd::CaptureScreen { owner, thread_id, is_group } => {
+                            let s = session.lock().await.clone();
+                            if owner != s.account_key() || !s.is_active() { continue; }
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let before = crate::screen_capture::clipboard_sequence();
-                                let launched = tokio::task::spawn_blocking(crate::screen_capture::launch).await;
-                                if let Ok(Err(e)) | Err(e) = launched.map_err(anyhow::Error::from) {
-                                    let _ = tx.send(GuiEvent::ScreenCaptureFinished(Err(e.to_string())));
-                                    ctx.request_repaint();
-                                    return;
-                                }
-                                let deadline = tokio::time::Instant::now() + crate::screen_capture::WAIT;
-                                while tokio::time::Instant::now() < deadline {
-                                    tokio::time::sleep(crate::screen_capture::POLL).await;
-                                    if crate::screen_capture::changed(before, crate::screen_capture::clipboard_sequence()) {
-                                        // Give the snipping tool a moment to finish writing all formats.
-                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                        let image = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten();
-                                        let _ = tx.send(GuiEvent::ScreenCaptureFinished(image.ok_or_else(|| "Bộ nhớ tạm không chứa ảnh chụp".to_owned())));
-                                        ctx.request_repaint();
-                                        return;
+                                let result = async {
+                                    let mut before = crate::screen_capture::clipboard_sequence();
+                                    tokio::task::spawn_blocking(crate::screen_capture::launch).await
+                                        .map_err(|_| "Không mở được công cụ chụp màn hình".to_owned())?
+                                        .map_err(|e| e.to_string())?;
+                                    let deadline = tokio::time::Instant::now() + crate::screen_capture::WAIT;
+                                    while tokio::time::Instant::now() < deadline {
+                                        tokio::time::sleep(crate::screen_capture::POLL).await;
+                                        if !s.is_active() { return Err("Đã dừng chụp màn hình".to_owned()); }
+                                        let now = crate::screen_capture::clipboard_sequence();
+                                        if crate::screen_capture::changed(before, now) {
+                                            before = now;
+                                            // The clipboard may change before all image formats are ready.
+                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                            if let Some(image) = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten() {
+                                                return Ok(image);
+                                            }
+                                        }
                                     }
-                                }
-                                let _ = tx.send(GuiEvent::ScreenCaptureFinished(Err("Không nhận được ảnh chụp trong 60 giây".into())));
+                                    Err("Không nhận được ảnh chụp trong 60 giây".to_owned())
+                                }.await;
+                                let _ = tx.send(GuiEvent::ScreenCaptureFinished { owner, thread_id, is_group, result });
                                 ctx.request_repaint();
                             });
                         }
@@ -1393,9 +1400,7 @@ pub(super) fn spawn_session_worker(
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            let commands = commands.clone();
                             let known = known_threads.clone();
-                            let auto_history_started = auto_history_started.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
                                 let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into()};
@@ -1466,12 +1471,7 @@ pub(super) fn spawn_session_worker(
                                     };
                                     persist_received(&s, &mut list).await;
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
-                                    let eligible = list.iter().any(|t| t.is_group || s.login.as_ref().is_some_and(|li| !li.send2me_id.is_empty() && li.send2me_id == t.id));
-                                    if eligible && !auto_history_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                                        if let Some(tx) = commands.upgrade() {
-                                            let _ = tx.send(WorkerCmd::SyncHistory { threads: list.clone(), retry_filtered: false });
-                                        }
-                                    }
+                                    // Startup refreshes live/offline queues; historical backfill is explicit.
                                     let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
                                     notice.message=match recent_result {

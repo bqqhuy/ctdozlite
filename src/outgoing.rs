@@ -256,27 +256,31 @@ async fn forward_media(
     original: &ChatMessage,
     client_id: u64,
 ) -> Result<ChatMessage> {
-    match forward_by_clone(s, to, group, original, client_id).await {
-        Ok(sent) => return Ok(sent),
-        Err(error) => crate::logger::log_error(
-            "forward clone",
-            &format!("{error:#}; re-uploading the media instead"),
-        ),
-    }
-    forward_by_reupload(s, to, group, original, client_id).await
+    let info = match clone_forward_info(s, to, group, original, client_id).await {
+        Ok(info) => info,
+        Err(_) => {
+            // Copying does not send a message. Only this preparation phase may fall back.
+            crate::logger::log_error("forward clone", "Media copy failed; trying re-upload");
+            return forward_by_reupload(s, to, group, original, client_id).await;
+        }
+    };
+    // A missing response can mean the message was delivered. Never issue a second send.
+    let msg_type = crate::media_renew::forward_type(crate::message_view::media(original).kind)
+        .ok_or_else(|| anyhow::anyhow!("Loại media chưa hỗ trợ"))?;
+    let response =
+        crate::chat::send_forward_message(s, to, group, msg_type, &info, client_id).await?;
+    Ok(cloned_message(original, client_id, info, &response))
 }
 
-async fn forward_by_clone(
+async fn clone_forward_info(
     s: &Session,
     to: &str,
     group: bool,
     original: &ChatMessage,
     client_id: u64,
-) -> Result<ChatMessage> {
+) -> Result<Value> {
     use crate::message_view::MediaKind;
     let media = crate::message_view::media(original);
-    let msg_type = crate::media_renew::forward_type(media.kind)
-        .ok_or_else(|| anyhow::anyhow!("Loại media chưa hỗ trợ"))?;
     let mut info = crate::chat::forward_info(original)
         .ok_or_else(|| anyhow::anyhow!("Thiếu thông tin media để sao chép"))?;
     let kind = media.kind;
@@ -318,20 +322,38 @@ async fn forward_by_clone(
         }
         MediaKind::None => anyhow::bail!("Loại media chưa hỗ trợ"),
     }
-    let response =
-        crate::chat::send_forward_message(s, to, group, msg_type, &info, client_id).await?;
-    let mut sent = original.clone();
-    sent.id = crate::chat::sent_server_id(&response);
-    if sent.id.is_empty() {
-        sent.id = format!("out_{client_id}");
-    }
-    sent.client_message_id = client_id.to_string();
-    sent.is_outgoing = true;
-    sent.sender = "Tôi".into();
-    sent.ts = client_id as i64;
-    sent.time = crate::ui::clock();
-    sent.history_source = None;
-    sent.wire_ref = Default::default();
+    Ok(info)
+}
+
+fn cloned_message(
+    original: &ChatMessage,
+    client_id: u64,
+    info: Value,
+    response: &Value,
+) -> ChatMessage {
+    use crate::message_view::MediaKind;
+    let media = crate::message_view::media(original);
+    // Forwarded content is a new message, not a copy of local flags/reactions/replies.
+    let server_id = crate::chat::sent_server_id(response);
+    let mut sent = ChatMessage {
+        id: if server_id.is_empty() {
+            format!("out_{client_id}")
+        } else {
+            server_id
+        },
+        client_message_id: client_id.to_string(),
+        kind: original.kind,
+        text: original.text.clone(),
+        text_styles: original.text_styles.clone(),
+        link_title: original.link_title.clone(),
+        link_desc: original.link_desc.clone(),
+        link_src: original.link_src.clone(),
+        is_outgoing: true,
+        sender: "Tôi".into(),
+        ts: client_id as i64,
+        time: crate::ui::clock(),
+        ..Default::default()
+    };
     sent.wire_ref.fields.insert("msgInfo".into(), info.clone());
     let url = |k: &str| {
         info.get(k)
@@ -350,7 +372,7 @@ async fn forward_by_clone(
         }
         _ => sent.link_url = url("url"),
     }
-    Ok(sent)
+    sent
 }
 
 async fn forward_by_reupload(
@@ -512,6 +534,30 @@ pub(crate) fn failure_message(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_media_does_not_inherit_source_conversation_state() {
+        let original = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            reactions: vec!["heart".into()],
+            is_pinned: true,
+            is_starred: true,
+            reply_to_id: Some("old-message".into()),
+            history_source: Some(json!({"old":true})),
+            ..Default::default()
+        };
+        let sent = cloned_message(
+            &original,
+            77,
+            json!({"oriUrl":"https://photo.zdn.vn/new", "thumbUrl":"https://photo.zdn.vn/thumb"}),
+            &json!({"error_code":0,"data":{"msgId":"99"}}),
+        );
+        assert!(sent.reactions.is_empty());
+        assert!(!sent.is_pinned && !sent.is_starred);
+        assert!(sent.reply_to_id.is_none() && sent.history_source.is_none());
+        assert_eq!(sent.id, "99");
+        assert_eq!(sent.link_url.as_deref(), Some("https://photo.zdn.vn/new"));
+    }
     #[test]
     fn interrupted_send_restores_payload_and_ack_removes_retry() {
         let original = pending("hello".into(), false, Payload::Text);

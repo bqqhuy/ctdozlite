@@ -16,7 +16,7 @@ const LIMIT: usize = 256;
 
 #[derive(Default)]
 struct Registry {
-    waiting: HashMap<String, tokio::sync::oneshot::Sender<String>>,
+    waiting: HashMap<String, (u64, tokio::sync::oneshot::Sender<String>)>,
     done: HashMap<String, (String, Instant)>,
 }
 
@@ -71,7 +71,7 @@ pub fn parse(payload: &Value) -> Vec<(String, String)> {
 }
 
 /// Deliver notifications from any control transport; never blocks.
-pub fn deliver(payload: &Value) {
+pub fn deliver(account: &str, payload: &Value) {
     let found = parse(payload);
     if found.is_empty() {
         return;
@@ -80,8 +80,9 @@ pub fn deliver(payload: &Value) {
         let now = Instant::now();
         r.done.retain(|_, (_, at)| now.duration_since(*at) < KEEP);
         for (file_id, url) in found {
+            let file_id = scoped_key(account, &file_id);
             match r.waiting.remove(&file_id) {
-                Some(waiter) => {
+                Some((_, waiter)) => {
                     let _ = waiter.send(url);
                 }
                 None if r.done.len() < LIMIT => {
@@ -93,17 +94,38 @@ pub fn deliver(payload: &Value) {
     });
 }
 
-/// Wait for the processed CDN URL of an uploaded file, up to `timeout`.
-pub async fn wait(file_id: &str, timeout: Duration) -> Option<String> {
+fn scoped_key(account: &str, file_id: &str) -> String {
+    format!("{}:{account}{file_id}", account.len())
+}
+
+struct Waiter(String, u64);
+impl Drop for Waiter {
+    fn drop(&mut self) {
+        // Also release cancelled futures; no later waiter can be removed by this one.
+        with(|r| {
+            if r.waiting.get(&self.0).is_some_and(|(id, _)| *id == self.1) {
+                r.waiting.remove(&self.0);
+            }
+        });
+    }
+}
+
+/// Wait for one account's processed upload URL; cancellation releases its registration.
+pub async fn wait(account: &str, file_id: &str, timeout: Duration) -> Option<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let generation = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file_id = scoped_key(account, file_id);
     let receiver = with(|r| {
-        if let Some((url, _)) = r.done.remove(file_id) {
-            return Err(url);
+        if let Some((url, at)) = r.done.remove(&file_id) {
+            if at.elapsed() < KEEP {
+                return Err(url);
+            }
         }
-        if r.waiting.len() >= LIMIT {
+        if r.waiting.len() >= LIMIT || r.waiting.contains_key(&file_id) {
             return Ok(None);
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        r.waiting.insert(file_id.to_owned(), tx);
+        r.waiting.insert(file_id.clone(), (generation, tx));
         Ok(Some(rx))
     });
     let receiver = match receiver {
@@ -111,10 +133,8 @@ pub async fn wait(file_id: &str, timeout: Duration) -> Option<String> {
         Ok(None) => return None,
         Ok(Some(rx)) => rx,
     };
+    let _waiter = Waiter(file_id, generation);
     let result = tokio::time::timeout(timeout, receiver).await;
-    with(|r| {
-        r.waiting.remove(file_id);
-    });
     result.ok().and_then(Result::ok)
 }
 
@@ -142,9 +162,9 @@ mod tests {
 
     #[tokio::test]
     async fn waiter_receives_url_delivered_later() {
-        let waiting = tokio::spawn(wait("file-later", Duration::from_secs(2)));
+        let waiting = tokio::spawn(wait("test-account", "file-later", Duration::from_secs(2)));
         tokio::time::sleep(Duration::from_millis(50)).await;
-        deliver(&done("file-later", "https://f.dlfl.vn/a"));
+        deliver("test-account", &done("file-later", "https://f.dlfl.vn/a"));
         assert_eq!(
             waiting.await.unwrap().as_deref(),
             Some("https://f.dlfl.vn/a")
@@ -153,9 +173,9 @@ mod tests {
 
     #[tokio::test]
     async fn early_notification_is_kept_for_a_late_waiter() {
-        deliver(&done("file-early", "https://f.dlfl.vn/b"));
+        deliver("test-account", &done("file-early", "https://f.dlfl.vn/b"));
         assert_eq!(
-            wait("file-early", Duration::from_millis(10))
+            wait("test-account", "file-early", Duration::from_millis(10))
                 .await
                 .as_deref(),
             Some("https://f.dlfl.vn/b")
@@ -164,8 +184,56 @@ mod tests {
 
     #[tokio::test]
     async fn wait_times_out_without_notification() {
-        assert!(wait("file-never", Duration::from_millis(20))
+        assert!(
+            wait("test-account", "file-never", Duration::from_millis(20))
+                .await
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn notifications_are_isolated_by_account_and_expired_entries_are_ignored() {
+        deliver("account-a", &done("scoped-file", "https://f.dlfl.vn/a"));
+        assert!(wait("account-b", "scoped-file", Duration::from_millis(1))
             .await
             .is_none());
+        assert_eq!(
+            wait("account-a", "scoped-file", Duration::from_millis(1))
+                .await
+                .as_deref(),
+            Some("https://f.dlfl.vn/a")
+        );
+        with(|r| {
+            r.done.insert(
+                scoped_key("expired", "file"),
+                (
+                    "https://f.dlfl.vn/old".into(),
+                    Instant::now() - KEEP - Duration::from_secs(1),
+                ),
+            );
+        });
+        assert!(wait("expired", "file", Duration::from_millis(1))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_waiter_does_not_replace_first_and_cancellation_cleans_up() {
+        let first = tokio::spawn(wait("waiters", "same-file", Duration::from_secs(10)));
+        tokio::task::yield_now().await;
+        assert!(wait("waiters", "same-file", Duration::from_millis(1))
+            .await
+            .is_none());
+        first.abort();
+        let _ = first.await;
+        assert!(!with(|r| r
+            .waiting
+            .contains_key(&scoped_key("waiters", "same-file"))));
+        let next = tokio::spawn(wait("waiters", "same-file", Duration::from_secs(1)));
+        tokio::task::yield_now().await;
+        deliver("waiters", &done("same-file", "https://f.dlfl.vn/new"));
+        assert_eq!(
+            next.await.unwrap().as_deref(),
+            Some("https://f.dlfl.vn/new")
+        );
     }
 }

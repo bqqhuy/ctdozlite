@@ -53,7 +53,7 @@ fn walk(
     budget: &mut usize,
 ) -> Result<()> {
     let mut pos = start;
-    while pos + 8 <= end {
+    while end.saturating_sub(pos) >= 8 {
         anyhow::ensure!(*budget > 0, "Quá nhiều hộp trong tệp video");
         *budget -= 1;
         file.seek(SeekFrom::Start(pos))?;
@@ -63,6 +63,7 @@ fn walk(
         let kind = [head[4], head[5], head[6], head[7]];
         let mut header = 8;
         if size == 1 {
+            anyhow::ensure!(end - pos >= 16, "Hộp video mở rộng bị cắt ngắn");
             let mut large = [0u8; 8];
             file.read_exact(&mut large)?;
             size = u64::from_be_bytes(large);
@@ -70,24 +71,26 @@ fn walk(
         } else if size == 0 {
             size = end - pos;
         }
-        if size < header || pos + size > end {
-            break;
-        }
+        anyhow::ensure!(
+            size >= header && size <= end - pos,
+            "Kích thước hộp video không hợp lệ"
+        );
         let body = pos + header;
+        let body_len = size - header;
         match &kind {
             b"moov" | b"trak" if depth < 4 => {
                 walk(file, body, pos + size, depth + 1, info, budget)?
             }
             b"mvhd" => {
                 let mut buf = [0u8; 32];
-                let n = read_up_to(file, &mut buf)?;
+                let n = read_up_to(file, &mut buf, body_len)?;
                 if let Some(ms) = mvhd_duration_ms(&buf[..n]) {
                     info.duration_ms = ms;
                 }
             }
             b"tkhd" => {
                 let mut buf = [0u8; 96];
-                let n = read_up_to(file, &mut buf)?;
+                let n = read_up_to(file, &mut buf, body_len)?;
                 if let Some((w, h)) = tkhd_size(&buf[..n]) {
                     if info.width == 0 && w > 0 && h > 0 {
                         info.width = w;
@@ -102,7 +105,10 @@ fn walk(
     Ok(())
 }
 
-fn read_up_to(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
+fn read_up_to(file: &mut std::fs::File, buf: &mut [u8], available: u64) -> Result<usize> {
+    // Never interpret the next box as fields of a truncated mvhd/tkhd.
+    let limit = available.min(buf.len() as u64) as usize;
+    let buf = &mut buf[..limit];
     let mut filled = 0;
     while filled < buf.len() {
         match file.read(&mut buf[filled..])? {
@@ -239,5 +245,31 @@ mod tests {
         assert!(is_video_message(Path::new("a.mov")));
         assert!(!is_video_message(Path::new("a.mkv")));
         assert!(!is_video_message(Path::new("a.webm")));
+    }
+    #[test]
+    fn malformed_box_sizes_cannot_overflow_or_read_following_boxes() {
+        let root = std::env::temp_dir().join(format!(
+            "video-invalid-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("bad.mp4");
+        let mut oversized = mp4_box(b"ftyp", b"isom");
+        oversized.extend_from_slice(&1u32.to_be_bytes());
+        oversized.extend_from_slice(b"moov");
+        oversized.extend_from_slice(&u64::MAX.to_be_bytes());
+        std::fs::write(&path, oversized).unwrap();
+        assert!(probe(&path).is_err());
+        // The tiny mvhd has no duration. Bytes in a following sibling box must not count.
+        let mut sibling = vec![0; 40];
+        sibling[4..8].copy_from_slice(&600u32.to_be_bytes());
+        sibling[8..12].copy_from_slice(&3300u32.to_be_bytes());
+        let broken = mp4_box(
+            b"moov",
+            &[mp4_box(b"mvhd", &[0; 4]), mp4_box(b"junk", &sibling)].concat(),
+        );
+        std::fs::write(&path, broken).unwrap();
+        assert!(probe(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -2038,7 +2038,7 @@ pub(crate) async fn send_attachment_with_client_id(
     // `video_done` control; Zalo PC sends `asyncfile/msg` only after receiving it.
     if file_url.is_empty() {
         if let Some(fid) = file_id.as_deref() {
-            match crate::upload_events::wait(fid, ASYNC_FILE_URL_WAIT).await {
+            match crate::upload_events::wait(s.account_key(), fid, ASYNC_FILE_URL_WAIT).await {
                 Some(url) => file_url = url,
                 None => crate::logger::log_error(
                     "asyncfile",
@@ -2270,7 +2270,7 @@ async fn send_video_message(
     let mut video_url = pick_str(data, &["fileUrl", "url"]).unwrap_or_default();
     if video_url.is_empty() {
         if let Some(file_id) = pick_str(data, &["fileId"]) {
-            video_url = crate::upload_events::wait(&file_id, ASYNC_FILE_URL_WAIT)
+            video_url = crate::upload_events::wait(s.account_key(), &file_id, ASYNC_FILE_URL_WAIT)
                 .await
                 .unwrap_or_default();
         }
@@ -4882,33 +4882,9 @@ pub async fn poll_new_messages(
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
         merge_previews(threads, &preview_resp);
     }
-    // 2b. Sync Cloud của tôi (`send2me_id`) and group conversations via `/api/cm/getrecentv2`
-    let send2me_id = s
-        .login
-        .as_ref()
-        .map(|l| l.send2me_id.clone())
-        .unwrap_or_default();
-    if !send2me_id.is_empty() {
-        if let Ok(cm_resp) = get_cloud_messages(s, &send2me_id, "0", false, 50).await {
-            if let Some(t) = threads.iter_mut().find(|t| t.id == send2me_id) {
-                merge_group_history(t, &cm_resp);
-            } else {
-                merge_previews(threads, &cm_resp);
-            }
-        }
-    }
-    let group_ids: Vec<String> = threads
-        .iter()
-        .filter(|t| t.is_group && !t.id.is_empty())
-        .map(|t| t.id.clone())
-        .collect();
-    for gid in group_ids {
-        if let Ok(cm_resp) = get_cloud_messages(s, &gid, "0", false, 50).await {
-            if let Some(t) = threads.iter_mut().find(|t| t.id == gid) {
-                merge_group_history(t, &cm_resp);
-            }
-        }
-    }
+    // Historical group/Cloud pages belong to explicit history sync. Re-reading every
+    // group's latest 50 messages here makes startup O(groups), even with a warm database.
+    // Live/offline group queues and conversation previews above supply current messages.
     // 3. Resolve display names for any newly discovered threads
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));

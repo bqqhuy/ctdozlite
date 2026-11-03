@@ -920,7 +920,7 @@ pub async fn poll_control_events(
         // discard historical replay events from previous sessions.
         return Ok((Vec::new(), Vec::new()));
     }
-    crate::upload_events::deliver(data_node);
+    crate::upload_events::deliver(s.account_key(), data_node);
     let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
     let events = extract_voip_controls(data_node);
     if !events.is_empty() {

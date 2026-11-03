@@ -97,21 +97,37 @@ async fn renew_once(
     })?;
     renew_body(s, tag, &body, crate::message_view::media(message)).await
 }
+#[derive(Debug)]
+struct PendingRenewal;
+impl std::fmt::Display for PendingRenewal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Máy chủ chưa chuẩn bị xong media, hãy thử lại sau")
+    }
+}
+impl std::error::Error for PendingRenewal {}
+
 /// Run `renewlink` for a prepared body, re-polling `async` replies within the shared budget.
 async fn renew_body(s: &Session, tag: u64, body: &Value, base: Media) -> Result<Media> {
-    let outcome = poll_pending(RENEW_DEADLINE, &PENDING_DELAYS, || async {
+    let polling = poll_pending(RENEW_DEADLINE, &PENDING_DELAYS, || async {
         let reply = renew_request(s, tag, body, base.clone()).await;
         if matches!(reply, Ok(Reply::Pending)) {
             diag::renewal(tag, RenewPhase::Pending, Some(0));
         }
         reply
-    })
-    .await;
+    });
+    let outcome = tokio::select! {
+        result = polling => result,
+        _ = async {
+            while s.is_active() {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        } => anyhow::bail!("Đã đăng xuất; dừng phục hồi media"),
+    };
     match outcome {
         Some(result) => result,
         None => {
             diag::renewal(tag, RenewPhase::PendingTimeout, None);
-            anyhow::bail!("Máy chủ chưa chuẩn bị xong media, hãy thử lại sau")
+            Err(PendingRenewal.into())
         }
     }
 }
@@ -347,7 +363,15 @@ fn parse(response: &Value, mut media: Media) -> std::result::Result<Reply, Renew
             media.thumbnail = pick(Some(&data), &["thumb", "thumbUrl"]);
             media.original = pick(
                 Some(&data),
-                &["normal", "oriUrl", "hd", "hdUrl", "fileUrl", "url"],
+                &[
+                    "normal",
+                    "oriUrl",
+                    "hd",
+                    "hdUrl",
+                    "normalUrl",
+                    "fileUrl",
+                    "url",
+                ],
             );
             media.preview = pick(
                 Some(&data),
@@ -385,9 +409,20 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
     static FLIGHTS: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, Renewal>>,
     > = std::sync::OnceLock::new();
+    ensure!(s.is_active(), "Đã đăng xuất");
     let tag = reference_tag(s, thread, message);
     diag::renewal(tag, RenewPhase::Entered, None);
-    let identity = serde_json::to_string(&(s.account_key(), thread, &message.id))?;
+    use sha2::Digest;
+    let session_tag = sha2::Sha256::digest(s.session_key_bytes());
+    // A new login or another attachment must not reuse a previous renewal result.
+    let identity = serde_json::to_string(&(
+        s.account_key(),
+        thread,
+        &message.id,
+        &message.client_message_id,
+        crate::message_view::media(message),
+        session_tag.as_slice(),
+    ))?;
     let cell = (|| -> Result<Renewal> {
         let mut map = FLIGHTS
             .get_or_init(Default::default)
@@ -409,6 +444,7 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
         diag::renewal(tag, RenewPhase::PreparationFailed, None);
     })?;
     let mut state = cell.lock().await;
+    ensure!(s.is_active(), "Đã đăng xuất");
     if let Some((at, result)) = &*state {
         if at.elapsed() < std::time::Duration::from_secs(60) {
             diag::renewal(
@@ -423,10 +459,18 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
             return result.clone().map_err(anyhow::Error::msg);
         }
     }
-    let result = renew_once(s, thread, group, message)
-        .await
-        .map_err(|e| e.to_string());
-    *state = Some((std::time::Instant::now(), result.clone()));
+    let result = renew_once(s, thread, group, message).await;
+    // Pending preparation is transient; allow an explicit retry instead of caching failure.
+    let pending = result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.is::<PendingRenewal>());
+    let result = result.map_err(|e| e.to_string());
+    *state = if pending || !s.is_active() {
+        None
+    } else {
+        Some((std::time::Instant::now(), result.clone()))
+    };
     result.map_err(anyhow::Error::msg)
 }
 
@@ -476,6 +520,15 @@ mod tests {
         assert_eq!(got.original.as_deref(), Some("https://photo.zdn.vn/n"));
         assert_eq!(got.preview.as_deref(), Some("https://photo.zdn.vn/h"));
         assert_eq!(got.thumbnail.as_deref(), Some("https://photo.zdn.vn/t"));
+    }
+    #[test]
+    fn normal_url_alone_is_a_usable_legacy_photo_reply() {
+        let got = ready(parse(
+            &json!({"error_code":0,"data":{"normalUrl":"https://photo.zdn.vn/normal"}}),
+            kind(MediaKind::Photo),
+        ));
+        assert_eq!(got.original.as_deref(), Some("https://photo.zdn.vn/normal"));
+        assert_eq!(got.preview, got.original);
     }
     #[test]
     fn video_thumbnail_as_plain_string_is_kept() {
