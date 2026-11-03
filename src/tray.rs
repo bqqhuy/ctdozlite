@@ -208,9 +208,10 @@ impl Drop for Tray {
         HAS_UNREAD.store(false, Ordering::Release);
         POPUP_PENDING.store(false, Ordering::Release);
         if let Ok(mut dispatch) = DISPATCH.lock() {
-            if dispatch.as_ref().is_some_and(|state| {
-                Arc::ptr_eq(&state.control.quitting, &self.control.quitting)
-            }) {
+            if dispatch
+                .as_ref()
+                .is_some_and(|state| Arc::ptr_eq(&state.control.quitting, &self.control.quitting))
+            {
                 *dispatch = None;
             }
         }
@@ -358,9 +359,10 @@ unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _:
         let Some(icon) = slot.as_mut() else {
             return;
         };
-        if let Some(desktop)=icon.desktop.as_mut(){desktop.tick(!previews_visible());}
-        let unread =
-            crate::desktop_notice::snapshot().count > 0;
+        if let Some(desktop) = icon.desktop.as_mut() {
+            desktop.tick(!previews_visible());
+        }
+        let unread = crate::desktop_notice::snapshot().count > 0;
         if unread != icon.shown {
             let image = if unread { &icon.unread } else { &icon.normal };
             if icon.icon.set_icon(Some(image.clone())).is_ok() {
@@ -378,7 +380,6 @@ unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _:
                 }
             }
         }
-
     });
 }
 pub(crate) fn configure_notifications(enabled: bool, sound: bool) {
@@ -399,7 +400,13 @@ pub(crate) fn note_background_unread(new_alert: bool) {
 }
 
 /// A popup click owns the exact notification snapshot, independent of newer arrivals.
-pub(crate) fn open_notice(notice:crate::desktop_notice::Notice){
+pub(crate) fn open_notice(notice: crate::desktop_notice::Notice) {
     crate::desktop_notice::activate(notice);
-    if let Some(control)=DISPATCH.lock().ok().and_then(|s|s.as_ref().map(|d|d.control.clone())){control.open();}
+    if let Some(control) = DISPATCH
+        .lock()
+        .ok()
+        .and_then(|s| s.as_ref().map(|d| d.control.clone()))
+    {
+        control.open();
+    }
 }

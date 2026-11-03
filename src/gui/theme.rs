@@ -324,7 +324,12 @@ fn paint_single_circle_avatar(
             );
             return;
         }
-        if painter.clip_rect().expand(64.0).intersects(Rect::from_center_size(center,Vec2::splat(radius*2.0))) && loading.insert(key.clone()) {
+        if painter
+            .clip_rect()
+            .expand(64.0)
+            .intersects(Rect::from_center_size(center, Vec2::splat(radius * 2.0)))
+            && loading.insert(key.clone())
+        {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchStickerImage {
                     key,

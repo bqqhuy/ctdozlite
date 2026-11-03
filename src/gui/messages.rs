@@ -6,10 +6,13 @@ use super::*;
 
 /// Request only the visible area and a small scroll-ahead margin, without
 /// turning the entire rendered history window into a download queue.
-pub(super) fn media_near_viewport(ui:&egui::Ui,height:f32)->bool {
-    let clip=ui.clip_rect().expand(160.0);
-    let y=ui.next_widget_position().y;
-    clip.intersects(Rect::from_min_max(Pos2::new(clip.min.x,y),Pos2::new(clip.max.x,y+height)))
+pub(super) fn media_near_viewport(ui: &egui::Ui, height: f32) -> bool {
+    let clip = ui.clip_rect().expand(160.0);
+    let y = ui.next_widget_position().y;
+    clip.intersects(Rect::from_min_max(
+        Pos2::new(clip.min.x, y),
+        Pos2::new(clip.max.x, y + height),
+    ))
 }
 
 pub(super) fn is_sticker_message(msg: &ChatMessage) -> Option<(u64, u64)> {
@@ -41,7 +44,10 @@ pub(super) fn render_sticker_widget(
         format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={sid}&size=130")
     };
 
-    if media_near_viewport(ui,128.0) && !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
+    if media_near_viewport(ui, 128.0)
+        && !sticker_textures.contains_key(&key)
+        && loading_stickers.insert(key.clone())
+    {
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::FetchStickerImage {
                 key: key.clone(),
@@ -328,7 +334,8 @@ pub(super) fn clipboard_has_image() -> bool {
 /// 1. Registered `"PNG"` / `"image/png"` streams (Snipping Tool, ShareX, Chrome/Edge, Discord)
 /// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
 /// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
-pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
+pub(super) fn read_clipboard_image_to_png(
+) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     crate::crash_report::phase("clipboard-copy");
     #[cfg(windows)]
     {
@@ -337,7 +344,9 @@ pub(super) fn read_clipboard_image_to_png() -> Option<(std::path::PathBuf, u32, 
         finalize_clipboard_rgba_image(rgba)
     }
     #[cfg(not(windows))]
-    { None }
+    {
+        None
+    }
 }
 
 /// Format a URL for clean UI display by stripping tracking query strings (`?_r=1&utm_...`)
@@ -752,9 +761,16 @@ pub(super) fn render_message_body(
     }
     if media.kind == crate::message_view::MediaKind::File {
         ui.add(egui::Label::new(RichText::new(&media.name).strong().color(text_col)).wrap());
-        if let Some(url)=media.original {
-            if ui.button("Lưu về máy…").clicked(){return Some(BubbleAction::SaveAttachment{url,name:media.name});}
-        }else{ui.label(RichText::new("Không còn đường dẫn tải tệp").color(pal.text_muted));}
+        if let Some(url) = media.original {
+            if ui.button("Lưu về máy…").clicked() {
+                return Some(BubbleAction::SaveAttachment {
+                    url,
+                    name: media.name,
+                });
+            }
+        } else {
+            ui.label(RichText::new("Không còn đường dẫn tải tệp").color(pal.text_muted));
+        }
         return None;
     }
 
@@ -762,7 +778,10 @@ pub(super) fn render_message_body(
         if msg.text_styles.is_empty() {
             ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
         } else {
-            ui.add(egui::Label::new(styled_text_job(&msg.text, &msg.text_styles, text_col, 14.0)).wrap());
+            ui.add(
+                egui::Label::new(styled_text_job(&msg.text, &msg.text_styles, text_col, 14.0))
+                    .wrap(),
+            );
         }
         return None;
     };
@@ -785,7 +804,7 @@ pub(super) fn render_message_body(
                         .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
             })
             .unwrap_or(false);
-    if needs_meta_enrich && media_near_viewport(ui,300.0) {
+    if needs_meta_enrich && media_near_viewport(ui, 300.0) {
         let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
         if loading_stickers.insert(meta_key) {
             if let Some(tx) = WORKER_TX.get() {
@@ -803,7 +822,8 @@ pub(super) fn render_message_body(
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if media_near_viewport(ui,200.0) && !sticker_textures.contains_key(&key)
+        if media_near_viewport(ui, 200.0)
+            && !sticker_textures.contains_key(&key)
             && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
             && loading_stickers.insert(key.clone())
         {
@@ -1991,11 +2011,34 @@ mod media_visibility_tests {
     use super::*;
     #[test]
     fn offscreen_sticker_does_not_start_download_until_it_is_visible() {
-        let ctx=egui::Context::default();let msg=ChatMessage{sticker_id:Some(1),sticker_cate_id:Some(0),..Default::default()};let textures=HashMap::new();let mut loading=HashSet::new();
-        let input=||egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,Vec2::new(400.0,400.0))),..Default::default()};
-        let _=ctx.run(input(),|ctx|{egui::CentralPanel::default().show(ctx,|ui|{ui.add_space(2000.0);render_sticker_widget(ui,&msg,&textures,&mut loading);});});
-        assert!(loading.is_empty(),"offscreen history must not flood the image queue");
-        let _=ctx.run(input(),|ctx|{egui::CentralPanel::default().show(ctx,|ui|{render_sticker_widget(ui,&msg,&textures,&mut loading);});});assert!(loading.contains("stk_0_1"));
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            sticker_id: Some(1),
+            sticker_cate_id: Some(0),
+            ..Default::default()
+        };
+        let textures = HashMap::new();
+        let mut loading = HashSet::new();
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add_space(2000.0);
+                render_sticker_widget(ui, &msg, &textures, &mut loading);
+            });
+        });
+        assert!(
+            loading.is_empty(),
+            "offscreen history must not flood the image queue"
+        );
+        let _ = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render_sticker_widget(ui, &msg, &textures, &mut loading);
+            });
+        });
+        assert!(loading.contains("stk_0_1"));
     }
 }
 
@@ -2016,8 +2059,16 @@ pub(super) fn styled_text_job(
                 font_id: egui::FontId::proportional(if style.bold { size + 0.6 } else { size }),
                 color,
                 italics: style.italic,
-                underline: if style.underline { stroke } else { egui::Stroke::NONE },
-                strikethrough: if style.strike { stroke } else { egui::Stroke::NONE },
+                underline: if style.underline {
+                    stroke
+                } else {
+                    egui::Stroke::NONE
+                },
+                strikethrough: if style.strike {
+                    stroke
+                } else {
+                    egui::Stroke::NONE
+                },
                 ..Default::default()
             },
         );

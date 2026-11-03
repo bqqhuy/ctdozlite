@@ -238,7 +238,10 @@ pub enum GuiEvent {
     },
     SessionExpired(String),
     CallStateChanged(String),
-    CallIdentity { thread_id: String, call_id: i64 },
+    CallIdentity {
+        thread_id: String,
+        call_id: i64,
+    },
     IncomingCall {
         call_id: i64,
         caller_id: String,
@@ -658,7 +661,9 @@ impl ZaloGuiApp {
 
         // The launcher already read the account cache and SQLite before the GUI starts.
         let mut threads = initial_threads;
-        for thread in &mut threads{crate::message_view::remove_call_logs(thread);}
+        for thread in &mut threads {
+            crate::message_view::remove_call_logs(thread);
+        }
         if let Some(li) = session.login.as_ref() {
             if !li.send2me_id.is_empty() {
                 for t in threads.iter_mut() {
@@ -853,8 +858,8 @@ impl ZaloGuiApp {
                     app.phone_sync_running = true;
                     app.phone_sync_status =
                         "Chờ xác nhận trên điện thoại: mở Zalo và chọn Đồng bộ ngay…".into();
-                    app.phone_download_status="Tải về: lượt 1 • gói 2 • 128 / 512 KiB".into();
-                    app.phone_import_status="Nhập CSDL: 125 tin mới • đang nhập gói 1".into();
+                    app.phone_download_status = "Tải về: lượt 1 • gói 2 • 128 / 512 KiB".into();
+                    app.phone_import_status = "Nhập CSDL: 125 tin mới • đang nhập gói 1".into();
                 }
                 let now = crate::login::unix_now() * 1000;
                 app.threads = [
@@ -975,20 +980,28 @@ impl ZaloGuiApp {
                         ..Default::default()
                     },
                 ];
-                app.selected_thread_index = if args.iter().any(|a| a == "--ui-smoke-switch-at") { 0 } else { 1 };
+                app.selected_thread_index = if args.iter().any(|a| a == "--ui-smoke-switch-at") {
+                    0
+                } else {
+                    1
+                };
             }
             if args.iter().any(|a| a == "--ui-smoke-contacts") {
                 app.settings_modal_open = false;
                 app.history_sync_running = false;
                 app.contacts_view_open = true;
                 app.threads.extend(
-                    [("fixture-an", "An Nguyễn"), ("fixture-binh", "Bình Trần"), ("fixture-duc", "Đức Lê")]
-                        .into_iter()
-                        .map(|(id, name)| Thread {
-                            id: id.into(),
-                            name: name.into(),
-                            ..Default::default()
-                        }),
+                    [
+                        ("fixture-an", "An Nguyễn"),
+                        ("fixture-binh", "Bình Trần"),
+                        ("fixture-duc", "Đức Lê"),
+                    ]
+                    .into_iter()
+                    .map(|(id, name)| Thread {
+                        id: id.into(),
+                        name: name.into(),
+                        ..Default::default()
+                    }),
                 );
             }
             if args.iter().any(|a| a == "--ui-smoke-rich-text") {
@@ -996,7 +1009,11 @@ impl ZaloGuiApp {
                 app.history_sync_running = false;
                 let text = "Chú ý: họp lúc 9h, mang tài liệu cũ và mới";
                 let style = |start, len, apply: fn(&mut crate::rich_text::TextStyle)| {
-                    let mut s = crate::rich_text::TextStyle { start, len, ..Default::default() };
+                    let mut s = crate::rich_text::TextStyle {
+                        start,
+                        len,
+                        ..Default::default()
+                    };
                     apply(&mut s);
                     s
                 };
@@ -1022,7 +1039,10 @@ impl ZaloGuiApp {
                 app.selected_thread_index = 0;
                 app.input_message = "Dòng 1\nDòng 2\nDòng 3".into();
             }
-            if args.iter().any(|a| a == "--ui-smoke-photo" || a == "--ui-smoke-media") {
+            if args
+                .iter()
+                .any(|a| a == "--ui-smoke-photo" || a == "--ui-smoke-media")
+            {
                 app.settings_modal_open = false;
                 app.history_sync_running = false;
                 let url = "https://photo-stal-16.zdn.vn/fixture/photo.jpg";
@@ -1059,11 +1079,32 @@ impl ZaloGuiApp {
                     ..Default::default()
                 }];
                 app.selected_thread_index = 0;
-                if args.iter().any(|a|a=="--ui-smoke-media") {
-                    let t=&mut app.threads[0];t.is_group=true;t.name="Nhóm kiểm thử media".into();
-                    t.messages[0].sender="Nguyễn An".into();
-                    t.messages.push(ChatMessage{id:"fixture-video".into(),kind:crate::message_model::MessageKind::Video,text:"[Video]".into(),sender:"Trần Bình".into(),link_thumb:Some(url.into()),link_url:Some("https://video.zdn.vn/fixture/movie.mp4".into()),link_title:Some("Video thử nghiệm.mp4".into()),ts:crate::login::unix_now()*1000,..Default::default()});
-                    t.messages.push(ChatMessage{id:"fixture-file".into(),kind:crate::message_model::MessageKind::File,text:"[Tệp]".into(),sender:"Nguyễn An".into(),link_url:Some("https://file.zdn.vn/fixture/report.xlsx".into()),link_title:Some("Báo cáo.xlsx".into()),ts:crate::login::unix_now()*1000,..Default::default()});
+                if args.iter().any(|a| a == "--ui-smoke-media") {
+                    let t = &mut app.threads[0];
+                    t.is_group = true;
+                    t.name = "Nhóm kiểm thử media".into();
+                    t.messages[0].sender = "Nguyễn An".into();
+                    t.messages.push(ChatMessage {
+                        id: "fixture-video".into(),
+                        kind: crate::message_model::MessageKind::Video,
+                        text: "[Video]".into(),
+                        sender: "Trần Bình".into(),
+                        link_thumb: Some(url.into()),
+                        link_url: Some("https://video.zdn.vn/fixture/movie.mp4".into()),
+                        link_title: Some("Video thử nghiệm.mp4".into()),
+                        ts: crate::login::unix_now() * 1000,
+                        ..Default::default()
+                    });
+                    t.messages.push(ChatMessage {
+                        id: "fixture-file".into(),
+                        kind: crate::message_model::MessageKind::File,
+                        text: "[Tệp]".into(),
+                        sender: "Nguyễn An".into(),
+                        link_url: Some("https://file.zdn.vn/fixture/report.xlsx".into()),
+                        link_title: Some("Báo cáo.xlsx".into()),
+                        ts: crate::login::unix_now() * 1000,
+                        ..Default::default()
+                    });
                 }
             }
             if args.iter().any(|a| a == "--ui-smoke-outgoing") {
@@ -1089,28 +1130,96 @@ impl ZaloGuiApp {
                 }];
                 app.selected_thread_index = 0;
             }
-            if args.iter().any(|a|a=="--ui-smoke-schedule" || a=="--ui-smoke-ami") {
-                app.settings_modal_open=false;app.history_sync_running=false;app.user_uin="fixture-owner".into();
-                app.threads=vec![Thread{id:"fixture-schedule".into(),name:"Nhóm thử nghiệm".into(),is_group:true,..Default::default()}];app.selected_thread_index=0;
-                app.input_message="Hẹn gửi báo cáo lúc 08:00. Giữ nguyên 2*3*4 và tiếng Việt.".into();
-                if args.iter().any(|a|a=="--ui-smoke-schedule"){app.open_quick_schedule();}
-                if args.iter().any(|a|a=="--ui-smoke-ami"){
-                    app.sticker_picker_open=true;app.sticker_tab=StickerTab::Pack(crate::bundled_stickers::CATEGORY);
+            if args
+                .iter()
+                .any(|a| a == "--ui-smoke-schedule" || a == "--ui-smoke-ami")
+            {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                app.user_uin = "fixture-owner".into();
+                app.threads = vec![Thread {
+                    id: "fixture-schedule".into(),
+                    name: "Nhóm thử nghiệm".into(),
+                    is_group: true,
+                    ..Default::default()
+                }];
+                app.selected_thread_index = 0;
+                app.input_message =
+                    "Hẹn gửi báo cáo lúc 08:00. Giữ nguyên 2*3*4 và tiếng Việt.".into();
+                if args.iter().any(|a| a == "--ui-smoke-schedule") {
+                    app.open_quick_schedule();
+                }
+                if args.iter().any(|a| a == "--ui-smoke-ami") {
+                    app.sticker_picker_open = true;
+                    app.sticker_tab = StickerTab::Pack(crate::bundled_stickers::CATEGORY);
                     for item in crate::bundled_stickers::ITEMS {
-                        let image=crate::limits::decode_image(item.png).expect("bundled fixture").to_rgba8();
-                        let image=egui::ColorImage::from_rgba_unmultiplied([image.width() as usize,image.height() as usize],image.as_raw());
-                        let key=format!("stk_{}_{}",crate::bundled_stickers::CATEGORY,item.id);
-                        app.sticker_textures.insert(key.clone(),ctx.load_texture(key,image,Default::default()));
+                        let image = crate::limits::decode_image(item.png)
+                            .expect("bundled fixture")
+                            .to_rgba8();
+                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                            [image.width() as usize, image.height() as usize],
+                            image.as_raw(),
+                        );
+                        let key = format!("stk_{}_{}", crate::bundled_stickers::CATEGORY, item.id);
+                        app.sticker_textures.insert(
+                            key.clone(),
+                            ctx.load_texture(key, image, Default::default()),
+                        );
                     }
                 }
             }
-            if args.iter().any(|a|a=="--ui-smoke-tools") {
-                app.settings_modal_open=false;app.history_sync_running=false;app.user_uin="fixture-owner".into();
-                app.tools=tools_panel::ToolsPanel{open:true,loaded_for:"fixture-owner".into(),tab:args.iter().position(|a|a=="--ui-smoke-tools-tab").and_then(|i|args.get(i+1)).and_then(|v|v.parse::<usize>().ok()).unwrap_or(0).min(4),..Default::default()};
-                app.tools.config.rules.push(crate::tools::ReplyRule{id:"fixture-rule".into(),keyword:"Xin chào".into(),reply_text:"Chào bạn, tôi sẽ trả lời sớm.".into(),mode:"contains".into(),scope:"direct".into(),enabled:false,enabled_since:0});
-                app.tools.query="lịch sử".into();app.tools.hits.push(crate::tools::SearchHit{thread_id:"fixture-chat".into(),message_id:"fixture-result".into(),thread_name:"Hội thoại thử nghiệm".into(),text:"Nội dung lịch sử từ SQLite, chưa cần nạp cả hội thoại vào RAM.".into(),time:crate::login::unix_now()*1000});
-                app.threads=vec![Thread{id:"fixture-chat".into(),name:"Hội thoại thử nghiệm".into(),..Default::default()}];app.selected_thread_index=0;
-                app.tools.tasks.push(crate::tools::Scheduled{id:"fixture-task".into(),owner:"fixture-owner".into(),thread_id:"fixture-chat".into(),deliver_at:crate::login::unix_now()+900,message:crate::outgoing::pending("Tin hẹn giờ thử nghiệm".into(),false,crate::outgoing::Payload::Text),status:"pending".into(),error:String::new()});
+            if args.iter().any(|a| a == "--ui-smoke-tools") {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                app.user_uin = "fixture-owner".into();
+                app.tools = tools_panel::ToolsPanel {
+                    open: true,
+                    loaded_for: "fixture-owner".into(),
+                    tab: args
+                        .iter()
+                        .position(|a| a == "--ui-smoke-tools-tab")
+                        .and_then(|i| args.get(i + 1))
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0)
+                        .min(4),
+                    ..Default::default()
+                };
+                app.tools.config.rules.push(crate::tools::ReplyRule {
+                    id: "fixture-rule".into(),
+                    keyword: "Xin chào".into(),
+                    reply_text: "Chào bạn, tôi sẽ trả lời sớm.".into(),
+                    mode: "contains".into(),
+                    scope: "direct".into(),
+                    enabled: false,
+                    enabled_since: 0,
+                });
+                app.tools.query = "lịch sử".into();
+                app.tools.hits.push(crate::tools::SearchHit {
+                    thread_id: "fixture-chat".into(),
+                    message_id: "fixture-result".into(),
+                    thread_name: "Hội thoại thử nghiệm".into(),
+                    text: "Nội dung lịch sử từ SQLite, chưa cần nạp cả hội thoại vào RAM.".into(),
+                    time: crate::login::unix_now() * 1000,
+                });
+                app.threads = vec![Thread {
+                    id: "fixture-chat".into(),
+                    name: "Hội thoại thử nghiệm".into(),
+                    ..Default::default()
+                }];
+                app.selected_thread_index = 0;
+                app.tools.tasks.push(crate::tools::Scheduled {
+                    id: "fixture-task".into(),
+                    owner: "fixture-owner".into(),
+                    thread_id: "fixture-chat".into(),
+                    deliver_at: crate::login::unix_now() + 900,
+                    message: crate::outgoing::pending(
+                        "Tin hẹn giờ thử nghiệm".into(),
+                        false,
+                        crate::outgoing::Payload::Text,
+                    ),
+                    status: "pending".into(),
+                    error: String::new(),
+                });
             }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
@@ -1216,7 +1325,13 @@ impl ZaloGuiApp {
             }
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
             let event = match event {
-                GuiEvent::LiveThreadsReady(updates) => {self.live_mailbox=Some(updates.clone());GuiEvent::ThreadsUpdated {threads:updates.take(),source:ThreadUpdateSource::Live}},
+                GuiEvent::LiveThreadsReady(updates) => {
+                    self.live_mailbox = Some(updates.clone());
+                    GuiEvent::ThreadsUpdated {
+                        threads: updates.take(),
+                        source: ThreadUpdateSource::Live,
+                    }
+                }
                 GuiEvent::LocalCallRecord {
                     thread_id,
                     text,
@@ -1653,15 +1768,23 @@ impl ZaloGuiApp {
                         continue;
                     }
                     match result {
-                        Ok(tools_panel::ToolsResult::Tasks{tasks,paused})=>{self.tools.tasks=tasks;self.tools.paused=paused;},
-                        Ok(tools_panel::ToolsResult::Loaded { config, tasks,paused }) => {
+                        Ok(tools_panel::ToolsResult::Tasks { tasks, paused }) => {
+                            self.tools.tasks = tasks;
+                            self.tools.paused = paused;
+                        }
+                        Ok(tools_panel::ToolsResult::Loaded {
+                            config,
+                            tasks,
+                            paused,
+                        }) => {
                             for old in &self.tools.config.stickers {
                                 self.sticker_pack_items.remove(&old.cate_id);
-                                self.pinned_sticker_packs.retain(|(id,_)| *id!=old.cate_id);
+                                self.pinned_sticker_packs
+                                    .retain(|(id, _)| *id != old.cate_id);
                             }
                             self.tools.config = config;
                             self.tools.tasks = tasks;
-                            self.tools.paused=paused;
+                            self.tools.paused = paused;
                             self.theme_dirty = true;
                             for pack in &self.tools.config.stickers {
                                 self.sticker_pack_items.insert(
@@ -1691,26 +1814,70 @@ impl ZaloGuiApp {
                                 self.tools.hits = hits;
                             }
                         }
-                        Ok(tools_panel::ToolsResult::Hit{thread,id})=>{
-                            self.replying_to=None;self.filter_starred_only=false;self.in_chat_search_query.clear();self.in_chat_search_open=false;
-                            let index=self.threads.iter().position(|t|t.id==thread.id).unwrap_or_else(||{self.threads.push(Thread{id:thread.id.clone(),name:thread.name.clone(),is_group:thread.is_group,..Default::default()});self.threads.len()-1});
-                            self.selected_thread_index=index;self.threads[index].messages=thread.messages;self.chat_render_window=(thread.id.clone(),150);
-                            self.quote_jump=Some(QuoteJump{thread_id:thread.id,reference:id,highlight_until:std::time::Instant::now()+Duration::from_secs(3),scroll_pending:true});self.tools.open=false;
+                        Ok(tools_panel::ToolsResult::Hit { thread, id }) => {
+                            self.replying_to = None;
+                            self.filter_starred_only = false;
+                            self.in_chat_search_query.clear();
+                            self.in_chat_search_open = false;
+                            let index = self
+                                .threads
+                                .iter()
+                                .position(|t| t.id == thread.id)
+                                .unwrap_or_else(|| {
+                                    self.threads.push(Thread {
+                                        id: thread.id.clone(),
+                                        name: thread.name.clone(),
+                                        is_group: thread.is_group,
+                                        ..Default::default()
+                                    });
+                                    self.threads.len() - 1
+                                });
+                            self.selected_thread_index = index;
+                            self.threads[index].messages = thread.messages;
+                            self.chat_render_window = (thread.id.clone(), 150);
+                            self.quote_jump = Some(QuoteJump {
+                                thread_id: thread.id,
+                                reference: id,
+                                highlight_until: std::time::Instant::now() + Duration::from_secs(3),
+                                scroll_pending: true,
+                            });
+                            self.tools.open = false;
                         }
-                        Ok(tools_panel::ToolsResult::ScheduleSaved {request,thread,text,at,result}) => {
-                            let matching=self.quick_schedule.as_ref().is_some_and(|draft|draft.matches_saved(request,&thread,&text,at));
+                        Ok(tools_panel::ToolsResult::ScheduleSaved {
+                            request,
+                            thread,
+                            text,
+                            at,
+                            result,
+                        }) => {
+                            let matching = self.quick_schedule.as_ref().is_some_and(|draft| {
+                                draft.matches_saved(request, &thread, &text, at)
+                            });
                             match result {
-                                Ok(())=>{
+                                Ok(()) => {
                                     if matching {
-                                        if self.threads.get(self.selected_thread_index).is_some_and(|t|t.id==thread) && self.input_message==text {self.input_message.clear();}
-                                        self.quick_schedule=None;
+                                        if self
+                                            .threads
+                                            .get(self.selected_thread_index)
+                                            .is_some_and(|t| t.id == thread)
+                                            && self.input_message == text
+                                        {
+                                            self.input_message.clear();
+                                        }
+                                        self.quick_schedule = None;
                                     }
-                                    self.tools.status="Đã lưu lịch gửi".into();self.show_toast("Đã lưu lịch gửi");
+                                    self.tools.status = "Đã lưu lịch gửi".into();
+                                    self.show_toast("Đã lưu lịch gửi");
                                     self.tools_command(tools_panel::ToolsCommand::Load);
                                 }
-                                Err(error)=>{
-                                    if matching {if let Some(draft)=&mut self.quick_schedule {draft.failed(error.clone());}}
-                                    self.tools.status=error.clone();self.show_toast(format!("Không lưu được lịch gửi: {error}"));
+                                Err(error) => {
+                                    if matching {
+                                        if let Some(draft) = &mut self.quick_schedule {
+                                            draft.failed(error.clone());
+                                        }
+                                    }
+                                    self.tools.status = error.clone();
+                                    self.show_toast(format!("Không lưu được lịch gửi: {error}"));
                                 }
                             }
                         }
@@ -2169,12 +2336,20 @@ impl ZaloGuiApp {
                     self.phone_modal_open = true;
                     self.phone_lookup_error = Some(err);
                 }
-                GuiEvent::CallIdentity {thread_id,call_id} => {
-                    if let Some(call)=self.active_call.as_mut().filter(|c|c.partner_id==thread_id && c.call_id.is_none()) {call.call_id=Some(call_id);}
+                GuiEvent::CallIdentity { thread_id, call_id } => {
+                    if let Some(call) = self
+                        .active_call
+                        .as_mut()
+                        .filter(|c| c.partner_id == thread_id && c.call_id.is_none())
+                    {
+                        call.call_id = Some(call_id);
+                    }
                 }
                 GuiEvent::CallStateChanged(state) => {
                     if state == "free" {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Reset));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Reset,
+                        ));
                         // A terminal call always closes its incoming controls.
                         let _has_error = self
                             .active_call
@@ -2256,10 +2431,17 @@ impl ZaloGuiApp {
                     self.sync_notice_dismissed = false;
                 }
                 GuiEvent::PhoneSyncStatus { running, message } => {
-                    if !running {self.phone_download_status=message.clone();}
-                    if message.starts_with("Tải về:"){self.phone_download_status=message.clone();}
-                    else if message.starts_with("Nhập CSDL:"){self.phone_import_status=message.clone();}
-                    else if running && !self.phone_sync_running {self.phone_download_status=message.clone();self.phone_import_status="Nhập CSDL: chờ dữ liệu".into();}
+                    if !running {
+                        self.phone_download_status = message.clone();
+                    }
+                    if message.starts_with("Tải về:") {
+                        self.phone_download_status = message.clone();
+                    } else if message.starts_with("Nhập CSDL:") {
+                        self.phone_import_status = message.clone();
+                    } else if running && !self.phone_sync_running {
+                        self.phone_download_status = message.clone();
+                        self.phone_import_status = "Nhập CSDL: chờ dữ liệu".into();
+                    }
 
                     if !running || !self.phone_sync_running {
                         self.sync_cancel_requested = false;
@@ -2303,19 +2485,45 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let notice_owner = if self.is_logged_in{self.user_uin.as_str()}else{""};
+        let notice_owner = if self.is_logged_in {
+            self.user_uin.as_str()
+        } else {
+            ""
+        };
         let notice_account_changed = crate::desktop_notice::snapshot().owner != notice_owner;
         crate::desktop_notice::account(notice_owner);
-        if self.is_logged_in && notice_account_changed {crate::desktop_notice::count(&self.user_uin,self.unread_counts.values().sum());}
-        crate::desktop_notice::configure(self.settings.enable_notifications,self.settings.play_notification_sound);
-        if self.settings.enable_notifications && self.settings.play_notification_sound && self.is_logged_in {
-            if !self.sound_prepared{if let Some(tx)=WORKER_TX.get(){self.sound_prepared=tx.send(WorkerCmd::PrepareNotificationSound).is_ok();}}
-        }else{self.sound_prepared=false;}
+        if self.is_logged_in && notice_account_changed {
+            crate::desktop_notice::count(&self.user_uin, self.unread_counts.values().sum());
+        }
+        crate::desktop_notice::configure(
+            self.settings.enable_notifications,
+            self.settings.play_notification_sound,
+        );
+        if self.settings.enable_notifications
+            && self.settings.play_notification_sound
+            && self.is_logged_in
+        {
+            if !self.sound_prepared {
+                if let Some(tx) = WORKER_TX.get() {
+                    self.sound_prepared = tx.send(WorkerCmd::PrepareNotificationSound).is_ok();
+                }
+            }
+        } else {
+            self.sound_prepared = false;
+        }
 
-        if let Some(notice)=crate::desktop_notice::take_activation(){
-            if self.is_logged_in && notice.owner==self.user_uin {
-                if let Some(index)=self.threads.iter().position(|t|t.id==notice.thread_id){self.selected_thread_index=index;self.filter_starred_only=false;self.in_chat_search_open=false;}
-                else{self.tools_command(tools_panel::ToolsCommand::OpenHit{thread:notice.thread_id,id:notice.message_id});}
+        if let Some(notice) = crate::desktop_notice::take_activation() {
+            if self.is_logged_in && notice.owner == self.user_uin {
+                if let Some(index) = self.threads.iter().position(|t| t.id == notice.thread_id) {
+                    self.selected_thread_index = index;
+                    self.filter_starred_only = false;
+                    self.in_chat_search_open = false;
+                } else {
+                    self.tools_command(tools_panel::ToolsCommand::OpenHit {
+                        thread: notice.thread_id,
+                        id: notice.message_id,
+                    });
+                }
             }
         }
         #[cfg(windows)]
@@ -2330,16 +2538,27 @@ impl eframe::App for ZaloGuiApp {
             .map(|s| (s.frames + 1, s.switch_at));
         if let Some((frame, at)) = smoke_switch {
             if frame == at {
-                if let Some(index) = self.threads.iter().position(|t| t.id == "fixture-group-long") {
+                if let Some(index) = self
+                    .threads
+                    .iter()
+                    .position(|t| t.id == "fixture-group-long")
+                {
                     self.open_thread(ctx, index, "fixture-group-long".into(), true);
                 }
             } else if frame == at + 2 {
-                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == "fixture-group-long") {
+                if let Some(thread) = self
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.id == "fixture-group-long")
+                {
                     let older: Vec<_> = (0..120)
                         .map(|i| ChatMessage {
                             id: format!("fixture-older-{i}"),
                             sender: "Giang Hồ".into(),
-                            text: format!("Tin cũ hơn số {i}: {}", "lịch sử nhóm tải về sau ".repeat(1 + i % 3)),
+                            text: format!(
+                                "Tin cũ hơn số {i}: {}",
+                                "lịch sử nhóm tải về sau ".repeat(1 + i % 3)
+                            ),
                             ts: 1_690_000_000_000 + i as i64 * 60_000,
                             time: "09:00".into(),
                             ..Default::default()
@@ -2807,8 +3026,10 @@ impl ZaloGuiApp {
     fn refresh_unread_title(&self, ctx: &egui::Context) {
         let total: usize = self.unread_counts.values().sum();
         #[cfg(windows)]
-        crate::desktop_notice::count(&self.user_uin,total);
-        if let Some(mailbox)=&self.live_mailbox{mailbox.seed(&self.threads);}
+        crate::desktop_notice::count(&self.user_uin, total);
+        if let Some(mailbox) = &self.live_mailbox {
+            mailbox.seed(&self.threads);
+        }
         let title = if total > 0 {
             format!("({total}) Zalo Lite — Native Rust Client")
         } else {

@@ -1980,8 +1980,10 @@ impl ZaloGuiApp {
                                             .clicked()
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx
-                                                    .send(WorkerCmd::AnswerCall { accept: false, call_id: call.call_id });
+                                                let _ = tx.send(WorkerCmd::AnswerCall {
+                                                    accept: false,
+                                                    call_id: call.call_id,
+                                                });
                                             }
                                             self.active_call = None;
                                         }
@@ -2015,8 +2017,10 @@ impl ZaloGuiApp {
                                             call.is_incoming_ringing = false;
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ =
-                                                    tx.send(WorkerCmd::AnswerCall { accept: true, call_id: call.call_id });
+                                                let _ = tx.send(WorkerCmd::AnswerCall {
+                                                    accept: true,
+                                                    call_id: call.call_id,
+                                                });
                                             }
                                         }
                                         ui.label(
@@ -2205,7 +2209,9 @@ impl ZaloGuiApp {
             self.sticker_textures.remove("call_remote_video_1");
             self.sticker_textures.remove("call_local_video");
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::EndCall { call_id: call.call_id });
+                let _ = tx.send(WorkerCmd::EndCall {
+                    call_id: call.call_id,
+                });
             }
         } else if self.active_call.is_some() {
             self.active_call = Some(call);

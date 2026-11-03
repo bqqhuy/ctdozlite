@@ -33,9 +33,13 @@ pub fn decode_image(bytes: &[u8]) -> image::ImageResult<image::DynamicImage> {
             "Image exceeds size limit",
         )));
     }
-    let (width,height)=image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?.into_dimensions()?;
-    if (width as u64)*(height as u64)>16*1024*1024 {
-        return Err(image::ImageError::Limits(image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError)));
+    let (width, height) = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    if (width as u64) * (height as u64) > 16 * 1024 * 1024 {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+        ));
     }
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();

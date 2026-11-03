@@ -134,7 +134,10 @@ mod tests {
             {"content":{"act_type":"voip","fileId":1,"data":{"url":"https://x"}}},
             {"content":{"act_type":"file_done","fileId":"9","data":{"url":"http://insecure"}}}
         ]});
-        assert_eq!(parse(&payload), vec![("77".to_string(), "https://v.dlmd.me/x.mp4".to_string())]);
+        assert_eq!(
+            parse(&payload),
+            vec![("77".to_string(), "https://v.dlmd.me/x.mp4".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -142,20 +145,27 @@ mod tests {
         let waiting = tokio::spawn(wait("file-later", Duration::from_secs(2)));
         tokio::time::sleep(Duration::from_millis(50)).await;
         deliver(&done("file-later", "https://f.dlfl.vn/a"));
-        assert_eq!(waiting.await.unwrap().as_deref(), Some("https://f.dlfl.vn/a"));
+        assert_eq!(
+            waiting.await.unwrap().as_deref(),
+            Some("https://f.dlfl.vn/a")
+        );
     }
 
     #[tokio::test]
     async fn early_notification_is_kept_for_a_late_waiter() {
         deliver(&done("file-early", "https://f.dlfl.vn/b"));
         assert_eq!(
-            wait("file-early", Duration::from_millis(10)).await.as_deref(),
+            wait("file-early", Duration::from_millis(10))
+                .await
+                .as_deref(),
             Some("https://f.dlfl.vn/b")
         );
     }
 
     #[tokio::test]
     async fn wait_times_out_without_notification() {
-        assert!(wait("file-never", Duration::from_millis(20)).await.is_none());
+        assert!(wait("file-never", Duration::from_millis(20))
+            .await
+            .is_none());
     }
 }

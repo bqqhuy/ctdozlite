@@ -55,7 +55,8 @@ pub fn validate_profile(name: &str) -> Result<String> {
         "Tên hồ sơ phải dài 1–{PROFILE_MAX_LEN} ký tự"
     );
     anyhow::ensure!(
-        name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+        name.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
         "Tên hồ sơ chỉ được dùng chữ, số, '-' hoặc '_'"
     );
     let upper = name.to_ascii_uppercase();
@@ -63,7 +64,10 @@ pub fn validate_profile(name: &str) -> Result<String> {
         || ((upper.starts_with("COM") || upper.starts_with("LPT"))
             && upper.len() == 4
             && upper.as_bytes()[3].is_ascii_digit());
-    anyhow::ensure!(!reserved, "Tên hồ sơ trùng tên thiết bị dành riêng của Windows");
+    anyhow::ensure!(
+        !reserved,
+        "Tên hồ sơ trùng tên thiết bị dành riêng của Windows"
+    );
     // Case-insensitive file systems would otherwise merge `Work` and `work`.
     Ok(name.to_ascii_lowercase())
 }

@@ -585,9 +585,11 @@ async fn run_once(
             Some(proxy) => {
                 let uri = req.uri();
                 let host = uri.host().unwrap_or_default().to_owned();
-                let port = uri
-                    .port_u16()
-                    .unwrap_or(if uri.scheme_str() == Some("ws") { 80 } else { 443 });
+                let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
+                    80
+                } else {
+                    443
+                });
                 let stream = crate::proxy::connect_via(proxy, &host, port)
                     .await
                     .map_err(|e| {

@@ -150,10 +150,28 @@ impl Domains {
     /// Keep verified REST hosts first; service discovery may advertise a PC host
     /// which returns 404 for a Web/QR session. Long-poll and WS stay dynamic.
     fn prefer_verified_rest(&mut self) {
-        self.service_fallbacks.retain(|key,values| {
-            let known=["chat","friend","conversation","profile","group","file","group_cloud_message","voice_call","sticker"].iter().filter_map(|key|crate::endpoints::service(key)).any(|host|host==key);
-            if !known{return false;}
-            let mut seen=std::collections::HashSet::new();values.retain(|host|trusted_service_url(host) && seen.insert(host.clone()));values.truncate(16);true
+        self.service_fallbacks.retain(|key, values| {
+            let known = [
+                "chat",
+                "friend",
+                "conversation",
+                "profile",
+                "group",
+                "file",
+                "group_cloud_message",
+                "voice_call",
+                "sticker",
+            ]
+            .iter()
+            .filter_map(|key| crate::endpoints::service(key))
+            .any(|host| host == key);
+            if !known {
+                return false;
+            }
+            let mut seen = std::collections::HashSet::new();
+            values.retain(|host| trusted_service_url(host) && seen.insert(host.clone()));
+            values.truncate(16);
+            true
         });
         for (key, slot) in [
             ("chat", &mut self.chat),
@@ -1376,13 +1394,19 @@ mod candidate_persistence_tests {
     use super::*;
     #[test]
     fn discovery_retains_all_trusted_candidates_and_saved_candidates_are_sanitized() {
-        let mut s=Session::new(false,false,false).unwrap();
+        let mut s = Session::new(false, false, false).unwrap();
         s.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"chat":["https://fallback-one.zalo.me","https://fallback-two.zaloapp.com","https://attacker.invalid"]}}));
-        let primary=crate::endpoints::service("chat").unwrap();
-        assert_eq!(s.domains.service_fallbacks[primary].len(),2);
-        let mut restored:Domains=serde_json::from_value(serde_json::to_value(&s.domains).unwrap()).unwrap();
-        restored.service_fallbacks.get_mut(primary).unwrap().push("https://attacker.invalid".into());restored.prefer_verified_rest();
-        assert_eq!(restored.service_fallbacks[primary].len(),2);
+        let primary = crate::endpoints::service("chat").unwrap();
+        assert_eq!(s.domains.service_fallbacks[primary].len(), 2);
+        let mut restored: Domains =
+            serde_json::from_value(serde_json::to_value(&s.domains).unwrap()).unwrap();
+        restored
+            .service_fallbacks
+            .get_mut(primary)
+            .unwrap()
+            .push("https://attacker.invalid".into());
+        restored.prefer_verified_rest();
+        assert_eq!(restored.service_fallbacks[primary].len(), 2);
         assert!(restored.winners.lock().unwrap().is_empty());
     }
 }

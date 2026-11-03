@@ -2066,7 +2066,9 @@ enum CallEngineCmd {
         is_on_mic: bool,
         is_on_cam: bool,
     },
-    EndCall { expected_call_id: Option<i64> },
+    EndCall {
+        expected_call_id: Option<i64>,
+    },
     ControlEvent(Value),
 }
 
@@ -2512,7 +2514,10 @@ impl CallBridge {
                                             media: media_handle,
                                             extra_legs: Vec::new(),
                                         });
-                                        let _ = gui_tx_clone.send(GuiEvent::CallIdentity {thread_id:partner_id.clone(),call_id:real_call_id});
+                                        let _ = gui_tx_clone.send(GuiEvent::CallIdentity {
+                                            thread_id: partner_id.clone(),
+                                            call_id: real_call_id,
+                                        });
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::CallStateChanged("calling".into()));
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
@@ -2769,7 +2774,10 @@ impl CallBridge {
                                 media: None,
                                 extra_legs: dialed_legs,
                             });
-                            let _ = gui_tx_clone.send(GuiEvent::CallIdentity {thread_id:partner_id.clone(),call_id:primary_cid});
+                            let _ = gui_tx_clone.send(GuiEvent::CallIdentity {
+                                thread_id: partner_id.clone(),
+                                call_id: primary_cid,
+                            });
                             let _ = gui_tx_clone.send(GuiEvent::CallStateChanged("calling".into()));
                             let status_txt = if n_ringing > 1 {
                                 format!(
@@ -2785,7 +2793,10 @@ impl CallBridge {
                         });
                     }
 
-                    CallEngineCmd::AnswerCall { accept, expected_call_id } => {
+                    CallEngineCmd::AnswerCall {
+                        accept,
+                        expected_call_id,
+                    } => {
                         let s_snap = session.lock().await.clone();
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
@@ -2808,7 +2819,12 @@ impl CallBridge {
                             }
                             let mut guard = active_clone.lock().await;
                             if let Some(ref mut st) = *guard {
-                                if expected_call_id.is_some_and(|id|id!=st.call_id) || st.is_caller || st.is_connected {return;}
+                                if expected_call_id.is_some_and(|id| id != st.call_id)
+                                    || st.is_caller
+                                    || st.is_connected
+                                {
+                                    return;
+                                }
                                 let call_id = st.call_id;
                                 let caller_id = st.partner_id.clone();
                                 let rtp_ip = st.rtp_ip.clone();
@@ -2957,9 +2973,15 @@ impl CallBridge {
 
                     CallEngineCmd::EndCall { expected_call_id } => {
                         let s_snap = session.lock().await.clone();
-                        let taken = { let mut active = active_call.lock().await;
-                            if expected_call_id.is_some_and(|id| active.as_ref().is_none_or(|call| call.call_id != id)) { continue; }
-                            active.take() };
+                        let taken = {
+                            let mut active = active_call.lock().await;
+                            if expected_call_id.is_some_and(|id| {
+                                active.as_ref().is_none_or(|call| call.call_id != id)
+                            }) {
+                                continue;
+                            }
+                            active.take()
+                        };
                         if let Some(mut st) = taken {
                             let duration_sec = if st.is_connected {
                                 st.started_at.elapsed().as_secs()
@@ -3210,13 +3232,35 @@ impl CallBridge {
                                 let Some(st_check) = guard.as_ref() else {
                                     continue;
                                 };
-                                let actor=data.get("uidN").or_else(||data.get("uidFrom")).and_then(|v|v.as_str().map(str::to_owned).or_else(||v.as_u64().map(|n|n.to_string()))).unwrap_or_default();
-                                let actor_is_self=s_snap.login.as_ref().is_some_and(|login|!actor.is_empty() && actor==login.uin);
-                                if crate::call_lifecycle::answered_elsewhere(st_check.call_id,ev_call_id,st_check.is_caller,st_check.is_connected,st_check.is_group,actor_is_self,status){
+                                let actor = data
+                                    .get("uidN")
+                                    .or_else(|| data.get("uidFrom"))
+                                    .and_then(|v| {
+                                        v.as_str()
+                                            .map(str::to_owned)
+                                            .or_else(|| v.as_u64().map(|n| n.to_string()))
+                                    })
+                                    .unwrap_or_default();
+                                let actor_is_self = s_snap
+                                    .login
+                                    .as_ref()
+                                    .is_some_and(|login| !actor.is_empty() && actor == login.uin);
+                                if crate::call_lifecycle::answered_elsewhere(
+                                    st_check.call_id,
+                                    ev_call_id,
+                                    st_check.is_caller,
+                                    st_check.is_connected,
+                                    st_check.is_group,
+                                    actor_is_self,
+                                    status,
+                                ) {
                                     guard.take();
-                                    let _=gui_tx.send(GuiEvent::CallStateChanged("free".into()));
-                                    let _=gui_tx.send(GuiEvent::StatusUpdate("Cuộc gọi đã được nhận trên thiết bị khác".into()));
-                                    egui_ctx.request_repaint();continue;
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(
+                                        "Cuộc gọi đã được nhận trên thiết bị khác".into(),
+                                    ));
+                                    egui_ctx.request_repaint();
+                                    continue;
                                 }
                                 let is_primary_leg =
                                     ev_call_id == 0 || ev_call_id == st_check.call_id;
@@ -4003,12 +4047,15 @@ impl CallBridge {
 
     /// Accept (`true`) or decline (`false`) an incoming VoIP call.
     pub fn answer_call(&self, accept: bool) {
-        self.answer_call_for(accept,None);
+        self.answer_call_for(accept, None);
     }
 
     /// Update microphone/camera state (`12006` `/api/voicecall/conf`) during an active call.
-    pub fn answer_call_for(&self,accept:bool,expected_call_id:Option<i64>){
-        let _=self.cmd_tx.send(CallEngineCmd::AnswerCall{accept,expected_call_id});
+    pub fn answer_call_for(&self, accept: bool, expected_call_id: Option<i64>) {
+        let _ = self.cmd_tx.send(CallEngineCmd::AnswerCall {
+            accept,
+            expected_call_id,
+        });
     }
     pub fn set_media_state(&self, is_on_mic: bool, is_on_cam: bool) {
         let _ = self.cmd_tx.send(CallEngineCmd::SetMediaState {
@@ -4024,7 +4071,9 @@ impl CallBridge {
 
     /// Hang up or cancel the current active call in pure Rust (`405` cancel or `409` endcall).
     pub fn end_call_for(&self, expected_call_id: Option<i64>) {
-        let _ = self.cmd_tx.send(CallEngineCmd::EndCall { expected_call_id });
+        let _ = self
+            .cmd_tx
+            .send(CallEngineCmd::EndCall { expected_call_id });
     }
     pub fn end_call(&self) {
         self.end_call_for(None);

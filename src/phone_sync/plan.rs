@@ -153,7 +153,10 @@ mod tests {
             &owner,
         )
         .unwrap();
-        assert_eq!(queries(&c, &saved, now + DAY, false, 0)[0].from, now - OVERLAP);
+        assert_eq!(
+            queries(&c, &saved, now + DAY, false, 0)[0].from,
+            now - OVERLAP
+        );
         assert_eq!(
             queries(&c, &HashMap::new(), now, true, 0)[0].from,
             now - 7 * DAY
@@ -196,11 +199,34 @@ mod floor_tests {
     fn floor_limits_new_ranges_and_delta_applies_once_coverage_reaches_floor() {
         let now = 1_800_000_000_000;
         let floor = now - 30 * DAY;
-        let c = vec![Conversation { partition: "oneone/a".into(), activity: now }];
-        assert_eq!(queries(&c, &HashMap::new(), now, false, floor)[0].from, floor);
-        let reaching = HashMap::from([("oneone/a".to_string(), PhoneSyncRange { thread_id: "1".into(), from_ts: floor - DAY, to_ts: now - DAY })]);
-        assert_eq!(queries(&c, &reaching, now, false, floor)[0].from, now - DAY - OVERLAP);
-        let short = HashMap::from([("oneone/a".to_string(), PhoneSyncRange { thread_id: "1".into(), from_ts: floor + DAY, to_ts: now - DAY })]);
+        let c = vec![Conversation {
+            partition: "oneone/a".into(),
+            activity: now,
+        }];
+        assert_eq!(
+            queries(&c, &HashMap::new(), now, false, floor)[0].from,
+            floor
+        );
+        let reaching = HashMap::from([(
+            "oneone/a".to_string(),
+            PhoneSyncRange {
+                thread_id: "1".into(),
+                from_ts: floor - DAY,
+                to_ts: now - DAY,
+            },
+        )]);
+        assert_eq!(
+            queries(&c, &reaching, now, false, floor)[0].from,
+            now - DAY - OVERLAP
+        );
+        let short = HashMap::from([(
+            "oneone/a".to_string(),
+            PhoneSyncRange {
+                thread_id: "1".into(),
+                from_ts: floor + DAY,
+                to_ts: now - DAY,
+            },
+        )]);
         assert_eq!(queries(&c, &short, now, false, floor)[0].from, floor);
     }
 }

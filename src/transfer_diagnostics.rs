@@ -94,9 +94,23 @@ pub(crate) enum RenewPhase {
     ServerReply,
     ServerRejected,
     ParseFailed,
+    /// Server accepted the request but is still preparing the copy (`async`).
+    Pending,
+    /// The shared renewal deadline ran out while the server stayed `async`.
+    PendingTimeout,
     Finished,
     CacheHitSuccess,
     CacheHitFailure,
+}
+/// Why a renewal reply could not be used; never carries URLs or server text.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RenewFailure {
+    MissingData,
+    WrongType,
+    DecodeFailed,
+    UrlBlocked,
+    ServerRejected,
 }
 /// Why one socket generation ended; never carries the close reason text.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -181,6 +195,8 @@ enum Event {
         phase: RenewPhase,
         server_code: Option<i64>,
         http_status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<RenewFailure>,
     },
     PhoneControl {
         session_tag: u64,
@@ -285,6 +301,21 @@ pub(crate) fn renewal(reference_tag: u64, phase: RenewPhase, server_code: Option
         phase,
         server_code,
         http_status: None,
+        reason: None,
+    });
+}
+/// Record why a successful-looking reply could not be used.
+pub(crate) fn renewal_failed(reference_tag: u64, server_code: Option<i64>, reason: RenewFailure) {
+    record(Event::MediaRenewal {
+        reference_tag,
+        phase: if reason == RenewFailure::ServerRejected {
+            RenewPhase::ServerRejected
+        } else {
+            RenewPhase::ParseFailed
+        },
+        server_code,
+        http_status: None,
+        reason: Some(reason),
     });
 }
 /// Record typed HTTP failures separately from JSON API error codes.
@@ -294,6 +325,7 @@ pub(crate) fn renewal_http(reference_tag: u64, http_status: u16) {
         phase: RenewPhase::HttpRejected,
         server_code: None,
         http_status: Some(http_status),
+        reason: None,
     });
 }
 /// RAII stage tracing records aborted work even when a task exits through `?`.

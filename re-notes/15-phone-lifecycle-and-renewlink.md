@@ -19,3 +19,19 @@ Ngày 03/11/2026: main vẫn ed550f6. PR #70 head `1dd4ee69d4a860a49b4a12dd550c8
 Projection legacy chỉ nhận dạng các hàng URL/filename đủ dấu hiệu, không rewrite nguồn, không làm mất văn bản thường. Filename metadata giữ nguyên qua renewal dù URL mới có basename renewMedia.doc. Fixture kiểm host nhìn giống, credential URL và optional URL string trong renew request.
 
 Chẩn đoán production đi qua transfer_diagnostics: event typed chỉ có số/enum/tag session đã băm, bounded channel và hai file JSONL khoảng 1 MiB/file. Không phụ thuộc logger dev; không nhận body/URL/khóa làm trường sự kiện.
+
+## renewlink reply handling (Zalo PC 26.11.10 `compact-app-pc`, `__callClone` / `_callClone`) — 2026-11-03
+
+- HTTP 200 with `data.error_code == 0`; `data.data` is AES-decoded then JSON-parsed into
+  `{error_code, data}`. A non-zero inner code is a server rejection (`in2_<code>`).
+- The inner `data` is dispatched by message type:
+  `async` → `_awaitCtrlEvent` re-sends renewlink after a growing delay (bounded by
+  `async_forward.timeout_wait_ctrl`); files use `fileUrl`; photos/videos use
+  `normal` (→ `oriUrl`), `hd` (→ `hdUrl`), `thumb` (→ `thumbUrl`, a plain string); videos may
+  also return `fileUrl`. Anything else is "cant handle this case".
+- The fork accepts these plus the older `*Url` names, re-polls only on an explicit `async`
+  flag (2/4/8 s inside one 15 s budget that also covers network time) and records a typed
+  failure reason (`missing_data`, `wrong_type`, `decode_failed`, `url_blocked`,
+  `server_rejected`) without URLs or server text.
+- Field log 03/11: two requests got `server_code 0` then `parse_failed`, consistent with the
+  `normal`/`hd`/`thumb` shape the old parser did not read. Needs a field re-test.

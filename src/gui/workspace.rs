@@ -188,7 +188,8 @@ impl ZaloGuiApp {
                     ui.add_space(18.0);
 
                     // Navigation Icon 1: Tin nhắn (All / Active Chat)
-                    let is_msg_nav = self.thread_filter == ThreadFilter::All && !self.contacts_view_open;
+                    let is_msg_nav =
+                        self.thread_filter == ThreadFilter::All && !self.contacts_view_open;
                     let (nav1_rect, nav1_resp) =
                         ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
                     if is_msg_nav {
@@ -1534,9 +1535,22 @@ impl ZaloGuiApp {
                                                     pal.text_muted,
                                                 );
                                             }
-                                            if media.kind==crate::message_view::MediaKind::Video {
-                                                let c=cell_r.center();ui.painter().circle_filled(c,14.0,Color32::from_black_alpha(150));
-                                                ui.painter().add(egui::Shape::convex_polygon(vec![c+Vec2::new(-4.0,-7.0),c+Vec2::new(8.0,0.0),c+Vec2::new(-4.0,7.0)],Color32::WHITE,Stroke::NONE));
+                                            if media.kind == crate::message_view::MediaKind::Video {
+                                                let c = cell_r.center();
+                                                ui.painter().circle_filled(
+                                                    c,
+                                                    14.0,
+                                                    Color32::from_black_alpha(150),
+                                                );
+                                                ui.painter().add(egui::Shape::convex_polygon(
+                                                    vec![
+                                                        c + Vec2::new(-4.0, -7.0),
+                                                        c + Vec2::new(8.0, 0.0),
+                                                        c + Vec2::new(-4.0, 7.0),
+                                                    ],
+                                                    Color32::WHITE,
+                                                    Stroke::NONE,
+                                                ));
                                             }
                                             ui.painter().rect_stroke(
                                                 cell_r,
@@ -3557,7 +3571,13 @@ impl ZaloGuiApp {
     }
 
     /// Select a conversation, mark visible messages read and load server history when needed.
-    pub(super) fn open_thread(&mut self, ctx: &egui::Context, idx: usize, tid: String, is_group: bool) {
+    pub(super) fn open_thread(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        tid: String,
+        is_group: bool,
+    ) {
         if self.selected_thread_index != idx {
             self.replying_to = None;
             self.filter_starred_only = false;
@@ -3603,7 +3623,7 @@ impl ZaloGuiApp {
         self.render_settings_modal(ctx, pal);
         self.render_tools_panel(ctx);
         self.render_downloads(ctx);
-        self.render_quick_schedule(ctx,pal);
+        self.render_quick_schedule(ctx, pal);
     }
 }
 
@@ -3854,9 +3874,22 @@ fn composer_rows(text: &str) -> usize {
 }
 
 /// Reserve visual wrapping too; explicit newline counts miss narrow editors.
-fn composer_editor_height(ui:&egui::Ui,text:&str,width:f32)->f32 {
-    let measured=ui.fonts(|f|f.layout(if text.is_empty(){" ".into()}else{text.to_owned()},FontId::proportional(14.0),Color32::WHITE,(width-12.0).max(1.0)).size().y);
-    (measured.max(COMPOSER_ROW_HEIGHT)+14.0).min(COMPOSER_MAX_HEIGHT)
+fn composer_editor_height(ui: &egui::Ui, text: &str, width: f32) -> f32 {
+    let measured = ui.fonts(|f| {
+        f.layout(
+            if text.is_empty() {
+                " ".into()
+            } else {
+                text.to_owned()
+            },
+            FontId::proportional(14.0),
+            Color32::WHITE,
+            (width - 12.0).max(1.0),
+        )
+        .size()
+        .y
+    });
+    (measured.max(COMPOSER_ROW_HEIGHT) + 14.0).min(COMPOSER_MAX_HEIGHT)
 }
 
 fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
@@ -3984,21 +4017,23 @@ mod composer_tests {
         assert_eq!(composer_rows("một dòng"), 1);
         assert_eq!(composer_rows("a\nb\nc"), 3);
         assert_eq!(composer_rows("1\n2\n3\n4\n5\n6\n7"), 5);
-
     }
     #[test]
     fn wrapped_single_line_yields_message_space_and_stops_at_five_rows() {
-        let ctx=egui::Context::default();
-        let _=ctx.run(Default::default(),|ctx| {
-            egui::CentralPanel::default().show(ctx,|ui| {
-                let short=composer_editor_height(ui,"Hi",200.0);
-                let wrapped=composer_editor_height(ui,&"Tiếng Việt có dấu và khoảng trắng. ".repeat(12),80.0);
-                assert!(wrapped>short);
-                assert_eq!(wrapped,COMPOSER_MAX_HEIGHT);
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let short = composer_editor_height(ui, "Hi", 200.0);
+                let wrapped = composer_editor_height(
+                    ui,
+                    &"Tiếng Việt có dấu và khoảng trắng. ".repeat(12),
+                    80.0,
+                );
+                assert!(wrapped > short);
+                assert_eq!(wrapped, COMPOSER_MAX_HEIGHT);
             });
         });
     }
-
 }
 
 #[cfg(test)]
@@ -4010,11 +4045,23 @@ mod ime_tests {
     #[test]
     fn enter_is_blocked_while_composing_and_when_commit_arrives_in_same_frame() {
         assert_eq!(ime_state(&[], false), (false, false));
-        assert_eq!(ime_state(&[ime(egui::ImeEvent::Preedit("vie".into()))], false), (true, true));
+        assert_eq!(
+            ime_state(&[ime(egui::ImeEvent::Preedit("vie".into()))], false),
+            (true, true)
+        );
         assert_eq!(ime_state(&[], true), (true, true));
-        assert_eq!(ime_state(&[ime(egui::ImeEvent::Commit("việt".into()))], true), (false, true));
-        assert_eq!(ime_state(&[ime(egui::ImeEvent::Preedit(String::new()))], true), (false, true));
-        assert_eq!(ime_state(&[ime(egui::ImeEvent::Disabled)], true), (false, true));
+        assert_eq!(
+            ime_state(&[ime(egui::ImeEvent::Commit("việt".into()))], true),
+            (false, true)
+        );
+        assert_eq!(
+            ime_state(&[ime(egui::ImeEvent::Preedit(String::new()))], true),
+            (false, true)
+        );
+        assert_eq!(
+            ime_state(&[ime(egui::ImeEvent::Disabled)], true),
+            (false, true)
+        );
     }
 }
 
@@ -4033,8 +4080,14 @@ mod chat_layout_key_tests {
         let key = chat_layout_key("t", &base, 150);
         assert_eq!(key, chat_layout_key("t", &base, 150));
         assert_ne!(key, chat_layout_key("u", &base, 150));
-        assert_ne!(key, chat_layout_key("t", &[msg("z"), msg("a"), msg("b")], 150));
-        assert_ne!(key, chat_layout_key("t", &[msg("a"), msg("b"), msg("c")], 150));
+        assert_ne!(
+            key,
+            chat_layout_key("t", &[msg("z"), msg("a"), msg("b")], 150)
+        );
+        assert_ne!(
+            key,
+            chat_layout_key("t", &[msg("a"), msg("b"), msg("c")], 150)
+        );
         assert_ne!(key, chat_layout_key("t", &base, 300));
     }
 }

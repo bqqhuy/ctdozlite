@@ -709,7 +709,10 @@ impl MessageStore {
     ) -> Result<std::collections::HashMap<String, ConversationPreference>> {
         let tx = self.conn.unchecked_transaction()?;
         for change in changes {
-            anyhow::ensure!(!change.thread_id.trim().is_empty(), "Missing thread identity");
+            anyhow::ensure!(
+                !change.thread_id.trim().is_empty(),
+                "Missing thread identity"
+            );
             tx.execute(
                 "INSERT INTO thread_preferences(thread_id,is_muted) VALUES(?1,?2)
                 ON CONFLICT(thread_id) DO UPDATE SET is_muted=excluded.is_muted",
@@ -1077,7 +1080,12 @@ impl MessageStore {
                     existing.is_starred = existing.is_starred || cm.is_starred;
                 } else {
                     if crate::message_view::is_call_log(&cm) {
-                        if t.presentation.last_message_id==cm.id {t.presentation.last_message_ts=0;t.presentation.last_message_id.clear();t.preview.clear();t.time.clear();}
+                        if t.presentation.last_message_id == cm.id {
+                            t.presentation.last_message_ts = 0;
+                            t.presentation.last_message_id.clear();
+                            t.preview.clear();
+                            t.time.clear();
+                        }
                         continue;
                     }
                     t.messages.push(cm);

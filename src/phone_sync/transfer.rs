@@ -159,10 +159,26 @@ impl Round {
         )
     }
 
-    fn trace(&self,id:&str,wait:u64) {
-        let max=self.seen.keys().max().copied();
-        let missing=self.last_index.or(max).map_or(0,|last|(0..=last).filter(|idx|!self.seen.contains_key(idx)).count());
-        crate::transfer_diagnostics::round(id,crate::transfer_diagnostics::RoundSummary{round:self.number,received:self.seen.len(),max_index:max,final_index:self.last_index,missing,confirmed:self.confirmed,idle:self.idle,active_wait_seconds:wait});
+    fn trace(&self, id: &str, wait: u64) {
+        let max = self.seen.keys().max().copied();
+        let missing = self.last_index.or(max).map_or(0, |last| {
+            (0..=last)
+                .filter(|idx| !self.seen.contains_key(idx))
+                .count()
+        });
+        crate::transfer_diagnostics::round(
+            id,
+            crate::transfer_diagnostics::RoundSummary {
+                round: self.number,
+                received: self.seen.len(),
+                max_index: max,
+                final_index: self.last_index,
+                missing,
+                confirmed: self.confirmed,
+                idle: self.idle,
+                active_wait_seconds: wait,
+            },
+        );
     }
     fn complete(&self, _wanted: &[String]) -> bool {
         self.last_index
@@ -1061,7 +1077,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     crate::logger::log_error("phone cleanup", "Deferred stale-session cleanup");
                 }
                 crate::transfer_diagnostics::resume(reconnects, epoch);
-                emit("Tải về: đã kết nối lại; tiếp tục đồng bộ (điện thoại có thể hỏi xác nhận lại)".into());
+                emit(
+                    "Tải về: đã kết nối lại; tiếp tục đồng bộ (điện thoại có thể hỏi xác nhận lại)"
+                        .into(),
+                );
                 disconnected = false;
                 continue;
             }
@@ -1071,7 +1090,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         let outcome = classify(&result, &transport, epoch);
         crate::transfer_diagnostics::round_result(job.number, job.attempt, partitions, outcome);
         if let Ok(mut b) = board.lock() {
-            b.remove(job.number, outcome == crate::transfer_diagnostics::RoundOutcome::Complete);
+            b.remove(
+                job.number,
+                outcome == crate::transfer_diagnostics::RoundOutcome::Complete,
+            );
         }
         match (outcome, result) {
             (crate::transfer_diagnostics::RoundOutcome::Complete, Ok(failed)) => {
@@ -1081,7 +1103,9 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     let mut completed: Vec<_> = job
                         .wanted
                         .into_iter()
-                        .filter(|q| !failed.contains(&q.partition) && owners.contains_key(&q.partition))
+                        .filter(|q| {
+                            !failed.contains(&q.partition) && owners.contains_key(&q.partition)
+                        })
                         .collect();
                     plan::checkpoint_completed(&mut coverage, &mut completed, &owners)?;
                     let ranges: Vec<_> = coverage
@@ -1097,7 +1121,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     .await??;
                 }
                 let inserted = shared.lock().map(|s| s.inserted).unwrap_or(0);
-                emit(format!("Nhập CSDL: {inserted} tin mới • hoàn tất lượt {}", job.number));
+                emit(format!(
+                    "Nhập CSDL: {inserted} tin mới • hoàn tất lượt {}",
+                    job.number
+                ));
             }
             (crate::transfer_diagnostics::RoundOutcome::Disconnected, _) => {
                 disconnected = true;
@@ -1105,7 +1132,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             }
             (crate::transfer_diagnostics::RoundOutcome::Stalled, _) => {
                 if job.attempt == 0 {
-                    emit(format!("Tải về: lượt {} chưa đầy đủ; sẽ xin lại một lần", job.number));
+                    emit(format!(
+                        "Tải về: lượt {} chưa đầy đủ; sẽ xin lại một lần",
+                        job.number
+                    ));
                     queue.push_back(Job { attempt: 1, ..job });
                 } else {
                     consecutive += 1;
@@ -1128,16 +1158,30 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                 if let Some(limit) = error.downcast_ref::<policy::LimitRejection>() {
                     if adjustments < 4 && partitions > 1 {
                         adjustments += 1;
-                        let maximum = limit.0.unwrap_or(partitions.div_ceil(2)).min(partitions - 1).max(1);
+                        let maximum = limit
+                            .0
+                            .unwrap_or(partitions.div_ceil(2))
+                            .min(partitions - 1)
+                            .max(1);
                         limits.count = Some(maximum);
                         let mut pieces = policy::split(job.wanted, Some(maximum))?.into_iter();
                         let mut replanned = Vec::new();
                         if let Some(first) = pieces.next() {
-                            replanned.push(Job { wanted: first, number: job.number, attempt: job.attempt, priority: job.priority });
+                            replanned.push(Job {
+                                wanted: first,
+                                number: job.number,
+                                attempt: job.attempt,
+                                priority: job.priority,
+                            });
                         }
                         for wanted in pieces {
                             number += 1;
-                            replanned.push(Job { wanted, number, attempt: job.attempt, priority: job.priority });
+                            replanned.push(Job {
+                                wanted,
+                                number,
+                                attempt: job.attempt,
+                                priority: job.priority,
+                            });
                         }
                         if let Ok(mut b) = board.lock() {
                             b.total = number;
@@ -1147,7 +1191,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                         }
                         let path = limit_path.clone();
                         let data = serde_json::to_vec(&limits)?;
-                        tokio::task::spawn_blocking(move || crate::storage::atomic_write(&path, &data)).await??;
+                        tokio::task::spawn_blocking(move || {
+                            crate::storage::atomic_write(&path, &data)
+                        })
+                        .await??;
                         continue;
                     }
                 }
@@ -1273,7 +1320,8 @@ fn range_floor(range_days: u32, now: i64) -> i64 {
     if range_days == 0 {
         0
     } else {
-        now.saturating_sub(i64::from(range_days) * 86_400_000).max(0)
+        now.saturating_sub(i64::from(range_days) * 86_400_000)
+            .max(0)
     }
 }
 
@@ -1793,7 +1841,9 @@ mod resilience_tests {
         }
     }
     fn batch(idx: u64, url: &str, metadata: bool) -> WsEvent {
-        control(json!({"act":"upload_batch","data":{"syncId":"s","idx":idx,"batchType":if metadata{2}else{1},"msgUrl":url,"scopes":[{"partition":"oneone/a"}]}}))
+        control(
+            json!({"act":"upload_batch","data":{"syncId":"s","idx":idx,"batchType":if metadata{2}else{1},"msgUrl":url,"scopes":[{"partition":"oneone/a"}]}}),
+        )
     }
     fn status(code: u64) -> WsEvent {
         control(json!({"act":"transfer_status","data":{"syncId":"s","status":code}}))
@@ -1802,31 +1852,49 @@ mod resilience_tests {
     #[test]
     fn resigned_duplicate_is_ignored_but_changed_batch_kind_is_rejected() {
         let mut round = Round::default();
-        round.apply(&batch(1, "https://a.zdn.vn/one", false), "s").unwrap();
-        round.apply(&batch(1, "https://a.zdn.vn/one-resigned", false), "s").unwrap();
+        round
+            .apply(&batch(1, "https://a.zdn.vn/one", false), "s")
+            .unwrap();
+        round
+            .apply(&batch(1, "https://a.zdn.vn/one-resigned", false), "s")
+            .unwrap();
         assert_eq!(round.seen.len(), 1);
         assert_eq!(round.batches.len(), 1);
-        assert!(round.apply(&batch(1, "https://a.zdn.vn/one", true), "s").is_err());
+        assert!(round
+            .apply(&batch(1, "https://a.zdn.vn/one", true), "s")
+            .is_err());
     }
 
     #[test]
     fn progress_hints_stall_idle_and_resume_when_phone_state_changes() {
-        let mut round = Round { number: 3, ..Default::default() };
+        let mut round = Round {
+            number: 3,
+            ..Default::default()
+        };
         round.apply(&status(5), "s").unwrap();
-        round.apply(&batch(0, "https://a.zdn.vn/m", true), "s").unwrap();
+        round
+            .apply(&batch(0, "https://a.zdn.vn/m", true), "s")
+            .unwrap();
         assert!(!round.progress(5).contains("khóa màn hình"));
-        assert!(round.progress(STALL_HINT.as_secs()).contains("khóa màn hình"));
+        assert!(round
+            .progress(STALL_HINT.as_secs())
+            .contains("khóa màn hình"));
         round.apply(&status(2), "s").unwrap();
         assert!(round.progress(0).contains("tạm nghỉ"));
         round.apply(&status(1), "s").unwrap();
         assert!(round.progress(0).contains("hoạt động lại"));
-        round.apply(&batch(1, "https://a.zdn.vn/n", false), "s").unwrap();
+        round
+            .apply(&batch(1, "https://a.zdn.vn/n", false), "s")
+            .unwrap();
         assert!(!round.progress(0).contains("hoạt động lại"));
     }
 
     #[test]
     fn journal_reads_legacy_formats_and_rejects_unsafe_ids() {
-        let dir = std::env::temp_dir().join(format!("ctdoz-journal-{}", crate::param_cipher::random_hex(8)));
+        let dir = std::env::temp_dir().join(format!(
+            "ctdoz-journal-{}",
+            crate::param_cipher::random_hex(8)
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("j.json");
         assert!(read_journal(&path).unwrap().is_empty());
@@ -1853,23 +1921,49 @@ mod resilience_tests {
     fn board_combines_parallel_round_lines_and_passes_import_lines_through() {
         let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink_lines = lines.clone();
-        let sink = Arc::new(std::sync::Mutex::new(move |text: String| sink_lines.lock().unwrap().push(text)));
-        let mut board = Board { sink, lines: Default::default(), done: 0, total: 5 };
+        let sink = Arc::new(std::sync::Mutex::new(move |text: String| {
+            sink_lines.lock().unwrap().push(text)
+        }));
+        let mut board = Board {
+            sink,
+            lines: Default::default(),
+            done: 0,
+            total: 5,
+        };
         board.update(2, "Tải về: lượt 2 • 10 mô tả gói".into());
         board.update(3, "Tải về: lượt 3 • chờ".into());
         board.update(2, "Nhập CSDL: 5 tin mới".into());
         board.remove(2, true);
         let out = lines.lock().unwrap().clone();
-        assert_eq!(out[0], "Tải về: xong 0/5 lượt • 1 lượt đang chạy • lượt 2: 10 mô tả gói");
-        assert_eq!(out[1], "Tải về: xong 0/5 lượt • 2 lượt đang chạy • lượt 2: 10 mô tả gói");
+        assert_eq!(
+            out[0],
+            "Tải về: xong 0/5 lượt • 1 lượt đang chạy • lượt 2: 10 mô tả gói"
+        );
+        assert_eq!(
+            out[1],
+            "Tải về: xong 0/5 lượt • 2 lượt đang chạy • lượt 2: 10 mô tả gói"
+        );
         assert_eq!(out[2], "Nhập CSDL: 5 tin mới");
-        assert_eq!(out[3], "Tải về: xong 1/5 lượt • 1 lượt đang chạy • lượt 3: chờ");
+        assert_eq!(
+            out[3],
+            "Tải về: xong 1/5 lượt • 1 lượt đang chạy • lượt 3: chờ"
+        );
     }
 
     #[test]
     fn priority_requests_carry_short_page_limit() {
-        let wanted = vec![plan::Query { partition: "oneone/a".into(), from: 0, to: 10 }];
-        assert_eq!(request_queries(&wanted, 99, PRIORITY_MESSAGES)[0]["limit"], json!(100));
-        assert_eq!(request_queries(&wanted, 99, UNLIMITED)[0]["limit"], json!(2_147_483_647));
+        let wanted = vec![plan::Query {
+            partition: "oneone/a".into(),
+            from: 0,
+            to: 10,
+        }];
+        assert_eq!(
+            request_queries(&wanted, 99, PRIORITY_MESSAGES)[0]["limit"],
+            json!(100)
+        );
+        assert_eq!(
+            request_queries(&wanted, 99, UNLIMITED)[0]["limit"],
+            json!(2_147_483_647)
+        );
     }
 }

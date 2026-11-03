@@ -17,12 +17,14 @@ pub struct LiveUpdates {
     baselines: Mutex<HashMap<String, Baseline>>,
     alerts: Mutex<(HashMap<String, u128>, bool)>,
     notice: Mutex<Option<crate::desktop_notice::Notice>>,
-    counts: Mutex<HashMap<String,usize>>,
-    names: Mutex<HashMap<String,(String,Option<String>)>>,
+    counts: Mutex<HashMap<String, usize>>,
+    names: Mutex<HashMap<String, (String, Option<String>)>>,
 }
 impl LiveUpdates {
     pub(crate) fn publish(&self, mut threads: Vec<Thread>) -> bool {
-        for thread in &mut threads {crate::message_view::remove_call_logs(thread);}
+        for thread in &mut threads {
+            crate::message_view::remove_call_logs(thread);
+        }
         let batches: Vec<_> = {
             let seeds = self.baselines.lock().unwrap_or_else(|e| e.into_inner());
             threads
@@ -64,12 +66,32 @@ impl LiveUpdates {
                             && !muted.contains(&thread.id)
                         {
                             alerts.1 = true;
-                            let cached=self.names.lock().ok().and_then(|names|names.get(&thread.id).cloned());
-                            let title=cached.as_ref().map(|p|p.0.clone()).filter(|s|!s.is_empty()).unwrap_or_else(||thread.name.clone());
-                            let avatar=thread.avatar.clone().or_else(||cached.and_then(|p|p.1));
-                            let preview=Thread{is_group:thread.is_group,messages:vec![message.clone()],..Default::default()};
-                            if let Ok(mut slot)=self.notice.lock(){*slot=Some(crate::desktop_notice::Notice{title,body:crate::message_view::preview(&preview),avatar,thread_id:thread.id.clone(),message_id:message.id.clone(),owner:String::new()});}
-
+                            let cached = self
+                                .names
+                                .lock()
+                                .ok()
+                                .and_then(|names| names.get(&thread.id).cloned());
+                            let title = cached
+                                .as_ref()
+                                .map(|p| p.0.clone())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| thread.name.clone());
+                            let avatar = thread.avatar.clone().or_else(|| cached.and_then(|p| p.1));
+                            let preview = Thread {
+                                is_group: thread.is_group,
+                                messages: vec![message.clone()],
+                                ..Default::default()
+                            };
+                            if let Ok(mut slot) = self.notice.lock() {
+                                *slot = Some(crate::desktop_notice::Notice {
+                                    title,
+                                    body: crate::message_view::preview(&preview),
+                                    avatar,
+                                    thread_id: thread.id.clone(),
+                                    message_id: message.id.clone(),
+                                    owner: String::new(),
+                                });
+                            }
                         }
                         latest = latest.max(id);
                     }
@@ -102,7 +124,9 @@ impl LiveUpdates {
                     .unread_ids
                     .retain(|id| !seed.read_ids.contains(id));
             }
-            if let Ok(mut counts)=self.counts.lock(){counts.insert(entry.id.clone(),entry.unread.count());}
+            if let Ok(mut counts) = self.counts.lock() {
+                counts.insert(entry.id.clone(), entry.unread.count());
+            }
             let skip = entry
                 .messages
                 .len()
@@ -116,8 +140,16 @@ impl LiveUpdates {
         true
     }
     pub(crate) fn seed(&self, threads: &[Thread]) {
-        if let Ok(mut counts)=self.counts.lock(){for t in threads{counts.insert(t.id.clone(),t.unread.count());}}
-        if let Ok(mut names)=self.names.lock(){for t in threads{names.insert(t.id.clone(),(t.name.clone(),t.avatar.clone()));}}
+        if let Ok(mut counts) = self.counts.lock() {
+            for t in threads {
+                counts.insert(t.id.clone(), t.unread.count());
+            }
+        }
+        if let Ok(mut names) = self.names.lock() {
+            for t in threads {
+                names.insert(t.id.clone(), (t.name.clone(), t.avatar.clone()));
+            }
+        }
         {
             let mut alerts = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
             for thread in threads {
@@ -156,10 +188,17 @@ impl LiveUpdates {
             .unwrap_or_else(|e| e.into_inner())
             .extend(baselines);
     }
-    #[cfg(any(windows,test))]
-    pub(crate) fn take_notice(&self)->Option<crate::desktop_notice::Notice>{self.notice.lock().ok().and_then(|mut s|s.take())}
-    #[cfg(any(windows,test))]
-    pub(crate) fn total(&self)->usize{self.counts.lock().map(|s|s.values().copied().sum()).unwrap_or(0)}
+    #[cfg(any(windows, test))]
+    pub(crate) fn take_notice(&self) -> Option<crate::desktop_notice::Notice> {
+        self.notice.lock().ok().and_then(|mut s| s.take())
+    }
+    #[cfg(any(windows, test))]
+    pub(crate) fn total(&self) -> usize {
+        self.counts
+            .lock()
+            .map(|s| s.values().copied().sum())
+            .unwrap_or(0)
+    }
     pub(crate) fn set_muted(&self, values: &HashMap<String, crate::store::ConversationPreference>) {
         *self.muted.lock().unwrap_or_else(|e| e.into_inner()) = values
             .iter()
@@ -416,11 +455,38 @@ mod notification_tests {
 mod notification_contract_tests {
     use super::*;
     #[test]
-    fn group_notification_and_hidden_count_use_live_message_identity(){
-        let q=LiveUpdates::default();q.seed(&[Thread{id:"group".into(),name:"Nhóm dự án".into(),is_group:true,..Default::default()}]);
-        let message=crate::chat::ChatMessage{id:"12".into(),sender:"An".into(),text:"Xin chào".into(),ts:100,..Default::default()};
-        q.publish(vec![Thread{id:"group".into(),is_group:true,messages:vec![message.clone()],..Default::default()}]);
-        let notice=q.take_notice().unwrap();assert_eq!(notice.title,"Nhóm dự án");assert_eq!(notice.body,"An: Xin chào");assert_eq!(q.total(),1);
-        q.take();q.publish(vec![Thread{id:"group".into(),is_group:true,messages:vec![message],..Default::default()}]);assert!(q.take_notice().is_none());
+    fn group_notification_and_hidden_count_use_live_message_identity() {
+        let q = LiveUpdates::default();
+        q.seed(&[Thread {
+            id: "group".into(),
+            name: "Nhóm dự án".into(),
+            is_group: true,
+            ..Default::default()
+        }]);
+        let message = crate::chat::ChatMessage {
+            id: "12".into(),
+            sender: "An".into(),
+            text: "Xin chào".into(),
+            ts: 100,
+            ..Default::default()
+        };
+        q.publish(vec![Thread {
+            id: "group".into(),
+            is_group: true,
+            messages: vec![message.clone()],
+            ..Default::default()
+        }]);
+        let notice = q.take_notice().unwrap();
+        assert_eq!(notice.title, "Nhóm dự án");
+        assert_eq!(notice.body, "An: Xin chào");
+        assert_eq!(q.total(), 1);
+        q.take();
+        q.publish(vec![Thread {
+            id: "group".into(),
+            is_group: true,
+            messages: vec![message],
+            ..Default::default()
+        }]);
+        assert!(q.take_notice().is_none());
     }
 }

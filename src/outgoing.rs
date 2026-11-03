@@ -101,8 +101,19 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                 crate::chat::send_message_with_client_id(s, to, &message.text, id).await?
             }
         }
-        Payload::Forward(original) if original.sticker_cate_id == Some(crate::bundled_stickers::CATEGORY) => {
-            sent=send_bundled(s,to,job.is_group,original.sticker_id.ok_or_else(||anyhow::anyhow!("Thiếu nhãn GIF"))?,id).await?;
+        Payload::Forward(original)
+            if original.sticker_cate_id == Some(crate::bundled_stickers::CATEGORY) =>
+        {
+            sent = send_bundled(
+                s,
+                to,
+                job.is_group,
+                original
+                    .sticker_id
+                    .ok_or_else(|| anyhow::anyhow!("Thiếu nhãn GIF"))?,
+                id,
+            )
+            .await?;
             serde_json::Value::Null
         }
         Payload::Forward(original) => {
@@ -124,10 +135,14 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             category,
             kind: _,
         } if *category == crate::bundled_stickers::CATEGORY => {
-            sent=send_bundled(s,to,job.is_group,*sticker,id).await?;
+            sent = send_bundled(s, to, job.is_group, *sticker, id).await?;
             serde_json::Value::Null
         }
-        Payload::Sticker {id:sticker,category,kind} => {
+        Payload::Sticker {
+            id: sticker,
+            category,
+            kind,
+        } => {
             crate::chat::send_sticker_with_client_id(
                 s,
                 to,
@@ -169,10 +184,19 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
 }
 
 /// Keep the actual attachment response and reuse the original outgoing client identity.
-async fn send_bundled(s:&Session,to:&str,group:bool,sticker:u64,client_id:u64)->Result<ChatMessage> {
-    let path=crate::bundled_stickers::stage(s,sticker).await?;
-    let (_,mut sent)=crate::chat::send_attachment_with_client_id(s,to,group,&path,"",client_id).await?;
-    sent.sticker_id=Some(sticker);sent.sticker_cate_id=Some(crate::bundled_stickers::CATEGORY);sent.sticker_type=Some(7);
+async fn send_bundled(
+    s: &Session,
+    to: &str,
+    group: bool,
+    sticker: u64,
+    client_id: u64,
+) -> Result<ChatMessage> {
+    let path = crate::bundled_stickers::stage(s, sticker).await?;
+    let (_, mut sent) =
+        crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await?;
+    sent.sticker_id = Some(sticker);
+    sent.sticker_cate_id = Some(crate::bundled_stickers::CATEGORY);
+    sent.sticker_type = Some(7);
     Ok(sent)
 }
 

@@ -3,7 +3,7 @@ use crate::{
     chat::ChatMessage,
     message_view::{Media, MediaKind},
     session::Session,
-    transfer_diagnostics::{self as diag, RenewPhase},
+    transfer_diagnostics::{self as diag, RenewFailure, RenewPhase},
 };
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
@@ -71,7 +71,18 @@ fn payload(s: &Session, thread: &str, group: bool, message: &ChatMessage) -> Res
         json!({"toId":clean,"msgType":msg_type,"msgInfo":info.to_string(),"clientId":client,"imei":s.imei,"isGroup":if group||self_cloud{1}else{0}}),
     )
 }
-/// Renew an inaccessible media reference once; the caller owns single-flight and retry policy.
+/// Shared budget for one renewal including `async` re-polls and network time.
+const RENEW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+/// Pauses between re-polls while the server reports `async` (Zalo PC `_awaitCtrlEvent`).
+const PENDING_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+];
+/// Renew an inaccessible media reference; the caller owns single-flight and caching.
+///
+/// Zalo PC re-sends `renewlink` while the decoded reply says `async`; this repeats that with a
+/// bounded backoff inside one shared deadline that also covers network time.
 /// # Errors
 /// Returns sanitized protocol, account, unsupported encryption or response errors.
 async fn renew_once(
@@ -81,6 +92,59 @@ async fn renew_once(
     message: &ChatMessage,
 ) -> Result<Media> {
     let tag = reference_tag(s, thread, message);
+    let outcome = poll_pending(RENEW_DEADLINE, &PENDING_DELAYS, || async {
+        let reply = renew_request(s, tag, thread, group, message).await;
+        if matches!(reply, Ok(Reply::Pending)) {
+            diag::renewal(tag, RenewPhase::Pending, Some(0));
+        }
+        reply
+    })
+    .await;
+    match outcome {
+        Some(result) => result,
+        None => {
+            diag::renewal(tag, RenewPhase::PendingTimeout, None);
+            anyhow::bail!("Máy chủ chưa chuẩn bị xong media, hãy thử lại sau")
+        }
+    }
+}
+/// Repeat `attempt` while it reports `Pending`, sleeping through `delays`, until one shared
+/// `budget` (covering attempts and pauses) runs out. `None` means the budget ran out.
+async fn poll_pending<F, Fut>(
+    budget: std::time::Duration,
+    delays: &[std::time::Duration],
+    mut attempt: F,
+) -> Option<Result<Media>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Reply>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut delays = delays.iter();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, attempt()).await {
+            Ok(Ok(Reply::Ready(media))) => return Some(Ok(media)),
+            Ok(Err(error)) => return Some(Err(error)),
+            Ok(Ok(Reply::Pending)) => {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match delays.next() {
+                    Some(delay) if *delay < left => tokio::time::sleep(*delay).await,
+                    _ => return None,
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+}
+/// One `renewlink` round trip.
+async fn renew_request(
+    s: &Session,
+    tag: u64,
+    thread: &str,
+    group: bool,
+    message: &ChatMessage,
+) -> Result<Reply> {
     let params = (|| -> Result<String> {
         ensure!(s.is_active(), "Đã đăng xuất");
         s.encoded_params(&payload(s, thread, group, message)?)
@@ -108,29 +172,36 @@ async fn renew_once(
     let response = s.maybe_decrypt(response, s.session_key_bytes()).await;
     let code = reply_code(&response);
     diag::renewal(tag, RenewPhase::ServerReply, code);
-    let result = parse(&response, crate::message_view::media(message));
-    diag::renewal(
-        tag,
-        if result.is_ok() {
-            RenewPhase::Finished
-        } else if code.is_some_and(|code| code != 0) {
-            RenewPhase::ServerRejected
-        } else {
-            RenewPhase::ParseFailed
-        },
-        code,
-    );
-    result
+    // A session switch while the request was in flight must not leak into the new account.
+    ensure!(s.is_active(), "Đã đăng xuất");
+    match parse(&response, crate::message_view::media(message)) {
+        Ok(reply) => {
+            if matches!(reply, Reply::Ready(_)) {
+                diag::renewal(tag, RenewPhase::Finished, code);
+            }
+            Ok(reply)
+        }
+        Err(reason) => {
+            diag::renewal_failed(tag, code, reason);
+            Err(anyhow::anyhow!(match reason {
+                RenewFailure::ServerRejected => "Máy chủ chưa cho phép phục hồi media",
+                RenewFailure::UrlBlocked => "Không nhận được đường dẫn media hợp lệ",
+                _ => "Không đọc được kết quả phục hồi media",
+            }))
+        }
+    }
+}
+fn number(v: &Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str()?.trim().parse().ok())
 }
 fn reply_code(response: &Value) -> Option<i64> {
-    let number = |v: &Value| v.as_i64().or_else(|| v.as_str()?.parse().ok());
     let outer = response.get("error_code").and_then(number)?;
     if outer != 0 {
         return Some(outer);
     }
-    response
-        .pointer("/data/error_code")
-        .and_then(number)
+    unwrap_layer(response.get("data"))
+        .ok()
+        .and_then(|data| data.get("error_code").and_then(number))
         .or(Some(outer))
 }
 fn reference_tag(s: &Session, thread: &str, message: &ChatMessage) -> u64 {
@@ -145,61 +216,112 @@ fn reference_tag(s: &Session, thread: &str, message: &ChatMessage) -> u64 {
         message.id
     ))
 }
-fn parse(response: &Value, mut media: Media) -> Result<Media> {
-    ensure!(
-        response
-            .get("error_code")
-            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-            == Some(0),
-        "Máy chủ chưa cho phép phục hồi media"
-    );
-    let data = response
-        .get("data")
-        .context("Thiếu kết quả phục hồi media")?;
-    let data = if data.get("error_code").is_some() {
-        ensure!(
-            data.get("error_code").and_then(Value::as_i64) == Some(0),
-            "Không thể phục hồi media"
-        );
-        data.get("data").context("Thiếu đường dẫn phục hồi")?
-    } else {
-        data
-    };
-    let pick = |v: &Value, keys: &[&str]| -> Option<String> {
+/// Usable result of one renewal reply.
+#[derive(Debug)]
+enum Reply {
+    Ready(Media),
+    /// Server reported `async`: the copy is still being prepared.
+    Pending,
+}
+/// A `data` layer may arrive as an object or as a JSON string (after session decryption).
+fn unwrap_layer(data: Option<&Value>) -> std::result::Result<Value, RenewFailure> {
+    match data {
+        None | Some(Value::Null) => Err(RenewFailure::MissingData),
+        Some(Value::String(raw)) => {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Err(RenewFailure::MissingData);
+            }
+            match serde_json::from_str::<Value>(raw) {
+                Ok(value @ Value::Object(_)) => Ok(value),
+                Ok(_) => Err(RenewFailure::WrongType),
+                Err(_) => Err(RenewFailure::DecodeFailed),
+            }
+        }
+        Some(value @ Value::Object(_)) => Ok(value.clone()),
+        Some(_) => Err(RenewFailure::WrongType),
+    }
+}
+/// Decode the reply layers observed in Zalo PC `__callClone` / `_callClone`:
+/// HTTP envelope `{error_code, data}` → decoded `{error_code, data:{...}}` → result fields
+/// (`async`, `normal`/`hd`/`thumb` for photos and videos, `fileUrl` for files and videos).
+/// Older `*Url` field names stay accepted.
+fn parse(response: &Value, mut media: Media) -> std::result::Result<Reply, RenewFailure> {
+    if response.get("error_code").and_then(number) != Some(0) {
+        return Err(RenewFailure::ServerRejected);
+    }
+    let mut data = unwrap_layer(response.get("data"))?;
+    if let Some(code) = data.get("error_code") {
+        if number(code) != Some(0) {
+            return Err(RenewFailure::ServerRejected);
+        }
+        data = unwrap_layer(data.get("data"))?;
+    }
+    if data
+        .get("async")
+        .is_some_and(|v| v == true || number(v) == Some(1))
+    {
+        return Ok(Reply::Pending);
+    }
+    // Remember whether URL fields existed at all so blocked hosts are not reported as missing.
+    let mut seen_url = false;
+    let mut pick = |v: Option<&Value>, keys: &[&str]| -> Option<String> {
+        let v = v?;
         keys.iter().find_map(|key| {
-            v.get(*key)
-                .and_then(Value::as_str)
-                .filter(|s| {
-                    reqwest::Url::parse(s)
-                        .ok()
-                        .is_some_and(|u| crate::media_download::allowed(&u))
-                })
-                .map(str::to_owned)
+            let raw = match v.get(*key)? {
+                Value::String(raw) if !raw.is_empty() => raw,
+                _ => return None,
+            };
+            seen_url = true;
+            reqwest::Url::parse(raw)
+                .ok()
+                .is_some_and(|u| crate::media_download::allowed(&u))
+                .then(|| raw.clone())
         })
     };
-    if media.kind == MediaKind::Video {
-        media.thumbnail = pick(
-            data.get("thumb").unwrap_or(data),
-            &["thumbUrl", "hdUrl", "oriUrl"],
-        );
-        media.original = pick(
-            data.get("video").unwrap_or(data),
-            &["url", "videoUrl", "fileUrl"],
-        );
-        media.preview = media.original.clone();
-    } else {
-        media.thumbnail = pick(data, &["thumbUrl", "thumb"]);
-        media.original = pick(data, &["oriUrl", "hdUrl", "fileUrl", "url"]);
-        media.preview = pick(data, &["normalUrl", "hdUrl", "oriUrl", "fileUrl", "url"]);
+    match media.kind {
+        MediaKind::Video => {
+            let thumb = data.get("thumb");
+            media.thumbnail = pick(Some(&data), &["thumb", "thumbUrl"])
+                .or_else(|| pick(thumb, &["thumbUrl", "hdUrl", "oriUrl", "url"]));
+            media.original = pick(data.get("video"), &["url", "videoUrl", "fileUrl"])
+                .or_else(|| pick(Some(&data), &["fileUrl", "normal", "url", "videoUrl"]));
+            media.preview = media.original.clone();
+        }
+        MediaKind::File => {
+            media.original = pick(Some(&data), &["fileUrl", "url", "normal"]);
+        }
+        _ => {
+            media.thumbnail = pick(Some(&data), &["thumb", "thumbUrl"]);
+            media.original = pick(
+                Some(&data),
+                &["normal", "oriUrl", "hd", "hdUrl", "fileUrl", "url"],
+            );
+            media.preview = pick(
+                Some(&data),
+                &[
+                    "hd",
+                    "hdUrl",
+                    "normalUrl",
+                    "normal",
+                    "oriUrl",
+                    "fileUrl",
+                    "url",
+                ],
+            );
+        }
     }
     if media.kind == MediaKind::Photo && media.preview.is_none() {
         media.preview = media.thumbnail.clone();
     }
-    ensure!(
-        media.thumbnail.is_some() || media.original.is_some(),
-        "Không nhận được đường dẫn media hợp lệ"
-    );
-    Ok(media)
+    if media.thumbnail.is_none() && media.original.is_none() {
+        return Err(if seen_url {
+            RenewFailure::UrlBlocked
+        } else {
+            RenewFailure::MissingData
+        });
+    }
+    Ok(Reply::Ready(media))
 }
 type Renewal = std::sync::Arc<
     tokio::sync::Mutex<Option<(std::time::Instant, std::result::Result<Media, String>)>>,
@@ -259,24 +381,170 @@ pub async fn renew(s: &Session, thread: &str, group: bool, message: &ChatMessage
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn ready(reply: std::result::Result<Reply, RenewFailure>) -> Media {
+        match reply {
+            Ok(Reply::Ready(media)) => media,
+            other => panic!("expected ready media, got {other:?}"),
+        }
+    }
+    fn kind(kind: MediaKind) -> Media {
+        Media {
+            kind,
+            ..Default::default()
+        }
+    }
     #[test]
     fn renewed_photo_and_video_urls_are_validated() {
-        let photo = Media {
-            kind: MediaKind::Photo,
-            ..Default::default()
-        };
-        let got=parse(&json!({"error_code":0,"data":{"thumbUrl":"https://photo.zdn.vn/a","hdUrl":"https://photo.zdn.vn/b"}}),photo.clone()).unwrap();
+        let got = ready(parse(
+            &json!({"error_code":0,"data":{"thumbUrl":"https://photo.zdn.vn/a","hdUrl":"https://photo.zdn.vn/b"}}),
+            kind(MediaKind::Photo),
+        ));
         assert!(got.thumbnail.is_some());
-        assert!(parse(
-            &json!({"error_code":0,"data":{"url":"https://evil.invalid/a"}}),
-            photo
-        )
-        .is_err());
-        let video = Media {
-            kind: MediaKind::Video,
-            ..Default::default()
-        };
-        assert!(parse(&json!({"error_code":0,"data":{"thumb":{"oriUrl":"https://photo.zdn.vn/a"},"video":{"url":"https://video.zdn.vn/a"}}}),video).unwrap().original.is_some());
+        assert_eq!(
+            parse(
+                &json!({"error_code":0,"data":{"url":"https://evil.invalid/a"}}),
+                kind(MediaKind::Photo)
+            )
+            .unwrap_err(),
+            RenewFailure::UrlBlocked
+        );
+        let got = ready(parse(
+            &json!({"error_code":0,"data":{"thumb":{"oriUrl":"https://photo.zdn.vn/a"},"video":{"url":"https://video.zdn.vn/a"}}}),
+            kind(MediaKind::Video),
+        ));
+        assert!(got.original.is_some() && got.thumbnail.is_some());
+    }
+    #[test]
+    fn zalo_pc_decoded_layer_with_normal_hd_thumb_is_read() {
+        let inner = json!({"error_code":0,"data":{"normal":"https://photo.zdn.vn/n","hd":"https://photo.zdn.vn/h","thumb":"https://photo.zdn.vn/t"}});
+        let got = ready(parse(
+            &json!({"error_code":0,"data":inner.to_string()}),
+            kind(MediaKind::Photo),
+        ));
+        assert_eq!(got.original.as_deref(), Some("https://photo.zdn.vn/n"));
+        assert_eq!(got.preview.as_deref(), Some("https://photo.zdn.vn/h"));
+        assert_eq!(got.thumbnail.as_deref(), Some("https://photo.zdn.vn/t"));
+    }
+    #[test]
+    fn video_thumbnail_as_plain_string_is_kept() {
+        let got = ready(parse(
+            &json!({"error_code":0,"data":{"error_code":"0","data":{"normal":"https://video.zdn.vn/v.mp4","thumb":"https://photo.zdn.vn/t"}}}),
+            kind(MediaKind::Video),
+        ));
+        assert_eq!(got.thumbnail.as_deref(), Some("https://photo.zdn.vn/t"));
+        assert_eq!(got.original.as_deref(), Some("https://video.zdn.vn/v.mp4"));
+        let got = ready(parse(
+            &json!({"error_code":0,"data":{"fileUrl":"https://video.zdn.vn/f.mp4"}}),
+            kind(MediaKind::Video),
+        ));
+        assert_eq!(got.original.as_deref(), Some("https://video.zdn.vn/f.mp4"));
+    }
+    #[test]
+    fn async_flag_is_pending_but_missing_urls_are_not() {
+        assert!(matches!(
+            parse(
+                &json!({"error_code":0,"data":{"error_code":0,"data":{"async":true}}}),
+                kind(MediaKind::Photo)
+            ),
+            Ok(Reply::Pending)
+        ));
+        assert!(matches!(
+            parse(
+                &json!({"error_code":0,"data":{"async":1}}),
+                kind(MediaKind::File)
+            ),
+            Ok(Reply::Pending)
+        ));
+        assert_eq!(
+            parse(
+                &json!({"error_code":0,"data":{"error_code":0,"data":{}}}),
+                kind(MediaKind::Photo)
+            )
+            .unwrap_err(),
+            RenewFailure::MissingData
+        );
+    }
+    #[test]
+    fn failure_reasons_distinguish_layers() {
+        let photo = || kind(MediaKind::Photo);
+        assert_eq!(
+            parse(&json!({"error_code":"-1"}), photo()).unwrap_err(),
+            RenewFailure::ServerRejected
+        );
+        assert_eq!(
+            parse(
+                &json!({"error_code":0,"data":{"error_code":"15","data":{}}}),
+                photo()
+            )
+            .unwrap_err(),
+            RenewFailure::ServerRejected
+        );
+        assert_eq!(
+            parse(&json!({"error_code":0,"data":"not-json"}), photo()).unwrap_err(),
+            RenewFailure::DecodeFailed
+        );
+        assert_eq!(
+            parse(&json!({"error_code":0,"data":[1]}), photo()).unwrap_err(),
+            RenewFailure::WrongType
+        );
+        assert_eq!(
+            parse(&json!({"error_code":0}), photo()).unwrap_err(),
+            RenewFailure::MissingData
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    // Real time scaled down 20x from the production 2/4/8 s inside 15 s.
+    const DELAYS: [Duration; 3] = [
+        Duration::from_millis(100),
+        Duration::from_millis(200),
+        Duration::from_millis(400),
+    ];
+    const BUDGET: Duration = Duration::from_millis(750);
+    #[tokio::test]
+    async fn pending_then_ready_returns_media() {
+        let calls = AtomicUsize::new(0);
+        let got = poll_pending(BUDGET, &DELAYS, || async {
+            if calls.fetch_add(1, Ordering::SeqCst) < 2 {
+                Ok(Reply::Pending)
+            } else {
+                Ok(Reply::Ready(Media::default()))
+            }
+        })
+        .await;
+        assert!(matches!(got, Some(Ok(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+    #[tokio::test]
+    async fn shared_budget_counts_slow_network_and_stops() {
+        let calls = AtomicUsize::new(0);
+        let start = tokio::time::Instant::now();
+        let got = poll_pending(BUDGET, &DELAYS, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(Reply::Pending)
+        })
+        .await;
+        assert!(got.is_none());
+        assert!(start.elapsed() <= BUDGET + Duration::from_millis(100));
+        // 150 + 100 + 150 + 200 + 150 = 750 ms budget: the 400 ms pause never starts.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+    #[tokio::test]
+    async fn errors_are_not_retried() {
+        let calls = AtomicUsize::new(0);
+        let got = poll_pending(BUDGET, &DELAYS, || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("rejected"))
+        })
+        .await;
+        assert!(matches!(got, Some(Err(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
 
@@ -301,8 +569,14 @@ mod request_tests {
             name: "Báo cáo.doc".into(),
             ..Default::default()
         };
-        let got=parse(&json!({"error_code":0,"data":{"fileUrl":"https://file-stal-3.dlfl.vn/file/renewMedia.doc"}}),old).unwrap();
+        let Ok(Reply::Ready(got)) = parse(
+            &json!({"error_code":0,"data":{"fileUrl":"https://file-stal-3.dlfl.vn/file/renewMedia.doc"}}),
+            old,
+        ) else {
+            panic!("file renewal must succeed");
+        };
         assert_eq!(got.name, "Báo cáo.doc");
+        assert!(got.original.is_some());
     }
 }
 

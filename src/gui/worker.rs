@@ -174,7 +174,9 @@ pub enum WorkerCmd {
         is_on_mic: bool,
         is_on_cam: bool,
     },
-    EndCall { call_id: Option<i64> },
+    EndCall {
+        call_id: Option<i64>,
+    },
     AddFriend {
         user_id: String,
         user_name: String,
@@ -293,10 +295,20 @@ pub(super) fn is_session_expired_error(err_str: &str) -> bool {
 /// Immediately decode any disk-cached sticker thumbnails (`stickers_cache/stk_{cid}_{sid}.png`)
 /// and push `GuiEvent::StickerImageReady` *before* sending sticker list metadata, returning any
 /// missing `(key, url, cache_path)` entries for concurrent network prefetching.
-pub(super) async fn preload_disk_sticker_thumbnails(items:&[crate::chat::StickerItem],gui_tx:&Sender<GuiEvent>,limit:usize)->Vec<(String,String,std::path::PathBuf)> {
-    let items=items.to_vec();let tx=gui_tx.clone();
-    match tokio::task::spawn_blocking(move||preload_disk_sticker_inner(&items,&tx,limit)).await {
-        Ok(missing)=>missing,Err(_)=>{crate::logger::log_error("sticker cache","Thumbnail cache worker failed");Vec::new()}
+pub(super) async fn preload_disk_sticker_thumbnails(
+    items: &[crate::chat::StickerItem],
+    gui_tx: &Sender<GuiEvent>,
+    limit: usize,
+) -> Vec<(String, String, std::path::PathBuf)> {
+    let items = items.to_vec();
+    let tx = gui_tx.clone();
+    match tokio::task::spawn_blocking(move || preload_disk_sticker_inner(&items, &tx, limit)).await
+    {
+        Ok(missing) => missing,
+        Err(_) => {
+            crate::logger::log_error("sticker cache", "Thumbnail cache worker failed");
+            Vec::new()
+        }
     }
 }
 fn preload_disk_sticker_inner(
@@ -311,7 +323,7 @@ fn preload_disk_sticker_inner(
     for item in items.iter().take(limit) {
         let key = format!("stk_{}_{}", item.cate_id, item.sticker_id);
         let cache_path = cache_dir.join(format!("{key}.png"));
-        if let Ok(disk_bytes) = crate::limits::read_file(&cache_path,crate::limits::IMAGE_BYTES) {
+        if let Ok(disk_bytes) = crate::limits::read_file(&cache_path, crate::limits::IMAGE_BYTES) {
             if let Ok(dyn_img) = crate::limits::decode_image(&disk_bytes) {
                 let rgba = dyn_img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
@@ -416,12 +428,16 @@ async fn fetch_gui_image(
         s.is_active() && !s.account_key().is_empty(),
         "No active media account"
     );
-    if let Some(bytes)=crate::bundled_stickers::thumbnail(key) {
-        let key=key.to_owned();
-        return tokio::task::spawn_blocking(move|| {
-            let image=crate::limits::preview_image(bytes,&key)?;
-            Ok(egui::ColorImage::from_rgba_unmultiplied([image.width() as usize,image.height() as usize],image.as_raw()))
-        }).await?;
+    if let Some(bytes) = crate::bundled_stickers::thumbnail(key) {
+        let key = key.to_owned();
+        return tokio::task::spawn_blocking(move || {
+            let image = crate::limits::preview_image(bytes, &key)?;
+            Ok(egui::ColorImage::from_rgba_unmultiplied(
+                [image.width() as usize, image.height() as usize],
+                image.as_raw(),
+            ))
+        })
+        .await?;
     }
     let root = root.to_owned();
     let account = s.account_key().to_owned();
@@ -2173,11 +2189,24 @@ mod image_pipeline_tests {
     use super::*;
     #[tokio::test]
     async fn bundled_thumbnail_never_uses_network_or_private_disk_cache() {
-        let mut session=Session::new(false,false,false).unwrap();
-        session.login=Some(crate::session::LoginInfo{uin:"bundled-thumbnail-fixture".into(),..Default::default()});
-        let root=std::env::temp_dir().join(format!("ctdoz-no-cache-{}",crate::param_cipher::random_hex(16)));
-        let image=fetch_gui_image(&session,&root,"stk_99901_999001","https://untrusted.invalid/not-contacted").await.unwrap();
-        assert!(image.size[0]>0 && image.size[1]>0);
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: "bundled-thumbnail-fixture".into(),
+            ..Default::default()
+        });
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-no-cache-{}",
+            crate::param_cipher::random_hex(16)
+        ));
+        let image = fetch_gui_image(
+            &session,
+            &root,
+            "stk_99901_999001",
+            "https://untrusted.invalid/not-contacted",
+        )
+        .await
+        .unwrap();
+        assert!(image.size[0] > 0 && image.size[1] > 0);
         assert!(!root.exists());
     }
 
@@ -2357,7 +2386,10 @@ async fn sync_mute_snapshot(
     let server = match crate::mute_sync::fetch_mute_snapshot(&s).await {
         Ok(server) => server,
         Err(_) => {
-            crate::logger::log_error("mute sync", "Mute snapshot unavailable; keeping local state");
+            crate::logger::log_error(
+                "mute sync",
+                "Mute snapshot unavailable; keeping local state",
+            );
             return;
         }
     };
@@ -2370,7 +2402,10 @@ async fn sync_mute_snapshot(
         let mut local_only = Vec::new();
         if !seeded {
             for change in changes.iter().filter(|c| !c.muted) {
-                local_only.push((change.thread_id.clone(), store.thread_is_group(&change.thread_id)?));
+                local_only.push((
+                    change.thread_id.clone(),
+                    store.thread_is_group(&change.thread_id)?,
+                ));
             }
         }
         Ok((changes, seeded, local_only))
@@ -2511,25 +2546,54 @@ async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMess
     }
 }
 
-fn publish_live(session:&Session, updates: &crate::live_updates::LiveUpdates, threads: Vec<Thread>) -> bool {
-    if !session.is_active(){return false;}
-    let wake=updates.publish(threads);
-    #[cfg(windows)]{
-        crate::desktop_notice::count(session.account_key(),updates.total());
-        if let Some(mut notice)=updates.take_notice(){notice.owner=session.account_key().to_owned();if !crate::tray::previews_visible(){
-                if let Some(url)=notice.avatar.clone(){
-                    static AVATAR_LOADING:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
-                    if !AVATAR_LOADING.swap(true,std::sync::atomic::Ordering::AcqRel){
-                        let account=session.clone();tokio::spawn(async move{
-                            struct Guard;impl Drop for Guard{fn drop(&mut self){AVATAR_LOADING.store(false,std::sync::atomic::Ordering::Release);}}let _guard=Guard;
-                            let key=format!("ava_{}",crate::crypto::md5_hex(&url));
-                            if let Ok(image)=fetch_gui_image(&account,crate::storage::root(),&key,&url).await{if account.is_active(){crate::desktop_notice::cache_avatar(account.account_key().into(),url,image);}}
+fn publish_live(
+    session: &Session,
+    updates: &crate::live_updates::LiveUpdates,
+    threads: Vec<Thread>,
+) -> bool {
+    if !session.is_active() {
+        return false;
+    }
+    let wake = updates.publish(threads);
+    #[cfg(windows)]
+    {
+        crate::desktop_notice::count(session.account_key(), updates.total());
+        if let Some(mut notice) = updates.take_notice() {
+            notice.owner = session.account_key().to_owned();
+            if !crate::tray::previews_visible() {
+                if let Some(url) = notice.avatar.clone() {
+                    static AVATAR_LOADING: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !AVATAR_LOADING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                        let account = session.clone();
+                        tokio::spawn(async move {
+                            struct Guard;
+                            impl Drop for Guard {
+                                fn drop(&mut self) {
+                                    AVATAR_LOADING
+                                        .store(false, std::sync::atomic::Ordering::Release);
+                                }
+                            }
+                            let _guard = Guard;
+                            let key = format!("ava_{}", crate::crypto::md5_hex(&url));
+                            if let Ok(image) =
+                                fetch_gui_image(&account, crate::storage::root(), &key, &url).await
+                            {
+                                if account.is_active() {
+                                    crate::desktop_notice::cache_avatar(
+                                        account.account_key().into(),
+                                        url,
+                                        image,
+                                    );
+                                }
+                            }
                         });
                     }
                 }
-                crate::desktop_notice::publish(notice,updates.total());
-            }}
-        let _=updates.take_notification();
+                crate::desktop_notice::publish(notice, updates.total());
+            }
+        }
+        let _ = updates.take_notification();
     }
     wake
 }

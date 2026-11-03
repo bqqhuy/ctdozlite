@@ -873,8 +873,10 @@ pub fn is_generic_thread_name(name: &str) -> bool {
     let t = name.trim();
     t.is_empty()
         || numeric(t)
-        || t.strip_prefix("Người dùng ").is_some_and(|rest| numeric(rest.trim()))
-        || t.strip_prefix("Nhóm ").is_some_and(|rest| numeric(rest.trim()))
+        || t.strip_prefix("Người dùng ")
+            .is_some_and(|rest| numeric(rest.trim()))
+        || t.strip_prefix("Nhóm ")
+            .is_some_and(|rest| numeric(rest.trim()))
 }
 
 /// Extract the stable avatar filename (e.g. `"00000000000000000000000000000001.jpg"`) from a Zalo CDN URL.
@@ -2490,7 +2492,10 @@ pub(crate) async fn send_sticker_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
-    anyhow::ensure!(cate_id != crate::bundled_stickers::CATEGORY,"GIF cục bộ phải được gửi qua luồng attachment");
+    anyhow::ensure!(
+        cate_id != crate::bundled_stickers::CATEGORY,
+        "GIF cục bộ phải được gửi qua luồng attachment"
+    );
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }

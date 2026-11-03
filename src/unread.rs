@@ -137,7 +137,8 @@ impl UnreadState {
             return;
         };
         for message in messages {
-            if crate::message_view::is_call_log(message) || message.is_outgoing
+            if crate::message_view::is_call_log(message)
+                || message.is_outgoing
                 || message.kind == crate::message_model::MessageKind::System
                 || !message.unread_policy.counts_unread()
             {
