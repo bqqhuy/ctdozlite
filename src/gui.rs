@@ -21,15 +21,16 @@ use crate::logger::{self, FindingLevel, LogEntry, ScanFinding};
 use crate::qr::QrLogin;
 use crate::session::Session;
 
+mod composer_drafts;
 mod contacts;
+mod download_panel;
 mod messages;
 mod modals;
+mod schedule_modal;
 mod stickers;
 mod theme;
-mod worker;
 mod tools_panel;
-mod download_panel;
-mod schedule_modal;
+mod worker;
 mod workspace;
 
 use messages::*;
@@ -51,9 +52,40 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
-    MediaStarted {owner:String,id:String,name:String,cancel:std::sync::Arc<std::sync::atomic::AtomicBool>},
-    MediaProgress {owner:String,id:String,bytes:u64,total:Option<u64>},
-    MediaFinished {owner:String,id:String,result:Result<std::path::PathBuf,String>},
+    ComposerDraftLoaded {
+        owner: String,
+        thread: String,
+        generation: u64,
+        result: Result<String, String>,
+    },
+    ComposerDraftSaved {
+        owner: String,
+        thread: String,
+        generation: u64,
+        text: String,
+        result: Result<(), String>,
+    },
+    MediaStarted {
+        owner: String,
+        id: String,
+        name: String,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
+    MediaProgress {
+        owner: String,
+        id: String,
+        bytes: u64,
+        total: Option<u64>,
+    },
+    MediaTransientClosed {
+        owner: String,
+        id: String,
+    },
+    MediaFinished {
+        owner: String,
+        id: String,
+        result: Result<std::path::PathBuf, String>,
+    },
     Tools {
         owner: String,
         result: Result<tools_panel::ToolsResult, String>,
@@ -64,6 +96,10 @@ pub enum GuiEvent {
     ConversationPreferences {
         owner: String,
         values: HashMap<String, crate::store::ConversationPreference>,
+    },
+    ThreadDeleted {
+        owner: String,
+        thread: String,
     },
     ThreadHistoryCleared {
         owner: String,
@@ -131,11 +167,19 @@ pub enum GuiEvent {
         image: egui::ColorImage,
         permit: crate::media_resources::MediaJobPermit,
     },
+    MediaRenewed {
+        thread: String,
+        message: Box<ChatMessage>,
+    },
+    UpdateChecked(Result<Option<crate::updater::ReleaseUpdate>, String>),
+    UpdatePrepared(Result<crate::updater::ReadyUpdate, String>),
+    UpdateLaunched(Result<(), String>),
     ImageBusy {
         key: String,
     },
     ImageUnavailable {
         key: String,
+        failure: crate::media_recovery::Failure,
     },
     VideoFrameReady {
         generation: u64,
@@ -182,6 +226,7 @@ pub enum GuiEvent {
         reaction: String,
     },
     MessageDeleted {
+        owner: String,
         thread_id: String,
         msg_id: String,
         ts: i64,
@@ -413,6 +458,8 @@ pub struct ZaloGuiApp {
     contacts_query: String,
     search_query: String,
     input_message: String,
+    composer_draft: composer_drafts::ComposerDraft,
+    deleted_message_ids: HashSet<(String, String)>,
     status_msg: String,
 
     // Reply / forward state
@@ -440,7 +487,12 @@ pub struct ZaloGuiApp {
     sticker_textures: HashMap<String, TextureHandle>,
     texture_budget: crate::media_resources::ResourceLru,
     loading_stickers: HashSet<String>,
+    update_offer: Option<crate::updater::ReleaseUpdate>,
+    update_ready: Option<crate::updater::ReadyUpdate>,
+    update_busy: bool,
+    update_status: String,
     image_retry_at: HashMap<String, std::time::Instant>,
+    image_failures: HashMap<String, crate::media_recovery::Retry>,
     downloads: HashMap<String, download_panel::DownloadView>,
     live_mailbox: Option<std::sync::Arc<crate::live_updates::LiveUpdates>>,
     sound_prepared: bool,
@@ -470,7 +522,7 @@ pub struct ZaloGuiApp {
     unread_counts: HashMap<String, usize>,
     conversation_preferences: HashMap<String, crate::store::ConversationPreference>,
     show_hidden_conversations: bool,
-    clear_history_confirmation: Option<String>,
+    clear_history_confirmation: Option<(String, bool)>,
     link_metadata_cache: HashMap<String, crate::chat::LinkMetadata>,
     loading_link_previews: HashSet<String>,
     dismissed_link_preview_for: String,
@@ -645,6 +697,8 @@ impl ZaloGuiApp {
             contacts_query: String::new(),
             search_query: String::new(),
             input_message: String::new(),
+            composer_draft: Default::default(),
+            deleted_message_ids: HashSet::new(),
             replying_to: None,
             forward_msg: None,
             forward_filter: String::new(),
@@ -670,7 +724,12 @@ impl ZaloGuiApp {
                 crate::media_resources::TEXTURE_BUDGET,
             ),
             loading_stickers: HashSet::new(),
+            update_offer: None,
+            update_ready: None,
+            update_busy: false,
+            update_status: String::new(),
             image_retry_at: HashMap::new(),
+            image_failures: HashMap::new(),
             downloads: HashMap::new(),
             live_mailbox: None,
             sound_prepared: false,
@@ -897,6 +956,19 @@ impl ZaloGuiApp {
                 let url = "https://photo-stal-16.zdn.vn/fixture/photo.jpg";
                 let image = egui::ColorImage::example();
                 let texture = ctx.load_texture("photo-fixture", image, Default::default());
+                app.sticker_textures.insert(
+                    crate::media_recovery::image_key(
+                        "fixture-photo",
+                        "fixture-photo-message",
+                        0,
+                        false,
+                    ),
+                    texture.clone(),
+                );
+                app.sticker_textures.insert(
+                    crate::media_recovery::image_key("fixture-photo", "fixture-video", 0, false),
+                    texture.clone(),
+                );
                 app.sticker_textures
                     .insert(format!("thumb_{}", crate::crypto::md5_hex(url)), texture);
                 app.threads = vec![Thread {
@@ -1080,16 +1152,69 @@ impl ZaloGuiApp {
                 } => {
                     let _ = (thread_id, text, msg_id);
                     continue;
-                },
+                }
                 event => event,
             };
             match event {
-                GuiEvent::MediaStarted{owner,id,name,cancel}=>{
-                    if owner==self.user_uin && self.is_logged_in {self.downloads.insert(id,download_panel::DownloadView{name,bytes:0,total:None,cancel,result:None});}
-                    else{cancel.store(true,std::sync::atomic::Ordering::Release);}
+                GuiEvent::ComposerDraftLoaded {
+                    owner,
+                    thread,
+                    generation,
+                    result,
+                } => self.composer_draft_loaded(owner, thread, generation, result),
+                GuiEvent::ComposerDraftSaved {
+                    owner,
+                    thread,
+                    generation,
+                    text,
+                    result,
+                } => self.composer_draft_saved(ctx, owner, thread, generation, text, result),
+                GuiEvent::MediaStarted {
+                    owner,
+                    id,
+                    name,
+                    cancel,
+                } => {
+                    if owner == self.user_uin && self.is_logged_in {
+                        self.downloads.insert(
+                            id,
+                            download_panel::DownloadView {
+                                name,
+                                bytes: 0,
+                                total: None,
+                                cancel,
+                                result: None,
+                            },
+                        );
+                    } else {
+                        cancel.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
-                GuiEvent::MediaProgress{owner,id,bytes,total}=>{if owner==self.user_uin{if let Some(d)=self.downloads.get_mut(&id){d.bytes=bytes;d.total=total;}}}
-                GuiEvent::MediaFinished{owner,id,result}=>{if owner==self.user_uin{if let Some(d)=self.downloads.get_mut(&id){d.result=Some(result);}}}
+                GuiEvent::MediaProgress {
+                    owner,
+                    id,
+                    bytes,
+                    total,
+                } => {
+                    if owner == self.user_uin {
+                        if let Some(d) = self.downloads.get_mut(&id) {
+                            d.bytes = bytes;
+                            d.total = total;
+                        }
+                    }
+                }
+                GuiEvent::MediaTransientClosed { owner, id } => {
+                    if owner == self.user_uin {
+                        self.downloads.remove(&id);
+                    }
+                }
+                GuiEvent::MediaFinished { owner, id, result } => {
+                    if owner == self.user_uin {
+                        if let Some(d) = self.downloads.get_mut(&id) {
+                            d.result = Some(result);
+                        }
+                    }
+                }
                 GuiEvent::ClipboardImageRead(image) => {
                     self.clipboard_read_pending = false;
                     if let Some((path, w, h, image)) = image {
@@ -1121,6 +1246,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
                     if self.user_uin != uin {
+                        self.deleted_message_ids.clear();
                         self.reset_sync_status();
                         self.threads.clear();
                         self.selected_thread_index = 0;
@@ -1134,6 +1260,7 @@ impl ZaloGuiApp {
                         );
                         self.loading_stickers.clear();
                         self.image_retry_at.clear();
+                        self.image_failures.clear();
                     }
                     self.is_logged_in = true;
                     self.user_name = name;
@@ -1155,6 +1282,16 @@ impl ZaloGuiApp {
                         self.conversation_preferences = values;
                     }
                 }
+                GuiEvent::ThreadDeleted { owner, thread } => {
+                    if owner == self.user_uin {
+                        self.discard_deleted_conversation_draft(&owner, &thread);
+                        self.threads.retain(|t| t.id != thread);
+                        self.selected_thread_index = self
+                            .selected_thread_index
+                            .min(self.threads.len().saturating_sub(1));
+                        self.status_msg = "Đã xóa hội thoại sau khi máy chủ xác nhận".into();
+                    }
+                }
                 GuiEvent::ThreadHistoryCleared { owner, thread_id } => {
                     if self.is_logged_in && owner == self.user_uin {
                         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
@@ -1173,9 +1310,25 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ThreadsUpdated {
-                    threads: updates,
+                    threads: mut updates,
                     source,
                 } => {
+                    for thread in &mut updates {
+                        let before = thread.messages.len();
+                        thread.messages.retain(|m| {
+                            !self.deleted_message_ids.contains(&(
+                                thread.id.clone(),
+                                if m.id.is_empty() {
+                                    format!("msg_{}", m.ts)
+                                } else {
+                                    m.id.clone()
+                                },
+                            ))
+                        });
+                        if before != thread.messages.len() {
+                            thread.refresh_after_removal();
+                        }
+                    }
                     if self.is_logged_in && !updates.is_empty() {
                         let prev_selected_id = self
                             .threads
@@ -1326,7 +1479,8 @@ impl ZaloGuiApp {
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
                 GuiEvent::SessionExpired(reason) => {
-                    self.live_mailbox=None;
+                    self.flush_composer_before_logout();
+                    self.live_mailbox = None;
                     crate::desktop_notice::account("");
                     self.clear_downloads();
                     self.is_logged_in = false;
@@ -1360,9 +1514,10 @@ impl ZaloGuiApp {
                     self.show_toast("Đã đổi thư mục tải về");
                 }
                 GuiEvent::LoggedOut => {
-                    self.quick_schedule=None;
+                    self.deleted_message_ids.clear();
+                    self.quick_schedule = None;
                     self.reset_sync_status();
-                    self.live_mailbox=None;
+                    self.live_mailbox = None;
                     crate::desktop_notice::account("");
                     self.clear_downloads();
                     self.is_logged_in = false;
@@ -1405,6 +1560,7 @@ impl ZaloGuiApp {
                     );
                     self.loading_stickers.clear();
                     self.image_retry_at.clear();
+                    self.image_failures.clear();
                     self.composer_sticker_cache.clear();
                     self.link_metadata_cache.clear();
                     let (tx, rx) = channel();
@@ -1673,18 +1829,28 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã thả cảm xúc".into();
                 }
                 GuiEvent::MessageDeleted {
+                    owner,
                     thread_id,
                     msg_id,
                     ts,
                 } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        continue;
+                    }
+                    self.deleted_message_ids.insert((
+                        thread_id.clone(),
+                        if msg_id.is_empty() {
+                            format!("msg_{ts}")
+                        } else {
+                            msg_id.clone()
+                        },
+                    ));
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         t.messages.retain(|m| {
                             !((!msg_id.is_empty() && m.id == msg_id)
                                 || (msg_id.is_empty() && m.ts == ts))
                         });
-                        if let Some(last) = t.messages.last() {
-                            t.preview = last.text.clone();
-                        }
+                        t.refresh_after_removal();
                         self.persist_threads_async();
                     }
                     self.status_msg = "Đã xóa tin nhắn ở phía bạn".into();
@@ -1708,6 +1874,51 @@ impl ZaloGuiApp {
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
                 }
+                GuiEvent::UpdateChecked(result) => {
+                    self.update_busy = false;
+                    match result {
+                        Ok(Some(release)) => {
+                            self.update_status =
+                                format!("Có bản {} cho Windows ARM64", release.tag);
+                            self.update_offer = Some(release);
+                        }
+                        Ok(None) => {
+                            self.update_status = "Chưa có bản phát hành ổn định mới hơn".into();
+                            self.update_offer = None;
+                        }
+                        Err(error) => {
+                            self.update_status = error;
+                        }
+                    }
+                }
+                GuiEvent::UpdatePrepared(result) => {
+                    self.update_busy = false;
+                    match result {
+                        Ok(ready) => {
+                            self.update_ready = Some(ready);
+                            self.update_status="Bộ cài đã được kiểm tra SHA-256; ứng dụng trong release đúng ARM64".into();
+                        }
+                        Err(error) => self.update_status = error,
+                    }
+                }
+                GuiEvent::UpdateLaunched(result) => {
+                    self.update_busy = false;
+                    match result {
+                        Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(error) => self.update_status = error,
+                    }
+                }
+                GuiEvent::MediaRenewed { thread, message } => {
+                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread) {
+                        if let Some(m) = t.messages.iter_mut().find(|m| m.id == message.id) {
+                            m.link_url = message.link_url;
+                            m.link_thumb = message.link_thumb;
+                            if let Some(v) = message.wire_ref.fields.get("renewed_media") {
+                                m.wire_ref.fields.insert("renewed_media".into(), v.clone());
+                            }
+                        }
+                    }
+                }
                 GuiEvent::ImageBusy { key } => {
                     if self.image_retry_at.len() < 1024 {
                         self.image_retry_at
@@ -1717,20 +1928,23 @@ impl ZaloGuiApp {
                     }
                     ctx.request_repaint_after(Duration::from_millis(250));
                 }
-                GuiEvent::ImageUnavailable { key } => {
-                    if self.image_retry_at.len() >= 1024 {
-                        if let Some(oldest) = self
-                            .image_retry_at
-                            .iter()
-                            .min_by_key(|(_, deadline)| **deadline)
-                            .map(|(key, _)| key.clone())
-                        {
-                            self.image_retry_at.remove(&oldest);
-                            self.loading_stickers.remove(&oldest);
+                GuiEvent::ImageUnavailable { key, failure } => {
+                    let next =
+                        crate::media_recovery::Retry::next(failure, self.image_failures.get(&key));
+                    self.status_msg = next.failure.message().into();
+                    if let Some(at) = next.at {
+                        self.image_retry_at.insert(key.clone(), at);
+                        ctx.request_repaint_after(
+                            at.saturating_duration_since(std::time::Instant::now()),
+                        );
+                    }
+                    if self.image_failures.len() >= 1024 {
+                        if let Some(old) = self.image_failures.keys().next().cloned() {
+                            self.image_failures.remove(&old);
+                            self.loading_stickers.remove(&old);
                         }
                     }
-                    self.image_retry_at
-                        .insert(key, std::time::Instant::now() + Duration::from_secs(10));
+                    self.image_failures.insert(key, next);
                 }
                 GuiEvent::VideoFrameReady {
                     generation,
@@ -1745,12 +1959,14 @@ impl ZaloGuiApp {
                 GuiEvent::PreviewImageReady { key, image, permit } => {
                     self.loading_stickers.remove(&key);
                     self.image_retry_at.remove(&key);
+                    self.image_failures.remove(&key);
                     self.store_texture(ctx, key, image);
                     drop(permit);
                 }
                 GuiEvent::StickerImageReady { key, image } => {
                     self.loading_stickers.remove(&key);
                     self.image_retry_at.remove(&key);
+                    self.image_failures.remove(&key);
                     self.store_texture(ctx, key, image);
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
@@ -2113,6 +2329,9 @@ impl eframe::App for ZaloGuiApp {
             if tray.control().quitting() {
                 self.allow_quit = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.check_events(ctx);
+                self.sync_composer_draft(ctx);
+                self.preserve_draft_before_close(ctx);
                 return;
             }
         }
@@ -2141,7 +2360,9 @@ impl eframe::App for ZaloGuiApp {
             self.theme_dirty = false;
         }
 
+        self.sync_composer_draft(ctx);
         self.check_events(ctx);
+        self.sync_composer_draft(ctx);
         if self.is_logged_in && self.tools.loaded_for != self.user_uin && self.smoke.is_none() {
             self.tools = tools_panel::ToolsPanel {
                 loaded_for: self.user_uin.clone(),
@@ -2173,7 +2394,7 @@ impl eframe::App for ZaloGuiApp {
             ),
         );
 
-        ctx.request_repaint_after(Duration::from_millis(1200));
+        // Network events, input and animation deadlines schedule their own repaints.
 
         let pal = self.palette();
 
@@ -2234,6 +2455,8 @@ impl eframe::App for ZaloGuiApp {
             self.render_sync_status_bar(ctx, &pal);
             self.render_chat_workspace(ctx, &pal);
         }
+        self.sync_composer_draft(ctx);
+        self.preserve_draft_before_close(ctx);
 
         if !ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             let screen = ctx.screen_rect();

@@ -49,12 +49,13 @@ fn message(
     let kind = match value.get("msgType").and_then(Value::as_i64).unwrap_or(0) {
         0 => "chat.text".into(),
         2 => "chat.doodle".into(),
-        3 | 4 => "chat.photo".into(),
+        3 | 4 | 31 => "chat.photo".into(),
         6 => "chat.voice".into(),
         10 => "chat.sticker".into(),
         12 => "chat.link".into(),
         18 => "chat.location".into(),
         19 => "chat.video".into(),
+        25 => "chat.video.live.msg".into(),
         21 => "chat.contact".into(),
         22 => "chat.file".into(),
         23 => "chat.gif".into(),
@@ -279,5 +280,24 @@ mod performance_tests {
             "{}",
             json!({"task":"import_5000_phone_messages","iterations":5,"min_ms":times[0],"avg_ms":times.iter().sum::<f64>()/5.0,"p50_ms":times[2],"p95_ms":times[4],"p99_ms":times[4],"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"profile":"debug"})
         );
+    }
+}
+
+#[cfg(test)]
+mod media_archive_tests {
+    use super::*;
+    #[test]
+    fn verified_photo_v2_and_video_live_archive_codes_keep_media_metadata() {
+        for (code, expected) in [
+            (31, crate::message_view::MediaKind::Photo),
+            (25, crate::message_view::MediaKind::Video),
+        ] {
+            let source = json!({"globalId":"archive-message","clientId":"11","senderId":"sender","timestamp":100,"msgType":code,"content":{"href":"https://photo.zdn.vn/file","thumb":"https://photo.zdn.vn/thumb","params":{"normalUrl":"https://photo.zdn.vn/normal"}}});
+            let msg = message(&source, &HashMap::new(), "self", &HashMap::new()).unwrap();
+            let media = crate::message_view::media(&msg);
+            assert_eq!(media.kind, expected);
+            assert!(media.thumbnail.is_some());
+            assert!(media.original.is_some());
+        }
     }
 }

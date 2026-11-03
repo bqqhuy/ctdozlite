@@ -328,6 +328,25 @@ fn queues_from_auth(auth: &Value) -> Vec<(u16, u8)> {
     out
 }
 
+fn continuation_cursor(last: Option<&Value>, ids: &Value) -> Option<String> {
+    let scalar = |value: &Value| match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let last = last
+        .and_then(scalar)
+        .filter(|id| !id.is_empty() && id != "0")?;
+    let values = ids.as_array()?;
+    if values.len() > 1024 {
+        return None;
+    }
+    let mut ids = values.iter().map(scalar).collect::<Option<Vec<_>>>()?;
+    ids.sort();
+    ids.dedup();
+    Some(json!([last, ids]).to_string())
+}
+
 fn pull_frame(cmd: u16, sub_cmd: u8, req_id: &str) -> Vec<u8> {
     let data = json!({
         "first": true,
@@ -379,11 +398,13 @@ impl SyncTransport {
     pub(crate) async fn request(&self, epoch: u64, body: Value) -> Result<()> {
         self.write(epoch, CMD_SYNC_REQUEST, body).await
     }
-    pub(crate) async fn dispose(&self, epoch: u64, id: &str) -> Result<()> {
+    /// Dispose a known phone session with the official cancellation/success/error/outdated reason.
+    pub(crate) async fn dispose_reason(&self, epoch: u64, id: &str, reason: u8) -> Result<()> {
+        anyhow::ensure!(reason <= 3, "Invalid sync disposal reason");
         self.write(
             epoch,
             CMD_SYNC_DISPOSE,
-            json!({"data":{"syncId":id,"toDevice":0,"reason":1},"reqId":"req_dispose"}),
+            json!({"data":{"syncId":id,"toDevice":0,"reason":reason},"reqId":"req_dispose"}),
         )
         .await
     }
@@ -531,6 +552,8 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
+    let mut catchups =
+        std::collections::HashMap::<(u16, u8), crate::queue_catchup::CatchupGuard>::new();
     let mut writes_open = true;
     loop {
         tokio::select! {
@@ -651,25 +674,21 @@ async fn run_once(
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
-                if payload.pointer("/data/more").and_then(|v| v.as_i64()) == Some(1) {
+                if matches!(cmd,CMD_PULL_MSG_1_1|CMD_PULL_MSG_GROUP|CMD_PULL_MSG_513|CMD_PULL_MSG_514|CMD_PULL_MSG_515|CMD_PULL_MSG_517|CMD_PULL_MSG_518|CMD_CTRL_PULL_CTRL|CMD_CTRL_PULL_VOIP) {
                     let qkey = format!("{cmd}_{sub_cmd}");
-                    let last_id = payload
-                        .pointer("/data/lastActionId")
-                        .or_else(|| payload.pointer(&format!("/data/queueStatus/{qkey}/lastId")))
-                        .cloned()
-                        .unwrap_or(json!(1));
-                    let pre_ids = payload
-                        .pointer(&format!("/data/queueStatus/{qkey}/ids"))
-                        .cloned()
-                        .unwrap_or_else(|| json!([]));
-                    let id = format!("req_{req_id}");
-                    req_id += 1;
-                    let _ = ws
-                        .send(Message::Binary(
-                            pull_next_frame(cmd, sub_cmd, &id, last_id, pre_ids),
-                        ))
-                        .await;
-                    trace(format!("-> pull next {qkey} {id}"));
+                    let more=payload.pointer("/data/more").and_then(Value::as_i64)==Some(1);
+                    let last_id=payload.pointer("/data/lastActionId")
+                        .or_else(||payload.pointer(&format!("/data/queueStatus/{qkey}/lastId"))).cloned();
+                    let pre_ids=payload.pointer(&format!("/data/queueStatus/{qkey}/ids")).cloned().unwrap_or_else(||json!([]));
+                    let guard=catchups.entry((cmd,sub_cmd)).or_default();
+                    // Boundary IDs are part of the cursor; their order and JSON scalar type are not.
+                    let cursor=continuation_cursor(last_id.as_ref(),&pre_ids);
+                    if guard.observe(cursor,more,std::time::Instant::now()) {
+                        if let Some(last_id)=last_id {
+                            let id=format!("req_{req_id}");req_id+=1;
+                            ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,last_id,pre_ids))).await?;
+                        }
+                    }
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE) {
                     // Broadcast is bounded and never waits for phone decoding or disk writes.
@@ -684,6 +703,20 @@ async fn run_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuation_cursor_normalizes_ids_but_keeps_boundary_progress() {
+        assert_eq!(
+            continuation_cursor(Some(&json!(100)), &json!([99, 100])),
+            continuation_cursor(Some(&json!("100")), &json!(["100", "99", "99"]))
+        );
+        assert_ne!(
+            continuation_cursor(Some(&json!(100)), &json!([99])),
+            continuation_cursor(Some(&json!(100)), &json!([99, 100]))
+        );
+        assert!(continuation_cursor(None, &json!([])).is_none());
+        assert!(continuation_cursor(Some(&json!(0)), &json!([])).is_none());
+    }
 
     #[tokio::test]
     async fn phone_writes_require_current_epoch_and_acknowledgement() {
@@ -708,7 +741,7 @@ mod tests {
         write.ack.send(true).unwrap();
         assert!(task.await.unwrap().is_ok());
         ready_tx.send_replace(None);
-        assert!(transport.dispose(4, "synthetic").await.is_err());
+        assert!(transport.dispose_reason(4, "synthetic", 1).await.is_err());
         assert!(writes.try_recv().is_err());
     }
 

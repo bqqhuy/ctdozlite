@@ -38,6 +38,7 @@ pub enum ToolsCommand {
         query: String,
         hidden: bool,
     },
+    ExportHistory,
     Import {
         directory: bool,
         confirmed: bool,
@@ -177,6 +178,12 @@ impl ZaloGuiApp {
         }
     }
     fn render_tools_import(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Xuất lịch sử SQLite…").clicked() {
+            self.tools_command(ToolsCommand::ExportHistory);
+        }
+        ui.label(
+            "Bản xuất chỉ gồm lịch sử tin nhắn; không chứa lịch gửi hoặc cấu hình tự trả lời.",
+        );
         ui.label(
             "Nhập lịch sử SQLite/JSON tương thích từ máy khác. Dữ liệu nguồn được mở chỉ đọc.",
         );

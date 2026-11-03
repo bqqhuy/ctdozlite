@@ -70,7 +70,7 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 6, "Database requires a newer application version");
+        anyhow::ensure!(schema <= 8, "Database requires a newer application version");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -160,6 +160,34 @@ impl MessageStore {
                 PRAGMA user_version=6;")?;
             migration.commit()?;
         }
+        if schema < 7 {
+            // Old scoped/final-marker completion could acknowledge ranges with missing batches.
+            // Only derived coverage is invalidated; messages and server cursors are preserved.
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch("DELETE FROM phone_sync_ranges; PRAGMA user_version=7;")?;
+            migration.commit()?;
+        }
+        if schema < 8 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch("CREATE TABLE IF NOT EXISTS deleted_messages (
+                thread_id TEXT NOT NULL, msg_id TEXT NOT NULL,
+                client_message_id TEXT NOT NULL DEFAULT '', sender_id TEXT NOT NULL DEFAULT '', is_local INTEGER NOT NULL DEFAULT 0,
+                is_outgoing INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(thread_id,msg_id));
+                CREATE INDEX IF NOT EXISTS deleted_client ON deleted_messages(thread_id,client_message_id,is_outgoing);
+                CREATE TABLE IF NOT EXISTS composer_drafts(thread_id TEXT PRIMARY KEY,text TEXT NOT NULL);
+                CREATE TRIGGER IF NOT EXISTS reject_deleted_replay BEFORE INSERT ON messages
+                WHEN EXISTS(SELECT 1 FROM deleted_messages WHERE thread_id=NEW.thread_id AND msg_id=NEW.msg_id)
+                    OR EXISTS(SELECT 1 FROM deleted_messages d WHERE d.thread_id=NEW.thread_id
+                        AND d.client_message_id!='' AND d.client_message_id!='0'
+                        AND d.client_message_id=CASE WHEN json_valid(NEW.raw_json) THEN json_extract(NEW.raw_json,'$.message_state.client_message_id') END
+                        AND d.is_outgoing=NEW.is_outgoing
+                        AND (d.is_local=1 OR NEW.msg_id GLOB 'phone-client:*' OR NEW.msg_id GLOB 'out_*' OR NEW.msg_id GLOB 'local_*')
+                        AND (NEW.is_outgoing=1 OR (d.sender_id!='' AND d.sender_id=CASE WHEN json_valid(NEW.raw_json) THEN NEW.raw_json -> '$.message_state.wire_ref.sender' END)))
+                BEGIN SELECT RAISE(IGNORE); END;
+                PRAGMA user_version=8;")?;
+            migration.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -228,8 +256,56 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Insert a message. Returns `true` if a new row was inserted, `false` if already existed.
+    /// Update only renewed media metadata, preserving delivery, recall and local flags.
+    /// # Errors
+    /// Returns invalid metadata or database failures; never creates a missing message.
+    pub(crate) fn update_media_metadata(&self, thread: &str, message: &ChatMessage) -> Result<()> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT raw_json FROM messages WHERE thread_id=?1 AND msg_id=?2",
+                params![thread, message.id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else { return Ok(()) };
+        let mut old: serde_json::Value = serde_json::from_str(&raw)?;
+        anyhow::ensure!(old.is_object(), "Invalid media metadata");
+        if old
+            .get("message_state")
+            .and_then(|s| s.get("kind"))
+            .and_then(|k| k.as_str())
+            == Some("recall")
+        {
+            return Ok(());
+        }
+        old["link_thumb"] = serde_json::json!(message.link_thumb);
+        old["link_url"] = serde_json::json!(message.link_url);
+        if let Some(v) = message.wire_ref.fields.get("renewed_media") {
+            let mut node = &mut old;
+            for key in ["message_state", "wire_ref", "fields"] {
+                if node.get(key).is_none() {
+                    node[key] = serde_json::json!({});
+                }
+                anyhow::ensure!(
+                    node.get(key).is_some_and(|v| v.is_object()),
+                    "Invalid media metadata parent"
+                );
+                node = &mut node[key];
+            }
+            node["renewed_media"] = v.clone();
+        }
+        self.conn.execute("UPDATE messages SET raw_json=?1 WHERE thread_id=?2 AND msg_id=?3 AND text != '[Tin nhắn đã thu hồi]'",params![old.to_string(),thread,message.id])?;
+        Ok(())
+    }
+    /// Insert or reconcile a message without duplicating its composite identity.
+    /// # Errors
+    /// Returns SQLite or stored metadata validation failures.
     pub fn upsert_message(&self, msg: &StoredMessage) -> Result<bool> {
+        if self.is_deleted_message(msg)? {
+            return Ok(false);
+        }
         let rows = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(
@@ -246,6 +322,10 @@ impl MessageStore {
             ],
         )?;
         if rows == 0 {
+            // Another writer may have deleted the row after the admission check.
+            if self.is_deleted_message(msg)? {
+                return Ok(false);
+            }
             let (old_text, old_raw): (String, String) = self.conn.query_row(
                 "SELECT text,raw_json FROM messages WHERE thread_id=?1 AND msg_id=?2",
                 params![msg.thread_id, msg.msg_id],
@@ -286,6 +366,18 @@ impl MessageStore {
             }
             if !new.is_object() {
                 new = serde_json::json!({});
+            }
+            if let Some(renewed) = old.pointer("/message_state/wire_ref/fields/renewed_media") {
+                if let Some(url) = renewed.get("original") {
+                    new["link_url"] = url.clone();
+                }
+                if let Some(thumb) = renewed.get("thumbnail") {
+                    new["link_thumb"] = thumb.clone();
+                }
+                state
+                    .wire_ref
+                    .fields
+                    .insert("renewed_media".into(), renewed.clone());
             }
             new["message_state"] = state.durable_state();
             if recalled {
@@ -376,17 +468,167 @@ impl MessageStore {
         Ok(())
     }
 
-    /// Delete a message from local SQLite store when user selects "Xóa chỉ ở phía tôi".
+    /// Remove message content while retaining only identity needed to reject history replay.
+    /// # Errors
+    /// Returns SQLite failures; deletion and its marker commit atomically.
     pub fn delete_message(&mut self, thread_id: &str, msg_id: &str, ts: i64) -> Result<()> {
+        use rusqlite::OptionalExtension;
         let key = if msg_id.is_empty() {
-            format!("{thread_id}_{ts}")
+            format!("msg_{ts}")
         } else {
             msg_id.to_owned()
         };
-        self.conn.execute(
-            "DELETE FROM messages WHERE thread_id = ?1 AND msg_id = ?2",
-            params![thread_id, key],
+        let row = self
+            .conn
+            .query_row(
+                "SELECT raw_json,is_outgoing FROM messages WHERE thread_id=?1 AND msg_id=?2",
+                params![thread_id, key],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                        r.get::<_, bool>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let mut message = ChatMessage {
+            id: key,
+            ts,
+            ..Default::default()
+        };
+        if let Some((raw, outgoing)) = row {
+            message.is_outgoing = outgoing;
+            if let Some(state) = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.get("message_state").cloned())
+            {
+                message.restore_state(&state)?;
+            }
+        }
+        self.delete_chat_message(thread_id, &message)
+    }
+
+    /// Delete an acknowledged message, including a local-only row not yet persisted.
+    /// # Errors
+    /// Returns invalid identity or SQLite failures without a partial deletion.
+    pub fn delete_chat_message(&mut self, thread: &str, message: &ChatMessage) -> Result<()> {
+        anyhow::ensure!(!thread.is_empty(), "Missing thread identity");
+        let key = if message.id.is_empty() {
+            format!("msg_{}", message.ts)
+        } else {
+            message.id.clone()
+        };
+        let local = key.starts_with("out_") || key.starts_with("local_");
+        let sender = message
+            .wire_ref
+            .sender
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        let tx = self.conn.savepoint()?;
+        tx.execute("INSERT INTO deleted_messages(thread_id,msg_id,client_message_id,is_local,is_outgoing,sender_id) VALUES(?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(thread_id,msg_id) DO UPDATE SET client_message_id=CASE WHEN excluded.client_message_id='' THEN deleted_messages.client_message_id ELSE excluded.client_message_id END",
+            params![thread,key,message.client_message_id,local,message.is_outgoing,sender])?;
+        tx.execute(
+            "DELETE FROM messages WHERE thread_id=?1 AND msg_id=?2",
+            params![thread, key],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn is_deleted_message(&self, message: &StoredMessage) -> Result<bool> {
+        let raw = serde_json::from_str::<serde_json::Value>(&message.raw_json).unwrap_or_default();
+        let client = raw
+            .pointer("/message_state/client_message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let sender = raw
+            .pointer("/message_state/wire_ref/sender")
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default();
+        // Two concrete server IDs remain distinct even when a broken server/client repeats a client ID.
+        let provisional = message.msg_id.starts_with("phone-client:")
+            || message.msg_id.starts_with("out_")
+            || message.msg_id.starts_with("local_");
+        Ok(self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM deleted_messages WHERE thread_id=?1 AND msg_id=?2)
+            OR (?3!='' AND ?3!='0' AND EXISTS(SELECT 1 FROM deleted_messages WHERE thread_id=?1 AND client_message_id=?3
+                AND is_outgoing=?4 AND (is_local=1 OR ?5=1) AND (?4=1 OR (?6!='' AND sender_id=?6))))")?
+            .query_row(params![message.thread_id,message.msg_id,client,message.is_outgoing,provisional,sender],|r|r.get(0))?)
+    }
+
+    /// Filter replayed deleted messages before UI publication and notification delivery.
+    /// # Errors
+    /// Returns SQLite failures; callers must not publish an unchecked batch on failure.
+    pub(crate) fn filter_deleted(&self, threads: &mut [Thread]) -> Result<()> {
+        for thread in threads {
+            let mut kept = Vec::with_capacity(thread.messages.len());
+            let mut removed = false;
+            for message in std::mem::take(&mut thread.messages) {
+                let mut row = StoredMessage::from(&message);
+                row.thread_id = thread.id.clone();
+                if row.msg_id.is_empty() {
+                    row.msg_id = format!("{}_{}", thread.id, row.ts);
+                }
+                if self.is_deleted_message(&row)? {
+                    removed = true;
+                } else {
+                    kept.push(message);
+                }
+            }
+            thread.messages = kept;
+            let last_deleted = !thread.presentation.last_message_id.is_empty()
+                && self.is_deleted_message(&StoredMessage {
+                    thread_id: thread.id.clone(),
+                    msg_id: thread.presentation.last_message_id.clone(),
+                    sender_id: String::new(),
+                    sender_name: String::new(),
+                    text: String::new(),
+                    msg_type: String::new(),
+                    ts: 0,
+                    is_outgoing: false,
+                    raw_json: "{}".into(),
+                })?;
+            if removed || last_deleted {
+                thread.refresh_after_removal();
+                if thread.messages.is_empty() {
+                    thread.unread.fresh = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Load one account-scoped composer draft without loading other conversations.
+    /// # Errors
+    /// Returns SQLite failures.
+    pub(crate) fn composer_draft(&self, thread: &str) -> Result<String> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT text FROM composer_drafts WHERE thread_id=?1",
+                [thread],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Save literal composer text, or remove an empty draft; never trims Vietnamese input.
+    /// # Errors
+    /// Rejects an empty thread, text above 64 KiB, or SQLite failures.
+    pub(crate) fn save_composer_draft(&self, thread: &str, text: &str) -> Result<()> {
+        anyhow::ensure!(
+            !thread.is_empty() && text.len() <= 64 * 1024,
+            "Invalid composer draft"
+        );
+        if text.is_empty() {
+            self.conn
+                .execute("DELETE FROM composer_drafts WHERE thread_id=?1", [thread])?;
+        } else {
+            self.conn.execute("INSERT INTO composer_drafts(thread_id,text) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET text=excluded.text",params![thread,text])?;
+        }
         Ok(())
     }
 
@@ -485,8 +727,51 @@ impl MessageStore {
     /// # Errors
     /// Propagates SQLite failures; a later explicit sync may download history again.
     pub fn clear_thread_history(&mut self, id: &str) -> Result<()> {
-        anyhow::ensure!(!id.trim().is_empty(), "Missing thread identity");
+        self.remove_thread_history(id)
+    }
+
+    /// Delete a server-acknowledged conversation and its visible/archived row identities atomically.
+    /// # Errors
+    /// Returns invalid identity or SQLite failures; content and markers roll back together.
+    pub(crate) fn delete_conversation(&mut self, id: &str, visible: &[ChatMessage]) -> Result<()> {
+        anyhow::ensure!(!id.is_empty(), "Missing thread identity");
         let tx = self.conn.transaction()?;
+        tx.execute("INSERT OR IGNORE INTO deleted_messages(thread_id,msg_id,client_message_id,is_outgoing,sender_id)
+            SELECT thread_id,msg_id,CASE WHEN json_valid(raw_json) THEN COALESCE(json_extract(raw_json,'$.message_state.client_message_id'),'') ELSE '' END,
+            is_outgoing,CASE WHEN json_valid(raw_json) THEN COALESCE(raw_json -> '$.message_state.wire_ref.sender','') ELSE '' END
+            FROM messages WHERE thread_id=?1",[id])?;
+        for message in visible {
+            let key = if message.id.is_empty() {
+                format!("msg_{}", message.ts)
+            } else {
+                message.id.clone()
+            };
+            let sender = message
+                .wire_ref
+                .sender
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default();
+            tx.execute("INSERT OR IGNORE INTO deleted_messages(thread_id,msg_id,client_message_id,is_outgoing,sender_id,is_local) VALUES(?1,?2,?3,?4,?5,?6)",
+                params![id,key,message.client_message_id,message.is_outgoing,sender,key.starts_with("out_")||key.starts_with("local_")])?;
+        }
+        for table in [
+            "messages",
+            "history_sync",
+            "phone_sync_ranges",
+            "threads",
+            "thread_preferences",
+            "composer_drafts",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE thread_id=?1"), [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn remove_thread_history(&mut self, id: &str) -> Result<()> {
+        anyhow::ensure!(!id.trim().is_empty(), "Missing thread identity");
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM messages WHERE thread_id=?1", params![id])?;
         tx.execute("DELETE FROM history_sync WHERE thread_id=?1", params![id])?;
         tx.execute(
@@ -604,6 +889,7 @@ impl MessageStore {
         limit_per_thread: usize,
         include_unlisted: bool,
     ) -> Result<usize> {
+        self.filter_deleted(threads)?;
         crate::chat::deduplicate_threads(threads, None);
 
         let stored_threads = self.all_threads().unwrap_or_default();
@@ -1538,7 +1824,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                6
+                8
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -1710,7 +1996,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            6
+            8
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,
@@ -1744,5 +2030,314 @@ mod phone_resume_tests {
             .is_empty());
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod coverage_migration_tests {
+    use super::*;
+    #[test]
+    fn invalidates_old_coverage_once_but_preserves_messages_and_new_coverage() {
+        let root = std::env::temp_dir().join(format!(
+            "coverage-migration-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("history.db");
+        {
+            let store = MessageStore::open(&path).unwrap();
+            store.conn.execute_batch("INSERT INTO messages(thread_id,msg_id,text,ts,is_outgoing,sender_id,sender_name,msg_type,raw_json) VALUES('a','m','keep',0,0,'b','B','text','{}');INSERT INTO phone_sync_ranges VALUES('oneone/a','a',0,100);PRAGMA user_version=6;").unwrap();
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert!(store.phone_sync_ranges().unwrap().is_empty());
+            assert_eq!(store.messages_for("a", 10).unwrap().len(), 1);
+            store
+                .save_phone_sync_ranges(&[(
+                    "oneone/a".into(),
+                    PhoneSyncRange {
+                        thread_id: "a".into(),
+                        from_ts: 0,
+                        to_ts: 100,
+                    },
+                )])
+                .unwrap();
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(store.phone_sync_ranges().unwrap().len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod media_projection_tests {
+    use super::*;
+    #[test]
+    fn renewal_preserves_delivery_and_recall_and_survives_old_history_replay() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let old = ChatMessage {
+            id: "m".into(),
+            text: "caption".into(),
+            client_message_id: "11".into(),
+            kind: crate::message_model::MessageKind::Photo,
+            delivery: crate::message_model::DeliveryState::ServerAccepted,
+            link_url: Some("https://photo.zdn.vn/old".into()),
+            ..Default::default()
+        };
+        let mut row = StoredMessage::from(&old);
+        row.thread_id = "thread".into();
+        store.upsert_message(&row).unwrap();
+        let mut updated = old.clone();
+        let projection = crate::message_view::Media {
+            kind: crate::message_view::MediaKind::Photo,
+            original: Some("https://photo.zdn.vn/new".into()),
+            preview: Some("https://photo.zdn.vn/new".into()),
+            ..Default::default()
+        };
+        updated.link_url = projection.original.clone();
+        updated.wire_ref.fields.insert(
+            "renewed_media".into(),
+            serde_json::to_value(projection).unwrap(),
+        );
+        store.update_media_metadata("thread", &updated).unwrap();
+        store.upsert_message(&row).unwrap();
+        let mut threads = vec![Thread {
+            id: "thread".into(),
+            ..Default::default()
+        }];
+        store.hydrate_selected_threads(&mut threads, 20).unwrap();
+        let got = &threads[0].messages[0];
+        assert_eq!(got.delivery, old.delivery);
+        assert_eq!(got.link_url.as_deref(), Some("https://photo.zdn.vn/new"));
+        assert_eq!(
+            crate::message_view::media(got).original.as_deref(),
+            Some("https://photo.zdn.vn/new")
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET text='[Tin nhắn đã thu hồi]' WHERE thread_id='thread'",
+                [],
+            )
+            .unwrap();
+        store.update_media_metadata("thread", &updated).unwrap();
+        assert_eq!(
+            store.messages_for("thread", 1).unwrap()[0].text,
+            "[Tin nhắn đã thu hồi]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod draft_and_delete_tests {
+    use super::*;
+    fn message(id: &str, client: &str, outgoing: bool) -> ChatMessage {
+        let mut message = ChatMessage {
+            id: id.into(),
+            client_message_id: client.into(),
+            sender: "Người gửi thử".into(),
+            text: "Nội dung phải bị xóa".into(),
+            ts: 100,
+            is_outgoing: outgoing,
+            ..Default::default()
+        };
+        message.wire_ref.sender = Some(serde_json::json!("user-1"));
+        message
+    }
+    fn row(thread: &str, message: &ChatMessage) -> StoredMessage {
+        let mut row = StoredMessage::from(message);
+        row.thread_id = thread.into();
+        row
+    }
+    #[test]
+    fn deleted_message_cannot_reappear_through_persist_hydrate_or_ui_snapshot() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let deleted = message("server-1", "client-1", false);
+        store.upsert_message(&row("thread-a", &deleted)).unwrap();
+        store.delete_chat_message("thread-a", &deleted).unwrap();
+        assert!(!store.upsert_message(&row("thread-a", &deleted)).unwrap());
+        assert!(store.messages_for("thread-a", 20).unwrap().is_empty());
+        let mut stale = vec![Thread {
+            id: "thread-a".into(),
+            preview: deleted.text.clone(),
+            messages: vec![deleted.clone()],
+            ..Default::default()
+        }];
+        stale[0].refresh_sidebar_presentation();
+        persist_threads(&mut store, &stale).unwrap();
+        store.hydrate_selected_threads(&mut stale, 20).unwrap();
+        assert!(stale[0].messages.is_empty());
+        assert!(stale[0].preview.is_empty());
+        assert!(store.upsert_message(&row("thread-b", &deleted)).unwrap()); // (INV-4)
+        let marker_body_columns:i64=store.conn.query_row("SELECT count(*) FROM pragma_table_info('deleted_messages') WHERE name IN ('text','raw_json','sender_name')",[],|r|r.get(0)).unwrap();
+        assert_eq!(marker_body_columns, 0);
+    }
+    #[test]
+    fn phone_client_alias_is_suppressed_without_merging_two_real_server_ids() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let deleted = message("server-1", "client-1", false);
+        store.delete_chat_message("thread-a", &deleted).unwrap();
+        let alias = message("phone-client:6:user-1:client-1", "client-1", false);
+        assert!(!store.upsert_message(&row("thread-a", &alias)).unwrap());
+        let different_server = message("server-2", "client-1", false);
+        assert!(store
+            .upsert_message(&row("thread-a", &different_server))
+            .unwrap());
+        let mut another_sender = alias.clone();
+        another_sender.wire_ref.sender = Some(serde_json::json!("user-2"));
+        assert!(store
+            .upsert_message(&row("thread-a", &another_sender))
+            .unwrap());
+        assert!(store.upsert_message(&row("thread-b", &alias)).unwrap());
+    }
+    #[test]
+    fn deleted_local_send_stays_deleted_after_server_echo() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store
+            .delete_chat_message("thread-a", &message("out_1", "client-1", true))
+            .unwrap();
+        assert!(!store
+            .upsert_message(&row("thread-a", &message("server-1", "client-1", true)))
+            .unwrap());
+        assert!(store
+            .upsert_message(&row("thread-a", &message("server-2", "client-2", true)))
+            .unwrap());
+        assert!(store
+            .upsert_message(&row("thread-a", &message("server-3", "client-1", false)))
+            .unwrap());
+    }
+    #[test]
+    fn delete_marker_and_content_roll_back_together_on_storage_failure() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = message("server-1", "client-1", true);
+        store.upsert_message(&row("thread-a", &message)).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON messages BEGIN SELECT RAISE(ABORT,'fixture');END;").unwrap();
+        assert!(store.delete_chat_message("thread-a", &message).is_err());
+        assert_eq!(store.messages_for("thread-a", 20).unwrap().len(), 1);
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM deleted_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[test]
+    fn remote_conversation_delete_marks_rows_but_local_cache_clear_allows_refetch() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = message("server-1", "client-1", true);
+        store.upsert_message(&row("local-clear", &message)).unwrap();
+        store.clear_thread_history("local-clear").unwrap();
+        assert!(store.upsert_message(&row("local-clear", &message)).unwrap());
+        store
+            .upsert_message(&row("remote-delete", &message))
+            .unwrap();
+        store.save_composer_draft("remote-delete", "nháp").unwrap();
+        store.delete_conversation("remote-delete", &[]).unwrap();
+        assert!(!store
+            .upsert_message(&row("remote-delete", &message))
+            .unwrap());
+        assert_eq!(store.composer_draft("remote-delete").unwrap(), "");
+        // A genuinely new message in the same conversation remains receivable.
+        assert!(store
+            .upsert_message(&row(
+                "remote-delete",
+                &self::message("new", "new-client", false)
+            ))
+            .unwrap());
+    }
+    #[test]
+    fn draft_is_literal_scoped_and_empty_draft_is_removed() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let other_account = MessageStore::open(":memory:").unwrap();
+        let literal = "  Tiếng Việt đang gõ\n2*3*4  ";
+        store.save_composer_draft("thread-a", literal).unwrap();
+        assert_eq!(store.composer_draft("thread-a").unwrap(), literal);
+        assert_eq!(store.composer_draft("thread-b").unwrap(), "");
+        assert_eq!(other_account.composer_draft("thread-a").unwrap(), "");
+        store.save_composer_draft("thread-a", "").unwrap();
+        assert_eq!(store.composer_draft("thread-a").unwrap(), "");
+        assert!(store.save_composer_draft("", literal).is_err());
+        assert!(store
+            .save_composer_draft("thread-a", &"x".repeat(65537))
+            .is_err());
+    }
+    #[test]
+    fn schema_seven_migration_preserves_coverage_drafts_and_markers_after_reopen() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-followup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("fixture.db");
+        {
+            let store = MessageStore::open(&path).unwrap();
+            store.conn.execute_batch("DROP TABLE composer_drafts;DROP TABLE deleted_messages;INSERT INTO phone_sync_ranges VALUES('p','thread-a',0,100);PRAGMA user_version=7;").unwrap();
+        }
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            assert_eq!(store.phone_sync_ranges().unwrap().len(), 1);
+            store
+                .save_composer_draft("thread-a", "Bản nháp sau khởi động")
+                .unwrap();
+            store
+                .delete_chat_message("thread-a", &message("server-1", "client-1", false))
+                .unwrap();
+        }
+        {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(
+                store.composer_draft("thread-a").unwrap(),
+                "Bản nháp sau khởi động"
+            );
+            assert!(!store
+                .upsert_message(&row("thread-a", &message("server-1", "client-1", false)))
+                .unwrap());
+            assert_eq!(store.phone_sync_ranges().unwrap().len(), 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod deleted_insert_race_tests {
+    use super::*;
+    #[test]
+    fn sqlite_admission_rejects_a_deleted_row_even_if_an_older_writer_bypasses_rust_checks() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = ChatMessage {
+            id: "server-1".into(),
+            client_message_id: "client-1".into(),
+            is_outgoing: true,
+            ..Default::default()
+        };
+        store.delete_chat_message("thread-a", &message).unwrap();
+        let raw = serde_json::json!({"message_state":{"client_message_id":"client-1"}}).to_string();
+        let exact=store.conn.execute("INSERT OR IGNORE INTO messages(thread_id,msg_id,text,is_outgoing,raw_json) VALUES('thread-a','server-1','must not reappear',1,?1)",[&raw]).unwrap();
+        assert_eq!(exact, 0);
+        let alias=store.conn.execute("INSERT OR IGNORE INTO messages(thread_id,msg_id,text,is_outgoing,raw_json) VALUES('thread-a','phone-client:client-1','must not reappear',1,?1)",[&raw]).unwrap();
+        assert_eq!(alias, 0);
+        assert!(store.messages_for("thread-a", 20).unwrap().is_empty());
+    }
+    #[test]
+    fn empty_id_legacy_row_uses_the_same_key_for_persistence_and_delete() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = ChatMessage {
+            ts: 42,
+            text: "legacy".into(),
+            ..Default::default()
+        };
+        let thread = Thread {
+            id: "thread-a".into(),
+            messages: vec![message.clone()],
+            ..Default::default()
+        };
+        persist_threads(&mut store, std::slice::from_ref(&thread)).unwrap();
+        store.delete_chat_message("thread-a", &message).unwrap();
+        assert_eq!(persist_threads(&mut store, &[thread]).unwrap(), 0);
+        assert!(store.messages_for("thread-a", 20).unwrap().is_empty());
     }
 }

@@ -184,7 +184,7 @@ pub fn preview(t: &Thread) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MediaKind {
     Photo,
     Video,
@@ -192,7 +192,7 @@ pub enum MediaKind {
     #[default]
     None,
 }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Media {
     pub kind: MediaKind,
     pub thumbnail: Option<String>,
@@ -212,8 +212,71 @@ fn url(v: &Value) -> Option<String> {
         && u.password().is_none())
     .then(|| s.to_owned())
 }
+fn legacy_media(m: &ChatMessage) -> Option<(MediaKind, String)> {
+    if m.sticker_id.is_some() || m.text.starts_with('[') {
+        return None;
+    }
+    let raw = m.link_url.as_deref().unwrap_or(m.text.trim()).trim();
+    if raw.len() > 16384 || raw.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(raw).ok()?;
+    if !crate::media_download::allowed(&parsed) || parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    let on = |family: &str| {
+        host == family || host.strip_suffix(family).is_some_and(|p| p.ends_with('.'))
+    };
+    let bare = m.text.trim() == raw;
+    if on("dlfl.vn") {
+        let plain = m
+            .wire_ref
+            .original_type
+            .as_ref()
+            .and_then(Value::as_str)
+            .is_some_and(|s| matches!(s, "chat.text" | "text" | "webchat"));
+        let filename = m.text.trim().rsplit_once('.').is_some_and(|(stem, ext)| {
+            !stem.is_empty()
+                && !ext.is_empty()
+                && ext.len() <= 16
+                && ext.bytes().all(|b| b.is_ascii_alphanumeric())
+        }) && !m.text.contains(['\n', '\r', '/', '\\']);
+        if bare
+            || (!plain
+                && matches!(
+                    m.kind,
+                    crate::message_model::MessageKind::Unknown
+                        | crate::message_model::MessageKind::Link
+                )
+                && filename)
+        {
+            return Some((MediaKind::File, raw.into()));
+        }
+        return None;
+    }
+    if !bare {
+        return None;
+    }
+    let path = parsed.path().to_ascii_lowercase();
+    if path.ends_with(".mp4")
+        || path.ends_with(".webm")
+        || host.split('.').any(|label| label.starts_with("video-"))
+    {
+        return Some((MediaKind::Video, raw.into()));
+    }
+    if [".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"]
+        .iter()
+        .any(|ext| path.ends_with(ext))
+        || host.split('.').any(|label| label.starts_with("photo-"))
+    {
+        return Some((MediaKind::Photo, raw.into()));
+    }
+    None
+}
 pub fn media(m: &ChatMessage) -> Media {
     use crate::message_model::MessageKind;
+    let legacy = legacy_media(m);
     let kind = if matches!(m.kind, MessageKind::Video)
         || m.link_src.as_deref() == Some("Video Zalo")
         || m.text.starts_with("[Video]")
@@ -228,17 +291,37 @@ pub fn media(m: &ChatMessage) -> Media {
     {
         MediaKind::File
     } else {
-        MediaKind::None
+        legacy.as_ref().map_or(MediaKind::None, |v| v.0)
     };
     let mut out = Media {
         kind,
         thumbnail: m.link_thumb.clone().filter(|s| !s.is_empty()),
-        original: m.link_url.clone().filter(|s| !s.is_empty()),
+        original: m
+            .link_url
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| legacy.as_ref().map(|v| v.1.clone())),
         name: m.link_title.clone().unwrap_or_default(),
         ..Default::default()
     };
+    if kind == MediaKind::File && legacy.as_ref().is_some_and(|v| v.0 == MediaKind::File) {
+        if reqwest::Url::parse(&out.name).is_ok() {
+            out.name.clear();
+        }
+        if out.name.is_empty() && m.text.trim() != out.original.as_deref().unwrap_or_default() {
+            out.name = m.text.trim().to_owned();
+        }
+    }
     if kind == MediaKind::None {
         return out;
+    }
+    if let Some(renewed) = m
+        .wire_ref
+        .fields
+        .get("renewed_media")
+        .and_then(|v| serde_json::from_value::<Media>(v.clone()).ok())
+    {
+        return renewed;
     }
     let mut values = Vec::new();
     if let Some(v) = &m.history_source {
@@ -250,6 +333,7 @@ pub fn media(m: &ChatMessage) -> Media {
     values.extend(m.wire_ref.fields.get("content").cloned());
     values.extend(m.wire_ref.fields.get("msgInfo").cloned());
     let mut thumb = None;
+    let mut normal_thumbnail = None;
     let mut normal = None;
     let mut original = None;
     for v in values {
@@ -268,6 +352,7 @@ pub fn media(m: &ChatMessage) -> Media {
             for k in ["thumbUrl", "thumb", "previewThumb"] {
                 thumb = thumb.or_else(|| v.get(k).and_then(url));
             }
+            normal_thumbnail = normal_thumbnail.or_else(|| v.get("normalUrl").and_then(url));
             for k in ["normalUrl", "rawUrl"] {
                 normal = normal.or_else(|| v.get(k).and_then(url));
             }
@@ -306,9 +391,11 @@ pub fn media(m: &ChatMessage) -> Media {
             out.duration = out.duration.or_else(|| number("duration"));
         }
     }
-    out.thumbnail = thumb.or(out.thumbnail);
+    out.thumbnail = thumb.or(out.thumbnail).or(normal_thumbnail);
     out.original = original.or(out.original).or_else(|| normal.clone());
-    out.preview = normal.or_else(|| out.original.clone());
+    out.preview = normal
+        .or_else(|| out.original.clone())
+        .or_else(|| out.thumbnail.clone());
     if out.name.is_empty() {
         out.name = match kind {
             MediaKind::Video => "Video.mp4",
@@ -358,5 +445,50 @@ mod tests {
         assert!(view.thumbnail.unwrap().ends_with("/thumb"));
         assert!(view.preview.unwrap().ends_with("/preview"));
         assert!(view.original.unwrap().ends_with("/original"));
+    }
+}
+
+#[cfg(test)]
+mod legacy_media_tests {
+    use super::*;
+    #[test]
+    fn old_video_url_and_filename_rows_become_media_without_rewriting_messages() {
+        let source = "https://video-stal-44.dlmd.me/no/file";
+        let m = ChatMessage {
+            text: source.into(),
+            link_url: Some(source.into()),
+            ..Default::default()
+        };
+        let view = media(&m);
+        assert_eq!(view.kind, MediaKind::Video);
+        assert_eq!(view.original.as_deref(), Some(source));
+        assert_eq!(m.text, source);
+        let file = ChatMessage {
+            text: "Báo cáo.doc".into(),
+            link_url: Some("https://file-stal-3.dlfl.vn/file/renewMedia.doc".into()),
+            ..Default::default()
+        };
+        let view = media(&file);
+        assert_eq!(view.kind, MediaKind::File);
+        assert_eq!(view.name, "Báo cáo.doc");
+    }
+    #[test]
+    fn ordinary_text_and_lookalike_hosts_are_not_legacy_media() {
+        let mut m = ChatMessage {
+            text: "Gửi bạn báo cáo.doc".into(),
+            link_url: Some("https://file-stal-3.dlfl.vn/file".into()),
+            kind: crate::message_model::MessageKind::Text,
+            ..Default::default()
+        };
+        assert_eq!(media(&m).kind, MediaKind::None);
+        for raw in [
+            "https://video-stal-44.dlmd.me.evil.invalid/a",
+            "https://evildlfl.vn/a",
+            "https://u:p@video-stal-44.dlmd.me/a",
+        ] {
+            m.text = raw.into();
+            m.link_url = Some(raw.into());
+            assert_eq!(media(&m).kind, MediaKind::None);
+        }
     }
 }

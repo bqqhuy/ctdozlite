@@ -20,12 +20,59 @@ impl Drop for Staged {
         let _ = std::fs::remove_file(&self.path);
     }
 }
+struct Feed {
+    receiver: tokio::sync::mpsc::Receiver<Batch>,
+    ready: tokio::sync::watch::Receiver<bool>,
+    pending: std::collections::VecDeque<Batch>,
+    closed: bool,
+    metadata_seen: bool,
+}
+fn batch_feed(
+    receiver: tokio::sync::mpsc::Receiver<Batch>,
+    ready: tokio::sync::watch::Receiver<bool>,
+) -> impl futures_util::Stream<Item = Result<Batch>> {
+    stream::unfold(
+        Feed {
+            receiver,
+            ready,
+            pending: Default::default(),
+            closed: false,
+            metadata_seen: false,
+        },
+        |mut state| async move {
+            loop {
+                let ready = *state.ready.borrow();
+                if let Some(index) = state.pending.iter().position(|b| b.metadata || ready) {
+                    return state.pending.remove(index).map(|batch| (Ok(batch), state));
+                }
+                if state.closed && state.pending.is_empty() {
+                    return None;
+                }
+                if state.closed && !state.metadata_seen {
+                    state.pending.clear();
+                    return Some((
+                        Err(anyhow::anyhow!("Không nhận được metadata giải mã")),
+                        state,
+                    ));
+                }
+                tokio::select! {
+                    next=state.receiver.recv(),if !state.closed=>match next {
+                        Some(batch)=>{state.metadata_seen|=batch.metadata; if state.pending.len()>=2048 {state.pending.clear();state.closed=true;return Some((Err(anyhow::anyhow!("Hàng đợi descriptor vượt giới hạn")),state));}state.pending.push_back(batch);},
+                        None=>state.closed=true,
+                    },
+                    changed=state.ready.changed(),if !ready=>{if changed.is_err(){return None;}},
+                }
+            }
+        },
+    )
+}
 pub(super) fn start<F: FnMut(String) + Send + 'static>(
     session: Session,
-    batches: Vec<Batch>,
+    batches: tokio::sync::mpsc::Receiver<Batch>,
     cancel: Arc<AtomicBool>,
     progress: Arc<std::sync::Mutex<F>>,
     round: usize,
+    ready: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::sync::mpsc::Receiver<Result<Staged>> {
     let (tx, rx) = tokio::sync::mpsc::channel(2);
     tokio::spawn(async move {
@@ -47,48 +94,53 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                 .await;
             return;
         }
-        let mut jobs = stream::iter(batches.into_iter().map(|batch| {
-            let directory = directory.clone();
-            let session = session.clone();
-            let cancel = cancel.clone();
-            let progress = progress.clone();
-            async move {
-                ensure!(
-                    session.is_active() && !cancel.load(Ordering::Acquire),
-                    "Đã dừng tải lịch sử"
-                );
-                let staged = Staged {
-                    batch,
-                    path: directory.join(format!("{}.part", crate::chat::next_client_message_id())),
-                };
-                let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
-                assets::download_to(
-                    &staged.batch.url,
-                    &staged.path,
-                    &session,
-                    &cancel,
-                    |bytes, total| {
-                        if last.elapsed() >= std::time::Duration::from_millis(200) {
-                            if let Ok(mut p) = progress.lock() {
-                                p(format!(
-                                    "Tải về: lượt {round} • gói {} • {} / {} KiB",
-                                    staged.batch.index,
-                                    bytes / 1024,
-                                    total
-                                        .map(|n| (n / 1024).to_string())
-                                        .unwrap_or_else(|| "?".into())
-                                ));
+        let feed = batch_feed(batches, ready);
+        let jobs = feed
+            .map(|batch| {
+                let directory = directory.clone();
+                let session = session.clone();
+                let cancel = cancel.clone();
+                let progress = progress.clone();
+                async move {
+                    let batch = batch?;
+                    ensure!(
+                        session.is_active() && !cancel.load(Ordering::Acquire),
+                        "Đã dừng tải lịch sử"
+                    );
+                    let staged = Staged {
+                        batch,
+                        path: directory
+                            .join(format!("{}.part", crate::chat::next_client_message_id())),
+                    };
+                    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                    assets::download_to(
+                        &staged.batch.url,
+                        &staged.path,
+                        &session,
+                        &cancel,
+                        |bytes, total| {
+                            if last.elapsed() >= std::time::Duration::from_millis(200) {
+                                if let Ok(mut p) = progress.lock() {
+                                    p(format!(
+                                        "Tải về: lượt {round} • gói {} • {} / {} KiB",
+                                        staged.batch.index,
+                                        bytes / 1024,
+                                        total
+                                            .map(|n| (n / 1024).to_string())
+                                            .unwrap_or_else(|| "?".into())
+                                    ));
+                                }
+                                last = std::time::Instant::now();
                             }
-                            last = std::time::Instant::now();
-                        }
-                    },
-                )
-                .await?;
-                Ok(staged)
-            }
-        }))
-        .buffered(2);
-        while let Some(result) = jobs.next().await {
+                        },
+                    )
+                    .await?;
+                    Ok(staged)
+                }
+            })
+            .buffer_unordered(2);
+        let mut jobs = std::pin::pin!(jobs);
+        while let Some(result) = tokio::select! {result=jobs.next()=>result,_=tx.closed()=>None} {
             let failed = result.is_err();
             if tx.send(result).await.is_err() || failed {
                 break;
@@ -155,5 +207,52 @@ impl Writer {
             .map_err(|_| anyhow::anyhow!("Hàng đợi nhập lịch sử đã đóng"))?;
         rx.await
             .map_err(|_| anyhow::anyhow!("Không hoàn tất ghi lịch sử"))?
+    }
+}
+
+#[cfg(test)]
+mod dependency_tests {
+    use super::*;
+    fn batch(index: u64, metadata: bool) -> Batch {
+        Batch {
+            metadata,
+            index,
+            url: "https://example.invalid/file".into(),
+        }
+    }
+    #[tokio::test]
+    async fn late_metadata_bypasses_messages_and_decoding_opens_message_queue() {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        let (ready, state) = tokio::sync::watch::channel(false);
+        for i in 0..20 {
+            tx.send(batch(i, false)).await.unwrap();
+        }
+        tx.send(batch(20, true)).await.unwrap();
+        drop(tx);
+        let feed = batch_feed(rx, state);
+        let mut feed = std::pin::pin!(feed);
+        assert!(feed.next().await.unwrap().unwrap().metadata);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), feed.next())
+                .await
+                .is_err()
+        );
+        ready.send(true).unwrap();
+        let mut n = 0;
+        while let Some(batch) = feed.next().await {
+            assert!(!batch.unwrap().metadata);
+            n += 1;
+        }
+        assert_eq!(n, 20);
+    }
+    #[tokio::test]
+    async fn message_only_manifest_reports_missing_metadata_instead_of_success() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        let (_ready, state) = tokio::sync::watch::channel(false);
+        tx.send(batch(0, false)).await.unwrap();
+        drop(tx);
+        let feed = batch_feed(rx, state);
+        let mut feed = std::pin::pin!(feed);
+        assert!(feed.next().await.unwrap().is_err());
     }
 }

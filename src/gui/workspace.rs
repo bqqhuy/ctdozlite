@@ -947,8 +947,9 @@ impl ZaloGuiApp {
                                     ui.close_menu();
                                 }
                                 ui.separator();
+                                if ui.button("Xóa cuộc trò chuyện…").clicked(){clear_history_action=Some((t.id.clone(),true));ui.close_menu();}
                                 if ui.button("Xóa lịch sử trên máy này…").clicked() {
-                                    clear_history_action = Some(t.id.clone());
+                                    clear_history_action = Some((t.id.clone(),false));
                                     ui.close_menu();
                                 }
                             });
@@ -1220,29 +1221,27 @@ impl ZaloGuiApp {
                 if let Some(id) = clear_history_action {
                     self.clear_history_confirmation = Some(id);
                 }
-                if let Some(id) = self.clear_history_confirmation.clone() {
+                if let Some((id,remote)) = self.clear_history_confirmation.clone() {
                     let mut confirmed = false;
                     let mut cancelled = false;
-                    egui::Window::new("Xóa lịch sử trên máy này?")
+                    egui::Window::new(if remote{"Xóa cuộc trò chuyện?"}else{"Xóa lịch sử trên máy này?"})
                         .id(Id::new("clear_thread_history"))
                         .collapsible(false)
                         .resizable(false)
                         .show(ctx, |ui| {
                             ui.label(
-                                "Chỉ xóa bản lưu trên máy này, không thu hồi tin của người khác.",
+                                if remote{"Yêu cầu máy chủ xóa cuộc trò chuyện cho tài khoản này. Không thu hồi tin của người khác và không rời nhóm."}else{"Chỉ xóa bản lưu trên máy này, không thu hồi tin của người khác."},
                             );
-                            ui.label("Đồng bộ sau đó có thể tải lại lịch sử từ máy chủ.");
+                            ui.label(if remote{"Chỉ xóa dữ liệu trên máy sau khi máy chủ xác nhận. Hãy xuất lịch sử trước nếu cần giữ bản sao."}else{"Đồng bộ sau đó có thể tải lại lịch sử từ máy chủ."});
                             ui.horizontal(|ui| {
                                 confirmed = ui.button("Xóa lịch sử").clicked();
                                 cancelled = ui.button("Hủy").clicked();
                             });
                         });
                     if confirmed {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::ClearThreadHistory {
-                                owner: self.user_uin.clone(),
-                                thread_id: id,
-                            });
+                        if let Some(tx)=WORKER_TX.get(){
+                            if remote {if let Some(t)=self.threads.iter().find(|t|t.id==id){let _=tx.send(WorkerCmd::DeleteConversation{owner:self.user_uin.clone(),thread:Box::new(t.clone())});}}
+                            else {let _=tx.send(WorkerCmd::ClearThreadHistory{owner:self.user_uin.clone(),thread_id:id.clone()});}
                         }
                     }
                     if confirmed || cancelled {
@@ -1279,7 +1278,7 @@ impl ZaloGuiApp {
 
         if show_info_drawer {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
-                let shared_photos: Vec<(String, crate::message_view::Media)> = self
+                let shared_photos: Vec<(String, crate::message_view::Media, ChatMessage)> = self
                     .threads
                     .get(self.selected_thread_index)
                     .map(|t| {
@@ -1287,10 +1286,21 @@ impl ZaloGuiApp {
                             .iter()
                             .rev()
                             .filter_map(|m| {
-                                let media=crate::message_view::media(m);
-                                if !matches!(media.kind,crate::message_view::MediaKind::Photo|crate::message_view::MediaKind::Video) {return None;}
-                                let thumb=media.thumbnail.as_deref().filter(|u|!u.is_empty())?;
-                                Some((format!("thumb_{}",crate::crypto::md5_hex(thumb)),media))
+                                let media = crate::message_view::media(m);
+                                if !matches!(
+                                    media.kind,
+                                    crate::message_view::MediaKind::Photo
+                                        | crate::message_view::MediaKind::Video
+                                ) {
+                                    return None;
+                                }
+                                let _thumb =
+                                    media.thumbnail.as_deref().filter(|u| !u.is_empty())?;
+                                Some((
+                                    crate::media_recovery::image_key(&t.id, &m.id, 0, false),
+                                    media,
+                                    m.clone(),
+                                ))
                             })
                             .take(9)
                             .collect()
@@ -1466,18 +1476,28 @@ impl ZaloGuiApp {
                                 } else {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                                        for (tkey, media) in &shared_photos {
-                                            let (cell_r, cell_resp) = ui.allocate_exact_size(Vec2::splat(74.0), Sense::click());
-                                            let thumb_u=media.thumbnail.as_deref().unwrap_or_default();
-                                            let full_u=media.preview.as_deref().unwrap_or_default();
-                                            let ptitle=&media.name;
-                                            if ui.is_rect_visible(cell_r) && !self.sticker_textures.contains_key(tkey)
+                                        for (tkey, media, message) in &shared_photos {
+                                            let (cell_r, cell_resp) = ui.allocate_exact_size(
+                                                Vec2::splat(74.0),
+                                                Sense::click(),
+                                            );
+                                            let thumb_u =
+                                                media.thumbnail.as_deref().unwrap_or_default();
+                                            let full_u =
+                                                media.preview.as_deref().unwrap_or_default();
+                                            let ptitle = &media.name;
+                                            if ui.is_rect_visible(cell_r)
+                                                && !self.sticker_textures.contains_key(tkey)
                                                 && self.loading_stickers.insert(tkey.clone())
                                             {
                                                 if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(WorkerCmd::FetchStickerImage {
+                                                    let _ = tx.send(WorkerCmd::FetchChatImage {
                                                         key: tkey.clone(),
                                                         url: thumb_u.to_owned(),
+                                                        thread: d_id.clone(),
+                                                        group: d_is_group,
+                                                        message: Box::new(message.clone()),
+                                                        preview: false,
                                                     });
                                                 }
                                             }
@@ -1523,18 +1543,73 @@ impl ZaloGuiApp {
                                             );
                                             if cell_resp
                                                 .on_hover_cursor(CursorIcon::PointingHand)
-                                                .on_hover_text(if media.kind==crate::message_view::MediaKind::Video {"Phát video"}else{"Xem ảnh phóng to"})
+                                                .on_hover_text(
+                                                    if media.kind
+                                                        == crate::message_view::MediaKind::Video
+                                                    {
+                                                        "Phát video"
+                                                    } else {
+                                                        "Xem ảnh phóng to"
+                                                    },
+                                                )
                                                 .clicked()
                                             {
-                                                if media.kind == crate::message_view::MediaKind::Video {
-                                                    if let (Some(tx),Some(url))=(WORKER_TX.get(),media.original.clone()) {let _=tx.send(WorkerCmd::DownloadMedia{url,name:media.name.clone(),play:true});}
+                                                if media.kind
+                                                    == crate::message_view::MediaKind::Video
+                                                {
+                                                    if let (Some(tx), Some(url)) =
+                                                        (WORKER_TX.get(), media.original.clone())
+                                                    {
+                                                        let _ = tx.send(WorkerCmd::DownloadMedia {
+                                                            url,
+                                                            name: media.name.clone(),
+                                                            play: true,
+                                                            context: Some(
+                                                                super::worker::ChatImage {
+                                                                    thread: d_id.clone(),
+                                                                    group: d_is_group,
+                                                                    message: message.clone(),
+                                                                    preview: false,
+                                                                },
+                                                            ),
+                                                        });
+                                                    }
                                                     continue;
+                                                }
+                                                let full_key = crate::media_recovery::image_key(
+                                                    d_id,
+                                                    &message.id,
+                                                    0,
+                                                    true,
+                                                );
+                                                if !full_u.is_empty()
+                                                    && !self
+                                                        .sticker_textures
+                                                        .contains_key(&full_key)
+                                                    && self
+                                                        .loading_stickers
+                                                        .insert(full_key.clone())
+                                                {
+                                                    if let Some(tx) = WORKER_TX.get() {
+                                                        let _ =
+                                                            tx.send(WorkerCmd::FetchChatImage {
+                                                                key: full_key.clone(),
+                                                                url: full_u.into(),
+                                                                thread: d_id.clone(),
+                                                                group: d_is_group,
+                                                                message: Box::new(message.clone()),
+                                                                preview: true,
+                                                            });
+                                                    }
                                                 }
                                                 self.image_viewer = Some(ImageViewerModal {
                                                     tex_key: tkey.clone(),
-                                                    hd_tex_key: None,
+                                                    hd_tex_key: Some(full_key),
                                                     full_url: full_u.to_owned(),
-                                                    original_url: media.original.clone().unwrap_or_default(),
+                                                    original_url: media
+                                                        .original
+                                                        .clone()
+                                                        .unwrap_or_default(),
                                                     title: ptitle.clone(),
                                                     sender: d_name.clone(),
                                                     time: String::new(),
@@ -2484,6 +2559,7 @@ impl ZaloGuiApp {
                     let composer_spacing=match composer_action_count {0=>16.0,1=>24.0,_=>36.0};
                     let composer_separator=if composer_action_count>0{8.0}else{0.0};
                     let composer_input_width=(ui.available_width()-44.0-34.0*composer_action_count as f32-composer_separator-composer_send_width-composer_schedule_width-composer_spacing).max(32.0);
+                    self.sync_composer_draft(ctx);
                     let editor_height=composer_editor_height(ui,&self.input_message,composer_input_width);
                     let msg_area_height =
                         (ui.available_height() - 48.0 - picker_reserve - editor_height).max(0.0);
@@ -2557,6 +2633,7 @@ impl ZaloGuiApp {
                                                 String::new()
                                             };
                                             let in_chat_folded = fold_vn_search(&in_chat_q);
+                                            let avatar_by_sender:std::collections::HashMap<String,String>=self.threads.iter().filter(|t|!t.is_group).filter_map(|t|t.avatar.as_ref().map(|a|(t,a))).flat_map(|(t,a)|[(t.id.clone(),a.clone()),(t.presentation.global_id.clone(),a.clone())]).filter(|(id,_)|!id.is_empty()).collect();
                                             let visible_indices: Vec<usize> = thread
                                                 .messages
                                                 .iter()
@@ -2644,7 +2721,7 @@ impl ZaloGuiApp {
                                                     let sender_ava_opt = if !is_group {
                                                         thread_avatar.as_deref()
                                                     } else {
-                                                        self.threads.iter().find(|th| !th.is_group && th.name==msg.sender).and_then(|th|th.avatar.as_deref())
+                                                        msg.wire_ref.sender.as_ref().and_then(|v|v.as_str().map(str::to_owned).or_else(||v.as_u64().map(|n|n.to_string()))).and_then(|id|avatar_by_sender.get(&id)).map(String::as_str)
                                                     };
                                                     if let Some(action) = render_chat_bubble(
                                                         ui,
@@ -2654,6 +2731,8 @@ impl ZaloGuiApp {
                                                         is_latest_outgoing,
                                                         is_group,
                                                         &thread_name,
+                                                        &self.threads[self.selected_thread_index].id,
+                                                        &self.image_failures,
                                                         sender_ava_opt,
                                                         pal,
                                                         &self.sticker_textures,
@@ -2701,11 +2780,14 @@ impl ZaloGuiApp {
                             .cloned();
                         if let Some(m) = target {
                             match action {
+                                BubbleAction::RetryMedia{key}=>{let preview=crate::media_recovery::image_key(&self.threads[self.selected_thread_index].id,&m.id,0,true);for key in [key,preview]{self.loading_stickers.remove(&key);self.image_failures.remove(&key);self.image_retry_at.remove(&key);}}
+                                BubbleAction::MediaUnavailable=>{self.status_msg="Thiếu thông tin tải ảnh/video; chưa thể mở tệp".into();}
+
                                 BubbleAction::SaveAttachment {url,name} => {
-                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false});}
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
                                 }
                                 BubbleAction::OpenVideo {url,name} => {
-                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true});}
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
                                 }
                                 BubbleAction::RetrySend => {
                                     if let Some(tx) = WORKER_TX.get() {
@@ -2858,29 +2940,15 @@ impl ZaloGuiApp {
                                     sender,
                                     time,
                                 } => {
-                                    let lower_u = full_url.to_lowercase();
-                                    let is_direct_img = lower_u.contains("zdn.vn")
-                                        || lower_u.ends_with(".png")
-                                        || lower_u.ends_with(".jpg")
-                                        || lower_u.ends_with(".jpeg")
-                                        || lower_u.ends_with(".webp")
-                                        || lower_u.ends_with(".gif")
-                                        || lower_u.ends_with(".bmp")
-                                        || (!lower_u.starts_with("http://")
-                                            && !lower_u.starts_with("https://"));
-                                    let hd_tex_key = if !full_url.is_empty() && is_direct_img {
-                                        let hk = format!(
-                                            "full_{}",
-                                            crate::crypto::md5_hex(&full_url)
-                                        );
+                                    let hd_tex_key = if !full_url.is_empty() {
+                                        let hk = crate::media_recovery::image_key(&self.threads[self.selected_thread_index].id,&m.id,0,true);
                                         if hk != tex_key
                                             && !self.sticker_textures.contains_key(&hk)
                                             && self.loading_stickers.insert(hk.clone())
                                         {
                                             if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::FetchStickerImage {
-                                                    key: hk.clone(),
-                                                    url: full_url.clone(),
+                                                let _ = tx.send(WorkerCmd::FetchChatImage {
+                                                    key: hk.clone(),url:full_url.clone(),thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:Box::new(m.clone()),preview:true
                                                 });
                                             }
                                         }
@@ -3470,6 +3538,7 @@ impl ZaloGuiApp {
             self.filter_starred_only = false;
         }
         self.selected_thread_index = idx;
+        self.sync_composer_draft(ctx);
         if let Some(thread) = self.threads.get_mut(idx) {
             thread.unread.read_visible(&thread.messages);
         }

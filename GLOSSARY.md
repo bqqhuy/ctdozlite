@@ -32,6 +32,9 @@ Ubiquitous language for `ctdozlite`. Use these terms verbatim in issues, ADRs, t
 | **Message** | One chat entry with `msg_id`, `thread_id`, sender, timestamp, type and raw JSON. | "text" |
 | **Local message ID** | Client-generated ID used to reconcile optimistic UI rows with server echoes. | "temp id" |
 | **Recall** | Server-side removal of a message for all participants. | "delete" (that is local-only) |
+| **Composer draft** | Unsent literal editor text persisted per account database and thread. | "outbox" |
+| **Delete replay marker** | Content-free message identity retained to reject re-import of a delete-for-me row. | "soft delete" |
+| **Queue cursor** | Server action ID plus boundary IDs used to request the next page of a message queue. | "phone sync checkpoint" |
 | **Delete for me** | Local-only removal mirrored into SQLite. | "recall" |
 
 ## Runtime

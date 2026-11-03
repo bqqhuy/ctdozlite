@@ -86,3 +86,14 @@ mod desktop_notice_windows;
 pub mod notification_sound;
 
 mod bundled_stickers;
+
+/// Media recovery classifications and finite retry state.
+pub mod media_recovery;
+
+/// Official FILE service media URL renewal.
+pub mod media_renew;
+
+/// Typed, bounded diagnostics available without development logging.
+mod transfer_diagnostics;
+
+mod queue_catchup;

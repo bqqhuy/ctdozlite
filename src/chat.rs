@@ -651,6 +651,22 @@ impl Thread {
         }
     }
 
+    /// Rebuild the sidebar after deleting messages, including an older surviving latest row.
+    pub(crate) fn refresh_after_removal(&mut self) {
+        self.presentation.last_message_ts = 0;
+        self.presentation.last_message_id.clear();
+        self.presentation.last_sender.clear();
+        self.presentation.last_sender_id.clear();
+        self.presentation.last_outgoing = false;
+        self.preview = self
+            .messages
+            .iter()
+            .max_by_key(|m| crate::clock::normalize_ts_ms(m.ts))
+            .map(crate::message_view::summary)
+            .unwrap_or_default();
+        self.refresh_sidebar_presentation();
+    }
+
     pub fn refresh_sidebar_presentation(&mut self) {
         if let Some(message) = self
             .messages
@@ -1297,6 +1313,16 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
                     }
                 }
             }
+            // Cached previews are non-authoritative; deletion markers must win at startup too.
+            match crate::store::MessageStore::open(s.history_path())
+                .and_then(|store| store.filter_deleted(&mut threads))
+            {
+                Ok(()) => {}
+                Err(_) => {
+                    eprintln!("Cannot filter cached deletion identities");
+                    return Vec::new();
+                }
+            }
             deduplicate_threads(&mut threads, None);
             return threads;
         }
@@ -1310,7 +1336,7 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
         return;
     }
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
-    let slim: Vec<Thread> = threads
+    let mut slim: Vec<Thread> = threads
         .iter()
         .map(|t| {
             let mut t = t.clone();
@@ -1319,6 +1345,13 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
             t
         })
         .collect();
+    if crate::store::MessageStore::open(s.history_path())
+        .and_then(|store| store.filter_deleted(&mut slim))
+        .is_err()
+    {
+        eprintln!("Cannot filter history cache before saving");
+        return;
+    }
     if let Ok(text) = serde_json::to_string(&slim) {
         if let Err(e) = crate::storage::atomic_write(&s.cache_path(), text.as_bytes()) {
             eprintln!("Cannot save history cache: {e}");
@@ -4041,6 +4074,8 @@ pub struct PollState {
     pub last_action_id: String,
     pub last_action_id_other: String,
     pub queues: std::collections::BTreeMap<String, QueueCursor>,
+    #[serde(skip)]
+    catchup: crate::queue_catchup::CatchupGuard,
 }
 
 impl Default for PollState {
@@ -4059,6 +4094,7 @@ impl Default for PollState {
             last_action_id: "1".into(),
             last_action_id_other: "1".into(),
             queues,
+            catchup: Default::default(),
         }
     }
 }
@@ -4076,6 +4112,22 @@ fn max_action_id(a: &str, b: &str) -> String {
 }
 
 impl PollState {
+    /// Whether the current automatic catch-up chain has not stalled or exceeded its page budget.
+    pub(crate) fn catchup_ready(&mut self) -> bool {
+        self.catchup.ready(std::time::Instant::now())
+    }
+
+    fn receive_poll_response(&mut self, response: &Value) {
+        self.catchup.seed(self.encode_params());
+        self.update_from_response(response);
+        let outer = response.get("data").unwrap_or(response);
+        let data = outer.get("data").filter(|v| v.is_object()).unwrap_or(outer);
+        let more = data.get("more").and_then(Value::as_i64) == Some(1)
+            || pick_str(data, &["resetLastActionId"]).is_some_and(|r| r != "0" && !r.is_empty());
+        self.catchup
+            .observe(Some(self.encode_params()), more, std::time::Instant::now());
+    }
+
     pub fn encode_params(&self) -> String {
         use base64::Engine;
         let q_json = serde_json::to_string(&self.queues).unwrap_or_else(|_| "{}".into());
@@ -4239,6 +4291,9 @@ pub async fn get_cloud_messages(
 ///
 /// Uses a 12-second timeout matching `lp_chat` long-polling windows (`sync-v2-sub-worker.js:3498030`).
 pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result<Value> {
+    if !state.catchup.ready(std::time::Instant::now()) {
+        return Ok(json!({"error_code":0,"data":{}}));
+    }
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -4267,7 +4322,7 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
                     anyhow::bail!("server error {code}: {msg}");
                 }
             }
-            state.update_from_response(&dec);
+            state.receive_poll_response(&dec);
             Ok(dec)
         }
         Ok(Err(e)) => Err(e),
@@ -4297,7 +4352,7 @@ pub async fn poll_new_messages(
         let has_reset = pick_str(data_node, &["resetLastActionId"])
             .map(|r| r != "0" && !r.is_empty())
             .unwrap_or(false);
-        if more == 0 && !has_reset {
+        if (more == 0 && !has_reset) || !state.catchup_ready() {
             break;
         }
     }
@@ -6551,5 +6606,137 @@ mod rich_text_parse_tests {
         let content = json!({"action":"rtf","title":"bí mật","params":"{\"styles\":[{\"start\":0,\"len\":2,\"st\":\"b\"}]}"});
         let msg = parse_chat_message(&json!({"msgId":"fixture-undo","uidFrom":"user-1","msgType":"chat.undo","content":content})).unwrap();
         assert!(msg.text_styles.is_empty());
+    }
+}
+
+/// Delete a conversation for this account after an explicit user confirmation.
+/// # Errors
+/// Requires a real latest client identity and a successful decrypted server response.
+pub async fn delete_conversation(s: &Session, thread: &Thread) -> Result<()> {
+    anyhow::ensure!(s.is_active(), "Đã đăng xuất");
+    let last = thread
+        .messages
+        .iter()
+        .max_by_key(|m| m.ts)
+        .context("Chưa có tin cuối; hãy cập nhật hội thoại rồi thử lại")?;
+    let client = last
+        .wire_ref
+        .client_id
+        .as_ref()
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        })
+        .or_else(|| (!last.client_message_id.is_empty()).then(|| last.client_message_id.clone()))
+        .context("Thiếu định danh tin cuối; hãy cập nhật hội thoại trước khi xóa")?;
+    let id = thread
+        .id
+        .strip_prefix("group_")
+        .or_else(|| thread.id.strip_prefix('g'))
+        .unwrap_or(&thread.id);
+    anyhow::ensure!(
+        !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()),
+        "Định danh hội thoại không hợp lệ"
+    );
+    let body = if thread.is_group {
+        json!({"grid":id,"cliMsgId":client,"conver":{},"onlyMe":1,"imei":s.imei})
+    } else {
+        json!({"toid":id,"cliMsgId":client,"conver":{},"onlyMe":1,"imei":s.imei})
+    };
+    let (domain, path) = if thread.is_group {
+        (&s.domains.group, "/api/group/deleteconver")
+    } else {
+        (&s.domains.chat, "/api/message/deleteconver")
+    };
+    let params = s.encoded_params(&body)?;
+    let url = format!("{domain}{path}?{}", s.common_params());
+    let response = s
+        .post_form(&url, format!("params={params}"))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("Không thể xác nhận xóa hội thoại; dữ liệu trên máy được giữ")
+        })?;
+    let response = s.maybe_decrypt(response, s.session_key_bytes()).await;
+    anyhow::ensure!(
+        response.get("error_code").and_then(Value::as_i64) == Some(0),
+        "Máy chủ chưa xác nhận xóa hội thoại; dữ liệu trên máy được giữ"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod catchup_progress_tests {
+    use super::*;
+    #[test]
+    fn repeated_more_response_stops_without_inventing_a_cursor() {
+        let mut state = PollState::default();
+        let response = json!({"error_code":0,"data":{"more":1,"lastActionId":"100","queueStatus":{"1":{"lastId":"100","ids":["99","100"]}}}});
+        state.receive_poll_response(&response);
+        assert!(state.catchup_ready());
+        let cursor = state.encode_params();
+        state.receive_poll_response(&response);
+        assert!(!state.catchup_ready());
+        assert_eq!(state.encode_params(), cursor);
+    }
+    #[test]
+    fn missing_cursor_or_repeated_reset_cannot_drive_an_infinite_loop() {
+        let mut state = PollState::default();
+        state.receive_poll_response(&json!({"data":{"more":1}}));
+        assert!(!state.catchup_ready());
+        let mut state = PollState::default();
+        let reset = json!({"data":{"resetLastActionId":"30"}});
+        state.receive_poll_response(&reset);
+        assert!(state.catchup_ready());
+        state.receive_poll_response(&reset);
+        assert!(!state.catchup_ready());
+    }
+    #[test]
+    fn independent_progress_and_completed_pages_remain_receivable() {
+        let mut state = PollState::default();
+        for id in ["10", "11", "12"] {
+            state.receive_poll_response(&json!({"data":{"more":1,"lastActionId":id}}));
+            assert!(state.catchup_ready());
+        }
+        state.receive_poll_response(&json!({"data":{"more":0,"lastActionId":"12"}}));
+        assert!(state.catchup_ready());
+    }
+}
+
+#[cfg(test)]
+mod catchup_measurement {
+    use super::*;
+    #[test]
+    #[ignore = "controlled synthetic pagination measurement"]
+    fn repeated_queue_response_benchmark() {
+        let response = json!({"data":{"more":1,"lastActionId":"100","queueStatus":{"1":{"lastId":"100","ids":["99","100"]}}}});
+        for guarded in [false, true] {
+            let mut measurements = Vec::new();
+            let mut requests = 0;
+            for _ in 0..20 {
+                let mut state = PollState::default();
+                let start = std::time::Instant::now();
+                let mut count = 0;
+                for _ in 0..1800 {
+                    count += 1;
+                    if guarded {
+                        state.receive_poll_response(&response);
+                        if !state.catchup_ready() {
+                            break;
+                        }
+                    } else {
+                        state.update_from_response(&response);
+                    }
+                }
+                requests = count;
+                measurements.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            measurements.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                json!({"task":if guarded{"guarded_repeated_cursor"}else{"legacy_repeated_cursor"},"iterations":20,"dataset_max_responses":1800,"responses_processed":requests,"min_ms":measurements[0],"avg_ms":measurements.iter().sum::<f64>()/20.0,"p50_ms":measurements[10],"p95_ms":measurements[18],"p99_ms":measurements[19],"environment":"Linux x86_64 debug; no network or account"})
+            );
+            assert_eq!(requests, if guarded { 2 } else { 1800 });
+        }
     }
 }

@@ -662,6 +662,13 @@ pub fn import_history(
                     | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             src.pragma_update(None, "query_only", true)?;
+            let has_owner:bool=src.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_export')",[],|r|r.get(0))?;
+            if has_owner {
+                let source_owner: String =
+                    src.query_row("SELECT owner FROM history_export LIMIT 1", [], |r| r.get(0))?;
+                ensure!(source_owner == owner, "Nguồn lịch sử thuộc tài khoản khác");
+            }
+
             let oversized:i64=src.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE length(COALESCE(text,''))>1048576 OR length(COALESCE(raw_json,''))>1048576)",[],|r|r.get(0))?;
             ensure!(oversized == 0, "Nguồn có tin vượt giới hạn nhập 1 MiB");
             let mut stmt=src.prepare("SELECT thread_id,msg_id,COALESCE(sender_name,''),COALESCE(text,''),ts,is_outgoing,COALESCE(raw_json,'') FROM messages ORDER BY thread_id,ts")?;
@@ -988,5 +995,183 @@ mod delivery_and_navigation_tests {
         assert_eq!(context.name, "Tên nhóm");
         assert!(context.is_group);
         assert!(open_hit(&store, "other", "5").is_err());
+    }
+}
+
+/// Export history only to a new compatible SQLite file, excluding automation/configuration.
+/// # Errors
+/// Returns cancellation, destination-exists and SQLite errors without replacing a destination.
+pub fn export_history(
+    store: &MessageStore,
+    destination: &std::path::Path,
+    owner: &str,
+    active: &dyn Fn() -> bool,
+) -> Result<usize> {
+    use std::io::Write;
+    ensure!(!owner.is_empty() && active(), "Đã đăng xuất");
+    ensure!(
+        !destination.exists(),
+        "Tệp đích đã tồn tại; hãy chọn tên mới"
+    );
+    let stage = destination.with_file_name(format!(
+        ".ctdo-history-{}.db",
+        crate::chat::next_client_message_id()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(&stage)?.flush()?;
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(stage.clone());
+    let mut target = rusqlite::Connection::open(&stage)?;
+    target.execute_batch("CREATE TABLE threads(thread_id TEXT PRIMARY KEY,name TEXT,is_group INTEGER,last_ts INTEGER);CREATE TABLE messages(msg_id TEXT,thread_id TEXT,sender_id TEXT,sender_name TEXT,text TEXT,msg_type TEXT,ts INTEGER,is_outgoing INTEGER,raw_json TEXT,PRIMARY KEY(thread_id,msg_id));CREATE TABLE history_export(owner TEXT NOT NULL,version INTEGER NOT NULL);")?;
+    let tx = target.transaction()?;
+    tx.execute("INSERT INTO history_export VALUES(?1,1)", [owner])?;
+    let snapshot = store.conn.unchecked_transaction()?;
+    for table in ["threads", "messages"] {
+        let (select, insert) = if table == "threads" {
+            (
+                "SELECT thread_id,name,is_group,last_ts FROM threads",
+                "INSERT INTO threads VALUES(?1,?2,?3,?4)",
+            )
+        } else {
+            ("SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json FROM messages","INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+        };
+        let mut read = snapshot.prepare(select)?;
+        let count = read.column_count();
+        let mut rows = read.query([])?;
+        let mut write = tx.prepare(insert)?;
+        while let Some(row) = rows.next()? {
+            ensure!(active(), "Đã đăng xuất; dừng xuất lịch sử");
+            let values = (0..count)
+                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            write.execute(rusqlite::params_from_iter(values))?;
+        }
+    }
+    let n = tx.query_row("SELECT COUNT(*) FROM messages", [], |r| {
+        r.get::<_, usize>(0)
+    })?;
+    tx.commit()?;
+    snapshot.commit()?;
+    drop(target);
+    ensure!(active(), "Đã đăng xuất; dừng xuất lịch sử");
+    // A hard link publishes without replacing an existing user file on either platform.
+    #[cfg(not(windows))]
+    std::fs::hard_link(&stage, destination)
+        .context("Không thể xuất tệp; hãy chọn thư mục hoặc tên khác")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileW(from: *const u16, to: *const u16) -> i32;
+        }
+        let from: Vec<u16> = stage.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        ensure!(
+            !from[..from.len() - 1].contains(&0) && !to[..to.len() - 1].contains(&0),
+            "Tên tệp không hợp lệ"
+        );
+        // SAFETY: both paths are NUL-terminated and remain alive through a non-replacing move.
+        ensure!(
+            unsafe { MoveFileW(from.as_ptr(), to.as_ptr()) } != 0,
+            "Không thể xuất tệp; đích đã tồn tại hoặc ổ đĩa không cho phép ghi"
+        );
+    }
+
+    Ok(n)
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    #[test]
+    fn exported_history_round_trips_without_automation_and_checks_owner() {
+        let source = MessageStore::open(":memory:").unwrap();
+        source.conn.execute_batch("INSERT INTO threads VALUES('t','Thread',0,100);INSERT INTO messages(thread_id,msg_id,text,ts,is_outgoing,raw_json) VALUES('t','m','hello',100,0,'{}');INSERT INTO tool_config VALUES('private-config','must-not-export');").unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "history-export-{}.db",
+            crate::chat::next_client_message_id()
+        ));
+        assert_eq!(
+            export_history(&source, &path, "owner-a", &|| true).unwrap(),
+            1
+        );
+        assert!(export_history(&source, &path, "owner-a", &|| true).is_err());
+        let mut destination = MessageStore::open(":memory:").unwrap();
+        assert!(import_history(&mut destination, &path, "owner-b", true, &|| true).is_err());
+        assert_eq!(
+            import_history(&mut destination, &path, "owner-a", true, &|| true).unwrap(),
+            1
+        );
+        assert_eq!(
+            import_history(&mut destination, &path, "owner-a", true, &|| true).unwrap(),
+            0
+        );
+        assert_eq!(
+            destination
+                .conn
+                .query_row("SELECT COUNT(*) FROM tool_config", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod deleted_import_tests {
+    use super::*;
+    #[test]
+    fn importing_an_old_backup_cannot_restore_a_deleted_message() {
+        let root = std::env::temp_dir().join(format!(
+            "ctdo-deleted-import-{}",
+            crate::param_cipher::random_hex(12)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("old.db");
+        let message = ChatMessage {
+            id: "server-1".into(),
+            text: "Tin đã xóa".into(),
+            ts: 100,
+            ..Default::default()
+        };
+        {
+            let mut source = MessageStore::open(&path).unwrap();
+            crate::store::persist_threads(
+                &mut source,
+                &[Thread {
+                    id: "thread-a".into(),
+                    messages: vec![message.clone()],
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        }
+        let mut destination = MessageStore::open(":memory:").unwrap();
+        destination
+            .delete_chat_message("thread-a", &message)
+            .unwrap();
+        assert_eq!(
+            import_history(&mut destination, &path, "owner-a", true, &|| true).unwrap(),
+            0
+        );
+        assert!(destination.messages_for("thread-a", 20).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

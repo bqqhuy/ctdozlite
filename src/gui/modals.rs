@@ -180,6 +180,7 @@ impl ZaloGuiApp {
         }
 
         if do_logout {
+            self.flush_composer_before_logout();
             self.is_logged_in = false;
             self.user_name.clear();
             self.user_uin.clear();
@@ -948,6 +949,8 @@ impl ZaloGuiApp {
                                             ui.label("Các thiết lập quyền riêng tư trên máy chủ chưa được tích hợp. Hãy thay đổi trên ứng dụng Zalo chính thức; các nút cũ chỉ lưu cục bộ nên đã được gỡ để tránh hiểu nhầm.");
                                         }
                                         SettingsTab::Sync => {
+                                            if ui.button("Nhập / Xuất lịch sử…").clicked(){self.tools.open=true;self.tools.tab=1;open=false;}
+
                                             ui.label(RichText::new("Đồng bộ tin nhắn").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
                                             egui::Frame::none()
@@ -1235,6 +1238,12 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Utilities => {
+                                            ui.label(format!("Phiên bản {} • Windows ARM64",env!("CARGO_PKG_VERSION")));
+                                            if ui.add_enabled(!self.update_busy,egui::Button::new("Kiểm tra cập nhật")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::CheckUpdate).is_ok(){self.update_busy=true;self.update_status="Đang kiểm tra bản phát hành của fork…".into();}}}
+                                            if let Some(release)=self.update_offer.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new(format!("Tải bộ cài {}",release.tag))).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::PrepareUpdate(release)).is_ok(){self.update_busy=true;self.update_status="Đang tải và kiểm tra bản cập nhật…".into();}}}}
+                                            if let Some(ready)=self.update_ready.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new("Mở bộ cài và đóng ứng dụng")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::LaunchUpdate(ready)).is_ok(){self.update_busy=true;}}}}
+                                            ui.label(&self.update_status);ui.separator();
+
                                             if ui.button("Tìm lịch sử, nhập dữ liệu, theme/sticker, hẹn giờ & tự trả lời").clicked() { self.tools.open=true; }
                                             ui.label(RichText::new("Gợi ý Sticker").color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
@@ -2408,7 +2417,13 @@ impl ZaloGuiApp {
                     painter.text(
                         img_rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Đang tải hình ảnh…",
+                        viewer
+                            .hd_tex_key
+                            .as_ref()
+                            .and_then(|k| self.image_failures.get(k))
+                            .or_else(|| self.image_failures.get(&viewer.tex_key))
+                            .map(|e| e.failure.message())
+                            .unwrap_or("Đang tải hình ảnh…"),
                         FontId::proportional(13.0),
                         pal.text_primary,
                     );
@@ -2544,7 +2559,43 @@ impl ZaloGuiApp {
                                         .on_hover_text(&viewer.full_url)
                                         .clicked()
                                     {
-                                        if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url:viewer.original_url.clone(),name:viewer.title.clone(),play:false});}
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let context = self
+                                                .threads
+                                                .get(self.selected_thread_index)
+                                                .and_then(|thread| {
+                                                    thread
+                                                        .messages
+                                                        .iter()
+                                                        .find(|message| {
+                                                            crate::media_recovery::image_key(
+                                                                &thread.id,
+                                                                &message.id,
+                                                                0,
+                                                                false,
+                                                            ) == viewer.tex_key
+                                                        })
+                                                        .map(|message| super::worker::ChatImage {
+                                                            thread: thread.id.clone(),
+                                                            group: thread.is_group,
+                                                            message: message.clone(),
+                                                            preview: false,
+                                                        })
+                                                });
+                                            let url = context
+                                                .as_ref()
+                                                .and_then(|context| {
+                                                    crate::message_view::media(&context.message)
+                                                        .original
+                                                })
+                                                .unwrap_or_else(|| viewer.original_url.clone());
+                                            let _ = tx.send(WorkerCmd::DownloadMedia {
+                                                url,
+                                                name: viewer.title.clone(),
+                                                play: false,
+                                                context,
+                                            });
+                                        }
                                     }
 
                                     let copy_btn = egui::Button::new(

@@ -20,9 +20,11 @@ pub fn allowed(u: &reqwest::Url) -> bool {
         && u.password().is_none()
         && u.port_or_known_default() == Some(443)
         && u.host_str().is_some_and(|host| {
-            crate::endpoints::PHOTO_CDN_DOMAINS.iter().any(|suffix| {
-                host == *suffix || host.strip_suffix(suffix).is_some_and(|p| p.ends_with('.'))
-            })
+            crate::endpoints::MEDIA_DOWNLOAD_DOMAINS
+                .iter()
+                .any(|suffix| {
+                    host == *suffix || host.strip_suffix(suffix).is_some_and(|p| p.ends_with('.'))
+                })
         })
 }
 fn client() -> Result<&'static reqwest::Client> {
@@ -53,9 +55,9 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
             .await;
         let r = result.map_err(|e| {
             if e.is_timeout() {
-                anyhow::anyhow!("Tải media hết thời gian chờ")
+                anyhow::Error::from(crate::media_recovery::Failure::Timeout)
             } else {
-                anyhow::anyhow!("Không kết nối được nguồn media")
+                anyhow::Error::from(crate::media_recovery::Failure::Network)
             }
         })?;
         if r.status().is_redirection() {
@@ -69,11 +71,9 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                 .map_err(|_| anyhow::anyhow!("Nguồn media chuyển hướng không hợp lệ"))?;
             continue;
         }
-        ensure!(
-            r.status().is_success(),
-            "Không tải được media (HTTP {})",
-            r.status().as_u16()
-        );
+        if !r.status().is_success() {
+            return Err(crate::media_recovery::Failure::Http(r.status().as_u16()).into());
+        }
         return Ok(r);
     }
     anyhow::bail!("Nguồn media chuyển hướng quá nhiều lần")
@@ -98,11 +98,48 @@ pub fn safe_name(name: &str) -> String {
         s.into()
     }
 }
+/// Stream a general attachment without interpreting JSON documents as media errors.
+/// # Errors
+/// Returns transport, cancellation and filesystem failures without replacing a destination.
 pub async fn save<F: FnMut(u64, Option<u64>)>(
     url: &str,
     path: &Path,
     cancel: Arc<AtomicBool>,
+    progress: F,
+) -> Result<u64> {
+    save_classified(url, path, cancel, progress, false).await
+}
+/// Stream a visual attachment, rejecting JSON/HTML error bodies even with HTTP 200.
+/// # Errors
+/// Returns typed media failures or safe streaming/finalization failures.
+pub async fn save_classified<F: FnMut(u64, Option<u64>)>(
+    url: &str,
+    path: &Path,
+    cancel: Arc<AtomicBool>,
+    progress: F,
+    visual: bool,
+) -> Result<u64> {
+    save_inner(url, path, cancel, progress, visual, None).await
+}
+/// Stream a playback copy using its shared disk budget.
+/// # Errors
+/// Returns media failures or an exhausted playback cache budget.
+pub(crate) async fn save_video<F: FnMut(u64, Option<u64>)>(
+    url: &str,
+    path: &Path,
+    cancel: Arc<AtomicBool>,
+    progress: F,
+    lease: &crate::video_player::CachedVideo,
+) -> Result<u64> {
+    save_inner(url, path, cancel, progress, true, Some(lease)).await
+}
+async fn save_inner<F: FnMut(u64, Option<u64>)>(
+    url: &str,
+    path: &Path,
+    cancel: Arc<AtomicBool>,
     mut progress: F,
+    visual: bool,
+    lease: Option<&crate::video_player::CachedVideo>,
 ) -> Result<u64> {
     use tokio::io::AsyncWriteExt;
     let _slot = DOWNLOADS.acquire().await?;
@@ -140,6 +177,30 @@ pub async fn save<F: FnMut(u64, Option<u64>)>(
         let Some(chunk) = chunk else {
             break;
         };
+        if visual && total == 0 {
+            let first = chunk.iter().find(|b| !b.is_ascii_whitespace());
+            if matches!(first, Some(b'{' | b'[' | b'<')) {
+                let mut body = chunk.to_vec();
+                while body.len() <= 65536 {
+                    let next = tokio::time::timeout(Duration::from_secs(20), response.chunk())
+                        .await
+                        .map_err(|_| crate::media_recovery::Failure::Timeout)?
+                        .map_err(|_| crate::media_recovery::Failure::Network)?;
+                    let Some(next) = next else {
+                        break;
+                    };
+                    if next.len() > 65536usize.saturating_sub(body.len()) {
+                        return Err(crate::media_recovery::Failure::Content.into());
+                    }
+                    body.extend_from_slice(&next);
+                }
+                crate::media_recovery::validate_image_body(&body)?;
+                return Err(crate::media_recovery::Failure::Content.into());
+            }
+        }
+        if let Some(lease) = lease {
+            lease.admit(chunk.len())?;
+        }
         file.write_all(&chunk)
             .await
             .context("Không ghi được tệp; kiểm tra dung lượng đĩa")?;
@@ -252,6 +313,53 @@ mod tests {
         assert!(!truncated.exists());
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod response_body_tests {
+    use super::*;
+    #[tokio::test]
+    async fn http_200_json_is_a_remote_error_for_video_but_a_valid_general_attachment() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = [0; 1024];
+                let _ = socket.read(&mut request);
+                let body = br#"{"err_code":17,"message":"unavailable"}"#;
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                socket.write_all(body).unwrap();
+            }
+        });
+        let root = std::env::temp_dir().join(format!(
+            "media-json-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("video.mp4");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let url = format!("http://{address}/sample");
+        let error = save_classified(&url, &path, cancel.clone(), |_, _| {}, true)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::media_recovery::Failure>(),
+            Some(&crate::media_recovery::Failure::Json(17))
+        );
+        assert!(!path.exists());
+        let json = root.join("data.json");
+        assert!(save(&url, &json, cancel, |_, _| {}).await.is_ok());
+        server.join().unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,6 +1,6 @@
 # ADR-0014: Bounded phone sync with independent download/import progress
 
-- Status: accepted
+- Status: superseded by ADR-0017
 - Date: 2026-11-02
 - Supersedes: ADR-0010 default request grouping and sequential download/import.
 

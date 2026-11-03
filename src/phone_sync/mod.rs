@@ -2,9 +2,11 @@
 mod assets;
 pub mod codec;
 mod import;
+mod pipeline;
 mod plan;
 mod policy;
-mod pipeline;
 mod transfer;
 mod wire;
 pub(crate) use transfer::download;
+
+pub(crate) use transfer::clean_after_connect;

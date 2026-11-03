@@ -592,6 +592,9 @@ pub(super) fn render_message_body(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     thread_name: &str,
+    thread_id: &str,
+    is_group: bool,
+    image_failures: &HashMap<String, crate::media_recovery::Retry>,
     pal: &ThemePalette,
     outgoing: bool,
     max_text_width: f32,
@@ -625,36 +628,126 @@ pub(super) fn render_message_body(
     };
 
     let media = crate::message_view::media(msg);
-    if matches!(media.kind, crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video) {
+    if matches!(
+        media.kind,
+        crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
+    ) {
         let video = media.kind == crate::message_view::MediaKind::Video;
         let thumb = media.thumbnail.as_deref().unwrap_or_default();
-        let key = format!("thumb_{}",crate::crypto::md5_hex(thumb));
-        let width=max_text_width.clamp(120.0,270.0);
-        let ratio=media.width.zip(media.height).map(|(w,h)|h as f32/w as f32).unwrap_or(0.67);
-        let height=(width*ratio).clamp(95.0,260.0);
-        let (rect,response)=ui.allocate_exact_size(Vec2::new(width,height),Sense::click());
-        if !thumb.is_empty() && rect.intersects(ui.clip_rect().expand(160.0)) && !sticker_textures.contains_key(&key) && loading_stickers.insert(key.clone()) {
-            if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::FetchStickerImage{key:key.clone(),url:thumb.into()});}
-        }
-        ui.painter().rect_filled(rect,Rounding::same(10.0),pal.bg_elevated);
-        if let Some(texture)=sticker_textures.get(&key){
-            let size=texture.size_vec2();let scale=(rect.width()/size.x).min(rect.height()/size.y);
-            let target=Rect::from_center_size(rect.center(),size*scale);
-            ui.painter().image(texture.id(),target,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE);
-        } else {draw_icon_image(ui.painter(),rect.center(),24.0,pal.text_muted);}
-        if video {
-            ui.painter().circle_filled(rect.center(),20.0,Color32::from_black_alpha(150));
-            let c=rect.center();ui.painter().add(egui::Shape::convex_polygon(vec![c+Vec2::new(-5.0,-9.0),c+Vec2::new(10.0,0.0),c+Vec2::new(-5.0,9.0)],Color32::WHITE,Stroke::NONE));
-            if let Some(duration)=media.duration {ui.painter().text(rect.right_bottom()-Vec2::new(8.0,8.0),egui::Align2::RIGHT_BOTTOM,format!("{}:{:02}",duration/60,duration%60),FontId::proportional(12.0),Color32::WHITE);}
-        }
-        if response.clicked(){
-            if let Some(url)=if video {media.original.clone()}else{media.preview.clone()}{
-                if video {body_action=Some(BubbleAction::OpenVideo{url,name:media.name.clone()});}
-                else {body_action=Some(BubbleAction::OpenImagePopup{tex_key:key,full_url:url,title:"Hình ảnh".into(),sender:sender_label,time:msg.display_time()});}
+        let key = crate::media_recovery::image_key(thread_id, &msg.id, 0, false);
+        let width = max_text_width.clamp(120.0, 270.0);
+        let ratio = media
+            .width
+            .zip(media.height)
+            .map(|(w, h)| h as f32 / w as f32)
+            .unwrap_or(0.67);
+        let height = (width * ratio).clamp(95.0, 260.0);
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        if !thumb.is_empty()
+            && rect.intersects(ui.clip_rect().expand(160.0))
+            && !sticker_textures.contains_key(&key)
+            && loading_stickers.insert(key.clone())
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchChatImage {
+                    key: key.clone(),
+                    url: thumb.into(),
+                    thread: thread_id.into(),
+                    group: is_group,
+                    message: Box::new(msg.clone()),
+                    preview: false,
+                });
             }
         }
-        if media.original.is_some() && ui.small_button("Lưu về máy").clicked(){body_action=Some(BubbleAction::SaveAttachment{url:media.original.clone().unwrap_or_default(),name:media.name.clone()});}
-        if !video {if let Some(caption)=msg.photo_caption(){ui.add(egui::Label::new(RichText::new(caption).color(text_col)).wrap());}}
+        ui.painter()
+            .rect_filled(rect, Rounding::same(10.0), pal.bg_elevated);
+        if let Some(texture) = sticker_textures.get(&key) {
+            let size = texture.size_vec2();
+            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let target = Rect::from_center_size(rect.center(), size * scale);
+            ui.painter().image(
+                texture.id(),
+                target,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            draw_icon_image(ui.painter(), rect.center(), 24.0, pal.text_muted);
+        }
+        if video {
+            ui.painter()
+                .circle_filled(rect.center(), 20.0, Color32::from_black_alpha(150));
+            let c = rect.center();
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    c + Vec2::new(-5.0, -9.0),
+                    c + Vec2::new(10.0, 0.0),
+                    c + Vec2::new(-5.0, 9.0),
+                ],
+                Color32::WHITE,
+                Stroke::NONE,
+            ));
+            if let Some(duration) = media.duration {
+                ui.painter().text(
+                    rect.right_bottom() - Vec2::new(8.0, 8.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    format!("{}:{:02}", duration / 60, duration % 60),
+                    FontId::proportional(12.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+        if let Some(error) = image_failures.get(&key) {
+            ui.label(
+                RichText::new(error.failure.message())
+                    .small()
+                    .color(pal.text_muted),
+            );
+            if ui.small_button("Thử lại").clicked() {
+                body_action = Some(BubbleAction::RetryMedia { key: key.clone() });
+            }
+        } else if thumb.is_empty() {
+            ui.label(
+                RichText::new("Chưa có thumbnail")
+                    .small()
+                    .color(pal.text_muted),
+            );
+        }
+        if response.clicked() {
+            if let Some(url) = if video {
+                media.original.clone()
+            } else {
+                media.preview.clone()
+            } {
+                if video {
+                    body_action = Some(BubbleAction::OpenVideo {
+                        url,
+                        name: media.name.clone(),
+                    });
+                } else {
+                    body_action = Some(BubbleAction::OpenImagePopup {
+                        tex_key: key,
+                        full_url: url,
+                        title: "Hình ảnh".into(),
+                        sender: sender_label,
+                        time: msg.display_time(),
+                    });
+                }
+            } else {
+                body_action = Some(BubbleAction::MediaUnavailable);
+            }
+        }
+        if media.original.is_some() && ui.small_button("Lưu về máy").clicked() {
+            body_action = Some(BubbleAction::SaveAttachment {
+                url: media.original.clone().unwrap_or_default(),
+                name: media.name.clone(),
+            });
+        }
+        if !video {
+            if let Some(caption) = msg.photo_caption() {
+                ui.add(egui::Label::new(RichText::new(caption).color(text_col)).wrap());
+            }
+        }
         return body_action;
     }
     if media.kind == crate::message_view::MediaKind::File {
@@ -825,6 +918,8 @@ pub(super) fn render_chat_bubble(
     is_latest_outgoing: bool,
     is_group: bool,
     thread_name: &str,
+    thread_id: &str,
+    image_failures: &HashMap<String, crate::media_recovery::Retry>,
     sender_avatar: Option<&str>,
     pal: &ThemePalette,
     sticker_textures: &HashMap<String, TextureHandle>,
@@ -1107,6 +1202,9 @@ pub(super) fn render_chat_bubble(
                                     ui,
                                     msg,
                                     thread_name,
+                                    thread_id,
+                                    is_group,
+                                    image_failures,
                                     pal,
                                     true,
                                     content_width,
@@ -1276,6 +1374,9 @@ pub(super) fn render_chat_bubble(
                                     ui,
                                     msg,
                                     thread_name,
+                                    thread_id,
+                                    is_group,
+                                    image_failures,
                                     pal,
                                     false,
                                     content_width,
@@ -1339,8 +1440,18 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
-    SaveAttachment {url:String,name:String},
-    OpenVideo {url:String,name:String},
+    SaveAttachment {
+        url: String,
+        name: String,
+    },
+    OpenVideo {
+        url: String,
+        name: String,
+    },
+    RetryMedia {
+        key: String,
+    },
+    MediaUnavailable,
     RetrySend,
     DoubleClickReply,
     Reply,
@@ -1702,6 +1813,8 @@ mod quote_navigation_tests {
                                 false,
                                 false,
                                 "Thread",
+                                "thread-id",
+                                &HashMap::new(),
                                 None,
                                 &ThemePalette::light(),
                                 &HashMap::new(),
@@ -1848,6 +1961,9 @@ mod photo_viewer_tests {
                                 ui,
                                 &msg,
                                 "Fixture",
+                                "thread-id",
+                                false,
+                                &HashMap::new(),
                                 &ThemePalette::light(),
                                 is_outgoing,
                                 300.0,

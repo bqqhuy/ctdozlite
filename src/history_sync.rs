@@ -147,6 +147,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
                         rusqlite::params![thread.id, checkpoint])?;
                 }
+                store.filter_deleted(std::slice::from_mut(&mut thread))?;
                 page_ready(thread.clone());
                 if metadata.filtered {
                     filtered += 1;
