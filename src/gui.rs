@@ -54,13 +54,21 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 pub enum GuiEvent {
     /// Group roster for the info drawer: members and server total.
     GroupMembersLoaded {
+        /// Account that requested it; rosters of another account are dropped.
+        owner: String,
         group_id: String,
         result: Result<(Vec<crate::chat::SidebarMember>, Option<u64>), String>,
     },
-    /// People typing now (`presence::typing`).
-    Typing(Vec<crate::presence::Typing>),
-    /// Outgoing messages whose delivery state rose: `(thread, msg_id, state)`.
-    Receipts(Vec<(String, String, crate::message_model::DeliveryState)>),
+    /// People typing now (`presence::typing`), for `owner`.
+    Typing {
+        owner: String,
+        events: Vec<crate::presence::Typing>,
+    },
+    /// Outgoing messages of `owner` whose delivery state rose: `(thread, msg_id, state)`.
+    Receipts {
+        owner: String,
+        changed: Vec<(String, String, crate::message_model::DeliveryState)>,
+    },
     ComposerDraftLoaded {
         owner: String,
         thread: String,
@@ -1298,6 +1306,15 @@ impl ZaloGuiApp {
         palette
     }
 
+    /// Forget per-account typing, roster and capture state at an account boundary.
+    fn clear_presence_state(&mut self) {
+        self.typing_map.clear();
+        self.typing_sent.clear();
+        self.group_members.clear();
+        self.group_members_state.clear();
+        self.group_member_search.clear();
+    }
+
     fn request_screen_capture(&mut self) {
         if self.screen_capture_pending {
             return;
@@ -1500,6 +1517,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
                     if self.user_uin != uin {
+                        self.clear_presence_state();
                         self.deleted_message_ids.clear();
                         self.reset_sync_status();
                         self.threads.clear();
@@ -1732,7 +1750,10 @@ impl ZaloGuiApp {
                     self.refresh_unread_title(ctx);
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
-                GuiEvent::GroupMembersLoaded { group_id, result } => match result {
+                GuiEvent::GroupMembersLoaded { owner, .. } if owner != self.user_uin => {}
+                GuiEvent::GroupMembersLoaded {
+                    group_id, result, ..
+                } => match result {
                     Ok(roster) => {
                         self.group_members_state.remove(&group_id);
                         self.group_members.insert(group_id, roster);
@@ -1741,7 +1762,8 @@ impl ZaloGuiApp {
                         self.group_members_state.insert(group_id, Some(error));
                     }
                 },
-                GuiEvent::Typing(events) => {
+                GuiEvent::Typing { owner, .. } if owner != self.user_uin => {}
+                GuiEvent::Typing { events, .. } => {
                     let now = std::time::Instant::now();
                     for event in events {
                         self.typing_map
@@ -1749,7 +1771,8 @@ impl ZaloGuiApp {
                     }
                     ctx.request_repaint_after(crate::presence::TYPING_VISIBLE);
                 }
-                GuiEvent::Receipts(changed) => {
+                GuiEvent::Receipts { owner, .. } if owner != self.user_uin => {}
+                GuiEvent::Receipts { changed, .. } => {
                     for (thread, msg_id, state) in changed {
                         for t in self.threads.iter_mut().filter(|t| t.id == thread) {
                             for m in t.messages.iter_mut().filter(|m| m.id == msg_id) {
@@ -1759,6 +1782,7 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.clear_presence_state();
                     self.flush_composer_before_logout();
                     self.live_mailbox = None;
                     crate::desktop_notice::account("");
@@ -1794,6 +1818,7 @@ impl ZaloGuiApp {
                     self.show_toast("Đã đổi thư mục tải về");
                 }
                 GuiEvent::LoggedOut => {
+                    self.clear_presence_state();
                     self.deleted_message_ids.clear();
                     self.quick_schedule = None;
                     self.reset_sync_status();

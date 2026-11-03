@@ -640,10 +640,14 @@ impl RunningRound {
                         }
                         let before=state.activity;
                         let was_idle=state.idle;
+                        let batches_before=state.seen.len();
                         let waiting=state.apply(&event,&sync)?;
+                        // Only a newly received batch index proves the phone is serving; status
+                        // controls also change `activity` but must not count as progress here.
+                        if state.seen.len()>batches_before {idle_woken=None;note_peer_batch(number);}
                         if state.idle && !was_idle {idle_since=Some(std::time::Instant::now());}
                         if !state.idle {idle_since=None;}
-                        if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();idle_woken=None;if !state.seen.is_empty(){note_peer_batch(number);}}
+                        if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();}
                         if waiting{if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}}
                         for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
                         if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
@@ -1129,6 +1133,8 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         attempted: HashSet::new(),
         read: 0,
         inserted: 0,
+        existing: 0,
+        deleted: 0,
         unmapped: 0,
     });
     let page = std::sync::Mutex::new(page);
@@ -1359,14 +1365,15 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         "Đã dừng đồng bộ điện thoại; giữ dữ liệu đã lưu"
     );
     diagnostic.finish();
-    let (read, inserted, unmapped) = shared
+    let (read, inserted, existing, deleted, unmapped) = shared
         .lock()
-        .map(|s| (s.read, s.inserted, s.unmapped))
-        .unwrap_or((0, 0, 0));
+        .map(|s| (s.read, s.inserted, s.existing, s.deleted, s.unmapped))
+        .unwrap_or_default();
     crate::transfer_diagnostics::phone_totals(crate::transfer_diagnostics::PhoneTotals {
         read,
         inserted,
-        existing: read.saturating_sub(inserted),
+        existing,
+        deleted,
         unmapped,
         skipped_rounds: skipped,
         failed_conversations: failures,
@@ -1376,8 +1383,12 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     } else {
         String::new()
     };
-    let existing = read.saturating_sub(inserted);
-    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail} {plan_summary}."))
+    let deleted_note = if deleted > 0 {
+        format!(", {deleted} tin bạn đã xóa trên máy này được bỏ qua")
+    } else {
+        String::new()
+    };
+    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có{deleted_note}; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail} {plan_summary}."))
 }
 
 /// Vietnamese summary of what an update run will check.
@@ -1421,6 +1432,8 @@ struct Shared {
     attempted: HashSet<String>,
     read: usize,
     inserted: usize,
+    existing: usize,
+    deleted: usize,
     unmapped: usize,
 }
 
@@ -1657,6 +1670,8 @@ where
                             let mut shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
                             shared.read += imported.read;
                             shared.inserted += imported.inserted;
+                            shared.existing += imported.existing;
+                            shared.deleted += imported.deleted;
                             shared.unmapped += imported.unmapped;
                             shared.inserted
                         };
@@ -2048,6 +2063,21 @@ mod resilience_tests {
         assert!(round
             .apply(&batch(1, "https://a.zdn.vn/one", true), "s")
             .is_err());
+    }
+
+    #[test]
+    fn only_new_batch_indices_count_as_progress() {
+        let mut round = Round::default();
+        round.apply(&status(5), "s").unwrap();
+        round.apply(&status(2), "s").unwrap();
+        assert!(round.seen.is_empty(), "status controls are not batches");
+        round
+            .apply(&batch(0, "https://a.zdn.vn/m", false), "s")
+            .unwrap();
+        round
+            .apply(&batch(0, "https://a.zdn.vn/m", false), "s")
+            .unwrap();
+        assert_eq!(round.seen.len(), 1, "a repeated index is not new");
     }
 
     #[test]

@@ -52,6 +52,27 @@ pub struct MessageStore {
     pub conn: Connection,
 }
 
+/// Whether a stored thread is the conversation a receipt names. Group IDs may be stored
+/// with or without the `g` / `group_` prefix; a recorded thread kind must agree.
+fn receipt_matches(
+    receipt: &crate::presence::Receipt,
+    thread: &str,
+    is_group: Option<bool>,
+) -> bool {
+    if is_group.is_some_and(|group| group != receipt.is_group) {
+        return false;
+    }
+    let bare = if receipt.is_group {
+        thread
+            .strip_prefix("group_")
+            .or_else(|| thread.strip_prefix('g'))
+            .unwrap_or(thread)
+    } else {
+        thread
+    };
+    bare == receipt.thread_id
+}
+
 impl MessageStore {
     /// Initial history window; deeper reads occur when opening a thread.
     pub const PRELOAD_MSGS: usize = 20;
@@ -257,7 +278,10 @@ impl MessageStore {
     }
 
     /// Raise the delivery state of outgoing messages named by receipts; never lowers it.
-    /// Server message IDs are global, so rows are matched by ID among outgoing messages.
+    ///
+    /// A receipt that names its conversation only touches that conversation (and its kind,
+    /// when the thread row records it). Without a conversation, a row is updated only when
+    /// the message ID matches exactly one outgoing message.
     /// Returns `(thread_id, msg_id, new state)` for rows that changed.
     /// # Errors
     /// Returns database failures; malformed rows are skipped.
@@ -270,7 +294,9 @@ impl MessageStore {
         let transaction = self.conn.unchecked_transaction()?;
         {
             let mut select = transaction.prepare_cached(
-                "SELECT thread_id,raw_json FROM messages WHERE msg_id=?1 AND is_outgoing=1 LIMIT 4",
+                "SELECT m.thread_id,m.raw_json,t.is_group FROM messages m \
+                 LEFT JOIN threads t ON t.thread_id=m.thread_id \
+                 WHERE m.msg_id=?1 AND m.is_outgoing=1 LIMIT 8",
             )?;
             let mut update = transaction.prepare_cached(
                 "UPDATE messages SET raw_json=?1 WHERE thread_id=?2 AND msg_id=?3",
@@ -284,10 +310,25 @@ impl MessageStore {
                 for id in receipt.msg_ids.iter().take(8) {
                     let rows = select
                         .query_map(params![id], |r| {
-                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, Option<bool>>(2)?,
+                            ))
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    for (thread, raw) in rows {
+                    let rows: Vec<_> = if receipt.thread_id.is_empty() {
+                        if rows.len() == 1 {
+                            rows
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        rows.into_iter()
+                            .filter(|(thread, _, group)| receipt_matches(receipt, thread, *group))
+                            .collect()
+                    };
+                    for (thread, raw, _) in rows {
                         let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
                             continue;
                         };
@@ -1252,6 +1293,27 @@ impl From<&ChatMessage> for StoredMessage {
 
 /// Persist threads and their messages to SQLite store, returning the count of newly inserted messages.
 pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
+    persist_snapshot(store, threads, false).map(|c| c.inserted)
+}
+
+/// Outcome of persisting a snapshot, message by message.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PersistCounts {
+    /// New rows.
+    pub inserted: usize,
+    /// Already stored (deduplicated or merged into the existing row).
+    pub existing: usize,
+    /// Refused because the user deleted that message on this device.
+    pub deleted: usize,
+}
+
+/// Like [`persist_threads`], also reporting duplicates and delete-marker refusals.
+/// # Errors
+/// Returns database failures and rolls back the entire snapshot.
+pub fn persist_threads_counted(
+    store: &mut MessageStore,
+    threads: &[Thread],
+) -> Result<PersistCounts> {
     persist_snapshot(store, threads, false)
 }
 
@@ -1259,15 +1321,15 @@ pub fn persist_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<u
 /// # Errors
 /// Returns database failures and rolls back the entire snapshot.
 pub fn persist_local_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
-    persist_snapshot(store, threads, true)
+    persist_snapshot(store, threads, true).map(|c| c.inserted)
 }
 fn persist_snapshot(
     store: &mut MessageStore,
     threads: &[Thread],
     local_flags: bool,
-) -> Result<usize> {
+) -> Result<PersistCounts> {
     let transaction = store.conn.unchecked_transaction()?;
-    let mut new_count = 0;
+    let mut counts = PersistCounts::default();
     for t in threads {
         let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
         let st = StoredThread {
@@ -1293,8 +1355,16 @@ fn persist_snapshot(
                 sm.msg_id = format!("{}_{}", t.id, sm.ts);
             }
             store.reconcile_send_identity(m, &mut sm)?;
+            if store.is_deleted_message(&sm)? {
+                counts.deleted += 1;
+                continue;
+            }
             if store.upsert_message(&sm)? {
-                new_count += 1;
+                counts.inserted += 1;
+            } else if store.is_deleted_message(&sm)? {
+                counts.deleted += 1;
+            } else {
+                counts.existing += 1;
             }
             if local_flags {
                 store.conn.execute("UPDATE messages SET raw_json=json_set(raw_json,'$.is_starred',json(?1),'$.is_pinned',json(?2)) WHERE thread_id=?3 AND msg_id=?4",
@@ -1303,7 +1373,7 @@ fn persist_snapshot(
         }
     }
     transaction.commit()?;
-    Ok(new_count)
+    Ok(counts)
 }
 
 /// Convenience helper: open `zalo_history.db` (or `path`) and hydrate `threads` with saved history.
@@ -1374,7 +1444,7 @@ mod tests {
                 .unwrap();
         }
         let receipt = |id: &str, read: bool| crate::presence::Receipt {
-            thread_id: String::new(),
+            thread_id: "t".into(),
             is_group: false,
             msg_ids: vec![id.into()],
             read,

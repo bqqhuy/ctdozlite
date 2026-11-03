@@ -1330,8 +1330,9 @@ pub(super) fn spawn_session_worker(
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
+                                let owner = s.account_key().to_owned();
                                 let result = crate::chat::group_members(&s, &group_id).await.map_err(|e| e.to_string());
-                                let _ = tx.send(GuiEvent::GroupMembersLoaded { group_id, result });
+                                let _ = tx.send(GuiEvent::GroupMembersLoaded { owner, group_id, result });
                                 ctx.request_repaint();
                             });
                         }
@@ -2429,7 +2430,10 @@ async fn deliver_presence(
     let self_id = s.account_key().to_owned();
     let typing = crate::presence::typing(payload, &self_id);
     if !typing.is_empty() {
-        let _ = gui_tx.send(GuiEvent::Typing(typing));
+        let _ = gui_tx.send(GuiEvent::Typing {
+            owner: self_id.clone(),
+            events: typing,
+        });
         ctx.request_repaint();
     }
     let receipts = crate::presence::receipts(payload);
@@ -2443,7 +2447,10 @@ async fn deliver_presence(
     .await;
     match changed {
         Ok(Ok(changed)) if !changed.is_empty() => {
-            let _ = gui_tx.send(GuiEvent::Receipts(changed));
+            let _ = gui_tx.send(GuiEvent::Receipts {
+                owner: s.account_key().to_owned(),
+                changed,
+            });
             ctx.request_repaint();
         }
         Ok(Err(e)) => crate::logger::log_error("presence::receipts", &e.to_string()),

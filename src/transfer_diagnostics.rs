@@ -68,6 +68,8 @@ pub(crate) struct PhoneTotals {
     pub inserted: usize,
     /// Read but already stored (deduplicated).
     pub existing: usize,
+    /// Read but refused by a local delete marker (not in the database).
+    pub deleted: usize,
     /// Kept in quarantine because the conversation was not recognised.
     pub unmapped: usize,
     pub skipped_rounds: usize,

@@ -92,6 +92,10 @@ pub(super) struct Imported {
     /// Messages read from the batch for mapped conversations.
     pub read: usize,
     pub inserted: usize,
+    /// Already stored before this batch.
+    pub existing: usize,
+    /// Refused by a local delete marker.
+    pub deleted: usize,
     pub unmapped: usize,
     pub previews: Vec<Thread>,
 }
@@ -110,6 +114,8 @@ pub(super) fn save(
     let mut result = Imported {
         read: 0,
         inserted: 0,
+        existing: 0,
+        deleted: 0,
         unmapped: 0,
         previews: Vec::new(),
     };
@@ -161,7 +167,11 @@ pub(super) fn save(
                 }
             }
             result.read += thread.messages.len();
-            result.inserted += crate::store::persist_threads(store, std::slice::from_ref(&thread))?;
+            let counts =
+                crate::store::persist_threads_counted(store, std::slice::from_ref(&thread))?;
+            result.inserted += counts.inserted;
+            result.existing += counts.existing;
+            result.deleted += counts.deleted;
             // Read back the bounded latest page, including durable local/recall state.
             thread.messages.clear();
             let mut hydrated = vec![thread];
