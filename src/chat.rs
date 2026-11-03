@@ -4180,8 +4180,21 @@ impl PollState {
         }
         if let Some(qs) = data_node.get("queueStatus").and_then(Value::as_object) {
             for (qid, qval) in qs {
-                // Only update configured HTTP long-polling MSG queues ("1", "2", "3").
-                // Adding socket-only queues ("15", "16", "7", "8") causes lp_chat to reject subsequent requests.
+                // Message queues the server reports for this session ("6" = 511_0,
+                // "15" = 510_1, "16" = 511_1) are tracked from the start of what it kept.
+                // Untracked, lp_chat repeats the same `more = 1` page indefinitely (upstream
+                // PR #69 evidence 02/11, group queue "16"); lp_chat accepted these queues.
+                // Unknown queues ("7", "8") stay untracked.
+                if matches!(qid.as_str(), "6" | "15" | "16") && !self.queues.contains_key(qid) {
+                    self.queues.insert(
+                        qid.clone(),
+                        QueueCursor {
+                            last_id: "1".into(),
+                            ids: Vec::new(),
+                        },
+                    );
+                    continue;
+                }
                 let Some(entry) = self.queues.get_mut(qid) else {
                     continue;
                 };
@@ -5871,8 +5884,9 @@ mod tests {
             ps.queues.get("1").unwrap().ids,
             vec!["8399086511016".to_string()]
         );
-        // Socket-only queue "15" must NOT be added to HTTP polling queues
-        assert!(!ps.queues.contains_key("15"));
+        // A message queue the server reports ("15" = 510_1) is tracked from the start of what
+        // it kept; lp_chat accepted 15/16 on a real account (upstream PR #69, 02/11).
+        assert_eq!(ps.queues.get("15").unwrap().last_id, "1");
     }
 
     #[test]
@@ -6751,5 +6765,26 @@ mod catchup_measurement {
             );
             assert_eq!(requests, if guarded { 2 } else { 1800 });
         }
+    }
+}
+
+#[cfg(test)]
+mod reported_queue_tests {
+    use super::*;
+    #[test]
+    fn reported_group_queue_is_tracked_and_advances_while_unknown_queues_stay_untracked() {
+        let mut state = PollState::default();
+        let reply = json!({"data":{"more":1,"lastActionId":"100","queueStatus":{
+            "1":{"lastId":"100","ids":[]},
+            "16":{"lastId":"8442899323544","ids":["8442899323544"]},
+            "7":{"lastId":"100","evict":1}
+        }}});
+        state.update_from_response(&reply);
+        assert_eq!(state.queues["16"].last_id, "1");
+        assert!(!state.queues.contains_key("7"));
+        state.update_from_response(&reply);
+        assert_eq!(state.queues["16"].last_id, "8442899323544");
+        let queues = serde_json::to_string(&state.queues).unwrap();
+        assert!(queues.contains("\"16\""));
     }
 }
