@@ -41,3 +41,33 @@ live traffic (the parsers accept the shapes above and ignore anything else).
   `_reuploadMedia`. The fork uses the re-upload path only (download the original into a
   private folder, send through the existing attachment flow, delete the copy). Videos are
   re-sent through the same attachment flow as files.
+
+## Video messages and media forwarding like Zalo PC (supersedes the re-upload note above)
+
+Static source: same `compact-app-pc` bundle.
+
+- Video upload (`uploadVideoMessage` → `uploadVideo` → generic uploader): chunks go to
+  `getFileDomain()/api/{message|group}/video/file/upload?…&params=…&type=2|11` with
+  `{totalChunk, fileName, clientId, totalSize, imei, chunkId, toid|grid}` and form field
+  `chunkContent` (`buildSendChunksInfo`). A video chunk is done when `data.finished` and
+  `data.fileId`; the CDN URL arrives later (`fileAsync.fileUrl`, the `video_done` control).
+  The poster goes to `video/thumb/upload` the same way and is done on `photoId`; its URL is
+  `fileAsync.oriUrl || hdUrl`.
+- Sending (`sendVideoMessage` → `_forwardMessages(…, MSGTYPE_FORWARD_VIDEO)` → `forwardFile`
+  → `forwardMessage`): `getFileDomain()/api/message/forward` `{toId, imei}` or
+  `/api/group/forward` `{grid, visibility}`, plus `msgType`, `clientId` and
+  `msgInfo = JSON {videoUrl, thumbUrl, duration (default 1), width, height, fileSize,
+  properties, title}`. `MSGTYPE_FORWARD_FILE/PHOTO/VOICE/GIF/VIDEO = 1/2/3/4/5`.
+- Forwarding (`_forwardMessages`): photo `msgInfo {title, oriUrl, thumbUrl, rawThumbUrl,
+  hdUrl, previewThumb, width, height, properties, fileSize, hdSize, thumbSize}` (requires
+  `oriUrl` and `thumbUrl`); file `{url, fileName, extension, checksum, size, fType,
+  fdata?, thumbUrl?}` (refused unless `checksum` is 32 hex digits).
+- `forwardFile` with `async_forward` → `ForwardAsync.forward(target, msgType, msgInfo,
+  newClientId)`: `renewLink(target, msgType, msgInfo, newClientId)` (msgInfo gains
+  `isE2EE`, `isOriginal`), then `_transContent` applies the copied URLs (photo `normal/hd/
+  thumb` → `oriUrl/hdUrl/thumbUrl`, `normalUrl` cleared; file `fileUrl` → `url`; video:
+  one copy with `renewType: 1` for `videoUrl`, one with `renewType: 0` and `isPhotoOriginal`
+  for `thumbUrl`) and calls `forwardMessage`. `_reuploadMedia` is the fallback.
+- The `isClone` flag (`_forwardMessages`) depends on remote config (`media_cloud`) and was
+  not reproduced. Live captures are still needed for the reply of `video/file/upload` and
+  for one forward of each media kind.

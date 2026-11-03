@@ -65,3 +65,4 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0022 — Resumable control queue drain](0022-resumable-control-queue-drain.md)
 - [0023 — Phased, parallel and resumable phone sync](0023-phased-parallel-resumable-phone-sync.md)
 - [0024 — Update-only sync, media renewal and selected PR #78 features](0024-update-only-sync-and-selected-pr78.md)
+- [0025 — Video messages and media forwarding like Zalo PC](0025-video-messages-and-forward-like-zalo-pc.md)
