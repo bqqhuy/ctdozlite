@@ -192,9 +192,9 @@ pub(super) fn open_external_url(url: &str) {
 pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "windows")]
     {
-        return rfd::FileDialog::new()
+        rfd::FileDialog::new()
             .set_title("Chọn thư mục lưu file tải về")
-            .pick_folder();
+            .pick_folder()
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -222,7 +222,7 @@ pub(super) fn pick_native_files_dialog(images_only: bool) -> Option<Vec<std::pat
                 .add_filter("Video & âm thanh", &["mp4", "mov", "mkv", "mp3", "wav"])
                 .add_filter("Tài liệu", &["pdf", "zip", "docx", "xlsx", "txt"])
         };
-        return dlg.pick_files();
+        dlg.pick_files()
     }
     #[cfg(not(windows))]
     {
@@ -266,7 +266,7 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
         }
         let prev = WAS_PASTE_DOWN.swap(win32_down, std::sync::atomic::Ordering::SeqCst);
         let edge_triggered = win32_down && !prev;
-        return egui_paste || edge_triggered;
+        egui_paste || edge_triggered
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -317,8 +317,8 @@ pub(super) fn clipboard_has_image() -> bool {
                 8,
                 15,
                 17,
-                RegisterClipboardFormatA(b"PNG\0".as_ptr()),
-                RegisterClipboardFormatA(b"image/png\0".as_ptr()),
+                RegisterClipboardFormatA(c"PNG".as_ptr().cast()),
+                RegisterClipboardFormatA(c"image/png".as_ptr().cast()),
             ]
             .into_iter()
             .any(|format| format != 0 && IsClipboardFormatAvailable(format) != 0)

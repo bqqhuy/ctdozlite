@@ -211,15 +211,6 @@ impl LiveUpdates {
         let mut alerts = self.alerts.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut alerts.1)
     }
-    #[cfg(windows)]
-    pub(crate) fn has_unread(&self) -> bool {
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .0
-            .values()
-            .any(|thread| thread.unread.has_badge())
-    }
     pub(crate) fn take(&self) -> Vec<Thread> {
         let mut state = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         state.1 = false;

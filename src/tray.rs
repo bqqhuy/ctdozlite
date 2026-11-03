@@ -268,6 +268,9 @@ pub(crate) fn take_restore_request() -> bool {
 }
 
 /// Wake the native window for an incoming call even when rendering is suspended.
+// Not called since cbbb011 removed it from the incoming-call path; kept until the
+// maintainer decides whether a hidden window should open for incoming calls again.
+#[allow(dead_code)]
 pub(crate) fn show_incoming_call() {
     let control = DISPATCH
         .lock()
@@ -391,12 +394,6 @@ pub(crate) fn configure_notifications(enabled: bool, sound: bool) {
 }
 pub(crate) fn set_unread(unread: bool) {
     HAS_UNREAD.store(unread, Ordering::Release);
-}
-pub(crate) fn note_background_unread(new_alert: bool) {
-    HAS_UNREAD.store(true, Ordering::Release);
-    if !previews_visible() && new_alert && NOTIFICATIONS_ENABLED.load(Ordering::Relaxed) {
-        POPUP_PENDING.store(true, Ordering::Release);
-    }
 }
 
 /// A popup click owns the exact notification snapshot, independent of newer arrivals.

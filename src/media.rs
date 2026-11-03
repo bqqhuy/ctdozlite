@@ -922,7 +922,6 @@ fn spawn_camera_capture_thread(
                 }
             }
         });
-        return;
     }
     #[cfg(not(windows))]
     {
@@ -2081,7 +2080,6 @@ fn run_native_h264_decoder(
             )));
             egui_ctx.request_repaint();
         }
-        return;
     }
     #[cfg(not(windows))]
     {
