@@ -1172,6 +1172,20 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.quick_messages_enabled, pal);
                                                         });
                                                     });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Hiện khi người khác đang soạn tin").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.show_typing, pal);
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Cho người khác biết khi tôi đang soạn tin").color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.send_typing, pal);
+                                                        });
+                                                    });
                                                 });
                                             ui.add_space(14.0);
 

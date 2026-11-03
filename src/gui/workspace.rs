@@ -3007,6 +3007,18 @@ impl ZaloGuiApp {
                         }
                     }
 
+                    if let Some(who) = self.typing_label(&thread_id, is_group) {
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.label(
+                                RichText::new(format!("{who} đang soạn tin…"))
+                                    .italics()
+                                    .size(12.0)
+                                    .color(pal.text_secondary),
+                            );
+                        });
+                    }
+
                     // 3. Optional Sticker Picker Drawer
                     if self.sticker_picker_open {
                         self.render_sticker_picker(ui, &thread_id, is_group, pal);
@@ -3333,6 +3345,9 @@ impl ZaloGuiApp {
                                         if self.composer_focus_pending {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
+                                        }
+                                        if response.changed() && !self.input_message.trim().is_empty() {
+                                            self.maybe_send_typing(&thread_id, is_group);
                                         }
                                         response.context_menu(|ui| {
                                             if ui
@@ -4089,5 +4104,78 @@ mod chat_layout_key_tests {
             chat_layout_key("t", &[msg("a"), msg("b"), msg("c")], 150)
         );
         assert_ne!(key, chat_layout_key("t", &base, 300));
+    }
+}
+
+impl ZaloGuiApp {
+    /// Who is typing in this conversation, while the indicator is still fresh.
+    fn typing_label(&mut self, thread_id: &str, is_group: bool) -> Option<String> {
+        if !self.settings.show_typing {
+            return None;
+        }
+        let key = (
+            thread_id
+                .trim_start_matches("group_")
+                .trim_start_matches(if is_group { "g" } else { "" })
+                .to_owned(),
+            is_group,
+        );
+        let now = std::time::Instant::now();
+        self.typing_map
+            .retain(|_, (_, at)| now.duration_since(*at) < crate::presence::TYPING_VISIBLE);
+        let (uid, _) = self.typing_map.get(&key)?;
+        let thread = self.threads.iter().find(|t| t.id == thread_id)?;
+        if !is_group {
+            return Some(thread.name.clone());
+        }
+        let name = thread
+            .messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m.wire_ref.sender.as_ref().and_then(|v| v.as_str()) == Some(uid.as_str())
+                    && !m.sender.is_empty()
+                    && !m.sender.chars().all(|c| c.is_ascii_digit())
+            })
+            .map(|m| m.sender.clone())
+            .unwrap_or_else(|| "Một thành viên".into());
+        Some(name)
+    }
+
+    /// Send a typing signal at most every `TYPING_SEND_EVERY` per conversation.
+    fn maybe_send_typing(&mut self, thread_id: &str, is_group: bool) {
+        if !self.settings.send_typing {
+            return;
+        }
+        let cloud = self
+            .threads
+            .iter()
+            .any(|t| t.id == thread_id && !t.is_group && t.name.contains("Cloud của tôi"));
+        if cloud {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .typing_sent
+            .get(thread_id)
+            .is_some_and(|at| now.duration_since(*at) < crate::presence::TYPING_SEND_EVERY)
+        {
+            return;
+        }
+        if self.typing_sent.len() > 256 {
+            self.typing_sent
+                .retain(|_, at| now.duration_since(*at) < crate::presence::TYPING_SEND_EVERY);
+        }
+        if let Some(tx) = WORKER_TX.get() {
+            if tx
+                .send(WorkerCmd::SendTyping {
+                    thread_id: thread_id.to_owned(),
+                    is_group,
+                })
+                .is_ok()
+            {
+                self.typing_sent.insert(thread_id.to_owned(), now);
+            }
+        }
     }
 }

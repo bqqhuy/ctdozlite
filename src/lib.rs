@@ -98,5 +98,7 @@ mod transfer_diagnostics;
 
 mod queue_catchup;
 
+/// Typing indicators and delivery/read receipts.
+pub mod presence;
 /// Correlates async file uploads with their processed-URL notifications.
 pub mod upload_events;

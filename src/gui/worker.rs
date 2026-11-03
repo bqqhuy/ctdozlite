@@ -68,6 +68,11 @@ pub enum WorkerCmd {
         retry_filtered: bool,
     },
     CancelHistorySync,
+    /// Best-effort typing signal; the UI rate-limits it per conversation.
+    SendTyping {
+        thread_id: String,
+        is_group: bool,
+    },
     /// Explicit phone-approved history transfer; never started by login/refresh.
     /// `range_days == 0` requests the whole phone history.
     SyncPhoneHistory {
@@ -671,6 +676,7 @@ pub(super) fn spawn_session_worker(
                                             {
                                                 cb.handle_control_event(voip_ev);
                                             }
+                                            deliver_presence(&s_snap, &ev.payload, &gui_tx_ws, &ctx_ws).await;
                                             if ev.is_voip_ish() {
                                                 let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
                                                 apply_server_mutes(&s_snap, mutes, &mute_sync, &gui_tx_ws, &live_updates, &ctx_ws).await;
@@ -1285,6 +1291,14 @@ pub(super) fn spawn_session_worker(
                                 let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,message});ctx.request_repaint();
                             });
                         }
+                        WorkerCmd::SendTyping { thread_id, is_group } => {
+                            let s = session.lock().await.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::presence::send_typing(&s, &thread_id, is_group).await {
+                                    crate::logger::log_error("presence::typing", &e.to_string());
+                                }
+                            });
+                        }
                         WorkerCmd::CancelHistorySync => {
                             history_sync_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
@@ -1455,6 +1469,7 @@ pub(super) fn spawn_session_worker(
                                         };
                                         match poll_res {
                                             Ok(lp_resp) => {
+                                                deliver_presence(&s, &lp_resp, &gui_tx_clone, &ctx_clone).await;
                                                 crate::chat::merge_previews(
                                                     &mut temp_threads,
                                                     &lp_resp,
@@ -2348,6 +2363,38 @@ fn publish_preferences(
         values,
     });
     ctx.request_repaint();
+}
+
+/// Forward typing actions and persist delivery/read receipts from a realtime payload.
+async fn deliver_presence(
+    s: &Session,
+    payload: &serde_json::Value,
+    gui_tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) {
+    let self_id = s.account_key().to_owned();
+    let typing = crate::presence::typing(payload, &self_id);
+    if !typing.is_empty() {
+        let _ = gui_tx.send(GuiEvent::Typing(typing));
+        ctx.request_repaint();
+    }
+    let receipts = crate::presence::receipts(payload);
+    if receipts.is_empty() || !s.is_active() {
+        return;
+    }
+    let account = s.clone();
+    let changed = tokio::task::spawn_blocking(move || {
+        crate::store::MessageStore::open(account.history_path())?.apply_receipts(&receipts)
+    })
+    .await;
+    match changed {
+        Ok(Ok(changed)) if !changed.is_empty() => {
+            let _ = gui_tx.send(GuiEvent::Receipts(changed));
+            ctx.request_repaint();
+        }
+        Ok(Err(e)) => crate::logger::log_error("presence::receipts", &e.to_string()),
+        _ => {}
+    }
 }
 
 /// Apply realtime `act_type: "mute"` controls; newer than any snapshot already in flight.

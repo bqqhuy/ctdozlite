@@ -52,6 +52,10 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    /// People typing now (`presence::typing`).
+    Typing(Vec<crate::presence::Typing>),
+    /// Outgoing messages whose delivery state rose: `(thread, msg_id, state)`.
+    Receipts(Vec<(String, String, crate::message_model::DeliveryState)>),
     ComposerDraftLoaded {
         owner: String,
         thread: String,
@@ -328,6 +332,10 @@ struct AppSettings {
     play_notification_sound: bool,
     // 5. Tin nhắn
     quick_messages_enabled: bool,
+    /// Show "đang soạn tin" from other people.
+    show_typing: bool,
+    /// Tell others while this account is typing (at most every 10 s per conversation).
+    send_typing: bool,
     hidden_chat_pin_enabled: bool,
     split_priority_inbox: bool,
     excel_paste_mode: String, // "image" | "text" | "ask"
@@ -376,6 +384,8 @@ impl Default for AppSettings {
             enable_notifications: true,
             play_notification_sound: false,
             quick_messages_enabled: true,
+            show_typing: true,
+            send_typing: true,
             hidden_chat_pin_enabled: true,
             split_priority_inbox: false,
             excel_paste_mode: "ask".into(),
@@ -469,6 +479,10 @@ pub struct ZaloGuiApp {
     composer_ime_active: bool,
     /// Last rendered chat-list identity; a change discards one stale layout pass.
     chat_layout_key: u64,
+    /// `(thread without prefix, is_group)` → (who is typing, when it was reported).
+    typing_map: HashMap<(String, bool), (String, std::time::Instant)>,
+    /// Last typing signal sent per conversation.
+    typing_sent: HashMap<String, std::time::Instant>,
     contacts_tab: contacts::ContactsTab,
     contacts_query: String,
     search_query: String,
@@ -712,6 +726,8 @@ impl ZaloGuiApp {
             contacts_view_open: false,
             composer_ime_active: false,
             chat_layout_key: 0,
+            typing_map: HashMap::new(),
+            typing_sent: HashMap::new(),
             contacts_tab: contacts::ContactsTab::default(),
             contacts_query: String::new(),
             search_query: String::new(),
@@ -1664,6 +1680,23 @@ impl ZaloGuiApp {
                     }
                     self.refresh_unread_title(ctx);
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
+                }
+                GuiEvent::Typing(events) => {
+                    let now = std::time::Instant::now();
+                    for event in events {
+                        self.typing_map
+                            .insert((event.thread_id, event.is_group), (event.uid, now));
+                    }
+                    ctx.request_repaint_after(crate::presence::TYPING_VISIBLE);
+                }
+                GuiEvent::Receipts(changed) => {
+                    for (thread, msg_id, state) in changed {
+                        for t in self.threads.iter_mut().filter(|t| t.id == thread) {
+                            for m in t.messages.iter_mut().filter(|m| m.id == msg_id) {
+                                m.delivery = m.delivery.merge(state);
+                            }
+                        }
+                    }
                 }
                 GuiEvent::SessionExpired(reason) => {
                     self.flush_composer_before_logout();

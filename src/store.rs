@@ -256,6 +256,66 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Raise the delivery state of outgoing messages named by receipts; never lowers it.
+    /// Server message IDs are global, so rows are matched by ID among outgoing messages.
+    /// Returns `(thread_id, msg_id, new state)` for rows that changed.
+    /// # Errors
+    /// Returns database failures; malformed rows are skipped.
+    pub(crate) fn apply_receipts(
+        &self,
+        receipts: &[crate::presence::Receipt],
+    ) -> Result<Vec<(String, String, crate::message_model::DeliveryState)>> {
+        use crate::message_model::DeliveryState;
+        let mut changed = Vec::new();
+        let transaction = self.conn.unchecked_transaction()?;
+        {
+            let mut select = transaction.prepare_cached(
+                "SELECT thread_id,raw_json FROM messages WHERE msg_id=?1 AND is_outgoing=1 LIMIT 4",
+            )?;
+            let mut update = transaction.prepare_cached(
+                "UPDATE messages SET raw_json=?1 WHERE thread_id=?2 AND msg_id=?3",
+            )?;
+            for receipt in receipts.iter().take(512) {
+                let incoming = if receipt.read {
+                    DeliveryState::Read
+                } else {
+                    DeliveryState::Delivered
+                };
+                for id in receipt.msg_ids.iter().take(8) {
+                    let rows = select
+                        .query_map(params![id], |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    for (thread, raw) in rows {
+                        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                            continue;
+                        };
+                        if !value.is_object() {
+                            continue;
+                        }
+                        if !value.get("message_state").is_some_and(|v| v.is_object()) {
+                            value["message_state"] = serde_json::json!({});
+                        }
+                        let current: DeliveryState = value["message_state"]
+                            .get("delivery")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                            .unwrap_or_default();
+                        let next = current.merge(incoming);
+                        if next == current {
+                            continue;
+                        }
+                        value["message_state"]["delivery"] = serde_json::to_value(next)?;
+                        update.execute(params![value.to_string(), thread, id])?;
+                        changed.push((thread, id.clone(), next));
+                    }
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(changed)
+    }
+
     /// Update only renewed media metadata, preserving delivery, recall and local flags.
     /// # Errors
     /// Returns invalid metadata or database failures; never creates a missing message.
@@ -1288,6 +1348,54 @@ mod tests {
         store.hydrate_selected_threads(&mut selected, 500).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "Name thread-1");
+    }
+    #[test]
+    fn receipts_only_raise_outgoing_delivery_state() {
+        use crate::message_model::DeliveryState;
+        let store = MessageStore::open(":memory:").unwrap();
+        for (id, outgoing, delivery) in [
+            ("m1", true, "server_accepted"),
+            ("m2", false, "unknown"),
+            ("m3", true, "read"),
+        ] {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: id.into(),
+                    thread_id: "t".into(),
+                    sender_id: "me".into(),
+                    sender_name: String::new(),
+                    text: "x".into(),
+                    msg_type: "chat.text".into(),
+                    ts: 1,
+                    is_outgoing: outgoing,
+                    raw_json: serde_json::json!({"message_state":{"delivery":delivery}})
+                        .to_string(),
+                })
+                .unwrap();
+        }
+        let receipt = |id: &str, read: bool| crate::presence::Receipt {
+            thread_id: String::new(),
+            is_group: false,
+            msg_ids: vec![id.into()],
+            read,
+        };
+        let changed = store
+            .apply_receipts(&[
+                receipt("m1", false),
+                receipt("m2", true),
+                receipt("m3", false),
+            ])
+            .unwrap();
+        assert_eq!(
+            changed,
+            vec![("t".into(), "m1".into(), DeliveryState::Delivered)]
+        );
+        let changed = store.apply_receipts(&[receipt("m1", true)]).unwrap();
+        assert_eq!(changed[0].2, DeliveryState::Read);
+        assert!(store
+            .apply_receipts(&[receipt("m1", false)])
+            .unwrap()
+            .is_empty());
     }
     #[test]
     fn limited_history_keeps_newest_rows_and_uses_thread_index() {
