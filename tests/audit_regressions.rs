@@ -358,3 +358,33 @@ async fn streaming_upload_preserves_chunk_order_checksum_and_final_ack() {
     );
     assert_eq!(message.id, "999");
 }
+#[tokio::test]
+async fn forward_message_body_matches_zalo_pc_forward_message() {
+    let ok = r#"{"error_code":0,"data":{"msgId":"9"}}"#;
+    let info =
+        serde_json::json!({"videoUrl":"https://video.zdn.vn/v.mp4","thumbUrl":"","duration":1});
+    let (url, task) = fixture(Some(ok)).await;
+    chat::send_forward_message(&session(&url), "456", false, 5, &info, 77)
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("POST /api/message/forward?"));
+    let body = params(&requests[0]);
+    assert_eq!(body["toId"], "456");
+    assert_eq!(body["msgType"], 5);
+    assert_eq!(body["clientId"], 77);
+    let sent: serde_json::Value = serde_json::from_str(body["msgInfo"].as_str().unwrap()).unwrap();
+    assert_eq!(sent, info);
+    let (url, task) = fixture(Some(ok)).await;
+    chat::send_forward_message(&session(&url), "g789", true, 2, &info, 78)
+        .await
+        .unwrap();
+    let requests = task.await.unwrap();
+    assert!(requests[0].starts_with("POST /api/group/forward?"));
+    let body = params(&requests[0]);
+    assert_eq!(
+        (body["grid"].as_str(), body["visibility"].as_i64()),
+        (Some("789"), Some(0))
+    );
+    assert!(body.get("toId").is_none());
+}

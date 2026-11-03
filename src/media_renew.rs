@@ -92,8 +92,15 @@ async fn renew_once(
     message: &ChatMessage,
 ) -> Result<Media> {
     let tag = reference_tag(s, thread, message);
+    let body = payload(s, thread, group, message).inspect_err(|_| {
+        diag::renewal(tag, RenewPhase::PreparationFailed, None);
+    })?;
+    renew_body(s, tag, &body, crate::message_view::media(message)).await
+}
+/// Run `renewlink` for a prepared body, re-polling `async` replies within the shared budget.
+async fn renew_body(s: &Session, tag: u64, body: &Value, base: Media) -> Result<Media> {
     let outcome = poll_pending(RENEW_DEADLINE, &PENDING_DELAYS, || async {
-        let reply = renew_request(s, tag, thread, group, message).await;
+        let reply = renew_request(s, tag, body, base.clone()).await;
         if matches!(reply, Ok(Reply::Pending)) {
             diag::renewal(tag, RenewPhase::Pending, Some(0));
         }
@@ -107,6 +114,57 @@ async fn renew_once(
             anyhow::bail!("Máy chủ chưa chuẩn bị xong media, hãy thử lại sau")
         }
     }
+}
+/// `msgType` codes of `renewlink` / `forward` (Zalo PC `MSGTYPE_FORWARD_FILE/PHOTO/VIDEO`).
+pub(crate) fn forward_type(kind: MediaKind) -> Option<u8> {
+    match kind {
+        MediaKind::File => Some(1),
+        MediaKind::Photo => Some(2),
+        MediaKind::Video => Some(5),
+        MediaKind::None => None,
+    }
+}
+/// Ask the server for a copy of media usable in `target` (Zalo PC `ForwardAsync.forward`:
+/// `renewLink(targetConversation, msgType, msgInfo, newClientId)`). `info` is the forward
+/// `msgInfo` object; the reply carries the target's URLs in the usual renewal shapes.
+/// # Errors
+/// Returns sanitized server, parse and timeout failures.
+pub(crate) async fn clone_for(
+    s: &Session,
+    target: &str,
+    target_group: bool,
+    kind: MediaKind,
+    info: &Value,
+    client_id: u64,
+    original: bool,
+) -> Result<Media> {
+    let msg_type = forward_type(kind).context("Loại media chưa hỗ trợ sao chép")?;
+    // `renewLink` merges these two flags into msgInfo before encoding it.
+    let mut info = info.clone();
+    info["isE2EE"] = json!(0);
+    info["isOriginal"] = json!(if original { 1 } else { 0 });
+    let clean = target
+        .strip_prefix("group_")
+        .or_else(|| target_group.then(|| target.strip_prefix('g')).flatten())
+        .unwrap_or(target);
+    ensure!(
+        !clean.is_empty() && clean.bytes().all(|b| b.is_ascii_digit()),
+        "Định danh hội thoại không hợp lệ"
+    );
+    let self_cloud = s.login.as_ref().is_some_and(|l| l.send2me_id == target);
+    let body = json!({"toId":clean,"msgType":msg_type,"msgInfo":info.to_string(),
+        "clientId":client_id.to_string(),"imei":s.imei,"isGroup":if target_group||self_cloud{1}else{0}});
+    let tag = diag::tag(&format!("clone:{}:{target}:{client_id}", s.account_key()));
+    renew_body(
+        s,
+        tag,
+        &body,
+        Media {
+            kind,
+            ..Default::default()
+        },
+    )
+    .await
 }
 /// Repeat `attempt` while it reports `Pending`, sleeping through `delays`, until one shared
 /// `budget` (covering attempts and pauses) runs out. `None` means the budget ran out.
@@ -138,16 +196,10 @@ where
     }
 }
 /// One `renewlink` round trip.
-async fn renew_request(
-    s: &Session,
-    tag: u64,
-    thread: &str,
-    group: bool,
-    message: &ChatMessage,
-) -> Result<Reply> {
+async fn renew_request(s: &Session, tag: u64, body: &Value, base: Media) -> Result<Reply> {
     let params = (|| -> Result<String> {
         ensure!(s.is_active(), "Đã đăng xuất");
-        s.encoded_params(&payload(s, thread, group, message)?)
+        s.encoded_params(body)
     })();
     let params = params.inspect_err(|_| {
         diag::renewal(tag, RenewPhase::PreparationFailed, None);
@@ -174,7 +226,7 @@ async fn renew_request(
     diag::renewal(tag, RenewPhase::ServerReply, code);
     // A session switch while the request was in flight must not leak into the new account.
     ensure!(s.is_active(), "Đã đăng xuất");
-    match parse(&response, crate::message_view::media(message)) {
+    match parse(&response, base) {
         Ok(reply) => {
             if matches!(reply, Reply::Ready(_)) {
                 diag::renewal(tag, RenewPhase::Finished, code);

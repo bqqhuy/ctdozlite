@@ -277,6 +277,22 @@ impl MessageStore {
         Ok(())
     }
 
+    /// The conversation (and whether it is a group) holding `msg_id`, when exactly one does.
+    /// # Errors
+    /// Returns database failures.
+    pub(crate) fn unique_thread_of_message(&self, msg_id: &str) -> Result<Option<(String, bool)>> {
+        let mut statement = self.conn.prepare_cached(
+            "SELECT m.thread_id,COALESCE(t.is_group,0) FROM messages m \
+             LEFT JOIN threads t ON t.thread_id=m.thread_id WHERE m.msg_id=?1 LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(params![msg_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows.len() == 1).then(|| rows[0].clone()))
+    }
+
     /// Raise the delivery state of outgoing messages named by receipts; never lowers it.
     ///
     /// A receipt that names its conversation only touches that conversation (and its kind,

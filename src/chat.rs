@@ -1956,6 +1956,32 @@ pub(crate) async fn send_attachment_with_client_id(
         return Ok((send_resp, cm));
     }
 
+    // MP4/MOV go out as a video message like Zalo PC; any failure before that message is
+    // sent falls back to the file path below, so nothing is sent twice.
+    if crate::video_meta::is_video_message(file_path) {
+        match send_video_message(
+            s,
+            file_path,
+            &mut source,
+            is_group,
+            clean_target,
+            caption,
+            client_id,
+        )
+        .await
+        {
+            Ok(VideoSend::Sent(result)) => return Ok(*result),
+            Ok(VideoSend::Fallback(reason)) => {
+                crate::logger::log_error(
+                    "video message",
+                    &format!("{reason:#}; sending as a file"),
+                );
+                source = crate::upload::Source::open(file_path).await?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     // Video / Audio / Document / Archive upload (`asyncfile/upload` -> `asyncfile/msg`, fallback `sharefile_full`)
     let mime = match ext.as_str() {
         "mp4" => "video/mp4",
@@ -2103,6 +2129,219 @@ pub(crate) async fn send_attachment_with_client_id(
         ..Default::default()
     };
     Ok((send_resp, cm))
+}
+
+/// Outcome of the video-message path.
+enum VideoSend {
+    Sent(Box<(Value, ChatMessage)>),
+    /// Nothing was sent yet; the caller may send the file through `asyncfile` instead.
+    Fallback(anyhow::Error),
+}
+
+/// Upload chunks of `source` to a FILE-service upload endpoint with the parameters of the
+/// Zalo PC uploader (`buildSendChunksInfo`): `totalChunk, fileName, clientId, totalSize,
+/// imei, chunkId, toid|grid` plus `&type=2|11`. Returns the decoded reply of the last chunk.
+#[allow(clippy::too_many_arguments)]
+async fn upload_chunks(
+    s: &Session,
+    endpoint: &str,
+    file_name: &str,
+    mime: &str,
+    source: &mut crate::upload::Source,
+    is_group: bool,
+    target: &str,
+    client_id: u64,
+) -> Result<Value> {
+    let file_host = s.domains.file.trim_end_matches('/');
+    anyhow::ensure!(!file_host.is_empty(), "Thiếu máy chủ tệp");
+    let total = source.size;
+    let chunks = total.div_ceil(crate::upload::CHUNK as u64).max(1);
+    let mut last = Value::Null;
+    for chunk_id in 1..=chunks {
+        let chunk = source.next_chunk().await?;
+        let mut m = serde_json::Map::new();
+        m.insert("totalChunk".into(), json!(chunks));
+        m.insert("fileName".into(), json!(file_name));
+        m.insert("clientId".into(), json!(client_id));
+        m.insert("totalSize".into(), json!(total));
+        m.insert("imei".into(), json!(s.imei));
+        m.insert("chunkId".into(), json!(chunk_id));
+        m.insert(if is_group { "grid" } else { "toid" }.into(), json!(target));
+        let params = s.encoded_params(&Value::Object(m))?;
+        let url = format!(
+            "{file_host}{endpoint}?{}&params={params}&type={}",
+            s.common_params(),
+            if is_group { 11 } else { 2 }
+        );
+        let raw = s
+            .post_multipart(&url, "chunkContent", file_name, mime, &chunk)
+            .await?;
+        last = confirmed_upload(s.maybe_decrypt(raw, s.session_key_bytes()).await)?;
+    }
+    source.verify().await?;
+    Ok(last)
+}
+
+/// Send a `msgType` forward message (`/api/message/forward`, `/api/group/forward`) as Zalo PC
+/// `forwardMessage` does: `{toId, imei}` or `{grid, visibility}` plus `msgType`, `clientId`
+/// and the JSON `msgInfo`.
+/// # Errors
+/// Returns transport errors and server rejections.
+pub async fn send_forward_message(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    msg_type: u8,
+    info: &Value,
+    client_id: u64,
+) -> Result<Value> {
+    anyhow::ensure!(s.login.is_some() && s.is_active(), "Chưa đăng nhập");
+    let file_host = s.domains.file.trim_end_matches('/');
+    anyhow::ensure!(!file_host.is_empty(), "Thiếu máy chủ tệp");
+    let mut body = serde_json::Map::new();
+    let path = if is_group {
+        let grid = to_id.trim_start_matches("group_").trim_start_matches('g');
+        body.insert("grid".into(), json!(grid));
+        body.insert("visibility".into(), json!(0));
+        "/api/group/forward"
+    } else {
+        body.insert("toId".into(), json!(to_id));
+        body.insert("imei".into(), json!(s.imei));
+        "/api/message/forward"
+    };
+    body.insert("msgType".into(), json!(msg_type));
+    body.insert("clientId".into(), json!(client_id));
+    body.insert("msgInfo".into(), json!(info.to_string()));
+    let params = s.encoded_params(&Value::Object(body))?;
+    let url = format!("{file_host}{path}?{}", s.common_params());
+    let response = s.post_form(&url, format!("params={params}")).await?;
+    confirmed_send(s.maybe_decrypt(response, s.session_key_bytes()).await)
+}
+
+/// Zalo PC video message: upload the file (`video/file/upload`, URL announced by a
+/// `video_done` control), upload a poster (`video/thumb/upload`), then send
+/// `forward` `msgType 5` with `{videoUrl, thumbUrl, duration, width, height, fileSize,
+/// properties, title}` (`sendVideoMessage` / `_forwardMessages`).
+async fn send_video_message(
+    s: &Session,
+    path: &std::path::Path,
+    source: &mut crate::upload::Source,
+    is_group: bool,
+    target: &str,
+    caption: &str,
+    client_id: u64,
+) -> Result<VideoSend> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("video.mp4")
+        .to_owned();
+    let probe_path = path.to_owned();
+    let (info, poster) = tokio::task::spawn_blocking(move || {
+        (
+            crate::video_meta::probe(&probe_path).unwrap_or_default(),
+            crate::video_meta::poster_jpeg(&probe_path),
+        )
+    })
+    .await
+    .unwrap_or_default();
+    let scope = if is_group { "group" } else { "message" };
+    let mime = if file_name.to_ascii_lowercase().ends_with(".mov") {
+        "video/quicktime"
+    } else {
+        "video/mp4"
+    };
+    let uploaded = match upload_chunks(
+        s,
+        &format!("/api/{scope}/video/file/upload"),
+        &file_name,
+        mime,
+        source,
+        is_group,
+        target,
+        client_id,
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) => return Ok(VideoSend::Fallback(error.context("Tải video lên thất bại"))),
+    };
+    let data = uploaded.get("data").unwrap_or(&uploaded);
+    let mut video_url = pick_str(data, &["fileUrl", "url"]).unwrap_or_default();
+    if video_url.is_empty() {
+        if let Some(file_id) = pick_str(data, &["fileId"]) {
+            video_url = crate::upload_events::wait(&file_id, ASYNC_FILE_URL_WAIT)
+                .await
+                .unwrap_or_default();
+        }
+    }
+    if video_url.is_empty() {
+        return Ok(VideoSend::Fallback(anyhow::anyhow!(
+            "Máy chủ chưa trả đường dẫn video"
+        )));
+    }
+    let mut thumb_url = String::new();
+    if let Some(jpeg) = poster {
+        let dir = crate::storage::root().join("video-posters");
+        let poster_path = dir.join(format!("{client_id}.jpg"));
+        if crate::storage::atomic_write(&poster_path, &jpeg).is_ok() {
+            if let Ok(mut poster_source) = crate::upload::Source::open(&poster_path).await {
+                let reply = upload_chunks(
+                    s,
+                    &format!("/api/{scope}/video/thumb/upload"),
+                    "thumb.jpg",
+                    "image/jpeg",
+                    &mut poster_source,
+                    is_group,
+                    target,
+                    next_client_message_id(),
+                )
+                .await;
+                if let Ok(reply) = reply {
+                    let d = reply.get("data").unwrap_or(&reply);
+                    thumb_url = pick_str(d, &["oriUrl", "hdUrl", "normalUrl", "thumbUrl", "url"])
+                        .unwrap_or_default();
+                }
+            }
+            let _ = tokio::fs::remove_file(&poster_path).await;
+        }
+    }
+    let msg_info = json!({
+        "videoUrl": video_url,
+        "thumbUrl": thumb_url,
+        "duration": info.duration_ms.max(1),
+        "width": info.width,
+        "height": info.height,
+        "fileSize": source.size,
+        "properties": Value::Null,
+        "title": caption.trim(),
+    });
+    let response = send_forward_message(s, target, is_group, 5, &msg_info, client_id).await?;
+    let msg_id = response
+        .get("data")
+        .and_then(|d| wire_identity(d.get("msgId")))
+        .unwrap_or_else(|| format!("out_{client_id}"));
+    let mut cm = ChatMessage {
+        id: msg_id,
+        client_message_id: client_id.to_string(),
+        sender: "Tôi".into(),
+        text: if caption.trim().is_empty() {
+            format!("[Video] {file_name}")
+        } else {
+            caption.trim().to_owned()
+        },
+        time: crate::ui::clock(),
+        is_outgoing: true,
+        ts: client_id as i64,
+        link_url: Some(video_url),
+        link_thumb: (!thumb_url.is_empty()).then_some(thumb_url),
+        link_title: Some(format!("{file_name} ({})", format_file_size(source.size))),
+        link_src: Some("Video Zalo".into()),
+        kind: crate::message_model::MessageKind::Video,
+        ..Default::default()
+    };
+    cm.wire_ref.fields.insert("msgInfo".into(), msg_info);
+    Ok(VideoSend::Sent(Box::new((response, cm))))
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -3421,6 +3660,97 @@ pub fn forward_source(msg: &ChatMessage) -> Option<(String, bool)> {
     let source = msg.wire_ref.fields.get(FORWARD_SOURCE)?;
     let thread = source.get("thread")?.as_str().filter(|t| !t.is_empty())?;
     Some((thread.to_owned(), source.get("group")?.as_bool()?))
+}
+
+/// The forward `msgInfo` Zalo PC builds from a received media message
+/// (`ForwardService._forwardMessages`). `None` when a required field is missing, e.g. a
+/// file without its MD5 checksum, which Zalo PC refuses to forward.
+pub fn forward_info(msg: &ChatMessage) -> Option<Value> {
+    use crate::message_view::MediaKind;
+    let media = crate::message_view::media(msg);
+    // Merge the message content, its `params` and a stored msgInfo into one lookup.
+    let mut fields = serde_json::Map::new();
+    let parse = |v: &Value| match v {
+        Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+        other => other.clone(),
+    };
+    for key in ["msgInfo", "content"] {
+        if let Some(Value::Object(map)) = msg.wire_ref.fields.get(key).map(parse) {
+            if let Some(Value::Object(params)) = map.get("params").map(parse) {
+                for (k, v) in params {
+                    fields.entry(k).or_insert(v);
+                }
+            }
+            for (k, v) in map {
+                fields.entry(k).or_insert(v);
+            }
+        }
+    }
+    let number = |keys: &[&str]| -> Option<u64> {
+        keys.iter().find_map(|k| {
+            fields
+                .get(*k)
+                .and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+        })
+    };
+    let text = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            fields
+                .get(*k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    match media.kind {
+        MediaKind::Photo => {
+            let ori = media.original.clone().or(media.preview.clone())?;
+            let thumb = media.thumbnail.clone().unwrap_or_else(|| ori.clone());
+            Some(json!({
+                "title": "",
+                "oriUrl": ori,
+                "thumbUrl": thumb,
+                "hdUrl": text(&["hdUrl", "hd"]).unwrap_or_default(),
+                "width": media.width.map(u64::from).or_else(|| number(&["width"])),
+                "height": media.height.map(u64::from).or_else(|| number(&["height"])),
+                "properties": Value::Null,
+                "fileSize": number(&["fileSize"]),
+                "hdSize": number(&["hdSize"]),
+                "thumbSize": number(&["thumbSize"]),
+            }))
+        }
+        MediaKind::Video => Some(json!({
+            "videoUrl": media.original.clone()?,
+            "thumbUrl": media.thumbnail.clone().unwrap_or_default(),
+            "duration": media.duration.or_else(|| number(&["duration"])).unwrap_or(1).max(1),
+            "width": number(&["video_width", "width"]).or(media.width.map(u64::from)),
+            "height": number(&["video_height", "height"]).or(media.height.map(u64::from)),
+            "fileSize": number(&["fileSize", "file_size"]),
+            "properties": Value::Null,
+            "title": "",
+        })),
+        MediaKind::File => {
+            let checksum = text(&["checksum"])
+                .filter(|c| c.len() == 32 && c.bytes().all(|b| b.is_ascii_hexdigit()))?;
+            let name = forward_file_name(msg, &media);
+            let extension = text(&["fileExt"]).unwrap_or_else(|| {
+                std::path::Path::new(&name)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            Some(json!({
+                "url": media.original.clone()?,
+                "fileName": name,
+                "extension": extension,
+                "checksum": checksum,
+                "size": number(&["fileSize", "size", "totalSize"]),
+                "fType": number(&["fType"]).unwrap_or(1),
+            }))
+        }
+        MediaKind::None => None,
+    }
 }
 
 /// File name for a forwarded media copy: the original name when known, else by kind.
@@ -6578,6 +6908,50 @@ mod send_ack_tests {
 #[cfg(test)]
 mod forward_media_tests {
     use super::*;
+    #[test]
+    fn forward_info_follows_zalo_pc_shapes() {
+        let mut video = ChatMessage {
+            kind: crate::message_model::MessageKind::Video,
+            link_url: Some("https://video.zdn.vn/v.mp4".into()),
+            link_thumb: Some("https://photo.zdn.vn/t.jpg".into()),
+            ..Default::default()
+        };
+        video.wire_ref.fields.insert(
+            "content".into(),
+            json!({"href":"https://video.zdn.vn/v.mp4","params":"{\"duration\":4200,\"video_width\":720,\"video_height\":1280,\"fileSize\":\"99\"}"}),
+        );
+        let info = forward_info(&video).unwrap();
+        assert_eq!(info["videoUrl"], "https://video.zdn.vn/v.mp4");
+        assert_eq!(info["thumbUrl"], "https://photo.zdn.vn/t.jpg");
+        assert_eq!(
+            (info["width"].as_u64(), info["height"].as_u64()),
+            (Some(720), Some(1280))
+        );
+        assert_eq!(info["fileSize"], 99);
+        let photo = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            link_url: Some("https://photo-stal-1.zdn.vn/jpg/a.jpg".into()),
+            ..Default::default()
+        };
+        let info = forward_info(&photo).unwrap();
+        assert_eq!(info["oriUrl"], info["thumbUrl"]);
+        let mut file = ChatMessage {
+            kind: crate::message_model::MessageKind::File,
+            link_url: Some("https://f.dlfl.vn/a/report.pdf".into()),
+            link_title: Some("report.pdf".into()),
+            ..Default::default()
+        };
+        // Zalo PC refuses to forward a file without a valid MD5 checksum.
+        assert!(forward_info(&file).is_none());
+        file.wire_ref.fields.insert(
+            "content".into(),
+            json!({"params":{"checksum":"0123456789abcdef0123456789abcdef","fileSize":12,"fileExt":"pdf"}}),
+        );
+        let info = forward_info(&file).unwrap();
+        assert_eq!(info["extension"], "pdf");
+        assert_eq!(info["size"], 12);
+        assert_eq!(info["fType"], 1);
+    }
     #[test]
     fn photos_files_and_videos_with_urls_are_forwardable() {
         let photo = ChatMessage {

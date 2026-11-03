@@ -636,6 +636,67 @@ pub fn capture(
     Ok(())
 }
 
+/// First displayable frame of a local video file as packed RGB, plus its size.
+///
+/// Uses the Source Reader with video processing so any installed decoder can produce RGB32;
+/// no frame is shown or sent anywhere by this function.
+/// # Errors
+/// Returns decoder, size and read failures; callers send the video without a poster.
+pub fn poster_frame(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    let _runtime = Runtime::new()?;
+    unsafe {
+        let attrs = attributes()?;
+        attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let reader = MFCreateSourceReaderFromURL(windows::core::PCWSTR(wide.as_ptr()), &attrs)
+            .context("Không mở được video để tạo ảnh thu nhỏ")?;
+        let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+        reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+        reader.SetStreamSelection(stream, true)?;
+        reader.SetCurrentMediaType(stream, None, &media_type(&MFVideoFormat_RGB32, None)?)?;
+        let current = reader.GetCurrentMediaType(stream)?;
+        let size = current.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let (w, h) = ((size >> 32) as usize, (size & 0xffff_ffff) as usize);
+        anyhow::ensure!(
+            w > 0 && h > 0 && w <= 8192 && h <= 8192 && w * h <= 40_000_000,
+            "Kích thước video không hợp lệ"
+        );
+        let stride = current
+            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+            .map(|s| s as i32)
+            .unwrap_or((w * 4) as i32);
+        for _ in 0..60 {
+            let mut sample = None;
+            let mut flags = 0;
+            reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))?;
+            anyhow::ensure!(
+                flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 == 0,
+                "Video không có khung hình"
+            );
+            let Some(sample) = sample else {
+                continue;
+            };
+            let data = bytes(&sample)?;
+            let row = stride.unsigned_abs() as usize;
+            anyhow::ensure!(
+                row >= w * 4 && data.len() >= row * h,
+                "Khung hình không hợp lệ"
+            );
+            let mut rgb = Vec::with_capacity(w * h * 3);
+            for y in 0..h {
+                // A negative stride means the rows are stored bottom-up.
+                let line = if stride < 0 { h - 1 - y } else { y };
+                for px in data[line * row..line * row + w * 4].as_chunks::<4>().0 {
+                    rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+                }
+            }
+            return Ok((rgb, w as u32, h as u32));
+        }
+        anyhow::bail!("Không đọc được khung hình đầu của video")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

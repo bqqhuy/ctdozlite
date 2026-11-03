@@ -2,6 +2,7 @@
 use crate::{chat::ChatMessage, message_model::DeliveryState, session::Session};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Text,
@@ -17,7 +18,17 @@ pub enum Payload {
         caption: String,
         #[serde(default)]
         stamp: Option<FileStamp>,
+        /// Set when `path` is an HD copy: the user's original photo, used to rebuild a
+        /// copy that was cleaned up before a retry.
+        #[serde(default)]
+        hd_source: Option<HdSource>,
     },
+}
+/// The original photo an HD copy was made from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HdSource {
+    pub path: std::path::PathBuf,
+    pub stamp: Option<FileStamp>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileStamp {
@@ -162,16 +173,33 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             path,
             caption,
             stamp,
+            hd_source,
         } => {
-            if let Some(stamp) = stamp {
-                anyhow::ensure!(
-                    *stamp == FileStamp::read(path).await?,
-                    "Tệp gốc đã thay đổi. Hãy chọn và gửi như một tệp mới"
-                );
+            let upload = match hd_source {
+                Some(source) => hd_copy_for(s, path, source).await?,
+                None => {
+                    if let Some(stamp) = stamp {
+                        anyhow::ensure!(
+                            *stamp == FileStamp::read(path).await?,
+                            "Tệp gốc đã thay đổi. Hãy chọn và gửi như một tệp mới"
+                        );
+                    }
+                    path.clone()
+                }
+            };
+            let (_, result) = crate::chat::send_attachment_with_client_id(
+                s,
+                to,
+                job.is_group,
+                &upload,
+                caption,
+                id,
+            )
+            .await?;
+            if hd_source.is_some() {
+                // The HD copy has served its purpose; the original stays where it was.
+                let _ = tokio::fs::remove_file(&upload).await;
             }
-            let (_, result) =
-                crate::chat::send_attachment_with_client_id(s, to, job.is_group, path, caption, id)
-                    .await?;
             sent = result;
             serde_json::Value::Null
         }
@@ -187,15 +215,145 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
     Ok(sent)
 }
 
+/// The HD copy to upload: the existing one, or a new one from the unchanged original when
+/// it was cleaned up.
+async fn hd_copy_for(
+    s: &Session,
+    copy: &std::path::Path,
+    source: &HdSource,
+) -> Result<std::path::PathBuf> {
+    if tokio::fs::metadata(copy).await.is_ok_and(|m| m.is_file()) {
+        return Ok(copy.to_owned());
+    }
+    if let Some(stamp) = &source.stamp {
+        anyhow::ensure!(
+            *stamp == FileStamp::read(&source.path).await?,
+            "Ảnh gốc đã thay đổi. Hãy chọn và gửi lại ảnh"
+        );
+    }
+    let original = source.path.clone();
+    let dir = crate::photo_quality::outgoing_dir(s.account_key());
+    Ok(
+        tokio::task::spawn_blocking(move || crate::photo_quality::reduce(&original, &dir))
+            .await??
+            .unwrap_or_else(|| source.path.clone()),
+    )
+}
+
 /// Largest media file downloaded for a forward.
 const FORWARD_LIMIT: u64 = 1024 * 1024 * 1024;
 
-/// Forward a photo, video or file by downloading it and sending it again through the
-/// verified attachment path, as Zalo PC falls back to `_reuploadMedia`. When the stored link
-/// fails and the source conversation is known, the link is renewed once through the shared
-/// `renewlink` path (same single-flight and cache as the viewer) and the download retried.
-/// The copy lives in a private folder only for the duration of the send.
+/// Forward a photo, video or file like Zalo PC (`forwardFile` → `ForwardAsync.forward`):
+/// ask the server to copy the media for the target with `renewlink` (target conversation,
+/// new client ID; videos copy the file and the poster separately), then send
+/// `forward` with the copied URLs. If that path cannot be used (missing checksum, copy
+/// refused), fall back to downloading the media and sending it again (`_reuploadMedia`),
+/// renewing an expired source link once through its source conversation.
 async fn forward_media(
+    s: &Session,
+    to: &str,
+    group: bool,
+    original: &ChatMessage,
+    client_id: u64,
+) -> Result<ChatMessage> {
+    match forward_by_clone(s, to, group, original, client_id).await {
+        Ok(sent) => return Ok(sent),
+        Err(error) => crate::logger::log_error(
+            "forward clone",
+            &format!("{error:#}; re-uploading the media instead"),
+        ),
+    }
+    forward_by_reupload(s, to, group, original, client_id).await
+}
+
+async fn forward_by_clone(
+    s: &Session,
+    to: &str,
+    group: bool,
+    original: &ChatMessage,
+    client_id: u64,
+) -> Result<ChatMessage> {
+    use crate::message_view::MediaKind;
+    let media = crate::message_view::media(original);
+    let msg_type = crate::media_renew::forward_type(media.kind)
+        .ok_or_else(|| anyhow::anyhow!("Loại media chưa hỗ trợ"))?;
+    let mut info = crate::chat::forward_info(original)
+        .ok_or_else(|| anyhow::anyhow!("Thiếu thông tin media để sao chép"))?;
+    let kind = media.kind;
+    let copy = move |info: Value, original_flag: bool| async move {
+        crate::media_renew::clone_for(s, to, group, kind, &info, client_id, original_flag).await
+    };
+    match media.kind {
+        MediaKind::Photo => {
+            let copied = copy(info.clone(), false).await?;
+            info["oriUrl"] = json!(copied.original.clone().unwrap_or_default());
+            info["hdUrl"] = json!(copied.preview.clone().unwrap_or_default());
+            info["thumbUrl"] = json!(copied.thumbnail.clone().unwrap_or_default());
+            info["normalUrl"] = json!("");
+            anyhow::ensure!(
+                info["oriUrl"].as_str().is_some_and(|u| !u.is_empty())
+                    && info["thumbUrl"].as_str().is_some_and(|u| !u.is_empty()),
+                "Bản sao ảnh thiếu đường dẫn"
+            );
+        }
+        MediaKind::Video => {
+            let mut video = info.clone();
+            video["renewType"] = json!(1);
+            let mut poster = info.clone();
+            poster["renewType"] = json!(0);
+            let (video, poster) = tokio::join!(copy(video, false), copy(poster, true));
+            let video = video?;
+            info["videoUrl"] = json!(video
+                .original
+                .ok_or_else(|| anyhow::anyhow!("Bản sao video thiếu đường dẫn"))?);
+            if let Some(thumb) = poster.ok().and_then(|p| p.original.or(p.thumbnail)) {
+                info["thumbUrl"] = json!(thumb);
+            }
+        }
+        MediaKind::File => {
+            let copied = copy(info.clone(), false).await?;
+            info["url"] = json!(copied
+                .original
+                .ok_or_else(|| anyhow::anyhow!("Bản sao tệp thiếu đường dẫn"))?);
+        }
+        MediaKind::None => anyhow::bail!("Loại media chưa hỗ trợ"),
+    }
+    let response =
+        crate::chat::send_forward_message(s, to, group, msg_type, &info, client_id).await?;
+    let mut sent = original.clone();
+    sent.id = crate::chat::sent_server_id(&response);
+    if sent.id.is_empty() {
+        sent.id = format!("out_{client_id}");
+    }
+    sent.client_message_id = client_id.to_string();
+    sent.is_outgoing = true;
+    sent.sender = "Tôi".into();
+    sent.ts = client_id as i64;
+    sent.time = crate::ui::clock();
+    sent.history_source = None;
+    sent.wire_ref = Default::default();
+    sent.wire_ref.fields.insert("msgInfo".into(), info.clone());
+    let url = |k: &str| {
+        info.get(k)
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned)
+    };
+    match media.kind {
+        MediaKind::Photo => {
+            sent.link_url = url("oriUrl");
+            sent.link_thumb = url("thumbUrl");
+        }
+        MediaKind::Video => {
+            sent.link_url = url("videoUrl");
+            sent.link_thumb = url("thumbUrl");
+        }
+        _ => sent.link_url = url("url"),
+    }
+    Ok(sent)
+}
+
+async fn forward_by_reupload(
     s: &Session,
     to: &str,
     group: bool,
@@ -220,7 +378,11 @@ async fn forward_media(
         None => Err(anyhow::anyhow!("Tin này không còn đường dẫn media")),
     };
     if result.is_err() {
-        if let Some((thread, source_group)) = crate::chat::forward_source(original) {
+        let source = match crate::chat::forward_source(original) {
+            Some(source) => Some(source),
+            None => source_from_store(s, &original.id).await,
+        };
+        if let Some((thread, source_group)) = source {
             let renewed = crate::media_renew::renew(s, &thread, source_group, original).await;
             if let Some(url) = renewed.ok().as_ref().and_then(forward_url) {
                 result = download_for_forward(s, &url, &path, &media).await;
@@ -230,13 +392,32 @@ async fn forward_media(
     if let Err(error) = result {
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error.context(
-            "Không tải được media để chuyển tiếp (đường dẫn đã hết hạn và không phục hồi được)",
+            "Không chuyển tiếp được media: máy chủ không sao chép được và đường dẫn gốc đã hết hạn",
         ));
     }
     let sent =
         crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await;
     let _ = tokio::fs::remove_file(&path).await;
     Ok(sent?.1)
+}
+
+/// The conversation that stores `msg_id`, when exactly one does.
+async fn source_from_store(s: &Session, msg_id: &str) -> Option<(String, bool)> {
+    if msg_id.is_empty() {
+        return None;
+    }
+    let account = s.clone();
+    let id = msg_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        crate::store::MessageStore::open(account.history_path())
+            .ok()?
+            .unique_thread_of_message(&id)
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn forward_url(media: &crate::message_view::Media) -> Option<String> {

@@ -106,3 +106,5 @@ pub mod presence;
 pub mod screen_capture;
 /// Correlates async file uploads with their processed-URL notifications.
 pub mod upload_events;
+/// Local video size, duration and poster for video messages.
+pub mod video_meta;

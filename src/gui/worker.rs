@@ -583,6 +583,8 @@ pub(super) fn spawn_session_worker(
                 .unwrap();
 
             rt.block_on(async move {
+                // Old HD photo copies left by failed sends; pending retries rebuild theirs.
+                tokio::task::spawn_blocking(crate::photo_quality::prune_all);
                 {
                     let shared = session.clone(); let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                     let visible = crate::media_resources::MediaJobQueue::default();
@@ -1111,6 +1113,10 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::Logout => {
                             if let Some(task) = current_qr_task.take() { task.abort(); }
                             call_bridge.end_call();
+                            let account = session.lock().await.account_key().to_owned();
+                            if !account.is_empty() {
+                                let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&account)).await;
+                            }
                             session.lock().await.logout();
                             if let Err(e) = crate::storage::remove_session() {
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể xóa phiên: {e}")));
@@ -1953,14 +1959,19 @@ pub(super) fn spawn_session_worker(
                                     let Ok(queued)=attachment_queue.clone().acquire_owned().await else{break;};
                                     if !s.is_active(){break;}
                                     let original_path = path.clone();
+                                    let copy_dir = crate::photo_quality::outgoing_dir(s.account_key());
                                     let hd_copy = if photo_original { None } else {
-                                        tokio::task::spawn_blocking(move || crate::photo_quality::reduce(&original_path, &crate::photo_quality::outgoing_dir()))
+                                        tokio::task::spawn_blocking(move || crate::photo_quality::reduce(&original_path, &copy_dir))
                                             .await.ok().and_then(|r| r.inspect_err(|e| crate::logger::log_error("photo_quality", &e.to_string())).ok()).flatten()
+                                    };
+                                    let hd_source = match &hd_copy {
+                                        Some(_) => Some(crate::outgoing::HdSource { stamp: crate::outgoing::FileStamp::read(&path).await.ok(), path: path.clone() }),
+                                        None => None,
                                     };
                                     let path = hd_copy.clone().unwrap_or(path);
                                     let stamp = crate::outgoing::FileStamp::read(&path).await.ok();
                                     let mut message = crate::outgoing::pending(format!("[Tệp] {}", path.file_name().unwrap_or_default().to_string_lossy()), is_group,
-                                        crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp });
+                                        crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp, hd_source });
                                     let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
                                     persist_outgoing(&s, &to_id, &message).await;
                                     let _ = gui_tx_clone.send(GuiEvent::OutgoingState { owner: owner.clone(), thread_id: to_id.clone(), message: message.clone() });
@@ -1971,10 +1982,7 @@ pub(super) fn spawn_session_worker(
                                     tokio::spawn(async move {
                                         let _queued=queued;
                                         match crate::outgoing::send(&s, &thread_id, &message).await {
-                                            Ok(sent) => {
-                                                message = sent;
-                                                if let Some(copy) = &hd_copy { let _ = tokio::fs::remove_file(copy).await; }
-                                            }
+                                            Ok(sent) => message = sent,
                                             Err(error) => { message.delivery = crate::message_model::DeliveryState::Failed; if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); } }
                                         }
                                         persist_outgoing(&s, &thread_id, &message).await;

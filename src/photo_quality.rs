@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 pub const HD_LONG_SIDE: u32 = 2560;
 /// Files at or below this size and within `HD_LONG_SIDE` are sent unchanged.
 const KEEP_BYTES: u64 = 1_500_000;
-/// HD copies older than this are removed; a send still pending after a week is re-picked.
+/// HD copies older than this are removed; a pending retry rebuilds its copy from the original.
 const KEEP_COPIES: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+/// Total size kept across all accounts' HD copies; the oldest go first.
+const MAX_COPY_BYTES: u64 = 500 * 1024 * 1024;
 /// Decoding limit for untrusted local files.
 const MAX_PIXELS: u64 = 200_000_000;
 
@@ -71,7 +73,7 @@ pub fn reduce(path: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     }
     let rgb = image.to_rgb8();
     crate::storage::private_dir(dir)?;
-    prune(dir, KEEP_COPIES);
+    prune(dir, KEEP_COPIES, MAX_COPY_BYTES);
     let mut random = [0u8; 8];
     crate::random::fill(&mut random)?;
     let stem = path
@@ -102,29 +104,72 @@ pub fn reduce(path: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(out))
 }
 
-/// Remove HD copies older than `age` (left behind by sends that never succeeded).
-fn prune(dir: &Path, age: std::time::Duration) {
+/// Remove HD copies older than `age`, then the oldest until the folder fits `max_bytes`.
+/// Only `.jpg` files this module wrote are touched.
+fn prune(dir: &Path, age: std::time::Duration, max_bytes: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let now = std::time::SystemTime::now();
+    let mut kept = Vec::new();
     for entry in entries.flatten().take(10_000) {
-        let old = entry
-            .metadata()
-            .ok()
-            .filter(|m| m.is_file())
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|elapsed| elapsed >= age);
-        if old && entry.path().extension().is_some_and(|e| e == "jpg") {
-            let _ = std::fs::remove_file(entry.path());
+        let path = entry.path();
+        let Some(meta) = entry.metadata().ok().filter(|m| m.is_file()) else {
+            continue;
+        };
+        if path.extension().is_none_or(|e| e != "jpg") {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(now);
+        if now
+            .duration_since(modified)
+            .is_ok_and(|elapsed| elapsed >= age)
+        {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            kept.push((modified, meta.len(), path));
+        }
+    }
+    kept.sort_by_key(|(modified, _, _)| *modified);
+    let mut total: u64 = kept.iter().map(|(_, len, _)| *len).sum();
+    for (_, len, path) in kept {
+        if total <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= len;
         }
     }
 }
 
-/// Folder for HD copies waiting to be sent (kept until the send finishes).
-pub fn outgoing_dir() -> PathBuf {
-    crate::storage::root().join("outgoing-photos")
+/// Clean every account's HD copy folder; run once at startup.
+pub fn prune_all() {
+    let root = crate::storage::root().join("outgoing-photos");
+    prune(&root, KEEP_COPIES, MAX_COPY_BYTES);
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten().take(256) {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                prune(&entry.path(), KEEP_COPIES, MAX_COPY_BYTES);
+            }
+        }
+    }
+}
+
+/// Folder for one account's HD copies waiting to be sent; the account key is hashed so
+/// the path does not reveal it.
+pub fn outgoing_dir(account: &str) -> PathBuf {
+    let tag = crate::crypto::md5_hex(&format!("outgoing-photos:{account}"));
+    crate::storage::root()
+        .join("outgoing-photos")
+        .join(&tag[..16])
+}
+
+/// Remove one account's HD copies (logout); pending sends rebuild them from the originals.
+pub fn remove_account_copies(account: &str) {
+    let dir = outgoing_dir(account);
+    if dir.starts_with(crate::storage::root()) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[cfg(test)]
@@ -162,8 +207,26 @@ mod tests {
         // Pruning with a zero age removes the leftover copy but keeps other files.
         let keep = root.join("out").join("note.txt");
         std::fs::write(&keep, b"x").unwrap();
-        prune(&root.join("out"), std::time::Duration::ZERO);
+        prune(&root.join("out"), std::time::Duration::ZERO, u64::MAX);
         assert!(!out.exists() && keep.exists());
+        // The size cap removes the oldest copies first.
+        let dir = root.join("cap");
+        std::fs::create_dir(&dir).unwrap();
+        for (i, name) in ["a.jpg", "b.jpg", "c.jpg"].iter().enumerate() {
+            std::fs::write(dir.join(name), vec![0u8; 10]).unwrap();
+            let time =
+                std::time::SystemTime::now() - std::time::Duration::from_secs(300 - i as u64 * 100);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.join(name))
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        }
+        prune(&dir, std::time::Duration::from_secs(3600), 20);
+        assert!(
+            !dir.join("a.jpg").exists() && dir.join("b.jpg").exists() && dir.join("c.jpg").exists()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
