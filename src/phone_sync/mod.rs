@@ -9,4 +9,4 @@ mod transfer;
 mod wire;
 pub(crate) use transfer::download;
 
-pub(crate) use transfer::clean_after_connect;
+pub(crate) use transfer::{clean_after_connect, request_wake};

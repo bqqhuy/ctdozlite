@@ -61,6 +61,7 @@ pub(super) fn queries(
     coverage: &HashMap<String, PhoneSyncRange>,
     now: i64,
     recent_only: bool,
+    floor: i64,
 ) -> Vec<Query> {
     conversations
         .iter()
@@ -72,10 +73,11 @@ pub(super) fn queries(
                     .unwrap_or(now.saturating_sub(7 * DAY))
                     .max(now.saturating_sub(7 * DAY))
                     .max(0)
-            } else if let Some(saved) = saved.filter(|s| s.from_ts == 0) {
-                saved.to_ts.saturating_sub(OVERLAP).max(0).min(now)
+            } else if let Some(saved) = saved.filter(|s| s.from_ts <= floor) {
+                // Coverage already reaches the requested floor: fetch only the delta.
+                saved.to_ts.saturating_sub(OVERLAP).max(floor).min(now)
             } else {
-                0
+                floor
             };
             (now >= from).then(|| Query {
                 partition: c.partition.clone(),
@@ -143,17 +145,17 @@ mod tests {
             activity: now - 100 * DAY,
         }];
         let mut saved = HashMap::new();
-        assert_eq!(queries(&c, &saved, now, false)[0].from, 0);
+        assert_eq!(queries(&c, &saved, now, false, 0)[0].from, 0);
         let owner = HashMap::from([("group/test".into(), "test".into())]);
         extend(
             &mut saved,
-            &queries(&c, &HashMap::new(), now, false),
+            &queries(&c, &HashMap::new(), now, false, 0),
             &owner,
         )
         .unwrap();
-        assert_eq!(queries(&c, &saved, now + DAY, false)[0].from, now - OVERLAP);
+        assert_eq!(queries(&c, &saved, now + DAY, false, 0)[0].from, now - OVERLAP);
         assert_eq!(
-            queries(&c, &HashMap::new(), now, true)[0].from,
+            queries(&c, &HashMap::new(), now, true, 0)[0].from,
             now - 7 * DAY
         );
     }
@@ -184,5 +186,21 @@ mod tests {
         checkpoint_completed(&mut saved, &mut pending, &owners).unwrap();
         assert_eq!(saved["p"].to_ts, 30);
         assert!(pending.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod floor_tests {
+    use super::*;
+    #[test]
+    fn floor_limits_new_ranges_and_delta_applies_once_coverage_reaches_floor() {
+        let now = 1_800_000_000_000;
+        let floor = now - 30 * DAY;
+        let c = vec![Conversation { partition: "oneone/a".into(), activity: now }];
+        assert_eq!(queries(&c, &HashMap::new(), now, false, floor)[0].from, floor);
+        let reaching = HashMap::from([("oneone/a".to_string(), PhoneSyncRange { thread_id: "1".into(), from_ts: floor - DAY, to_ts: now - DAY })]);
+        assert_eq!(queries(&c, &reaching, now, false, floor)[0].from, now - DAY - OVERLAP);
+        let short = HashMap::from([("oneone/a".to_string(), PhoneSyncRange { thread_id: "1".into(), from_ts: floor + DAY, to_ts: now - DAY })]);
+        assert_eq!(queries(&c, &short, now, false, floor)[0].from, floor);
     }
 }

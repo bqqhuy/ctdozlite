@@ -89,6 +89,15 @@ impl ZaloGuiApp {
                             }
                         }
                     }
+                    if self.phone_sync_running
+                        && !self.sync_cancel_requested
+                        && ui
+                            .button("Đánh thức điện thoại")
+                            .on_hover_text("Gửi lại thông báo tới Zalo trên điện thoại khi việc gửi lịch sử bị đứng")
+                            .clicked()
+                    {
+                        crate::phone_sync::request_wake();
+                    }
                     if ui.button("Chi tiết").clicked() {
                         self.settings_tab = SettingsTab::Sync;
                         self.settings_modal_open = true;

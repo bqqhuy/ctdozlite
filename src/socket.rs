@@ -49,6 +49,8 @@ pub const SUB_KEEP_ACTIVE: u8 = 2;
 pub const CMD_SYNC_REQUEST: u16 = 590;
 /// Release the matching phone transfer session.
 pub const CMD_SYNC_DISPOSE: u16 = 591;
+/// Ask the master device to resume a sync session (`requestWakeUp`).
+pub const CMD_SYNC_WAKE: u16 = 592;
 pub const CMD_CTRL_PUSH_CTRL: u16 = 601;
 pub const CMD_CTRL_ACTION: u16 = 602;
 pub const CMD_CTRL_PULL_CTRL: u16 = 603;
@@ -265,6 +267,32 @@ impl WsEvent {
     }
 }
 
+/// Request ID used to correlate a wake-up acknowledgement with its session.
+pub(crate) fn wake_request_id(id: &str) -> String {
+    format!("req_wake_{id}")
+}
+
+/// Events buffered between the socket reader and the slower GUI consumer.
+const FORWARD_QUEUE: usize = 4096;
+
+/// Enqueue without waiting when possible; a full queue is recorded because waiting here
+/// also delays keep-alive pings.
+async fn forward_event(forward: &mpsc::Sender<WsEvent>, event: WsEvent, epoch: u64) -> Result<()> {
+    match forward.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(event)) => {
+            let started = std::time::Instant::now();
+            forward.send(event).await?;
+            crate::transfer_diagnostics::socket_backpressure(
+                epoch,
+                started.elapsed().as_millis() as u64,
+            );
+            Ok(())
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("event receiver closed")),
+    }
+}
+
 fn build_url(sess: &Session, endpoint_idx: usize) -> String {
     let endpoints = &sess.domains.ws;
     let base = std::env::var("ZCALL_WS")
@@ -411,6 +439,10 @@ impl SyncTransport {
     pub(crate) fn epoch(&self) -> Option<u64> {
         *self.ready.borrow()
     }
+    /// Observe socket generations; `None` while disconnected.
+    pub(crate) fn epochs(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
+        self.ready.clone()
+    }
     pub(crate) fn subscribe(&self) -> tokio::sync::broadcast::Receiver<WsEvent> {
         self.controls.subscribe()
     }
@@ -429,6 +461,15 @@ impl SyncTransport {
             .await;
         crate::transfer_diagnostics::dispose(id, reason, result.is_ok());
         result
+    }
+    /// Request the official master-device wake-up for one active session.
+    pub(crate) async fn wake(&self, epoch: u64, id: &str) -> Result<()> {
+        self.write(
+            epoch,
+            CMD_SYNC_WAKE,
+            json!({"data":{"syncId":id,"toDevice":0},"reqId":wake_request_id(id)}),
+        )
+        .await
     }
     async fn write(&self, epoch: u64, command: u16, body: Value) -> Result<()> {
         anyhow::ensure!(self.epoch() == Some(epoch), "Phone sync connection changed");
@@ -481,7 +522,14 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
             .await
             {
                 Ok(reason) => trace(format!("closed: {reason}")),
-                Err(e) => trace(format!("error: {e:#}")),
+                Err(e) => {
+                    crate::transfer_diagnostics::socket_closed(
+                        epoch,
+                        crate::transfer_diagnostics::SocketEnd::Error,
+                        None,
+                    );
+                    trace(format!("error: {e:#}"))
+                }
             }
             ready_tx.send_replace(None);
             while let Ok(write) = writes.try_recv() {
@@ -574,13 +622,27 @@ async fn run_once(
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await; // consume the immediate first tick
 
+    // The reader must keep answering pings while the GUI digests large sync batches, so
+    // events pass through a deep queue drained by a separate task; order is preserved.
+    let (forward, mut forwarded) = mpsc::channel::<WsEvent>(FORWARD_QUEUE);
+    let downstream = tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = forwarded.recv().await {
+            if downstream.send(event).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut catchups = queue_receiver::PullQueues::new(epoch);
     let mut pull_tick = tokio::time::interval(Duration::from_millis(100));
     pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut writes_open = true;
     loop {
         tokio::select! {
-            _ = tx.closed() => return Ok("receiver closed".into()),
+            _ = tx.closed() => {
+                crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::ReceiverClosed, None);
+                return Ok("receiver closed".into());
+            }
             _=pull_tick.tick(),if authed=>{
                 for pull in catchups.due(std::time::Instant::now()) {
                     let id=format!("req_{req_id}");req_id+=1;
@@ -589,7 +651,10 @@ async fn run_once(
                 }
             },
             _ = ping.tick() => {
-                if !sess.is_active() { return Ok("session revoked".into()); }
+                if !sess.is_active() {
+                    crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::SessionRevoked, None);
+                    return Ok("session revoked".into());
+                }
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
@@ -612,6 +677,7 @@ async fn run_once(
             }
             incoming = ws.next() => {
                 let Some(incoming) = incoming else {
+                    crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::Eof, None);
                     return Ok("eof".into());
                 };
                 let incoming = incoming?;
@@ -625,7 +691,14 @@ async fn run_once(
                         ws.send(Message::Pong(p)).await?;
                         continue;
                     }
-                    Message::Close(c) => return Ok(format!("close {c:?}")),
+                    Message::Close(c) => {
+                        crate::transfer_diagnostics::socket_closed(
+                            epoch,
+                            crate::transfer_diagnostics::SocketEnd::Close,
+                            c.as_ref().map(|frame| u16::from(frame.code)),
+                        );
+                        return Ok(format!("close {c:?}"));
+                    }
                     _ => continue,
                 };
 
@@ -661,7 +734,7 @@ async fn run_once(
                     }
                     authed = true;
                     ready.send_replace(Some(epoch));
-                    tx.send(WsEvent { cmd, sub_cmd, version, payload: auth.clone() }).await?;
+                    forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload: auth.clone() }, epoch).await?;
 
                     let queues=queues_from_auth(&auth);
                     anyhow::ensure!(queues.len()<=256,"Server advertised too many queues");
@@ -712,14 +785,14 @@ async fn run_once(
                     tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,pull.last,pull.ids)))).await??;
                     catchups.sent((cmd,sub_cmd),id,std::time::Instant::now());
                 }
-                if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE) {
+                if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE|CMD_SYNC_WAKE) {
                     // Broadcast is bounded and never waits for phone decoding or disk writes.
                     let _=controls.send(WsEvent{cmd,sub_cmd,version,payload:payload.clone()});
                     // Phone-only controls have their own bounded receiver. Do not let slow
                     // GUI history/profile work stall the authoritative phone transport.
                     if phone_only_controls(&payload){continue;}
                 }
-                tx.send(WsEvent { cmd, sub_cmd, version, payload }).await?;
+                forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload }, epoch).await?;
             }
         }
     }
@@ -835,5 +908,46 @@ mod phone_forwarding_tests {
             &json!({"data":{"controls":[control,{"content":{"act_type":"voip"}}]}})
         ));
         assert!(!phone_only_controls(&json!({"data":{"controls":[]}})));
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    fn event(n: u64) -> WsEvent {
+        WsEvent {
+            cmd: 501,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({ "n": n }),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_keeps_order_and_waits_only_when_queue_is_full() {
+        let (forward, mut received) = mpsc::channel(2);
+        forward_event(&forward, event(1), 1).await.unwrap();
+        forward_event(&forward, event(2), 1).await.unwrap();
+        let slow = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut seen = Vec::new();
+            while let Some(e) = received.recv().await {
+                seen.push(e.payload["n"].as_u64().unwrap());
+                if seen.len() == 3 {
+                    break;
+                }
+            }
+            seen
+        });
+        forward_event(&forward, event(3), 1).await.unwrap();
+        assert_eq!(slow.await.unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn forward_reports_closed_receiver_when_consumer_is_gone() {
+        let (forward, received) = mpsc::channel(1);
+        drop(received);
+        assert!(forward_event(&forward, event(1), 1).await.is_err());
     }
 }

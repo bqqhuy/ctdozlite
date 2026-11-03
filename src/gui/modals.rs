@@ -982,9 +982,20 @@ impl ZaloGuiApp {
                                                         }
                                                         ui.label(&self.history_sync_status);
                                                         ui.separator();
+                                                        ui.horizontal(|ui| {
+                                                            ui.label("Khoảng lịch sử:");
+                                                            let label = |days: u32| match days { 0 => "Toàn bộ", 365 => "1 năm", 90 => "90 ngày", _ => "30 ngày" };
+                                                            egui::ComboBox::from_id_salt("phone_sync_range")
+                                                                .selected_text(label(self.settings.phone_sync_range_days))
+                                                                .show_ui(ui, |ui| {
+                                                                    for days in [0u32, 365, 90, 30] {
+                                                                        ui.selectable_value(&mut self.settings.phone_sync_range_days, days, label(days));
+                                                                    }
+                                                                });
+                                                        });
                                                         if ui.button(if self.phone_sync_running {"Dừng đồng bộ điện thoại"}else{"Đồng bộ từ điện thoại"}).clicked() {
                                                             if let Some(tx)=WORKER_TX.get() {
-                                                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::SyncPhoneHistory}).is_ok() {
+                                                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::SyncPhoneHistory{range_days:self.settings.phone_sync_range_days}}).is_ok() {
                                                                     if self.phone_sync_running {self.sync_cancel_requested=true;}
                                                                     else {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị đồng bộ điện thoại…".into();self.sync_notice_dismissed=false;}
                                                                 }
@@ -994,9 +1005,12 @@ impl ZaloGuiApp {
                                                             if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::SyncPhoneRecent).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị lấy tin gần đây…".into();self.sync_notice_dismissed=false;}}
                                                         }
                                                         if ui.add_enabled(!self.phone_sync_running,egui::Button::new("Quét lại toàn bộ lịch sử điện thoại")).on_hover_text("Bỏ mốc tiến độ để kiểm tra lại lịch sử; không xóa tin đã lưu").clicked() {
-                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::RescanPhoneHistory).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị quét lại lịch sử điện thoại…".into();self.sync_notice_dismissed=false;}}
+                                                            if let Some(tx)=WORKER_TX.get() {if tx.send(WorkerCmd::RescanPhoneHistory{range_days:self.settings.phone_sync_range_days}).is_ok() {self.phone_sync_running=true;self.phone_sync_status="Đang chuẩn bị quét lại lịch sử điện thoại…".into();self.sync_notice_dismissed=false;}}
                                                         }
                                                         ui.label("Ưu tiên hội thoại hoạt động gần đây; lấy khoảng tin mới trước rồi mới tải lịch sử cũ. Lần sau tiếp tục từ mốc đã hoàn tất.");
+                                                        if self.phone_sync_running && ui.button("Đánh thức điện thoại").on_hover_text("Gửi lại thông báo tới Zalo trên điện thoại khi việc gửi lịch sử bị đứng").clicked() {
+                                                            crate::phone_sync::request_wake();
+                                                        }
                                                         ui.label(&self.phone_sync_status);
                                                         ui.label("Mở Zalo trên điện thoại, chọn Đồng bộ ngay khi được hỏi. Có thể dừng và chạy lại; các tin đã lưu không bị mất.");
 

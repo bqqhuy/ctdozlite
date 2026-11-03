@@ -20,6 +20,8 @@ pub(crate) struct PhoneControl {
     pub command: u16,
     pub sub_command: u8,
     pub round: usize,
+    /// Irreversible tags of the batch's partitions (at most eight) to locate missing ranges.
+    pub partition_tags: Vec<u64>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +43,10 @@ pub(crate) enum QueueDecision {
     Resume,
     Exhausted,
     Stale,
+    /// A known pull queue first seen in a valid server page, not in the auth list.
+    DiscoveredFromPage,
+    /// A page with more data for a queue that is neither advertised nor eligible.
+    Unadvertised,
 }
 /// Receiver counters let support distinguish actual descriptor gaps from dropped log events.
 #[derive(Serialize)]
@@ -92,9 +98,55 @@ pub(crate) enum RenewPhase {
     CacheHitSuccess,
     CacheHitFailure,
 }
+/// Why one socket generation ended; never carries the close reason text.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SocketEnd {
+    Close,
+    Eof,
+    Error,
+    ReceiverClosed,
+    SessionRevoked,
+}
+/// Terminal result of one phone round attempt.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoundOutcome {
+    Complete,
+    Stalled,
+    Disconnected,
+    Rejected,
+    Failed,
+    Skipped,
+}
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event {
+    SocketClosed {
+        epoch: u64,
+        end: SocketEnd,
+        code: Option<u16>,
+    },
+    SocketBackpressure {
+        epoch: u64,
+        waited_ms: u64,
+    },
+    PhoneWake {
+        session_tag: u64,
+        automatic: bool,
+        written: bool,
+        server_code: Option<i64>,
+    },
+    PhoneRoundResult {
+        round: usize,
+        attempt: u8,
+        partitions: usize,
+        outcome: RoundOutcome,
+    },
+    PhoneResume {
+        reconnects: u8,
+        epoch: u64,
+    },
     DiagnosticDropped {
         count: u64,
     },
@@ -187,6 +239,36 @@ pub(crate) fn round(id: &str, summary: RoundSummary) {
         session_tag: tag(id),
         summary,
     });
+}
+/// Record how a socket generation ended, with the numeric close code only.
+pub(crate) fn socket_closed(epoch: u64, end: SocketEnd, code: Option<u16>) {
+    record(Event::SocketClosed { epoch, end, code });
+}
+/// A slow consumer delayed the socket reader; long waits can starve keep-alive pings.
+pub(crate) fn socket_backpressure(epoch: u64, waited_ms: u64) {
+    record(Event::SocketBackpressure { epoch, waited_ms });
+}
+/// Record a wake-up request and, when known, the server acknowledgement code.
+pub(crate) fn wake(id: &str, automatic: bool, written: bool, server_code: Option<i64>) {
+    record(Event::PhoneWake {
+        session_tag: tag(id),
+        automatic,
+        written,
+        server_code,
+    });
+}
+/// Record the terminal outcome of one round attempt.
+pub(crate) fn round_result(round: usize, attempt: u8, partitions: usize, outcome: RoundOutcome) {
+    record(Event::PhoneRoundResult {
+        round,
+        attempt,
+        partitions,
+        outcome,
+    });
+}
+/// Record that a sync continued on a new socket generation.
+pub(crate) fn resume(reconnects: u8, epoch: u64) {
+    record(Event::PhoneResume { reconnects, epoch });
 }
 /// A socket write ACK is not an acknowledgement that the phone stopped its work.
 pub(crate) fn dispose(id: &str, reason: u8, socket_write_ack: bool) {
@@ -391,10 +473,12 @@ mod tests {
                 command: 603,
                 sub_command: 1,
                 round: 2,
+                partition_tags: vec![tag("oneone/private-partition")],
             },
         );
         let text = serde_json::to_string(&event).unwrap();
         assert!(!text.contains(id));
+        assert!(!text.contains("private-partition"));
         assert!(!text.contains("url"));
         assert!(!text.contains("key"));
         assert!(text.contains("session_tag"));

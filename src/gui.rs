@@ -298,6 +298,8 @@ enum SettingsTab {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct AppSettings {
+    /// Phone history window in days; `0` syncs the whole history like Zalo PC.
+    phone_sync_range_days: u32,
     // 1. Cài đặt chung
     show_all_contacts: bool,
     language: String,
@@ -350,6 +352,7 @@ impl Default for AppSettings {
             })
             .unwrap_or_else(|| "Downloads/Zalo Received Files".into());
         Self {
+            phone_sync_range_days: 0,
             show_all_contacts: false,
             language: "Tiếng Việt".into(),
             autostart_on_boot: false,

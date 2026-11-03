@@ -67,8 +67,13 @@ pub enum WorkerCmd {
     },
     CancelHistorySync,
     /// Explicit phone-approved history transfer; never started by login/refresh.
-    SyncPhoneHistory,
-    RescanPhoneHistory,
+    /// `range_days == 0` requests the whole phone history.
+    SyncPhoneHistory {
+        range_days: u32,
+    },
+    RescanPhoneHistory {
+        range_days: u32,
+    },
     SyncPhoneRecent,
     CancelPhoneHistory,
     PollMessages {
@@ -1237,9 +1242,10 @@ pub(super) fn spawn_session_worker(
                             phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
                             if phone_sync_running.load(std::sync::atomic::Ordering::SeqCst){let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Đang dừng đồng bộ và dọn tác vụ; giữ dữ liệu đã lưu…".into()});egui_ctx.request_repaint();}
                         }
-                        command @ (WorkerCmd::SyncPhoneHistory | WorkerCmd::RescanPhoneHistory | WorkerCmd::SyncPhoneRecent) => {
-                            let full_rescan=matches!(command,WorkerCmd::RescanPhoneHistory);
+                        command @ (WorkerCmd::SyncPhoneHistory{..} | WorkerCmd::RescanPhoneHistory{..} | WorkerCmd::SyncPhoneRecent) => {
+                            let full_rescan=matches!(command,WorkerCmd::RescanPhoneHistory{..});
                             let recent_only=matches!(command,WorkerCmd::SyncPhoneRecent);
+                            let range_days=match command {WorkerCmd::SyncPhoneHistory{range_days}|WorkerCmd::RescanPhoneHistory{range_days}=>range_days,_=>0};
                             if phone_sync_running.swap(true,std::sync::atomic::Ordering::SeqCst) {
                                 let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Phiên trước chưa kết thúc; chờ dọn tác vụ xong rồi bấm đồng bộ lại".into()});egui_ctx.request_repaint();continue;
                             }
@@ -1253,7 +1259,7 @@ pub(super) fn spawn_session_worker(
                                 let _guard=PollGuard(running);
                                 let progress_tx=tx.clone();let progress_ctx=ctx.clone();let progress_cancel=cancel.clone();
                                 let result=if let Some(transport)=transport {
-                                    crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,
+                                    crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,range_days,
                                         move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();}},
                                         |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};

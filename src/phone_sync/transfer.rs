@@ -24,6 +24,67 @@ use std::{
 use zeroize::Zeroizing;
 
 static SYNC_OWNER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Serializes read-modify-write of the account's session journal across parallel rounds.
+static JOURNAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Incremented by the user's "wake the phone" action; each active round reacts once.
+static WAKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Message sessions open at once (Zalo PC `max_number_of_concurrent_sync_items`).
+const PARALLEL_ROUNDS: usize = 4;
+/// Recent conversations fetched first with a short page (Zalo PC `sync_recent_chat`).
+const PRIORITY_CONVERSATIONS: usize = 10;
+const PRIORITY_MESSAGES: u32 = 100;
+/// Spacing between session requests, as Zalo Web sends a wave.
+const ROUND_START_GAP: Duration = Duration::from_millis(600);
+/// Waiting for the user's confirmation (Zalo PC `awaiting_mobile_timeout_ms`).
+const AWAIT_CONFIRM: Duration = Duration::from_secs(600);
+/// A phone reporting Idle this long is treated as stalled (`sync_paused_timeout_ms`).
+const IDLE_LIMIT: Duration = Duration::from_secs(600);
+/// Hint the user after this much silence from a confirmed phone.
+const STALL_HINT: Duration = Duration::from_secs(20);
+/// Send one automatic wake-up after this much silence.
+const AUTO_WAKE_AFTER: Duration = Duration::from_secs(30);
+/// Minimum spacing between wake-up requests for one session.
+const WAKE_SPACING: Duration = Duration::from_secs(15);
+/// Window granted after an acknowledged wake-up (Zalo PC `wakeup_timeout`).
+const WAKE_GRACE: Duration = Duration::from_secs(180);
+/// Silence after which a confirmed round is declared stalled.
+const STALL_AFTER: Duration = Duration::from_secs(300);
+/// Upper bound for one round, counted from the phone's confirmation.
+const ROUND_CAP: Duration = Duration::from_secs(2 * 60 * 60);
+/// Reconnects a single sync may resume across.
+const MAX_RECONNECTS: u8 = 2;
+/// Waiting for a new socket generation after a disconnect.
+const RECONNECT_WAIT: Duration = Duration::from_secs(30);
+/// Consecutive failed rounds that stop the whole sync.
+const MAX_CONSECUTIVE_FAILURES: usize = 2;
+/// Sessions remembered for cleanup; more than the parallel limit plus retries.
+const JOURNAL_LIMIT: usize = 16;
+
+/// The phone stopped delivering batches for a confirmed round.
+#[derive(Debug)]
+pub(super) struct Stalled;
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Chưa đầy đủ: điện thoại ngừng gửi gói; dữ liệu đã nhập được giữ")
+    }
+}
+impl std::error::Error for Stalled {}
+
+/// The socket generation that carried a round ended.
+#[derive(Debug)]
+pub(super) struct Disconnected;
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Mất kết nối khi đồng bộ điện thoại; dữ liệu đã lưu được giữ")
+    }
+}
+impl std::error::Error for Disconnected {}
+
+/// Ask every active round to send a wake-up to the phone (rate limited per session).
+pub(crate) fn request_wake() {
+    WAKE_SEQ.fetch_add(1, Ordering::AcqRel);
+}
 
 fn routing_id(id: &str) -> bool {
     !id.is_empty() && id != "0" && id.bytes().all(|b| b.is_ascii_digit())
@@ -50,10 +111,25 @@ struct Round {
     last_index: Option<u64>,
     confirmed: bool,
     idle: bool,
+    /// The phone reported Active after Idle and has not sent a batch since.
+    resumed: bool,
     activity: u64,
 }
 impl Round {
     fn progress(&self, wait: u64) -> String {
+        let base = self.progress_counts(wait);
+        if self.idle {
+            return format!("{base} • iPhone đang tạm nghỉ: mở Zalo và giữ màn hình sáng");
+        }
+        if self.resumed {
+            return format!("{base} • điện thoại đã hoạt động lại; đang chờ gửi tiếp");
+        }
+        if (self.confirmed || !self.seen.is_empty()) && wait >= STALL_HINT.as_secs() {
+            return format!("{base} • điện thoại có thể đã khóa màn hình hoặc chuyển app: mở Zalo, giữ màn hình sáng hoặc bấm Đánh thức điện thoại");
+        }
+        base
+    }
+    fn progress_counts(&self, wait: u64) -> String {
         let received = self.seen.len();
         if received == 0 {
             return format!(
@@ -156,13 +232,25 @@ impl Round {
                     command: event.cmd,
                     sub_command: event.sub_cmd,
                     round: self.number,
+                    partition_tags: data
+                        .get("scopes")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|scope| scope.get("partition").and_then(Value::as_str))
+                        .take(8)
+                        .map(crate::transfer_diagnostics::tag)
+                        .collect(),
                 },
             );
             match act {
                 "transfer_status" => {
                     self.activity += 1;
                     match status {
-                        1 => self.idle = false,
+                        1 => {
+                            self.resumed |= self.idle;
+                            self.idle = false;
+                        }
                         2 => self.idle = true,
                         3 => waiting = true,
                         4 | 5 => {
@@ -227,13 +315,13 @@ impl Round {
                         "Phone index exceeds final batch"
                     );
                     if let Some(old) = self.seen.get(&index) {
-                        ensure!(
-                            old == &(metadata, url, error),
-                            "Conflicting duplicate phone batch"
-                        );
+                        // A re-delivered control may carry a re-signed URL; only a different
+                        // batch kind for the same index is a real conflict.
+                        ensure!(old.0 == metadata, "Conflicting duplicate phone batch");
                     } else {
                         self.seen.insert(index, (metadata, url.clone(), error));
                         self.activity += 1;
+                        self.resumed = false;
                         if !url.is_empty() && error == 0 {
                             self.batches.push(Batch {
                                 metadata,
@@ -258,23 +346,25 @@ impl Round {
 fn integer(v: &Value) -> Option<i64> {
     v.as_i64().or_else(|| v.as_str()?.parse().ok())
 }
-fn request(id: &str, crypto: &Crypto, wanted: &[plan::Query]) -> Value {
+fn request(id: &str, crypto: &Crypto, wanted: &[plan::Query], limit: u32) -> Value {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let queries = request_queries(wanted, now);
+    let queries = request_queries(wanted, now, limit);
     json!({"data":{"syncId":id,"syncType":0,"ek":B64.encode(&crypto.ephemeral.public),"ik":B64.encode(&crypto.identity.public),
         "toDevice":0,"tempKey":"","deviceName":"ctdozlite Windows ARM64","req":{"type":if wanted.is_empty(){"conversation"}else{"message"},
         "priority":if wanted.is_empty(){0}else{2},"batchSize":2000,"queries":queries},"ver":1,"ussidx":0},"reqId":format!("req_sync_{id}")})
 }
-fn request_queries(wanted: &[plan::Query], now: u64) -> Vec<Value> {
+/// Unlimited per-partition query, as Zalo sends for complete transfers.
+const UNLIMITED: u32 = 2_147_483_647;
+fn request_queries(wanted: &[plan::Query], now: u64, limit: u32) -> Vec<Value> {
     if wanted.is_empty() {
-        vec![json!({"partition":"","from":0,"to":now,"limit":2147483647})]
+        vec![json!({"partition":"","from":0,"to":now,"limit":UNLIMITED})]
     } else {
         wanted
             .iter()
-            .map(|p| json!({"partition":p.partition,"from":p.from,"to":p.to,"limit":2147483647}))
+            .map(|p| json!({"partition":p.partition,"from":p.from,"to":p.to,"limit":limit}))
             .collect()
     }
 }
@@ -350,19 +440,23 @@ impl RunningRound {
         wanted: &[plan::Query],
         progress: Arc<std::sync::Mutex<F>>,
         number: usize,
+        limit: u32,
     ) -> Result<Self> {
         let id = sync_id()?;
-        let packet = request(&id, crypto, wanted);
+        let packet = request(&id, crypto, wanted, limit);
         ensure!(
             serde_json::to_vec(&packet)?.len() <= policy::PAYLOAD_BUDGET,
             "Yêu cầu đồng bộ vượt giới hạn payload cục bộ"
         );
-        journal(session, Some(id.clone())).await?;
+        journal(session, Some(&id), None).await?;
         let mut events = transport.subscribe();
         // Keep the journal if delivery is uncertain; the next explicit sync disposes it.
         if let Err(error) = transport.request(epoch, packet).await {
             if transport.dispose_reason(epoch, &id, 2).await.is_ok() {
-                journal(session, None).await?;
+                journal(session, None, Some(&id)).await?;
+            }
+            if transport.epoch() != Some(epoch) {
+                return Err(Disconnected.into());
             }
             return Err(error);
         }
@@ -386,28 +480,66 @@ impl RunningRound {
                 number,
                 ..Default::default()
             };
-            let started = std::time::Instant::now();
+            let mut confirmed_at: Option<std::time::Instant> = None;
+            let mut idle_since: Option<std::time::Instant> = None;
             let mut active_wait = Duration::ZERO;
             let mut previous = std::time::Instant::now();
             let mut tick = tokio::time::interval(Duration::from_millis(200));
             let mut last_display = std::time::Instant::now();
+            let mut wake_seq = WAKE_SEQ.load(Ordering::Acquire);
+            let mut last_wake: Option<std::time::Instant> = None;
+            let mut auto_woken = false;
+            let mut wake_grace: Option<std::time::Instant> = None;
+            let wake_reply = crate::socket::wake_request_id(&sync);
             loop {
                 tokio::select! {
                     _=stopped.changed()=>anyhow::bail!("Đã dừng nhận lịch sử"),
                     _=tick.tick()=>{
                         ensure!(account.is_active() && !cancel.load(Ordering::Acquire),"Đã dừng đồng bộ điện thoại");
-                        ensure!(transfer.epoch()==Some(epoch),"Mất kết nối khi đồng bộ điện thoại; dữ liệu đã lưu được giữ");
-                        let now=std::time::Instant::now();if !state.idle{active_wait+=now.duration_since(previous);}previous=now;
-                        ensure!(started.elapsed()<Duration::from_secs(1800),"Phiên đồng bộ quá lâu; đã dừng và giữ dữ liệu đã nhập");
-                        ensure!(active_wait<Duration::from_secs(if state.confirmed || !state.seen.is_empty(){300}else{180}),"Chưa đầy đủ: hết thời gian chờ điện thoại gửi gói tiếp theo; dữ liệu đã nhập được giữ");
+                        if transfer.epoch()!=Some(epoch) {return Err(Disconnected.into());}
+                        let now=std::time::Instant::now();
+                        if !state.idle {active_wait+=now.duration_since(previous);}
+                        previous=now;
+                        let engaged=state.confirmed || !state.seen.is_empty();
+                        if engaged && confirmed_at.is_none() {confirmed_at=Some(now);}
+                        match confirmed_at {
+                            Some(at)=>ensure!(now.duration_since(at)<ROUND_CAP,"Lượt đồng bộ quá 2 giờ; đã dừng và giữ dữ liệu đã nhập"),
+                            None=>ensure!(active_wait<AWAIT_CONFIRM,"Điện thoại chưa xác nhận đồng bộ; mở Zalo trên điện thoại rồi thử lại"),
+                        }
+                        if idle_since.is_some_and(|since|now.duration_since(since)>=IDLE_LIMIT) {return Err(Stalled.into());}
+                        let seq=WAKE_SEQ.load(Ordering::Acquire);
+                        let manual=seq!=wake_seq;
+                        wake_seq=seq;
+                        let automatic=engaged && !state.idle && !auto_woken && active_wait>=AUTO_WAKE_AFTER;
+                        if (manual || automatic) && engaged && last_wake.is_none_or(|at|now.duration_since(at)>=WAKE_SPACING) {
+                            auto_woken|=automatic;
+                            let written=transfer.wake(epoch,&sync).await.is_ok();
+                            crate::transfer_diagnostics::wake(&sync,automatic && !manual,written,None);
+                            last_wake=Some(now);
+                            if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • đã gửi lệnh đánh thức; giữ Zalo mở trên điện thoại"));}
+                            last_display=now;
+                        }
+                        if engaged && active_wait>=STALL_AFTER && wake_grace.is_none_or(|until|now>=until) {return Err(Stalled.into());}
                         if last_display.elapsed()>=Duration::from_secs(1){state.trace(&sync,active_wait.as_secs());if let Ok(mut p)=progress.lock(){p(state.progress(active_wait.as_secs()));}last_display=now;}
                     },
                     event=events.recv()=>{
                         let event=event.map_err(|error|match error {tokio::sync::broadcast::error::RecvError::Lagged(n)=>anyhow::anyhow!("Luồng control bỏ lỡ {n} sự kiện; không thể xác nhận lịch sử đầy đủ"),_=>anyhow::anyhow!("Luồng nhận lịch sử gián đoạn")})?;
+                        if event.cmd==crate::socket::CMD_SYNC_WAKE {
+                            let reply=event.payload.get("reqId").or_else(||event.payload.pointer("/data/reqId")).and_then(Value::as_str);
+                            if reply==Some(wake_reply.as_str()) {
+                                let code=event.payload.get("error_code").and_then(integer).unwrap_or(0);
+                                crate::transfer_diagnostics::wake(&sync,false,true,Some(code));
+                                if code==0 {wake_grace=Some(std::time::Instant::now()+WAKE_GRACE);}
+                            }
+                            continue;
+                        }
                         let before=state.activity;
+                        let was_idle=state.idle;
                         let waiting=state.apply(&event,&sync)?;
+                        if state.idle && !was_idle {idle_since=Some(std::time::Instant::now());}
+                        if !state.idle {idle_since=None;}
                         if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();}
-                        if waiting{if let Ok(mut p)=progress.lock(){p("Tải về: chờ xác nhận trên điện thoại…".into());}}
+                        if waiting{if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}}
                         for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
                         if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
                         if state.complete(&[]){state.trace(&sync,0);return Ok(state.failed);}
@@ -471,7 +603,7 @@ impl RunningRound {
             .await
             .is_ok()
         {
-            journal(session, None).await?;
+            journal(session, None, Some(&self.id)).await?;
         } else {
             crate::logger::log_error(
                 "phone cleanup",
@@ -495,32 +627,67 @@ impl RunningRound {
         received
     }
 }
-async fn journal(session: &Session, id: Option<String>) -> Result<()> {
-    let path = session.history_path().with_extension("sync-session.json");
-    tokio::task::spawn_blocking(move || {
-        crate::storage::atomic_write(&path, &serde_json::to_vec(&id)?)
-    })
-    .await?
+fn journal_path(session: &Session) -> std::path::PathBuf {
+    session.history_path().with_extension("sync-session.json")
 }
-async fn clean_old(session: &Session, transport: &SyncTransport, epoch: u64) -> Result<()> {
-    let path = session.history_path().with_extension("sync-session.json");
-    let old = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        Ok(serde_json::from_slice(&crate::limits::read_file(
-            &path, 4096,
-        )?)?)
-    })
-    .await??;
-    if let Some(id) = old {
+/// Read journaled session IDs; accepts the legacy single-ID and null formats.
+fn read_journal(path: &std::path::Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_slice(&crate::limits::read_file(path, 16 * 1024)?)?;
+    let ids: Vec<String> = match value {
+        Value::Null => Vec::new(),
+        Value::String(id) => vec![id],
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => anyhow::bail!("Invalid saved sync identity"),
+    };
+    for id in &ids {
         ensure!(
             id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
             "Invalid saved sync identity"
         );
-        transport.dispose_reason(epoch, &id, 3).await?;
-        journal(session, None).await?;
     }
+    Ok(ids)
+}
+/// Add or remove one session ID; the journal never stores keys or URLs.
+async fn journal(session: &Session, add: Option<&str>, remove: Option<&str>) -> Result<()> {
+    let _guard = JOURNAL.lock().await;
+    let path = journal_path(session);
+    let (add, remove) = (add.map(str::to_owned), remove.map(str::to_owned));
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut ids = read_journal(&path).unwrap_or_default();
+        if let Some(id) = remove {
+            ids.retain(|known| *known != id);
+        }
+        if let Some(id) = add {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        // Oldest entries beyond the bound are abandoned; the phone times them out itself.
+        if ids.len() > JOURNAL_LIMIT {
+            ids.drain(..ids.len() - JOURNAL_LIMIT);
+        }
+        crate::storage::atomic_write(&path, &serde_json::to_vec(&ids)?)
+    })
+    .await?
+}
+async fn clean_old(session: &Session, transport: &SyncTransport, epoch: u64) -> Result<()> {
+    let path = journal_path(session);
+    let old = tokio::task::spawn_blocking(move || read_journal(&path)).await??;
+    let mut failed = false;
+    for id in old {
+        if transport.dispose_reason(epoch, &id, 3).await.is_ok() {
+            journal(session, None, Some(&id)).await?;
+        } else {
+            failed = true;
+        }
+    }
+    ensure!(!failed, "Stale phone sessions could not be released yet");
     Ok(())
 }
 async fn decoded_file(
@@ -558,14 +725,16 @@ async fn decoded_file(
 /// Request phone approval once, then import history without pausing the live-chat transport.
 /// # Errors
 /// Returns bounded download/decode/identity/store failures; committed pages remain available.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread) + Send>(
     session: &Session,
     transport: SyncTransport,
     cancel: Arc<AtomicBool>,
     full_rescan: bool,
     recent_only: bool,
+    range_days: u32,
     mut progress: F,
-    mut page: G,
+    page: G,
 ) -> Result<String> {
     let _owner = SYNC_OWNER.lock().await;
     ensure!(
@@ -649,6 +818,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         &[],
         progress.clone(),
         0,
+        UNLIMITED,
     )
     .await?;
     let mut conversations = Vec::new();
@@ -766,60 +936,395 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     )
     .await??;
     let threads = Arc::new(threads);
-    let senders = Arc::new(senders);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as i64;
+    let floor = range_floor(range_days, now);
     let limit_path = session.history_path().with_extension("sync-limits.json");
     let read_path = limit_path.clone();
     let mut limits = tokio::task::spawn_blocking(move || policy::Limits::load(&read_path)).await?;
-    let jobs = plan::queries(&ordered, &coverage, now, recent_only);
-    let mut pending = policy::split(jobs, Some(limits.count.unwrap_or(30).min(30)))?;
-    let emit = |text: String| {
-        if let Ok(mut p) = progress.lock() {
-            p(text);
-        }
+    let per_round = limits.count.unwrap_or(30).min(30);
+    let jobs = plan::queries(&ordered, &coverage, now, recent_only, floor);
+    // Most recent conversations without durable coverage get a short page first, like
+    // Zalo PC's recent-chat phase; the full rounds later fetch them completely.
+    let priority: Vec<_> = if recent_only {
+        Vec::new()
+    } else {
+        jobs.iter()
+            .take(PRIORITY_CONVERSATIONS)
+            .filter(|q| !coverage.contains_key(&q.partition))
+            .cloned()
+            .collect()
     };
+    let mut queue = std::collections::VecDeque::new();
+    let mut number = 0;
+    if !priority.is_empty() {
+        number += 1;
+        queue.push_back(Job {
+            wanted: priority,
+            number,
+            attempt: 0,
+            priority: true,
+        });
+    }
+    for wanted in policy::split(jobs, Some(per_round))? {
+        number += 1;
+        queue.push_back(Job {
+            wanted,
+            number,
+            attempt: 0,
+            priority: false,
+        });
+    }
     let identity = (
         crypto.identity.public.clone(),
         crypto.identity.private.clone(),
     );
     drop(crypto);
     let writer = super::pipeline::Writer::start(session.clone(), threads.clone());
-    let mut senders = senders;
-    let mut attempted_senders = HashSet::new();
-    let mut inserted = 0;
-    let mut unmapped = 0;
-    let mut adjustments = 0;
-    let mut number = 0;
-    let mut failures = 0;
-    let mut last_start = std::time::Instant::now() - Duration::from_secs(2);
-    while let Some(wanted) = pending.pop_front() {
+    let shared = std::sync::Mutex::new(Shared {
+        senders: Arc::new(senders),
+        attempted: HashSet::new(),
+        inserted: 0,
+        unmapped: 0,
+    });
+    let page = std::sync::Mutex::new(page);
+    let board = Arc::new(std::sync::Mutex::new(Board {
+        sink: progress.clone(),
+        lines: Default::default(),
+        done: 0,
+        total: number,
+    }));
+    let ctx = RoundCtx {
+        session,
+        transport: &transport,
+        cancel: &cancel,
+        codec_bytes: &codec_bytes,
+        identity: &identity,
+        writer: &writer,
+        shared: &shared,
+        page: &page,
+        board: &board,
+    };
+    let emit = |text: String| {
+        if let Ok(mut p) = progress.lock() {
+            p(text);
+        }
+    };
+    let mut epoch = epoch;
+    let mut running = futures_util::stream::FuturesUnordered::new();
+    let mut reconnects = 0u8;
+    let mut consecutive = 0usize;
+    let mut failures = 0usize;
+    let mut skipped = 0usize;
+    let mut adjustments = 0usize;
+    let mut disconnected = false;
+    let mut fatal: Option<anyhow::Error> = None;
+    let mut last_start = std::time::Instant::now() - ROUND_START_GAP;
+    loop {
+        while fatal.is_none()
+            && !disconnected
+            && running.len() < PARALLEL_ROUNDS
+            && !queue.is_empty()
+            && session.is_active()
+            && !cancel.load(Ordering::Acquire)
+        {
+            tokio::time::sleep(ROUND_START_GAP.saturating_sub(last_start.elapsed())).await;
+            last_start = std::time::Instant::now();
+            if transport.epoch() != Some(epoch) {
+                disconnected = true;
+                break;
+            }
+            if let Some(job) = queue.pop_front() {
+                running.push(run_round(&ctx, job, epoch));
+            }
+        }
+        let Some((job, result)) = futures_util::StreamExt::next(&mut running).await else {
+            if fatal.is_some() || !session.is_active() || cancel.load(Ordering::Acquire) {
+                break;
+            }
+            if disconnected {
+                if reconnects >= MAX_RECONNECTS {
+                    fatal = Some(Disconnected.into());
+                    break;
+                }
+                reconnects += 1;
+                emit("Tải về: mất kết nối; đang chờ kết nối lại để tiếp tục…".into());
+                epoch = match wait_for_epoch(&transport, epoch, session, &cancel).await {
+                    Ok(next) => next,
+                    Err(error) => {
+                        fatal = Some(error);
+                        break;
+                    }
+                };
+                if clean_old(session, &transport, epoch).await.is_err() {
+                    crate::logger::log_error("phone cleanup", "Deferred stale-session cleanup");
+                }
+                crate::transfer_diagnostics::resume(reconnects, epoch);
+                emit("Tải về: đã kết nối lại; tiếp tục đồng bộ (điện thoại có thể hỏi xác nhận lại)".into());
+                disconnected = false;
+                continue;
+            }
+            break;
+        };
+        let partitions = job.wanted.len();
+        let outcome = classify(&result, &transport, epoch);
+        crate::transfer_diagnostics::round_result(job.number, job.attempt, partitions, outcome);
+        if let Ok(mut b) = board.lock() {
+            b.remove(job.number, outcome == crate::transfer_diagnostics::RoundOutcome::Complete);
+        }
+        match (outcome, result) {
+            (crate::transfer_diagnostics::RoundOutcome::Complete, Ok(failed)) => {
+                consecutive = 0;
+                failures += failed.len();
+                if !job.priority {
+                    let mut completed: Vec<_> = job
+                        .wanted
+                        .into_iter()
+                        .filter(|q| !failed.contains(&q.partition) && owners.contains_key(&q.partition))
+                        .collect();
+                    plan::checkpoint_completed(&mut coverage, &mut completed, &owners)?;
+                    let ranges: Vec<_> = coverage
+                        .iter()
+                        .map(|(p, r)| (p.clone(), r.clone()))
+                        .collect();
+                    let account = session.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        ensure!(account.is_active(), "Đã đăng xuất");
+                        crate::store::MessageStore::open(account.history_path())?
+                            .save_phone_sync_ranges(&ranges)
+                    })
+                    .await??;
+                }
+                let inserted = shared.lock().map(|s| s.inserted).unwrap_or(0);
+                emit(format!("Nhập CSDL: {inserted} tin mới • hoàn tất lượt {}", job.number));
+            }
+            (crate::transfer_diagnostics::RoundOutcome::Disconnected, _) => {
+                disconnected = true;
+                queue.push_front(job);
+            }
+            (crate::transfer_diagnostics::RoundOutcome::Stalled, _) => {
+                if job.attempt == 0 {
+                    emit(format!("Tải về: lượt {} chưa đầy đủ; sẽ xin lại một lần", job.number));
+                    queue.push_back(Job { attempt: 1, ..job });
+                } else {
+                    consecutive += 1;
+                    skipped += 1;
+                    failures += partitions;
+                    crate::transfer_diagnostics::round_result(
+                        job.number,
+                        job.attempt,
+                        partitions,
+                        crate::transfer_diagnostics::RoundOutcome::Skipped,
+                    );
+                    if consecutive >= MAX_CONSECUTIVE_FAILURES {
+                        fatal = Some(anyhow::anyhow!(
+                            "Điện thoại không hoàn tất {MAX_CONSECUTIVE_FAILURES} lượt liên tiếp; đã dừng và giữ dữ liệu đã nhập. Mở Zalo trên điện thoại rồi đồng bộ lại để lấy bù."
+                        ));
+                    }
+                }
+            }
+            (_, Err(error)) => {
+                if let Some(limit) = error.downcast_ref::<policy::LimitRejection>() {
+                    if adjustments < 4 && partitions > 1 {
+                        adjustments += 1;
+                        let maximum = limit.0.unwrap_or(partitions.div_ceil(2)).min(partitions - 1).max(1);
+                        limits.count = Some(maximum);
+                        let mut pieces = policy::split(job.wanted, Some(maximum))?.into_iter();
+                        let mut replanned = Vec::new();
+                        if let Some(first) = pieces.next() {
+                            replanned.push(Job { wanted: first, number: job.number, attempt: job.attempt, priority: job.priority });
+                        }
+                        for wanted in pieces {
+                            number += 1;
+                            replanned.push(Job { wanted, number, attempt: job.attempt, priority: job.priority });
+                        }
+                        if let Ok(mut b) = board.lock() {
+                            b.total = number;
+                        }
+                        for job in replanned.into_iter().rev() {
+                            queue.push_front(job);
+                        }
+                        let path = limit_path.clone();
+                        let data = serde_json::to_vec(&limits)?;
+                        tokio::task::spawn_blocking(move || crate::storage::atomic_write(&path, &data)).await??;
+                        continue;
+                    }
+                }
+                fatal = Some(error);
+            }
+            (_, Ok(_)) => {}
+        }
+    }
+    drop(running);
+    if let Some(error) = fatal {
+        return Err(error);
+    }
+    ensure!(
+        session.is_active() && !cancel.load(Ordering::Acquire),
+        "Đã dừng đồng bộ điện thoại; giữ dữ liệu đã lưu"
+    );
+    diagnostic.finish();
+    let (inserted, unmapped) = shared
+        .lock()
+        .map(|s| (s.inserted, s.unmapped))
+        .unwrap_or((0, 0));
+    let tail = if skipped > 0 || failures > 0 {
+        format!(" {skipped} lượt chưa hoàn tất, {failures} hội thoại cần đồng bộ lại để lấy bù.")
+    } else {
+        String::new()
+    };
+    Ok(format!("Đã hoàn tất tải và nhập lịch sử: {inserted} tin mới; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail}"))
+}
+
+/// One message round to run, retried at most once when the phone stalls.
+struct Job {
+    wanted: Vec<plan::Query>,
+    number: usize,
+    attempt: u8,
+    priority: bool,
+}
+
+/// Import state shared by parallel rounds; locks are never held across an await.
+struct Shared {
+    senders: Arc<HashMap<String, String>>,
+    attempted: HashSet<String>,
+    inserted: usize,
+    unmapped: usize,
+}
+
+/// Combines per-round progress into one line so parallel rounds do not flicker.
+struct Board<F> {
+    sink: Arc<std::sync::Mutex<F>>,
+    lines: std::collections::BTreeMap<usize, String>,
+    done: usize,
+    total: usize,
+}
+impl<F: FnMut(String)> Board<F> {
+    fn update(&mut self, number: usize, text: String) {
+        let Some(detail) = text.strip_prefix("Tải về:") else {
+            if let Ok(mut sink) = self.sink.lock() {
+                sink(text);
+            }
+            return;
+        };
+        let detail = detail.trim();
+        let detail = detail
+            .strip_prefix(&format!("lượt {number} • "))
+            .unwrap_or(detail)
+            .to_owned();
+        self.lines.insert(number, detail);
+        self.emit();
+    }
+    fn remove(&mut self, number: usize, done: bool) {
+        self.lines.remove(&number);
+        self.done += usize::from(done);
+        self.emit();
+    }
+    fn emit(&self) {
+        let current = self
+            .lines
+            .iter()
+            .next()
+            .map(|(n, l)| format!(" • lượt {n}: {l}"))
+            .unwrap_or_default();
+        if let Ok(mut sink) = self.sink.lock() {
+            sink(format!(
+                "Tải về: xong {}/{} lượt • {} lượt đang chạy{current}",
+                self.done,
+                self.total,
+                self.lines.len()
+            ));
+        }
+    }
+}
+
+struct RoundCtx<'a, F, G> {
+    session: &'a Session,
+    transport: &'a SyncTransport,
+    cancel: &'a Arc<AtomicBool>,
+    codec_bytes: &'a [u8],
+    identity: &'a (Vec<u8>, Zeroizing<Vec<u8>>),
+    writer: &'a super::pipeline::Writer,
+    shared: &'a std::sync::Mutex<Shared>,
+    page: &'a std::sync::Mutex<G>,
+    board: &'a Arc<std::sync::Mutex<Board<F>>>,
+}
+
+fn classify(
+    result: &Result<HashSet<String>>,
+    transport: &SyncTransport,
+    epoch: u64,
+) -> crate::transfer_diagnostics::RoundOutcome {
+    use crate::transfer_diagnostics::RoundOutcome;
+    match result {
+        Ok(_) => RoundOutcome::Complete,
+        Err(error) if error.is::<Disconnected>() || transport.epoch() != Some(epoch) => {
+            RoundOutcome::Disconnected
+        }
+        Err(error) if error.is::<Stalled>() => RoundOutcome::Stalled,
+        Err(error) if error.is::<policy::LimitRejection>() => RoundOutcome::Rejected,
+        Err(_) => RoundOutcome::Failed,
+    }
+}
+
+/// Floor of the requested history window; `0` days means the whole history.
+fn range_floor(range_days: u32, now: i64) -> i64 {
+    if range_days == 0 {
+        0
+    } else {
+        now.saturating_sub(i64::from(range_days) * 86_400_000).max(0)
+    }
+}
+
+/// Wait for a socket generation newer than `old`.
+async fn wait_for_epoch(
+    transport: &SyncTransport,
+    old: u64,
+    session: &Session,
+    cancel: &AtomicBool,
+) -> Result<u64> {
+    let mut epochs = transport.epochs();
+    let deadline = tokio::time::Instant::now() + RECONNECT_WAIT;
+    loop {
+        if let Some(epoch) = (*epochs.borrow_and_update()).filter(|e| *e != old) {
+            return Ok(epoch);
+        }
         ensure!(
             session.is_active() && !cancel.load(Ordering::Acquire),
-            "Đã dừng đồng bộ"
+            "Đã dừng đồng bộ điện thoại; giữ dữ liệu đã lưu"
         );
-        guarded(
-            async {
-                tokio::time::sleep(Duration::from_secs(2).saturating_sub(last_start.elapsed()))
-                    .await;
-                Ok(())
-            },
-            session,
-            &cancel,
-            &transport,
-            epoch,
-        )
-        .await?;
-        last_start = std::time::Instant::now();
-        number += 1;
-        emit(format!(
-            "Tải về: lượt {number} • {} hội thoại • chờ điện thoại",
-            wanted.len()
-        ));
-        let bytes = codec_bytes.clone();
-        let public = identity.0.clone();
-        let private = identity.1.clone();
+        match tokio::time::timeout_at(deadline, epochs.changed()).await {
+            Ok(Ok(())) => {}
+            _ => return Err(Disconnected.into()),
+        }
+    }
+}
+
+fn round_progress<F: FnMut(String) + Send + 'static>(
+    board: Arc<std::sync::Mutex<Board<F>>>,
+    number: usize,
+) -> impl FnMut(String) + Send + 'static {
+    move |text: String| {
+        if let Ok(mut b) = board.lock() {
+            b.update(number, text);
+        }
+    }
+}
+
+async fn run_round<F, G>(
+    ctx: &RoundCtx<'_, F, G>,
+    job: Job,
+    epoch: u64,
+) -> (Job, Result<HashSet<String>>)
+where
+    F: FnMut(String) + Send + 'static,
+    G: FnMut(Thread) + Send,
+{
+    let result = async {
+        let bytes = ctx.codec_bytes.to_vec();
+        let public = ctx.identity.0.clone();
+        let private = ctx.identity.1.clone();
         let mut crypto = tokio::task::spawn_blocking(move || -> Result<Crypto> {
             let mut codec = Codec::new(&bytes)?;
             let ephemeral = codec.key_pair()?;
@@ -831,92 +1336,105 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             })
         })
         .await??;
+        let progress = Arc::new(std::sync::Mutex::new(round_progress(ctx.board.clone(), job.number)));
+        let limit = if job.priority { PRIORITY_MESSAGES } else { UNLIMITED };
         let mut run = RunningRound::open(
-            session,
-            &transport,
+            ctx.session,
+            ctx.transport,
             epoch,
-            cancel.clone(),
+            ctx.cancel.clone(),
             &crypto,
-            &wanted,
-            progress.clone(),
-            number,
+            &job.wanted,
+            progress,
+            job.number,
+            limit,
         )
         .await?;
-        let before_unmapped = unmapped;
-        let result = async {
+        let emit = |text: String| {
+            if let Ok(mut b) = ctx.board.lock() {
+                b.update(job.number, text);
+            }
+        };
+        let consumed = async {
             let mut waiting = std::collections::VecDeque::new();
             while let Some(staged) = run.files.recv().await {
                 let staged = staged?;
                 if !staged.batch.metadata && crypto.record.is_none() {
-                    ensure!(
-                        waiting.len() < 8,
-                        "Chưa nhận khóa metadata; đã đạt giới hạn chờ"
-                    );
+                    ensure!(waiting.len() < 8, "Chưa nhận khóa metadata; đã đạt giới hạn chờ");
                     waiting.push_back(staged);
                     continue;
                 }
                 waiting.push_front(staged);
                 while let Some(staged) = waiting.pop_front() {
-                    let batch_index=staged.batch.index;
-                    emit(format!(
-                        "Nhập CSDL: {inserted} tin mới • đang giải mã gói {}",
-                        staged.batch.index
-                    ));
-                    let (next, objects) =
-                        decoded_file(crypto, staged, false, cancel.clone(), session.clone(),run.id.clone(),number)
-                            .await?;
+                    let batch_index = staged.batch.index;
+                    let (next, objects) = decoded_file(
+                        crypto,
+                        staged,
+                        false,
+                        ctx.cancel.clone(),
+                        ctx.session.clone(),
+                        run.id.clone(),
+                        job.number,
+                    )
+                    .await?;
                     crypto = next;
                     if crypto.record.is_some() {
                         let _ = run.decoder_ready.send(true);
                     }
-                    emit(format!("Nhập CSDL: {inserted} tin mới • đang nhập gói {batch_index}"));
                     for object in objects {
-                        ensure!(session.is_active() && !cancel.load(Ordering::Acquire),"Đã dừng nhập lịch sử; dữ liệu đã lưu được giữ");
-                        let unknown: Vec<_> = object
-                            .get("partitions")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .flat_map(|p| {
-                                p.get("messages")
-                                    .and_then(Value::as_array)
-                                    .into_iter()
-                                    .flatten()
-                            })
-                            .map(|m| import::number(m, "senderId"))
-                            .filter(|id| {
-                                !id.is_empty()
-                                    && !senders.contains_key(id)
-                                    && !attempted_senders.contains(id)
-                            })
-                            .collect::<HashSet<_>>()
-                            .into_iter()
-                            .collect();
-                        let mut resolving=if unknown.is_empty(){None}else{
-                            emit(format!("Nhập CSDL: {inserted} tin mới • đang xác định người gửi cho gói {batch_index}"));
-                            Some(crate::transfer_diagnostics::BatchWork::start(&run.id,number,batch_index,crate::transfer_diagnostics::BatchStage::ResolveSenders))
+                        ensure!(
+                            ctx.session.is_active() && !ctx.cancel.load(Ordering::Acquire),
+                            "Đã dừng nhập lịch sử; dữ liệu đã lưu được giữ"
+                        );
+                        let unknown: Vec<String> = {
+                            let shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
+                            object
+                                .get("partitions")
+                                .and_then(Value::as_array)
+                                .into_iter()
+                                .flatten()
+                                .flat_map(|p| p.get("messages").and_then(Value::as_array).into_iter().flatten())
+                                .map(|m| import::number(m, "senderId"))
+                                .filter(|id| {
+                                    !id.is_empty()
+                                        && !shared.senders.contains_key(id)
+                                        && !shared.attempted.contains(id)
+                                })
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect()
                         };
-                        for ids in unknown.chunks(50) {
-                            let resolved = crate::chat::resolve_sync_ids(session, ids)
-                                .await
-                                .unwrap_or_default();
-                            attempted_senders.extend(ids.iter().cloned());
-                            Arc::make_mut(&mut senders).extend(resolved);
+                        if !unknown.is_empty() {
+                            let mut trace = crate::transfer_diagnostics::BatchWork::start(&run.id, job.number, batch_index, crate::transfer_diagnostics::BatchStage::ResolveSenders);
+                            for ids in unknown.chunks(50) {
+                                // A transport failure is retried by a later batch instead of
+                                // permanently leaving the sender unresolved for this run.
+                                if let Ok(resolved) = crate::chat::resolve_sync_ids(ctx.session, ids).await {
+                                    let mut shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
+                                    shared.attempted.extend(ids.iter().cloned());
+                                    Arc::make_mut(&mut shared.senders).extend(resolved);
+                                }
+                            }
+                            trace.finish(unknown.len());
                         }
-                        if let Some(trace)=&mut resolving{trace.finish(unknown.len());}
-                        emit(format!("Nhập CSDL: {inserted} tin mới • đang nhập gói {batch_index}"));
-                        let mut trace=crate::transfer_diagnostics::BatchWork::start(&run.id,number,batch_index,crate::transfer_diagnostics::BatchStage::Import);
-                        let imported = writer.save(object, senders.clone()).await?;
+                        let senders = ctx.shared.lock().unwrap_or_else(|e| e.into_inner()).senders.clone();
+                        let mut trace = crate::transfer_diagnostics::BatchWork::start(&run.id, job.number, batch_index, crate::transfer_diagnostics::BatchStage::Import);
+                        let imported = ctx.writer.save(object, senders).await?;
                         trace.finish(imported.inserted);
-                        inserted += imported.inserted;
-                        unmapped += imported.unmapped;
+                        let inserted = {
+                            let mut shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
+                            shared.inserted += imported.inserted;
+                            shared.unmapped += imported.unmapped;
+                            shared.inserted
+                        };
                         for preview in imported.previews {
-                            page(preview);
-                            // Bound UI event production even when a phone batch has many partitions.
+                            if let Ok(mut page) = ctx.page.lock() {
+                                page(preview);
+                            }
                             tokio::task::yield_now().await;
                         }
+                        emit(format!("Nhập CSDL: {inserted} tin mới • đã nhập gói {batch_index} • chờ gói tiếp theo"));
                     }
-                    emit(format!("Nhập CSDL: {inserted} tin mới • đã nhập gói {batch_index} • chờ gói tiếp theo"));
                 }
             }
             ensure!(waiting.is_empty(), "Không nhận được metadata giải mã");
@@ -924,61 +1442,13 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         }
         .await;
         let received = run
-            .dispose(session, &transport, epoch, result.is_ok(), &cancel)
+            .dispose(ctx.session, ctx.transport, epoch, consumed.is_ok(), ctx.cancel)
             .await;
-        result?;
-        let failed = match received {
-            Ok(failed) => failed,
-            Err(error) => {
-                let Some(limit) = error.downcast_ref::<policy::LimitRejection>() else {
-                    return Err(error);
-                };
-                ensure!(
-                    adjustments < 4 && wanted.len() > 1,
-                    "Đã dừng điều chỉnh giới hạn đồng bộ"
-                );
-                let maximum = limit
-                    .0
-                    .unwrap_or(wanted.len().div_ceil(2))
-                    .min(wanted.len() - 1)
-                    .max(1);
-                adjustments += 1;
-                limits.count = Some(maximum);
-                let mut rest = wanted;
-                rest.extend(pending.into_iter().flatten());
-                pending = policy::split(rest, Some(maximum))?;
-                continue;
-            }
-        };
-        failures += failed.len();
-        if unmapped == before_unmapped {
-            let mut completed: Vec<_> = wanted
-                .into_iter()
-                .filter(|q| !failed.contains(&q.partition))
-                .collect();
-            plan::checkpoint_completed(&mut coverage, &mut completed, &owners)?;
-            let ranges: Vec<_> = coverage
-                .iter()
-                .map(|(p, r)| (p.clone(), r.clone()))
-                .collect();
-            let account = session.clone();
-            tokio::task::spawn_blocking(move || -> Result<()> {
-                ensure!(account.is_active(), "Đã đăng xuất");
-                crate::store::MessageStore::open(account.history_path())?
-                    .save_phone_sync_ranges(&ranges)
-            })
-            .await??;
-        }
-        if adjustments > 0 {
-            let path = limit_path.clone();
-            let data = serde_json::to_vec(&limits)?;
-            tokio::task::spawn_blocking(move || crate::storage::atomic_write(&path, &data))
-                .await??;
-        }
-        emit(format!("Nhập CSDL: {inserted} tin mới • hoàn tất lượt {number} • {} hội thoại lỗi chưa ghi checkpoint",failed.len()));
+        consumed?;
+        received
     }
-    diagnostic.finish();
-    Ok(format!("Đã hoàn tất tải và nhập lịch sử: {inserted} tin mới; {unmapped} tin chưa xác định hội thoại được giữ riêng; {failures} hội thoại lỗi cần đồng bộ lại."))
+    .await;
+    (job, result)
 }
 
 fn decode_batch(
@@ -1113,7 +1583,7 @@ mod range_request_tests {
                 to: 250,
             },
         ];
-        let values = request_queries(&wanted, 999);
+        let values = request_queries(&wanted, 999, UNLIMITED);
         assert_eq!(
             values[0],
             json!({"partition":"group/recent", "from":100, "to":500, "limit":2147483647})
@@ -1121,7 +1591,7 @@ mod range_request_tests {
         assert_eq!(values[1]["partition"], "oneone/older");
         assert_eq!(values[1]["to"], 250);
         assert_eq!(
-            request_queries(&[], 999)[0],
+            request_queries(&[], 999, UNLIMITED)[0],
             json!({"partition":"", "from":0, "to":999, "limit":2147483647})
         );
     }
@@ -1162,19 +1632,38 @@ mod batch_completion_tests {
 }
 
 /// Dispose a journaled session once the newly authenticated socket becomes ready.
+/// Dispose journaled phone sessions on every new socket generation.
+///
+/// A running sync owns its sessions and disposes or resumes them itself; cleanup waits until it
+/// releases ownership, so a session interrupted by a disconnect is still released afterwards.
 pub(crate) async fn clean_after_connect(session: Session, transport: SyncTransport) {
-    let _owner = SYNC_OWNER.lock().await;
-    for _ in 0..100 {
+    let mut epochs = transport.epochs();
+    let mut cleaned: Option<u64> = None;
+    loop {
         if !session.is_active() {
             return;
         }
-        if let Some(epoch) = transport.epoch() {
-            if clean_old(&session, &transport, epoch).await.is_err() {
-                crate::logger::log_error("phone cleanup", "Deferred stale-session cleanup");
+        let current = *epochs.borrow_and_update();
+        let mut pending = false;
+        if let Some(epoch) = current.filter(|e| cleaned != Some(*e)) {
+            match SYNC_OWNER.try_lock() {
+                Ok(_owner) => {
+                    if clean_old(&session, &transport, epoch).await.is_err() {
+                        crate::logger::log_error("phone cleanup", "Deferred stale-session cleanup");
+                    }
+                    cleaned = Some(epoch);
+                }
+                Err(_) => pending = true,
             }
+        }
+        if pending {
+            tokio::select! {
+                changed = epochs.changed() => if changed.is_err() { return; },
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        } else if epochs.changed().await.is_err() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -1288,5 +1777,99 @@ mod cleanup_tests {
         assert!(status.contains("idx lớn nhất 185"));
         assert!(status.contains("thiếu 32 idx"));
         assert!(!round.complete(&[]));
+    }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+
+    fn control(data: Value) -> WsEvent {
+        WsEvent {
+            cmd: 601,
+            sub_cmd: 0,
+            version: 1,
+            payload: json!({"controls":[{"content":{"act_type":"transfer_sync2","act":data["act"].clone(),"data":data["data"].clone()}}]}),
+        }
+    }
+    fn batch(idx: u64, url: &str, metadata: bool) -> WsEvent {
+        control(json!({"act":"upload_batch","data":{"syncId":"s","idx":idx,"batchType":if metadata{2}else{1},"msgUrl":url,"scopes":[{"partition":"oneone/a"}]}}))
+    }
+    fn status(code: u64) -> WsEvent {
+        control(json!({"act":"transfer_status","data":{"syncId":"s","status":code}}))
+    }
+
+    #[test]
+    fn resigned_duplicate_is_ignored_but_changed_batch_kind_is_rejected() {
+        let mut round = Round::default();
+        round.apply(&batch(1, "https://a.zdn.vn/one", false), "s").unwrap();
+        round.apply(&batch(1, "https://a.zdn.vn/one-resigned", false), "s").unwrap();
+        assert_eq!(round.seen.len(), 1);
+        assert_eq!(round.batches.len(), 1);
+        assert!(round.apply(&batch(1, "https://a.zdn.vn/one", true), "s").is_err());
+    }
+
+    #[test]
+    fn progress_hints_stall_idle_and_resume_when_phone_state_changes() {
+        let mut round = Round { number: 3, ..Default::default() };
+        round.apply(&status(5), "s").unwrap();
+        round.apply(&batch(0, "https://a.zdn.vn/m", true), "s").unwrap();
+        assert!(!round.progress(5).contains("khóa màn hình"));
+        assert!(round.progress(STALL_HINT.as_secs()).contains("khóa màn hình"));
+        round.apply(&status(2), "s").unwrap();
+        assert!(round.progress(0).contains("tạm nghỉ"));
+        round.apply(&status(1), "s").unwrap();
+        assert!(round.progress(0).contains("hoạt động lại"));
+        round.apply(&batch(1, "https://a.zdn.vn/n", false), "s").unwrap();
+        assert!(!round.progress(0).contains("hoạt động lại"));
+    }
+
+    #[test]
+    fn journal_reads_legacy_formats_and_rejects_unsafe_ids() {
+        let dir = std::env::temp_dir().join(format!("ctdoz-journal-{}", crate::param_cipher::random_hex(8)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.json");
+        assert!(read_journal(&path).unwrap().is_empty());
+        std::fs::write(&path, b"null").unwrap();
+        assert!(read_journal(&path).unwrap().is_empty());
+        std::fs::write(&path, br#""abc-1""#).unwrap();
+        assert_eq!(read_journal(&path).unwrap(), vec!["abc-1".to_string()]);
+        std::fs::write(&path, br#"["a-1","b-2"]"#).unwrap();
+        assert_eq!(read_journal(&path).unwrap().len(), 2);
+        std::fs::write(&path, br#"["../x"]"#).unwrap();
+        assert!(read_journal(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn range_floor_is_zero_for_whole_history_and_days_back_otherwise() {
+        let now = 1_800_000_000_000;
+        assert_eq!(range_floor(0, now), 0);
+        assert_eq!(range_floor(30, now), now - 30 * 86_400_000);
+        assert_eq!(range_floor(u32::MAX, 1000), 0);
+    }
+
+    #[test]
+    fn board_combines_parallel_round_lines_and_passes_import_lines_through() {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink_lines = lines.clone();
+        let sink = Arc::new(std::sync::Mutex::new(move |text: String| sink_lines.lock().unwrap().push(text)));
+        let mut board = Board { sink, lines: Default::default(), done: 0, total: 5 };
+        board.update(2, "Tải về: lượt 2 • 10 mô tả gói".into());
+        board.update(3, "Tải về: lượt 3 • chờ".into());
+        board.update(2, "Nhập CSDL: 5 tin mới".into());
+        board.remove(2, true);
+        let out = lines.lock().unwrap().clone();
+        assert_eq!(out[0], "Tải về: xong 0/5 lượt • 1 lượt đang chạy • lượt 2: 10 mô tả gói");
+        assert_eq!(out[1], "Tải về: xong 0/5 lượt • 2 lượt đang chạy • lượt 2: 10 mô tả gói");
+        assert_eq!(out[2], "Nhập CSDL: 5 tin mới");
+        assert_eq!(out[3], "Tải về: xong 1/5 lượt • 1 lượt đang chạy • lượt 3: chờ");
+    }
+
+    #[test]
+    fn priority_requests_carry_short_page_limit() {
+        let wanted = vec![plan::Query { partition: "oneone/a".into(), from: 0, to: 10 }];
+        assert_eq!(request_queries(&wanted, 99, PRIORITY_MESSAGES)[0]["limit"], json!(100));
+        assert_eq!(request_queries(&wanted, 99, UNLIMITED)[0]["limit"], json!(2_147_483_647));
     }
 }

@@ -10,6 +10,10 @@ use std::{
 type Key = (u16, u8);
 const WAIT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u8 = 3;
+/// Pull commands whose pages may continue a server queue (the pre-r2 fixed list).
+const KNOWN_PULL_COMMANDS: [u16; 9] = [510, 511, 513, 514, 515, 517, 518, 603, 604];
+/// Same bound as the auth-advertised queue list.
+const MAX_QUEUES: usize = 256;
 
 pub(crate) struct Pull {
     pub key: Key,
@@ -63,6 +67,9 @@ impl PullQueues {
     }
     /// Process only replies for an advertised queue, retaining the exact server cursor.
     pub fn page(&mut self, key: Key, payload: &Value, now: Instant) -> Option<Pull> {
+        if !self.queues.contains_key(&key) {
+            self.discover(key, payload)?;
+        }
         let queue = self.queues.get_mut(&key)?;
         let reply = payload
             .pointer("/data/reqId")
@@ -130,6 +137,51 @@ impl PullQueues {
             }
             None
         }
+    }
+    /// Register a known pull queue the auth reply did not list, from a valid page.
+    ///
+    /// Only error-free pages with `more=1` and a valid cursor qualify; pulling unknown
+    /// queues speculatively has closed sockets with `3002 NOT_FOUND_WORKER`.
+    fn discover(&mut self, key: Key, payload: &Value) -> Option<()> {
+        let more = payload.pointer("/data/more").and_then(Value::as_i64) == Some(1);
+        if !more {
+            return None;
+        }
+        let failed = payload
+            .get("error_code")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|code| code != 0);
+        let qkey = format!("{}_{}", key.0, key.1);
+        let last = payload
+            .pointer("/data/lastActionId")
+            .or_else(|| payload.pointer(&format!("/data/queueStatus/{qkey}/lastId")))
+            .cloned();
+        let ids = payload
+            .pointer(&format!("/data/queueStatus/{qkey}/ids"))
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let eligible = KNOWN_PULL_COMMANDS.contains(&key.0)
+            && !failed
+            && self.queues.len() < MAX_QUEUES
+            && continuation_cursor(last.as_ref(), &ids).is_some();
+        if !eligible {
+            diag::queue(self.epoch, key, diag::QueueDecision::Unadvertised, 0);
+            return None;
+        }
+        self.queues.insert(
+            key,
+            Queue {
+                guard: CatchupGuard::default(),
+                last: last.unwrap_or_else(|| json!(1)),
+                ids,
+                request: String::new(),
+                in_flight: false,
+                deadline: None,
+                retries: 0,
+            },
+        );
+        diag::queue(self.epoch, key, diag::QueueDecision::DiscoveredFromPage, 0);
+        Some(())
     }
     /// Mark a successful write. No second request is scheduled before its reply or timeout.
     pub fn sent(&mut self, key: Key, request: String, now: Instant) {
@@ -240,7 +292,9 @@ mod tests {
         assert!(old.page(key, &page(1, true), now).is_none());
         let mut next = PullQueues::new(2);
         assert!(next.due(now + Duration::from_secs(60)).is_empty());
-        assert!(next.page(key, &page(2, true), now).is_none());
+        // A valid page on the new connection is discovered fresh; no old timer carries over.
+        assert!(next.page(key, &page(2, true), now).is_some());
+        assert!(next.due(now + Duration::from_secs(1)).is_empty());
         assert!(old.page(key, &page(1, false), now).is_none());
         assert!(old.due(now + Duration::from_secs(60)).is_empty());
     }
@@ -271,5 +325,37 @@ mod tests {
         assert_eq!(queues.queues[&key].retries, 0);
         assert!(queues.page(key, &page(2, false), now + WAIT).is_none());
         assert!(queues.due(now + WAIT + WAIT).is_empty());
+    }
+
+    #[test]
+    fn late_known_queue_is_discovered_from_a_valid_page_and_continues_from_its_cursor() {
+        let now = Instant::now();
+        let mut queues = PullQueues::new(3);
+        let pull = queues.page((510, 1), &page(40, true), now).unwrap();
+        assert_eq!(pull.last, json!(40));
+        queues.sent((510, 1), "req-1".into(), now);
+        assert!(queues.page((510, 1), &page(41, true), now).is_some());
+    }
+
+    #[test]
+    fn undiscoverable_pages_are_not_pulled() {
+        let now = Instant::now();
+        let mut queues = PullQueues::new(3);
+        assert!(queues.page((999, 0), &page(5, true), now).is_none());
+        assert!(queues.page((510, 2), &page(5, false), now).is_none());
+        let failed = json!({"error_code":-1,"data":{"lastActionId":5,"more":1}});
+        assert!(queues.page((511, 2), &failed, now).is_none());
+        let missing = json!({"data":{"more":1}});
+        assert!(queues.page((511, 3), &missing, now).is_none());
+        assert!(queues.queues.is_empty());
+    }
+
+    #[test]
+    fn reconnect_starts_with_no_discovered_queues() {
+        let now = Instant::now();
+        let mut first = PullQueues::new(1);
+        assert!(first.page((511, 1), &page(9, true), now).is_some());
+        let second = PullQueues::new(2);
+        assert!(second.queues.is_empty());
     }
 }
