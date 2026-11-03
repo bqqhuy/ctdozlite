@@ -3175,6 +3175,7 @@ impl ZaloGuiApp {
                                         images_only: false,
                                         caption: String::new(),
                                         preset_path: Some(dpath),
+                                        photo_original: self.settings.send_photo_original,
                                     });
                                 }
                             }
@@ -3255,6 +3256,7 @@ impl ZaloGuiApp {
                                                     images_only: true,
                                                     caption: cap,
                                                     preset_path: None,
+                                                    photo_original: self.settings.send_photo_original,
                                                 });
                                             }
                                         }
@@ -3297,6 +3299,7 @@ impl ZaloGuiApp {
                                                     images_only: false,
                                                     caption: cap,
                                                     preset_path: None,
+                                                    photo_original: self.settings.send_photo_original,
                                                 });
                                             }
                                         }
@@ -3471,7 +3474,7 @@ impl ZaloGuiApp {
                                             if ui.button("Nhãn dán…").clicked(){self.sticker_picker_open = !self.sticker_picker_open;ui.close_menu();}
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
-                                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None});}
+                                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original});}
                                                     ui.close_menu();
                                                 }
                                             }
@@ -3520,6 +3523,7 @@ impl ZaloGuiApp {
                                                             images_only: true,
                                                             caption: cap,
                                                             preset_path: Some(clip_path),
+                                                            photo_original: self.settings.send_photo_original,
                                                         },
                                                     );
                                                 }

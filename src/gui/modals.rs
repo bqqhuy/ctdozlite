@@ -1186,6 +1186,14 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.send_typing, pal);
                                                         });
                                                     });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new("Gửi ảnh ở chất lượng gốc").color(pal.text_primary).size(13.2))
+                                                            .on_hover_text("Tắt để gửi bản HD (cạnh dài tối đa 2560 px), nhẹ và nhanh hơn");
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.send_photo_original, pal);
+                                                        });
+                                                    });
                                                 });
                                             ui.add_space(14.0);
 

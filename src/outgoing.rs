@@ -116,6 +116,10 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             .await?;
             serde_json::Value::Null
         }
+        Payload::Forward(original) if crate::chat::forwardable_media(original) => {
+            sent = forward_media(s, to, job.is_group, original, id).await?;
+            serde_json::Value::Null
+        }
         Payload::Forward(original) => {
             crate::chat::forward_message_with_client_id(s, to, job.is_group, original, id).await?
         }
@@ -181,6 +185,67 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
     sent.delivery = DeliveryState::ServerAccepted;
     sent.outgoing_job = None;
     Ok(sent)
+}
+
+/// Largest media file downloaded for a forward.
+const FORWARD_LIMIT: u64 = 1024 * 1024 * 1024;
+
+/// Forward a photo, video or file by downloading it and sending it again through the
+/// verified attachment path, as Zalo PC falls back to `_reuploadMedia`. The copy lives in a
+/// private folder only for the duration of the send.
+async fn forward_media(
+    s: &Session,
+    to: &str,
+    group: bool,
+    original: &ChatMessage,
+    client_id: u64,
+) -> Result<ChatMessage> {
+    let media = crate::message_view::media(original);
+    let url = match media.kind {
+        crate::message_view::MediaKind::Photo => media.original.clone().or(media.preview.clone()),
+        _ => media.original.clone(),
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!("Tin này không còn đường dẫn media; hãy mở media trước rồi chuyển tiếp")
+    })?;
+    let dir = crate::storage::root().join("forward-media");
+    crate::storage::private_dir(&dir)?;
+    let mut random = [0u8; 8];
+    crate::random::fill(&mut random)?;
+    let name = crate::media_download::safe_name(&crate::chat::forward_file_name(original, &media));
+    let path = dir.join(format!(
+        "{}-{name}",
+        random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    ));
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let visual = media.kind != crate::message_view::MediaKind::File;
+    let watch = cancel.clone();
+    let session = s.clone();
+    let saved = crate::media_download::save_classified(
+        &url,
+        &path,
+        cancel,
+        move |bytes, _| {
+            if bytes > FORWARD_LIMIT || !session.is_active() {
+                watch.store(true, std::sync::atomic::Ordering::Release);
+            }
+        },
+        visual,
+    )
+    .await;
+    if let Err(error) = saved {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(
+            error.context("Không tải được media để chuyển tiếp; hãy mở media trước rồi thử lại")
+        );
+    }
+    let result =
+        crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(result?.1)
 }
 
 /// Keep the actual attachment response and reuse the original outgoing client identity.

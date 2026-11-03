@@ -140,6 +140,8 @@ pub enum WorkerCmd {
         images_only: bool,
         caption: String,
         preset_path: Option<std::path::PathBuf>,
+        /// `false` sends photos as an HD copy (long side 2560 px) like Zalo PC's default.
+        photo_original: bool,
     },
     FetchChatImage {
         key: String,
@@ -1905,6 +1907,7 @@ pub(super) fn spawn_session_worker(
                             images_only,
                             caption,
                             preset_path,
+                            photo_original,
                         } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -1920,6 +1923,12 @@ pub(super) fn spawn_session_worker(
                                 for path in paths {
                                     let Ok(queued)=attachment_queue.clone().acquire_owned().await else{break;};
                                     if !s.is_active(){break;}
+                                    let original_path = path.clone();
+                                    let hd_copy = if photo_original { None } else {
+                                        tokio::task::spawn_blocking(move || crate::photo_quality::reduce(&original_path, &crate::photo_quality::outgoing_dir()))
+                                            .await.ok().and_then(|r| r.inspect_err(|e| crate::logger::log_error("photo_quality", &e.to_string())).ok()).flatten()
+                                    };
+                                    let path = hd_copy.clone().unwrap_or(path);
                                     let stamp = crate::outgoing::FileStamp::read(&path).await.ok();
                                     let mut message = crate::outgoing::pending(format!("[Tệp] {}", path.file_name().unwrap_or_default().to_string_lossy()), is_group,
                                         crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp });
@@ -1933,7 +1942,10 @@ pub(super) fn spawn_session_worker(
                                     tokio::spawn(async move {
                                         let _queued=queued;
                                         match crate::outgoing::send(&s, &thread_id, &message).await {
-                                            Ok(sent) => message = sent,
+                                            Ok(sent) => {
+                                                message = sent;
+                                                if let Some(copy) = &hd_copy { let _ = tokio::fs::remove_file(copy).await; }
+                                            }
                                             Err(error) => { message.delivery = crate::message_model::DeliveryState::Failed; if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); } }
                                         }
                                         persist_outgoing(&s, &thread_id, &message).await;

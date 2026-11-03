@@ -341,6 +341,8 @@ struct AppSettings {
     show_typing: bool,
     /// Tell others while this account is typing (at most every 10 s per conversation).
     send_typing: bool,
+    /// Send photos as the original file; off sends an HD copy (long side 2560 px).
+    send_photo_original: bool,
     hidden_chat_pin_enabled: bool,
     split_priority_inbox: bool,
     excel_paste_mode: String, // "image" | "text" | "ask"
@@ -391,6 +393,7 @@ impl Default for AppSettings {
             quick_messages_enabled: true,
             show_typing: true,
             send_typing: true,
+            send_photo_original: true,
             hidden_chat_pin_enabled: true,
             split_priority_inbox: false,
             excel_paste_mode: "ask".into(),

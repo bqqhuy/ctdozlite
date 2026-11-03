@@ -3369,6 +3369,9 @@ pub fn can_forward_message(msg: &ChatMessage) -> bool {
     {
         return false;
     }
+    if forwardable_media(msg) {
+        return true;
+    }
     if msg.sticker_id.is_some_and(|id| id > 0) {
         return true;
     }
@@ -3381,6 +3384,53 @@ pub fn can_forward_message(msg: &ChatMessage) -> bool {
         && !["[Tập tin]", "[Video]", "[Hình ảnh]", "[Tin nhắn thoại]"]
             .iter()
             .any(|label| msg.text.starts_with(label))
+}
+
+/// Photos, videos and files with a downloadable URL are forwarded by re-upload.
+pub fn forwardable_media(msg: &ChatMessage) -> bool {
+    if msg.kind == crate::message_model::MessageKind::Recall
+        || msg.sticker_id.is_some_and(|id| id > 0)
+    {
+        return false;
+    }
+    let media = crate::message_view::media(msg);
+    match media.kind {
+        crate::message_view::MediaKind::Photo => {
+            media.original.is_some() || media.preview.is_some()
+        }
+        crate::message_view::MediaKind::Video | crate::message_view::MediaKind::File => {
+            media.original.is_some()
+        }
+        crate::message_view::MediaKind::None => false,
+    }
+}
+
+/// File name for a forwarded media copy: the original name when known, else by kind.
+pub fn forward_file_name(msg: &ChatMessage, media: &crate::message_view::Media) -> String {
+    let named = [media.name.as_str(), msg.link_title.as_deref().unwrap_or("")]
+        .into_iter()
+        .map(str::trim)
+        .find(|n| !n.is_empty() && n.contains('.'));
+    if let Some(name) = named {
+        return name.to_owned();
+    }
+    match media.kind {
+        crate::message_view::MediaKind::Video => "video.mp4".into(),
+        crate::message_view::MediaKind::File => "tep".into(),
+        _ => {
+            let url = media
+                .original
+                .as_deref()
+                .or(media.preview.as_deref())
+                .unwrap_or("");
+            let path = url.split('?').next().unwrap_or("").to_ascii_lowercase();
+            let ext = [".png", ".webp", ".gif", ".jpeg"]
+                .into_iter()
+                .find(|e| path.ends_with(e))
+                .unwrap_or(".jpg");
+            format!("anh{ext}")
+        }
+    }
 }
 
 /// Forward a message or sticker to another conversation (`forwardMultiMessage` @ `compact-app-pc.js:14323900`).
@@ -3405,8 +3455,8 @@ pub(crate) async fn forward_message_with_client_id(
     now: u64,
 ) -> Result<Value> {
     anyhow::ensure!(
-        can_forward_message(msg),
-        "Chưa hỗ trợ chuyển tiếp loại tin này; hãy tải và gửi lại tệp gốc"
+        can_forward_message(msg) && !forwardable_media(msg),
+        "Chưa hỗ trợ chuyển tiếp trực tiếp loại tin này; media được chuyển tiếp bằng cách tải về rồi gửi lại"
     );
     if let Some(sid) = msg.sticker_id {
         if sid > 0 {
@@ -6504,6 +6554,39 @@ mod send_ack_tests {
         assert_eq!(message.sender, "user-1");
         assert_eq!(message.text, "hello");
         assert_eq!(message.delivery, crate::message_model::DeliveryState::Read);
+    }
+}
+
+#[cfg(test)]
+mod forward_media_tests {
+    use super::*;
+    #[test]
+    fn photos_files_and_videos_with_urls_are_forwardable() {
+        let photo = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            link_url: Some("https://photo-stal-1.zdn.vn/jpg/a.jpg".into()),
+            ..Default::default()
+        };
+        assert!(forwardable_media(&photo));
+        assert!(can_forward_message(&photo));
+        assert!(forward_file_name(&photo, &crate::message_view::media(&photo)).ends_with(".jpg"));
+        let mut unnamed = crate::message_view::media(&photo);
+        unnamed.name.clear();
+        assert_eq!(
+            forward_file_name(&ChatMessage::default(), &unnamed),
+            "anh.jpg"
+        );
+        let recalled = ChatMessage {
+            kind: crate::message_model::MessageKind::Recall,
+            ..photo.clone()
+        };
+        assert!(!forwardable_media(&recalled));
+        let text = ChatMessage {
+            text: "xin chào".into(),
+            ..Default::default()
+        };
+        assert!(!forwardable_media(&text));
+        assert!(can_forward_message(&text));
     }
 }
 

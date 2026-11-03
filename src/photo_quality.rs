@@ -1,0 +1,141 @@
+//! Optional HD downscale before a photo upload.
+//!
+//! Zalo PC sends photos in `PHOTO_RESOLUTION_MODE.HD` by default and only keeps the original
+//! file in `ORIGINAL` mode (`_shouldDowngradeOriginal`, `getSendPhotoConfig`). The upload and
+//! send requests are the same in both modes; only the uploaded file differs. The fork keeps
+//! the original by default, as before, and offers the HD copy as a choice.
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+/// Longest side of an HD copy.
+pub const HD_LONG_SIDE: u32 = 2560;
+/// Files at or below this size and within `HD_LONG_SIDE` are sent unchanged.
+const KEEP_BYTES: u64 = 1_500_000;
+/// Decoding limit for untrusted local files.
+const MAX_PIXELS: u64 = 200_000_000;
+
+/// Formats that are re-encoded; GIF keeps its animation and is never touched.
+fn reducible(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|e| matches!(e.as_str(), "jpg" | "jpeg" | "png" | "webp" | "bmp"))
+}
+
+/// Target size that fits `HD_LONG_SIDE`, or `None` when the image already fits.
+pub fn hd_size(width: u32, height: u32) -> Option<(u32, u32)> {
+    let long = width.max(height);
+    if long <= HD_LONG_SIDE || width == 0 || height == 0 {
+        return None;
+    }
+    let scale = f64::from(HD_LONG_SIDE) / f64::from(long);
+    let w = ((f64::from(width) * scale).round() as u32).max(1);
+    let h = ((f64::from(height) * scale).round() as u32).max(1);
+    Some((w, h))
+}
+
+/// Write an HD JPEG copy of `path` into `dir` when that makes it smaller.
+/// Returns `None` when the original should be sent as is.
+/// # Errors
+/// Returns decode and write failures; callers then send the original.
+pub fn reduce(path: &Path, dir: &Path) -> Result<Option<PathBuf>> {
+    use image::ImageDecoder;
+    if !reducible(path) {
+        return Ok(None);
+    }
+    let bytes = std::fs::metadata(path)?.len();
+    let reader = image::ImageReader::open(path)?.with_guessed_format()?;
+    let mut decoder = reader.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= MAX_PIXELS,
+        "Ảnh quá lớn để xử lý"
+    );
+    let orientation = decoder.orientation().ok();
+    let target = hd_size(width, height);
+    if target.is_none() && bytes <= KEEP_BYTES {
+        return Ok(None);
+    }
+    let mut image = image::DynamicImage::from_decoder(decoder)?;
+    if let Some(orientation) = orientation {
+        image.apply_orientation(orientation);
+    }
+    if hd_size(image.width(), image.height()).is_some() {
+        image = image.resize(
+            HD_LONG_SIDE,
+            HD_LONG_SIDE,
+            image::imageops::FilterType::Lanczos3,
+        );
+    }
+    let rgb = image.to_rgb8();
+    crate::storage::private_dir(dir)?;
+    let mut random = [0u8; 8];
+    crate::random::fill(&mut random)?;
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("anh")
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_'))
+        .take(48)
+        .collect::<String>();
+    let name = format!(
+        "{}-{}.jpg",
+        if stem.is_empty() { "anh" } else { &stem },
+        random
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let out = dir.join(name);
+    let mut encoded = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 90)
+        .encode_image(&rgb)
+        .context("Không mã hóa được ảnh HD")?;
+    if target.is_none() && encoded.len() as u64 >= bytes {
+        return Ok(None);
+    }
+    crate::storage::atomic_write(&out, &encoded)?;
+    Ok(Some(out))
+}
+
+/// Folder for HD copies waiting to be sent (kept until the send finishes).
+pub fn outgoing_dir() -> PathBuf {
+    crate::storage::root().join("outgoing-photos")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn hd_size_fits_the_long_side_and_keeps_small_images() {
+        assert_eq!(hd_size(4000, 3000), Some((2560, 1920)));
+        assert_eq!(hd_size(1000, 6000), Some((427, 2560)));
+        assert_eq!(hd_size(2560, 1000), None);
+        assert_eq!(hd_size(0, 9000), None);
+    }
+    #[test]
+    fn large_png_becomes_hd_jpeg_and_gif_is_untouched() {
+        let root = std::env::temp_dir().join(format!(
+            "photo-quality-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let source = root.join("big.png");
+        image::RgbImage::from_fn(3000, 1500, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, 7])
+        })
+        .save(&source)
+        .unwrap();
+        let out = reduce(&source, &root.join("out")).unwrap().unwrap();
+        let reduced = image::open(&out).unwrap();
+        assert_eq!((reduced.width(), reduced.height()), (2560, 1280));
+        let gif = root.join("a.gif");
+        std::fs::write(&gif, b"GIF89a").unwrap();
+        assert!(reduce(&gif, &root.join("out")).unwrap().is_none());
+        let small = root.join("small.png");
+        image::RgbImage::new(10, 10).save(&small).unwrap();
+        assert!(reduce(&small, &root.join("out")).unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

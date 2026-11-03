@@ -173,14 +173,16 @@ async fn missing_or_opaque_receipts_never_confirm_quote_or_recall() {
     assert_eq!(params(&requests[0])["cliMsgIdUndo"], "777");
 }
 #[tokio::test]
-async fn forwarding_media_is_explicitly_rejected_before_contacting_a_server() {
+async fn direct_media_forward_is_rejected_before_contacting_a_server() {
+    // Media is forwarded only through the outgoing queue, which re-uploads the file.
     let s = session("http://127.0.0.1:1");
     let msg = ChatMessage {
         text: "[Tập tin] report.pdf".into(),
         link_url: Some("https://example.invalid/report.pdf".into()),
         ..Default::default()
     };
-    assert!(!chat::can_forward_message(&msg));
+    assert!(chat::can_forward_message(&msg));
+    assert!(chat::forwardable_media(&msg));
     assert!(chat::forward_message(&s, "456", false, &msg)
         .await
         .unwrap_err()

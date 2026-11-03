@@ -28,3 +28,16 @@ executed. Upstream PR #78 head `4a052c6` was read for scope only.
 
 Real-account capture of a typing action and of a `seens` entry, to confirm field names in
 live traffic (the parsers accept the shapes above and ignore anything else).
+
+## Photo quality and media forwarding
+
+- `_shouldDowngradeOriginal` / `getSendPhotoConfig(photoResolutionMode)`: Zalo PC resizes
+  photos client-side in the default HD mode and keeps the file only in ORIGINAL mode; the
+  `photo_original/upload` and `photo_original/send` requests are the same. PR #78 instead
+  toggled `isHD`/`hd`/`isOriginal` request fields; no evidence was found that the server reads
+  them, so the fork changes only the uploaded file (HD copy: long side 2560 px, JPEG q90,
+  EXIF orientation applied; GIF untouched). Default stays "original", as before.
+- Forwarding media: Zalo PC clones media for the target with `renewlink`, and falls back to
+  `_reuploadMedia`. The fork uses the re-upload path only (download the original into a
+  private folder, send through the existing attachment flow, delete the copy). Videos are
+  re-sent through the same attachment flow as files.

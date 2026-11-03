@@ -98,6 +98,8 @@ mod transfer_diagnostics;
 
 mod queue_catchup;
 
+/// Optional HD copy of a photo before upload.
+pub mod photo_quality;
 /// Typing indicators and delivery/read receipts.
 pub mod presence;
 /// Correlates async file uploads with their processed-URL notifications.
