@@ -1,0 +1,101 @@
+name: Publish verified Windows ARM64 artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing draft release tag
+        required: true
+        type: string
+      build_run_id:
+        description: Successful native ARM64 build run
+        required: true
+        type: string
+      expected_commit:
+        description: Full source commit of the verified build
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-verified-arm64-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+      EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify build and draft release provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9][0-9A-Za-z.-]*$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > build-run.json
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,tagName,assets > release.json
+          python - <<'PY'
+          import json, os
+          run = json.load(open('build-run.json'))
+          release = json.load(open('release.json'))
+          assert run['conclusion'] == 'success' and run['head_sha'] == os.environ['EXPECTED_COMMIT']
+          assert run['path'] == '.github/workflows/windows-arm64.yml'
+          assert release['isDraft'] and release['tagName'] == os.environ['RELEASE_TAG']
+          assert not release['assets'], 'Refusing to replace an existing release asset set'
+          PY
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          name: ctdozlite-windows-arm64
+          path: verified
+      - name: Verify hashes and ARM64 executable, prepare release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, re, shutil, struct
+          from pathlib import Path
+          root, out = Path('verified'), Path('release-assets')
+          info = json.loads((root / 'build-info-windows-arm64.json').read_text())
+          assert info['commit'] == os.environ['EXPECTED_COMMIT']
+          assert info['target'] == 'aarch64-pc-windows-msvc'
+          version = info['version']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version)
+          executables = {f'ctdozlite-{version}-{kind}-windows-arm64.exe' for kind in ['portable', 'setup']}
+          found = set()
+          for line in (root / 'SHA256SUMS-windows-arm64.txt').read_text().splitlines():
+              expected, name = line.split(None, 1)
+              name = name.strip()
+              assert name in executables and name not in found
+              assert hashlib.sha256((root / name).read_bytes()).hexdigest() == expected
+              found.add(name)
+          assert found == executables
+          binary = (root / f'ctdozlite-{version}-portable-windows-arm64.exe').read_bytes()
+          offset = struct.unpack_from('<I', binary, 0x3c)[0]
+          assert binary[:2] == b'MZ' and binary[offset:offset+4] == b'PE\0\0'
+          assert struct.unpack_from('<H', binary, offset+4)[0] == 0xaa64
+          out.mkdir()
+          for name in sorted(executables | {'SHA256SUMS-windows-arm64.txt', 'build-info-windows-arm64.json', 'THIRD_PARTY_NOTICES.txt', 'LICENSE-MIT', 'LICENSE-APACHE', 'WINDOWS_ARM64.md'}):
+              shutil.copy2(root / name, out / name)
+          shutil.copy2('CHANGELOG.md', out / 'CHANGELOG.md')
+          print(f'Verified {len(executables)} executables and prepared {len(list(out.iterdir()))} release assets')
+          PY
+      - name: Attach verified assets and publish release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" release-assets/* --repo "$GITHUB_REPOSITORY"
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
