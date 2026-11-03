@@ -994,7 +994,44 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     let read_path = limit_path.clone();
     let mut limits = tokio::task::spawn_blocking(move || policy::Limits::load(&read_path)).await?;
     let per_round = limits.count.unwrap_or(30).min(30);
-    let jobs = plan::queries(&ordered, &coverage, now, recent_only, floor);
+    let deferred_path = session.history_path().with_extension("sync-deferred.json");
+    let read_deferred = deferred_path.clone();
+    let mut deferred = tokio::task::spawn_blocking(move || {
+        if full_rescan {
+            plan::Deferred::default()
+        } else {
+            plan::Deferred::load(&read_deferred)
+        }
+    })
+    .await?;
+    deferred.prune(&owners, now);
+    let planned = plan::Update {
+        coverage: &coverage,
+        owners: &owners,
+        deferred: &deferred,
+        now,
+        floor,
+        full_rescan,
+    }
+    .plan(&ordered, recent_only);
+    let unmapped_checks = planned
+        .queries
+        .iter()
+        .filter(|q| !owners.contains_key(&q.partition))
+        .count();
+    emit_plan(&progress, &planned, unmapped_checks);
+    let plan_summary = plan_line(&planned, unmapped_checks);
+    crate::transfer_diagnostics::phone_plan(
+        planned.queries.len(),
+        planned.unchanged,
+        planned.deferred,
+        unmapped_checks,
+    );
+    let activity: HashMap<String, i64> = ordered
+        .iter()
+        .map(|c| (c.partition.clone(), c.activity))
+        .collect();
+    let jobs = planned.queries;
     // Most recent conversations without durable coverage get a short page first, like
     // Zalo PC's recent-chat phase; the full rounds later fetch them completely.
     let priority: Vec<_> = if recent_only {
@@ -1134,6 +1171,26 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             (crate::transfer_diagnostics::RoundOutcome::Complete, Ok(failed)) => {
                 consecutive = 0;
                 failures += failed.len();
+                let mut postponed = false;
+                for query in job.wanted.iter().filter(|q| {
+                    !job.priority
+                        && !failed.contains(&q.partition)
+                        && !owners.contains_key(&q.partition)
+                }) {
+                    let last = activity.get(&query.partition).copied().unwrap_or(0);
+                    deferred.postpone(&query.partition, last, now);
+                    postponed = true;
+                }
+                if postponed {
+                    let snapshot = deferred.clone();
+                    let path = deferred_path.clone();
+                    let account = session.clone();
+                    tokio::task::spawn_blocking(move || -> Result<()> {
+                        ensure!(account.is_active(), "Đã đăng xuất");
+                        snapshot.save(&path)
+                    })
+                    .await??;
+                }
                 if !job.priority {
                     let mut completed: Vec<_> = job
                         .wanted
@@ -1265,7 +1322,34 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         String::new()
     };
     let existing = read.saturating_sub(inserted);
-    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail}"))
+    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail} {plan_summary}."))
+}
+
+/// Vietnamese summary of what an update run will check.
+fn plan_line(planned: &plan::Planned, unmapped_checks: usize) -> String {
+    let mut line = format!("Kế hoạch: {} hội thoại cần kiểm tra", planned.queries.len());
+    if planned.unchanged > 0 {
+        line.push_str(&format!(" • {} hội thoại không đổi", planned.unchanged));
+    }
+    if unmapped_checks > 0 {
+        line.push_str(&format!(" • {unmapped_checks} chưa nhận diện (thử lại)"));
+    }
+    if planned.deferred > 0 {
+        line.push_str(&format!(
+            " • {} chưa nhận diện đang tạm hoãn (Quét lại toàn bộ để xin lại)",
+            planned.deferred
+        ));
+    }
+    line
+}
+fn emit_plan<F: FnMut(String)>(
+    progress: &std::sync::Mutex<F>,
+    planned: &plan::Planned,
+    unmapped_checks: usize,
+) {
+    if let Ok(mut p) = progress.lock() {
+        p(plan_line(planned, unmapped_checks));
+    }
 }
 
 /// One message round to run, retried at most once when the phone stalls.

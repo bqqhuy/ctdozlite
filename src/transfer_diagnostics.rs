@@ -177,6 +177,12 @@ enum Event {
     PhoneTotals {
         totals: PhoneTotals,
     },
+    PhonePlan {
+        requested: usize,
+        unchanged: usize,
+        deferred: usize,
+        unmapped_requested: usize,
+    },
     DiagnosticDropped {
         count: u64,
     },
@@ -270,6 +276,20 @@ pub(crate) fn round(id: &str, summary: RoundSummary) {
     record(Event::PhoneRoundSummary {
         session_tag: tag(id),
         summary,
+    });
+}
+/// Record how many conversations an update run requests, skips or postpones.
+pub(crate) fn phone_plan(
+    requested: usize,
+    unchanged: usize,
+    deferred: usize,
+    unmapped_requested: usize,
+) {
+    record(Event::PhonePlan {
+        requested,
+        unchanged,
+        deferred,
+        unmapped_requested,
     });
 }
 /// Record the totals of one phone sync run.
