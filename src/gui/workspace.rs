@@ -1456,6 +1456,11 @@ impl ZaloGuiApp {
 
                         ui.add(egui::Separator::default().spacing(1.0));
 
+                        if d_is_group {
+                            self.render_group_members(ui, d_id, pal);
+                            ui.add(egui::Separator::default().spacing(1.0));
+                        }
+
                         // Shared Media Grid (`Ảnh / Video đã chia sẻ`)
                         egui::Frame::none()
                             .inner_margin(Margin::symmetric(16.0, 14.0))
@@ -4177,5 +4182,134 @@ impl ZaloGuiApp {
                 self.typing_sent.insert(thread_id.to_owned(), now);
             }
         }
+    }
+}
+
+impl ZaloGuiApp {
+    /// "Thành viên nhóm" section of the info drawer: count, search, roles.
+    fn render_group_members(&mut self, ui: &mut egui::Ui, group_id: &str, pal: &ThemePalette) {
+        let request = |app: &mut Self| {
+            if let Some(tx) = WORKER_TX.get() {
+                if tx
+                    .send(WorkerCmd::FetchGroupMembers {
+                        group_id: group_id.to_owned(),
+                    })
+                    .is_ok()
+                {
+                    app.group_members_state.insert(group_id.to_owned(), None);
+                }
+            }
+        };
+        let thread_members = self
+            .threads
+            .iter()
+            .find(|t| t.id == group_id && t.is_group)
+            .map(|t| (t.presentation.members.clone(), t.presentation.member_count));
+        let loaded = self.group_members.get(group_id).cloned();
+        let (members, total) = loaded.clone().or(thread_members).unwrap_or_default();
+        let state = self.group_members_state.get(group_id).cloned();
+        let loading = matches!(state, Some(None));
+        egui::Frame::none()
+            .inner_margin(Margin::symmetric(16.0, 14.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Thành viên nhóm")
+                            .size(12.5)
+                            .color(pal.text_primary)
+                            .strong(),
+                    );
+                    let count = total.unwrap_or(members.len() as u64);
+                    ui.label(
+                        RichText::new(format!("({count})"))
+                            .size(11.5)
+                            .color(pal.primary_hover),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if loading {
+                            ui.spinner();
+                        } else if ui
+                            .add(
+                                egui::Button::new(RichText::new(lucide::REFRESH).size(11.5))
+                                    .frame(false),
+                            )
+                            .on_hover_text("Tải lại danh sách thành viên")
+                            .clicked()
+                        {
+                            request(self);
+                        }
+                    });
+                });
+                if let Some(Some(error)) = &state {
+                    ui.label(
+                        RichText::new(format!("Không tải được thành viên: {error}"))
+                            .size(11.0)
+                            .color(pal.text_muted),
+                    );
+                }
+                if loaded.is_none() && !loading && state.is_none() {
+                    // First open: fetch names and avatars for the whole roster once.
+                    request(self);
+                }
+                if members.is_empty() {
+                    return;
+                }
+                ui.add_space(6.0);
+                if members.len() > 5 {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.group_member_search)
+                            .hint_text("Tìm thành viên…")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(4.0);
+                }
+                let query = fold_vn_search(self.group_member_search.trim());
+                egui::ScrollArea::vertical()
+                    .id_salt(("info_drawer_members", group_id))
+                    .max_height(220.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for member in members.iter().filter(|m| {
+                            query.is_empty()
+                                || fold_vn_search(&m.name).contains(&query)
+                                || m.id.contains(&query)
+                        }) {
+                            let name = if member.name.is_empty() {
+                                "Thành viên"
+                            } else {
+                                member.name.as_str()
+                            };
+                            ui.horizontal(|ui| {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(26.0), Sense::hover());
+                                paint_user_avatar(
+                                    ui.painter(),
+                                    rect.center(),
+                                    13.0,
+                                    name,
+                                    false,
+                                    member.avatar.as_deref(),
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
+                                ui.label(
+                                    RichText::new(truncate_chars(name, 22))
+                                        .size(12.0)
+                                        .color(pal.text_primary),
+                                );
+                                let role = match member.role.as_str() {
+                                    "creator" => {
+                                        Some(("Trưởng nhóm", Color32::from_rgb(245, 158, 11)))
+                                    }
+                                    "admin" => Some(("Phó nhóm", pal.primary_hover)),
+                                    _ => None,
+                                };
+                                if let Some((label, color)) = role {
+                                    ui.label(RichText::new(label).size(10.0).color(color));
+                                }
+                            });
+                        }
+                    });
+            });
     }
 }

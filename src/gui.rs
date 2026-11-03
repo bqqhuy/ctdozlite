@@ -52,6 +52,11 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    /// Group roster for the info drawer: members and server total.
+    GroupMembersLoaded {
+        group_id: String,
+        result: Result<(Vec<crate::chat::SidebarMember>, Option<u64>), String>,
+    },
     /// People typing now (`presence::typing`).
     Typing(Vec<crate::presence::Typing>),
     /// Outgoing messages whose delivery state rose: `(thread, msg_id, state)`.
@@ -481,6 +486,11 @@ pub struct ZaloGuiApp {
     chat_layout_key: u64,
     /// `(thread without prefix, is_group)` → (who is typing, when it was reported).
     typing_map: HashMap<(String, bool), (String, std::time::Instant)>,
+    /// Group rosters loaded for the info drawer, by thread ID.
+    group_members: HashMap<String, (Vec<crate::chat::SidebarMember>, Option<u64>)>,
+    /// Groups whose roster is loading, or failed (with the error).
+    group_members_state: HashMap<String, Option<String>>,
+    group_member_search: String,
     /// Last typing signal sent per conversation.
     typing_sent: HashMap<String, std::time::Instant>,
     contacts_tab: contacts::ContactsTab,
@@ -728,6 +738,9 @@ impl ZaloGuiApp {
             chat_layout_key: 0,
             typing_map: HashMap::new(),
             typing_sent: HashMap::new(),
+            group_members: HashMap::new(),
+            group_members_state: HashMap::new(),
+            group_member_search: String::new(),
             contacts_tab: contacts::ContactsTab::default(),
             contacts_query: String::new(),
             search_query: String::new(),
@@ -1681,6 +1694,15 @@ impl ZaloGuiApp {
                     self.refresh_unread_title(ctx);
                     self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
                 }
+                GuiEvent::GroupMembersLoaded { group_id, result } => match result {
+                    Ok(roster) => {
+                        self.group_members_state.remove(&group_id);
+                        self.group_members.insert(group_id, roster);
+                    }
+                    Err(error) => {
+                        self.group_members_state.insert(group_id, Some(error));
+                    }
+                },
                 GuiEvent::Typing(events) => {
                     let now = std::time::Instant::now();
                     for event in events {

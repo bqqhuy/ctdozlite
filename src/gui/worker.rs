@@ -68,6 +68,10 @@ pub enum WorkerCmd {
         retry_filtered: bool,
     },
     CancelHistorySync,
+    /// Load a group's member roster for the info drawer.
+    FetchGroupMembers {
+        group_id: String,
+    },
     /// Best-effort typing signal; the UI rate-limits it per conversation.
     SendTyping {
         thread_id: String,
@@ -1289,6 +1293,16 @@ pub(super) fn spawn_session_worker(
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};
                                 let message=result.unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
                                 let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,message});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchGroupMembers { group_id } => {
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let result = crate::chat::group_members(&s, &group_id).await.map_err(|e| e.to_string());
+                                let _ = tx.send(GuiEvent::GroupMembersLoaded { group_id, result });
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::SendTyping { thread_id, is_group } => {

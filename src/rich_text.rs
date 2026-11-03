@@ -23,6 +23,9 @@ pub struct TextStyle {
     pub underline: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub strike: bool,
+    /// A mention of a member (`mentions[].pos/len`), highlighted rather than styled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mention: bool,
 }
 
 /// Visual attributes of one byte range produced by [`segments`].
@@ -32,6 +35,7 @@ pub struct SegmentStyle {
     pub italic: bool,
     pub underline: bool,
     pub strike: bool,
+    pub mention: bool,
 }
 
 impl SegmentStyle {
@@ -103,6 +107,40 @@ pub fn parse_rtf_styles(content: &Value, text: &str) -> Vec<TextStyle> {
         .collect()
 }
 
+/// Mention ranges from a message's wire `mentions` (`[{uid, pos, len, type}]`, UTF-16).
+///
+/// Only ranges that lie inside `text` and start with `@` are kept, so a stale or foreign
+/// offset never highlights unrelated words.
+pub fn mention_styles(mentions: Option<&Value>, text: &str) -> Vec<TextStyle> {
+    let mentions = match mentions {
+        Some(Value::String(raw)) => serde_json::from_str::<Value>(raw).unwrap_or(Value::Null),
+        Some(value) => value.clone(),
+        None => return Vec::new(),
+    };
+    let Some(items) = mentions.as_array() else {
+        return Vec::new();
+    };
+    let units: Vec<u16> = text.encode_utf16().collect();
+    items
+        .iter()
+        .filter_map(|item| {
+            let start = item.get("pos").and_then(number)?;
+            let len = item.get("len").and_then(number)?;
+            let end = start.checked_add(len)? as usize;
+            if len == 0 || end > units.len() || units.get(start as usize) != Some(&(b'@' as u16)) {
+                return None;
+            }
+            Some(TextStyle {
+                start,
+                len,
+                mention: true,
+                ..TextStyle::default()
+            })
+        })
+        .take(MAX_STYLES)
+        .collect()
+}
+
 /// Split `text` into consecutive byte ranges with combined styles, covering the whole text.
 ///
 /// Overlapping styles combine; offsets that fall inside a surrogate pair are rounded to the
@@ -149,11 +187,37 @@ pub fn segments(text: &str, styles: &[TextStyle]) -> Vec<(std::ops::Range<usize>
                     combined.italic |= style.italic;
                     combined.underline |= style.underline;
                     combined.strike |= style.strike;
+                    combined.mention |= style.mention;
                 }
             }
             (w[0]..w[1], combined)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn mentions_use_utf16_offsets_and_reject_ranges_without_at_sign() {
+        let text = "😀 @Lan ơi, @Bình";
+        let styles = mention_styles(
+            Some(
+                &json!([{"uid":"1","pos":3,"len":4,"type":0},{"uid":"2","pos":12,"len":5},{"uid":"3","pos":0,"len":2},{"uid":"4","pos":15,"len":9}]),
+            ),
+            text,
+        );
+        assert_eq!(styles.len(), 2);
+        let marked: Vec<&str> = segments(text, &styles)
+            .into_iter()
+            .filter(|(_, s)| s.mention)
+            .map(|(r, _)| &text[r])
+            .collect();
+        assert_eq!(marked, ["@Lan", "@Bình"]);
+        assert!(mention_styles(Some(&json!("[{\"pos\":0,\"len\":4}]")), "@Ann").len() == 1);
+        assert!(mention_styles(None, "@Ann").is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -775,12 +775,27 @@ pub(super) fn render_message_body(
     }
 
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
-        if msg.text_styles.is_empty() {
+        let mentions =
+            crate::rich_text::mention_styles(msg.wire_ref.fields.get("mentions"), &msg.text);
+        if msg.text_styles.is_empty() && mentions.is_empty() {
             ui.add(egui::Label::new(RichText::new(&msg.text).color(text_col).size(14.0)).wrap());
         } else {
+            let mut styles = msg.text_styles.clone();
+            styles.extend(mentions);
+            let mention_col = if msg.is_outgoing {
+                text_col
+            } else {
+                pal.primary_hover
+            };
             ui.add(
-                egui::Label::new(styled_text_job(&msg.text, &msg.text_styles, text_col, 14.0))
-                    .wrap(),
+                egui::Label::new(styled_text_job_with_mentions(
+                    &msg.text,
+                    &styles,
+                    text_col,
+                    mention_col,
+                    14.0,
+                ))
+                .wrap(),
             );
         }
         return None;
@@ -2043,20 +2058,37 @@ mod media_visibility_tests {
 }
 
 /// Lay out rich-text spans; egui ships no bold face, so bold is a slightly larger glyph size.
+#[cfg(test)]
 pub(super) fn styled_text_job(
     text: &str,
     styles: &[crate::rich_text::TextStyle],
     color: Color32,
     size: f32,
 ) -> egui::text::LayoutJob {
+    styled_text_job_with_mentions(text, styles, color, color, size)
+}
+
+/// Like [`styled_text_job`], drawing mention ranges in `mention_color` and slightly larger.
+pub(super) fn styled_text_job_with_mentions(
+    text: &str,
+    styles: &[crate::rich_text::TextStyle],
+    color: Color32,
+    mention_color: Color32,
+    size: f32,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     for (range, style) in crate::rich_text::segments(text, styles) {
+        let color = if style.mention { mention_color } else { color };
         let stroke = egui::Stroke::new(1.0_f32, color);
         job.append(
             &text[range],
             0.0,
             egui::TextFormat {
-                font_id: egui::FontId::proportional(if style.bold { size + 0.6 } else { size }),
+                font_id: egui::FontId::proportional(if style.bold || style.mention {
+                    size + 0.6
+                } else {
+                    size
+                }),
                 color,
                 italics: style.italic,
                 underline: if style.underline {

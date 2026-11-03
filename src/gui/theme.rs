@@ -289,6 +289,47 @@ pub(super) fn matches_vn_query(haystack: &str, query_lower: &str, query_folded: 
     !query_folded.is_empty() && fold_vn_search(haystack).contains(query_folded)
 }
 
+/// Centre-crop the texture to a square, then draw it inside a circle so non-square
+/// avatars are neither stretched nor shown with corners.
+fn paint_circular_image(painter: &egui::Painter, center: Pos2, radius: f32, tex: &TextureHandle) {
+    let (uv_min, uv_max) = square_crop(tex.size());
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    let steps = 40u32;
+    mesh.vertices.push(egui::epaint::Vertex {
+        pos: center,
+        uv: Pos2::new((uv_min.x + uv_max.x) * 0.5, (uv_min.y + uv_max.y) * 0.5),
+        color: Color32::WHITE,
+    });
+    for i in 0..=steps {
+        let angle = i as f32 / steps as f32 * std::f32::consts::TAU;
+        let (sin, cos) = angle.sin_cos();
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: Pos2::new(center.x + radius * cos, center.y + radius * sin),
+            uv: Pos2::new(
+                uv_min.x + (cos * 0.5 + 0.5) * (uv_max.x - uv_min.x),
+                uv_min.y + (sin * 0.5 + 0.5) * (uv_max.y - uv_min.y),
+            ),
+            color: Color32::WHITE,
+        });
+        if i > 0 {
+            mesh.indices.extend_from_slice(&[0, i, i + 1]);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+/// UV rectangle of the centred square inside a `[width, height]` texture.
+fn square_crop([w, h]: [usize; 2]) -> (Pos2, Pos2) {
+    if w == h || w == 0 || h == 0 {
+        (Pos2::ZERO, Pos2::new(1.0, 1.0))
+    } else if w > h {
+        let crop = (w - h) as f32 / (2.0 * w as f32);
+        (Pos2::new(crop, 0.0), Pos2::new(1.0 - crop, 1.0))
+    } else {
+        let crop = (h - w) as f32 / (2.0 * h as f32);
+        (Pos2::new(0.0, crop), Pos2::new(1.0, 1.0 - crop))
+    }
+}
+
 // Rendering arguments describe one immediate-mode paint operation.
 #[allow(clippy::too_many_arguments)]
 fn paint_single_circle_avatar(
@@ -310,13 +351,7 @@ fn paint_single_circle_avatar(
             .unwrap_or_else(|| url.split('?').next().unwrap_or(url).to_string());
         let key = format!("ava_{}", crate::crypto::md5_hex(&file_or_base));
         if let Some(tex) = textures.get(&key) {
-            let rect = Rect::from_center_size(center, Vec2::splat(radius * 2.0));
-            painter.image(
-                tex.id(),
-                rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            paint_circular_image(painter, center, radius, tex);
             painter.circle_stroke(
                 center,
                 radius,
@@ -921,5 +956,19 @@ mod theme_tests {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod avatar_crop_tests {
+    use super::*;
+    #[test]
+    fn crop_keeps_the_centred_square() {
+        assert_eq!(square_crop([100, 100]), (Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        let (min, max) = square_crop([200, 100]);
+        assert!((min.x - 0.25).abs() < 1e-6 && (max.x - 0.75).abs() < 1e-6);
+        assert_eq!((min.y, max.y), (0.0, 1.0));
+        let (min, max) = square_crop([100, 400]);
+        assert!((min.y - 0.375).abs() < 1e-6 && (max.y - 0.625).abs() < 1e-6);
     }
 }

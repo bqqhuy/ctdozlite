@@ -634,6 +634,8 @@ pub struct SidebarMember {
     pub id: String,
     pub name: String,
     pub avatar: Option<String>,
+    /// `creator`, `admin` or empty, from `creatorId` / `adminIds`.
+    pub role: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -795,12 +797,21 @@ impl Thread {
             ids.extend(map.keys().cloned());
         }
         let mut leaders = Vec::new();
-        if let Some(creator) = pick_str(info, &["creatorId"]) {
+        let creator = pick_str(info, &["creatorId"]);
+        if let Some(creator) = creator.clone() {
             leaders.push(creator);
         }
-        if let Some(admins) = info.get("adminIds").and_then(Value::as_array) {
-            leaders.extend(admins.iter().filter_map(Value::as_str).map(str::to_owned));
-        }
+        let admins: Vec<String> = info
+            .get("adminIds")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        leaders.extend(admins.iter().cloned());
         let mut ordered = Vec::new();
         for id in leaders.into_iter().chain(ids.iter().cloned()) {
             if ids.contains(&id) && !ordered.contains(&id) {
@@ -844,6 +855,13 @@ impl Thread {
                                 member.avatar = Some(avatar);
                             }
                         }
+                        member.role = if creator.as_deref() == Some(member.id.as_str()) {
+                            "creator".into()
+                        } else if admins.contains(&member.id) {
+                            "admin".into()
+                        } else {
+                            String::new()
+                        };
                         member
                     })
                     .collect();
@@ -4012,6 +4030,63 @@ pub async fn get_mini_profiles(
     } else {
         Ok(serde_json::Map::new())
     }
+}
+
+/// Largest roster resolved for the member panel; larger groups show the first ones.
+const MEMBER_PANEL_LIMIT: usize = 1000;
+
+/// Load one group's roster (`getmg-v2`) and fill names/avatars with `getminiprofiles`.
+/// Returns the members (leaders first) and the server's total member count.
+/// # Errors
+/// Returns session and group-info failures; missing profiles keep the bare ID.
+pub async fn group_members(
+    s: &Session,
+    group_id: &str,
+) -> Result<(Vec<SidebarMember>, Option<u64>)> {
+    let clean = group_id
+        .trim_start_matches("group_")
+        .trim_start_matches('g');
+    anyhow::ensure!(
+        !clean.is_empty() && clean.bytes().all(|b| b.is_ascii_digit()),
+        "Mã nhóm không hợp lệ"
+    );
+    let (map, _) = fetch_group_profiles(s, &[clean.to_owned()]).await?;
+    let info = map
+        .get(clean)
+        .or_else(|| map.values().next())
+        .context("Máy chủ không trả thông tin nhóm")?;
+    let mut thread = Thread {
+        id: clean.to_owned(),
+        is_group: true,
+        ..Default::default()
+    };
+    thread.apply_group_sidebar_metadata(info);
+    let mut members = thread.presentation.members;
+    members.truncate(MEMBER_PANEL_LIMIT);
+    let missing: Vec<String> = members
+        .iter()
+        .filter(|m| m.name.is_empty() || m.avatar.is_none())
+        .map(|m| m.id.clone())
+        .collect();
+    for chunk in missing.chunks(50) {
+        anyhow::ensure!(s.is_active(), "Đã đăng xuất");
+        let Ok(profiles) = get_mini_profiles(s, chunk).await else {
+            continue;
+        };
+        for member in members.iter_mut().filter(|m| chunk.contains(&m.id)) {
+            if let Some(p) = profiles.get(&member.id) {
+                if member.name.is_empty() {
+                    member.name =
+                        pick_str(p, &["displayName", "zaloName", "name"]).unwrap_or_default();
+                }
+                if member.avatar.is_none() {
+                    member.avatar =
+                        pick_str(p, &["avatar", "avt"]).filter(|a| !a.ends_with("/default"));
+                }
+            }
+        }
+    }
+    Ok((members, thread.presentation.member_count))
 }
 
 /// Automatically resolve real display names and avatars for threads that only have placeholder names.
