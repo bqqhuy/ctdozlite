@@ -1480,6 +1480,8 @@ pub(super) fn spawn_session_worker(
                                         &mut list,
                                         crate::store::MessageStore::PRELOAD_MSGS,
                                     );
+                                    // Rows just read back from SQLite need no second write.
+                                    let preloaded = crate::chat::message_fingerprints(&list);
                                     let Ok(_cycle) = poll_delivery.acquire_owned().await else { return; };
                                     let (recent_result, processed_state, before_state)={
                                         let mut ps = poll_clone.lock().await;
@@ -1493,10 +1495,27 @@ pub(super) fn spawn_session_worker(
                                         let result = crate::chat::poll_new_messages(&s, &mut ps, &mut list).await;
                                         (result, ps.clone(), before)
                                     };
-                                    if persist_received(&s, &mut list).await {
+                                    let mut changed = crate::chat::changed_since(&list, &preloaded);
+                                    let offered: Vec<(String, String)> = changed
+                                        .iter()
+                                        .flat_map(|t| t.messages.iter().map(|m| (t.id.clone(), m.id.clone())))
+                                        .collect();
+                                    if persist_received(&s, &mut changed).await {
                                         crate::queue_cursors::commit_poll(&s, &processed_state).await;
                                     } else {
                                         *poll_clone.lock().await = before_state;
+                                    }
+                                    // Messages the store refused (deleted on this device) leave the list too.
+                                    let kept: HashSet<(String, String)> = changed
+                                        .iter()
+                                        .flat_map(|t| t.messages.iter().map(|m| (t.id.clone(), m.id.clone())))
+                                        .collect();
+                                    let dropped: HashSet<(String, String)> =
+                                        offered.into_iter().filter(|k| !kept.contains(k)).collect();
+                                    if !dropped.is_empty() {
+                                        for thread in &mut list {
+                                            thread.messages.retain(|m| !dropped.contains(&(thread.id.clone(), m.id.clone())));
+                                        }
                                     }
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                     // Startup refreshes live/offline queues; historical backfill is explicit.

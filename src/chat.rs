@@ -4864,6 +4864,56 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
 /// Poll both `getChatFromPolling` (`lp_chat`) and `get-last-msgs` (`convers_api`),
 /// merge all incoming/outgoing/group messages into `threads`, resolve unknown names,
 /// and persist to `zalo_history.db` and `threads_cache.json`.
+/// Fingerprint of every message in `threads`, keyed by `(thread, message)`.
+///
+/// Refresh starts from rows read back from SQLite; only messages that are new or that a
+/// poll changed (recall, reactions, delivery…) need writing again.
+pub fn message_fingerprints(
+    threads: &[Thread],
+) -> std::collections::HashMap<(String, String), u64> {
+    use std::hash::{Hash, Hasher};
+    let mut out = std::collections::HashMap::new();
+    for thread in threads {
+        for message in &thread.messages {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            serde_json::to_vec(message)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            out.insert((thread.id.clone(), message.id.clone()), hasher.finish());
+        }
+    }
+    out
+}
+
+/// The part of `threads` that differs from `before`: new threads, and new or changed
+/// messages of known ones. Unchanged rows are left out so they are not rewritten.
+pub fn changed_since(
+    threads: &[Thread],
+    before: &std::collections::HashMap<(String, String), u64>,
+) -> Vec<Thread> {
+    let known_threads: std::collections::HashSet<&str> =
+        before.keys().map(|(thread, _)| thread.as_str()).collect();
+    let now = message_fingerprints(threads);
+    threads
+        .iter()
+        .filter_map(|thread| {
+            let messages: Vec<ChatMessage> = thread
+                .messages
+                .iter()
+                .filter(|m| {
+                    let key = (thread.id.clone(), m.id.clone());
+                    before.get(&key) != now.get(&key)
+                })
+                .cloned()
+                .collect();
+            (!messages.is_empty() || !known_threads.contains(thread.id.as_str())).then(|| Thread {
+                messages,
+                ..thread.clone()
+            })
+        })
+        .collect()
+}
+
 pub async fn poll_new_messages(
     s: &Session,
     state: &mut PollState,
@@ -4872,6 +4922,7 @@ pub async fn poll_new_messages(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    let before = message_fingerprints(threads);
     // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
     for _ in 0..3 {
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
@@ -4901,8 +4952,11 @@ pub async fn poll_new_messages(
     if !s.is_active() || s.account_key().is_empty() {
         return Ok(());
     }
-    if let Ok(mut store) = crate::store::MessageStore::open(s.history_path()) {
-        let _ = crate::store::persist_threads(&mut store, threads);
+    let changed = changed_since(threads, &before);
+    if !changed.is_empty() {
+        if let Ok(mut store) = crate::store::MessageStore::open(s.history_path()) {
+            let _ = crate::store::persist_threads(&mut store, &changed);
+        }
     }
     save_threads_cache(s, threads);
     Ok(())
@@ -6887,6 +6941,58 @@ mod send_ack_tests {
         assert_eq!(message.sender, "user-1");
         assert_eq!(message.text, "hello");
         assert_eq!(message.delivery, crate::message_model::DeliveryState::Read);
+    }
+}
+
+#[cfg(test)]
+mod refresh_write_tests {
+    use super::*;
+    fn thread(id: &str, messages: &[(&str, &str)]) -> Thread {
+        Thread {
+            id: id.into(),
+            messages: messages
+                .iter()
+                .map(|(id, text)| ChatMessage {
+                    id: (*id).into(),
+                    text: (*text).into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn only_new_or_changed_messages_and_new_threads_are_rewritten() {
+        let before = vec![
+            thread("a", &[("1", "x"), ("2", "y")]),
+            thread("b", &[("3", "z")]),
+        ];
+        let marks = message_fingerprints(&before);
+        assert!(changed_since(&before, &marks).is_empty());
+        let mut after = before.clone();
+        after[0].messages[1].text = "[Tin nhắn đã thu hồi]".into();
+        after[0].messages.push(ChatMessage {
+            id: "4".into(),
+            ..Default::default()
+        });
+        after.push(thread("c", &[]));
+        let changed = changed_since(&after, &marks);
+        let ids: Vec<(String, Vec<String>)> = changed
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.messages.iter().map(|m| m.id.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("a".into(), vec!["2".into(), "4".into()]),
+                ("c".into(), vec![])
+            ]
+        );
     }
 }
 
