@@ -2559,6 +2559,18 @@ impl ZaloGuiApp {
                         );
                     }
                     let render_limit = self.chat_render_window.1;
+                    // A changed message list is first laid out at a stale scroll offset (top of a new
+                    // conversation, or mid-list after older history arrives). Discard that pass so
+                    // only the re-anchored layout reaches the screen.
+                    let layout_key = self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .map(|t| chat_layout_key(&thread_id, &t.messages, render_limit))
+                        .unwrap_or_default();
+                    if layout_key != self.chat_layout_key {
+                        self.chat_layout_key = layout_key;
+                        ctx.request_discard("chat message list changed");
+                    }
                     // Measure visual wrapping, not only explicit newlines: the info drawer
                     // can leave a narrow editor even on a wide desktop window.
                     let composer_compact=(ui.available_width()-44.0)<360.0;
@@ -3825,6 +3837,18 @@ fn ime_state(events: &[egui::Event], composing: bool) -> (bool, bool) {
     (active, composing || touched)
 }
 
+/// Identity of what the chat list will render; changes trigger one re-layout pass.
+fn chat_layout_key(thread_id: &str, messages: &[ChatMessage], render_limit: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    thread_id.hash(&mut hasher);
+    messages.len().hash(&mut hasher);
+    render_limit.hash(&mut hasher);
+    messages.first().map(|m| m.id.as_str()).hash(&mut hasher);
+    messages.last().map(|m| m.id.as_str()).hash(&mut hasher);
+    hasher.finish()
+}
+
 fn composer_rows(text: &str) -> usize {
     text.split('\n').count().clamp(1, COMPOSER_MAX_ROWS)
 }
@@ -3991,5 +4015,26 @@ mod ime_tests {
         assert_eq!(ime_state(&[ime(egui::ImeEvent::Commit("việt".into()))], true), (false, true));
         assert_eq!(ime_state(&[ime(egui::ImeEvent::Preedit(String::new()))], true), (false, true));
         assert_eq!(ime_state(&[ime(egui::ImeEvent::Disabled)], true), (false, true));
+    }
+}
+
+#[cfg(test)]
+mod chat_layout_key_tests {
+    use super::*;
+    fn msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn key_changes_on_switch_prepend_append_and_window_but_not_on_rerender() {
+        let base = vec![msg("a"), msg("b")];
+        let key = chat_layout_key("t", &base, 150);
+        assert_eq!(key, chat_layout_key("t", &base, 150));
+        assert_ne!(key, chat_layout_key("u", &base, 150));
+        assert_ne!(key, chat_layout_key("t", &[msg("z"), msg("a"), msg("b")], 150));
+        assert_ne!(key, chat_layout_key("t", &[msg("a"), msg("b"), msg("c")], 150));
+        assert_ne!(key, chat_layout_key("t", &base, 300));
     }
 }

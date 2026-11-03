@@ -422,6 +422,11 @@ struct UiSmoke {
     path: std::path::PathBuf,
     frames: u32,
     lifecycle_started: bool,
+    /// Capture this many consecutive frames (`<path>-<n>.png`) instead of one at frame 5.
+    sequence: u32,
+    shots: u32,
+    /// Open the fixture group at this frame, then deliver older history two frames later.
+    switch_at: u32,
 }
 
 pub struct ZaloGuiApp {
@@ -459,6 +464,8 @@ pub struct ZaloGuiApp {
     contacts_view_open: bool,
     /// An input method is composing text in the chat composer (Telex/IME preedit).
     composer_ime_active: bool,
+    /// Last rendered chat-list identity; a change discards one stale layout pass.
+    chat_layout_key: u64,
     contacts_tab: contacts::ContactsTab,
     contacts_query: String,
     search_query: String,
@@ -699,6 +706,7 @@ impl ZaloGuiApp {
             thread_filter: ThreadFilter::All,
             contacts_view_open: false,
             composer_ime_active: false,
+            chat_layout_key: 0,
             contacts_tab: contacts::ContactsTab::default(),
             contacts_query: String::new(),
             search_query: String::new(),
@@ -816,6 +824,20 @@ impl ZaloGuiApp {
                 path: path.into(),
                 frames: 0,
                 lifecycle_started: false,
+                sequence: args
+                    .iter()
+                    .position(|a| a == "--ui-smoke-sequence")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+                    .min(30),
+                shots: 0,
+                switch_at: args
+                    .iter()
+                    .position(|a| a == "--ui-smoke-switch-at")
+                    .and_then(|i| args.get(i + 1))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0),
             });
             app.is_logged_in = true;
             app.user_name = "ARM64 UI fixture".into();
@@ -910,6 +932,50 @@ impl ZaloGuiApp {
                     highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(60),
                     scroll_pending: true,
                 });
+            }
+            if args.iter().any(|a| a == "--ui-smoke-group-long") {
+                app.settings_modal_open = false;
+                app.history_sync_running = false;
+                let senders = ["An Nguyễn", "Bình Trần", "Chi Lê", "Dũng Phạm", "Em Võ"];
+                let messages: Vec<_> = (0..150)
+                    .map(|i| ChatMessage {
+                        id: format!("fixture-long-{i}"),
+                        client_message_id: format!("fixture-long-client-{i}"),
+                        sender: senders[i % senders.len()].into(),
+                        text: if i % 3 == 0 {
+                            format!("Tin dài số {i}: {}", "nội dung thảo luận nhóm khá dài để tự xuống nhiều dòng trong bong bóng chat ".repeat(1 + i % 4))
+                        } else {
+                            format!("Tin ngắn số {i}")
+                        },
+                        ts: 1_700_000_000_000 + i as i64 * 60_000,
+                        time: "10:00".into(),
+                        is_outgoing: i % 7 == 0,
+                        ..Default::default()
+                    })
+                    .collect();
+                app.threads = vec![
+                    Thread {
+                        id: "fixture-direct-short".into(),
+                        name: "Trò chuyện ngắn".into(),
+                        messages: vec![ChatMessage {
+                            id: "fixture-short-1".into(),
+                            sender: "An".into(),
+                            text: "Xin chào".into(),
+                            ts: 1_700_000_000_000,
+                            time: "10:00".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    Thread {
+                        id: "fixture-group-long".into(),
+                        name: "Nhóm thảo luận dài".into(),
+                        is_group: true,
+                        messages,
+                        ..Default::default()
+                    },
+                ];
+                app.selected_thread_index = if args.iter().any(|a| a == "--ui-smoke-switch-at") { 0 } else { 1 };
             }
             if args.iter().any(|a| a == "--ui-smoke-contacts") {
                 app.settings_modal_open = false;
@@ -2257,6 +2323,34 @@ impl eframe::App for ZaloGuiApp {
             self.settings.enable_notifications,
             self.settings.play_notification_sound,
         );
+        let smoke_switch = self
+            .smoke
+            .as_ref()
+            .filter(|s| s.switch_at > 0)
+            .map(|s| (s.frames + 1, s.switch_at));
+        if let Some((frame, at)) = smoke_switch {
+            if frame == at {
+                if let Some(index) = self.threads.iter().position(|t| t.id == "fixture-group-long") {
+                    self.open_thread(ctx, index, "fixture-group-long".into(), true);
+                }
+            } else if frame == at + 2 {
+                if let Some(thread) = self.threads.iter_mut().find(|t| t.id == "fixture-group-long") {
+                    let older: Vec<_> = (0..120)
+                        .map(|i| ChatMessage {
+                            id: format!("fixture-older-{i}"),
+                            sender: "Giang Hồ".into(),
+                            text: format!("Tin cũ hơn số {i}: {}", "lịch sử nhóm tải về sau ".repeat(1 + i % 3)),
+                            ts: 1_690_000_000_000 + i as i64 * 60_000,
+                            time: "09:00".into(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    let mut merged = older;
+                    merged.append(&mut thread.messages);
+                    thread.messages = merged;
+                }
+            }
+        }
         if let Some(smoke) = &mut self.smoke {
             smoke.frames += 1;
             let captured = ctx.input(|input| {
@@ -2276,8 +2370,15 @@ impl eframe::App for ZaloGuiApp {
                     std::process::exit(3);
                 }
                 let rgba: Vec<u8> = captured.pixels.iter().flat_map(|p| p.to_array()).collect();
+                let target = if smoke.sequence > 0 {
+                    smoke.shots += 1;
+                    let stem = smoke.path.with_extension("");
+                    std::path::PathBuf::from(format!("{}-{:02}.png", stem.display(), smoke.shots))
+                } else {
+                    smoke.path.clone()
+                };
                 if let Err(e) = image::save_buffer(
-                    &smoke.path,
+                    &target,
                     &rgba,
                     captured.size[0] as u32,
                     captured.size[1] as u32,
@@ -2285,6 +2386,11 @@ impl eframe::App for ZaloGuiApp {
                 ) {
                     eprintln!("UI smoke failed: {e}");
                     std::process::exit(3);
+                }
+                if smoke.sequence > 0 && smoke.shots < smoke.sequence {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                    ctx.request_repaint();
+                    return;
                 }
                 #[cfg(windows)]
                 if std::env::args().any(|a| a == "--tray-smoke-test") {
@@ -2305,7 +2411,9 @@ impl eframe::App for ZaloGuiApp {
                     self.allow_quit = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-            } else if smoke.frames == 5 && !smoke.lifecycle_started {
+            } else if (smoke.sequence > 0 && smoke.frames == 1)
+                || (smoke.frames == 5 && !smoke.lifecycle_started && smoke.sequence == 0)
+            {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
             } else if smoke.frames > 300 {
                 eprintln!("UI smoke failed: screenshot timeout");
@@ -2743,6 +2851,9 @@ mod settings_layout_tests {
             path: Default::default(),
             frames: 0,
             lifecycle_started: false,
+            sequence: 0,
+            shots: 0,
+            switch_at: 0,
         });
         for size in [[480.0, 360.0], [1020.0, 700.0], [320.0, 240.0]] {
             for tab in [
