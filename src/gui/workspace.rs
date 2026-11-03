@@ -2864,6 +2864,10 @@ impl ZaloGuiApp {
                                     }
                                 }
                                 BubbleAction::Forward => {
+                                    let mut m = m;
+                                    // The source conversation lets a forward renew an expired media link.
+                                    let source = &self.threads[self.selected_thread_index];
+                                    crate::chat::set_forward_source(&mut m, &source.id, source.is_group);
                                     self.forward_msg = Some(m);
                                     self.forward_filter.clear();
                                 }
@@ -3381,12 +3385,15 @@ impl ZaloGuiApp {
                                             }
                                         });
                                         // Zalo PC's capture shortcut; Ctrl+Alt+S is not bound elsewhere here.
+                                        // AltGr arrives as Ctrl+Alt and also types a character; a frame
+                                        // with typed text is never treated as the shortcut.
                                         if cfg!(windows)
                                             && ui.input_mut(|i| {
-                                                i.consume_key(
-                                                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
-                                                    Key::S,
-                                                )
+                                                !i.events.iter().any(|e| matches!(e, egui::Event::Text(_)))
+                                                    && i.consume_key(
+                                                        egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                                                        Key::S,
+                                                    )
                                             })
                                         {
                                             self.request_screen_capture();

@@ -191,8 +191,10 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
 const FORWARD_LIMIT: u64 = 1024 * 1024 * 1024;
 
 /// Forward a photo, video or file by downloading it and sending it again through the
-/// verified attachment path, as Zalo PC falls back to `_reuploadMedia`. The copy lives in a
-/// private folder only for the duration of the send.
+/// verified attachment path, as Zalo PC falls back to `_reuploadMedia`. When the stored link
+/// fails and the source conversation is known, the link is renewed once through the shared
+/// `renewlink` path (same single-flight and cache as the viewer) and the download retried.
+/// The copy lives in a private folder only for the duration of the send.
 async fn forward_media(
     s: &Session,
     to: &str,
@@ -201,13 +203,6 @@ async fn forward_media(
     client_id: u64,
 ) -> Result<ChatMessage> {
     let media = crate::message_view::media(original);
-    let url = match media.kind {
-        crate::message_view::MediaKind::Photo => media.original.clone().or(media.preview.clone()),
-        _ => media.original.clone(),
-    }
-    .ok_or_else(|| {
-        anyhow::anyhow!("Tin này không còn đường dẫn media; hãy mở media trước rồi chuyển tiếp")
-    })?;
     let dir = crate::storage::root().join("forward-media");
     crate::storage::private_dir(&dir)?;
     let mut random = [0u8; 8];
@@ -220,32 +215,58 @@ async fn forward_media(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     ));
+    let mut result = match forward_url(&media) {
+        Some(url) => download_for_forward(s, &url, &path, &media).await,
+        None => Err(anyhow::anyhow!("Tin này không còn đường dẫn media")),
+    };
+    if result.is_err() {
+        if let Some((thread, source_group)) = crate::chat::forward_source(original) {
+            let renewed = crate::media_renew::renew(s, &thread, source_group, original).await;
+            if let Some(url) = renewed.ok().as_ref().and_then(forward_url) {
+                result = download_for_forward(s, &url, &path, &media).await;
+            }
+        }
+    }
+    if let Err(error) = result {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(error.context(
+            "Không tải được media để chuyển tiếp (đường dẫn đã hết hạn và không phục hồi được)",
+        ));
+    }
+    let sent =
+        crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await;
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(sent?.1)
+}
+
+fn forward_url(media: &crate::message_view::Media) -> Option<String> {
+    match media.kind {
+        crate::message_view::MediaKind::Photo => media.original.clone().or(media.preview.clone()),
+        _ => media.original.clone(),
+    }
+}
+
+async fn download_for_forward(
+    s: &Session,
+    url: &str,
+    path: &std::path::Path,
+    media: &crate::message_view::Media,
+) -> Result<u64> {
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let visual = media.kind != crate::message_view::MediaKind::File;
     let watch = cancel.clone();
     let session = s.clone();
-    let saved = crate::media_download::save_classified(
-        &url,
-        &path,
+    crate::media_download::save_classified(
+        url,
+        path,
         cancel,
         move |bytes, _| {
             if bytes > FORWARD_LIMIT || !session.is_active() {
                 watch.store(true, std::sync::atomic::Ordering::Release);
             }
         },
-        visual,
+        media.kind != crate::message_view::MediaKind::File,
     )
-    .await;
-    if let Err(error) = saved {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Err(
-            error.context("Không tải được media để chuyển tiếp; hãy mở media trước rồi thử lại")
-        );
-    }
-    let result =
-        crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await;
-    let _ = tokio::fs::remove_file(&path).await;
-    Ok(result?.1)
+    .await
 }
 
 /// Keep the actual attachment response and reuse the original outgoing client identity.

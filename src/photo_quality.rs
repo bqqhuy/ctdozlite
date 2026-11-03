@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub const HD_LONG_SIDE: u32 = 2560;
 /// Files at or below this size and within `HD_LONG_SIDE` are sent unchanged.
 const KEEP_BYTES: u64 = 1_500_000;
+/// HD copies older than this are removed; a send still pending after a week is re-picked.
+const KEEP_COPIES: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 /// Decoding limit for untrusted local files.
 const MAX_PIXELS: u64 = 200_000_000;
 
@@ -69,6 +71,7 @@ pub fn reduce(path: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     }
     let rgb = image.to_rgb8();
     crate::storage::private_dir(dir)?;
+    prune(dir, KEEP_COPIES);
     let mut random = [0u8; 8];
     crate::random::fill(&mut random)?;
     let stem = path
@@ -97,6 +100,26 @@ pub fn reduce(path: &Path, dir: &Path) -> Result<Option<PathBuf>> {
     }
     crate::storage::atomic_write(&out, &encoded)?;
     Ok(Some(out))
+}
+
+/// Remove HD copies older than `age` (left behind by sends that never succeeded).
+fn prune(dir: &Path, age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten().take(10_000) {
+        let old = entry
+            .metadata()
+            .ok()
+            .filter(|m| m.is_file())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|elapsed| elapsed >= age);
+        if old && entry.path().extension().is_some_and(|e| e == "jpg") {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Folder for HD copies waiting to be sent (kept until the send finishes).
@@ -136,6 +159,11 @@ mod tests {
         let small = root.join("small.png");
         image::RgbImage::new(10, 10).save(&small).unwrap();
         assert!(reduce(&small, &root.join("out")).unwrap().is_none());
+        // Pruning with a zero age removes the leftover copy but keeps other files.
+        let keep = root.join("out").join("note.txt");
+        std::fs::write(&keep, b"x").unwrap();
+        prune(&root.join("out"), std::time::Duration::ZERO);
+        assert!(!out.exists() && keep.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

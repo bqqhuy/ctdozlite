@@ -3405,6 +3405,24 @@ pub fn forwardable_media(msg: &ChatMessage) -> bool {
     }
 }
 
+/// Key in `wire_ref.fields` naming the conversation a forwarded message came from.
+const FORWARD_SOURCE: &str = "forward_source";
+
+/// Remember where a message being forwarded lives, for media link renewal.
+pub fn set_forward_source(msg: &mut ChatMessage, thread: &str, is_group: bool) {
+    msg.wire_ref.fields.insert(
+        FORWARD_SOURCE.into(),
+        json!({"thread": thread, "group": is_group}),
+    );
+}
+
+/// The source conversation recorded by [`set_forward_source`].
+pub fn forward_source(msg: &ChatMessage) -> Option<(String, bool)> {
+    let source = msg.wire_ref.fields.get(FORWARD_SOURCE)?;
+    let thread = source.get("thread")?.as_str().filter(|t| !t.is_empty())?;
+    Some((thread.to_owned(), source.get("group")?.as_bool()?))
+}
+
 /// File name for a forwarded media copy: the original name when known, else by kind.
 pub fn forward_file_name(msg: &ChatMessage, media: &crate::message_view::Media) -> String {
     let named = [media.name.as_str(), msg.link_title.as_deref().unwrap_or("")]
@@ -6576,6 +6594,10 @@ mod forward_media_tests {
             forward_file_name(&ChatMessage::default(), &unnamed),
             "anh.jpg"
         );
+        let mut sourced = photo.clone();
+        assert_eq!(forward_source(&sourced), None);
+        set_forward_source(&mut sourced, "g12", true);
+        assert_eq!(forward_source(&sourced), Some(("g12".to_string(), true)));
         let recalled = ChatMessage {
             kind: crate::message_model::MessageKind::Recall,
             ..photo.clone()
