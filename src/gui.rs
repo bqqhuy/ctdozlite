@@ -457,6 +457,8 @@ pub struct ZaloGuiApp {
     thread_filter: ThreadFilter,
     /// Contacts page replaces the conversation list and chat while open.
     contacts_view_open: bool,
+    /// An input method is composing text in the chat composer (Telex/IME preedit).
+    composer_ime_active: bool,
     contacts_tab: contacts::ContactsTab,
     contacts_query: String,
     search_query: String,
@@ -696,6 +698,7 @@ impl ZaloGuiApp {
             chat_render_window: (String::new(), 150),
             thread_filter: ThreadFilter::All,
             contacts_view_open: false,
+            composer_ime_active: false,
             contacts_tab: contacts::ContactsTab::default(),
             contacts_query: String::new(),
             search_query: String::new(),

@@ -3274,7 +3274,11 @@ impl ZaloGuiApp {
                                         let composer_id = Id::new(("chat_composer_input", &thread_id));
                                         // Enter sends; Shift+Enter is left to the editor as a newline.
                                         // Only consumed while the composer owns focus, so other fields keep Enter.
-                                        let enter_send = self.quick_schedule.is_none() && ui.memory(|m| m.has_focus(composer_id))
+                                        // An IME uses Enter to commit the word being composed; that Enter
+                                        // must not also send the message.
+                                        let (ime_active, ime_blocks_enter) = ui.input(|i| ime_state(&i.events, self.composer_ime_active));
+                                        self.composer_ime_active = ime_active;
+                                        let enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                                         let rows = composer_rows(&self.input_message);
                                         let text_edit =
@@ -3795,6 +3799,32 @@ const COMPOSER_ROW_HEIGHT: f32 = 20.0;
 /// Height of five rows plus the editor margin.
 const COMPOSER_MAX_HEIGHT: f32 = 114.0;
 
+/// Track IME composition across frames: returns `(composing_after, block_enter_now)`.
+///
+/// Enter is left to the editor while a word is being composed or was just committed in the
+/// same frame, so committing a Telex word never sends the message early.
+fn ime_state(events: &[egui::Event], composing: bool) -> (bool, bool) {
+    let mut active = composing;
+    let mut touched = false;
+    for event in events {
+        if let egui::Event::Ime(ime) = event {
+            match ime {
+                egui::ImeEvent::Preedit(text) => {
+                    active = !text.is_empty();
+                    touched = true;
+                }
+                egui::ImeEvent::Commit(_) => {
+                    active = false;
+                    touched = true;
+                }
+                egui::ImeEvent::Disabled => active = false,
+                egui::ImeEvent::Enabled => {}
+            }
+        }
+    }
+    (active, composing || touched)
+}
+
 fn composer_rows(text: &str) -> usize {
     text.split('\n').count().clamp(1, COMPOSER_MAX_ROWS)
 }
@@ -3945,4 +3975,21 @@ mod composer_tests {
         });
     }
 
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::*;
+    fn ime(e: egui::ImeEvent) -> egui::Event {
+        egui::Event::Ime(e)
+    }
+    #[test]
+    fn enter_is_blocked_while_composing_and_when_commit_arrives_in_same_frame() {
+        assert_eq!(ime_state(&[], false), (false, false));
+        assert_eq!(ime_state(&[ime(egui::ImeEvent::Preedit("vie".into()))], false), (true, true));
+        assert_eq!(ime_state(&[], true), (true, true));
+        assert_eq!(ime_state(&[ime(egui::ImeEvent::Commit("việt".into()))], true), (false, true));
+        assert_eq!(ime_state(&[ime(egui::ImeEvent::Preedit(String::new()))], true), (false, true));
+        assert_eq!(ime_state(&[ime(egui::ImeEvent::Disabled)], true), (false, true));
+    }
 }
