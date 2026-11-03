@@ -19,7 +19,7 @@ Thiết bị đích được người dùng cung cấp: **Huawei MateBook E Go G
 - **Bản phát hành:** tải từ [Releases của fork](https://github.com/bqqhuy/ctdozlite/releases), đọc ghi chú của đúng phiên bản.
 - **Bản thử nghiệm:** vào [Actions](https://github.com/bqqhuy/ctdozlite/actions/workflows/windows-arm64.yml), chọn lần chạy thành công của nhánh/commit cần thử, tải artifact **`ctdozlite-windows-arm64`**.
 
-Các thay đổi mới đang được tập hợp tại [PR #2](https://github.com/bqqhuy/ctdozlite/pull/2). Bản trong Releases có thể chưa chứa các thay đổi trên nhánh này.
+Bản [v0.002-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.002-arm) tập hợp các thay đổi đã kiểm thử từ nhánh Windows ARM64. Xem [changelog so với upstream v0.0.1](CHANGELOG.md). Binary được giữ nguyên từ commit `c886171`; phiên bản nhúng và tên tệp là `0.0.3`.
 
 | Tệp trong gói | Cách dùng |
 | :--- | :--- |
@@ -58,13 +58,13 @@ Thay `<version>` bằng phiên bản đã tải và so sánh với tệp checksu
 | Audio/video | WASAPI/CPAL, Opus và Media Foundation/H.264 native; đã tích hợp relay/SFU nhóm, trộn audio theo nguồn và tối đa hai video từ xa. |
 | Tài nguyên | Giới hạn lịch sử giữ trong RAM, cache ảnh/texture và hàng đợi preview; lịch sử đầy đủ đã nhận vẫn ở SQLite. |
 
-Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đã ẩn**. Chức năng này không phải khóa PIN. Xóa lịch sử chỉ xóa bản lưu trên máy; đồng bộ sau đó có thể tải lại tin từ server.
+Hội thoại đã ẩn có thể mở lại qua **Hiện cả hội thoại đã ẩn**. Chức năng này không phải khóa PIN. Xóa lịch sử chỉ tác động bản lưu trên máy. Tin đã xóa có dấu định danh để chống xuất hiện lại sau import/đồng bộ; không lưu nội dung tin trong dấu xóa.
 
 Đối soát tin gửi dùng server/client ID thay vì nội dung/thời gian, tránh gộp nhầm các tin giống nhau. Có thể bấm khối trích dẫn để cuộn tới tin gốc **đã nạp** trong hội thoại; tin chưa nạp hoặc ID không duy nhất sẽ được báo rõ. Xem [ADR-0006](docs/adr/0006-exact-message-identity-and-quote-navigation.md).
 
 Ảnh nhận được hiển thị thumbnail và chú thích (nếu có), ẩn URL vận chuyển. Bấm ảnh để mở trình xem ảnh trong ứng dụng. Giờ tin mới, tin đồng bộ và mốc ngày dùng chung múi giờ Windows.
 
-Đồng bộ điện thoại gom tất cả khoảng lịch sử còn thiếu vào ít yêu cầu nhất, sau bước lấy danh sách hội thoại. Không chia ba lượt thời gian; mặc định bảo thủ tối đa 30 hội thoại/yêu cầu, một phiên hoạt động tại một thời điểm. Chỉ tách khi payload vượt giới hạn cục bộ, đã có giới hạn được ghi nhớ, hoặc điện thoại từ chối rõ vì quá nhiều hội thoại/payload. Timeout và lỗi không rõ kết quả dừng lượt, không tự gửi lại. Phản hồi giới hạn tần suất tạo thời gian chờ theo tài khoản. **Chỉ cập nhật tin gần đây** lấy phần mới (tối đa cửa sổ 7 ngày khi chưa có tiến độ); **Quét lại toàn bộ lịch sử điện thoại** đặt lại tiến độ, giữ tin đã lưu. Mỗi lần vẫn cần điện thoại chấp thuận.
+Đồng bộ điện thoại lấy danh sách hội thoại rồi xin phần còn thiếu; hội thoại không đổi được bỏ qua khi có checkpoint hoàn tất. Mặc định tối đa 30 hội thoại/yêu cầu và bốn phiên song song, có giãn nhịp mở phiên. Phiên đứng được xin lại có giới hạn; mất kết nối được phục hồi và dọn phiên cũ. Chỉ ghi checkpoint sau khi nhận đủ gói, giải mã và nhập xong. **Chỉ cập nhật tin gần đây** giới hạn phạm vi bảy ngày; **Quét lại toàn bộ lịch sử điện thoại** đặt lại tiến độ, giữ tin đã lưu. Vẫn cần điện thoại chấp thuận. Khi mở app, chỉ cập nhật metadata và hàng đợi tin mới; tải lịch sử máy chủ là thao tác chủ động.
 
 Bản cũ chưa ghi checkpoint nên không thể suy ra đợt tải đã hoàn tất từ số tin hiện có. Với dữ liệu từ bản cũ, dùng chế độ cập nhật gần đây nếu chưa muốn tải lại phần lịch sử cũ. Thứ tự gói do điện thoại quyết định, không bảo đảm từng tin đến đúng thứ tự mới → cũ. Mỗi yêu cầu có thể nhận nhiều gói dữ liệu từ điện thoại; nhận thêm gói không phát sinh yêu cầu sync mới. Khoảng tiếp tục có chồng lấn 2 phút để tránh bỏ sót tin ở ranh giới. Xem [ADR-0017](docs/adr/0017-complete-phone-transfer-lifecycle.md).
 
@@ -72,7 +72,7 @@ Cài đặt → Đồng bộ có **Nhập / Xuất lịch sử** (SQLite/JSON t�
 
 ## Trạng thái kiểm chứng và giới hạn
 
-Bản mã nguồn tại [`c45882a`](https://github.com/bqqhuy/ctdozlite/commit/c45882a) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41400539416): **261 kiểm thử đạt**, kiểm tra PE/metadata, ảnh framebuffer DX12 và quy trình ẩn/mở/thoát từ tray. CI dùng GPU phần mềm Microsoft Basic Render Driver. Kết quả cho các sửa tiếp theo được cập nhật trong [PR #2](https://github.com/bqqhuy/ctdozlite/pull/2).
+Bản build tại [`c886171`](https://github.com/bqqhuy/ctdozlite/commit/c886171) đã qua [CI native Windows ARM64](https://github.com/bqqhuy/ctdozlite/actions/runs/41684142970): **502 kiểm thử đạt**, thêm một codec test với worker công khai, kiểm tra PE/metadata và **21 smoke test giao diện DX12**. CI dùng GPU phần mềm Microsoft Basic Render Driver. Kết quả này chưa thay thế thử nghiệm trên thiết bị ARM64 thật.
 
 Những điểm cần biết trước khi dùng:
 

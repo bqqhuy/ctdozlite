@@ -23,6 +23,8 @@ env:
 
 jobs:
   windows-arm64:
+    # This custom release reuses the verified c886171 artifact instead of rebuilding it.
+    if: github.ref != 'refs/tags/v0.002-arm'
     name: Windows 11 ARM64 (.exe)
     runs-on: windows-11-arm
     timeout-minutes: 45
