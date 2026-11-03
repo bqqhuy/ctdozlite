@@ -102,5 +102,7 @@ mod queue_catchup;
 pub mod photo_quality;
 /// Typing indicators and delivery/read receipts.
 pub mod presence;
+/// Region screenshot for the composer (Windows snipping overlay).
+pub mod screen_capture;
 /// Correlates async file uploads with their processed-URL notifications.
 pub mod upload_events;

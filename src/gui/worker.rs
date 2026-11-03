@@ -40,6 +40,8 @@ pub enum WorkerCmd {
         message: ChatMessage,
     },
     ReadClipboardImage,
+    /// Open the Windows region picker and attach the capture like a pasted image.
+    CaptureScreen,
     RequestQr,
     PersistSession,
     LoginPassword {
@@ -979,6 +981,32 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::PrepareNotificationSound=>{
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{
                                 if crate::notification_sound::prepare().await.is_err(){let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được âm báo Zalo; kiểm tra mạng rồi bật lại âm thanh".into()));ctx.request_repaint();}
+                            });
+                        }
+                        WorkerCmd::CaptureScreen => {
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let before = crate::screen_capture::clipboard_sequence();
+                                let launched = tokio::task::spawn_blocking(crate::screen_capture::launch).await;
+                                if let Ok(Err(e)) | Err(e) = launched.map_err(anyhow::Error::from) {
+                                    let _ = tx.send(GuiEvent::ScreenCaptureFinished(Err(e.to_string())));
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let deadline = tokio::time::Instant::now() + crate::screen_capture::WAIT;
+                                while tokio::time::Instant::now() < deadline {
+                                    tokio::time::sleep(crate::screen_capture::POLL).await;
+                                    if crate::screen_capture::changed(before, crate::screen_capture::clipboard_sequence()) {
+                                        // Give the snipping tool a moment to finish writing all formats.
+                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                        let image = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten();
+                                        let _ = tx.send(GuiEvent::ScreenCaptureFinished(image.ok_or_else(|| "Bộ nhớ tạm không chứa ảnh chụp".to_owned())));
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                }
+                                let _ = tx.send(GuiEvent::ScreenCaptureFinished(Err("Không nhận được ảnh chụp trong 60 giây".into())));
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::ReadClipboardImage => {

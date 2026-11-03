@@ -100,6 +100,8 @@ pub enum GuiEvent {
         result: Result<tools_panel::ToolsResult, String>,
     },
     ClipboardImageRead(Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>),
+    /// A region capture ready to preview, or why there is none.
+    ScreenCaptureFinished(Result<(std::path::PathBuf, u32, u32, egui::ColorImage), String>),
     /// A single wake-up represents any number of live deltas while hidden.
     LiveThreadsReady(std::sync::Arc<crate::live_updates::LiveUpdates>),
     ConversationPreferences {
@@ -494,6 +496,8 @@ pub struct ZaloGuiApp {
     /// Groups whose roster is loading, or failed (with the error).
     group_members_state: HashMap<String, Option<String>>,
     group_member_search: String,
+    /// A region capture is waiting for the user.
+    screen_capture_pending: bool,
     /// Last typing signal sent per conversation.
     typing_sent: HashMap<String, std::time::Instant>,
     contacts_tab: contacts::ContactsTab,
@@ -741,6 +745,7 @@ impl ZaloGuiApp {
             chat_layout_key: 0,
             typing_map: HashMap::new(),
             typing_sent: HashMap::new(),
+            screen_capture_pending: false,
             group_members: HashMap::new(),
             group_members_state: HashMap::new(),
             group_member_search: String::new(),
@@ -1293,6 +1298,18 @@ impl ZaloGuiApp {
         palette
     }
 
+    fn request_screen_capture(&mut self) {
+        if self.screen_capture_pending {
+            return;
+        }
+        if let Some(tx) = WORKER_TX.get() {
+            self.screen_capture_pending = tx.send(WorkerCmd::CaptureScreen).is_ok();
+            if self.screen_capture_pending {
+                self.show_toast("Chọn vùng màn hình cần chụp…");
+            }
+        }
+    }
+
     fn request_clipboard_image(&mut self) {
         if self.clipboard_read_pending {
             return;
@@ -1432,6 +1449,24 @@ impl ZaloGuiApp {
                         if let Some(d) = self.downloads.get_mut(&id) {
                             d.result = Some(result);
                         }
+                    }
+                }
+                GuiEvent::ScreenCaptureFinished(result) => {
+                    self.screen_capture_pending = false;
+                    match result {
+                        Ok((path, w, h, image)) => {
+                            let texture = ctx.load_texture(
+                                "clipboard-preview",
+                                image,
+                                TextureOptions::LINEAR,
+                            );
+                            self.pending_clipboard_image = Some((path, w, h, texture));
+                            self.composer_focus_pending = true;
+                            self.show_toast(format!(
+                                "Đã chụp màn hình ({w}×{h} px) — nhấn Enter để gửi"
+                            ));
+                        }
+                        Err(reason) => self.show_toast(reason),
                     }
                 }
                 GuiEvent::ClipboardImageRead(image) => {

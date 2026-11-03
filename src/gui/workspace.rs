@@ -3368,7 +3368,29 @@ impl ZaloGuiApp {
                                                 ui.close_menu();
                                                 self.request_clipboard_image();
                                             }
+                                            if cfg!(windows)
+                                                && ui
+                                                    .button(format!(
+                                                        "{} Chụp màn hình (Ctrl+Alt+S)",
+                                                        lucide::CAMERA
+                                                    ))
+                                                    .clicked()
+                                            {
+                                                ui.close_menu();
+                                                self.request_screen_capture();
+                                            }
                                         });
+                                        // Zalo PC's capture shortcut; Ctrl+Alt+S is not bound elsewhere here.
+                                        if cfg!(windows)
+                                            && ui.input_mut(|i| {
+                                                i.consume_key(
+                                                    egui::Modifiers::CTRL | egui::Modifiers::ALT,
+                                                    Key::S,
+                                                )
+                                            })
+                                        {
+                                            self.request_screen_capture();
+                                        }
 
                                         // Keyboard navigation for contextual sticker popover (Zalo PC `changeSelectedIndex`):
                                         // - ArrowUp selects the first suggested sticker
