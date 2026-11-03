@@ -969,15 +969,22 @@ impl ZaloGuiApp {
                                                             trigger_sync = true;
                                                         }
                                                         ui.add_space(8.0);
-                                                        ui.label("Tải tiếp lịch sử nhóm và Cloud (tối đa 200 trang/hội thoại mỗi lượt).");
-                                                        if ui.button(if self.history_sync_running { "Dừng tải lịch sử" } else { "Tải / tiếp tục lịch sử" }).clicked() {
-                                                            if let Some(tx) = WORKER_TX.get() {
-                                                                let command = if self.history_sync_running { WorkerCmd::CancelHistorySync }
-                                                                    else { WorkerCmd::SyncHistory { threads: self.threads.clone() } };
-                                                                if tx.send(command).is_ok() {
-                                                                    if self.history_sync_running { self.sync_cancel_requested=true; }
-                                                                    else { self.history_sync_running=true; self.history_sync_status="Đang bắt đầu tải lịch sử nhóm và Cloud…".into(); self.sync_notice_dismissed=false; }
-                                                                }
+                                                        ui.label("Tải dữ liệu máy chủ còn cung cấp: lịch sử nhóm và Cloud của tôi (tối đa 200 trang/hội thoại mỗi lượt). Máy chủ thường chỉ trả tin từ sau lần đăng nhập đầu tiên trên thiết bị này; tin cũ và chat cá nhân cần Đồng bộ từ điện thoại.");
+                                                        let mut history_command = None;
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            if ui.button(if self.history_sync_running { "Dừng tải" } else { "Tải dữ liệu máy chủ còn cung cấp" }).clicked() {
+                                                                history_command = Some(if self.history_sync_running { WorkerCmd::CancelHistorySync }
+                                                                    else { WorkerCmd::SyncHistory { threads: self.threads.clone(), retry_filtered: false } });
+                                                            }
+                                                            if !self.history_sync_running && ui.button("Thử lại hội thoại bị giới hạn").on_hover_text("Hỏi lại máy chủ cả những hội thoại vừa bị giới hạn trong 24 giờ qua").clicked() {
+                                                                history_command = Some(WorkerCmd::SyncHistory { threads: self.threads.clone(), retry_filtered: true });
+                                                            }
+                                                        });
+                                                        if let (Some(command), Some(tx)) = (history_command, WORKER_TX.get()) {
+                                                            let cancel = matches!(command, WorkerCmd::CancelHistorySync);
+                                                            if tx.send(command).is_ok() {
+                                                                if cancel { self.sync_cancel_requested=true; }
+                                                                else { self.history_sync_running=true; self.history_sync_status="Đang bắt đầu tải dữ liệu máy chủ…".into(); self.sync_notice_dismissed=false; }
                                                             }
                                                         }
                                                         ui.label(&self.history_sync_status);

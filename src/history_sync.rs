@@ -73,13 +73,89 @@ pub fn page_metadata(response: &Value) -> Result<Page> {
     })
 }
 
+/// How long a conversation the server answered with `isFiltered` is left out.
+const FILTERED_KEEP_MS: i64 = 24 * 60 * 60 * 1000;
+const FILTERED_LIMIT: usize = 1024 * 1024;
+
+/// Conversations the server recently limited (`isFiltered`) for one login session.
+///
+/// This only avoids repeating calls that just returned nothing; it never marks history
+/// complete. A different login session, expiry or a manual retry ignores it, and a missing
+/// or damaged file reads as empty.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FilteredMemo {
+    /// Irreversible tag of the login session that observed the limits.
+    session: u64,
+    until: std::collections::HashMap<String, i64>,
+}
+impl FilteredMemo {
+    pub fn load(path: &std::path::Path, session: u64) -> Self {
+        crate::limits::read_file(path, FILTERED_LIMIT)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .filter(|memo| memo.session == session)
+            .unwrap_or(Self {
+                session,
+                until: Default::default(),
+            })
+    }
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        crate::storage::atomic_write(path, &serde_json::to_vec(self)?)
+    }
+    pub fn holds(&self, thread: &str, now: i64) -> bool {
+        self.until.get(thread).is_some_and(|until| *until > now)
+    }
+    pub fn remember(&mut self, thread: &str, now: i64) {
+        self.until
+            .insert(thread.to_owned(), now.saturating_add(FILTERED_KEEP_MS));
+    }
+    pub fn forget(&mut self, thread: &str) -> bool {
+        self.until.remove(thread).is_some()
+    }
+    fn prune(&mut self, now: i64) {
+        self.until.retain(|_, until| *until > now);
+    }
+}
+/// Login-session tag for `FilteredMemo`; the key itself is never stored.
+fn session_tag(session: &Session) -> u64 {
+    let key = session.session_key_bytes();
+    let mut identity = session.account_key().as_bytes().to_vec();
+    identity.push(0);
+    identity.extend_from_slice(key);
+    crate::transfer_diagnostics::tag(&String::from_utf8_lossy(&identity))
+}
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Download the group and Cloud history the server still provides.
+/// `retry_filtered` ignores the memo of conversations the server recently limited.
 pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     session: &Session,
     threads: Vec<Thread>,
     canceled: Arc<AtomicBool>,
+    retry_filtered: bool,
     mut progress: F,
     mut page_ready: G,
 ) -> Result<String> {
+    let memo_path = session
+        .history_path()
+        .with_extension("server-filtered.json");
+    let now = now_ms();
+    let mut memo = if retry_filtered {
+        FilteredMemo {
+            session: session_tag(session),
+            until: Default::default(),
+        }
+    } else {
+        FilteredMemo::load(&memo_path, session_tag(session))
+    };
+    memo.prune(now);
+    let mut memo_changed = retry_filtered;
+    let mut remembered = 0;
     let cloud = session
         .login
         .as_ref()
@@ -99,6 +175,10 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .filter(|t| t.is_group || (!cloud.is_empty() && t.id == cloud))
         .enumerate()
     {
+        if memo.holds(&thread.id, now) {
+            remembered += 1;
+            continue;
+        }
         thread.messages.clear();
         let checkpoint: Option<String> = store
             .conn
@@ -116,6 +196,9 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         let mut old = saved.is_some_and(|(kind, _)| kind == "old");
         for page in 0..200 {
             if canceled.load(Ordering::Relaxed) || !session.is_active() {
+                if memo_changed && session.is_active() {
+                    let _ = memo.save(&memo_path);
+                }
                 return Ok(format!(
                     "Đã dừng; lưu {inserted} tin mới và vị trí tiếp tục"
                 ));
@@ -147,10 +230,15 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
                         rusqlite::params![thread.id, checkpoint])?;
                 }
+                if !metadata.filtered && memo.forget(&thread.id) {
+                    memo_changed = true;
+                }
                 store.filter_deleted(std::slice::from_mut(&mut thread))?;
                 page_ready(thread.clone());
                 if metadata.filtered {
                     filtered += 1;
+                    memo.remember(&thread.id, now);
+                    memo_changed = true;
                     progress(format!("{}: máy chủ giới hạn lịch sử cho phiên này; dữ liệu cũ chưa được tải đầy đủ", thread.name));
                 }
                 Ok::<_,anyhow::Error>(metadata.cursor.map(|next| (next, metadata.old)))
@@ -163,6 +251,9 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 Ok(None) => break,
                 Err(e) => {
                     if e.to_string().contains("429") {
+                        if memo_changed {
+                            let _ = memo.save(&memo_path);
+                        }
                         return Ok(format!("Máy chủ giới hạn tốc độ; đã lưu {inserted} tin mới. Thử đồng bộ lại sau; vị trí tiếp tục được giữ."));
                     }
                     failed += 1;
@@ -182,11 +273,43 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
             }
         }
     }
-    Ok(format!("Đã lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị server giới hạn; {skipped} chat cá nhân chỉ có lịch sử cục bộ. Chỉ tải được dữ liệu server còn lưu."))
+    if memo_changed && session.is_active() {
+        // Best effort: losing the memo only means asking the server again next time.
+        let _ = memo.save(&memo_path);
+    }
+    let remembered = if remembered > 0 {
+        format!(" {remembered} hội thoại vừa bị giới hạn trong 24 giờ qua được bỏ qua (bấm \"Thử lại hội thoại bị giới hạn\" để hỏi lại).")
+    } else {
+        String::new()
+    };
+    Ok(format!("Đã lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị máy chủ giới hạn lịch sử cho thiết bị này; {skipped} chat cá nhân không có lịch sử trên máy chủ (dùng Đồng bộ từ điện thoại).{remembered} Đây là dữ liệu máy chủ còn cung cấp, chưa chắc là toàn bộ lịch sử."))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn filtered_memo_is_per_session_expires_and_survives_damage() {
+        let root = std::env::temp_dir().join(format!(
+            "filtered-memo-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("a.server-filtered.json");
+        std::fs::write(&path, b"[broken").unwrap();
+        assert!(FilteredMemo::load(&path, 1).until.is_empty());
+        let mut memo = FilteredMemo::load(&path, 1);
+        memo.remember("g1", 1_000);
+        memo.save(&path).unwrap();
+        let loaded = FilteredMemo::load(&path, 1);
+        assert!(loaded.holds("g1", 1_000 + FILTERED_KEEP_MS - 1));
+        assert!(!loaded.holds("g1", 1_000 + FILTERED_KEEP_MS));
+        // Another login session never reuses the memo.
+        assert!(!FilteredMemo::load(&path, 2).holds("g1", 1_001));
+        let mut loaded = loaded;
+        assert!(loaded.forget("g1"));
+        assert!(!loaded.holds("g1", 1_001));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn follows_server_cursor_instead_of_message_ids() {
         let page = page_metadata(&serde_json::json!({"data":{"groupMsgs":[{"msgId":"1"}], "lastMsgId":"9007199254740993", "hasMore":1,"isOld":0}})).unwrap();

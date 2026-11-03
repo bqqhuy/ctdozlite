@@ -64,6 +64,8 @@ pub enum WorkerCmd {
     },
     SyncHistory {
         threads: Vec<Thread>,
+        /// Ask again for conversations the server limited in the last 24 hours.
+        retry_filtered: bool,
     },
     CancelHistorySync,
     /// Explicit phone-approved history transfer; never started by login/refresh.
@@ -1286,17 +1288,17 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::CancelHistorySync => {
                             history_sync_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        WorkerCmd::SyncHistory { threads } => {
+                        WorkerCmd::SyncHistory { threads, retry_filtered } => {
                             if history_sync_running.swap(true, std::sync::atomic::Ordering::SeqCst) { continue; }
                             history_sync_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
                             let running = history_sync_running.clone();
                             let cancel = history_sync_cancel.clone();
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
-                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang tải lịch sử nhóm và Cloud từ máy chủ…".into() });
+                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang tải dữ liệu máy chủ còn cung cấp (nhóm và Cloud)…".into() });
                             ctx.request_repaint();
                             tokio::spawn(async move {
-                                let result = crate::history_sync::download(&s, threads, cancel,
+                                let result = crate::history_sync::download(&s, threads, cancel, retry_filtered,
                                     |message| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); } },
                                     |thread| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::ThreadsUpdated {threads:vec![thread],source:ThreadUpdateSource::History}); ctx.request_repaint(); } }).await;
                                 running.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1402,7 +1404,7 @@ pub(super) fn spawn_session_worker(
                                     let eligible = list.iter().any(|t| t.is_group || s.login.as_ref().is_some_and(|li| !li.send2me_id.is_empty() && li.send2me_id == t.id));
                                     if eligible && !auto_history_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                         if let Some(tx) = commands.upgrade() {
-                                            let _ = tx.send(WorkerCmd::SyncHistory { threads: list.clone() });
+                                            let _ = tx.send(WorkerCmd::SyncHistory { threads: list.clone(), retry_filtered: false });
                                         }
                                     }
                                     let count = list.len();
