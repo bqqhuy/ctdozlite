@@ -408,6 +408,14 @@ fn deliver_thread_updates() -> bool {
 /// Store a received batch. Returns `true` only when it reached SQLite, which is the
 /// condition for advancing persisted queue cursors.
 async fn persist_received(session: &Session, threads: &mut Vec<Thread>) -> bool {
+    persist_received_since(session, threads, None).await
+}
+
+async fn persist_received_since(
+    session: &Session,
+    threads: &mut Vec<Thread>,
+    baseline: Option<crate::chat::MessageFingerprints>,
+) -> bool {
     let session = session.clone();
     let mut batch = threads.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Thread>, bool)> {
@@ -416,9 +424,13 @@ async fn persist_received(session: &Session, threads: &mut Vec<Thread>) -> bool 
         store.filter_deleted(&mut batch)?;
         // Once deletion filtering succeeds, a cache-write or automation failure must
         // not suppress otherwise valid live delivery (history persistence is fail-open).
-        let stored = match crate::store::persist_threads(&mut store, &batch) {
+        let changed = baseline
+            .as_ref()
+            .map(|marks| crate::chat::changed_since(&batch, marks));
+        let offered = changed.as_deref().unwrap_or(&batch);
+        let stored = match crate::store::persist_threads(&mut store, offered) {
             Ok(_) => {
-                if crate::tools::auto_reply(&store, session.account_key(), &batch).is_err() {
+                if crate::tools::auto_reply(&store, session.account_key(), offered).is_err() {
                     eprintln!("Cannot evaluate auto reply for received batch");
                 }
                 true
@@ -428,6 +440,13 @@ async fn persist_received(session: &Session, threads: &mut Vec<Thread>) -> bool 
                 false
             }
         };
+        if baseline.is_some() {
+            // Recheck the entire view, including unchanged rows deleted during the refresh.
+            store.filter_deleted(&mut batch)?;
+            if session.is_active() {
+                crate::chat::save_threads_cache(&session, &batch);
+            }
+        }
         Ok((batch, stored))
     })
     .await;
@@ -1475,13 +1494,17 @@ pub(super) fn spawn_session_worker(
                                             return;
                                         }
                                     };
-                                    crate::store::load_history_into_threads(
-                                        s.history_path(),
-                                        &mut list,
-                                        crate::store::MessageStore::PRELOAD_MSGS,
-                                    );
-                                    // Rows just read back from SQLite need no second write.
-                                    let preloaded = crate::chat::message_fingerprints(&list);
+                                    let account = s.clone();
+                                    let (hydrated, preloaded) = match tokio::task::spawn_blocking(move || {
+                                        let mut list = list;
+                                        let marks = crate::store::MessageStore::open(account.history_path())
+                                            .and_then(|store| store.hydrate_refresh(&mut list, crate::store::MessageStore::PRELOAD_MSGS));
+                                        (list, marks.unwrap_or_default())
+                                    }).await {
+                                        Ok(snapshot) => snapshot,
+                                        Err(_) => { notice.message = "Không đọc được lịch sử cục bộ; thử cập nhật lại".into(); return; }
+                                    };
+                                    list = hydrated;
                                     let Ok(_cycle) = poll_delivery.acquire_owned().await else { return; };
                                     let (recent_result, processed_state, before_state)={
                                         let mut ps = poll_clone.lock().await;
@@ -1492,39 +1515,25 @@ pub(super) fn spawn_session_worker(
                                             }
                                         }
                                         let before = ps.clone();
-                                        let result = crate::chat::poll_new_messages(&s, &mut ps, &mut list).await;
+                                        let result = crate::chat::receive_new_messages(&s, &mut ps, &mut list).await;
                                         (result, ps.clone(), before)
                                     };
-                                    let mut changed = crate::chat::changed_since(&list, &preloaded);
-                                    let offered: Vec<(String, String)> = changed
-                                        .iter()
-                                        .flat_map(|t| t.messages.iter().map(|m| (t.id.clone(), m.id.clone())))
-                                        .collect();
-                                    if persist_received(&s, &mut changed).await {
+                                    let stored = persist_received_since(&s, &mut list, Some(preloaded)).await;
+                                    if stored {
                                         crate::queue_cursors::commit_poll(&s, &processed_state).await;
                                     } else {
                                         *poll_clone.lock().await = before_state;
-                                    }
-                                    // Messages the store refused (deleted on this device) leave the list too.
-                                    let kept: HashSet<(String, String)> = changed
-                                        .iter()
-                                        .flat_map(|t| t.messages.iter().map(|m| (t.id.clone(), m.id.clone())))
-                                        .collect();
-                                    let dropped: HashSet<(String, String)> =
-                                        offered.into_iter().filter(|k| !kept.contains(k)).collect();
-                                    if !dropped.is_empty() {
-                                        for thread in &mut list {
-                                            thread.messages.retain(|m| !dropped.contains(&(thread.id.clone(), m.id.clone())));
-                                        }
                                     }
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                     // Startup refreshes live/offline queues; historical backfill is explicit.
                                     let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
-                                    notice.message=match recent_result {
+                                    notice.message=if !stored {
+                                        "Chưa lưu được cập nhật vào CSDL; giữ cursor cũ để lấy bù lần sau".into()
+                                    } else { match recent_result {
                                         Ok(_) => format!("Đã cập nhật {count} hội thoại và tin gần đây; không phải toàn bộ lịch sử điện thoại"),
                                         Err(error) => format!("Đã cập nhật {count} hội thoại; chưa lấy được tin gần đây: {error}"),
-                                    };
+                                    }};
                                     ctx_clone.request_repaint();
                                 }
                             });

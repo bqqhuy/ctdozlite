@@ -4861,60 +4861,179 @@ pub async fn get_chat_from_polling(s: &Session, state: &mut PollState) -> Result
     }
 }
 
-/// Poll both `getChatFromPolling` (`lp_chat`) and `get-last-msgs` (`convers_api`),
-/// merge all incoming/outgoing/group messages into `threads`, resolve unknown names,
-/// and persist to `zalo_history.db` and `threads_cache.json`.
-/// Fingerprint of every message in `threads`, keyed by `(thread, message)`.
-///
-/// Refresh starts from rows read back from SQLite; only messages that are new or that a
-/// poll changed (recall, reactions, delivery…) need writing again.
-pub fn message_fingerprints(
-    threads: &[Thread],
-) -> std::collections::HashMap<(String, String), u64> {
-    use std::hash::{Hash, Hasher};
-    let mut out = std::collections::HashMap::new();
-    for thread in threads {
-        for message in &thread.messages {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            serde_json::to_vec(message)
-                .unwrap_or_default()
-                .hash(&mut hasher);
-            out.insert((thread.id.clone(), message.id.clone()), hasher.finish());
+/// In-memory marks for messages proven to have been read from SQLite.
+pub(crate) type MessageFingerprints = std::collections::HashMap<(String, String), u64>;
+
+pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
+    use std::hash::Hasher;
+    struct Writer(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
         }
     }
-    out
+    let mut writer = Writer(std::collections::hash_map::DefaultHasher::new());
+    // Display time is reconstructed on hydration and does not change a stored row.
+    // Exhaustive destructuring makes new fields an explicit fingerprint decision.
+    let ChatMessage {
+        outgoing_job,
+        kind,
+        wire_ref,
+        unread_policy,
+        delivery,
+        id,
+        sender,
+        text,
+        time: _,
+        is_outgoing,
+        ts,
+        sticker_id,
+        sticker_cate_id,
+        sticker_type,
+        reply_to_id,
+        reply_to_sender,
+        reply_to_text,
+        reactions,
+        reaction_summaries,
+        reaction_snapshot,
+        reaction_authoritative_snapshot,
+        reaction_snapshot_fresh: _,
+        reaction_snapshot_provenance,
+        reaction_versions,
+        client_message_id,
+        is_pinned,
+        is_starred,
+        text_styles,
+        link_url,
+        link_title,
+        link_desc,
+        link_thumb,
+        link_src,
+        history_source,
+        resolved_mention_uids,
+    } = message;
+    serde_json::to_writer(
+        &mut writer,
+        &(
+            (
+                outgoing_job,
+                kind,
+                wire_ref,
+                unread_policy,
+                delivery,
+                id,
+                sender,
+                text,
+                is_outgoing,
+                ts,
+                sticker_id,
+                sticker_cate_id,
+            ),
+            (
+                sticker_type,
+                reply_to_id,
+                reply_to_sender,
+                reply_to_text,
+                reactions,
+                reaction_summaries,
+                reaction_snapshot,
+                reaction_authoritative_snapshot,
+                reaction_snapshot_provenance,
+                reaction_versions,
+                client_message_id,
+                is_pinned,
+            ),
+            (
+                is_starred,
+                text_styles,
+                link_url,
+                link_title,
+                link_desc,
+                link_thumb,
+                link_src,
+                history_source,
+                resolved_mention_uids,
+            ),
+        ),
+    )
+    .ok()?;
+    Some(writer.0.finish())
 }
 
-/// The part of `threads` that differs from `before`: new threads, and new or changed
-/// messages of known ones. Unchanged rows are left out so they are not rewritten.
-pub fn changed_since(
-    threads: &[Thread],
-    before: &std::collections::HashMap<(String, String), u64>,
-) -> Vec<Thread> {
-    let known_threads: std::collections::HashSet<&str> =
-        before.keys().map(|(thread, _)| thread.as_str()).collect();
-    let now = message_fingerprints(threads);
+/// Fingerprint a known-durable snapshot; arbitrary network previews are not a baseline.
+#[cfg(test)]
+fn message_fingerprints(threads: &[Thread]) -> MessageFingerprints {
     threads
         .iter()
-        .filter_map(|thread| {
-            let messages: Vec<ChatMessage> = thread
-                .messages
-                .iter()
-                .filter(|m| {
-                    let key = (thread.id.clone(), m.id.clone());
-                    before.get(&key) != now.get(&key)
-                })
-                .cloned()
-                .collect();
-            (!messages.is_empty() || !known_threads.contains(thread.id.as_str())).then(|| Thread {
-                messages,
-                ..thread.clone()
+        .flat_map(|t| {
+            t.messages.iter().filter_map(|m| {
+                message_fingerprint(m).map(|mark| ((t.id.clone(), m.id.clone()), mark))
             })
         })
         .collect()
 }
 
+/// Preserve thread metadata while omitting only messages proven unchanged in SQLite.
+pub(crate) fn changed_since(threads: &[Thread], before: &MessageFingerprints) -> Vec<Thread> {
+    threads
+        .iter()
+        .map(|thread| Thread {
+            id: thread.id.clone(),
+            name: thread.name.clone(),
+            preview: thread.preview.clone(),
+            time: thread.time.clone(),
+            avatar: thread.avatar.clone(),
+            is_group: thread.is_group,
+            presentation: thread.presentation.clone(),
+            unread: thread.unread.clone(),
+            messages: thread
+                .messages
+                .iter()
+                .filter(|m| {
+                    m.id.is_empty()
+                        || message_fingerprint(m).is_none_or(|now| {
+                            before.get(&(thread.id.clone(), m.id.clone())) != Some(&now)
+                        })
+                })
+                .cloned()
+                .collect(),
+        })
+        .collect()
+}
+
+/// Poll and persist for CLI/TUI callers. GUI owns its separate durable commit boundary.
 pub async fn poll_new_messages(
+    s: &Session,
+    state: &mut PollState,
+    threads: &mut Vec<Thread>,
+) -> Result<()> {
+    receive_new_messages(s, state, threads).await?;
+    if !s.is_active() || s.account_key().is_empty() {
+        return Ok(());
+    }
+    let account = s.clone();
+    let snapshot = threads.clone();
+    *threads = tokio::task::spawn_blocking(move || -> Result<Vec<Thread>> {
+        anyhow::ensure!(account.is_active(), "Đã đăng xuất");
+        let mut snapshot = snapshot;
+        let mut store = crate::store::MessageStore::open(account.history_path())?;
+        store.filter_deleted(&mut snapshot)?;
+        crate::store::persist_threads(&mut store, &snapshot)?;
+        save_threads_cache(&account, &snapshot);
+        Ok(snapshot)
+    })
+    .await??;
+    Ok(())
+}
+
+/// Receive and merge network updates without writing history or cache.
+/// # Errors
+/// Returns authentication errors. GUI callers persist the batch before committing cursors.
+pub(crate) async fn receive_new_messages(
     s: &Session,
     state: &mut PollState,
     threads: &mut Vec<Thread>,
@@ -4922,7 +5041,6 @@ pub async fn poll_new_messages(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let before = message_fingerprints(threads);
     // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
     for _ in 0..3 {
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
@@ -4949,16 +5067,7 @@ pub async fn poll_new_messages(
     resolve_thread_names(s, threads).await;
     threads.retain(|t| !t.messages.is_empty() || !t.name.starts_with("Người dùng "));
     deduplicate_threads(threads, None);
-    if !s.is_active() || s.account_key().is_empty() {
-        return Ok(());
-    }
-    let changed = changed_since(threads, &before);
-    if !changed.is_empty() {
-        if let Ok(mut store) = crate::store::MessageStore::open(s.history_path()) {
-            let _ = crate::store::persist_threads(&mut store, &changed);
-        }
-    }
-    save_threads_cache(s, threads);
+
     Ok(())
 }
 
@@ -6968,7 +7077,9 @@ mod refresh_write_tests {
             thread("b", &[("3", "z")]),
         ];
         let marks = message_fingerprints(&before);
-        assert!(changed_since(&before, &marks).is_empty());
+        assert!(changed_since(&before, &marks)
+            .iter()
+            .all(|t| t.messages.is_empty()));
         let mut after = before.clone();
         after[0].messages[1].text = "[Tin nhắn đã thu hồi]".into();
         after[0].messages.push(ChatMessage {
@@ -6990,6 +7101,7 @@ mod refresh_write_tests {
             ids,
             vec![
                 ("a".into(), vec!["2".into(), "4".into()]),
+                ("b".into(), vec![]),
                 ("c".into(), vec![])
             ]
         );

@@ -659,14 +659,30 @@ impl MessageStore {
             .pointer("/message_state/wire_ref/sender")
             .map(serde_json::Value::to_string)
             .unwrap_or_default();
-        // Two concrete server IDs remain distinct even when a broken server/client repeats a client ID.
-        let provisional = message.msg_id.starts_with("phone-client:")
-            || message.msg_id.starts_with("out_")
-            || message.msg_id.starts_with("local_");
+        self.is_deleted_identity(
+            &message.thread_id,
+            &message.msg_id,
+            client,
+            message.is_outgoing,
+            &sender,
+        )
+    }
+
+    fn is_deleted_identity(
+        &self,
+        thread: &str,
+        id: &str,
+        client: &str,
+        outgoing: bool,
+        sender: &str,
+    ) -> Result<bool> {
+        // Two concrete server IDs remain distinct even when a client ID repeats.
+        let provisional =
+            id.starts_with("phone-client:") || id.starts_with("out_") || id.starts_with("local_");
         Ok(self.conn.prepare_cached("SELECT EXISTS(SELECT 1 FROM deleted_messages WHERE thread_id=?1 AND msg_id=?2)
             OR (?3!='' AND ?3!='0' AND EXISTS(SELECT 1 FROM deleted_messages WHERE thread_id=?1 AND client_message_id=?3
                 AND is_outgoing=?4 AND (is_local=1 OR ?5=1) AND (?4=1 OR (?6!='' AND sender_id=?6))))")?
-            .query_row(params![message.thread_id,message.msg_id,client,message.is_outgoing,provisional,sender],|r|r.get(0))?)
+            .query_row(params![thread,id,client,outgoing,provisional,sender],|r|r.get(0))?)
     }
 
     /// Filter replayed deleted messages before UI publication and notification delivery.
@@ -677,12 +693,24 @@ impl MessageStore {
             let mut kept = Vec::with_capacity(thread.messages.len());
             let mut removed = false;
             for message in std::mem::take(&mut thread.messages) {
-                let mut row = StoredMessage::from(&message);
-                row.thread_id = thread.id.clone();
-                if row.msg_id.is_empty() {
-                    row.msg_id = format!("{}_{}", thread.id, row.ts);
-                }
-                if self.is_deleted_message(&row)? {
+                let key = if message.id.is_empty() {
+                    format!("msg_{}", message.ts)
+                } else {
+                    message.id.clone()
+                };
+                let sender = message
+                    .wire_ref
+                    .sender
+                    .as_ref()
+                    .map(serde_json::Value::to_string)
+                    .unwrap_or_default();
+                if self.is_deleted_identity(
+                    &thread.id,
+                    &key,
+                    &message.client_message_id,
+                    message.is_outgoing,
+                    &sender,
+                )? {
                     removed = true;
                 } else {
                     kept.push(message);
@@ -690,17 +718,13 @@ impl MessageStore {
             }
             thread.messages = kept;
             let last_deleted = !thread.presentation.last_message_id.is_empty()
-                && self.is_deleted_message(&StoredMessage {
-                    thread_id: thread.id.clone(),
-                    msg_id: thread.presentation.last_message_id.clone(),
-                    sender_id: String::new(),
-                    sender_name: String::new(),
-                    text: String::new(),
-                    msg_type: String::new(),
-                    ts: 0,
-                    is_outgoing: false,
-                    raw_json: "{}".into(),
-                })?;
+                && self.is_deleted_identity(
+                    &thread.id,
+                    &thread.presentation.last_message_id,
+                    "",
+                    false,
+                    "",
+                )?;
             if removed || last_deleted {
                 thread.refresh_after_removal();
                 if thread.messages.is_empty() {
@@ -984,7 +1008,7 @@ impl MessageStore {
         threads: &mut Vec<Thread>,
         limit_per_thread: usize,
     ) -> Result<usize> {
-        self.hydrate_scoped(threads, limit_per_thread, true)
+        self.hydrate_scoped(threads, limit_per_thread, true, None)
     }
 
     /// Read history only for the requested threads, leaving unrelated histories unloaded.
@@ -995,7 +1019,20 @@ impl MessageStore {
         threads: &mut Vec<Thread>,
         limit_per_thread: usize,
     ) -> Result<usize> {
-        self.hydrate_scoped(threads, limit_per_thread, false)
+        self.hydrate_scoped(threads, limit_per_thread, false, None)
+    }
+
+    /// Read a refresh baseline from actual SQLite rows before merging server previews.
+    /// # Errors
+    /// Returns history errors; callers must discard partial marks on failure.
+    pub(crate) fn hydrate_refresh(
+        &self,
+        threads: &mut Vec<Thread>,
+        limit: usize,
+    ) -> Result<crate::chat::MessageFingerprints> {
+        let mut marks = crate::chat::MessageFingerprints::new();
+        self.hydrate_scoped(threads, limit, true, Some(&mut marks))?;
+        Ok(marks)
     }
 
     fn hydrate_scoped(
@@ -1003,6 +1040,7 @@ impl MessageStore {
         threads: &mut Vec<Thread>,
         limit_per_thread: usize,
         include_unlisted: bool,
+        mut marks: Option<&mut crate::chat::MessageFingerprints>,
     ) -> Result<usize> {
         self.filter_deleted(threads)?;
         crate::chat::deduplicate_threads(threads, None);
@@ -1158,6 +1196,11 @@ impl MessageStore {
                 }
                 if cm.text == "[Tin nhắn đã thu hồi]" {
                     cm.mark_recalled();
+                }
+                if let (Some(marks), Some(mark)) =
+                    (marks.as_deref_mut(), crate::chat::message_fingerprint(&cm))
+                {
+                    marks.insert((t.id.clone(), cm.id.clone()), mark);
                 }
                 if let Some(existing) = t
                     .messages
@@ -1402,6 +1445,159 @@ pub fn load_history_into_threads(
 mod tests {
     use super::*;
 
+    #[test]
+    fn refresh_baseline_excludes_unsaved_server_previews_and_preserves_thread_edits() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = |id: &str| ChatMessage {
+            id: id.into(),
+            text: id.into(),
+            ts: 1000,
+            ..Default::default()
+        };
+        let saved = Thread {
+            id: "thread".into(),
+            name: "Old name".into(),
+            messages: vec![message("stored")],
+            ..Default::default()
+        };
+        persist_threads(&mut store, &[saved]).unwrap();
+        let mut list = vec![Thread {
+            id: "thread".into(),
+            name: "New name".into(),
+            messages: vec![message("server-preview")],
+            ..Default::default()
+        }];
+        let baseline = store.hydrate_refresh(&mut list, 20).unwrap();
+        assert!(!baseline.contains_key(&("thread".into(), "server-preview".into())));
+        let changes = crate::chat::changed_since(&list, &baseline);
+        assert_eq!(changes[0].messages.len(), 1);
+        assert_eq!(changes[0].messages[0].id, "server-preview");
+        persist_threads(&mut store, &changes).unwrap();
+        assert_eq!(store.messages_for("thread", 20).unwrap().len(), 2);
+        assert_eq!(store.all_threads().unwrap()[0].name, "New name");
+        // A metadata-only refresh must still retain a renamed thread.
+        let baseline = store.hydrate_refresh(&mut list, 20).unwrap();
+        list[0].name = "Renamed again".into();
+        let changes = crate::chat::changed_since(&list, &baseline);
+        assert!(changes[0].messages.is_empty());
+        persist_threads(&mut store, &changes).unwrap();
+        assert_eq!(store.all_threads().unwrap()[0].name, "Renamed again");
+    }
+
+    #[test]
+    fn warm_refresh_writes_no_message_rows_but_keeps_metadata_and_real_deltas() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let source: Vec<_> = (0..100)
+            .map(|n| Thread {
+                id: format!("thread-{n}"),
+                name: format!("Name {n}"),
+                messages: (0..20)
+                    .map(|m| ChatMessage {
+                        id: format!("{m}"),
+                        text: format!("Message {m}"),
+                        sender: "Alice".into(),
+                        ts: 1_800_000_000_000 + m,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            })
+            .collect();
+        persist_threads(&mut store, &source).unwrap();
+        let mut loaded: Vec<_> = source
+            .iter()
+            .map(|t| Thread {
+                id: t.id.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let marks = store.hydrate_refresh(&mut loaded, 20).unwrap();
+        store.conn.execute_batch("CREATE TABLE refresh_writes(kind TEXT); CREATE TEMP TRIGGER refresh_updated AFTER UPDATE ON messages BEGIN INSERT INTO refresh_writes VALUES('update'); END; CREATE TEMP TRIGGER refresh_inserted AFTER INSERT ON messages BEGIN INSERT INTO refresh_writes VALUES('insert'); END;").unwrap();
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for _ in 0..5 {
+            let start = std::time::Instant::now();
+            persist_threads(&mut store, &loaded).unwrap();
+            before.push(start.elapsed().as_secs_f64() * 1000.0);
+            let writes: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM refresh_writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writes, 2000);
+            store
+                .conn
+                .execute("DELETE FROM refresh_writes", [])
+                .unwrap();
+            let start = std::time::Instant::now();
+            let changed = crate::chat::changed_since(&loaded, &marks);
+            assert!(changed.iter().all(|t| t.messages.is_empty()));
+            persist_threads(&mut store, &changed).unwrap();
+            after.push(start.elapsed().as_secs_f64() * 1000.0);
+            let writes: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM refresh_writes", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(writes, 0);
+        }
+        before.sort_by(f64::total_cmp);
+        after.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            serde_json::json!({"task":"warm_refresh_durable_writes", "environment":"Linux x86_64 debug SQLite memory", "messages":2000,"iterations":5,
+            "before":{"writes":2000,"min_ms":before[0],"avg_ms":before.iter().sum::<f64>()/5.0,"p50_ms":before[2],"p95_ms":before[4],"p99_ms":before[4]},
+            "after":{"writes":0,"min_ms":after[0],"avg_ms":after.iter().sum::<f64>()/5.0,"p50_ms":after[2],"p95_ms":after[4],"p99_ms":after[4]}})
+        );
+        loaded[0].name = "Renamed".into();
+        loaded[0].messages[0].mark_recalled();
+        let changed = crate::chat::changed_since(&loaded, &marks);
+        persist_threads(&mut store, &changed).unwrap();
+        let writes: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM refresh_writes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(writes, 1);
+        assert_eq!(
+            store.messages_for("thread-0", 20).unwrap()[0].text,
+            "[Tin nhắn đã thu hồi]"
+        );
+        assert!(store
+            .all_threads()
+            .unwrap()
+            .iter()
+            .any(|t| t.thread_id == "thread-0" && t.name == "Renamed"));
+    }
+    #[test]
+    fn unchanged_deleted_rows_leave_the_refreshed_view() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let message = ChatMessage {
+            id: "stored".into(),
+            text: "old".into(),
+            ts: 1000,
+            ..Default::default()
+        };
+        persist_threads(
+            &mut store,
+            &[Thread {
+                id: "thread".into(),
+                messages: vec![message.clone()],
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let mut list = vec![Thread {
+            id: "thread".into(),
+            ..Default::default()
+        }];
+        let baseline = store.hydrate_refresh(&mut list, 20).unwrap();
+        assert!(crate::chat::changed_since(&list, &baseline)[0]
+            .messages
+            .is_empty());
+        store.delete_chat_message("thread", &message).unwrap();
+        store.filter_deleted(&mut list).unwrap();
+        assert!(list[0].messages.is_empty());
+        persist_threads(&mut store, &crate::chat::changed_since(&list, &baseline)).unwrap();
+        assert!(store.messages_for("thread", 20).unwrap().is_empty());
+    }
     #[test]
     fn opening_one_thread_does_not_load_other_histories() {
         let store = MessageStore::open(":memory:").unwrap();
