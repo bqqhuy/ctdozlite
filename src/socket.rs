@@ -746,7 +746,7 @@ async fn run_once(
                     for (qcmd, qsub) in queues {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        let start = crate::queue_cursors::socket_start(sess, qcmd, qsub);
+                        let start = crate::queue_cursors::socket_start(sess, qcmd, qsub).await;
                         tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_frame(qcmd, qsub, &id, start.as_ref())))).await??;
                         catchups.register((qcmd,qsub),id.clone(),std::time::Instant::now(),start);
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));

@@ -570,6 +570,8 @@ pub(super) fn spawn_session_worker(
     });
 
     let refresh_in_flight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Serialize page receipt through durable cursor commit, not just the HTTP request.
+    let poll_delivery = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let mute_sync = MuteSync::default();
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -741,9 +743,7 @@ pub(super) fn spawn_session_worker(
                                                     ctx_ws.request_repaint();
                                                 }
                                                 // Like Zalo PC, a queue cursor advances only after its page is stored.
-                                                if stored {
-                                                    crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload);
-                                                }
+                                                crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload, stored).await;
                                             }
                                         }
                                         Ok(None) => {
@@ -1133,7 +1133,7 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::Logout => {
                             if let Some(task) = current_qr_task.take() { task.abort(); }
                             call_bridge.end_call();
-                            crate::queue_cursors::flush_all();
+                            crate::queue_cursors::flush_all().await;
                             let account = session.lock().await.account_key().to_owned();
                             if !account.is_empty() {
                                 let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&account)).await;
@@ -1415,6 +1415,7 @@ pub(super) fn spawn_session_worker(
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let known = known_threads.clone();
+                            let poll_delivery = poll_delivery.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
                                 let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into()};
@@ -1479,19 +1480,23 @@ pub(super) fn spawn_session_worker(
                                         &mut list,
                                         crate::store::MessageStore::PRELOAD_MSGS,
                                     );
-                                    let recent_result={
+                                    let Ok(_cycle) = poll_delivery.acquire_owned().await else { return; };
+                                    let (recent_result, processed_state, before_state)={
                                         let mut ps = poll_clone.lock().await;
                                         // Resume lp_chat where this account stopped (Zalo PC `init`).
                                         if *ps == crate::chat::PollState::default() {
-                                            if let Some(saved) = crate::queue_cursors::poll_start(&s) {
+                                            if let Some(saved) = crate::queue_cursors::poll_start(&s).await {
                                                 *ps = saved;
                                             }
                                         }
-                                        crate::chat::poll_new_messages(&s, &mut ps, &mut list).await
+                                        let before = ps.clone();
+                                        let result = crate::chat::poll_new_messages(&s, &mut ps, &mut list).await;
+                                        (result, ps.clone(), before)
                                     };
                                     if persist_received(&s, &mut list).await {
-                                        let state = poll_clone.lock().await.clone();
-                                        crate::queue_cursors::commit_poll(&s, &state);
+                                        crate::queue_cursors::commit_poll(&s, &processed_state).await;
+                                    } else {
+                                        *poll_clone.lock().await = before_state;
                                     }
                                     *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                     // Startup refreshes live/offline queues; historical backfill is explicit.
@@ -1516,10 +1521,19 @@ pub(super) fn spawn_session_worker(
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let poll_guard = PollGuard(is_polling.clone());
+                            let poll_delivery = poll_delivery.clone();
                             tokio::spawn(async move {
                                 let _poll_guard = poll_guard;
+                                let Ok(_cycle) = poll_delivery.acquire_owned().await else { return; };
                                 let s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
+                                    let before_state = {
+                                        let mut state = poll_clone.lock().await;
+                                        if *state == crate::chat::PollState::default() {
+                                            if let Some(saved) = crate::queue_cursors::poll_start(&s).await { *state = saved; }
+                                        }
+                                        state.clone()
+                                    };
                                     let mut temp_threads: Vec<Thread> = known_threads
                                         .into_iter()
                                         .map(|(id, name, is_group)| Thread {
@@ -1600,7 +1614,9 @@ pub(super) fn spawn_session_worker(
                                         }
                                         if stored {
                                             let state = poll_clone.lock().await.clone();
-                                            crate::queue_cursors::commit_poll(&s, &state);
+                                            crate::queue_cursors::commit_poll(&s, &state).await;
+                                        } else {
+                                            *poll_clone.lock().await = before_state;
                                         }
                                     }
                                 }
