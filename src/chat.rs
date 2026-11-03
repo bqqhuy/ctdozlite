@@ -1590,6 +1590,9 @@ pub(crate) fn next_client_message_id() -> u64 {
     now.max(previous.saturating_add(1))
 }
 
+/// Wait for the server to announce an uploaded file's processed URL.
+const ASYNC_FILE_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
     send_message_with_client_id(s, to_id, text, next_client_message_id()).await
@@ -1984,7 +1987,20 @@ pub(crate) async fn send_attachment_with_client_id(
     source.verify().await?;
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
     let file_id = pick_str(data_node, &["fileId", "clientFileId"]);
-    let file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
+    let mut file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
+    // Zalo processes the upload asynchronously and announces the CDN URL with a `file_done` /
+    // `video_done` control; Zalo PC sends `asyncfile/msg` only after receiving it.
+    if file_url.is_empty() {
+        if let Some(fid) = file_id.as_deref() {
+            match crate::upload_events::wait(fid, ASYNC_FILE_URL_WAIT).await {
+                Some(url) => file_url = url,
+                None => crate::logger::log_error(
+                    "asyncfile",
+                    "Processed file URL not announced in time; sending without it",
+                ),
+            }
+        }
+    }
 
     let send_resp = if let Some(fid) = file_id {
         let msg_ep = if is_group {

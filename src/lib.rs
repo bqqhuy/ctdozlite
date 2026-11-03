@@ -97,3 +97,6 @@ pub mod media_renew;
 mod transfer_diagnostics;
 
 mod queue_catchup;
+
+/// Correlates async file uploads with their processed-URL notifications.
+pub mod upload_events;

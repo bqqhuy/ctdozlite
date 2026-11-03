@@ -785,6 +785,9 @@ async fn run_once(
                     tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,pull.last,pull.ids)))).await??;
                     catchups.sent((cmd,sub_cmd),id,std::time::Instant::now());
                 }
+                if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL) {
+                    crate::upload_events::deliver(&payload);
+                }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL|CMD_SYNC_REQUEST|CMD_SYNC_DISPOSE|CMD_SYNC_WAKE) {
                     // Broadcast is bounded and never waits for phone decoding or disk writes.
                     let _=controls.send(WsEvent{cmd,sub_cmd,version,payload:payload.clone()});
