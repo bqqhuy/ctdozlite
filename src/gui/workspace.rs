@@ -116,6 +116,9 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let drop_blocked_at_start = self.file_drop_blocked(ctx);
+        let file_drag_active = self.attachment_drafts.has_deferred()
+            || ctx.input(|i| !i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty());
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
@@ -2560,13 +2563,14 @@ impl ZaloGuiApp {
                     }
 
                     // 2. Scrollable Messages Area
-                    let contextual_stickers = self.resolve_contextual_sticker_suggestions(ctx);
+                    let contextual_stickers = if self.attachment_drafts.len(&thread_id)>0 {Vec::new()} else {self.resolve_contextual_sticker_suggestions(ctx)};
                     let composer_link_preview = self.resolve_composer_link_preview(ctx);
                     // Do NOT subtract `contextual_stickers` height from `picker_reserve`!
                     // The sticker strip is a true floating overlay (`egui::Area`) above the composer bar
                     // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
                     // area and composer input box never shift or lose IME focus while typing.
-                    let picker_reserve = (if self.sticker_picker_open { 268.0 } else { 0.0 })
+                    let attachment_count = self.attachment_drafts.len(&thread_id);
+                    let picker_reserve = (if attachment_count > 0 {152.0} else {0.0}) + (if self.sticker_picker_open { 268.0 } else { 0.0 })
                         + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
                         + (if self.pending_clipboard_image.is_some() {
                             64.0
@@ -3228,6 +3232,9 @@ impl ZaloGuiApp {
                         self.request_clipboard_image();
                     }
                     if ctx.input(|i|i.events.iter().any(|e|matches!(e,egui::Event::Paste(_)))) {self.clipboard_text_only=false;}
+                    let compose_top = ui.cursor().top();
+                    let attachment_budget=(ui.available_height()-editor_height-64.0-if self.pending_clipboard_image.is_some(){64.0}else{0.0}).max(28.0);
+                    self.render_attachment_draft(ui, &thread_id, pal, attachment_budget);
                     if self.pending_clipboard_image.is_some() {
                         let mut clear_clip = false;
                         if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -3308,27 +3315,6 @@ impl ZaloGuiApp {
                         .inner_margin(Margin::symmetric(14.0, 10.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
                         .show(ui, |ui| {
-                            // Handle drag-and-drop files onto the chat window
-                            let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|i| {
-                                i.raw
-                                    .dropped_files
-                                    .iter()
-                                    .filter_map(|df| df.path.clone())
-                                    .collect()
-                            });
-                            for dpath in dropped {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                        to_id: thread_id.clone(),
-                                        is_group,
-                                        images_only: false,
-                                        caption: String::new(),
-                                        preset_path: Some(dpath),
-                                        photo_original: self.settings.send_photo_original,
-                                    });
-                                }
-                            }
-
                             egui::Frame::none()
                                 .fill(pal.bg_input)
                                 .rounding(Rounding::same(11.0))
@@ -3494,7 +3480,7 @@ impl ZaloGuiApp {
                                                 .font(FontId::proportional(14.0))
                                                 .id(composer_id)
                                                 .frame(false)
-                                                .hint_text(if input_w<110.0 {"Nhập tin…".into()}else if input_w<180.0 {"Nhập tin nhắn…".into()}else{format!(
+                                                .hint_text(if attachment_count>0 {"Nhập chú thích cho tệp…".into()}else if input_w<110.0 {"Nhập tin…".into()}else if input_w<180.0 {"Nhập tin nhắn…".into()}else{format!(
                                                     "Nhập tin nhắn tới {}...",
                                                     truncate_chars(&thread_name, 16)
                                                 )})
@@ -3514,7 +3500,8 @@ impl ZaloGuiApp {
                                             .inner;
                                         let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
                                         let response = output.response;
-                                        self.mention_suggestions(ui, &thread_id, cursor, &response, &mut enter_send, ime_blocks_enter);
+                                        if !file_drag_active {self.mention_suggestions(ui, &thread_id, cursor, &response, &mut enter_send, ime_blocks_enter);}
+                                        else {enter_send=false;}
                                         if self.composer_focus_pending {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
@@ -3614,7 +3601,7 @@ impl ZaloGuiApp {
                                         }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
                                         let can_send = !self.input_message.trim().is_empty()
-                                            || self.pending_clipboard_image.is_some();
+                                            || self.pending_clipboard_image.is_some() || self.attachment_drafts.len(&thread_id)>0;
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
@@ -3684,7 +3671,12 @@ impl ZaloGuiApp {
                                             })
                                             .clicked();
 
-                                        if send_selected_sticker.is_some() && !self.composer_mentions.mentions.is_empty() {
+                                        if (send_clicked || enter_pressed) && self.attachment_drafts.len(&thread_id) > 0 {
+                                            self.send_attachment_draft(ctx,&thread_id,is_group);
+                                            response.request_focus();
+                                        } else if send_selected_sticker.is_some() && attachment_count > 0 {
+                                            self.status_msg="Hãy gửi hoặc bỏ tệp chờ trước khi gửi nhãn dán".into();
+                                        } else if send_selected_sticker.is_some() && !self.composer_mentions.mentions.is_empty() {
                                             self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi nhãn dán".into();
                                         } else if let Some(chosen) = send_selected_sticker {
                                             self.input_message.clear();
@@ -3762,8 +3754,12 @@ impl ZaloGuiApp {
                                 });
                         });
 
+                    let mut compose_drop_rect = composer_frame.response.rect;
+                    compose_drop_rect.min.y = compose_top;
+                    self.handle_file_drop(ctx, &thread_id, is_group, message_scroll.inner_rect, compose_drop_rect, drop_blocked_at_start, pal);
+
                     // 4b. Floating Contextual Sticker Suggestion Popover (`egui::Area`, rendered AFTER composer bar)
-                    if !contextual_stickers.is_empty() && !self.sticker_picker_open {
+                    if !file_drag_active && !contextual_stickers.is_empty() && !self.sticker_picker_open {
                         self.render_contextual_sticker_popover(
                             ctx,
                             composer_frame.response.rect,
@@ -3774,7 +3770,7 @@ impl ZaloGuiApp {
                         );
                     }
                     if let Some(ref link_meta) = composer_link_preview {
-                        if contextual_stickers.is_empty() && !self.sticker_picker_open {
+                        if !file_drag_active && contextual_stickers.is_empty() && !self.sticker_picker_open {
                             self.render_composer_link_preview_popover(
                                 ctx,
                                 composer_frame.response.rect,

@@ -1,6 +1,16 @@
 use super::*;
 
 pub enum WorkerCmd {
+    PrepareDroppedFile {
+        owner: String,
+        thread: String,
+        id: u64,
+        path: std::path::PathBuf,
+    },
+    SendDroppedFiles {
+        owner: String,
+        batch: super::file_drop::Batch,
+    },
     CopyViewerImage {
         owner: String,
         context: ChatImage,
@@ -2091,60 +2101,36 @@ pub(super) fn spawn_session_worker(
                                 }
                             });
                         }
-                        WorkerCmd::PickAndSendAttachment {
-                            to_id,
-                            is_group,
-                            images_only,
-                            caption,
-                            preset_path,
-                            photo_original,
-                        } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
+                        WorkerCmd::PrepareDroppedFile {owner,thread,id,path} => {
+                            let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();
+                            static PREVIEW_QUEUE:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(64);
+                            let Ok(queued)=PREVIEW_QUEUE.try_acquire() else {
+                                let _=events.send(GuiEvent::DroppedFilePrepared {owner,thread,id,result:Err("Danh sách xử lý đang đầy; bỏ tệp và thả lại để thử".into())});ctx.request_repaint();continue;
+                            };
                             tokio::spawn(async move {
-                                let paths = if let Some(path) = preset_path { vec![path] } else {
-                                    tokio::task::spawn_blocking(move || super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default()
+                                let _queued=queued;
+                                static PREVIEWS:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(2);
+                                let result=async {
+                                    anyhow::ensure!(s.is_active() && s.account_key()==owner,"Tài khoản đã thay đổi");
+                                    let _permit=PREVIEWS.acquire().await?;
+                                    anyhow::ensure!(s.is_active(),"Tài khoản đã thay đổi");
+                                    super::file_drop::prepare(path).await
+                                }.await.map_err(|_|"Không đọc được tệp; hãy bỏ tệp và thả lại để thử".to_owned());
+                                let _=events.send(GuiEvent::DroppedFilePrepared {owner,thread,id,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SendDroppedFiles {owner,batch} => {
+                            let s=session.lock().await.clone();
+                            if !s.is_active() || s.account_key()!=owner || batch.files.len()>16 {continue;}
+                            tokio::spawn(send_attachment_batch(s,batch,gui_tx.clone(),egui_ctx.clone()));
+                        }
+                        WorkerCmd::PickAndSendAttachment {to_id,is_group,images_only,caption,preset_path,photo_original} => {
+                            let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let paths=if let Some(path)=preset_path {vec![path]} else {
+                                    tokio::task::spawn_blocking(move||super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default()
                                 };
-                                let s = session_clone.lock().await.clone();
-                                let owner = s.account_key().to_owned();
-                                static ATTACHMENT_QUEUE:std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>>=std::sync::OnceLock::new();
-                                let attachment_queue=ATTACHMENT_QUEUE.get_or_init(||std::sync::Arc::new(tokio::sync::Semaphore::new(16)));
-                                for path in paths {
-                                    let Ok(queued)=attachment_queue.clone().acquire_owned().await else{break;};
-                                    if !s.is_active(){break;}
-                                    let original_path = path.clone();
-                                    let copy_dir = crate::photo_quality::outgoing_dir(s.account_key());
-                                    let hd_copy = if photo_original { None } else {
-                                        tokio::task::spawn_blocking(move || crate::photo_quality::reduce(&original_path, &copy_dir))
-                                            .await.ok().and_then(|r| r.inspect_err(|e| crate::logger::log_error("photo_quality", &e.to_string())).ok()).flatten()
-                                    };
-                                    let hd_source = match &hd_copy {
-                                        Some(_) => Some(crate::outgoing::HdSource { stamp: crate::outgoing::FileStamp::read(&path).await.ok(), path: path.clone() }),
-                                        None => None,
-                                    };
-                                    let path = hd_copy.clone().unwrap_or(path);
-                                    let stamp = crate::outgoing::FileStamp::read(&path).await.ok();
-                                    let mut message = crate::outgoing::pending(format!("[Tệp] {}", path.file_name().unwrap_or_default().to_string_lossy()), is_group,
-                                        crate::outgoing::Payload::Attachment { path, caption: caption.clone(), stamp, hd_source });
-                                    let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
-                                    persist_outgoing(&s, &to_id, &message).await;
-                                    let _ = gui_tx_clone.send(GuiEvent::OutgoingState { owner: owner.clone(), thread_id: to_id.clone(), message: message.clone() });
-                                    ctx_clone.request_repaint();
-                                    let s = s.clone();
-                                    let owner = owner.clone();
-                                    let tx = gui_tx_clone.clone(); let ctx = ctx_clone.clone(); let thread_id = to_id.clone();
-                                    tokio::spawn(async move {
-                                        let _queued=queued;
-                                        match crate::outgoing::send(&s, &thread_id, &message).await {
-                                            Ok(sent) => message = sent,
-                                            Err(error) => { message.delivery = crate::message_model::DeliveryState::Failed; if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); } }
-                                        }
-                                        persist_outgoing(&s, &thread_id, &message).await;
-                                        drop(active);
-                                        let _ = tx.send(GuiEvent::OutgoingState { owner, thread_id, message }); ctx.request_repaint();
-                                    });
-                                }
+                                send_attachment_batch(s,super::file_drop::Batch {thread:to_id,group:is_group,caption,original:photo_original,files:paths.into_iter().map(|p|(p,None)).collect()},events,ctx).await;
                             });
                         }
                         WorkerCmd::StartCall {
@@ -3277,5 +3263,125 @@ mod mentioned_outgoing_tests {
         };
         assert_eq!(*mentions, draft.mentions);
         assert_eq!(quoted.as_ref().unwrap().text, "quoted");
+    }
+}
+
+/// Shared bounded upload path; the session is captured before any picker/preview await.
+async fn send_attachment_batch(
+    s: Session,
+    batch: super::file_drop::Batch,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+) {
+    let owner = s.account_key().to_owned();
+    static ATTACHMENT_QUEUE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    let attachment_queue =
+        ATTACHMENT_QUEUE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(16)));
+    for (path, expected_stamp) in batch.files {
+        let Ok(queued) = attachment_queue.clone().acquire_owned().await else {
+            break;
+        };
+        if !s.is_active() {
+            break;
+        }
+        let current_stamp = crate::outgoing::FileStamp::read(&path).await.ok();
+        let invalid_source = current_stamp.is_none();
+        let source_stamp = expected_stamp.clone().or_else(|| current_stamp.clone());
+        let original_path = path.clone();
+        let copy_dir = crate::photo_quality::outgoing_dir(s.account_key());
+        let mut hd_copy = if invalid_source
+            || batch.original
+            || expected_stamp
+                .as_ref()
+                .is_some_and(|expected| Some(expected) != current_stamp.as_ref())
+        {
+            None
+        } else {
+            tokio::task::spawn_blocking(move || {
+                crate::photo_quality::reduce(&original_path, &copy_dir)
+            })
+            .await
+            .ok()
+            .and_then(|r| {
+                r.inspect_err(|e| crate::logger::log_error("photo_quality", &e.to_string()))
+                    .ok()
+            })
+            .flatten()
+        };
+        if hd_copy.is_some() && source_stamp != crate::outgoing::FileStamp::read(&path).await.ok() {
+            if let Some(copy) = hd_copy.take() {
+                // Best-effort cleanup of a copy made while its source was being modified.
+                let _ = tokio::fs::remove_file(copy).await;
+            }
+        }
+        let hd_source = hd_copy.as_ref().map(|_| crate::outgoing::HdSource {
+            stamp: expected_stamp.clone().or_else(|| current_stamp.clone()),
+            path: path.clone(),
+        });
+        let path = hd_copy.clone().unwrap_or(path);
+        let stamp = if hd_copy.is_none() {
+            expected_stamp.or(current_stamp)
+        } else {
+            crate::outgoing::FileStamp::read(&path).await.ok()
+        };
+        let mut message = crate::outgoing::pending(
+            format!(
+                "[Tệp] {}",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            ),
+            batch.group,
+            crate::outgoing::Payload::Attachment {
+                path,
+                caption: batch.caption.clone(),
+                stamp,
+                hd_source,
+            },
+        );
+        if invalid_source {
+            message.delivery = crate::message_model::DeliveryState::Failed;
+            if let Some(job) = message.outgoing_job.as_mut() {
+                job.error = "Không đọc được tệp thường; thư mục không được hỗ trợ".into();
+            }
+        }
+        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+            continue;
+        };
+        persist_outgoing(&s, &batch.thread, &message).await;
+        let _ = events.send(GuiEvent::OutgoingState {
+            owner: owner.clone(),
+            thread_id: batch.thread.clone(),
+            message: message.clone(),
+        });
+        ctx.request_repaint();
+        if invalid_source {
+            drop(active);
+            continue;
+        }
+        let s = s.clone();
+        let owner = owner.clone();
+        let tx = events.clone();
+        let ctx = ctx.clone();
+        let thread_id = batch.thread.clone();
+        tokio::spawn(async move {
+            let _queued = queued;
+            match crate::outgoing::send(&s, &thread_id, &message).await {
+                Ok(sent) => message = sent,
+                Err(error) => {
+                    message.delivery = crate::message_model::DeliveryState::Failed;
+                    if let Some(job) = message.outgoing_job.as_mut() {
+                        job.error = crate::outgoing::failure_message(&error);
+                    }
+                }
+            }
+            persist_outgoing(&s, &thread_id, &message).await;
+            drop(active);
+            let _ = tx.send(GuiEvent::OutgoingState {
+                owner,
+                thread_id,
+                message,
+            });
+            ctx.request_repaint();
+        });
     }
 }

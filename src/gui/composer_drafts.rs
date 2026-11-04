@@ -81,6 +81,7 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn discard_deleted_conversation_draft(&mut self, owner: &str, thread: &str) {
+        self.attachment_drafts.remove_thread(owner, thread);
         let draft = &mut self.composer_draft;
         if draft.owner == owner && draft.thread == thread {
             self.input_message.clear();

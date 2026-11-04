@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.005-arm — Windows 11 ARM64 — 04/11/2026
+
+Thay đổi so với [v0.004-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.004-arm).
+
+- Kéo thả tệp: thả vào lịch sử chat để gửi ngay; thả vào compose để xem lại danh sách, thumbnail ảnh, bỏ tệp và thêm chú thích trước khi gửi.
+- Phân vùng theo vị trí con trỏ/DPI; không gửi khi thả ngoài chat/compose hoặc đang mở modal/menu.
+- Tệp chờ tách theo tài khoản/hội thoại, chỉ giữ trong phiên làm việc; kiểm tra tệp gốc thay đổi trước upload.
+
 ## v0.004-arm — Windows 11 ARM64 — 04/11/2026
 
 Thay đổi so với [v0.003-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.003-arm).

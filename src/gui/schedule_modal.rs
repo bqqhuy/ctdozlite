@@ -63,6 +63,14 @@ impl Draft {
 }
 impl ZaloGuiApp {
     pub(super) fn open_quick_schedule(&mut self) {
+        if self
+            .threads
+            .get(self.selected_thread_index)
+            .is_some_and(|t| self.attachment_drafts.len(&t.id) > 0)
+        {
+            self.status_msg = "Chưa hỗ trợ hẹn giờ tệp chờ; hãy gửi trực tiếp".into();
+            return;
+        }
         self.composer_mentions.edit(&self.input_message);
         if !self.composer_mentions.mentions.is_empty() {
             self.status_msg = "Chưa hỗ trợ hẹn giờ tin có mention; hãy gửi trực tiếp".into();

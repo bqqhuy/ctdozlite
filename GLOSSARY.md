@@ -33,6 +33,7 @@ Ubiquitous language for `ctdozlite`. Use these terms verbatim in issues, ADRs, t
 | **Local message ID** | Client-generated ID used to reconcile optimistic UI rows with server echoes. | "temp id" |
 | **Recall** | Server-side removal of a message for all participants. | "delete" (that is local-only) |
 | **Composer draft** | Unsent literal editor text and explicitly selected mention identities, persisted atomically per account database and thread. | "outbox" |
+| **Attachment draft** | In-memory local files staged for review before send, scoped by account/thread; distinct from persisted composer text. | "upload queue" |
 | **Mention** | An explicitly selected recipient UID with a UTF-16 position/length in a group message; plain `@name` text does not establish identity. | "name match" |
 | **Delete replay marker** | Content-free message identity retained to reject re-import of a delete-for-me row. | "soft delete" |
 | **Queue cursor** | Server action ID plus boundary IDs used to request the next page of a message queue. | "phone sync checkpoint" |

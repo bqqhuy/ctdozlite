@@ -24,6 +24,7 @@ use crate::session::Session;
 mod composer_drafts;
 mod contacts;
 mod download_panel;
+mod file_drop;
 mod mention_composer;
 mod messages;
 mod modals;
@@ -69,6 +70,12 @@ pub enum GuiEvent {
     Receipts {
         owner: String,
         changed: Vec<(String, String, crate::message_model::DeliveryState)>,
+    },
+    DroppedFilePrepared {
+        owner: String,
+        thread: String,
+        id: u64,
+        result: Result<file_drop::Prepared, String>,
     },
     ComposerDraftLoaded {
         owner: String,
@@ -535,6 +542,9 @@ pub struct ZaloGuiApp {
     input_message: String,
     composer_draft: composer_drafts::ComposerDraft,
     composer_mentions: crate::mentions::Draft,
+    attachment_drafts: file_drop::Drafts,
+    #[cfg(windows)]
+    native_hwnd: Option<isize>,
     deleted_message_ids: HashSet<(String, String)>,
     status_msg: String,
 
@@ -665,6 +675,7 @@ impl ZaloGuiApp {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(handle) = cc.window_handle() {
                 if let RawWindowHandle::Win32(window) = handle.as_raw() {
+                    app.native_hwnd = Some(window.hwnd.get());
                     match crate::tray::Tray::new(cc.egui_ctx.clone(), window.hwnd.get()) {
                         Ok(tray) => app.tray = Some(tray),
                         Err(e) => {
@@ -788,6 +799,9 @@ impl ZaloGuiApp {
             input_message: String::new(),
             composer_draft: Default::default(),
             composer_mentions: Default::default(),
+            attachment_drafts: Default::default(),
+            #[cfg(windows)]
+            native_hwnd: None,
             deleted_message_ids: HashSet::new(),
             replying_to: None,
             forward_msg: None,
@@ -1473,6 +1487,17 @@ impl ZaloGuiApp {
                 event => event,
             };
             match event {
+                GuiEvent::DroppedFilePrepared {
+                    owner,
+                    thread,
+                    id,
+                    result,
+                } => {
+                    if self.is_logged_in && owner == self.user_uin {
+                        self.attachment_drafts
+                            .complete(ctx, &owner, &thread, id, result);
+                    }
+                }
                 GuiEvent::ComposerDraftLoaded {
                     owner,
                     thread,
@@ -2959,8 +2984,18 @@ impl eframe::App for ZaloGuiApp {
             self.theme_dirty = false;
         }
 
+        self.attachment_drafts.sync_owner(if self.is_logged_in {
+            &self.user_uin
+        } else {
+            ""
+        });
         self.sync_composer_draft(ctx);
         self.check_events(ctx);
+        self.attachment_drafts.sync_owner(if self.is_logged_in {
+            &self.user_uin
+        } else {
+            ""
+        });
         self.sync_composer_draft(ctx);
         if self.is_logged_in && self.tools.loaded_for != self.user_uin && self.smoke.is_none() {
             self.tools = tools_panel::ToolsPanel {
