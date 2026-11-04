@@ -5,6 +5,9 @@ Xem thêm quy ước tại [ADR 0003 — Chính sách Changelog & Release Notes]
 
 ## [Unreleased]
 
+### Fixed
+- **Clipboard Windows:** nhận thêm `CF_DIBV5`, giới hạn kích thước trước khi cấp phát và giải mã đúng bit mask màu/alpha của DIB 24/32-bit; nhả clipboard trước khi chuyển pixel.
+
 ## [0.0.7] - 2026-11-03
 
 ### Fixed (Sửa lỗi & Tinh chỉnh giao diện)

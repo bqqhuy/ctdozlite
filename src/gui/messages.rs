@@ -551,6 +551,7 @@ pub(super) fn read_clipboard_image_to_png(
     #[cfg(target_os = "windows")]
     {
         const CF_DIB: u32 = 8;
+        const CF_DIBV5: u32 = 17;
         const CF_HDROP: u32 = 15;
         #[link(name = "user32")]
         extern "system" {
@@ -576,12 +577,14 @@ pub(super) fn read_clipboard_image_to_png(
             ) -> u32;
         }
 
+        // SAFETY: clipboard handles are inspected and released on this thread; locked data is copied before release.
         unsafe {
             let cf_png = RegisterClipboardFormatA(b"PNG\0".as_ptr());
             let cf_mime_png = RegisterClipboardFormatA(b"image/png\0".as_ptr());
             let has_png = cf_png != 0 && IsClipboardFormatAvailable(cf_png) != 0;
             let has_mime_png = cf_mime_png != 0 && IsClipboardFormatAvailable(cf_mime_png) != 0;
-            let has_dib = IsClipboardFormatAvailable(CF_DIB) != 0;
+            let has_dib = IsClipboardFormatAvailable(CF_DIB) != 0
+                || IsClipboardFormatAvailable(CF_DIBV5) != 0;
             let has_hdrop = IsClipboardFormatAvailable(CF_HDROP) != 0;
 
             if !has_png && !has_mime_png && !has_dib && !has_hdrop {
@@ -652,84 +655,34 @@ pub(super) fn read_clipboard_image_to_png(
                 }
             }
 
-            // 3. Fallback to CF_DIB (24-bit BGR or 32-bit BGRA/BGRX, BI_RGB or BI_BITFIELDS)
-            if has_dib {
-                let hmem = GetClipboardData(CF_DIB);
-                if !hmem.is_null() {
-                    let ptr = GlobalLock(hmem);
-                    let len = GlobalSize(hmem);
-                    if !ptr.is_null() && len >= 40 {
-                        let slice = std::slice::from_raw_parts(ptr, len);
-                        let bi_size =
-                            u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as usize;
-                        let width_i = i32::from_le_bytes([slice[4], slice[5], slice[6], slice[7]]);
-                        let height_i =
-                            i32::from_le_bytes([slice[8], slice[9], slice[10], slice[11]]);
-                        let bit_count = u16::from_le_bytes([slice[14], slice[15]]);
-                        let compression =
-                            u32::from_le_bytes([slice[16], slice[17], slice[18], slice[19]]);
-
-                        if width_i > 0
-                            && height_i != 0
-                            && (bit_count == 24 || bit_count == 32)
-                            && bi_size >= 40
-                            && bi_size <= slice.len()
-                        {
-                            let width = width_i as u32;
-                            let top_down = height_i < 0;
-                            let height = height_i.unsigned_abs();
-                            let mut offset = bi_size;
-                            if (compression == 3 || compression == 6) && bi_size == 40 {
-                                offset += if compression == 6 { 16 } else { 12 };
-                            }
-                            let bytes_per_px = (bit_count / 8) as usize;
-                            let row_stride = (width as usize * bytes_per_px + 3) & !3;
-                            let needed =
-                                offset.saturating_add(row_stride.saturating_mul(height as usize));
-                            if needed <= slice.len() {
-                                let mut rgba = image::RgbaImage::new(width, height);
-                                let mut any_nonzero_alpha = false;
-                                if bytes_per_px == 4 {
-                                    for y in 0..height {
-                                        let src_y =
-                                            if top_down { y } else { height - 1 - y } as usize;
-                                        let row = &slice[offset + src_y * row_stride..];
-                                        for x in 0..width {
-                                            if row[x as usize * 4 + 3] != 0 {
-                                                any_nonzero_alpha = true;
-                                                break;
-                                            }
-                                        }
-                                        if any_nonzero_alpha {
-                                            break;
-                                        }
-                                    }
-                                }
-                                for y in 0..height {
-                                    let src_y = if top_down { y } else { height - 1 - y } as usize;
-                                    let row = &slice[offset + src_y * row_stride..];
-                                    for x in 0..width {
-                                        let p = x as usize * bytes_per_px;
-                                        let b = row[p];
-                                        let g = row[p + 1];
-                                        let r = row[p + 2];
-                                        let a = if bytes_per_px == 4 && any_nonzero_alpha {
-                                            row[p + 3]
-                                        } else {
-                                            255
-                                        };
-                                        rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
-                                    }
-                                }
-                                GlobalUnlock(hmem);
-                                CloseClipboard();
-                                return finalize_clipboard_rgba_image(rgba);
-                            }
-                        }
-                    }
-                    if !ptr.is_null() {
-                        GlobalUnlock(hmem);
-                    }
+            // Validate while borrowed, then release handles before pixel decoding.
+            for format in [CF_DIBV5, CF_DIB] {
+                if IsClipboardFormatAvailable(format) == 0 {
+                    continue;
+                }
+                let handle = GetClipboardData(format);
+                if handle.is_null() {
+                    continue;
+                }
+                let len = GlobalSize(handle);
+                if !(40..=crate::clipboard_dib::MAX_RAW).contains(&len) {
+                    continue;
+                }
+                let ptr = GlobalLock(handle);
+                if ptr.is_null() {
+                    continue;
+                }
+                // SAFETY: GlobalSize bounds this locked allocation; no borrowed data escapes.
+                let borrowed = std::slice::from_raw_parts(ptr, len);
+                let owned = crate::clipboard_dib::validate_dib(borrowed)
+                    .ok()
+                    .map(|_| borrowed.to_vec());
+                GlobalUnlock(handle);
+                if let Some(bytes) = owned {
+                    CloseClipboard();
+                    return crate::clipboard_dib::decode_dib(&bytes)
+                        .ok()
+                        .and_then(finalize_clipboard_rgba_image);
                 }
             }
 
