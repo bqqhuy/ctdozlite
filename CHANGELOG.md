@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.003-arm — Windows 11 ARM64 — 04/11/2026
+
+Thay đổi so với [v0.002-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.002-arm).
+
+### Giao diện và thông báo
+
+- Sửa theme sáng: không kế thừa chữ trắng của theme dark phẳng; đồng bộ màu
+  selection, link, lỗi và cảnh báo theo giao diện đang chọn.
+- GUI release không tạo cửa sổ Terminal phụ khi mở từ desktop. CLI chủ động dùng
+  lại terminal cha.
+- Popup thông báo hiển thị 10 giây; giữ khi rê chuột và khởi động lại thời gian
+  đọc khi thay thông báo.
+- Thêm dấu @ riêng cho mention chưa đọc, nhãn preview đúng tin và nhảy tới tin
+  mention trong lịch sử cục bộ. Mở hội thoại không xóa dấu của mention chưa thấy.
+
+### Ảnh, video, clipboard và tệp
+
+- Video thêm thanh tiến độ, thời gian hiện tại/tổng, rê chuột xem mốc tua, click/kéo
+  để tua; giữ trạng thái play/pause sau kéo, có mute và bố cục theo DPI.
+- Gallery ảnh/video có điều hướng trước/sau từ SQLite, zoom/fit/1:1, lưu tệp và
+  sao chép ảnh đang xem. Dùng thumbnail sẵn có khi bản xem lớn hơn đang tải.
+- Thumbnail giữ tỷ lệ, bo góc và tránh phóng ảnh nhỏ. Hiển thị album khi có
+  metadata nhóm ảnh rõ ràng; không gom các ảnh độc lập chỉ vì gửi gần nhau.
+- Clipboard Excel hỗ trợ ảnh PNG/DIB và EMF dự phòng; preview trước khi gửi,
+  phục hồi văn bản nếu đọc ảnh lỗi. Ctrl+Shift+V/menu dán chữ; áp dụng lựa chọn
+  image/text/ask và ràng buộc kết quả theo tài khoản/hội thoại.
+- Tệp đính kèm có Mở qua cache và Lưu thành riêng. Cache theo tài khoản và định
+  danh tin/tệp, chống tải trùng, dọn bản cũ và bảo vệ tệp đang tải.
+
+### Phiên bản và cập nhật
+
+- Updater kiểm tra release fork `bqqhuy/ctdozlite`, hiểu nhãn `v0.NNN-arm` và tag
+  semver cũ; giữ checksum và xác minh kiến trúc ARM64.
+- Nhãn sản phẩm là `v0.003-arm`; phiên bản số Cargo/file là `0.0.4`, manifest
+  `0.0.4.0`. Tên artifact theo nhãn sản phẩm; buildinfo ghi cả hai.
+- Từ v0.002-arm cần tải/cài bản mới thủ công một lần vì updater cũ chưa đọc được
+  nhãn tùy chỉnh.
+
+Video vẫn tải xong trước khi phát và dùng cửa sổ MFPlay riêng; đóng player để
+quay về gallery. Không đổi schema hoặc giao thức đồng bộ điện thoại/server.
+Kiểm tra tự động không thay thế thử Excel, media và thiết bị ngoại vi trên máy
+người dùng. Xem [checklist native](docs/V0_003_ARM.md).
+
 ## v0.002-arm — Windows 11 ARM64 — 04/11/2026
 
 Tổng hợp thay đổi so với bản phát hành đầu tiên của upstream:
