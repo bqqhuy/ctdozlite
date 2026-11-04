@@ -3975,6 +3975,8 @@ mod v003_viewer_tests {
                     }
                 }
                 for label in [
+                    "Trước",
+                    "Tiếp",
                     "Lưu thành…",
                     "Sao chép ảnh",
                     "Sao chép link",
