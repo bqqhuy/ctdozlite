@@ -7,7 +7,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Once,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use windows::{
     core::{w, PCWSTR, PROPVARIANT},
@@ -25,6 +25,13 @@ thread_local! {
     static ROOT:Cell<HWND>=const{Cell::new(HWND(0))};
     static SURFACE:Cell<HWND>=const{Cell::new(HWND(0))};
     static FULL:Cell<bool>=const{Cell::new(false)};
+    static DRAG:Cell<bool>=const{Cell::new(false)};
+    static RESUME:Cell<bool>=const{Cell::new(false)};
+    static TARGET:Cell<i64>=const{Cell::new(0)};
+    static VOLUME:Cell<f32>=const{Cell::new(1.0)};
+    static FONT:Cell<HFONT>=const{Cell::new(HFONT(0))};
+    static FONT_DPI:Cell<i32>=const{Cell::new(0)};
+
 }
 struct Runtime;
 impl Runtime {
@@ -72,28 +79,219 @@ unsafe fn seek(delta: i64) {
         }
     }
 }
+#[link(name = "user32")]
+extern "system" {
+    fn SetCapture(hwnd: HWND) -> HWND;
+    fn ReleaseCapture() -> BOOL;
+    fn SetFocus(hwnd: HWND) -> HWND;
+}
+unsafe fn dpi(hwnd: HWND) -> i32 {
+    windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32
+}
+unsafe fn timeline(hwnd: HWND) -> RECT {
+    let mut r = RECT::default();
+    let _ = GetClientRect(hwnd, &mut r);
+    let unit = dpi(hwnd) as f32 / 96.0;
+    RECT {
+        left: (16.0 * unit) as i32,
+        right: (r.right - (16.0 * unit) as i32).max(17),
+        top: r.bottom - (94.0 * unit) as i32,
+        bottom: r.bottom - (72.0 * unit) as i32,
+    }
+}
+unsafe fn position() -> (i64, i64) {
+    player()
+        .map(|p| {
+            (
+                p.GetPosition(&MFP_POSITIONTYPE_100NS)
+                    .ok()
+                    .and_then(|v| i64::try_from(&v).ok())
+                    .unwrap_or(0),
+                p.GetDuration(&MFP_POSITIONTYPE_100NS)
+                    .ok()
+                    .and_then(|v| i64::try_from(&v).ok())
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or_default()
+}
+fn time_label(ticks: i64) -> String {
+    let seconds = ticks.max(0) / 10_000_000;
+    if seconds >= 3600 {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            seconds / 60 % 60,
+            seconds % 60
+        )
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+unsafe fn target_at(hwnd: HWND, x: i32) -> i64 {
+    let r = timeline(hwnd);
+    let (_, duration) = position();
+    ((x - r.left).clamp(0, (r.right - r.left).max(1)) as f64 / (r.right - r.left).max(1) as f64
+        * duration.max(0) as f64) as i64
+}
+unsafe fn set_label(hwnd: HWND, id: i32, label: &str) {
+    let text: Vec<u16> = label.encode_utf16().chain(Some(0)).collect();
+    let _ = SetWindowTextW(GetDlgItem(hwnd, id), PCWSTR(text.as_ptr()));
+}
 unsafe fn layout(hwnd: HWND) {
     let mut r = RECT::default();
     let _ = GetClientRect(hwnd, &mut r);
+    let window_dpi = dpi(hwnd);
+    let unit = window_dpi as f32 / 96.0;
+    if FONT_DPI.with(Cell::get) != window_dpi {
+        let mut spec = LOGFONTW {
+            lfHeight: -(14 * window_dpi / 96),
+            lfWeight: 400,
+            ..Default::default()
+        };
+        for (out, ch) in spec.lfFaceName.iter_mut().zip("Segoe UI".encode_utf16()) {
+            *out = ch;
+        }
+        let font = CreateFontIndirectW(&spec);
+        if font.0 != 0 {
+            for id in 1..=8 {
+                let _ = SendMessageW(
+                    GetDlgItem(hwnd, id),
+                    WM_SETFONT,
+                    WPARAM(font.0 as usize),
+                    LPARAM(1),
+                );
+            }
+            let old = FONT.with(|f| f.replace(font));
+            if old.0 != 0 {
+                DeleteObject(old);
+            }
+            FONT_DPI.with(|d| d.set(window_dpi));
+        }
+    }
     let video = SURFACE.with(Cell::get);
     if video.0 != 0 {
-        let _ = MoveWindow(video, 0, 0, r.right, (r.bottom - 56).max(1), true);
+        let _ = MoveWindow(
+            video,
+            0,
+            0,
+            r.right,
+            (r.bottom - (108.0 * unit) as i32).max(1),
+            true,
+        );
     }
-    let widths = [130, 90, 90, 85, 85, 135];
-    let mut x = 8;
-    for (index, width) in widths.into_iter().enumerate() {
-        let button = GetDlgItem(hwnd, index as i32 + 1);
+    let width = ((r.right - 16).max(7) / 7 - 4).max(1);
+    for index in 0..7 {
+        let button = GetDlgItem(hwnd, index + 1);
         if button.0 != 0 {
-            let _ = MoveWindow(button, x, (r.bottom - 46).max(0), width, 32, true);
+            let _ = MoveWindow(
+                button,
+                8 + index * (width + 4),
+                r.bottom - (38.0 * unit) as i32,
+                width,
+                (30.0 * unit) as i32,
+                true,
+            );
         }
-        x += width + 6;
     }
+    let _ = MoveWindow(
+        GetDlgItem(hwnd, 8),
+        16,
+        r.bottom - (69.0 * unit) as i32,
+        (r.right - 32).max(1),
+        (25.0 * unit) as i32,
+        true,
+    );
     if let Some(p) = player() {
         let _ = p.UpdateVideo();
     }
 }
+unsafe fn refresh_controls(hwnd: HWND) {
+    let (at, duration) = position();
+    let playing = player().is_some_and(|p| {
+        p.GetState()
+            .is_ok_and(|s| s == MFP_MEDIAPLAYER_STATE_PLAYING)
+    });
+    set_label(hwnd, 1, if playing { "Tạm dừng" } else { "Phát" });
+    let volume = player().and_then(|p| p.GetVolume().ok()).unwrap_or(0.0);
+    set_label(
+        hwnd,
+        7,
+        if volume <= 0.001 {
+            "Bật tiếng"
+        } else {
+            "Tắt tiếng"
+        },
+    );
+    let mut pointer = POINT::default();
+    let _ = GetCursorPos(&mut pointer);
+    let _ = ScreenToClient(hwnd, &mut pointer);
+    let r = timeline(hwnd);
+    let hover =
+        pointer.x >= r.left && pointer.x <= r.right && pointer.y >= r.top && pointer.y <= r.bottom;
+    let display = if DRAG.with(Cell::get) {
+        TARGET.with(Cell::get)
+    } else {
+        at
+    };
+    let detail = if DRAG.with(Cell::get) || hover {
+        format!(
+            " • Tua đến {}",
+            time_label(if hover {
+                target_at(hwnd, pointer.x)
+            } else {
+                display
+            })
+        )
+    } else {
+        String::new()
+    };
+    set_label(
+        hwnd,
+        8,
+        &if duration > 0 {
+            format!(
+                "{} / {} • Âm lượng {:.0}%{}",
+                time_label(display),
+                time_label(duration),
+                volume * 100.0,
+                detail
+            )
+        } else {
+            "Đang nạp video…".into()
+        },
+    );
+    let _ = InvalidateRect(hwnd, Some(&r), false);
+}
 unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
+        WM_GETMINMAXINFO if lp.0 != 0 => {
+            // SAFETY: Windows owns this writable structure for the message callback.
+            let info = &mut *(lp.0 as *mut MINMAXINFO);
+            let scale = dpi(hwnd);
+            info.ptMinTrackSize = POINT {
+                x: 480 * scale / 96,
+                y: 320 * scale / 96,
+            };
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            if hwnd == ROOT.with(Cell::get) && lp.0 != 0 {
+                // SAFETY: Windows supplies a suggested RECT for the duration of this message.
+                let r = *(lp.0 as *const RECT);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                layout(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             if hwnd == ROOT.with(Cell::get) {
                 layout(hwnd);
@@ -114,8 +312,100 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let brush = CreateSolidBrush(COLORREF(0x002b2622));
                 FillRect(dc, &r, brush);
                 DeleteObject(brush);
+                let bar = timeline(hwnd);
+                let y = (bar.top + bar.bottom) / 2;
+                let track = RECT {
+                    left: bar.left,
+                    right: bar.right,
+                    top: y - 3,
+                    bottom: y + 3,
+                };
+                let gray = CreateSolidBrush(COLORREF(0x00605a54));
+                FillRect(dc, &track, gray);
+                DeleteObject(gray);
+                let (at, duration) = position();
+                let at = if DRAG.with(Cell::get) {
+                    TARGET.with(Cell::get)
+                } else {
+                    at
+                };
+                let right = if duration > 0 {
+                    bar.left
+                        + ((bar.right - bar.left) as f64
+                            * (at as f64 / duration as f64).clamp(0.0, 1.0))
+                            as i32
+                } else {
+                    bar.left
+                };
+                let fill = RECT { right, ..track };
+                let blue = CreateSolidBrush(COLORREF(0x00ff6800));
+                FillRect(dc, &fill, blue);
+                let dot = RECT {
+                    left: right - 4,
+                    right: right + 4,
+                    top: y - 7,
+                    bottom: y + 7,
+                };
+                FillRect(dc, &dot, blue);
+                DeleteObject(blue);
             }
             EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC => {
+            let dc = HDC(wp.0 as isize);
+            SetTextColor(dc, COLORREF(0x00ffffff));
+            SetBkMode(dc, TRANSPARENT);
+            LRESULT(GetStockObject(BLACK_BRUSH).0)
+        }
+        WM_LBUTTONDOWN if hwnd == ROOT.with(Cell::get) => {
+            let x = lp.0 as i16 as i32;
+            let y = (lp.0 >> 16) as i16 as i32;
+            let r = timeline(hwnd);
+            if x >= r.left && x <= r.right && y >= r.top && y <= r.bottom && position().1 > 0 {
+                DRAG.with(|s| s.set(true));
+                TARGET.with(|s| s.set(target_at(hwnd, x)));
+                if let Some(p) = player() {
+                    let playing = p
+                        .GetState()
+                        .is_ok_and(|s| s == MFP_MEDIAPLAYER_STATE_PLAYING);
+                    RESUME.with(|s| s.set(playing));
+                    let _ = p.Pause();
+                }
+                SetCapture(hwnd);
+                refresh_controls(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE if hwnd == ROOT.with(Cell::get) => {
+            if DRAG.with(Cell::get) {
+                TARGET.with(|s| s.set(target_at(hwnd, lp.0 as i16 as i32)));
+            }
+            refresh_controls(hwnd);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP if hwnd == ROOT.with(Cell::get) => {
+            if DRAG.with(|s| s.replace(false)) {
+                ReleaseCapture();
+                if let Some(p) = player() {
+                    let _ = p.SetPosition(
+                        &MFP_POSITIONTYPE_100NS,
+                        &PROPVARIANT::from(TARGET.with(Cell::get)),
+                    );
+                    if RESUME.with(Cell::get) {
+                        let _ = p.Play();
+                    }
+                }
+                refresh_controls(hwnd);
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if DRAG.with(|s| s.replace(false)) && RESUME.with(Cell::get) {
+                if let Some(p) = player() {
+                    let _ = p.Play();
+                }
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -143,14 +433,32 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     }
                 }
                 6 => FULL.with(|s| s.set(!s.get())),
+                7 => {
+                    if let Some(p) = player() {
+                        if let Ok(v) = p.GetVolume() {
+                            if v > 0.001 {
+                                VOLUME.with(|s| s.set(v));
+                                let _ = p.SetVolume(0.0);
+                            } else {
+                                let _ = p.SetVolume(VOLUME.with(Cell::get).max(0.1));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
+            refresh_controls(ROOT.with(Cell::get));
+            let _ = SetFocus(ROOT.with(Cell::get));
             LRESULT(0)
         }
         WM_KEYDOWN => {
             match wp.0 {
                 0x1b => {
-                    let _ = DestroyWindow(ROOT.with(Cell::get));
+                    if FULL.with(Cell::get) {
+                        FULL.with(|s| s.set(false));
+                    } else {
+                        let _ = DestroyWindow(ROOT.with(Cell::get));
+                    }
                 }
                 0x20 => {
                     let _ = PostMessageW(ROOT.with(Cell::get), WM_COMMAND, WPARAM(1), LPARAM(0));
@@ -188,6 +496,11 @@ impl Drop for WindowGuard {
             if IsWindow(self.0).as_bool() {
                 let _ = DestroyWindow(self.0);
             }
+            let font = FONT.with(|f| f.replace(HFONT(0)));
+            if font.0 != 0 {
+                DeleteObject(font);
+            }
+            FONT_DPI.with(|d| d.set(0));
             ROOT.with(|s| s.set(HWND(0)));
             SURFACE.with(|s| s.set(HWND(0)));
             let mut msg = MSG::default();
@@ -276,7 +589,8 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
             "+10 giây",
             "Âm −",
             "Âm +",
-            "Toàn màn hình",
+            "Toàn màn",
+            "Tắt tiếng",
         ]
         .iter()
         .enumerate()
@@ -297,6 +611,22 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
                 None,
             );
         }
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("Đang nạp video…"),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+            300,
+            24,
+            root,
+            HMENU(8),
+            GetModuleHandleW(None)?,
+            None,
+        );
+        DRAG.with(|s| s.set(false));
+        FONT_DPI.with(|d| d.set(0));
         layout(root);
         ShowWindow(root, SW_SHOW);
         SetForegroundWindow(root);
@@ -304,6 +634,7 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
         let mut fullscreen = false;
         let mut restore = RECT::default();
         let mut result = Ok(());
+        let mut refreshed = Instant::now() - Duration::from_secs(1);
         'running: loop {
             while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
                 if msg.message == WM_QUIT {
@@ -364,6 +695,10 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
                         break;
                     }
                 }
+            }
+            if refreshed.elapsed() >= Duration::from_millis(200) {
+                refresh_controls(root);
+                refreshed = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(16));
         }

@@ -178,10 +178,16 @@ impl Popup {
         }
         if self.exit_at.is_none()
             && self.shown_at.is_some_and(|t| {
-                now.saturating_duration_since(t) >= std::time::Duration::from_millis(4500)
+                now.saturating_duration_since(t) >= std::time::Duration::from_secs(10)
             })
         {
             self.exit_at = Some(now);
+        }
+    }
+    /// Keep a hovered card readable without delaying a newer pending card.
+    pub fn hold(&mut self, now: std::time::Instant) {
+        if self.current.is_some() && self.pending.is_none() && self.exit_at.is_none() {
+            self.shown_at = Some(now);
         }
     }
     pub fn close(&mut self) {
@@ -225,5 +231,36 @@ mod tests {
         assert_eq!(badge(0), "");
         assert_eq!(badge(5), "5");
         assert_eq!(badge(1000), "5+");
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    #[test]
+    fn popup_lasts_ten_seconds_and_hover_extends_reading_time() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let mut p = Popup::default();
+        let s = Snapshot {
+            owner: "owner".into(),
+            enabled: true,
+            sequence: 1,
+            notice: Some(Notice {
+                owner: "owner".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        p.update(&s, now, true);
+        p.update(&s, now + Duration::from_secs(9), true);
+        assert!(p.exit_at.is_none());
+        p.hold(now + Duration::from_secs(9));
+        p.update(&s, now + Duration::from_secs(11), true);
+        assert!(p.exit_at.is_none());
+        p.update(&s, now + Duration::from_secs(19), true);
+        assert!(p.exit_at.is_some());
+        p.update(&s, now + Duration::from_millis(19160), true);
+        assert!(p.current.is_none());
     }
 }

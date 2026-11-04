@@ -7,6 +7,7 @@ mod windows_resources;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build_support/windows_resources.rs");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=src/assets/app_icon.ico");
     println!("cargo:rerun-if-changed=src/assets/app_icon.png");
 
@@ -81,7 +82,12 @@ fn embed_windows_icon() -> Result<(), Box<dyn std::error::Error>> {
     align4(&mut res);
 
     let version = std::env::var("CARGO_PKG_VERSION")?;
-    let version_resource = windows_resources::build_vs_version_info(&version);
+    let source = std::fs::read_to_string("src/lib.rs")?;
+    let product = source
+        .split_once("pub const PRODUCT_VERSION: &str = \"")
+        .and_then(|(_, tail)| tail.split_once('"').map(|(label, _)| label))
+        .ok_or("Missing product version")?;
+    let version_resource = windows_resources::build_vs_version_info_with_product(&version, product);
     write_res_header(&mut res, version_resource.len() as u32, 16, 1, 0x0030);
     res.extend_from_slice(&version_resource);
     align4(&mut res);

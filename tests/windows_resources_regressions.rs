@@ -46,3 +46,13 @@ fn explorer_version_resource_has_valid_fixed_header_and_cargo_version() {
         );
     }
 }
+
+#[test]
+fn numeric_file_version_can_carry_the_fork_release_label() {
+    let resource =
+        windows_resources::build_vs_version_info_with_product("0.0.4", zalo_rust::PRODUCT_VERSION);
+    for text in ["0.0.4.0", zalo_rust::PRODUCT_VERSION] {
+        let bytes: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(resource.windows(bytes.len()).any(|s| s == bytes));
+    }
+}

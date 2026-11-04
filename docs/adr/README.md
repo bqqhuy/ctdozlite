@@ -67,3 +67,5 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0024 — Update-only sync, media renewal and selected PR #78 features](0024-update-only-sync-and-selected-pr78.md)
 - [0025 — Video messages and media forwarding like Zalo PC](0025-video-messages-and-forward-like-zalo-pc.md)
 - [0026 — Persisted queue cursors](0026-persisted-queue-cursors.md)
+
+- [0027 — v0.003-arm desktop UI and release identity](0027-v003-arm-desktop-ui.md)

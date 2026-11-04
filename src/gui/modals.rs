@@ -1281,7 +1281,7 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Utilities => {
-                                            ui.label(format!("Phiên bản {} • Windows ARM64",env!("CARGO_PKG_VERSION")));
+                                            ui.label(format!("Phiên bản {} • Windows ARM64",crate::PRODUCT_VERSION));
                                             if ui.add_enabled(!self.update_busy,egui::Button::new("Kiểm tra cập nhật")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::CheckUpdate).is_ok(){self.update_busy=true;self.update_status="Đang kiểm tra bản phát hành của fork…".into();}}}
                                             if let Some(release)=self.update_offer.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new(format!("Tải bộ cài {}",release.tag))).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::PrepareUpdate(release)).is_ok(){self.update_busy=true;self.update_status="Đang tải và kiểm tra bản cập nhật…".into();}}}}
                                             if let Some(ready)=self.update_ready.clone(){if ui.add_enabled(!self.update_busy,egui::Button::new("Mở bộ cài và đóng ứng dụng")).clicked(){if let Some(tx)=WORKER_TX.get(){if tx.send(WorkerCmd::LaunchUpdate(ready)).is_ok(){self.update_busy=true;}}}}
@@ -1490,9 +1490,9 @@ impl ZaloGuiApp {
                                         pal.accent_online.linear_multiply(0.15)
                                     };
                                     let pill_fg = if has_err {
-                                        Color32::from_rgb(252, 165, 165)
+                                        pal.danger
                                     } else {
-                                        Color32::from_rgb(110, 231, 183)
+                                        pal.accent_online
                                     };
                                     let badge_txt = if call.is_video {
                                         format!("{} Zalo Video · ZRTP", lucide::VIDEO)
@@ -1882,7 +1882,7 @@ impl ZaloGuiApp {
                             ui.label(
                                 RichText::new("Cuộc gọi chưa kết nối được")
                                     .size(12.5)
-                                    .color(Color32::from_rgb(248, 113, 113))
+                                    .color(pal.danger)
                                     .strong(),
                             );
                             ui.add_space(6.0);
@@ -1900,9 +1900,7 @@ impl ZaloGuiApp {
                                 .show(ui, |ui| {
                                     ui.add(
                                         egui::Label::new(
-                                            RichText::new(clean_err)
-                                                .size(11.8)
-                                                .color(Color32::from_rgb(254, 226, 226)),
+                                            RichText::new(clean_err).size(11.8).color(pal.danger),
                                         )
                                         .wrap(),
                                     );
@@ -2325,6 +2323,61 @@ impl ZaloGuiApp {
         }
     }
 
+    pub(super) fn open_media_viewer(&mut self, thread_id: &str, message: &ChatMessage) {
+        let Some(thread) = self.threads.iter().find(|t| t.id == thread_id) else {
+            return;
+        };
+        let media = crate::message_view::media(message);
+        let video = media.kind == crate::message_view::MediaKind::Video;
+        let url = if video {
+            media.thumbnail.clone()
+        } else {
+            media
+                .preview
+                .clone()
+                .or_else(|| media.original.clone())
+                .or_else(|| media.thumbnail.clone())
+        }
+        .unwrap_or_default();
+        let key = crate::media_recovery::image_key(thread_id, &message.id, 0, !video);
+        if !url.is_empty()
+            && !self.sticker_textures.contains_key(&key)
+            && self.loading_stickers.insert(key.clone())
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::FetchChatImage {
+                    key: key.clone(),
+                    url: url.clone(),
+                    thread: thread_id.into(),
+                    group: thread.is_group,
+                    message: Box::new(message.clone()),
+                    preview: !video,
+                });
+            }
+        }
+        self.image_viewer = Some(ImageViewerModal {
+            source: super::worker::ChatImage {
+                thread: thread_id.into(),
+                group: thread.is_group,
+                message: message.clone(),
+                preview: !video,
+            },
+            is_video: video,
+            navigation_pending: false,
+            thread_id: thread_id.into(),
+            message_id: message.id.clone(),
+            dimensions: media.width.zip(media.height),
+            tex_key: crate::media_recovery::image_key(thread_id, &message.id, 0, false),
+            hd_tex_key: (!video).then_some(key),
+            original_url: media.original.unwrap_or_default(),
+            title: media.name,
+            sender: message.sender.clone(),
+            time: crate::clock::message_time(message.ts),
+            zoom: 1.0,
+            pan: Vec2::ZERO,
+        });
+    }
+
     pub(super) fn render_image_viewer_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(mut viewer) = self.image_viewer.clone() else {
             return;
@@ -2338,7 +2391,11 @@ impl ZaloGuiApp {
         let screen_rect = ctx.screen_rect();
         // Windows owns the native caption outside the client area.
         let viewer_top = screen_rect.top();
-        let toolbar_h = 46.0_f32;
+        let toolbar_h = if screen_rect.width() < 760.0 {
+            116.0_f32
+        } else {
+            88.0_f32
+        };
         let toolbar_rect = Rect::from_min_max(
             Pos2::new(screen_rect.left(), viewer_top),
             Pos2::new(
@@ -2351,6 +2408,14 @@ impl ZaloGuiApp {
             screen_rect.max,
         );
         let mut should_close = false;
+        let mut navigate = None;
+        let mut retry = false;
+        if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
+            navigate = Some(false);
+        }
+        if ctx.input(|i| i.key_pressed(Key::ArrowRight)) {
+            navigate = Some(true);
+        }
 
         let active_tex = viewer
             .hd_tex_key
@@ -2366,8 +2431,12 @@ impl ZaloGuiApp {
             let [tw, th] = tex.size();
             let tw_f = (tw.max(1)) as f32;
             let th_f = (th.max(1)) as f32;
-            let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(1.5);
-            (tw_f * fit_scale, th_f * fit_scale, Some((tw, th)))
+            let fit_scale = (max_stage_w / tw_f).min(max_stage_h / th_f).min(1.0);
+            (
+                tw_f * fit_scale,
+                th_f * fit_scale,
+                viewer.dimensions.map(|(w, h)| (w as usize, h as usize)),
+            )
         } else {
             (340.0_f32.min(max_stage_w), 220.0_f32.min(max_stage_h), None)
         };
@@ -2383,7 +2452,7 @@ impl ZaloGuiApp {
         if scroll_y.abs() > 0.1 {
             let old_zoom = viewer.zoom;
             let factor = if scroll_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
-            let new_zoom = (old_zoom * factor).clamp(0.25, 8.0);
+            let new_zoom = (old_zoom * factor).clamp(0.25, 32.0);
             if let Some(ptr) = ctx.input(|i| i.pointer.hover_pos()) {
                 if stage_area_rect.contains(ptr) {
                     let rel = ptr - (stage_area_rect.center() + viewer.pan);
@@ -2472,7 +2541,11 @@ impl ZaloGuiApp {
                             .and_then(|k| self.image_failures.get(k))
                             .or_else(|| self.image_failures.get(&viewer.tex_key))
                             .map(|e| e.failure.message())
-                            .unwrap_or("Đang tải hình ảnh…"),
+                            .unwrap_or(if viewer.is_video {
+                                "Chưa có ảnh xem trước. Bấm Phát video để mở."
+                            } else {
+                                "Đang tải hình ảnh…"
+                            }),
                         FontId::proportional(13.0),
                         pal.text_primary,
                     );
@@ -2481,24 +2554,6 @@ impl ZaloGuiApp {
                     }
                 }
             });
-        // 3. Clean Unified Top Toolbar Bar (docked under custom title bar, matching Atom One Dark pal.bg_sidebar)
-        let clean_title = {
-            let mut t = viewer.title.trim().trim_start_matches(lucide::IMAGE).trim();
-            if let Some(paren_idx) = t.rfind(" (") {
-                if t[paren_idx..].contains('×')
-                    || t[paren_idx..].contains("KB")
-                    || t[paren_idx..].contains("MB")
-                {
-                    t = t[..paren_idx].trim();
-                }
-            }
-            if t.is_empty() {
-                "Hình ảnh đính kèm"
-            } else {
-                t
-            }
-        };
-
         egui::Area::new(Id::new("image_viewer_top_bar"))
             .order(egui::Order::Tooltip)
             .fixed_pos(toolbar_rect.min)
@@ -2506,229 +2561,159 @@ impl ZaloGuiApp {
                 egui::Frame::none()
                     .fill(pal.bg_sidebar)
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .inner_margin(Margin::symmetric(16.0, 6.0))
+                    .inner_margin(Margin::symmetric(12.0, 6.0))
                     .show(ui, |ui| {
-                        ui.set_min_size(Vec2::new(
-                            (toolbar_rect.width() - 32.0).max(200.0),
-                            toolbar_h - 12.0,
-                        ));
-                        ui.set_max_size(Vec2::new(
-                            (toolbar_rect.width() - 32.0).max(200.0),
-                            toolbar_h - 12.0,
-                        ));
-                        ui.horizontal_centered(|ui| {
-                            // Left: Subtle icon badge + filename + sender/time/dimensions
-                            let (badge_r, _) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            ui.painter()
-                                .rect_filled(badge_r, Rounding::same(6.0), pal.bg_elevated);
-                            draw_icon_image(
-                                ui.painter(),
-                                badge_r.center(),
-                                15.0,
-                                pal.primary_hover,
-                            );
-                            ui.add_space(4.0);
+                        ui.set_width((toolbar_rect.width() - 24.0).max(240.0));
+                        ui.horizontal(|ui| {
                             ui.vertical(|ui| {
-                                ui.spacing_mut().item_spacing.y = 1.0;
                                 ui.label(
-                                    RichText::new(truncate_chars(clean_title, 44))
-                                        .size(13.0)
-                                        .color(pal.text_primary)
-                                        .strong(),
+                                    RichText::new(truncate_chars(
+                                        &viewer.title,
+                                        if screen_rect.width() < 760.0 { 24 } else { 64 },
+                                    ))
+                                    .strong()
+                                    .color(pal.text_primary),
                                 );
-                                let dim_str = match natural_dims {
-                                    Some((tw, th)) => format!(" · {tw}×{th} px"),
-                                    None => String::new(),
-                                };
-                                let sub = if viewer.time.is_empty() {
-                                    format!("{}{dim_str}", viewer.sender)
-                                } else {
-                                    format!(
-                                        "Gửi bởi {} lúc {}{dim_str}",
-                                        viewer.sender, viewer.time
-                                    )
-                                };
-                                ui.label(RichText::new(sub).size(11.0).color(pal.text_muted));
+                                let dims = natural_dims
+                                    .map(|(w, h)| format!(" • {w}×{h} px"))
+                                    .unwrap_or_default();
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} • {}{}",
+                                        truncate_chars(&viewer.sender, 24),
+                                        viewer.time,
+                                        dims
+                                    ))
+                                    .size(11.0)
+                                    .color(pal.text_secondary),
+                                );
                             });
-
-                            // Right: Unified Zoom + Actions + Close
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-
-                                // Close button (30x28, Atom One Dark style)
-                                let (close_r, close_resp) =
-                                    ui.allocate_exact_size(Vec2::new(30.0, 28.0), Sense::click());
-                                ui.painter().rect_filled(
-                                    close_r,
-                                    Rounding::same(6.0),
-                                    if close_resp.hovered() {
-                                        pal.danger
-                                    } else {
-                                        pal.bg_elevated
-                                    },
-                                );
-                                ui.painter().rect_stroke(
-                                    close_r,
-                                    Rounding::same(6.0),
-                                    Stroke::new(1.0_f32, pal.border),
-                                );
-                                draw_lucide_icon(
-                                    ui.painter(),
-                                    close_r.center(),
-                                    lucide::X,
-                                    14.5,
-                                    if close_resp.hovered() {
-                                        Color32::WHITE
-                                    } else {
-                                        pal.text_secondary
-                                    },
-                                );
-                                if close_resp
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đóng xem ảnh (Esc)")
-                                    .clicked()
-                                {
+                                if ui.button("Đóng ×").on_hover_text("Đóng (Esc)").clicked() {
                                     should_close = true;
                                 }
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let failed = self.image_failures.contains_key(&viewer.tex_key)
+                                || viewer
+                                    .hd_tex_key
+                                    .as_ref()
+                                    .is_some_and(|k| self.image_failures.contains_key(k));
+                            if failed && ui.button("Thử tải lại").clicked() {
+                                retry = true;
+                            }
 
-                                if !viewer.full_url.is_empty() {
-                                    let ext_btn = egui::Button::new(
-                                        RichText::new("Lưu bản gốc")
-                                            .size(11.8)
-                                            .color(pal.text_primary),
-                                    )
-                                    .fill(pal.bg_elevated)
-                                    .stroke(Stroke::new(1.0_f32, pal.border))
-                                    .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(72.0, 28.0));
-                                    if ui
-                                        .add(ext_btn)
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .on_hover_text(&viewer.full_url)
-                                        .clicked()
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let context = self
-                                                .threads
-                                                .get(self.selected_thread_index)
-                                                .and_then(|thread| {
-                                                    thread
-                                                        .messages
-                                                        .iter()
-                                                        .find(|message| {
-                                                            crate::media_recovery::image_key(
-                                                                &thread.id,
-                                                                &message.id,
-                                                                0,
-                                                                false,
-                                                            ) == viewer.tex_key
-                                                        })
-                                                        .map(|message| super::worker::ChatImage {
-                                                            thread: thread.id.clone(),
-                                                            group: thread.is_group,
-                                                            message: message.clone(),
-                                                            preview: false,
-                                                        })
-                                                });
-                                            let url = context
-                                                .as_ref()
-                                                .and_then(|context| {
-                                                    crate::message_view::media(&context.message)
-                                                        .original
-                                                })
-                                                .unwrap_or_else(|| viewer.original_url.clone());
-                                            let _ = tx.send(WorkerCmd::DownloadMedia {
-                                                url,
-                                                name: viewer.title.clone(),
-                                                play: false,
-                                                context,
-                                            });
-                                        }
-                                    }
-
-                                    let copy_btn = egui::Button::new(
-                                        RichText::new(format!("{} Sao chép", lucide::COPY))
-                                            .size(11.8)
-                                            .color(pal.text_secondary),
-                                    )
-                                    .fill(pal.bg_elevated)
-                                    .stroke(Stroke::new(1.0_f32, pal.border))
-                                    .rounding(Rounding::same(6.0))
-                                    .min_size(Vec2::new(78.0, 28.0));
-                                    if ui
-                                        .add(copy_btn)
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        ui.ctx().copy_text(viewer.full_url.clone());
-                                        self.show_toast("Đã sao chép đường dẫn ảnh vào bộ nhớ tạm");
-                                    }
-                                }
-
-                                // Zoom In (+)
-                                let zin_btn = egui::Button::new(
-                                    RichText::new(lucide::PLUS)
-                                        .size(12.5)
-                                        .color(pal.text_secondary),
-                                )
-                                .fill(pal.bg_elevated)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(28.0, 28.0));
+                            if ui
+                                .add_enabled(!viewer.navigation_pending, egui::Button::new("❮"))
+                                .on_hover_text("Trước (←)")
+                                .clicked()
+                            {
+                                navigate = Some(false);
+                            }
+                            if ui
+                                .add_enabled(!viewer.navigation_pending, egui::Button::new("❯"))
+                                .on_hover_text("Tiếp (→)")
+                                .clicked()
+                            {
+                                navigate = Some(true);
+                            }
+                            if viewer.navigation_pending {
+                                ui.spinner();
+                            }
+                            if viewer.is_video {
                                 if ui
-                                    .add(zin_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Phóng to (+25%)")
+                                    .add_enabled(
+                                        !viewer.original_url.is_empty(),
+                                        egui::Button::new("▶ Phát video"),
+                                    )
                                     .clicked()
                                 {
-                                    viewer.zoom = (viewer.zoom + 0.25).min(8.0);
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::DownloadMedia {
+                                            url: viewer.original_url.clone(),
+                                            name: viewer.title.clone(),
+                                            play: true,
+                                            open: false,
+                                            context: Some(viewer.source.clone()),
+                                        });
+                                    }
                                 }
-
-                                // Zoom Percentage Reset
-                                let zoom_pct = format!("{:.0}%", viewer.zoom * 100.0);
-                                let zreset_btn = egui::Button::new(
-                                    RichText::new(zoom_pct)
-                                        .size(11.8)
-                                        .color(pal.primary_hover)
-                                        .strong(),
-                                )
-                                .fill(pal.bg_input)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(50.0, 28.0));
-                                if ui
-                                    .add(zreset_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Đặt lại 100% (hoặc nhấp đúp vào ảnh)")
-                                    .clicked()
-                                {
+                            } else {
+                                if ui.small_button("−").clicked() {
+                                    viewer.zoom = (viewer.zoom / 1.25).max(0.25);
+                                }
+                                ui.label(format!(
+                                    "{:.0}%",
+                                    base_w * viewer.zoom
+                                        / viewer
+                                            .dimensions
+                                            .map(|(w, _)| w as f32)
+                                            .unwrap_or(base_w)
+                                            .max(1.0)
+                                        * 100.0
+                                ));
+                                if ui.small_button("+").clicked() {
+                                    viewer.zoom = (viewer.zoom * 1.25).min(32.0);
+                                }
+                                if ui.small_button("Vừa cửa sổ").clicked() {
                                     viewer.zoom = 1.0;
                                     viewer.pan = Vec2::ZERO;
                                 }
-
-                                // Zoom Out (-)
-                                let zout_btn = egui::Button::new(
-                                    RichText::new(lucide::MINUS)
-                                        .size(12.5)
-                                        .color(pal.text_secondary),
-                                )
-                                .fill(pal.bg_elevated)
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .rounding(Rounding::same(6.0))
-                                .min_size(Vec2::new(28.0, 28.0));
                                 if ui
-                                    .add(zout_btn)
-                                    .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Thu nhỏ (-25%)")
+                                    .small_button("1:1")
+                                    .on_hover_text("Kích thước ảnh gốc")
                                     .clicked()
                                 {
-                                    viewer.zoom = (viewer.zoom - 0.25).max(0.25);
-                                    if viewer.zoom <= 1.0 {
-                                        viewer.pan = Vec2::ZERO;
-                                    }
+                                    viewer.zoom = (viewer
+                                        .dimensions
+                                        .map(|(w, _)| w as f32)
+                                        .unwrap_or(base_w)
+                                        / base_w.max(1.0))
+                                    .clamp(0.25, 32.0);
+                                    viewer.pan = Vec2::ZERO;
                                 }
-                            });
+                            }
+                            if ui
+                                .add_enabled(
+                                    !viewer.original_url.is_empty(),
+                                    egui::Button::new("Lưu thành…"),
+                                )
+                                .clicked()
+                            {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::DownloadMedia {
+                                        url: viewer.original_url.clone(),
+                                        name: viewer.title.clone(),
+                                        play: false,
+                                        open: false,
+                                        context: Some(viewer.source.clone()),
+                                    });
+                                }
+                            }
+                            if !viewer.is_video
+                                && ui
+                                    .button("Sao chép ảnh")
+                                    .on_hover_text("Sao chép ảnh ở chất lượng đang xem")
+                                    .clicked()
+                            {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::CopyViewerImage {
+                                        owner: self.user_uin.clone(),
+                                        context: viewer.source.clone(),
+                                    });
+                                }
+                            }
+                            if ui
+                                .add_enabled(
+                                    !viewer.original_url.is_empty(),
+                                    egui::Button::new("Sao chép link"),
+                                )
+                                .clicked()
+                            {
+                                ctx.copy_text(viewer.original_url.clone());
+                                self.show_toast("Đã sao chép đường dẫn");
+                            }
                         });
                     });
             });
@@ -2736,7 +2721,31 @@ impl ZaloGuiApp {
         if should_close {
             self.image_viewer = None;
         } else {
-            self.image_viewer = Some(viewer);
+            if let Some(next) = navigate.filter(|_| !viewer.navigation_pending) {
+                if let Some(tx) = WORKER_TX.get() {
+                    viewer.navigation_pending = tx
+                        .send(WorkerCmd::MediaNeighbor {
+                            owner: self.user_uin.clone(),
+                            thread: viewer.thread_id.clone(),
+                            anchor: viewer.message_id.clone(),
+                            next,
+                        })
+                        .is_ok();
+                }
+            }
+            if retry {
+                for key in [Some(&viewer.tex_key), viewer.hd_tex_key.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    self.image_failures.remove(key);
+                    self.loading_stickers.remove(key);
+                    self.image_retry_at.remove(key);
+                }
+                self.open_media_viewer(&viewer.thread_id, &viewer.source.message);
+            } else {
+                self.image_viewer = Some(viewer);
+            }
         }
     }
 
@@ -2959,7 +2968,7 @@ impl ZaloGuiApp {
                 for f in &self.scanner_findings {
                     let (badge_text, color) = match f.level {
                         FindingLevel::Info => ("INFO", Color32::from_rgb(40, 167, 69)),
-                        FindingLevel::Warning => ("CẢNH BÁO", Color32::from_rgb(255, 193, 7)),
+                        FindingLevel::Warning => ("CẢNH BÁO", self.palette().warning),
                         FindingLevel::Critical => ("NGHIÊM TRỌNG", Color32::RED),
                     };
 

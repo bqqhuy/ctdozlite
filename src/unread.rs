@@ -178,6 +178,12 @@ impl UnreadState {
             }
         }
     }
+    /// Foreground cursors may advance while a mention remains outside the viewport.
+    pub fn read_foreground(&mut self, messages: &[ChatMessage]) {
+        let mentions = self.mention_ids.clone();
+        self.read_visible(messages);
+        self.mention_ids = mentions;
+    }
     /// Local foreground reading does not send a receipt or mutate the account.
     pub fn read_visible(&mut self, messages: &[ChatMessage]) {
         if let Some(last) = messages
@@ -529,5 +535,27 @@ pub fn classify_message_mention(message: &ChatMessage, account: &str) -> Mention
         MentionDetection::Unknown
     } else {
         MentionDetection::NoMention
+    }
+}
+
+#[cfg(test)]
+mod foreground_mention_tests {
+    use super::*;
+    #[test]
+    fn opening_a_thread_preserves_mentions_until_their_rows_are_seen() {
+        let mut state = UnreadState {
+            last_seen_id: Some("1".into()),
+            unread_ids: ["2".into(), "3".into()].into(),
+            mention_ids: ["2".into()].into(),
+            ..Default::default()
+        };
+        state.read_foreground(&[ChatMessage {
+            id: "3".into(),
+            ..Default::default()
+        }]);
+        assert_eq!(state.count(), 0);
+        assert!(state.has_unread_mentions());
+        state.mention_ids.remove("2");
+        assert!(!state.has_unread_mentions());
     }
 }

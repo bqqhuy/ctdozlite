@@ -119,7 +119,7 @@ pub async fn save_classified<F: FnMut(u64, Option<u64>)>(
     progress: F,
     visual: bool,
 ) -> Result<u64> {
-    save_inner(url, path, cancel, progress, visual, None).await
+    save_inner(url, path, cancel, progress, visual, None, None).await
 }
 /// Stream a playback copy using its shared disk budget.
 /// # Errors
@@ -131,7 +131,26 @@ pub(crate) async fn save_video<F: FnMut(u64, Option<u64>)>(
     progress: F,
     lease: &crate::video_player::CachedVideo,
 ) -> Result<u64> {
-    save_inner(url, path, cancel, progress, true, Some(lease)).await
+    save_inner(url, path, cancel, progress, true, Some(lease), None).await
+}
+/// Stream an attachment copy with a 512 MiB per-file cache limit.
+pub(crate) async fn save_cached<F: FnMut(u64, Option<u64>)>(
+    url: &str,
+    path: &Path,
+    cancel: Arc<AtomicBool>,
+    progress: F,
+    visual: bool,
+) -> Result<u64> {
+    save_inner(
+        url,
+        path,
+        cancel,
+        progress,
+        visual,
+        None,
+        Some(512 * 1024 * 1024),
+    )
+    .await
 }
 async fn save_inner<F: FnMut(u64, Option<u64>)>(
     url: &str,
@@ -140,12 +159,19 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
     mut progress: F,
     visual: bool,
     lease: Option<&crate::video_player::CachedVideo>,
+    byte_limit: Option<u64>,
 ) -> Result<u64> {
     use tokio::io::AsyncWriteExt;
     let _slot = DOWNLOADS.acquire().await?;
     ensure!(!cancel.load(Ordering::Acquire), "Đã hủy tải");
     let mut response = response(url, Duration::from_secs(3600)).await?;
     let expected = response.content_length();
+    ensure!(
+        !byte_limit
+            .zip(expected)
+            .is_some_and(|(limit, size)| size > limit),
+        "Tệp vượt giới hạn cache 512 MiB; hãy dùng Lưu thành…"
+    );
     let mut random = [0; 12];
     crate::random::fill(&mut random)?;
     let suffix = random
@@ -198,6 +224,10 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
                 return Err(crate::media_recovery::Failure::Content.into());
             }
         }
+        ensure!(
+            !byte_limit.is_some_and(|limit| total.saturating_add(chunk.len() as u64) > limit),
+            "Tệp vượt giới hạn cache 512 MiB; hãy dùng Lưu thành…"
+        );
         if let Some(lease) = lease {
             lease.admit(chunk.len())?;
         }

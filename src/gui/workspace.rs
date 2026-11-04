@@ -869,6 +869,7 @@ impl ZaloGuiApp {
                 let mut clear_history_action = None;
                 let mut read_action = None;
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
+                let mut mention_target: Option<(String, String)> = None;
                 let mut clicked_msg_hit: Option<(usize, String)> = None;
 
                 egui::ScrollArea::vertical()
@@ -1009,6 +1010,17 @@ impl ZaloGuiApp {
                                 &mut self.loading_stickers,
                             );
                             // Presence is unknown: no verified presence feed is available.
+                                if t.unread.has_unread_mentions() {
+                                    let rect = Rect::from_center_size(Pos2::new(if is_narrow_w{row_rect.left()+46.0}else{row_rect.right()-55.0}, row_rect.top()+40.0), Vec2::new(22.0,20.0));
+                                    ui.painter().rect_filled(rect, Rounding::same(8.0), pal.bg_selected);
+                                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "@", FontId::proportional(14.0), pal.danger);
+                                    let hit = ui.interact(rect, Id::new(("mention", &t.id)), Sense::click()).on_hover_text("Đến tin nhắc đến bạn chưa đọc");
+                                    if hit.clicked() {
+                                        let first=t.messages.iter().filter(|m|t.unread.mention_ids.contains(&m.id)).min_by_key(|m|m.ts).map(|m|m.id.clone())
+                                            .or_else(||t.unread.mention_ids.iter().next().cloned());
+                                        if let Some(id)=first {mention_target=Some((t.id.clone(),id));}
+                                    }
+                                }
                             // Only show text labels when sidebar is expanded
                             if !is_narrow_w {
                                 // Thread Name
@@ -1062,6 +1074,8 @@ impl ZaloGuiApp {
                                 let unread_n = self.unread_counts.get(&t.id).copied().unwrap_or(0);
                                 let max_snip_chars = if is_compact_w {
                                     16
+                                } else if t.unread.has_unread_mentions() {
+                                    19
                                 } else if unread_n > 0 {
                                     23
                                 } else {
@@ -1264,7 +1278,9 @@ impl ZaloGuiApp {
                     self.in_chat_search_focus_pending = true;
                     self.in_chat_search_query = q_str;
                 }
-                if let Some((idx, tid, is_group)) = clicked_thread {
+                if let Some((thread,id)) = mention_target {
+                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::Tools{owner:self.user_uin.clone(),command:tools_panel::ToolsCommand::OpenHit{thread,id}});}
+                } else if let Some((idx, tid, is_group)) = clicked_thread {
                     self.open_thread(ctx, idx, tid, is_group);
                 }
             });
@@ -1592,6 +1608,7 @@ impl ZaloGuiApp {
                                                             url,
                                                             name: media.name.clone(),
                                                             play: true,
+                                                            open: false,
                                                             context: Some(
                                                                 super::worker::ChatImage {
                                                                     thread: d_id.clone(),
@@ -1631,9 +1648,19 @@ impl ZaloGuiApp {
                                                     }
                                                 }
                                                 self.image_viewer = Some(ImageViewerModal {
+                                                    source: super::worker::ChatImage {
+                                                        thread: d_id.clone(),
+                                                        group: d_is_group,
+                                                        message: message.clone(),
+                                                        preview: true,
+                                                    },
+                                                    is_video: false,
+                                                    navigation_pending: false,
+                                                    thread_id: d_id.clone(),
+                                                    message_id: message.id.clone(),
+                                                    dimensions: media.width.zip(media.height),
                                                     tex_key: tkey.clone(),
                                                     hd_tex_key: Some(full_key),
-                                                    full_url: full_u.to_owned(),
                                                     original_url: media
                                                         .original
                                                         .clone()
@@ -2724,8 +2751,45 @@ impl ZaloGuiApp {
                                                 })
                                                 .map(|(i, _)| i);
 
+                                            let mut album_rendered=std::collections::HashSet::new();
                                             for (pos, &idx) in visible_indices.iter().enumerate() {
+                                                if album_rendered.contains(&idx){continue;}
                                                 let msg = &thread.messages[idx];
+                                                if let Some(bundle)=crate::message_view::photo_bundle(msg) {
+                                                    let members:Vec<usize>=visible_indices[pos..].iter().copied().take(9).take_while(|&index|{
+                                                        let other=&thread.messages[index];
+                                                        other.sender==msg.sender&&other.is_outgoing==msg.is_outgoing&&crate::message_view::photo_bundle(other).as_ref()==Some(&bundle)
+                                                    }).collect();
+                                                    if members.len()>1 {
+                                                        let previous=pos.checked_sub(1).and_then(|p|visible_indices.get(p)).map(|&index|&thread.messages[index]);
+                                                        if should_show_time_divider(previous,msg){render_date_divider(ui,msg,pal);}
+                                                        let width=(ui.available_width()*0.82).clamp(120.0,440.0);
+                                                        let columns=if width<200.0{1}else{2};
+                                                        let cell_width=(width-16.0-(columns-1) as f32*6.0)/columns as f32;
+                                                        ui.with_layout(if msg.is_outgoing{Layout::right_to_left(Align::TOP)}else{Layout::left_to_right(Align::TOP)},|ui|{
+                                                            egui::Frame::none().fill(if msg.is_outgoing{pal.bubble_out_bg}else{pal.bubble_in_bg})
+                                                                .rounding(10.0).inner_margin(8.0).show(ui,|ui|{
+                                                                ui.set_width(width-16.0);
+                                                                if is_group&&!msg.is_outgoing {ui.label(RichText::new(&msg.sender).small().color(pal.primary_hover));}
+                                                                for chunk in members.chunks(columns){ui.horizontal_top(|ui|{
+                                                                    for &index in chunk {
+                                                                        let item=&thread.messages[index];
+                                                                        let cell=ui.allocate_ui_with_layout(Vec2::new(cell_width,0.0),Layout::top_down(Align::LEFT),|ui|{
+                                                                            if let Some(action)=render_message_body(ui,item,&thread_name,&thread_id,is_group,&self.image_failures,pal,item.is_outgoing,cell_width,&self.sticker_textures,&mut self.loading_stickers){pending_action=Some((index,action));}
+                                                                        });
+                                                                        if let Some(action)=bubble_context_menu(ui,&cell.response,item,index,pal,&self.emoji_textures,true){pending_action=Some((index,action));}
+                                                                        if ui.is_rect_visible(cell.response.rect){ctx.data_mut(|d|d.get_temp_mut_or_default::<Vec<String>>(Id::new("visible_mentions")).push(item.id.clone()));}
+                                                                        if jump_index==Some(index){render_quote_target(ui,cell.response.rect,jump_scroll_pending,pal.primary);jump_scrolled|=jump_scroll_pending;}
+                                                                        album_rendered.insert(index);
+                                                                    }
+                                                                });}
+                                                                ui.label(RichText::new(msg.display_time()).size(10.5).color(if msg.is_outgoing{pal.bubble_out_meta}else{pal.bubble_in_meta}));
+                                                            });
+                                                        });
+                                                        ui.add_space(8.0);
+                                                        continue;
+                                                    }
+                                                }
                                                 let prev_msg = pos
                                                     .checked_sub(1)
                                                     .and_then(|p| visible_indices.get(p))
@@ -2788,6 +2852,9 @@ impl ZaloGuiApp {
                                                         9.0
                                                     });
                                                 });
+                                                if ui.is_rect_visible(row.response.rect) {
+                                                    ctx.data_mut(|d| d.get_temp_mut_or_default::<Vec<String>>(Id::new("visible_mentions")).push(msg.id.clone()));
+                                                }
                                                 if jump_index == Some(idx) {
                                                     render_quote_target(
                                                         ui,
@@ -2802,6 +2869,14 @@ impl ZaloGuiApp {
                                     }
                                 });
                         });
+                    let read_ids=ctx.data_mut(|d| d.remove_temp::<Vec<String>>(Id::new("visible_mentions"))).unwrap_or_default();
+                    if ctx.input(|i| i.focused) && self.image_viewer.is_none() && !self.settings_modal_open && !self.tools.open {
+                        if let Some(thread)=self.threads.get_mut(self.selected_thread_index) {
+                            let before=thread.unread.mention_ids.len();
+                            for id in read_ids {thread.unread.mention_ids.remove(&id);}
+                            if before!=thread.unread.mention_ids.len(){self.persist_threads_async();}
+                        }
+                    }
                     if jump_scrolled {
                         if let Some(jump) = &mut self.quote_jump {
                             jump.scroll_pending = false;
@@ -2823,11 +2898,16 @@ impl ZaloGuiApp {
                                 BubbleAction::RetryMedia{key}=>{let preview=crate::media_recovery::image_key(&self.threads[self.selected_thread_index].id,&m.id,0,true);for key in [key,preview]{self.loading_stickers.remove(&key);self.image_failures.remove(&key);self.image_retry_at.remove(&key);}}
                                 BubbleAction::MediaUnavailable=>{self.status_msg="Thiếu thông tin tải ảnh/video; chưa thể mở tệp".into();}
 
+                                BubbleAction::OpenAttachment {url,name} => {
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false,open:true,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
+                                }
                                 BubbleAction::SaveAttachment {url,name} => {
-                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:false,open:false,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
                                 }
                                 BubbleAction::OpenVideo {url,name} => {
-                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true,context:Some(super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:false})});}
+                                    let source=&self.threads[self.selected_thread_index];let id=source.id.clone();let group=source.is_group;
+                                    self.open_media_viewer(&id,&m);
+                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true,open:false,context:Some(super::worker::ChatImage{thread:id,group,message:m.clone(),preview:false})});}
                                 }
                                 BubbleAction::RetrySend => {
                                     if let Some(tx) = WORKER_TX.get() {
@@ -3001,10 +3081,11 @@ impl ZaloGuiApp {
                                         None
                                     };
                                     self.image_viewer = Some(ImageViewerModal {
+                                        source:super::worker::ChatImage{thread:self.threads[self.selected_thread_index].id.clone(),group:self.threads[self.selected_thread_index].is_group,message:m.clone(),preview:true},is_video:false,navigation_pending:false,
+                                        thread_id:self.threads[self.selected_thread_index].id.clone(), message_id:m.id.clone(), dimensions:crate::message_view::media(&m).width.zip(crate::message_view::media(&m).height),
                                         tex_key,
                                         hd_tex_key,
                                         original_url: crate::message_view::media(&m).original.unwrap_or_else(||full_url.clone()),
-                                        full_url,
                                         title,
                                         sender,
                                         time,
@@ -3089,10 +3170,22 @@ impl ZaloGuiApp {
                         }
                     }
                     // 3c. Clipboard Image Preview Banner (`Ctrl+V` / `Shift+Insert` screenshot or image file paste)
-                    if is_clipboard_paste_triggered(ctx) && clipboard_has_image() {
+                    // Ctrl+Shift+V explicitly preserves spreadsheet cells as text.
+                    let spreadsheet_text=ctx.input(|i|i.events.iter().find_map(|e|if let egui::Event::Paste(text)=e{Some(text.contains('\t'))}else{None})).unwrap_or(false);
+                    let composer_can_paste=ctx.memory(|m|m.focused().is_none()||m.has_focus(Id::new(("chat_composer_input",&thread_id))));
+                    if composer_can_paste && is_clipboard_paste_triggered(ctx) && clipboard_has_image()
+                        && !(spreadsheet_text&&self.settings.excel_paste_mode=="text")
+                        && !self.clipboard_text_only
+                        && !ctx.input(|i| i.modifiers.shift && i.modifiers.command)
+                        && !self.clipboard_read_pending
+                    {
+                        self.clipboard_text_fallback = ctx.input(|i| i.events.iter().find_map(|e| {
+                            if let egui::Event::Paste(text) = e { Some(text.clone()) } else { None }
+                        }));
                         ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Paste(_))));
                         self.request_clipboard_image();
                     }
+                    if ctx.input(|i|i.events.iter().any(|e|matches!(e,egui::Event::Paste(_)))) {self.clipboard_text_only=false;}
                     if self.pending_clipboard_image.is_some() {
                         let mut clear_clip = false;
                         if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -3152,8 +3245,18 @@ impl ZaloGuiApp {
                                     });
                                 });
                         }
+                        if self.clipboard_alternative_text.is_some() {
+                            ui.horizontal(|ui|{
+                                ui.label(RichText::new("Vùng Excel: Enter để gửi ảnh, hoặc").color(pal.text_secondary));
+                                if ui.button("Dán dạng chữ").clicked(){
+                                    if let Some(text)=self.clipboard_alternative_text.take(){self.input_message.push_str(&text);self.composer_focus_pending=true;}
+                                    clear_clip=true;
+                                }
+                            });
+                        }
                         if clear_clip {
                             self.pending_clipboard_image = None;
+                            self.clipboard_alternative_text=None;
                         }
                     }
 
@@ -3362,6 +3465,10 @@ impl ZaloGuiApp {
                                             self.maybe_send_typing(&thread_id, is_group);
                                         }
                                         response.context_menu(|ui| {
+                                            if ui.button("Dán dạng văn bản (Ctrl+Shift+V)").clicked(){
+                                                self.clipboard_text_only=true;ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);ui.close_menu();
+                                            }
+
                                             if ui
                                                 .button(format!(
                                                     "{} Dán hình ảnh từ Clipboard (Ctrl+V)",
@@ -3638,7 +3745,7 @@ impl ZaloGuiApp {
         self.selected_thread_index = idx;
         self.sync_composer_draft(ctx);
         if let Some(thread) = self.threads.get_mut(idx) {
-            thread.unread.read_visible(&thread.messages);
+            thread.unread.read_foreground(&thread.messages);
         }
         self.persist_threads_async();
         if self.unread_counts.remove(&tid).is_some() {

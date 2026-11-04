@@ -78,12 +78,14 @@ Invoke-Checked $binary @('--version')
 $version = ((& cargo metadata --locked --no-deps --format-version 1) | ConvertFrom-Json).packages |
     Where-Object { $_.name -eq 'ctdozlite' } | Select-Object -ExpandProperty version
 if ($LASTEXITCODE -ne 0 -or -not $version) { throw 'Cannot read package version' }
-if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
-    throw "Release tag must match Cargo version: expected v$version"
+$productVersion = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $PWD 'src/lib.rs')), 'pub const PRODUCT_VERSION: &str = "([^"]+)"').Groups[1].Value
+if (-not $productVersion) { throw 'Cannot read product version' }
+if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne $productVersion) {
+    throw "Release tag must match product version: expected $productVersion"
 }
 # Inspect embedded resources from the finished ARM64 PE, not source strings.
 $properties = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($binary)
-if ($properties.ProductVersion -ne $version -or $properties.OriginalFilename -ne 'ctdozlite.exe') {
+if ($properties.ProductVersion -ne $productVersion -or $properties.OriginalFilename -ne 'ctdozlite.exe') {
     throw 'Embedded version resource does not match the package'
 }
 Add-Type -TypeDefinition @'
@@ -132,6 +134,9 @@ try {
         @{ Size='1020x700'; Scale='1.5'; Tab='quote-jump'; QuoteJump=$true },
         @{ Size='1020x700'; Scale='1.5'; Tab='photo'; Photo=$true },
         @{ Size='1020x700'; Scale='1'; Tab='media'; Media=$true },
+        @{ Size='480x360'; Scale='1'; Tab='viewer-light'; Photo=$true; Viewer=$true; Light=$true },
+        @{ Size='1020x700'; Scale='1.5'; Tab='viewer-dark'; Photo=$true; Viewer=$true },
+        @{ Size='1020x700'; Scale='1'; Tab='media-light'; Media=$true; Light=$true },
         @{ Size='1020x700'; Scale='1'; Tab='contacts'; Contacts=$true },
         @{ Size='1020x700'; Scale='1'; Tab='schedule'; Schedule=$true },
         @{ Size='480x360'; Scale='1'; Tab='schedule-small'; Schedule=$true },
@@ -163,6 +168,8 @@ try {
         if ($case.ContainsKey('PhoneSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-phone-sync') }
         if ($case.ContainsKey('ToolsTab')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-tools'); $process.StartInfo.ArgumentList.Add('--ui-smoke-tools-tab'); $process.StartInfo.ArgumentList.Add([string]$case.ToolsTab) }
         if ($case.ContainsKey('Outgoing')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-outgoing') }
+        if ($case.ContainsKey('Viewer')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-viewer') }
+        if ($case.ContainsKey('Light')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-light') }
         if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
         if ($case.ContainsKey('Media')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-media') }
         if ($case.ContainsKey('Contacts')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-contacts') }
@@ -192,18 +199,19 @@ try {
     $env:CTDOZ_DATA_DIR = $previousData
     $env:CTDOZ_RENDERER = $previousRenderer
 }
-Copy-Item $binary "dist\ctdozlite-$version-portable-windows-arm64.exe" -Force
+$assetVersion = $productVersion.TrimStart('v')
+Copy-Item $binary "dist\ctdozlite-$assetVersion-portable-windows-arm64.exe" -Force
 $compiler = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $compiler) { throw 'Install Inno Setup 6.7.1 or newer before packaging' }
 $buildDir = Split-Path $binary
-Invoke-Checked $compiler.Source @("/DMyAppVersion=$version", "/DBuildDir=$buildDir", 'packaging\windows\installer.iss')
+Invoke-Checked $compiler.Source @("/DMyAppVersion=$version", "/DMyProductVersion=$productVersion", "/DBuildDir=$buildDir", 'packaging\windows\installer.iss')
 $installer = 'dist\ctdozlite-setup-windows-arm64.exe'
 if (-not (Test-Path $installer)) { throw 'Installer was not produced' }
-Move-Item $installer "dist\ctdozlite-$version-setup-windows-arm64.exe" -Force
+Move-Item $installer "dist\ctdozlite-$assetVersion-setup-windows-arm64.exe" -Force
 Copy-Item LICENSE-MIT, LICENSE-APACHE, THIRD_PARTY_NOTICES.txt, docs\WINDOWS_ARM64.md dist -Force
 $sourceCommit = (& git rev-parse HEAD).Trim()
 @{
-    version = $version; target = $target; commit = $sourceCommit; rust = $hostInfo
+    version = $version; product_version = $productVersion; target = $target; commit = $sourceCommit; rust = $hostInfo
     cargo_lock_sha256 = (Get-FileHash Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
     video_backend = 'Windows Media Foundation (native)'
     renderer = 'Direct3D 12'

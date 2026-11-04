@@ -3,6 +3,7 @@
 //! Protocol reimplemented from Zalo PC 26.10.11.
 
 #![allow(dead_code)]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use zalo_rust::{chat, gui, logger, login, platform, qr, session, storage, store, tui, ui, video};
 
@@ -15,8 +16,9 @@ use session::Session;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    attach_cli_console(&args);
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("ctdozlite v{} (Windows ARM64)", env!("CARGO_PKG_VERSION"));
+        println!("ctdozlite {} (Windows ARM64)", zalo_rust::PRODUCT_VERSION);
         return Ok(());
     }
     if args.iter().any(|a| a == "--licenses") {
@@ -116,23 +118,6 @@ async fn main() -> Result<()> {
     // Background worker in `gui.rs` handles `get_server_info`, `get_friends`, and `poll_new_messages`.
     if force_gui || (!force_tui && !force_qr && !args.iter().any(|a| a.starts_with("--phone"))) {
         println!("🚀 Đang khởi chạy giao diện đồ họa Zalo GUI (egui)…");
-        #[cfg(target_os = "windows")]
-        if !dev_mode {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn GetConsoleWindow() -> *mut std::ffi::c_void;
-            }
-            #[link(name = "user32")]
-            extern "system" {
-                fn ShowWindow(hwnd: *mut std::ffi::c_void, n_cmd_show: i32) -> i32;
-            }
-            unsafe {
-                let hwnd = GetConsoleWindow();
-                if !hwnd.is_null() {
-                    ShowWindow(hwnd, 0); // SW_HIDE
-                }
-            }
-        }
         let mut viewport = eframe::egui::ViewportBuilder::default()
             .with_decorations(true)
             .with_inner_size([1020.0, 700.0])
@@ -370,4 +355,36 @@ fn gui_renderer_order() -> Vec<eframe::Renderer> {
         _ => {}
     }
     order
+}
+
+// A GUI-subsystem release never creates a console for ordinary desktop launches.
+// Explicit CLI invocations can reuse their parent terminal without hiding it.
+fn attach_cli_console(args: &[String]) {
+    #[cfg(windows)]
+    if args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--tui"
+                | "--qr"
+                | "--doctor"
+                | "--version"
+                | "-V"
+                | "--licenses"
+                | "--logout"
+                | "--dev"
+                | "--verbose"
+                | "-v"
+        ) || a.starts_with("--phone")
+    }) {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(process: u32) -> i32;
+        }
+        // SAFETY: the special parent PID attaches only this process to an existing console.
+        unsafe {
+            AttachConsole(u32::MAX);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = args;
 }

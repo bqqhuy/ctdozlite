@@ -1,6 +1,16 @@
 use super::*;
 
 pub enum WorkerCmd {
+    CopyViewerImage {
+        owner: String,
+        context: ChatImage,
+    },
+    MediaNeighbor {
+        owner: String,
+        thread: String,
+        anchor: String,
+        next: bool,
+    },
     LoadComposerDraft {
         owner: String,
         thread: String,
@@ -24,6 +34,7 @@ pub enum WorkerCmd {
         url: String,
         name: String,
         play: bool,
+        open: bool,
         context: Option<ChatImage>,
     },
     OpenDownloaded {
@@ -39,7 +50,10 @@ pub enum WorkerCmd {
         thread_id: String,
         message: ChatMessage,
     },
-    ReadClipboardImage,
+    ReadClipboardImage {
+        owner: String,
+        thread: String,
+    },
     /// Open the Windows region picker and attach the capture like a pasted image.
     CaptureScreen {
         owner: String,
@@ -957,10 +971,47 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::LaunchUpdate(ready)=>{
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{let result=tokio::task::spawn_blocking(move||crate::updater::launch_update(ready)).await.unwrap_or_else(|_|Err("Không chạy được bộ cài".into()));let _=tx.send(GuiEvent::UpdateLaunched(result));ctx.request_repaint();});
                         }
+                        WorkerCmd::CopyViewerImage{owner,context}=>{
+                            static COPY:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(1);
+                            let Ok(slot)=COPY.try_acquire() else{let _=gui_tx.send(GuiEvent::StatusUpdate("Đang sao chép ảnh…".into()));continue;};
+                            let account=session.lock().await.clone();if owner!=account.account_key()||!account.is_active(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let _slot=slot;
+                                let media=crate::message_view::media(&context.message);
+                                let key=crate::media_recovery::image_key(&context.thread,&context.message.id,0,true);
+                                let url=media.preview.or(media.original).or(media.thumbnail).unwrap_or_default();
+                                let result=fetch_chat_image(&account,&key,&url,Some(context),&tx).await;
+                                let status=match result {
+                                    Ok(image)=>{let active=account.clone();let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
+                                        anyhow::ensure!(active.is_active(),"Đã đăng xuất");
+                                        #[cfg(windows)]{crate::clipboard_image::write_windows(&image)}
+                                        #[cfg(not(windows))]{let _=image;anyhow::bail!("Sao chép ảnh yêu cầu Windows")}
+                                    }).await;
+                                        if matches!(result,Ok(Ok(()))){"Đã sao chép ảnh đang xem"}else{"Không sao chép được ảnh; clipboard có thể đang bận"}
+                                    },
+                                    Err(_)=>"Không tải được ảnh để sao chép",
+                                };
+                                if account.is_active(){let _=tx.send(GuiEvent::StatusUpdate(status.into()));ctx.request_repaint();}
+                            });
+                        }
+                        WorkerCmd::MediaNeighbor{owner,thread,anchor,next}=>{
+                            let account=session.lock().await.clone();if owner!=account.account_key()||!account.is_active(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let t=thread.clone();let a=anchor.clone();let disk=account.clone();
+                                let result=tokio::task::spawn_blocking(move||->anyhow::Result<_>{
+                                    anyhow::ensure!(disk.is_active(),"Đã đăng xuất");
+                                    let store=crate::store::MessageStore::open(disk.history_path())?;
+                                    crate::tools::media_neighbor(&store,&t,&a,next)
+                                }).await.map_err(|_|"Không đọc được lịch sử media".to_owned()).and_then(|r|r.map_err(|_|"Không đọc được lịch sử media".into()));
+                                if account.is_active(){let _=tx.send(GuiEvent::MediaNeighbor{owner,thread,anchor,result});ctx.request_repaint();}
+                            });
+                        }
                         WorkerCmd::OpenDownloaded{path,folder}=>{
                             tokio::task::spawn_blocking(move||{if folder{if let Some(parent)=path.parent(){crate::platform::open_folder(parent);}}else{crate::platform::open_file(&path);}});
                         }
-                        WorkerCmd::DownloadMedia{mut url,name,play,context}=>{
+                        WorkerCmd::DownloadMedia{mut url,name,play,open,context}=>{
                             static REQUESTS:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(4);
                             let Ok(request_slot)=REQUESTS.try_acquire() else {let _=gui_tx.send(GuiEvent::StatusUpdate("Đang có nhiều yêu cầu tải; vui lòng chờ hoặc hủy bớt".into()));continue;};
                             let account=session.lock().await.clone();if !account.is_active() || account.account_key().is_empty(){continue;}
@@ -974,7 +1025,28 @@ pub(super) fn spawn_session_worker(
                                     let root=account.history_path().with_extension("video-cache");let name=name.clone();let id=id.clone();
                                     tokio::task::spawn_blocking(move||crate::video_player::CachedVideo::reserve(&root,&format!("{id}-{name}"))).await.ok().and_then(Result::ok)
                                 }else{None};
-                                let destination=if play {video_lease.as_ref().map(|v|v.path().to_owned())}else{
+                                let file_entry=if open {
+                                    let Some(source)=context.as_ref() else {let _=tx.send(GuiEvent::StatusUpdate("Thiếu định danh tệp đính kèm".into()));return;};
+                                    let root=account.history_path().with_extension("attachment-cache");
+                                    let thread=source.thread.clone();let message=source.message.id.clone();let name=name.clone();
+                                    match tokio::task::spawn_blocking(move||crate::attachment_cache::Entry::reserve(&root,&thread,&message,&name)).await {
+                                        Ok(Ok(Some(entry)))=>Some(entry),
+                                        Ok(Ok(None))=>{let _=tx.send(GuiEvent::StatusUpdate("Cache đang xử lý tệp; vui lòng thử lại sau".into()));ctx.request_repaint();return;},
+                                        _=>{let _=tx.send(GuiEvent::StatusUpdate("Không tạo được cache tệp".into()));ctx.request_repaint();return;}
+                                    }
+                                }else{None};
+                                let (file_entry,ready)=if let Some(entry)=file_entry {
+                                    match tokio::task::spawn_blocking(move||{let ready=entry.ready();(entry,ready)}).await {
+                                        Ok((entry,ready))=>(Some(entry),ready),
+                                        Err(_)=>{let _=tx.send(GuiEvent::StatusUpdate("Không đọc được cache tệp".into()));ctx.request_repaint();return;}
+                                    }
+                                }else{(None,false)};
+                                if let Some(entry)=file_entry.as_ref().filter(|_|ready) {
+                                    let path=entry.path().to_owned();
+                                    tokio::task::spawn_blocking(move||{if account.is_active(){crate::platform::open_file(&path);}}).await.ok();
+                                    return;
+                                }
+                                let destination=if open {file_entry.as_ref().map(|e|e.path().to_owned())}else if play {video_lease.as_ref().map(|v|v.path().to_owned())}else{
                                     let name=name.clone();tokio::task::spawn_blocking(move||{
                                         #[cfg(windows)]{rfd::FileDialog::new().set_title("Lưu tệp về máy").set_file_name(&name).save_file()}
                                         #[cfg(not(windows))]{let _=name;None}
@@ -987,16 +1059,21 @@ pub(super) fn spawn_session_worker(
                                 let mut result=save_media_target(&url,&path,cancel.clone(),|bytes,total|{
                                     if !account.is_active(){cancel.store(true,std::sync::atomic::Ordering::Release);}
                                     let _=tx.send(GuiEvent::MediaProgress{owner:owner.clone(),id:id.clone(),bytes,total});ctx.request_repaint();
-                                },visual,video_lease.as_ref()).await;
+                                },visual,video_lease.as_ref(),open).await;
                                 if result.as_ref().err().and_then(|e|e.downcast_ref::<crate::media_recovery::Failure>()).is_some_and(|e|e.renew_candidate()) {
                                     if let Some(context)=context.as_ref(){
                                         if let Ok(media)=crate::media_renew::renew(&account,&context.thread,context.group,&context.message).await {
-                                            if let Some(next)=media.original.clone() {let mut renewed=context.clone();if persist_media_projection(&account,&mut renewed,&media,&tx).await.is_err(){crate::logger::log_error("media renewal","Cannot persist renewed file metadata");}url=next;result=save_media_target(&url,&path,cancel.clone(),|bytes,total|{let _=tx.send(GuiEvent::MediaProgress{owner:owner.clone(),id:id.clone(),bytes,total});ctx.request_repaint();},visual,video_lease.as_ref()).await;}
+                                            if let Some(next)=media.original.clone() {let mut renewed=context.clone();if persist_media_projection(&account,&mut renewed,&media,&tx).await.is_err(){crate::logger::log_error("media renewal","Cannot persist renewed file metadata");}url=next;result=save_media_target(&url,&path,cancel.clone(),|bytes,total|{if !account.is_active(){cancel.store(true,std::sync::atomic::Ordering::Release);}let _=tx.send(GuiEvent::MediaProgress{owner:owner.clone(),id:id.clone(),bytes,total});ctx.request_repaint();},visual,video_lease.as_ref(),open).await;}
                                         }
                                     }
                                 }
                                 let result=result.map(|_|path.clone()).map_err(|e|e.to_string());
                                 let success=result.is_ok();let _=tx.send(GuiEvent::MediaFinished{owner:owner.clone(),id:id.clone(),result});ctx.request_repaint();
+                                if success && open && account.is_active(){
+                                    let path=path.clone();let account=account.clone();
+                                    tokio::task::spawn_blocking(move||{if account.is_active(){crate::platform::open_file(&path);}}).await.ok();
+                                }
+                                if let Some(entry)=file_entry {tokio::task::spawn_blocking(move||entry.prune()).await.ok();}
                                 if success && play && account.is_active(){
                                     let result=tokio::task::spawn_blocking(move||crate::video_player::play(&path,&name,||account.is_active())).await;
                                     let _=tx.send(GuiEvent::MediaTransientClosed{owner,id});ctx.request_repaint();
@@ -1050,12 +1127,12 @@ pub(super) fn spawn_session_worker(
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::ReadClipboardImage => {
+                        WorkerCmd::ReadClipboardImage{owner,thread} => {
+                            let account=session.lock().await.clone();if owner!=account.account_key()||!account.is_active(){continue;}
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let image = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten();
-                                let _ = tx.send(GuiEvent::ClipboardImageRead(image));
-                                ctx.request_repaint();
+                                if account.is_active(){let _ = tx.send(GuiEvent::ClipboardImageRead{owner,thread,image});ctx.request_repaint();}
                             });
                         }
                         WorkerCmd::SetConversationPreference { owner, thread_id, is_group, value } => {
@@ -3089,9 +3166,12 @@ async fn save_media_target<F: FnMut(u64, Option<u64>)>(
     progress: F,
     visual: bool,
     lease: Option<&crate::video_player::CachedVideo>,
+    cached: bool,
 ) -> anyhow::Result<u64> {
     if let Some(lease) = lease {
         crate::media_download::save_video(url, path, cancel, progress, lease).await
+    } else if cached {
+        crate::media_download::save_cached(url, path, cancel, progress, visual).await
     } else {
         crate::media_download::save_classified(url, path, cancel, progress, visual).await
     }

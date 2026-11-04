@@ -107,7 +107,17 @@ pub enum GuiEvent {
         owner: String,
         result: Result<tools_panel::ToolsResult, String>,
     },
-    ClipboardImageRead(Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>),
+    MediaNeighbor {
+        owner: String,
+        thread: String,
+        anchor: String,
+        result: Result<Option<ChatMessage>, String>,
+    },
+    ClipboardImageRead {
+        owner: String,
+        thread: String,
+        image: Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>,
+    },
     /// A region capture ready to preview, or why there is none.
     ScreenCaptureFinished {
         owner: String,
@@ -299,11 +309,16 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ImageViewerModal {
+    source: worker::ChatImage,
+    is_video: bool,
+    navigation_pending: bool,
+    thread_id: String,
+    message_id: String,
+    dimensions: Option<(u32, u32)>,
     tex_key: String,
     hd_tex_key: Option<String>,
-    full_url: String,
     original_url: String,
     title: String,
     sender: String,
@@ -411,7 +426,7 @@ impl Default for AppSettings {
             send_photo_original: true,
             hidden_chat_pin_enabled: true,
             split_priority_inbox: false,
-            excel_paste_mode: "ask".into(),
+            excel_paste_mode: "image".into(),
             double_click_to_reply: true,
             show_typing_indicator: true,
             suggest_stickers_while_typing: true,
@@ -577,6 +592,9 @@ pub struct ZaloGuiApp {
     composer_sticker_selected: Option<usize>,
     composer_focus_pending: bool,
     clipboard_read_pending: bool,
+    clipboard_text_fallback: Option<String>,
+    clipboard_text_only: bool,
+    clipboard_alternative_text: Option<String>,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
     unread_counts: HashMap<String, usize>,
     conversation_preferences: HashMap<String, crate::store::ConversationPreference>,
@@ -830,6 +848,9 @@ impl ZaloGuiApp {
             composer_sticker_selected: None,
             composer_focus_pending: false,
             clipboard_read_pending: false,
+            clipboard_text_fallback: None,
+            clipboard_text_only: false,
+            clipboard_alternative_text: None,
             pending_clipboard_image: None,
             unread_counts,
             conversation_preferences: HashMap::new(),
@@ -1271,6 +1292,19 @@ impl ZaloGuiApp {
                     error: String::new(),
                 });
             }
+            if args.iter().any(|a| a == "--ui-smoke-light") {
+                app.dark_mode = false;
+                ThemePalette::light().apply_to_ctx(ctx);
+            }
+            if args.iter().any(|a| a == "--ui-smoke-viewer") {
+                if let Some((thread, message)) = app
+                    .threads
+                    .first()
+                    .and_then(|t| t.messages.first().map(|m| (t.id.clone(), m.clone())))
+                {
+                    app.open_media_viewer(&thread, &message);
+                }
+            }
             // No worker, account restore, network calls, or real contacts in smoke mode.
             return app;
         }
@@ -1319,6 +1353,9 @@ impl ZaloGuiApp {
         self.group_members_state.clear();
         self.group_member_search.clear();
         self.screen_capture_pending = false;
+        self.clipboard_text_fallback = None;
+        self.clipboard_alternative_text = None;
+        self.clipboard_text_only = false;
     }
 
     fn request_screen_capture(&mut self) {
@@ -1347,7 +1384,16 @@ impl ZaloGuiApp {
             return;
         }
         if let Some(tx) = WORKER_TX.get() {
-            self.clipboard_read_pending = tx.send(WorkerCmd::ReadClipboardImage).is_ok();
+            self.clipboard_read_pending = tx
+                .send(WorkerCmd::ReadClipboardImage {
+                    owner: self.user_uin.clone(),
+                    thread: self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .map(|t| t.id.clone())
+                        .unwrap_or_default(),
+                })
+                .is_ok();
         }
     }
 
@@ -1528,9 +1574,52 @@ impl ZaloGuiApp {
                         Err(reason) => self.show_toast(reason),
                     }
                 }
-                GuiEvent::ClipboardImageRead(image) => {
+                GuiEvent::MediaNeighbor {
+                    owner,
+                    thread,
+                    anchor,
+                    result,
+                } => {
+                    if owner != self.user_uin
+                        || !self
+                            .image_viewer
+                            .as_ref()
+                            .is_some_and(|v| v.thread_id == thread && v.message_id == anchor)
+                    {
+                        continue;
+                    }
+                    if let Some(viewer) = self.image_viewer.as_mut() {
+                        viewer.navigation_pending = false;
+                    }
+                    match result {
+                        Ok(Some(message)) => self.open_media_viewer(&thread, &message),
+                        Ok(None) => self
+                            .show_toast("Không còn ảnh/video theo hướng này trong lịch sử cục bộ"),
+                        Err(reason) => self.show_toast(reason),
+                    }
+                }
+                GuiEvent::ClipboardImageRead {
+                    owner,
+                    thread,
+                    image,
+                } => {
+                    if owner != self.user_uin {
+                        continue;
+                    }
                     self.clipboard_read_pending = false;
+                    if !self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .is_some_and(|t| t.id == thread)
+                    {
+                        self.clipboard_text_fallback = None;
+                        continue;
+                    }
                     if let Some((path, w, h, image)) = image {
+                        self.clipboard_alternative_text =
+                            self.clipboard_text_fallback.take().filter(|text| {
+                                self.settings.excel_paste_mode == "ask" && text.contains('\t')
+                            });
                         let texture =
                             ctx.load_texture("clipboard-preview", image, TextureOptions::LINEAR);
                         self.pending_clipboard_image = Some((path, w, h, texture));
@@ -1538,6 +1627,10 @@ impl ZaloGuiApp {
                         self.show_toast(format!(
                             "Đã dán ảnh ({w}×{h} px) từ Clipboard — nhấn Enter để gửi"
                         ));
+                    } else if let Some(text) = self.clipboard_text_fallback.take() {
+                        self.input_message.push_str(&text);
+                        self.composer_focus_pending = true;
+                        self.show_toast("Không đọc được ảnh; đã dán dạng văn bản");
                     } else {
                         self.show_toast(
                             "Không đọc được ảnh Clipboard hoặc ảnh vượt giới hạn cho phép",
@@ -1609,7 +1702,7 @@ impl ZaloGuiApp {
                 GuiEvent::ThreadHistoryCleared { owner, thread_id } => {
                     if self.is_logged_in && owner == self.user_uin {
                         if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                            thread.unread.read_visible(&thread.messages);
+                            thread.unread.read_foreground(&thread.messages);
                             thread.messages.clear();
                             thread.preview.clear();
                             thread.time.clear();
@@ -1709,7 +1802,7 @@ impl ZaloGuiApp {
                                 };
                                 if metadata_fresh || existing.unread.last_seen_id.is_some() {
                                     if existing.id == active_tid && is_focused {
-                                        existing.unread.read_visible(&existing.messages);
+                                        existing.unread.read_foreground(&existing.messages);
                                     }
                                     if existing.unread.count() == 0 {
                                         self.unread_counts.remove(&existing.id);
@@ -1743,7 +1836,7 @@ impl ZaloGuiApp {
                                     nt.unread.advance_seen("0");
                                     nt.unread.observe_for_account(&nt.messages, &self.user_uin);
                                     if nt.id == active_tid && is_focused {
-                                        nt.unread.read_visible(&nt.messages);
+                                        nt.unread.read_foreground(&nt.messages);
                                     }
                                     if nt.unread.count() > 0 {
                                         self.unread_counts.insert(nt.id.clone(), nt.unread.count());
@@ -2308,6 +2401,16 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::MediaRenewed { thread, message } => {
+                    if let Some(viewer) = self
+                        .image_viewer
+                        .as_mut()
+                        .filter(|v| v.thread_id == thread && v.message_id == message.id)
+                    {
+                        let media = crate::message_view::media(&message);
+                        viewer.original_url = media.original.unwrap_or_default();
+                        viewer.dimensions = media.width.zip(media.height);
+                        viewer.source.message = (*message).clone();
+                    }
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread) {
                         if let Some(m) = t.messages.iter_mut().find(|m| m.id == message.id) {
                             m.link_url = message.link_url;
@@ -3806,5 +3909,91 @@ mod capture_boundary_tests {
         app.screen_capture_pending = true;
         app.clear_presence_state();
         assert!(!app.screen_capture_pending);
+    }
+}
+
+#[cfg(test)]
+mod v003_viewer_tests {
+    use super::*;
+    fn text_rects(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    text_rects(shape, out);
+                }
+            }
+            egui::Shape::Text(text) => out.push((
+                text.galley.job.text.clone(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            _ => {}
+        }
+    }
+    #[test]
+    fn viewer_actions_fit_small_and_large_light_and_dark_windows() {
+        for dark in [false, true] {
+            for size in [Vec2::new(480.0, 360.0), Vec2::new(1020.0, 700.0)] {
+                let ctx = egui::Context::default();
+                let message = ChatMessage {
+                    id: "photo-1".into(),
+                    sender: "Một tên người gửi rất dài để kiểm tra".into(),
+                    kind: crate::message_model::MessageKind::Photo,
+                    link_url: Some("https://example.invalid/photo.jpg".into()),
+                    link_title: Some("Bức ảnh kiểm tra bố cục với tên tệp dài.jpg".into()),
+                    ..Default::default()
+                };
+                let mut app = ZaloGuiApp::from_context(
+                    &ctx,
+                    Session::new(false, false, false).unwrap(),
+                    false,
+                    vec![Thread {
+                        id: "thread-1".into(),
+                        messages: vec![message.clone()],
+                        ..Default::default()
+                    }],
+                    false,
+                );
+                app.dark_mode = dark;
+                app.is_logged_in = true;
+                let pal = app.palette();
+                pal.apply_to_ctx(&ctx);
+                let key = crate::media_recovery::image_key("thread-1", "photo-1", 0, true);
+                app.store_texture(&ctx, key, egui::ColorImage::new([80, 60], Color32::BLUE));
+                app.open_media_viewer("thread-1", &message);
+                let mut last = Vec::new();
+                for _ in 0..3 {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| app.render_image_viewer_modal(ctx, &pal),
+                    );
+                    last.clear();
+                    for shape in output.shapes {
+                        text_rects(&shape.shape, &mut last);
+                    }
+                }
+                for label in [
+                    "Lưu thành…",
+                    "Sao chép ảnh",
+                    "Sao chép link",
+                    "Đóng ×",
+                    "Vừa cửa sổ",
+                ] {
+                    let (_, rect) = last
+                        .iter()
+                        .find(|(text, _)| text == label)
+                        .unwrap_or_else(|| panic!("missing {label}"));
+                    assert!(
+                        rect.left() >= 0.0
+                            && rect.right() <= size.x + 1.0
+                            && rect.top() >= 0.0
+                            && rect.bottom() < size.y,
+                        "{label}: {rect:?} in {size:?}"
+                    );
+                }
+            }
+        }
     }
 }
