@@ -521,6 +521,91 @@ pub fn open_hit(store: &MessageStore, thread: &str, id: &str) -> Result<Thread> 
         ..Default::default()
     })
 }
+/// Find one adjacent visual attachment using the thread/time index, without hydrating history.
+/// # Errors
+/// Returns database failures or an unavailable anchor.
+pub(crate) fn media_neighbor(
+    store: &MessageStore,
+    thread: &str,
+    anchor: &str,
+    next: bool,
+) -> Result<Option<ChatMessage>> {
+    ensure!(
+        thread.len() <= 512 && anchor.len() <= 512,
+        "Định danh quá dài"
+    );
+    let ts: i64 = store.conn.query_row(
+        "SELECT ts FROM messages WHERE thread_id=?1 AND msg_id=?2",
+        params![thread, anchor],
+        |r| r.get(0),
+    )?;
+    store.conn.create_scalar_function(
+        "ctdo_visual",
+        3,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+            | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let mut m = ChatMessage {
+                text: ctx.get(0)?,
+                ..Default::default()
+            };
+            let raw: String = ctx.get(1)?;
+            let kind: String = ctx.get(2)?;
+            if raw.len() > 1024 * 1024 {
+                return Ok(false);
+            }
+            if restore_import_metadata(&mut m, &raw).is_err() {
+                return Ok(false);
+            }
+            if m.kind == crate::message_model::MessageKind::Unknown {
+                m.kind = crate::message_model::MessageKind::from_wire_name(&kind);
+            }
+            Ok(!matches!(
+                m.kind,
+                crate::message_model::MessageKind::Recall
+                    | crate::message_model::MessageKind::Delete
+            ) && matches!(
+                crate::message_view::media(&m).kind,
+                crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
+            ))
+        },
+    )?;
+    let sql = if next {
+        "SELECT msg_id,COALESCE(sender_name,''),COALESCE(text,''),ts,COALESCE(is_outgoing,0),COALESCE(raw_json,''),COALESCE(msg_type,'') FROM messages WHERE thread_id=?1 AND (ts,msg_id)>(?2,?3) AND ctdo_visual(COALESCE(text,''),COALESCE(raw_json,''),COALESCE(msg_type,'')) ORDER BY ts ASC,msg_id ASC LIMIT 1"
+    } else {
+        "SELECT msg_id,COALESCE(sender_name,''),COALESCE(text,''),ts,COALESCE(is_outgoing,0),COALESCE(raw_json,''),COALESCE(msg_type,'') FROM messages WHERE thread_id=?1 AND (ts,msg_id)<(?2,?3) AND ctdo_visual(COALESCE(text,''),COALESCE(raw_json,''),COALESCE(msg_type,'')) ORDER BY ts DESC,msg_id DESC LIMIT 1"
+    };
+    let row = store
+        .conn
+        .query_row(sql, params![thread, ts, anchor], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })
+        .optional()?;
+    row.map(|(id, sender, text, ts, is_outgoing, raw, kind)| {
+        let mut m = ChatMessage {
+            id,
+            sender,
+            text,
+            ts,
+            is_outgoing,
+            ..Default::default()
+        };
+        restore_import_metadata(&mut m, &raw)?;
+        if m.kind == crate::message_model::MessageKind::Unknown {
+            m.kind = crate::message_model::MessageKind::from_wire_name(&kind);
+        }
+        Ok(m)
+    })
+    .transpose()
+}
 fn restore_import_metadata(message: &mut ChatMessage, raw: &str) -> Result<()> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
         if let Some(state) = value.get("message_state") {
@@ -1194,5 +1279,139 @@ mod deleted_import_tests {
         );
         assert!(destination.messages_for("thread-a", 20).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod gallery_tests {
+    use super::*;
+    #[test]
+    fn gallery_uses_time_and_id_order_and_never_crosses_threads() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let photo = |id: &str, ts: i64| ChatMessage {
+            id: id.into(),
+            ts,
+            kind: crate::message_model::MessageKind::Photo,
+            link_url: Some("https://example.invalid/photo.jpg".into()),
+            ..Default::default()
+        };
+        let thread = Thread {
+            id: "thread-a".into(),
+            name: "A".into(),
+            messages: vec![
+                photo("001", 10),
+                ChatMessage {
+                    id: "002".into(),
+                    ts: 10,
+                    text: "plain".into(),
+                    ..Default::default()
+                },
+                photo("003", 10),
+                photo("004", 20),
+            ],
+            ..Default::default()
+        };
+        crate::store::persist_threads(
+            &mut store,
+            &[
+                thread,
+                Thread {
+                    id: "thread-b".into(),
+                    messages: vec![photo("other", 11)],
+                    ..Default::default()
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            media_neighbor(&store, "thread-a", "001", true)
+                .unwrap()
+                .unwrap()
+                .id,
+            "003"
+        );
+        assert_eq!(
+            media_neighbor(&store, "thread-a", "004", false)
+                .unwrap()
+                .unwrap()
+                .id,
+            "003"
+        );
+        assert!(media_neighbor(&store, "thread-a", "001", false)
+            .unwrap()
+            .is_none());
+        assert!(media_neighbor(&store, "thread-a", "missing", true).is_err());
+        store.delete_message("thread-a", "003", 10).unwrap();
+        assert_eq!(
+            media_neighbor(&store, "thread-a", "001", true)
+                .unwrap()
+                .unwrap()
+                .id,
+            "004"
+        );
+        let plan:String=store.conn.query_row("EXPLAIN QUERY PLAN SELECT msg_id FROM messages WHERE thread_id=?1 AND (ts,msg_id)>(?2,?3) ORDER BY ts,msg_id LIMIT 1",params!["thread-a",10,"001"],|r|r.get(3)).unwrap();
+        assert!(plan.contains("INDEX"), "{plan}");
+    }
+}
+
+#[cfg(test)]
+mod media_gallery_bench {
+    use super::*;
+    #[test]
+    #[ignore = "Run explicitly to measure indexed navigation against full hydration"]
+    fn indexed_navigation_measurement() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let messages = (0..500)
+            .map(|i| ChatMessage {
+                id: format!("{i:06}"),
+                ts: i,
+                kind: if i % 10 == 0 {
+                    crate::message_model::MessageKind::Photo
+                } else {
+                    crate::message_model::MessageKind::Text
+                },
+                text: "fixture".into(),
+                link_url: (i % 10 == 0).then(|| "https://example.invalid/photo.jpg".into()),
+                ..Default::default()
+            })
+            .collect();
+        crate::store::persist_threads(
+            &mut store,
+            &[Thread {
+                id: "bench".into(),
+                messages,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        for indexed in [false, true] {
+            let mut times = Vec::new();
+            let budget = std::time::Instant::now();
+            for _ in 0..30 {
+                let start = std::time::Instant::now();
+                if indexed {
+                    assert!(media_neighbor(&store, "bench", "000200", true)
+                        .unwrap()
+                        .is_some());
+                } else {
+                    let mut threads = vec![Thread {
+                        id: "bench".into(),
+                        ..Default::default()
+                    }];
+                    store.hydrate_selected_threads(&mut threads, 500).unwrap();
+                    assert_eq!(threads[0].messages.len(), 500);
+                }
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+                if budget.elapsed() > std::time::Duration::from_secs(2) {
+                    break;
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            let count = times.len();
+            println!(
+                "{}",
+                serde_json::json!({"task":if indexed{"gallery_indexed_neighbor"}else{"full_thread_hydration_reference"},"rows":500,"iterations":count,"min_ms":times[0],"avg_ms":times.iter().sum::<f64>()/count as f64,"p50_ms":times[count/2],"p95_ms":times[(count*95/100).min(count-1)],"p99_ms":times[count-1]})
+            );
+        }
     }
 }

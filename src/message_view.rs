@@ -165,6 +165,19 @@ pub fn preview(t: &Thread) -> String {
     if body.is_empty() {
         return "Chưa có tin nhắn".into();
     }
+    let preview_id = last
+        .filter(|m| {
+            crate::clock::normalize_ts_ms(m.ts)
+                >= crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
+        })
+        .map(|m| m.id.as_str())
+        .unwrap_or(&t.presentation.last_message_id);
+    let mentioned = !outgoing && t.unread.mention_ids.contains(preview_id);
+    let body = if mentioned {
+        format!("[Nhắc đến bạn] {body}")
+    } else {
+        body
+    };
     if outgoing {
         return format!("Bạn: {}", body.strip_prefix("Bạn: ").unwrap_or(&body));
     }
@@ -274,6 +287,50 @@ fn legacy_media(m: &ChatMessage) -> Option<(MediaKind, String)> {
     }
     None
 }
+/// Explicit photo-bundle metadata; nearby timestamps alone never establish an album.
+/// Source: PC 26.11.10 compact-app-pc.js, photoBundle.groupLayoutId/totalItemInGroup/idInGroup.
+pub(crate) fn photo_bundle(message: &ChatMessage) -> Option<(String, u32)> {
+    if media(message).kind != MediaKind::Photo {
+        return None;
+    }
+    fn inspect(value: &Value, depth: u8) -> Option<(String, u32)> {
+        if depth > 4 {
+            return None;
+        }
+        let value = json_value(value.clone());
+        let id = value.get("groupLayoutId").and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+        });
+        if let (Some(id), Some(total)) = (id, value.get("totalItemInGroup").and_then(Value::as_u64))
+        {
+            if !id.is_empty() && id.len() <= 128 && (2..=100).contains(&total) {
+                return Some((id, total as u32));
+            }
+        }
+        for key in ["photoBundle", "params", "content", "data", "meta"] {
+            if let Some(found) = value.get(key).and_then(|v| inspect(v, depth + 1)) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    message
+        .wire_ref
+        .fields
+        .get("content")
+        .and_then(|v| inspect(v, 0))
+        .or_else(|| {
+            message
+                .wire_ref
+                .fields
+                .get("photoBundle")
+                .and_then(|v| inspect(v, 0))
+        })
+        .or_else(|| message.history_source.as_ref().and_then(|v| inspect(v, 0)))
+}
+
 pub fn media(m: &ChatMessage) -> Media {
     use crate::message_model::MessageKind;
     let legacy = legacy_media(m);
@@ -490,5 +547,22 @@ mod legacy_media_tests {
             m.link_url = Some(raw.into());
             assert_eq!(media(&m).kind, MediaKind::None);
         }
+    }
+}
+
+#[cfg(test)]
+mod photo_bundle_tests {
+    use super::*;
+    #[test]
+    fn albums_require_explicit_group_identity() {
+        let mut message = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            ..Default::default()
+        };
+        assert!(photo_bundle(&message).is_none());
+        message.wire_ref.fields.insert("content".into(),serde_json::json!({"params":{"photoBundle":{"groupLayoutId":"bundle-a","totalItemInGroup":3,"idInGroup":0}}}));
+        assert_eq!(photo_bundle(&message), Some(("bundle-a".into(), 3)));
+        message.kind = crate::message_model::MessageKind::Video;
+        assert!(photo_bundle(&message).is_none());
     }
 }

@@ -133,6 +133,124 @@ pub fn decode_dib(bytes: &[u8]) -> Result<image::RgbaImage> {
     Ok(image)
 }
 
+/// Rasterize Office vector clipboard data after all borrowed clipboard handles are released.
+#[cfg(windows)]
+fn render_emf(bytes: &[u8]) -> Result<image::RgbaImage> {
+    use windows::Win32::{
+        Foundation::{HANDLE, RECT},
+        Graphics::Gdi::*,
+    };
+    struct Resources {
+        emf: HENHMETAFILE,
+        dc: HDC,
+        bitmap: HBITMAP,
+        old: HGDIOBJ,
+    }
+    impl Drop for Resources {
+        fn drop(&mut self) {
+            // SAFETY: these resources were created and selected only on this worker thread.
+            unsafe {
+                if self.old.0 != 0 {
+                    SelectObject(self.dc, self.old);
+                }
+                if self.bitmap.0 != 0 {
+                    DeleteObject(self.bitmap);
+                }
+                if self.dc.0 != 0 {
+                    DeleteDC(self.dc);
+                }
+                if self.emf.0 != 0 {
+                    DeleteEnhMetaFile(self.emf);
+                }
+            }
+        }
+    }
+    ensure!(bytes.len() <= MAX_RAW, "Ảnh vector clipboard quá lớn");
+    // SAFETY: the owned byte slice outlives decoding; all GDI handles are RAII-owned.
+    unsafe {
+        let mut r = Resources {
+            emf: SetEnhMetaFileBits(bytes),
+            dc: HDC(0),
+            bitmap: HBITMAP(0),
+            old: HGDIOBJ(0),
+        };
+        ensure!(r.emf.0 != 0, "Không đọc được ảnh vector clipboard");
+        let mut header = ENHMETAHEADER::default();
+        ensure!(
+            GetEnhMetaFileHeader(
+                r.emf,
+                std::mem::size_of::<ENHMETAHEADER>() as u32,
+                Some(&mut header)
+            ) > 0,
+            "Thiếu kích thước ảnh vector"
+        );
+        // Office frame coordinates are hundredths of millimetres. 144 DPI keeps cell text sharp.
+        let dimension = |start: i32, end: i32, fallback: i64| {
+            let frame = end as i64 - start as i64;
+            if frame > 0 {
+                (frame * 144 + 1270) / 2540
+            } else {
+                fallback
+            }
+        };
+        let width = dimension(
+            header.rclFrame.left,
+            header.rclFrame.right,
+            header.rclBounds.right as i64 - header.rclBounds.left as i64,
+        );
+        let height = dimension(
+            header.rclFrame.top,
+            header.rclFrame.bottom,
+            header.rclBounds.bottom as i64 - header.rclBounds.top as i64,
+        );
+        ensure!(
+            (1..=8192).contains(&width)
+                && (1..=8192).contains(&height)
+                && width * height <= MAX_PIXELS as i64,
+            "Vùng Excel quá lớn; hãy sao chép vùng nhỏ hơn"
+        );
+        r.dc = CreateCompatibleDC(HDC(0));
+        ensure!(r.dc.0 != 0, "Không tạo được vùng vẽ clipboard");
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = std::ptr::null_mut();
+        r.bitmap = CreateDIBSection(r.dc, &info, DIB_RGB_COLORS, &mut pixels, HANDLE(0), 0)?;
+        ensure!(!pixels.is_null(), "Không tạo được bitmap clipboard");
+        r.old = SelectObject(r.dc, r.bitmap);
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        // Initialize opaque white because spreadsheet vector formats generally have no background fill.
+        let count = width as usize * height as usize * 4;
+        std::ptr::write_bytes(pixels.cast::<u8>(), 255, count);
+        ensure!(
+            PlayEnhMetaFile(r.dc, r.emf, &rect).as_bool(),
+            "Không vẽ được vùng Excel"
+        );
+        GdiFlush();
+        let bgra = std::slice::from_raw_parts(pixels.cast::<u8>(), count);
+        let mut rgba = Vec::with_capacity(count);
+        for pixel in bgra.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
+        }
+        image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+            .context("Bitmap clipboard không hợp lệ")
+    }
+}
+
 #[cfg(windows)]
 pub fn read_windows() -> Result<Option<image::RgbaImage>> {
     use std::ffi::c_void;
@@ -175,6 +293,7 @@ pub fn read_windows() -> Result<Option<image::RgbaImage>> {
     enum Source {
         Png(Vec<u8>),
         Dib(Vec<u8>),
+        Emf(Vec<u8>),
         File(std::path::PathBuf),
     }
     let source = {
@@ -239,6 +358,24 @@ pub fn read_windows() -> Result<Option<image::RgbaImage>> {
                 break;
             }
         }
+        // SAFETY: format inspection borrows no clipboard memory and runs on this reader thread.
+        if source.is_none() && unsafe { IsClipboardFormatAvailable(14) } != 0 {
+            use windows::Win32::Graphics::Gdi::{GetEnhMetaFileBits, HENHMETAFILE};
+            // SAFETY: clipboard remains open; copy the vector bytes before releasing its handle.
+            unsafe {
+                let handle = GetClipboardData(14);
+                if !handle.is_null() {
+                    let emf = HENHMETAFILE(handle as isize);
+                    let count = GetEnhMetaFileBits(emf, None) as usize;
+                    if count > 0 && count <= MAX_RAW {
+                        let mut bytes = vec![0; count];
+                        if GetEnhMetaFileBits(emf, Some(&mut bytes)) as usize == count {
+                            source = Some(Source::Emf(bytes));
+                        }
+                    }
+                }
+            }
+        }
         if source.is_none() {
             // SAFETY: HDROP is queried only while the clipboard remains open; path is copied.
             unsafe {
@@ -267,6 +404,7 @@ pub fn read_windows() -> Result<Option<image::RgbaImage>> {
         None => return Ok(None),
         Some(Source::Png(bytes)) => crate::limits::decode_image(&bytes)?.to_rgba8(),
         Some(Source::Dib(bytes)) => decode_dib(&bytes)?,
+        Some(Source::Emf(bytes)) => render_emf(&bytes)?,
         Some(Source::File(path)) => crate::limits::decode_image(&crate::limits::read_file(
             &path,
             crate::limits::IMAGE_BYTES,
@@ -317,4 +455,120 @@ mod tests {
         b[16..20].copy_from_slice(&1u32.to_le_bytes());
         assert!(decode_dib(&b).is_err());
     }
+}
+
+/// Copy decoded viewer pixels as a top-down DIB, without exposing a signed CDN URL.
+/// # Errors
+/// Returns clipboard ownership/allocation failures. Must run off the UI thread.
+#[cfg(windows)]
+pub(crate) fn write_windows(image: &eframe::egui::ColorImage) -> Result<()> {
+    use std::ffi::c_void;
+    use windows::{
+        core::w,
+        Win32::{Foundation::HWND, UI::WindowsAndMessaging::*},
+    };
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(format: u32, memory: *mut c_void) -> *mut c_void;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+        fn GlobalLock(memory: *mut c_void) -> *const u8;
+        fn GlobalUnlock(memory: *mut c_void) -> i32;
+        fn GlobalFree(memory: *mut c_void) -> *mut c_void;
+    }
+    struct Owned {
+        hwnd: HWND,
+        memory: *mut c_void,
+        opened: bool,
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: ownership transfers to Windows only after SetClipboardData succeeds.
+            unsafe {
+                if self.opened {
+                    CloseClipboard();
+                }
+                if !self.memory.is_null() {
+                    GlobalFree(self.memory);
+                }
+                if self.hwnd.0 != 0 {
+                    let _ = DestroyWindow(self.hwnd);
+                }
+            }
+        }
+    }
+    let [width, height] = image.size;
+    ensure!(
+        width > 0
+            && height > 0
+            && width <= 8192
+            && height <= 8192
+            && width
+                .checked_mul(height)
+                .is_some_and(|n| n <= MAX_PIXELS && n == image.pixels.len()),
+        "Ảnh quá lớn để sao chép"
+    );
+    let bytes = 40 + image.pixels.len() * 4;
+    // SAFETY: all handles stay on this worker, allocations are checked and sized before writing.
+    unsafe {
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+        );
+        ensure!(hwnd.0 != 0, "Không tạo được chủ clipboard");
+        let mut owned = Owned {
+            hwnd,
+            memory: GlobalAlloc(2, bytes),
+            opened: false,
+        };
+        ensure!(!owned.memory.is_null(), "Không cấp phát được clipboard");
+        let ptr = GlobalLock(owned.memory);
+        ensure!(!ptr.is_null(), "Không ghi được clipboard");
+        let buffer = std::slice::from_raw_parts_mut(ptr as *mut u8, bytes);
+        buffer.fill(0);
+        buffer[0..4].copy_from_slice(&40u32.to_le_bytes());
+        buffer[4..8].copy_from_slice(&(width as i32).to_le_bytes());
+        buffer[8..12].copy_from_slice(&(-(height as i32)).to_le_bytes());
+        buffer[12..14].copy_from_slice(&1u16.to_le_bytes());
+        buffer[14..16].copy_from_slice(&32u16.to_le_bytes());
+        for (out, pixel) in buffer[40..]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(&image.pixels)
+        {
+            out.copy_from_slice(&[pixel.b(), pixel.g(), pixel.r(), 255]);
+        }
+        GlobalUnlock(owned.memory);
+        for _ in 0..8 {
+            if OpenClipboard(hwnd.0 as *mut c_void) != 0 {
+                owned.opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+        ensure!(owned.opened, "Clipboard đang bận");
+        ensure!(EmptyClipboard() != 0, "Không mở được clipboard để ghi");
+        ensure!(
+            !SetClipboardData(8, owned.memory).is_null(),
+            "Không sao chép được ảnh"
+        );
+        owned.memory = std::ptr::null_mut();
+    }
+    Ok(())
 }

@@ -372,6 +372,18 @@ impl Desktop {
             if CLOSE.with(|c| c.replace(false)) {
                 self.popup.close();
             }
+            let mut pointer = POINT::default();
+            let mut bounds = RECT::default();
+            if IsWindowVisible(self.hwnd).as_bool()
+                && GetCursorPos(&mut pointer).is_ok()
+                && GetWindowRect(self.hwnd, &mut bounds).is_ok()
+                && pointer.x >= bounds.left
+                && pointer.x < bounds.right
+                && pointer.y >= bounds.top
+                && pointer.y < bounds.bottom
+            {
+                self.popup.hold(now);
+            }
             self.popup.update(&snapshot, now, background);
             CARD.with(|slot| {
                 if let Ok(mut slot) = slot.try_borrow_mut() {

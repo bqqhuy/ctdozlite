@@ -80,6 +80,7 @@ impl LiveUpdates {
                             let preview = Thread {
                                 is_group: thread.is_group,
                                 messages: vec![message.clone()],
+                                unread: thread.unread.clone(),
                                 ..Default::default()
                             };
                             if let Ok(mut slot) = self.notice.lock() {

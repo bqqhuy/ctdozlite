@@ -1,3 +1,6 @@
+/// User-visible fork release identifier, independent of the numeric Windows file version.
+pub const PRODUCT_VERSION: &str = "v0.003-arm";
+
 pub mod call;
 pub mod chat;
 pub mod clock;
@@ -110,3 +113,5 @@ pub mod screen_capture;
 pub mod upload_events;
 /// Local video size, duration and poster for video messages.
 pub mod video_meta;
+
+mod attachment_cache;

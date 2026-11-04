@@ -34,9 +34,15 @@ pub(super) struct ThemePalette {
 
 impl ThemePalette {
     pub(super) fn apply_tools_theme(&mut self, value: &serde_json::Value) {
-        let section = value
-            .get(if self.is_dark { "dark" } else { "light" })
-            .unwrap_or(value);
+        // Legacy flat themes describe a single (dark) palette. Do not apply their
+        // white foregrounds to light mode when no light palette was supplied.
+        let section = match value.get(if self.is_dark { "dark" } else { "light" }) {
+            Some(section) => section,
+            None if self.is_dark && value.get("light").is_none() && value.get("dark").is_none() => {
+                value
+            }
+            None => return,
+        };
         for (name, target) in [
             ("bg_app", &mut self.bg_app),
             ("bg_sidebar", &mut self.bg_sidebar),
@@ -123,7 +129,7 @@ impl ThemePalette {
             primary_hover: Color32::from_rgb(37, 99, 235),    // #2563EB
             accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
             danger: Color32::from_rgb(220, 38, 38),           // #DC2626
-            warning: Color32::from_rgb(217, 119, 6),          // #D97706
+            warning: Color32::from_rgb(146, 64, 14),          // #92400E
             bubble_out_bg: Color32::from_rgb(229, 239, 255), // Zalo Desktop Light Outgoing (#E5EFFF)
             bubble_out_text: Color32::from_rgb(15, 23, 42),  // Crisp dark text on light blue (14:1)
             bubble_out_meta: Color32::from_rgb(71, 92, 122),
@@ -155,10 +161,13 @@ impl ThemePalette {
         visuals.extreme_bg_color = self.bg_input;
         visuals.faint_bg_color = self.bg_hover;
         visuals.override_text_color = Some(self.text_primary);
+        visuals.hyperlink_color = self.primary_hover;
+        visuals.warn_fg_color = self.warning;
+        visuals.error_fg_color = self.danger;
         visuals.selection.bg_fill =
             self.primary
                 .linear_multiply(if self.is_dark { 0.45 } else { 0.22 });
-        visuals.selection.stroke = Stroke::new(1.5_f32, self.primary);
+        visuals.selection.stroke = Stroke::new(1.5_f32, self.text_primary);
 
         let r = Rounding::same(8.0);
         visuals.widgets.noninteractive.bg_fill = self.bg_app;
@@ -970,5 +979,27 @@ mod avatar_crop_tests {
         assert_eq!((min.y, max.y), (0.0, 1.0));
         let (min, max) = square_crop([100, 400]);
         assert!((min.y - 0.375).abs() < 1e-6 && (max.y - 0.625).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod custom_theme_tests {
+    use super::*;
+    #[test]
+    fn dark_only_custom_colors_do_not_leak_into_light_mode() {
+        let flat = serde_json::json!({"text_primary":"#ffffff","bg_app":"#111111"});
+        let mut light = ThemePalette::light();
+        let expected = light.text_primary;
+        light.apply_tools_theme(&flat);
+        assert_eq!(light.text_primary, expected);
+        let mut dark = ThemePalette::dark();
+        dark.apply_tools_theme(&flat);
+        assert_eq!(dark.text_primary, Color32::WHITE);
+        let mut dark = ThemePalette::dark();
+        let expected = dark.text_primary;
+        dark.apply_tools_theme(&serde_json::json!({"light":{"text_primary":"#112233"}}));
+        assert_eq!(dark.text_primary, expected);
+        light.apply_tools_theme(&serde_json::json!({"light":{"text_primary":"#112233"}}));
+        assert_eq!(light.text_primary, Color32::from_rgb(17, 34, 51));
     }
 }

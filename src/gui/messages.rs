@@ -315,6 +315,7 @@ pub(super) fn clipboard_has_image() -> bool {
         unsafe {
             [
                 8,
+                14,
                 15,
                 17,
                 RegisterClipboardFormatA(c"PNG".as_ptr().cast()),
@@ -576,6 +577,21 @@ pub(super) fn render_system_notice_pill(ui: &mut egui::Ui, msg: &ChatMessage, pa
     });
 }
 
+/// A stable frame derived from message dimensions, independent of download completion.
+fn thumbnail_size(media: &crate::message_view::Media, max_width: f32) -> Vec2 {
+    let max_size = Vec2::new(max_width.clamp(40.0, 300.0), 280.0);
+    let dimensions = media
+        .width
+        .zip(media.height)
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .map(|(w, h)| Vec2::new(w as f32, h as f32))
+        .unwrap_or(Vec2::new(240.0, 160.0));
+    let scale = (max_size.x / dimensions.x)
+        .min(max_size.y / dimensions.y)
+        .min(1.0);
+    dimensions * scale
+}
+
 /// Return `true` when two adjacent messages belong to the same visual bubble group.
 pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     if is_system_notice_message(a) || is_system_notice_message(b) {
@@ -644,13 +660,8 @@ pub(super) fn render_message_body(
         let video = media.kind == crate::message_view::MediaKind::Video;
         let thumb = media.thumbnail.as_deref().unwrap_or_default();
         let key = crate::media_recovery::image_key(thread_id, &msg.id, 0, false);
-        let width = max_text_width.clamp(120.0, 270.0);
-        let ratio = media
-            .width
-            .zip(media.height)
-            .map(|(w, h)| h as f32 / w as f32)
-            .unwrap_or(0.67);
-        let height = (width * ratio).clamp(95.0, 260.0);
+        let size = thumbnail_size(&media, max_text_width);
+        let (width, height) = (size.x, size.y);
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         if !thumb.is_empty()
             && rect.intersects(ui.clip_rect().expand(160.0))
@@ -672,13 +683,14 @@ pub(super) fn render_message_body(
             .rect_filled(rect, Rounding::same(10.0), pal.bg_elevated);
         if let Some(texture) = sticker_textures.get(&key) {
             let size = texture.size_vec2();
-            let scale = (rect.width() / size.x).min(rect.height() / size.y);
+            let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
             let target = Rect::from_center_size(rect.center(), size * scale);
-            ui.painter().image(
-                texture.id(),
+            // Image widgets clip their texture to the same rounded outline as the card.
+            ui.put(
                 target,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
+                egui::Image::new(texture)
+                    .fit_to_exact_size(target.size())
+                    .rounding(10.0),
             );
         } else {
             draw_icon_image(ui.painter(), rect.center(), 24.0, pal.text_muted);
@@ -762,7 +774,17 @@ pub(super) fn render_message_body(
     if media.kind == crate::message_view::MediaKind::File {
         ui.add(egui::Label::new(RichText::new(&media.name).strong().color(text_col)).wrap());
         if let Some(url) = media.original {
-            if ui.button("Lưu về máy…").clicked() {
+            if ui
+                .button("Mở tệp")
+                .on_hover_text("Tải vào cache và mở bằng ứng dụng mặc định")
+                .clicked()
+            {
+                return Some(BubbleAction::OpenAttachment {
+                    url,
+                    name: media.name,
+                });
+            }
+            if ui.small_button("Lưu thành…").clicked() {
                 return Some(BubbleAction::SaveAttachment {
                     url,
                     name: media.name,
@@ -968,7 +990,10 @@ pub(super) fn render_chat_bubble(
     let has_sticker = is_sticker_message(msg).is_some();
     let call_card_opt = extract_call_card_view(msg);
     let is_call_card = call_card_opt.is_some();
-    let is_photo_card = msg.is_photo();
+    let is_photo_card = matches!(
+        crate::message_view::media(msg).kind,
+        crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
+    );
     let is_file_card = matches!(
         msg.link_src.as_deref(),
         Some("Tập tin Zalo") | Some("Video Zalo")
@@ -1004,23 +1029,8 @@ pub(super) fn render_chat_bubble(
     } else if is_call_card {
         max_text_width.min(256.0)
     } else if is_photo_card {
-        let thumb_u = msg
-            .link_thumb
-            .as_deref()
-            .or(msg.link_url.as_deref())
-            .unwrap_or("");
-        let tkey = format!("thumb_{}", crate::crypto::md5_hex(thumb_u));
-        let photo_w = if let Some(tex) = sticker_textures.get(&tkey) {
-            let [tw, th] = tex.size();
-            let tw_f = (tw.max(1)) as f32;
-            let th_f = (th.max(1)) as f32;
-            let max_w = max_text_width.clamp(160.0, 270.0);
-            let max_h = 260.0_f32;
-            let scale = (max_w / tw_f).min(max_h / th_f).min(1.0);
-            (tw_f * scale).clamp(135.0, max_w).ceil()
-        } else {
-            220.0_f32
-        };
+        let media = crate::message_view::media(msg);
+        let photo_w = thumbnail_size(&media, max_text_width).x.ceil();
         if has_photo_caption {
             let cap_str = msg
                 .link_desc
@@ -1475,6 +1485,10 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    OpenAttachment {
+        url: String,
+        name: String,
+    },
     SaveAttachment {
         url: String,
         name: String,
@@ -2130,5 +2144,26 @@ mod rich_text_tests {
             .map(|s| &job.text[s.byte_range.clone()])
             .collect();
         assert_eq!(marked, ["đậm"]);
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_geometry_tests {
+    use super::*;
+    #[test]
+    fn frames_preserve_aspect_ratio_without_upscaling_small_images() {
+        for (w, h) in [(4000, 500), (500, 4000), (80, 60)] {
+            let m = crate::message_view::Media {
+                width: Some(w),
+                height: Some(h),
+                ..Default::default()
+            };
+            let size = thumbnail_size(&m, 270.0);
+            assert!(size.x <= 270.0 && size.y <= 280.0);
+            assert!((size.x / size.y - w as f32 / h as f32).abs() < 0.01);
+            if w == 80 {
+                assert_eq!(size, Vec2::new(80.0, 60.0));
+            }
+        }
     }
 }

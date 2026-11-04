@@ -40,7 +40,13 @@ fn build_version_node(key: &str, w_type: u16, value: &[u8], children: &[Vec<u8>]
 }
 
 /// Build version resources using the Cargo package version for Explorer properties.
+#[cfg(test)]
 pub fn build_vs_version_info(pkg_ver: &str) -> Vec<u8> {
+    build_vs_version_info_with_product(pkg_ver, pkg_ver)
+}
+
+/// Build numeric file metadata with a separate human-readable release label.
+pub fn build_vs_version_info_with_product(pkg_ver: &str, product_version: &str) -> Vec<u8> {
     let mut parts = pkg_ver
         .trim_start_matches(['v', 'V'])
         .split(['.', '-', '+'])
@@ -81,7 +87,7 @@ pub fn build_vs_version_info(pkg_ver: &str) -> Vec<u8> {
         ),
         ("OriginalFilename", "ctdozlite.exe"),
         ("ProductName", "ctdozlite"),
-        ("ProductVersion", pkg_ver),
+        ("ProductVersion", product_version),
     ];
 
     let mut string_nodes = Vec::with_capacity(string_pairs.len());

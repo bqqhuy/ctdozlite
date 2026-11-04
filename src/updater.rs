@@ -410,21 +410,26 @@ fn release_client() -> Result<reqwest::Client, String> {
     .map_err(|_| "Không tạo được kết nối cập nhật".into())
 }
 fn version(s: &str) -> Option<(u64, u64, u64)> {
-    let mut p = s.trim_start_matches('v').split('.');
-    let a = p.next()?.parse().ok()?;
-    let b = p.next()?.parse().ok()?;
-    let c = p.next()?.parse().ok()?;
-    if p.next().is_some() {
-        None
-    } else {
-        Some((a, b, c))
+    let s = s.strip_prefix('v').unwrap_or(s);
+    if let Some(serial) = s.strip_prefix("0.").and_then(|s| s.strip_suffix("-arm")) {
+        if serial.is_empty() || !serial.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        return Some((0, 0, serial.parse().ok()?));
     }
+    let mut p = s.split('.');
+    let result = (
+        p.next()?.parse().ok()?,
+        p.next()?.parse().ok()?,
+        p.next()?.parse().ok()?,
+    );
+    p.next().is_none().then_some(result)
 }
 fn choose_release(metadata: ReleaseMetadata, sums: &str) -> Result<Option<ReleaseUpdate>, String> {
     if metadata.draft || metadata.prerelease {
         return Ok(None);
     }
-    let current = version(env!("CARGO_PKG_VERSION")).ok_or("Phiên bản ứng dụng không hợp lệ")?;
+    let current = version(crate::PRODUCT_VERSION).ok_or("Phiên bản ứng dụng không hợp lệ")?;
     let next = version(&metadata.tag_name).ok_or("Phiên bản phát hành chưa được hỗ trợ")?;
     if next <= current {
         return Ok(None);
@@ -522,7 +527,7 @@ pub async fn discover() -> Result<Option<ReleaseUpdate>, String> {
     if metadata.draft
         || metadata.prerelease
         || version(&metadata.tag_name)
-            .zip(version(env!("CARGO_PKG_VERSION")))
+            .zip(version(crate::PRODUCT_VERSION))
             .is_some_and(|(next, current)| next <= current)
     {
         return Ok(None);
@@ -692,5 +697,37 @@ mod release_tests {
         let mut r = m();
         r.assets[0].name = "ctdozlite-99.0.0-setup-windows-arm64.exe".into();
         assert!(choose_release(r, "").is_err());
+    }
+}
+
+#[cfg(test)]
+mod product_version_tests {
+    use super::*;
+    #[test]
+    fn arm_release_serials_compare_with_legacy_versions() {
+        assert!(version("v0.002-arm") < version(crate::PRODUCT_VERSION));
+        assert_eq!(version(crate::PRODUCT_VERSION), Some((0, 0, 3)));
+        assert!(version("v0.010-arm") > version("v0.009-arm"));
+        assert_eq!(version("v0.0.3"), version("v0.003-arm"));
+        for invalid in [
+            "v0.003-arm-beta",
+            "v0.003-x64",
+            "v0.-arm",
+            "vv0.003-arm",
+            "0.0.3.1",
+        ] {
+            assert!(version(invalid).is_none(), "{invalid}");
+        }
+        assert!(choose_release(
+            ReleaseMetadata {
+                tag_name: crate::PRODUCT_VERSION.into(),
+                draft: false,
+                prerelease: false,
+                assets: vec![]
+            },
+            ""
+        )
+        .unwrap()
+        .is_none());
     }
 }
