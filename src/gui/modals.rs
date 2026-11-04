@@ -2481,9 +2481,9 @@ impl ZaloGuiApp {
                     ui.allocate_exact_size(stage_area_rect.size(), Sense::click_and_drag());
                 let painter = ui.painter().with_clip_rect(bg_rect);
                 let bg_col = if pal.is_dark {
-                    Color32::from_rgba_unmultiplied(24, 26, 31, 244)
+                    Color32::from_rgb(24, 26, 31)
                 } else {
-                    Color32::from_rgba_unmultiplied(24, 28, 36, 228)
+                    Color32::from_rgb(24, 28, 36)
                 };
                 painter.rect_filled(bg_rect, Rounding::ZERO, bg_col);
 
@@ -2605,14 +2605,14 @@ impl ZaloGuiApp {
                             }
 
                             if ui
-                                .add_enabled(!viewer.navigation_pending, egui::Button::new("❮"))
+                                .add_enabled(!viewer.navigation_pending, egui::Button::new("Trước"))
                                 .on_hover_text("Trước (←)")
                                 .clicked()
                             {
                                 navigate = Some(false);
                             }
                             if ui
-                                .add_enabled(!viewer.navigation_pending, egui::Button::new("❯"))
+                                .add_enabled(!viewer.navigation_pending, egui::Button::new("Tiếp"))
                                 .on_hover_text("Tiếp (→)")
                                 .clicked()
                             {
