@@ -1611,7 +1611,7 @@ pub(crate) fn next_client_message_id() -> u64 {
 }
 
 /// Wait for the server to announce an uploaded file's processed URL.
-const ASYNC_FILE_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+const ASYNC_FILE_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
@@ -1668,6 +1668,20 @@ pub(crate) async fn send_group_message_with_client_id(
     text: &str,
     now: u64,
 ) -> Result<Value> {
+    send_group_mentions(s, grid, text, now, &[]).await
+}
+
+/// Send explicit UTF-16 mention recipients through the regular group session path.
+/// # Errors
+/// Rejects invalid ranges before I/O, or returns session/transport/server failures.
+pub(crate) async fn send_group_mentions(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    now: u64,
+    mentions: &[crate::mentions::Mention],
+) -> Result<Value> {
+    crate::mentions::validate(text, mentions)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1675,16 +1689,25 @@ pub(crate) async fn send_group_message_with_client_id(
         .trim_start_matches("group_")
         .trim_start_matches('g')
         .trim_start_matches('G');
-    let body = obj(&[
+    let mut body = obj(&[
         ("grid", json!(clean_grid)),
         ("message", json!(text)),
         ("clientId", json!(now)),
         ("imei", json!(s.imei)),
         ("visibility", json!(0)),
     ]);
+    let endpoint = if mentions.is_empty() {
+        "sendmsg"
+    } else {
+        "mention"
+    };
+    if !mentions.is_empty() {
+        body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+        body["language"] = json!("vi");
+    }
     let params = s.encoded_params(&body)?;
     let url = format!(
-        "{}/api/group/sendmsg?{}",
+        "{}/api/group/{endpoint}?{}",
         s.domains.group,
         s.common_params()
     );
@@ -1956,8 +1979,8 @@ pub(crate) async fn send_attachment_with_client_id(
         return Ok((send_resp, cm));
     }
 
-    // MP4/MOV go out as a video message like Zalo PC; any failure before that message is
-    // sent falls back to the file path below, so nothing is sent twice.
+    // MP4/MOV use the native video path. Unsupported preparation/upload falls back to a
+    // file; waiting for a processed URL fails explicitly instead of uploading again.
     if crate::video_meta::is_video_message(file_path) {
         match send_video_message(
             s,
@@ -2033,6 +2056,12 @@ pub(crate) async fn send_attachment_with_client_id(
     source.verify().await?;
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
     let file_id = pick_str(data_node, &["fileId", "clientFileId"]);
+    anyhow::ensure!(
+        file_id
+            .as_deref()
+            .is_none_or(crate::upload_events::valid_id),
+        "Máy chủ trả mã tệp không hợp lệ"
+    );
     let mut file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
     // Zalo processes the upload asynchronously and announces the CDN URL with a `file_done` /
     // `video_done` control; Zalo PC sends `asyncfile/msg` only after receiving it.
@@ -2040,14 +2069,15 @@ pub(crate) async fn send_attachment_with_client_id(
         if let Some(fid) = file_id.as_deref() {
             match crate::upload_events::wait(s.account_key(), fid, ASYNC_FILE_URL_WAIT).await {
                 Some(url) => file_url = url,
-                None => crate::logger::log_error(
-                    "asyncfile",
-                    "Processed file URL not announced in time; sending without it",
-                ),
+                None => anyhow::bail!("Chưa nhận được đường dẫn tệp đã xử lý; tệp chưa được gửi"),
             }
         }
     }
 
+    anyhow::ensure!(
+        !file_url.is_empty(),
+        "Máy chủ chưa cấp đường dẫn tệp; tệp chưa được gửi"
+    );
     let send_resp = if let Some(fid) = file_id {
         let msg_ep = if is_group {
             "/api/group/asyncfile/msg"
@@ -2270,15 +2300,17 @@ async fn send_video_message(
     let mut video_url = pick_str(data, &["fileUrl", "url"]).unwrap_or_default();
     if video_url.is_empty() {
         if let Some(file_id) = pick_str(data, &["fileId"]) {
+            anyhow::ensure!(
+                crate::upload_events::valid_id(&file_id),
+                "Máy chủ trả mã video không hợp lệ"
+            );
             video_url = crate::upload_events::wait(s.account_key(), &file_id, ASYNC_FILE_URL_WAIT)
                 .await
                 .unwrap_or_default();
         }
     }
     if video_url.is_empty() {
-        return Ok(VideoSend::Fallback(anyhow::anyhow!(
-            "Máy chủ chưa trả đường dẫn video"
-        )));
+        anyhow::bail!("Máy chủ chưa xử lý xong video; video chưa được gửi");
     }
     let mut thumb_url = String::new();
     if let Some(jpeg) = poster {
@@ -3495,6 +3527,27 @@ pub(crate) async fn send_quote_message_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    send_quote_mentions(s, to_id, text, quoted, is_group, now, &[]).await
+}
+
+/// Send a quote retaining explicit group mention identities.
+/// # Errors
+/// Rejects invalid mentions/reference metadata or propagates send failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_quote_mentions(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    quoted: &ChatMessage,
+    is_group: bool,
+    now: u64,
+    mentions: &[crate::mentions::Mention],
+) -> Result<Value> {
+    crate::mentions::validate(text, mentions)?;
+    anyhow::ensure!(
+        is_group || mentions.is_empty(),
+        "Mention chỉ hỗ trợ trong nhóm"
+    );
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -3537,7 +3590,7 @@ pub(crate) async fn send_quote_message_with_client_id(
                 .trim_start_matches("group_")
                 .trim_start_matches('g')
                 .trim_start_matches('G');
-            let body = obj(&[
+            let mut body = obj(&[
                 ("grid", json!(clean_grid)),
                 ("message", json!(text)),
                 ("clientId", json!(now)),
@@ -3553,6 +3606,9 @@ pub(crate) async fn send_quote_message_with_client_id(
                 ("imei", json!(s.imei)),
                 ("zsource", json!(101)),
             ]);
+            if !mentions.is_empty() {
+                body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
+            }
             let params = s.encoded_params(&body)?;
             let url = format!("{}/api/group/quote?{}", s.domains.group, s.common_params());
             let resp = s.post_form(&url, format!("params={params}")).await?;
@@ -7224,7 +7280,7 @@ mod send_identity_tests {
         let host = format!("http://{}", listener.local_addr().unwrap());
         let fixture = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..7 {
+            for _ in 0..9 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -7353,8 +7409,55 @@ mod send_identity_tests {
         )
         .await
         .unwrap();
+        let draft = crate::mentions::Draft {
+            text: "😀 @An hello".into(),
+            mentions: vec![crate::mentions::Mention {
+                uid: "42".into(),
+                pos: 3,
+                len: 3,
+                kind: 0,
+            }],
+        };
+        send_group_mentions(
+            &session,
+            "group_12",
+            &draft.text,
+            client_id,
+            &draft.mentions,
+        )
+        .await
+        .unwrap();
+        let quoted = ChatMessage {
+            id: "123".into(),
+            client_message_id: "777".into(),
+            ts: 1700000000000,
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(json!("42")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        send_quote_mentions(
+            &session,
+            "group_12",
+            &draft.text,
+            &quoted,
+            true,
+            client_id,
+            &draft.mentions,
+        )
+        .await
+        .unwrap();
         let requests = fixture.join().unwrap();
-        assert_eq!(requests.len(), 7);
+        assert_eq!(requests.len(), 9);
+        assert!(requests[7].0.starts_with("/api/group/mention?"));
+        assert!(requests[8].0.starts_with("/api/group/quote?"));
+        for (_, body) in &requests[7..] {
+            assert_eq!(body["grid"], json!("12"));
+            let mentions: Value =
+                serde_json::from_str(body["mentionInfo"].as_str().unwrap()).unwrap();
+            assert_eq!(mentions, json!([{"uid":"42","pos":3,"len":3,"type":0}]));
+        }
         for (_, body) in requests {
             assert_eq!(body["clientId"], json!(client_id));
         }

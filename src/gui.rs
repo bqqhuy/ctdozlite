@@ -24,6 +24,7 @@ use crate::session::Session;
 mod composer_drafts;
 mod contacts;
 mod download_panel;
+mod mention_composer;
 mod messages;
 mod modals;
 mod schedule_modal;
@@ -73,13 +74,13 @@ pub enum GuiEvent {
         owner: String,
         thread: String,
         generation: u64,
-        result: Result<String, String>,
+        result: Result<crate::mentions::Draft, String>,
     },
     ComposerDraftSaved {
         owner: String,
         thread: String,
         generation: u64,
-        text: String,
+        text: crate::mentions::Draft,
         result: Result<(), String>,
     },
     MediaStarted {
@@ -533,6 +534,7 @@ pub struct ZaloGuiApp {
     search_query: String,
     input_message: String,
     composer_draft: composer_drafts::ComposerDraft,
+    composer_mentions: crate::mentions::Draft,
     deleted_message_ids: HashSet<(String, String)>,
     status_msg: String,
 
@@ -785,6 +787,7 @@ impl ZaloGuiApp {
             search_query: String::new(),
             input_message: String::new(),
             composer_draft: Default::default(),
+            composer_mentions: Default::default(),
             deleted_message_ids: HashSet::new(),
             replying_to: None,
             forward_msg: None,

@@ -27,46 +27,81 @@ fn with<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     f(guard.get_or_insert_with(Registry::default))
 }
 
+/// Server processing sentinels are not upload identities.
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.trim() == id && id != "-1" && id != "0"
+}
+
 fn id_text(v: &Value) -> Option<String> {
     v.as_str()
         .map(str::to_owned)
         .or_else(|| v.as_u64().map(|n| n.to_string()))
         .or_else(|| v.as_i64().map(|n| n.to_string()))
-        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .filter(|s| valid_id(s))
 }
 
 /// Extract `(fileId, url)` pairs from a decrypted control payload.
 pub fn parse(payload: &Value) -> Vec<(String, String)> {
-    let controls = payload
-        .pointer("/data/controls")
-        .or_else(|| payload.get("controls"))
-        .and_then(Value::as_array);
-    let mut out = Vec::new();
-    for control in controls.into_iter().flatten() {
-        let content = control.get("content").unwrap_or(control);
-        if !matches!(
+    // Bound traversal and embedded JSON independently of the socket frame limit.
+    fn visit(value: &Value, depth: usize, budget: &mut usize, out: &mut Vec<(String, String)>) {
+        if depth > 8 || *budget == 0 || out.len() >= LIMIT {
+            return;
+        }
+        *budget -= 1;
+        if let Some(items) = value.as_array() {
+            for item in items {
+                if *budget == 0 || out.len() >= LIMIT {
+                    break;
+                }
+                visit(item, depth + 1, budget, out);
+            }
+            return;
+        }
+        let content = value.get("content").unwrap_or(value);
+        if matches!(
             content.get("act_type").and_then(Value::as_str),
             Some("file_done" | "video_done")
         ) {
-            continue;
+            let data = match content.get("data") {
+                Some(Value::String(raw)) => {
+                    if raw.len() <= 16 * 1024 {
+                        serde_json::from_str(raw).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                Some(value) => value.clone(),
+                None => Value::Null,
+            };
+            let id = [content.get("fileId"), data.get("fileId")]
+                .into_iter()
+                .flatten()
+                .find_map(id_text);
+            let url = ["url", "fileUrl"]
+                .into_iter()
+                .filter_map(|key| data.get(key).and_then(Value::as_str))
+                .find(|raw| {
+                    raw.len() <= 4096
+                        && reqwest::Url::parse(raw).is_ok_and(|u| {
+                            u.scheme() == "https"
+                                && u.host_str().is_some()
+                                && u.username().is_empty()
+                                && u.password().is_none()
+                        })
+                });
+            if let (Some(id), Some(url)) = (id, url) {
+                out.push((id, url.to_owned()));
+            }
+            return;
         }
-        let data = match content.get("data") {
-            Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or(Value::Null),
-            Some(value) => value.clone(),
-            None => Value::Null,
-        };
-        let file_id = content
-            .get("fileId")
-            .or_else(|| data.get("fileId"))
-            .and_then(id_text);
-        let url = data
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|u| u.starts_with("https://") && u.len() <= 4096);
-        if let (Some(file_id), Some(url)) = (file_id, url) {
-            out.push((file_id, url.to_owned()));
+        for key in ["data", "controls"] {
+            if let Some(child) = value.get(key) {
+                visit(child, depth + 1, budget, out);
+            }
         }
     }
+    let mut out = Vec::new();
+    visit(payload, 0, &mut 1024, &mut out);
     out
 }
 
@@ -158,6 +193,31 @@ mod tests {
             parse(&payload),
             vec![("77".to_string(), "https://v.dlmd.me/x.mp4".to_string())]
         );
+    }
+
+    #[test]
+    fn accepts_direct_batched_and_file_url_alias_with_bounds() {
+        let control =
+            json!({"act_type":"file_done","fileId":42,"data":{"fileUrl":"https://f.dlfl.vn/file"}});
+        assert_eq!(parse(&control).len(), 1);
+        let mut mixed = control.clone();
+        mixed["data"]["url"] = Value::Null;
+        assert_eq!(parse(&mixed).len(), 1);
+        mixed["data"]["url"] = json!("");
+        assert_eq!(parse(&mixed).len(), 1);
+        assert_eq!(
+            parse(&json!([{"data":{"controls":[control.clone()]}}])).len(),
+            1
+        );
+        for id in ["-1", "0", ""] {
+            let mut invalid = control.clone();
+            invalid["fileId"] = json!(id);
+            assert!(parse(&invalid).is_empty());
+        }
+        let mut invalid = control.clone();
+        invalid["data"]["fileUrl"] = json!("https://user:secret@example.com/file");
+        assert!(parse(&invalid).is_empty());
+        assert_eq!(parse(&Value::Array(vec![control; 2048])).len(), LIMIT);
     }
 
     #[tokio::test]

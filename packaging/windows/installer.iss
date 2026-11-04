@@ -1,6 +1,6 @@
 #define MyAppName "ctdozlite"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.4"
+  #define MyAppVersion "0.0.5"
 #endif
 #ifndef BuildDir
   #define BuildDir "..\..\target\aarch64-pc-windows-msvc\release"
@@ -12,7 +12,7 @@
 #define ArchAllowed "arm64"
 
 #ifndef MyProductVersion
-  #define MyProductVersion "v0.003-arm"
+  #define MyProductVersion "v0.004-arm"
 #endif
 
 [Setup]

@@ -69,3 +69,5 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0026 — Persisted queue cursors](0026-persisted-queue-cursors.md)
 
 - [0027 — v0.003-arm desktop UI and release identity](0027-v003-arm-desktop-ui.md)
+
+- [0028 — v0.004-arm selected upstream improvements](0028-v004-arm-selected-upstream.md)

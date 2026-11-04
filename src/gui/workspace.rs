@@ -2631,7 +2631,8 @@ impl ZaloGuiApp {
                     let msg_area_height =
                         (ui.available_height() - 48.0 - picker_reserve - editor_height).max(0.0);
 
-                    egui::ScrollArea::vertical()
+                    let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
+                    let message_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .min_scrolled_height(0.0)
                         .max_height(msg_area_height)
@@ -2777,7 +2778,8 @@ impl ZaloGuiApp {
                                                                         let cell=ui.allocate_ui_with_layout(Vec2::new(cell_width,0.0),Layout::top_down(Align::LEFT),|ui|{
                                                                             if let Some(action)=render_message_body(ui,item,&thread_name,&thread_id,is_group,&self.image_failures,pal,item.is_outgoing,cell_width,&self.sticker_textures,&mut self.loading_stickers){pending_action=Some((index,action));}
                                                                         });
-                                                                        if let Some(action)=bubble_context_menu(ui,&cell.response,item,index,pal,&self.emoji_textures,true){pending_action=Some((index,action));}
+                                                                        if let Some(action)=bubble_context_menu(ui,&cell.response,item,index,pal,&self.emoji_textures,is_group){pending_action=Some((index,action));}
+                                                                        if let Some(action)=hover_message_actions(ui,cell.response.rect,&thread_id,item,&self.emoji_textures){pending_action=Some((index,action));}
                                                                         if ui.is_rect_visible(cell.response.rect){ctx.data_mut(|d|d.get_temp_mut_or_default::<Vec<String>>(Id::new("visible_mentions")).push(item.id.clone()));}
                                                                         if jump_index==Some(index){render_quote_target(ui,cell.response.rect,jump_scroll_pending,pal.primary);jump_scrolled|=jump_scroll_pending;}
                                                                         album_rendered.insert(index);
@@ -2852,6 +2854,12 @@ impl ZaloGuiApp {
                                                         9.0
                                                     });
                                                 });
+                                                if !is_system_notice_message(msg) {
+                                                    let mut hit = row.response.clone();
+                                                    hit.rect = egui::Rect::from_min_max(egui::pos2(ui.clip_rect().left(), hit.rect.top()), egui::pos2(ui.clip_rect().right(), hit.rect.bottom()));
+                                                    if let Some(action) = bubble_context_menu(ui, &hit, msg, idx, pal, &self.emoji_textures, is_group) {pending_action=Some((idx,action));}
+                                                }
+                                                if let Some(action) = hover_message_actions(ui, row.response.rect, &thread_id, msg, &self.emoji_textures) { pending_action = Some((idx, action)); }
                                                 if ui.is_rect_visible(row.response.rect) {
                                                     ctx.data_mut(|d| d.get_temp_mut_or_default::<Vec<String>>(Id::new("visible_mentions")).push(msg.id.clone()));
                                                 }
@@ -2868,7 +2876,25 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 });
+                            if newest_requested { ui.scroll_to_cursor(Some(egui::Align::BOTTOM)); }
                         });
+                    if message_scroll.state.offset.y + message_scroll.inner_rect.height() + 40.0 < message_scroll.content_size.y {
+                        egui::Area::new(Id::new(("newest_button", &thread_id)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(message_scroll.inner_rect.right_bottom() - Vec2::new(16.0, 12.0))
+                            .pivot(egui::Align2::RIGHT_BOTTOM)
+                            .show(ctx, |ui| {
+                                if ui.button("↓ Tin nhắn mới nhất").clicked() {
+                                    self.quote_jump = None;
+                                    self.filter_starred_only = false;
+                                    self.in_chat_search_open = false;
+                                    self.in_chat_search_query.clear();
+                                    self.chat_render_window.1 = 150;
+                                    ctx.data_mut(|d|d.insert_temp(Id::new(("jump_newest", &thread_id)),true));
+                                    ctx.request_repaint();
+                                }
+                            });
+                    }
                     let read_ids=ctx.data_mut(|d| d.remove_temp::<Vec<String>>(Id::new("visible_mentions"))).unwrap_or_default();
                     if ctx.input(|i| i.focused) && self.image_viewer.is_none() && !self.settings_modal_open && !self.tools.open {
                         if let Some(thread)=self.threads.get_mut(self.selected_thread_index) {
@@ -2917,6 +2943,22 @@ impl ZaloGuiApp {
                                         if let Some(job) = message.outgoing_job.as_mut() { job.attempt += 1; }
                                         self.threads[self.selected_thread_index].messages[idx] = message.clone();
                                         let _ = tx.send(WorkerCmd::RetryOutgoing { thread_id, message });
+                                    }
+                                }
+                                BubbleAction::Mention => {
+                                    if is_group && !m.is_outgoing {
+                                        if let Some(uid) = m.wire_ref.sender.as_ref().and_then(|v| v.as_str().map(str::to_owned).or_else(|| v.as_u64().map(|n|n.to_string()))) {
+                                            self.composer_mentions.edit(&self.input_message);
+                                            let end = self.input_message.len();
+                                            if end > 0 && !self.input_message.ends_with(char::is_whitespace) {
+                                                self.input_message.push(' ');
+                                                self.composer_mentions.edit(&self.input_message);
+                                            }
+                                            let end = self.input_message.len();
+                                            self.composer_mentions.insert(end,end,&uid,&m.sender);
+                                            self.input_message = self.composer_mentions.text.clone();
+                                            self.composer_focus_pending = true;
+                                        }
                                     }
                                 }
                                 BubbleAction::Reply => self.replying_to = Some(m),
@@ -3354,17 +3396,21 @@ impl ZaloGuiApp {
                                             .on_hover_text("Gửi hình ảnh")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: true,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                    photo_original: self.settings.send_photo_original,
-                                                });
+                                            if !self.composer_mentions.mentions.is_empty() {
+                                                self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();
+                                            } else {
+                                                let cap = self.input_message.trim().to_string();
+                                                self.input_message.clear();
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
+                                                        to_id: thread_id.clone(),
+                                                        is_group,
+                                                        images_only: true,
+                                                        caption: cap,
+                                                        preset_path: None,
+                                                        photo_original: self.settings.send_photo_original,
+                                                    });
+                                                }
                                             }
                                         }
 
@@ -3397,17 +3443,21 @@ impl ZaloGuiApp {
                                             .on_hover_text("Đính kèm File / Video")
                                             .clicked()
                                         {
-                                            let cap = self.input_message.trim().to_string();
-                                            self.input_message.clear();
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                    to_id: thread_id.clone(),
-                                                    is_group,
-                                                    images_only: false,
-                                                    caption: cap,
-                                                    preset_path: None,
-                                                    photo_original: self.settings.send_photo_original,
-                                                });
+                                            if !self.composer_mentions.mentions.is_empty() {
+                                                self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();
+                                            } else {
+                                                let cap = self.input_message.trim().to_string();
+                                                self.input_message.clear();
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    let _ = tx.send(WorkerCmd::PickAndSendAttachment {
+                                                        to_id: thread_id.clone(),
+                                                        is_group,
+                                                        images_only: false,
+                                                        caption: cap,
+                                                        preset_path: None,
+                                                        photo_original: self.settings.send_photo_original,
+                                                    });
+                                                }
                                             }
                                         }
 
@@ -3431,11 +3481,16 @@ impl ZaloGuiApp {
                                         // must not also send the message.
                                         let (ime_active, ime_blocks_enter) = ui.input(|i| ime_state(&i.events, self.composer_ime_active));
                                         self.composer_ime_active = ime_active;
-                                        let enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
+                                        let mut enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                                         let rows = composer_rows(&self.input_message);
+                                        let mention_draft = self.composer_mentions.clone();
+                                        let mut mention_layouter = |ui: &egui::Ui, text: &str, width: f32| {
+                                            ui.fonts(|fonts|fonts.layout_job(super::mention_composer::mention_layout(text, &mention_draft, width, pal)))
+                                        };
                                         let text_edit =
                                             egui::TextEdit::multiline(&mut self.input_message)
+                                                .layouter(&mut mention_layouter)
                                                 .font(FontId::proportional(14.0))
                                                 .id(composer_id)
                                                 .frame(false)
@@ -3447,7 +3502,7 @@ impl ZaloGuiApp {
                                                 .desired_rows(rows)
                                                 .desired_width(input_w);
 
-                                        let response = egui::ScrollArea::vertical()
+                                        let output = egui::ScrollArea::vertical()
                                             .id_salt(("chat_composer_scroll", &thread_id))
                                             .max_width(input_w)
                                             .min_scrolled_width(input_w)
@@ -3455,8 +3510,11 @@ impl ZaloGuiApp {
                                             .min_scrolled_height(0.0)
                                             .max_height(editor_height)
                                             .stick_to_bottom(true)
-                                            .show(ui, |ui| ui.add(text_edit))
+                                            .show(ui, |ui| text_edit.show(ui))
                                             .inner;
+                                        let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
+                                        let response = output.response;
+                                        self.mention_suggestions(ui, &thread_id, cursor, &response, &mut enter_send, ime_blocks_enter);
                                         if self.composer_focus_pending {
                                             response.request_focus();
                                             self.composer_focus_pending = false;
@@ -3610,7 +3668,8 @@ impl ZaloGuiApp {
                                             if ui.button("Nhãn dán…").clicked(){self.sticker_picker_open = !self.sticker_picker_open;ui.close_menu();}
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
-                                                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original});}
+                                                    if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
+                                                    else if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original});}
                                                     ui.close_menu();
                                                 }
                                             }
@@ -3625,7 +3684,9 @@ impl ZaloGuiApp {
                                             })
                                             .clicked();
 
-                                        if let Some(chosen) = send_selected_sticker {
+                                        if send_selected_sticker.is_some() && !self.composer_mentions.mentions.is_empty() {
+                                            self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi nhãn dán".into();
+                                        } else if let Some(chosen) = send_selected_sticker {
                                             self.input_message.clear();
                                             self.dismissed_sticker_suggest_for.clear();
                                             self.composer_sticker_selected = None;
@@ -3639,6 +3700,8 @@ impl ZaloGuiApp {
                                                     is_group,
                                                 });
                                             }
+                                        } else if (send_clicked || enter_pressed) && self.pending_clipboard_image.is_some() && !self.composer_mentions.mentions.is_empty() {
+                                            self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi ảnh".into();
                                         } else if (send_clicked || enter_pressed)
                                             && self.pending_clipboard_image.is_some()
                                         {
@@ -3665,14 +3728,19 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
-                                            let text = self.input_message.trim().to_string();
+                                            self.composer_mentions.edit(&self.input_message);
+                                            let draft = self.composer_mentions.trimmed();
+                                            let text = draft.text.clone();
                                             self.input_message.clear();
+                                            self.composer_mentions.clear();
                                             self.dismissed_sticker_suggest_for.clear();
                                             self.composer_sticker_selected = None;
                                             response.request_focus();
                                             let quoted = self.replying_to.take();
                                             if let Some(tx) = WORKER_TX.get() {
-                                                if let Some(quoted) = quoted {
+                                                if is_group && !draft.mentions.is_empty() {
+                                                    let _ = tx.send(WorkerCmd::SendMentioned {to_id: thread_id.clone(), draft, quoted});
+                                                } else if let Some(quoted) = quoted {
                                                     let _ = tx.send(WorkerCmd::SendQuote {
                                                         to_id: thread_id.clone(),
                                                         text,

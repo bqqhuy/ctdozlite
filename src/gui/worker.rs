@@ -20,7 +20,7 @@ pub enum WorkerCmd {
         owner: String,
         thread: String,
         generation: u64,
-        text: String,
+        text: crate::mentions::Draft,
     },
     CheckUpdate,
     PrepareUpdate(crate::updater::ReleaseUpdate),
@@ -114,6 +114,11 @@ pub enum WorkerCmd {
         group_id: String,
         is_group: bool,
         limit: usize,
+    },
+    SendMentioned {
+        to_id: String,
+        draft: crate::mentions::Draft,
+        quoted: Option<ChatMessage>,
     },
     SendMessage {
         to_id: String,
@@ -899,9 +904,9 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::LoadComposerDraft{owner,thread,generation}=>{
                             let s=session.lock().await.clone();
                             let id=thread.clone();let expected=owner.clone();
-                            let result=tokio::task::spawn_blocking(move||->anyhow::Result<String>{
+                            let result=tokio::task::spawn_blocking(move||->anyhow::Result<crate::mentions::Draft>{
                                 anyhow::ensure!(s.is_active() && !expected.is_empty() && s.account_key()==expected,"Tài khoản đã thay đổi");
-                                crate::store::MessageStore::open(s.history_path())?.composer_draft(&id)
+                                crate::store::MessageStore::open(s.history_path())?.composer_document(&id)
                             }).await.map_err(|_|"Không đọc được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không đọc được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftLoaded{owner,thread,generation,result});egui_ctx.request_repaint();
                         }
@@ -910,7 +915,7 @@ pub(super) fn spawn_session_worker(
                             let (id,expected,value)=(thread.clone(),owner.clone(),text.clone());
                             let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
                                 anyhow::ensure!(s.is_active() && !expected.is_empty() && s.account_key()==expected,"Tài khoản đã thay đổi");
-                                crate::store::MessageStore::open(s.history_path())?.save_composer_draft(&id,&value)
+                                crate::store::MessageStore::open(s.history_path())?.save_composer_document(&id,&value)
                             }).await.map_err(|_|"Không lưu được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không lưu được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftSaved{owner,thread,generation,text,result});egui_ctx.request_repaint();
                         }
@@ -1797,7 +1802,7 @@ pub(super) fn spawn_session_worker(
                                 }
                             });
                         }
-                        WorkerCmd::SendMessage { .. } | WorkerCmd::SendQuote { .. } | WorkerCmd::Forward { .. } | WorkerCmd::SendSticker { .. } => {
+                        WorkerCmd::SendMentioned { .. } | WorkerCmd::SendMessage { .. } | WorkerCmd::SendQuote { .. } | WorkerCmd::Forward { .. } | WorkerCmd::SendSticker { .. } => {
                             let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể gửi loại tin nhắn này".into()));
                         }
                         WorkerCmd::React {
@@ -2717,6 +2722,34 @@ fn outgoing_command(cmd: &WorkerCmd) -> Option<(String, ChatMessage)> {
         WorkerCmd::RetryOutgoing { thread_id, message } => {
             Some((thread_id.clone(), message.clone()))
         }
+        WorkerCmd::SendMentioned {
+            to_id,
+            draft,
+            quoted,
+        } => {
+            let mut quoted = quoted.clone();
+            if let Some(q) = quoted.as_mut() {
+                q.outgoing_job = None;
+            }
+            let mut msg = pending(
+                draft.text.clone(),
+                true,
+                Payload::Mentioned {
+                    mentions: draft.mentions.clone(),
+                    quoted: quoted.clone().map(Box::new),
+                },
+            );
+            msg.wire_ref.fields.insert(
+                "mentions".into(),
+                serde_json::to_value(&draft.mentions).unwrap_or_default(),
+            );
+            if let Some(q) = quoted {
+                msg.reply_to_id = Some(q.id.clone());
+                msg.reply_to_sender = Some(q.sender.clone());
+                msg.reply_to_text = Some(q.text.clone());
+            }
+            Some((to_id.clone(), msg))
+        }
         WorkerCmd::SendMessage {
             to_id,
             text,
@@ -3207,4 +3240,42 @@ async fn persist_media_projection(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mentioned_outgoing_tests {
+    use super::*;
+    #[test]
+    fn durable_job_retains_uid_quote_and_client_identity_on_retry() {
+        let mut draft = crate::mentions::Draft::from("Hi ");
+        draft.insert(3, 3, "42", "An");
+        let quoted = ChatMessage {
+            id: "123".into(),
+            sender: "An".into(),
+            text: "quoted".into(),
+            ..Default::default()
+        };
+        let (_, message) = outgoing_command(&WorkerCmd::SendMentioned {
+            to_id: "group_1".into(),
+            draft: draft.clone(),
+            quoted: Some(quoted),
+        })
+        .unwrap();
+        let persisted = serde_json::to_string(&message).unwrap();
+        let loaded: ChatMessage = serde_json::from_str(&persisted).unwrap();
+        let (_, retry) = outgoing_command(&WorkerCmd::RetryOutgoing {
+            thread_id: "group_1".into(),
+            message: loaded,
+        })
+        .unwrap();
+        assert_eq!(retry.client_message_id, message.client_message_id);
+        assert_eq!(retry.reply_to_id.as_deref(), Some("123"));
+        let crate::outgoing::Payload::Mentioned { mentions, quoted } =
+            &retry.outgoing_job.unwrap().payload
+        else {
+            panic!("lost mentions")
+        };
+        assert_eq!(*mentions, draft.mentions);
+        assert_eq!(quoted.as_ref().unwrap().text, "quoted");
+    }
 }

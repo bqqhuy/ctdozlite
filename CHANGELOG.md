@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.004-arm — Windows 11 ARM64 — 04/11/2026
+
+Thay đổi so với [v0.003-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.003-arm).
+
+- Menu chuột phải cả dòng tin; thanh cảm xúc và trả lời khi hover, giữ mô hình reaction của fork.
+- Mention nhóm có UID thật, gợi ý thành viên và @All; giữ metadata trong bản nháp, trích dẫn và gửi lại.
+- Thêm nút về tin nhắn mới nhất khi đang đọc lịch sử.
+- Upload đọc thêm control trực tiếp/mảng và `fileUrl`; chờ xử lý tối đa 90 giây, báo lỗi thay vì gửi tệp thiếu URL.
+- Không đổi schema hoặc luồng đồng bộ điện thoại.
+
 ## v0.003-arm — Windows 11 ARM64 — 04/11/2026
 
 Thay đổi so với [v0.002-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.002-arm).

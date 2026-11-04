@@ -7,9 +7,9 @@ pub(super) struct ComposerDraft {
     owner: String,
     thread: String,
     generation: u64,
-    observed: String,
-    persisted: String,
-    queued: Option<String>,
+    observed: crate::mentions::Draft,
+    persisted: crate::mentions::Draft,
+    queued: Option<crate::mentions::Draft>,
     touched: bool,
     changed: Option<std::time::Instant>,
     close_pending: bool,
@@ -48,6 +48,7 @@ impl ZaloGuiApp {
                 ..Default::default()
             };
             self.input_message.clear();
+            self.composer_mentions.clear();
             if !owner.is_empty() && !thread.is_empty() {
                 if let Some(tx) = WORKER_TX.get() {
                     if tx
@@ -68,7 +69,7 @@ impl ZaloGuiApp {
         let draft = &self.composer_draft;
         if draft.touched
             && (draft.observed != draft.persisted || draft.queued.is_some())
-            && draft.queued.as_deref() != Some(&draft.observed)
+            && draft.queued.as_ref() != Some(&draft.observed)
         {
             let elapsed = draft.changed.map(|at| at.elapsed()).unwrap_or_default();
             if elapsed >= std::time::Duration::from_millis(500) {
@@ -83,6 +84,7 @@ impl ZaloGuiApp {
         let draft = &mut self.composer_draft;
         if draft.owner == owner && draft.thread == thread {
             self.input_message.clear();
+            self.composer_mentions.clear();
             draft.observed.clear();
             draft.persisted.clear();
             draft.queued = None;
@@ -93,7 +95,7 @@ impl ZaloGuiApp {
                         owner: owner.into(),
                         thread: thread.into(),
                         generation: draft.generation,
-                        text: String::new(),
+                        text: Default::default(),
                     })
                     .is_err()
                 {
@@ -109,9 +111,10 @@ impl ZaloGuiApp {
     }
 
     fn observe_composer_draft(&mut self) {
+        self.composer_mentions.edit(&self.input_message);
         let draft = &mut self.composer_draft;
-        if !draft.thread.is_empty() && self.input_message != draft.observed {
-            draft.observed = self.input_message.clone();
+        if !draft.thread.is_empty() && self.composer_mentions != draft.observed {
+            draft.observed = self.composer_mentions.clone();
             draft.touched = true;
             draft.changed = Some(std::time::Instant::now());
         }
@@ -123,7 +126,7 @@ impl ZaloGuiApp {
             || draft.owner.is_empty()
             || draft.thread.is_empty()
             || (draft.observed == draft.persisted && draft.queued.is_none())
-            || draft.queued.as_deref() == Some(&draft.observed)
+            || draft.queued.as_ref() == Some(&draft.observed)
         {
             return;
         }
@@ -154,7 +157,7 @@ impl ZaloGuiApp {
         owner: String,
         thread: String,
         generation: u64,
-        result: Result<String, String>,
+        result: Result<crate::mentions::Draft, String>,
     ) {
         let draft = &mut self.composer_draft;
         if draft.owner != owner || draft.thread != thread || draft.generation != generation {
@@ -163,8 +166,9 @@ impl ZaloGuiApp {
         match result {
             Ok(text) => {
                 // Keystrokes, send, and explicit clearing all win over an asynchronous load.
-                if !draft.touched && self.input_message == draft.observed {
-                    self.input_message = text.clone();
+                if !draft.touched && self.input_message == draft.observed.text {
+                    self.input_message = text.text.clone();
+                    self.composer_mentions = text.clone();
                     draft.observed = text.clone();
                     draft.persisted = text;
                 }
@@ -179,7 +183,7 @@ impl ZaloGuiApp {
         owner: String,
         thread: String,
         generation: u64,
-        text: String,
+        text: crate::mentions::Draft,
         result: Result<(), String>,
     ) {
         let draft = &mut self.composer_draft;
@@ -194,7 +198,8 @@ impl ZaloGuiApp {
                 draft.persisted = text;
                 if draft.close_pending
                     && draft.queued.is_none()
-                    && self.input_message == draft.persisted
+                    && self.input_message == draft.persisted.text
+                    && self.composer_mentions == draft.persisted
                 {
                     draft.close_pending = false;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -316,7 +321,7 @@ mod tests {
         let mut app = app(&ctx);
         let generation = app.composer_draft.generation;
         app.composer_draft.touched = true;
-        app.composer_draft.queued = Some(String::new());
+        app.composer_draft.queued = Some(Default::default());
         app.composer_draft_saved(
             &ctx,
             "owner-a".into(),
@@ -325,14 +330,14 @@ mod tests {
             "tin đã gửi".into(),
             Ok(()),
         );
-        assert_eq!(app.composer_draft.queued, Some(String::new()));
+        assert_eq!(app.composer_draft.queued, Some(Default::default()));
         assert_eq!(app.composer_draft.persisted, "tin đã gửi");
         app.composer_draft_saved(
             &ctx,
             "owner-a".into(),
             "thread-a".into(),
             generation,
-            String::new(),
+            Default::default(),
             Ok(()),
         );
         assert!(app.composer_draft.queued.is_none());
@@ -373,7 +378,7 @@ mod close_tests {
             .commands
             .iter()
             .any(|c| matches!(c, egui::ViewportCommand::CancelClose)));
-        app.composer_draft.queued = Some(String::new());
+        app.composer_draft.queued = Some(Default::default());
         let output = ctx.run(Default::default(), |ctx| {
             app.composer_draft_saved(
                 ctx,
@@ -394,7 +399,7 @@ mod close_tests {
                 "owner-a".into(),
                 "thread-a".into(),
                 1,
-                String::new(),
+                Default::default(),
                 Ok(()),
             )
         });
@@ -440,5 +445,43 @@ mod explicit_quit_tests {
                 .last(),
             Some(egui::ViewportCommand::CancelClose)
         ));
+    }
+}
+
+#[cfg(test)]
+mod mention_identity_tests {
+    use super::*;
+    #[test]
+    fn same_literal_with_a_different_uid_is_a_real_draft_change() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "group_1".into(),
+                is_group: true,
+                ..Default::default()
+            }],
+            false,
+        );
+        app.selected_thread_index = 0;
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.sync_composer_draft(&ctx);
+        app.composer_mentions.insert(0, 0, "42", "An");
+        app.input_message = app.composer_mentions.text.clone();
+        app.observe_composer_draft();
+        let first = app.composer_draft.observed.clone();
+        app.composer_mentions.mentions[0].uid = "43".into();
+        app.observe_composer_draft();
+        assert_eq!(app.composer_draft.observed.text, first.text);
+        assert_ne!(app.composer_draft.observed, first);
+        let generation = app.composer_draft.generation;
+        app.composer_draft_loaded("owner".into(), "group_1".into(), generation, Ok(first));
+        assert_eq!(app.composer_mentions.mentions[0].uid, "43");
+        app.user_uin = "other".into();
+        app.sync_composer_draft(&ctx);
+        assert!(app.composer_mentions.mentions.is_empty());
     }
 }

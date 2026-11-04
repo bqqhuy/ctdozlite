@@ -982,7 +982,7 @@ pub(super) fn render_chat_bubble(
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
-    idx: usize,
+    _idx: usize,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
@@ -1313,17 +1313,7 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::DoubleClickReply);
                 }
-                quote_action.or(card_action).or_else(|| {
-                    bubble_context_menu(
-                        ui,
-                        &fr.response,
-                        msg,
-                        idx,
-                        pal,
-                        emoji_textures,
-                        has_interactive_card,
-                    )
-                })
+                quote_action.or(card_action)
             });
 
             row_resp.inner
@@ -1465,17 +1455,7 @@ pub(super) fn render_chat_bubble(
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::DoubleClickReply);
                 }
-                quote_action.or(card_action).or_else(|| {
-                    bubble_context_menu(
-                        ui,
-                        &fr.response,
-                        msg,
-                        idx,
-                        pal,
-                        emoji_textures,
-                        has_interactive_card,
-                    )
-                })
+                quote_action.or(card_action)
             })
             .inner
         })
@@ -1504,6 +1484,7 @@ pub(super) enum BubbleAction {
     RetrySend,
     DoubleClickReply,
     Reply,
+    Mention,
     JumpToQuoted(String),
     Forward,
     React(&'static str),
@@ -1531,7 +1512,7 @@ pub(super) fn bubble_context_menu(
     _idx: usize,
     _pal: &ThemePalette,
     emoji_textures: &HashMap<String, TextureHandle>,
-    _has_interactive_card: bool,
+    is_group: bool,
 ) -> Option<BubbleAction> {
     let secondary_or_popup = ui.input(|i| {
         i.pointer.button_down(egui::PointerButton::Secondary)
@@ -1543,13 +1524,25 @@ pub(super) fn bubble_context_menu(
     }
     let resp = ui.interact(
         bubble.rect,
-        Id::new(("bubble_ctx", msg.ts, &msg.id)),
+        ui.id().with(("bubble_ctx", msg.ts, &msg.id)),
         Sense::click(),
     );
     let mut action = None;
 
     resp.context_menu(|ui| {
         ui.set_min_width(210.0);
+        if is_group
+            && !msg.is_outgoing
+            && msg.wire_ref.sender.as_ref().is_some_and(|v| {
+                v.as_u64().is_some()
+                    || v.as_str()
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            })
+            && ui.button("@ Nhắc đến người gửi (trong nhóm)").clicked()
+        {
+            action = Some(BubbleAction::Mention);
+            ui.close_menu();
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
             for &(code, key, tooltip) in &REACTION_LIST {
@@ -2165,5 +2158,161 @@ mod thumbnail_geometry_tests {
                 assert_eq!(size, Vec2::new(80.0, 60.0));
             }
         }
+    }
+}
+
+/// Native controls on a stable message identity; the row-to-toolbar corridor avoids hover gaps.
+pub(super) fn hover_message_actions(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    thread: &str,
+    msg: &ChatMessage,
+    emoji: &HashMap<String, TextureHandle>,
+) -> Option<BubbleAction> {
+    if !ui.is_rect_visible(rect)
+        || is_system_notice_message(msg)
+        || msg.id.is_empty()
+        || ui.memory(|m| m.any_popup_open())
+    {
+        return None;
+    }
+    let key = Id::new(("hover_message", thread));
+    let identity = (&msg.id, msg.ts);
+    let bar = egui::Rect::from_min_size(
+        rect.right_top() - Vec2::new(260.0, 0.0),
+        Vec2::new(260.0, 34.0),
+    );
+    let active = ui
+        .ctx()
+        .data(|d| d.get_temp::<(String, i64, egui::Rect)>(key));
+    let pointer = ui.input(|i| i.pointer.hover_pos());
+    let over_active_bar = active
+        .as_ref()
+        .is_some_and(|(_, _, bar)| pointer.is_some_and(|p| bar.expand(3.0).contains(p)));
+    let this_active = active
+        .as_ref()
+        .is_some_and(|(id, ts, _)| (id, *ts) == (identity.0, identity.1));
+    if over_active_bar && !this_active {
+        return None;
+    }
+    if !pointer.is_some_and(|p| rect.contains(p))
+        && !(this_active
+            && pointer.is_some_and(|p| {
+                rect.union(active.as_ref().map(|a| a.2).unwrap_or(bar))
+                    .expand(6.0)
+                    .contains(p)
+            }))
+    {
+        return None;
+    }
+    let mut action = None;
+    let toolbar = egui::Area::new(Id::new(("hover_actions", thread, &msg.id, msg.ts)))
+        .order(egui::Order::Foreground)
+        .fixed_pos(bar.left_top())
+        .constrain_to(ui.clip_rect())
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .inner_margin(3.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for &(code, key, hint) in &REACTION_LIST {
+                            let response = if let Some(tex) = emoji.get(key) {
+                                ui.add(egui::ImageButton::new(
+                                    egui::Image::new(tex).fit_to_exact_size(Vec2::splat(20.0)),
+                                ))
+                            } else {
+                                ui.button(code)
+                            };
+                            if response.on_hover_text(hint).clicked() {
+                                action = Some(BubbleAction::React(code));
+                            }
+                        }
+                        if ui.button("↩").on_hover_text("Trả lời").clicked() {
+                            action = Some(BubbleAction::Reply);
+                        }
+                    });
+                });
+        });
+    ui.ctx()
+        .data_mut(|d| d.insert_temp(key, (msg.id.clone(), msg.ts, toolbar.response.rect)));
+    action
+}
+
+#[cfg(test)]
+mod hover_action_tests {
+    use super::*;
+    #[test]
+    fn native_reaction_click_keeps_target_when_another_row_appears() {
+        let ctx = egui::Context::default();
+        let message = ChatMessage {
+            id: "stable-target".into(),
+            text: "hello".into(),
+            ts: 100,
+            ..Default::default()
+        };
+        let other = ChatMessage {
+            id: "new-row".into(),
+            text: "other".into(),
+            ts: 200,
+            ..Default::default()
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(20.0, 50.0), Vec2::new(600.0, 100.0));
+        let mut point = rect.center();
+        let mut result = None;
+        for frame in 0..5 {
+            let mut events = vec![egui::Event::PointerMoved(point)];
+            if frame == 3 || frame == 4 {
+                events.push(egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame == 3,
+                    modifiers: Default::default(),
+                });
+            }
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if frame >= 2 {
+                            // A neighboring row must not steal an already hovered toolbar.
+                            let overlapping = rect.translate(Vec2::new(0.0, -30.0));
+                            assert!(hover_message_actions(
+                                ui,
+                                overlapping,
+                                "group_1",
+                                &other,
+                                &HashMap::new()
+                            )
+                            .is_none());
+                        }
+                        if let Some(action) =
+                            hover_message_actions(ui, rect, "group_1", &message, &HashMap::new())
+                        {
+                            result = Some(action);
+                        }
+                    });
+                },
+            );
+            if frame == 1 {
+                let (_, _, toolbar) = ctx
+                    .data(|d| {
+                        d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                            "hover_message",
+                            "group_1",
+                        )))
+                    })
+                    .unwrap();
+                point = toolbar.left_top() + Vec2::new(12.0, 12.0);
+            }
+        }
+        assert!(matches!(result, Some(BubbleAction::React("👍"))));
     }
 }

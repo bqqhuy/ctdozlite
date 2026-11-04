@@ -751,20 +751,55 @@ impl MessageStore {
             .unwrap_or_default())
     }
 
-    /// Save literal composer text, or remove an empty draft; never trims Vietnamese input.
-    /// # Errors
-    /// Rejects an empty thread, text above 64 KiB, or SQLite failures.
-    pub(crate) fn save_composer_draft(&self, thread: &str, text: &str) -> Result<()> {
+    #[cfg(test)]
+    fn save_composer_draft(&self, thread: &str, text: &str) -> Result<()> {
+        self.save_composer_document(thread, &crate::mentions::Draft::from(text))
+    }
+
+    /// Load mention metadata only when it belongs to the exact persisted literal draft.
+    pub(crate) fn composer_document(&self, thread: &str) -> Result<crate::mentions::Draft> {
+        use rusqlite::OptionalExtension;
+        let text = self.composer_draft(thread)?;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM tool_config WHERE key=?1",
+                [format!("draft_mentions:{thread}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let saved = raw
+            .filter(|r| r.len() <= 128 * 1024)
+            .and_then(|r| serde_json::from_str::<crate::mentions::Draft>(&r).ok());
+        Ok(saved
+            .filter(|d| d.text == text && crate::mentions::validate(&d.text, &d.mentions).is_ok())
+            .unwrap_or_else(|| text.into()))
+    }
+
+    /// Persist literal text and explicit identities in one SQLite transaction.
+    pub(crate) fn save_composer_document(
+        &self,
+        thread: &str,
+        draft: &crate::mentions::Draft,
+    ) -> Result<()> {
+        crate::mentions::validate(&draft.text, &draft.mentions)?;
+        let tx = self.conn.unchecked_transaction()?;
         anyhow::ensure!(
-            !thread.is_empty() && text.len() <= 64 * 1024,
+            !thread.is_empty() && draft.text.len() <= 64 * 1024,
             "Invalid composer draft"
         );
-        if text.is_empty() {
-            self.conn
-                .execute("DELETE FROM composer_drafts WHERE thread_id=?1", [thread])?;
+        if draft.text.is_empty() {
+            tx.execute("DELETE FROM composer_drafts WHERE thread_id=?1", [thread])?;
         } else {
-            self.conn.execute("INSERT INTO composer_drafts(thread_id,text) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET text=excluded.text",params![thread,text])?;
+            tx.execute("INSERT INTO composer_drafts(thread_id,text) VALUES(?1,?2) ON CONFLICT(thread_id) DO UPDATE SET text=excluded.text",params![thread,draft.text])?;
         }
+        let key = format!("draft_mentions:{thread}");
+        if draft.mentions.is_empty() {
+            tx.execute("DELETE FROM tool_config WHERE key=?1", [&key])?;
+        } else {
+            tx.execute("INSERT INTO tool_config(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, serde_json::to_string(draft)?])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -904,6 +939,10 @@ impl MessageStore {
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE thread_id=?1"), [id])?;
         }
+        tx.execute(
+            "DELETE FROM tool_config WHERE key=?1",
+            [format!("draft_mentions:{id}")],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -2772,5 +2811,63 @@ mod deleted_insert_race_tests {
         store.delete_chat_message("thread-a", &message).unwrap();
         assert_eq!(persist_threads(&mut store, &[thread]).unwrap(), 0);
         assert!(store.messages_for("thread-a", 20).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod mention_draft_tests {
+    use super::*;
+    #[test]
+    fn document_roundtrip_binding_and_delete() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let mut draft = crate::mentions::Draft::from("Xin ");
+        draft.insert(4, 4, "42", "An");
+        store.save_composer_document("group_1", &draft).unwrap();
+        assert_eq!(store.composer_draft("group_1").unwrap(), draft.text);
+        assert_eq!(store.composer_document("group_1").unwrap(), draft);
+        assert!(store
+            .composer_document("group_2")
+            .unwrap()
+            .mentions
+            .is_empty());
+        assert!(MessageStore::open(":memory:")
+            .unwrap()
+            .composer_document("group_1")
+            .unwrap()
+            .mentions
+            .is_empty());
+        store
+            .conn
+            .execute(
+                "UPDATE composer_drafts SET text='Khác' WHERE thread_id='group_1'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .composer_document("group_1")
+            .unwrap()
+            .mentions
+            .is_empty());
+        store.save_composer_document("group_1", &draft).unwrap();
+        store.delete_conversation("group_1", &[]).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM tool_config WHERE key='draft_mentions:group_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[test]
+    fn metadata_failure_rolls_back_literal_text_too() {
+        let store = MessageStore::open(":memory:").unwrap();
+        store.save_composer_draft("group_1", "old").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_mention BEFORE INSERT ON tool_config BEGIN SELECT RAISE(ABORT,'fixture');END;").unwrap();
+        let mut draft = crate::mentions::Draft::default();
+        draft.insert(0, 0, "42", "An");
+        assert!(store.save_composer_document("group_1", &draft).is_err());
+        assert_eq!(store.composer_draft("group_1").unwrap(), "old");
     }
 }

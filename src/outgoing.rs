@@ -6,6 +6,10 @@ use serde_json::{json, Value};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Text,
+    Mentioned {
+        mentions: Vec<crate::mentions::Mention>,
+        quoted: Option<Box<ChatMessage>>,
+    },
     Quote(Box<ChatMessage>),
     Forward(Box<ChatMessage>),
     Sticker {
@@ -80,6 +84,19 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
     let id = message.client_message_id.parse()?;
     let mut sent = message.clone();
     let response = match &job.payload {
+        Payload::Mentioned { mentions, quoted } => {
+            anyhow::ensure!(
+                job.is_group && !mentions.is_empty(),
+                "Thiếu thông tin mention nhóm"
+            );
+            crate::mentions::validate(&message.text, mentions)?;
+            if let Some(quoted) = quoted {
+                crate::chat::send_quote_mentions(s, to, &message.text, quoted, true, id, mentions)
+                    .await?
+            } else {
+                crate::chat::send_group_mentions(s, to, &message.text, id, mentions).await?
+            }
+        }
         Payload::Text => {
             if let Some(url) = crate::chat::extract_first_url(&message.text) {
                 let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
