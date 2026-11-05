@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.007-arm — Windows 11 ARM64 — 05/11/2026
+
+Thay đổi so với [v0.005-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.005-arm).
+Bản này gộp phần v0.006 chưa phát hành và các thay đổi v0.007 đã triển khai.
+
+### Tìm kiếm, thư viện và giao diện
+
+- Tìm lịch sử cục bộ bằng FTS: Liên hệ/hội thoại, Tin nhắn, Ảnh/Video, File, Link;
+  Ctrl+F tìm trong hội thoại và mở đúng tin, giữ bản nháp.
+- Thư viện hội thoại lọc người gửi, khoảng ngày, đuôi tệp; tìm tên file, link và caption.
+- Sửa tương phản chữ ở theme sáng, giữ emoji/dấu tổ hợp khi cắt tên; giảm invalidation
+  ô chat khi hội thoại khác cập nhật. Kết hợp lọc chưa đọc với Cá nhân/Nhóm.
+- Ghi nhớ metadata nhóm theo version và đầu lịch sử còn mới, giảm request lặp khi mở lại.
+- Thêm nhãn VI/EN chính; một số trạng thái động/lỗi native vẫn dùng ngôn ngữ nguồn.
+
+### Reaction, thông báo và dữ liệu server
+
+- Reaction qua nút bấm thay vì bảng emoji bung khi hover; xem người thả, lọc emoji,
+  tra tên/avatar và bỏ cảm xúc của mình. Preview hiển thị reaction mới nhất.
+- Lưu reaction đến trước tin gốc, khử trùng replay; nhiều target cùng đợt đều cập nhật.
+- Sửa ACK/identity reaction và thu hồi; chỉ đổi nội dung sau xác nhận server.
+- Thông báo phân biệt foreground/visible; âm thanh có kiểm tra chuẩn bị và nút thử.
+- Ghim hội thoại server, đọc/ghim tin nhóm và nhắc hẹn server riêng với lịch gửi local.
+
+### Nhóm và vòng đời tin nhắn
+
+- Kiểm tra quyền gửi nhóm ở composer và đường gửi chung; chưa xác minh thì khóa gửi.
+- Thêm tạo nhóm, nhóm chung và quản trị: thành viên, quản trị viên, chuyển trưởng,
+  rời/giải tán; thao tác nguy hiểm có xác nhận, không tự lặp khi mất ACK.
+- Bảng ghi chú văn bản và bình chọn: danh sách/phân trang, tạo/sửa/xóa ghi chú,
+  bỏ phiếu/thêm phương án/đóng bình chọn theo quyền đã xác nhận.
+- Đọc/đổi TTL và chặn chia sẻ; chặn qua các đường forward/copy/save/export có nguồn tin.
+- Tin hết hạn được loại khỏi DB/FTS/UI và có marker chống import hồi sinh;
+  kiểm tra hạn khi tải ảnh, phát video và nhận preview đến muộn.
+
+### Khôi phục lịch sử — thử nghiệm, chủ động lựa chọn
+
+- V1 fallback RSA/ZDB4 tách khỏi Sync2; kiểm tra phiên, ánh xạ UID qua znoise,
+  tải/giải nén có giới hạn và hủy được. Không tự chạy khi Sync2 lỗi, không đổi coverage Sync2.
+- Nhập backup Zalo Desktop V2 chọn lọc từ PR #96: chọn file/key thủ công, dry-run,
+  kiểm tra tài khoản, import lặp an toàn và kho media bền vững; đọc ảnh JPEG XL cục bộ.
+- Import theo lô: hủy/lỗi giữ các lô đã commit, rollback lô hiện tại; chạy lại khử trùng.
+
+### Lưu ý nâng cấp và giới hạn
+
+- Schema SQLite lên **10**. Sao lưu thư mục dữ liệu trước nâng cấp; binary cũ không
+  mở DB schema 10. Muốn quay lại cần bản sao dữ liệu trước nâng cấp, không sửa user_version.
+- V1 chưa nghiệm thu với iPhone thật và chưa giải mã đầy đủ media BinNet. Backup V2
+  vẫn thử nghiệm; không thay thế bản sao lưu gốc. Kiểm tra tar/CBC không xác thực nguồn file.
+- Control quyền nhóm/cộng đồng tức thời, cleanup toàn bộ cache và các đường chia sẻ
+  vẫn cần rà thêm. Danh sách reactor chỉ gồm danh tính đã nhận; không suy ra từ số đếm.
+- Kiểm thử tự động/native CI không thay thế nghiệm thu GUI, iPhone và tài khoản thật.
+- Loại thư viện RSA có advisory RUSTSEC-2023-0071, thay AWS-LC; cập nhật dependency clipboard đã bị yank.
+- Spec Kit được thêm cho phát triển, không đi vào runtime ứng dụng.
+
 ## v0.005-arm — Windows 11 ARM64 — 04/11/2026
 
 Thay đổi so với [v0.004-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.004-arm).
