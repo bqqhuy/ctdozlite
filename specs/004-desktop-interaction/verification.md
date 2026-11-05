@@ -27,3 +27,10 @@ Test tương phản và grapheme không thay kiểm chứng glyph thực tế ha
 
 Chỉ thêm kết quả đã chạy; ghi test failed/ignored. Không điền bảng bằng dự đoán.
 Không ghi khóa, cookie, URL có chữ ký hay nội dung tin của người khác.
+
+## Hồi quy bố cục trước release
+
+Native CI 41987509192 phát hiện cảnh báo quyền nhóm đẩy nút Gửi vượt viewport.
+Test blocked_group_notice_keeps_send_inside_viewport tái hiện lỗi trước sửa và
+qua sau khi dành chiều cao đúng galley; ba cấu hình kích thước/DPI được kiểm tra.
+Chờ CI native mới; chưa đóng task nghiệm thu GUI/tài khoản thật.

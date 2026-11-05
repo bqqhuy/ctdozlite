@@ -2383,8 +2383,19 @@ impl ZaloGuiApp {
                     let composer_input_width=(ui.available_width()-44.0-34.0*composer_action_count as f32-composer_separator-composer_send_width-composer_schedule_width-composer_spacing).max(32.0);
                     self.sync_composer_draft(ctx);
                     let editor_height=composer_editor_height(ui,&self.input_message,composer_input_width);
+                    let group_send_allowed = !is_group || self.threads[self.selected_thread_index]
+                        .presentation.send_policy.as_ref().is_some_and(|policy| policy.allows(&self.user_uin));
+                    let group_notice = (!group_send_allowed).then(|| {
+                        let text = if self.threads[self.selected_thread_index].presentation.send_policy.is_none() {
+                            "Chưa xác minh được quyền gửi. Mở lại hội thoại để thử tải quyền nhóm."
+                        } else { "Nhóm đang khóa gửi tin hoặc bạn không còn quyền gửi." };
+                        ui.fonts(|fonts| fonts.layout(text.into(), egui::TextStyle::Body.resolve(ui.style()), pal.text_primary, ui.available_width()))
+                    });
+                    // Reserve the same wrapped galley that is rendered below the history.
+                    // A permission notice must not push the composer outside the viewport.
+                    let notice_height = group_notice.as_ref().map(|galley| galley.size().y + ui.spacing().item_spacing.y).unwrap_or(0.0);
                     let msg_area_height =
-                        (ui.available_height() - 48.0 - picker_reserve - editor_height).max(0.0);
+                        (ui.available_height() - 48.0 - picker_reserve - editor_height - notice_height).max(0.0);
 
                     let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
                     let content_protected=self.content_protected(&thread_id,is_group);
@@ -3041,13 +3052,7 @@ impl ZaloGuiApp {
                     }
 
                     // 4. Bottom Message Composer Bar (Compact Icon Actions + Spacious Input + Padded Send Button)
-                    let group_send_allowed = !is_group || self.threads[self.selected_thread_index]
-                        .presentation.send_policy.as_ref().is_some_and(|policy| policy.allows(&self.user_uin));
-                    if !group_send_allowed {
-                        ui.colored_label(pal.text_primary, if self.threads[self.selected_thread_index].presentation.send_policy.is_none() {
-                            "Chưa xác minh được quyền gửi. Mở lại hội thoại để thử tải quyền nhóm."
-                        } else { "Nhóm đang khóa gửi tin hoặc bạn không còn quyền gửi." });
-                    }
+                    if let Some(notice) = group_notice { ui.label(notice); }
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(14.0, 10.0))
@@ -3345,8 +3350,10 @@ impl ZaloGuiApp {
                                             Vec2::new(send_btn_w, 34.0),
                                             Sense::click(),
                                         );
+                                        #[cfg(test)]
+                                        ctx.data_mut(|data| data.insert_temp(Id::new("composer-send-bounds"), (send_rect, ui.clip_rect())));
                                         if self.smoke.is_some() && !ui.clip_rect().expand(1.0).contains_rect(send_rect) {
-                                            eprintln!("UI smoke failed: send button outside composer viewport");std::process::exit(3);
+                                            eprintln!("UI smoke failed: send button outside composer viewport: send={send_rect:?}, clip={:?}",ui.clip_rect());std::process::exit(3);
                                         }
                                         let send_bg = if !can_send {
                                             pal.primary.linear_multiply(0.42)
@@ -3988,6 +3995,50 @@ mod quote_navigation_tests {
 mod composer_tests {
     use super::*;
 
+    #[test]
+    fn blocked_group_notice_keeps_send_inside_viewport() {
+        for (width, height, scale) in [
+            (1020.0, 700.0, 1.0),
+            (1020.0, 700.0, 1.5),
+            (480.0, 360.0, 1.0),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut app = ZaloGuiApp::from_context(
+                &ctx,
+                Session::new(false, false, false).unwrap(),
+                false,
+                Vec::new(),
+                false,
+            );
+            app.settings_modal_open = false;
+            app.history_sync_running = false;
+            app.threads = vec![Thread {
+                id: "blocked-fixture".into(),
+                name: "Nhóm chưa xác minh quyền".into(),
+                is_group: true,
+                ..Default::default()
+            }];
+            app.selected_thread_index = 0;
+            for _ in 0..4 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(width / scale, height / scale),
+                    )),
+                    ..Default::default()
+                };
+                let _ = ctx.run(input, |ctx| app.render_chat_workspace(ctx, &app.palette()));
+            }
+            let (send, clip) = ctx
+                .data(|data| data.get_temp::<(Rect, Rect)>(Id::new("composer-send-bounds")))
+                .unwrap();
+            assert!(
+                clip.expand(1.0).contains_rect(send),
+                "{width}x{height}@{scale}: send={send:?}, clip={clip:?}"
+            );
+        }
+    }
     #[test]
     fn composer_rows_grow_with_lines_and_cap_at_five() {
         assert_eq!(composer_rows(""), 1);

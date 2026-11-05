@@ -27,3 +27,11 @@ V1 chưa nghiệm thu iPhone và chưa decode đủ BinNet. CBC/tar hợp lệ k
 
 Chỉ thêm kết quả đã chạy; ghi test failed/ignored. Không điền bảng bằng dự đoán.
 Không ghi khóa, cookie, URL có chữ ký hay nội dung tin của người khác.
+
+## Chuẩn bị phát hành 05/11/2026
+
+H-T005 đã thực hiện: thay rsa bằng AWS-LC, thêm SPKI/unwrap known-answer OpenSSL;
+audit đầy đủ 0 vulnerabilities, không còn gói yank. Warning bảo trì vẫn được công bố.
+Xem [ADR-0033](../../docs/adr/0033-v1-rsa-backend-release-audit.md) và
+[release verification](../../docs/releases/v0.007-arm-verification.md).
+Điều này không xác nhận V1 trên iPhone hay giải mã BinNet.

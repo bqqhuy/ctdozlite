@@ -27,6 +27,7 @@ Bản này gộp phần v0.006 chưa phát hành và các thay đổi v0.007 đ�
 ### Nhóm và vòng đời tin nhắn
 
 - Kiểm tra quyền gửi nhóm ở composer và đường gửi chung; chưa xác minh thì khóa gửi.
+  Cảnh báo quyền được dành chỗ để nút Gửi không tràn khỏi cửa sổ.
 - Thêm tạo nhóm, nhóm chung và quản trị: thành viên, quản trị viên, chuyển trưởng,
   rời/giải tán; thao tác nguy hiểm có xác nhận, không tự lặp khi mất ACK.
 - Bảng ghi chú văn bản và bình chọn: danh sách/phân trang, tạo/sửa/xóa ghi chú,
