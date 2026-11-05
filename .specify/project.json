@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "default_feature": "specs/001-group-governance",
+  "release_scope": "docs/releases/v0.007-arm-plan.md",
+  "features": [
+    "specs/001-group-governance",
+    "specs/002-message-media-lifecycle",
+    "specs/003-history-restoration",
+    "specs/004-desktop-interaction"
+  ]
+}

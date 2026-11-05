@@ -67,3 +67,14 @@ MUST read the corresponding standard file under `docs/standards/` before modifyi
 - **Tests, fixtures, and benchmarks** → `docs/standards/testing-and-fixtures.md`
 - **Secrets, crypto, and session handling** → `docs/standards/security-and-cryptography.md`
 - **Branches, commits, and PRs** → `docs/standards/git-flow-and-pr-matrix.md`
+
+## Spec Kit pilot
+
+For the remaining v0.007 work, read `docs/SPEC_KIT.md` and the relevant feature under
+`specs/`; the release scope map is `docs/releases/v0.007-arm-plan.md`. Keep spec,
+plan, tasks and verification consistent. Distinguish code, fixture checks and native
+device confirmation; never mark the latter complete from unit tests. Existing
+standards/ADRs and GitHub ticket lifecycle remain canonical. Use the current branch
+and respect existing authorization; do not invoke automatic workflows or release
+operations as a side effect of Spec Kit. Update command sources in
+`.specify/templates/overrides/`, then regenerate skills with the pinned CLI.

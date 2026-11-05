@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "tool": "github/spec-kit",
+  "version": "1.3.0",
+  "git_commit": "34a0d388eac671d656eb05b125ad3ed6056168ed",
+  "upstream": "https://github.com/github/spec-kit",
+  "preset": "lean",
+  "project_overrides": ".specify/templates/overrides",
+  "integration": "codex",
+  "extensions": [],
+  "automatic_workflows": false,
+  "project_preset": {
+    "id": "ctdo-lite",
+    "version": "1.0.0",
+    "purpose": "Register all nine command overrides for native skill rendering"
+  }
+}

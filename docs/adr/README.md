@@ -73,3 +73,11 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0028 — v0.004-arm selected upstream improvements](0028-v004-arm-selected-upstream.md)
 
 - [0029 — Scoped chat file-drop zones](0029-chat-file-drop-zones.md)
+
+- [0030 — Indexed local search and explicit server state](0030-v006-search-and-server-state.md)
+
+- [0031 — Group policy, message lifecycle and explicit restoration](0031-v007-group-policy-and-restoration.md)
+
+- [0032 — Lightweight Spec Kit pilot](0032-lightweight-spec-kit-pilot.md)
+
+- [0033 — V1 RSA backend after release audit](0033-v1-rsa-backend-release-audit.md)

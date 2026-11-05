@@ -1,0 +1,65 @@
+{
+  "schema_version": "1.0",
+  "presets": {
+    "lean": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:d316b3ad5f41988d51fe2b7faedab9c942edc68b44cf6970d5e26ef5a8522751",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "codex": [
+          "speckit.specify",
+          "speckit.plan",
+          "speckit.tasks",
+          "speckit.implement",
+          "speckit.constitution"
+        ]
+      },
+      "registered_skills": {
+        "codex": [
+          "speckit-specify",
+          "speckit-plan",
+          "speckit-tasks",
+          "speckit-implement",
+          "speckit-constitution"
+        ]
+      },
+      "installed_at": "2026-11-05T06:38:28.780883+00:00"
+    },
+    "ctdo-lite": {
+      "version": "1.0.0",
+      "source": "local",
+      "manifest_hash": "sha256:7253a4a092ddc8b4de1c2c6934d13048fdb96628642c2df34a8d00f258431542",
+      "enabled": true,
+      "priority": 5,
+      "registered_commands": {
+        "codex": [
+          "speckit.analyze",
+          "speckit.checklist",
+          "speckit.clarify",
+          "speckit.constitution",
+          "speckit.converge",
+          "speckit.implement",
+          "speckit.plan",
+          "speckit.specify",
+          "speckit.tasks"
+        ]
+      },
+      "registered_skills": {
+        "codex": [
+          "speckit-analyze",
+          "speckit-checklist",
+          "speckit-clarify",
+          "speckit-constitution",
+          "speckit-converge",
+          "speckit-implement",
+          "speckit-plan",
+          "speckit-specify",
+          "speckit-tasks"
+        ]
+      },
+      "installed_at": "2026-11-05T06:49:21.980558+00:00"
+    }
+  }
+}
