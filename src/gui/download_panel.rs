@@ -11,7 +11,7 @@ impl ZaloGuiApp {
         if self.downloads.is_empty() {
             return;
         }
-        egui::Window::new("Tải tệp")
+        egui::Window::new(crate::i18n::tr("Tải tệp"))
             .id(Id::new("media_downloads"))
             .default_width(340.0)
             .resizable(true)
@@ -40,13 +40,13 @@ impl ZaloGuiApp {
                                     } else {
                                         ui.label(format!("Đã tải {} KiB", d.bytes / 1024));
                                     }
-                                    if ui.button("Hủy tải").clicked() {
+                                    if ui.button(crate::i18n::tr("Hủy tải")).clicked() {
                                         d.cancel.store(true, std::sync::atomic::Ordering::Release);
                                     }
                                 }
                                 Some(Ok(path)) => {
                                     ui.horizontal(|ui| {
-                                        if ui.button("Mở tệp").clicked() {
+                                        if ui.button(crate::i18n::tr("Mở tệp")).clicked() {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::OpenDownloaded {
                                                     path: path.clone(),
@@ -54,7 +54,7 @@ impl ZaloGuiApp {
                                                 });
                                             }
                                         }
-                                        if ui.button("Mở thư mục").clicked() {
+                                        if ui.button(crate::i18n::tr("Mở thư mục")).clicked() {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::OpenDownloaded {
                                                     path: path.clone(),
@@ -69,7 +69,7 @@ impl ZaloGuiApp {
                                 }
                                 Some(Err(error)) => {
                                     ui.label(error);
-                                    if ui.small_button("Đóng").clicked() {
+                                    if ui.small_button(crate::i18n::tr("Đóng")).clicked() {
                                         remove.push(id.clone());
                                     }
                                 }

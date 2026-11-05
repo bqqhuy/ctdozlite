@@ -654,3 +654,15 @@ impl ReactionCoverage {
         self.unresolved.is_empty()
     }
 }
+
+/// Sidebar activity is separate from message timestamps and unread message counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Preview {
+    pub reactor: String,
+    pub emoji: String,
+    pub target: String,
+    pub event_id: String,
+    pub ts: i64,
+    pub by_self: bool,
+    pub target_by_self: bool,
+}

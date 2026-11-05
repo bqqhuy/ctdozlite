@@ -15,6 +15,7 @@ use tray_icon::{
 extern "system" {
     fn ShowWindow(hwnd: *mut std::ffi::c_void, command: i32) -> i32;
     fn SetForegroundWindow(hwnd: *mut std::ffi::c_void) -> i32;
+    fn GetForegroundWindow() -> *mut std::ffi::c_void;
     fn IsIconic(hwnd: *mut std::ffi::c_void) -> i32;
     fn IsWindowVisible(hwnd: *mut std::ffi::c_void) -> i32;
     fn PostMessageW(hwnd: *mut std::ffi::c_void, message: u32, wparam: usize, lparam: isize)
@@ -363,7 +364,7 @@ unsafe extern "system" fn notification_tick(_: *mut std::ffi::c_void, _: u32, _:
             return;
         };
         if let Some(desktop) = icon.desktop.as_mut() {
-            desktop.tick(!previews_visible());
+            desktop.tick(!foreground());
         }
         let unread = crate::desktop_notice::snapshot().count > 0;
         if unread != icon.shown {
@@ -406,4 +407,16 @@ pub(crate) fn open_notice(notice: crate::desktop_notice::Notice) {
     {
         control.open();
     }
+}
+
+/// Visible does not imply foreground: another application may cover the root window.
+pub(crate) fn foreground() -> bool {
+    let control = DISPATCH
+        .lock()
+        .ok()
+        .and_then(|d| d.as_ref().map(|d| d.control.clone()));
+    control.is_some_and(|c| {
+        // SAFETY: user32 returns a handle; comparison does not dereference it.
+        !c.hidden.load(Ordering::SeqCst) && unsafe { GetForegroundWindow() as isize == c.hwnd }
+    })
 }

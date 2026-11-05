@@ -39,7 +39,13 @@ pub enum WorkerCmd {
         owner: String,
         open: bool,
     },
-    PrepareNotificationSound,
+    PrepareNotificationSound {
+        play: bool,
+    },
+    OpenLibraryLink {
+        owner: String,
+        url: String,
+    },
     DownloadMedia {
         url: String,
         name: String,
@@ -56,6 +62,22 @@ pub enum WorkerCmd {
         command: super::tools_panel::ToolsCommand,
     },
     RunAutomation,
+    PruneExpired,
+    FetchReactorProfiles {
+        owner: String,
+        ids: Vec<String>,
+    },
+    GroupContent {
+        owner: String,
+        thread: String,
+        generation: u64,
+        action: crate::group_content::Action,
+    },
+    ConversationPolicy {
+        owner: String,
+        generation: u64,
+        action: crate::conversation_policy::Action,
+    },
     RetryOutgoing {
         thread_id: String,
         message: ChatMessage,
@@ -77,6 +99,41 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
+    PickDesktopBackup {
+        owner: String,
+        generation: u64,
+    },
+    DesktopBackup {
+        owner: String,
+        generation: u64,
+        path: std::path::PathBuf,
+        key: zeroize::Zeroizing<String>,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        expected: Option<crate::desktop_backup::Report>,
+    },
+
+    FetchGroupPolicy {
+        group_id: String,
+    },
+    Group {
+        owner: String,
+        target: String,
+        generation: u64,
+        action: crate::groups::Action,
+    },
+    Board {
+        owner: String,
+        thread: String,
+        group: bool,
+        generation: u64,
+        action: crate::board::Action,
+    },
+    SetServerPin {
+        owner: String,
+        thread: String,
+        group: bool,
+        pinned: bool,
+    },
     SetConversationPreference {
         owner: String,
         thread_id: String,
@@ -116,6 +173,7 @@ pub enum WorkerCmd {
         range_days: u32,
     },
     SyncPhoneRecent,
+    SyncPhoneLegacy,
     CancelPhoneHistory,
     PollMessages {
         known_threads: Vec<(String, String, bool)>,
@@ -621,6 +679,9 @@ pub(super) fn spawn_session_worker(
     // Serialize page receipt through durable cursor commit, not just the HTTP request.
     let poll_delivery = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let mute_sync = MuteSync::default();
+    let pin_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let search_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let search_latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let history_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let history_sync_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let phone_sync_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -665,8 +726,10 @@ pub(super) fn spawn_session_worker(
                                 let background = key.starts_with("ava_") || key.starts_with("stk_");
                                 let Some(job) = admission.start().await else { return; };
                                 let _background = background;
+                                let owner = s.account_key().to_owned();
+                                let expires_at = context.as_ref().and_then(|source| crate::message_lifecycle::expires_at(&source.message));
                                 match fetch_chat_image(&s,&key,&url,context,&tx).await {
-                                    Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { key,image,permit:job }); },
+                                    Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { owner,expires_at,key,image,permit:job }); },
                                     Err(error) => { let failure=error.downcast_ref::<crate::media_recovery::Failure>().cloned().unwrap_or(crate::media_recovery::Failure::Local);crate::transfer_diagnostics::media(&failure);let _ = tx.send(GuiEvent::ImageUnavailable { key,failure }); }
                                 }
                                 ctx.request_repaint();
@@ -749,11 +812,21 @@ pub(super) fn spawn_session_worker(
                                                 cb.handle_control_event(voip_ev);
                                             }
                                             deliver_presence(&s_snap, &ev.payload, &gui_tx_ws, &ctx_ws).await;
+                                            let reaction_events=crate::reaction_pipeline::events(&ev.payload);
+                                            let has_reactions=!reaction_events.is_empty();
+                                            let reactions_stored=if reaction_events.is_empty(){true}else{
+                                                let account=s_snap.clone();
+                                                match tokio::task::spawn_blocking(move||->anyhow::Result<_>{let store=crate::store::MessageStore::open(account.history_path())?;crate::reaction_pipeline::enqueue(&store,&reaction_events)?;crate::reaction_pipeline::drain(&store,&account)}).await {
+                                                    Ok(Ok(threads))=>{if !threads.is_empty(){let _=gui_tx_ws.send(GuiEvent::ThreadsUpdated{threads,source:ThreadUpdateSource::History});ctx_ws.request_repaint();}true},
+                                                    _=>{crate::logger::log_error("reaction","Cannot persist incoming reaction page");false}
+                                                }
+                                            };
+
                                             if ev.is_voip_ish() {
                                                 let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
                                                 apply_server_mutes(&s_snap, mutes, &mute_sync, &gui_tx_ws, &live_updates, &ctx_ws).await;
                                             }
-                                            if ev.is_chat_ish() || data_node.get("clearUnreads").is_some()
+                                            if ev.is_chat_ish() || has_reactions || data_node.get("clearUnreads").is_some()
                                                 || data_node.get("clearUnreadInfo").is_some() || data_node.get("chatEntries").is_some() || data_node.get("statusMap").is_some() {
                                                 let mut ws_threads = Vec::new();
                                                 if let Some(li) = s_snap.login.as_ref() {
@@ -791,7 +864,7 @@ pub(super) fn spawn_session_worker(
                                                     ctx_ws.request_repaint();
                                                 }
                                                 // Like Zalo PC, a queue cursor advances only after its page is stored.
-                                                crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload, stored).await;
+                                                crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload, stored && reactions_stored).await;
                                             }
                                         }
                                         Ok(None) => {
@@ -872,7 +945,8 @@ pub(super) fn spawn_session_worker(
 
                 {
                     let commands=commands.clone();
-                    tokio::spawn(async move {let mut tick=tokio::time::interval(Duration::from_secs(2));loop{tick.tick().await;let Some(tx)=commands.upgrade()else{break;};if tx.send(WorkerCmd::RunAutomation).is_err(){break;}}});
+                    tokio::spawn(async move {let mut tick=tokio::time::interval(Duration::from_secs(2));loop{tick.tick().await;let Some(tx)=commands.upgrade()else{break;};if tx.send(WorkerCmd::RunAutomation).is_err(){break;}
+if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                 }
                 let mut recovered_accounts=HashSet::new();
                 let automation_running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -932,11 +1006,56 @@ pub(super) fn spawn_session_worker(
                         WorkerCmd::Tools {owner,command}=>{
                             let s=session.lock().await.clone();if owner!=s.account_key() || owner.is_empty() || !s.is_active(){continue;}
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            let open_request=match &command {super::tools_panel::ToolsCommand::OpenSearchHit{generation,thread,id}=>Some((*generation,thread.clone(),id.clone())),_=>None};
+                            let search_request=match &command {super::tools_panel::ToolsCommand::SearchPage(request)=>Some(request.clone()),_=>None};
+                            let search_gate=search_gate.clone();let latest=search_latest.clone();
+                            if let Some(request)=&search_request{latest.store(request.generation,std::sync::atomic::Ordering::Release);}
                             let schedule=match &command {super::tools_panel::ToolsCommand::Schedule{request,thread,text,at,..}=>Some((*request,thread.clone(),text.clone(),*at)),_=>None};
                             tokio::spawn(async move{
-                                let mut result=account_tools(s,command).await.map_err(|e|e.to_string());
+                                let permit=if search_request.is_some(){search_gate.acquire_owned().await.ok()}else{None};
+                                let stale=search_request.as_ref().is_some_and(|r|latest.load(std::sync::atomic::Ordering::Acquire)!=r.generation);
+                                let mut result=if stale{Err("Đã thay bằng truy vấn mới".into())}else{account_tools(s,command).await.map_err(|e|e.to_string())};
+                                drop(permit);
+                                if let (Err(error),Some((generation,thread,id)))=(&result,open_request){result=Ok(super::tools_panel::ToolsResult::SearchOpenFailed{generation,thread,id,error:error.clone()});}
+                                if let (Err(error),Some(request))=(&result,search_request){result=Ok(super::tools_panel::ToolsResult::SearchPage{request,result:Err(error.clone()),senders:Vec::new()});}
                                 if let (Err(error),Some((request,thread,text,at)))=(&result,schedule){result=Ok(super::tools_panel::ToolsResult::ScheduleSaved{request,thread,text,at,result:Err(error.clone())});}
                                 let _=tx.send(GuiEvent::Tools{owner,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchReactorProfiles{owner,ids}=>{
+                            let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let result=if owner!=account.account_key()||!account.is_active()||ids.len()>50{Err("Yêu cầu hồ sơ không hợp lệ".into())}else{crate::chat::get_mini_profiles(&account,&ids).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::ReactorProfiles{owner,ids,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::GroupContent{owner,thread,generation,action}=>{
+                            let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{let mutation=action.mutation();let result=if owner!=account.account_key()||!account.is_active(){Err("Phiên đã thay đổi".into())}else{crate::group_content::execute(&account,&thread,&action).await.map_err(|error|error.to_string())};let _=tx.send(GuiEvent::GroupContent{owner,thread,generation,mutation,result});ctx.request_repaint();});
+                        }
+                        WorkerCmd::ConversationPolicy{owner,generation,action}=>{
+                            let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                if matches!(action,crate::conversation_policy::Action::Read)&&owner==account.account_key()&&account.is_active(){if let Ok(Some(snapshot))=crate::conversation_policy::cached(&account).await{let _=tx.send(GuiEvent::ConversationPolicy{loading:true,owner:owner.clone(),generation,result:Ok(snapshot)});ctx.request_repaint();}}
+                                let result=if owner!=account.account_key()||!account.is_active(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::conversation_policy::execute(&account,&action).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::ConversationPolicy{loading:false,owner,generation,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PruneExpired=>{
+                            static PRUNER:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(1);
+                            let Ok(permit)=PRUNER.try_acquire()else{continue;};
+                            let account=session.lock().await.clone();if !account.is_active()||account.account_key().is_empty(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();let owner=account.account_key().to_owned();
+                            tokio::spawn(async move{
+                                let _permit=permit;
+                                let result=tokio::task::spawn_blocking(move||->anyhow::Result<_>{
+                                    anyhow::ensure!(account.is_active(),"Phiên đã đóng");
+                                    let store=crate::store::MessageStore::open(account.history_path())?;
+                                    let ids=crate::message_lifecycle::purge(&store.conn,crate::login::unix_now()*1000)?;
+                                    crate::message_lifecycle::clean_restored(&account,&store.conn)?;let updates=crate::reaction_pipeline::drain(&store,&account)?;Ok((ids,updates))
+                                }).await;
+                                if let Ok(Ok((ids,threads)))=result {if !ids.is_empty(){let _=tx.send(GuiEvent::Expired{owner:owner.clone(),ids});ctx.request_repaint();}
+if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:ThreadUpdateSource::History});ctx.request_repaint();}}
                             });
                         }
                         WorkerCmd::RunAutomation=>{
@@ -996,6 +1115,7 @@ pub(super) fn spawn_session_worker(
                                 let media=crate::message_view::media(&context.message);
                                 let key=crate::media_recovery::image_key(&context.thread,&context.message.id,0,true);
                                 let url=media.preview.or(media.original).or(media.thumbnail).unwrap_or_default();
+                                if let Err(error)=crate::conversation_policy::require_shareable(&account,&context.thread,context.group).await{let _=tx.send(GuiEvent::StatusUpdate(error.to_string()));ctx.request_repaint();return;}
                                 let result=fetch_chat_image(&account,&key,&url,Some(context),&tx).await;
                                 let status=match result {
                                     Ok(image)=>{let active=account.clone();let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
@@ -1033,7 +1153,33 @@ pub(super) fn spawn_session_worker(
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             tokio::spawn(async move{
                                 let _request_slot=request_slot;
+                                if !media_context_alive(&account,context.as_ref()) { let _=tx.send(GuiEvent::StatusUpdate("Tin nhắn đã hết hạn hoặc phiên đã đóng".into()));ctx.request_repaint();return; }
+                                if !play {if let Some(source)=&context {if let Err(error)=crate::conversation_policy::require_shareable(&account,&source.thread,source.group).await{let _=tx.send(GuiEvent::StatusUpdate(error.to_string()));ctx.request_repaint();return;}}}
+
                                 let name=crate::media_download::safe_name(&name);
+                                if let Some(source)=&context {
+                                    if let Some(restored)=crate::desktop_backup::restored_path(&account,&source.message,false){
+                                        if tokio::fs::symlink_metadata(&restored).await.is_ok_and(|meta|meta.is_file()){
+                                            let account=account.clone();let tx=tx.clone();let ctx=ctx.clone();let name=name.clone();let context=context.clone();
+                                            let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
+                                                anyhow::ensure!(account.is_active(),"Phiên đã đóng");
+                                                let destination=if play||open{
+                                                    let root=account.cache_path().parent().ok_or_else(||anyhow::anyhow!("Missing cache"))?.join("restored-open").join(crate::crypto::md5_hex(&restored.to_string_lossy()));
+                                                    crate::storage::private_dir(&root)?;root.join(&name)
+                                                }else{
+                                                    #[cfg(windows)]{let Some(path)=rfd::FileDialog::new().set_title("Lưu tệp backup").set_file_name(&name).save_file()else{return Ok(());};path}
+                                                    #[cfg(not(windows))]{anyhow::bail!("Chọn nơi lưu tệp hiện hỗ trợ Windows");}
+                                                };
+                                                std::fs::copy(&restored,&destination)?;
+                                                if play{crate::video_player::play(&destination,&name,||media_context_alive(&account,context.as_ref()))?;}else if open{crate::platform::open_file(&destination);}
+                                                Ok(())
+                                            }).await;
+                                            if !matches!(result,Ok(Ok(()))){let _=tx.send(GuiEvent::StatusUpdate("Không mở/lưu được tệp đã phục hồi từ backup".into()));ctx.request_repaint();}
+                                            return;
+                                        }
+                                    }
+                                }
+
                                 let id=crate::chat::next_client_message_id().to_string();
                                 let owner=account.account_key().to_owned();
                                 let video_lease=if play {
@@ -1072,7 +1218,7 @@ pub(super) fn spawn_session_worker(
                                 let _=tx.send(GuiEvent::MediaStarted{owner:owner.clone(),id:id.clone(),name:name.clone(),cancel:cancel.clone()});ctx.request_repaint();
                                 let visual=play||context.as_ref().is_some_and(|c|matches!(crate::message_view::media(&c.message).kind,crate::message_view::MediaKind::Photo|crate::message_view::MediaKind::Video));
                                 let mut result=save_media_target(&url,&path,cancel.clone(),|bytes,total|{
-                                    if !account.is_active(){cancel.store(true,std::sync::atomic::Ordering::Release);}
+                                    if !media_context_alive(&account,context.as_ref()){cancel.store(true,std::sync::atomic::Ordering::Release);}
                                     let _=tx.send(GuiEvent::MediaProgress{owner:owner.clone(),id:id.clone(),bytes,total});ctx.request_repaint();
                                 },visual,video_lease.as_ref(),open).await;
                                 if result.as_ref().err().and_then(|e|e.downcast_ref::<crate::media_recovery::Failure>()).is_some_and(|e|e.renew_candidate()) {
@@ -1090,7 +1236,7 @@ pub(super) fn spawn_session_worker(
                                 }
                                 if let Some(entry)=file_entry {tokio::task::spawn_blocking(move||entry.prune()).await.ok();}
                                 if success && play && account.is_active(){
-                                    let result=tokio::task::spawn_blocking(move||crate::video_player::play(&path,&name,||account.is_active())).await;
+                                    let result=tokio::task::spawn_blocking(move||crate::video_player::play(&path,&name,||media_context_alive(&account,context.as_ref()))).await;
                                     let _=tx.send(GuiEvent::MediaTransientClosed{owner,id});ctx.request_repaint();
                                     if !matches!(result,Ok(Ok(()))){let _=tx.send(GuiEvent::StatusUpdate("Không phát được video; kiểm tra codec hoặc thử lưu tệp".into()));ctx.request_repaint();}
                                 }
@@ -1107,9 +1253,18 @@ pub(super) fn spawn_session_worker(
                             }).await;
                             if !matches!(result,Ok(Ok(()))){let _=gui_tx.send(GuiEvent::StatusUpdate("Không lưu được trạng thái bảng thông tin hội thoại".into()));egui_ctx.request_repaint();}
                         }
-                        WorkerCmd::PrepareNotificationSound=>{
+                        WorkerCmd::OpenLibraryLink{owner,url}=>{
+                            let s=session.lock().await.clone();if !s.is_active()||owner!=s.account_key(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let result=tokio::task::spawn_blocking(move||crate::platform::open_url(&url)).await;
+                                if !matches!(result,Ok(true)){let _=tx.send(GuiEvent::StatusUpdate("Không mở được liên kết".into()));ctx.request_repaint();}
+                            });
+                        }
+                        WorkerCmd::PrepareNotificationSound{play}=>{
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{
-                                if crate::notification_sound::prepare().await.is_err(){let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được âm báo Zalo; kiểm tra mạng rồi bật lại âm thanh".into()));ctx.request_repaint();}
+                                let ready = crate::notification_sound::prepare().await.is_ok(); if ready&&play{crate::notification_sound::play();} let _ = tx.send(GuiEvent::NotificationSoundPrepared(ready)); ctx.request_repaint();
+                                if !ready {let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được âm báo Zalo; kiểm tra mạng rồi bật lại âm thanh".into()));ctx.request_repaint();}
                             });
                         }
                         WorkerCmd::CaptureScreen { owner, thread_id, is_group } => {
@@ -1438,7 +1593,8 @@ pub(super) fn spawn_session_worker(
                             phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
                             if phone_sync_running.load(std::sync::atomic::Ordering::SeqCst){let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Đang dừng đồng bộ và dọn tác vụ; giữ dữ liệu đã lưu…".into()});egui_ctx.request_repaint();}
                         }
-                        command @ (WorkerCmd::SyncPhoneHistory{..} | WorkerCmd::RescanPhoneHistory{..} | WorkerCmd::SyncPhoneRecent) => {
+                        command @ (WorkerCmd::SyncPhoneHistory{..} | WorkerCmd::RescanPhoneHistory{..} | WorkerCmd::SyncPhoneRecent | WorkerCmd::SyncPhoneLegacy) => {
+                            let legacy=matches!(command,WorkerCmd::SyncPhoneLegacy);
                             let full_rescan=matches!(command,WorkerCmd::RescanPhoneHistory{..});
                             let recent_only=matches!(command,WorkerCmd::SyncPhoneRecent);
                             let range_days=match command {WorkerCmd::SyncPhoneHistory{range_days}|WorkerCmd::RescanPhoneHistory{range_days}=>range_days,_=>0};
@@ -1455,12 +1611,54 @@ pub(super) fn spawn_session_worker(
                                 let _guard=PollGuard(running);
                                 let progress_tx=tx.clone();let progress_ctx=ctx.clone();let progress_cancel=cancel.clone();
                                 let result=if let Some(transport)=transport {
+                                    if legacy {
+                                        crate::phone_sync::legacy::download(&account,transport,cancel,
+                                            move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();}},
+                                            |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
+                                    } else {
                                     crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,range_days,
                                         move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();}},
                                         |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
+                                    }
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};
                                 let message=result.unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
                                 let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,message});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PickDesktopBackup{owner,generation}=>{
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{let path=tokio::task::spawn_blocking(||tools_file(false,"Chọn backup Desktop V2",&["zip"])).await.unwrap_or(None);let _=tx.send(GuiEvent::DesktopBackupPath{owner,generation,path});ctx.request_repaint();});
+                        }
+                        WorkerCmd::DesktopBackup{owner,generation,path,key,cancel,expected}=>{
+                            let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let imported=expected.is_some();let wanted=owner.clone();
+                                let result=tokio::task::spawn_blocking(move||->anyhow::Result<_>{
+                                    anyhow::ensure!(account.is_active() && account.account_key()==wanted,"Phiên tài khoản đã thay đổi");
+                                    crate::desktop_backup::execute(&path,&key,&account,cancel,expected.as_ref())
+                                }).await.map_err(|_|"Không xử lý được backup".into()).and_then(|result|result.map_err(|error|error.to_string()));
+                                let _=tx.send(GuiEvent::DesktopBackup{owner,generation,imported,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::Group {owner,target,generation,action} => {
+                            let s=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let mutation=action.mutation();
+                                let result=if owner!=s.account_key() || !s.is_active(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::groups::execute(&s,&target,&action).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::Group{owner,target,generation,mutation,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchGroupPolicy { group_id } => {
+                            let account = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let owner = account.account_key().to_owned();
+                                let result = async {
+                                    let snapshot = crate::group_state::snapshot(&account, &group_id, false).await?;
+                                    if snapshot.removed { return Ok(crate::chat::GroupSendPolicy { locked: true, managers: Vec::new() }); }
+                                    crate::chat::GroupSendPolicy::parse(&snapshot.info).ok_or_else(|| anyhow::anyhow!("Chưa xác minh được quyền nhóm"))
+                                }.await.map_err(|error: anyhow::Error| error.to_string());
+                                if account.is_active() { let _ = tx.send(GuiEvent::GroupPolicy { owner, group_id, result }); ctx.request_repaint(); }
                             });
                         }
                         WorkerCmd::FetchGroupMembers { group_id } => {
@@ -1504,7 +1702,49 @@ pub(super) fn spawn_session_worker(
                                 ctx.request_repaint();
                             });
                         }
+                        WorkerCmd::Board{owner,thread,group,generation,action} => {
+                            let s=session.lock().await.clone();if !s.is_active()||owner!=s.account_key(){continue;}
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move{
+                                let list=matches!(action,crate::board::Action::List{..});
+                                let mutation=matches!(action,crate::board::Action::Save{..}|crate::board::Action::Remove{..}|crate::board::Action::PinMessage{..}|crate::board::Action::Unpin{..});
+                                let result=crate::board::execute(&s,&thread,group,&action).await.map_err(|e|e.to_string());
+                                if s.is_active(){let _=tx.send(GuiEvent::Board{owner,thread,generation,mutation,list,result});ctx.request_repaint();}
+                            });
+                        }
+                        WorkerCmd::SetServerPin{owner,thread,group,pinned} => {
+                            let s=session.lock().await.clone();if !s.is_active()||owner!=s.account_key(){continue;}
+                            let gate=pin_gate.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let _guard=gate.lock().await;
+                                match crate::server_pins::set(&s,&thread,group,pinned).await {
+                                    Ok(snapshot)=>publish_pins(&s,snapshot,&tx).await,
+                                    Err(_)=>{
+                                        if let Ok(snapshot)=crate::server_pins::fetch(&s).await {publish_pins(&s,snapshot,&tx).await;}
+                                        let _=tx.send(GuiEvent::StatusUpdate("Chưa xác nhận thay đổi ghim; đã thử tải lại trạng thái server".into()));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerCmd::RefreshThreads => {
+                            let s=session.lock().await.clone();let gate=pin_gate.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let _guard=gate.lock().await;
+                                if !s.is_active()||s.account_key().is_empty(){return;}
+                                let cached=s.clone();
+                                if let Ok(Ok(Some(snapshot)))=tokio::task::spawn_blocking(move||->anyhow::Result<Option<crate::server_pins::Snapshot>>{
+                                    use rusqlite::OptionalExtension;
+                                    let store=crate::store::MessageStore::open(cached.history_path())?;
+                                    let raw:Option<String>=store.conn.query_row("SELECT value FROM tool_config WHERE key='server_pins'",[],|r|r.get(0)).optional()?;
+                                    Ok(raw.and_then(|s|serde_json::from_str(&s).ok()))
+                                }).await {let _=tx.send(GuiEvent::ServerPins{owner:s.account_key().into(),snapshot});}
+                                match crate::server_pins::fetch(&s).await {
+                                    Ok(snapshot)=>publish_pins(&s,snapshot,&tx).await,
+                                    Err(_)=>{let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được danh sách ghim server; giữ bản đã lưu".into()));}
+                                }
+                                ctx.request_repaint();
+                            });
                             let s_pref=session.lock().await.clone();
                             if !s_pref.account_key().is_empty() && s_pref.is_active() {
                                 let owner=s_pref.account_key().to_owned();
@@ -1779,36 +2019,21 @@ pub(super) fn spawn_session_worker(
                                             ctx_clone.request_repaint(); return;
                                         }
                                     };
-                                    if is_group && !is_send2me {
-                                        if let Ok(resp) =
-                                            crate::chat::get_group_history(&s, &group_id, 50).await
-                                        {
-                                            crate::chat::merge_group_history(&mut t, &resp);
-                                        }
-                                    }
-                                    if is_group || is_send2me {
-                                        if let Ok(cm_resp) = crate::chat::get_cloud_messages(
-                                            &s,
-                                            &group_id,
-                                            "0",
-                                            false,
-                                            50,
-                                        )
-                                        .await
-                                        {
-                                            crate::chat::merge_group_history(&mut t, &cm_resp);
-                                        }
-                                    }
+                                    let head=if is_group||is_send2me {
+                                        crate::history_open::fetch(&s,&group_id,is_group).await.unwrap_or_default()
+                                    }else{None};
+                                    if let Some(head)=&head{crate::chat::merge_group_history(&mut t,&head.response);}
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
                                         let mut filtered=vec![t];
-                                        persist_received(&s, &mut filtered).await;
+                                        let stored=persist_received(&s, &mut filtered).await;
+                                        if stored{if let Some(head)=head{if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist head freshness");}}}
                                         let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:filtered,source:ThreadUpdateSource::History});
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ"
                                         )));
                                         ctx_clone.request_repaint();
-                                    }
+                                    } else if let Some(head)=head {if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist empty head freshness");}}
                                 }
                             });
                         }
@@ -1833,6 +2058,8 @@ pub(super) fn spawn_session_worker(
                                 match res {
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
                                         let _ = gui_tx_clone.send(GuiEvent::Reacted {
+                                            owner: s.account_key().to_owned(),
+                                            action_id: resp.get("client_action_id").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
                                             thread_id: to_id,
                                             msg_id: msg.id.clone(),
                                             ts: msg.ts,
@@ -1937,7 +2164,9 @@ pub(super) fn spawn_session_worker(
                                 };
                                 match res {
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
+                                        let mut recalled=msg.clone();recalled.mark_recalled();persist_outgoing(&s,&to_id,&recalled).await;
                                         let _ = gui_tx_clone.send(GuiEvent::MessageRecalled {
+                                            owner:s.account_key().into(),
                                             thread_id: to_id,
                                             msg_id: msg.id.clone(),
                                             ts: msg.ts,
@@ -2847,7 +3076,7 @@ fn publish_live(
         crate::desktop_notice::count(session.account_key(), updates.total());
         if let Some(mut notice) = updates.take_notice() {
             notice.owner = session.account_key().to_owned();
-            if !crate::tray::previews_visible() {
+            if !crate::tray::foreground() {
                 if let Some(url) = notice.avatar.clone() {
                     static AVATAR_LOADING: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
@@ -2916,6 +3145,9 @@ async fn account_tools(
     command: super::tools_panel::ToolsCommand,
 ) -> anyhow::Result<super::tools_panel::ToolsResult> {
     use super::tools_panel::{ToolsCommand as C, ToolsResult as R};
+    if matches!(command, C::ExportHistory) {
+        crate::conversation_policy::snapshot(&session, false).await?;
+    }
 
     tokio::task::spawn_blocking(move || -> anyhow::Result<R> {
 
@@ -2924,7 +3156,12 @@ async fn account_tools(
         let mut store=crate::store::MessageStore::open(session.history_path())?;
 
         match command {
-
+            C::SearchPage(request) => {
+                let result=crate::search::query_with_cancel(&store,&request,&||!session.is_active()).map_err(|e|e.to_string());
+                let senders=match request.thread.as_deref() {Some(thread)=>crate::search::senders(&store,thread)?,None=>Vec::new()};
+                Ok(R::SearchPage{request,result,senders})
+            }
+            C::OpenSearchHit{generation,thread,id} => Ok(R::SearchOpened{generation,thread:Box::new(crate::tools::open_hit(&store,&thread,&id)?),id}),
             C::OpenHit{
 thread,id}
 =>Ok(R::Hit{
@@ -3149,13 +3386,61 @@ pub struct ChatImage {
     pub message: ChatMessage,
     pub preview: bool,
 }
+fn media_context_alive(session: &Session, context: Option<&ChatImage>) -> bool {
+    session.is_active()
+        && context.is_none_or(|source| {
+            !crate::message_lifecycle::expired(&source.message, crate::login::unix_now() * 1000)
+        })
+}
 async fn fetch_chat_image(
+    session: &Session,
+    key: &str,
+    url: &str,
+    context: Option<ChatImage>,
+    events: &Sender<GuiEvent>,
+) -> anyhow::Result<egui::ColorImage> {
+    anyhow::ensure!(
+        media_context_alive(session, context.as_ref()),
+        "Tin nhắn đã hết hạn hoặc phiên đã đóng"
+    );
+    let result = fetch_chat_image_inner(session, key, url, context.clone(), events).await;
+    anyhow::ensure!(
+        media_context_alive(session, context.as_ref()),
+        "Tin nhắn đã hết hạn hoặc phiên đã đóng"
+    );
+    result
+}
+async fn fetch_chat_image_inner(
     s: &Session,
     key: &str,
     url: &str,
     context: Option<ChatImage>,
     events: &Sender<GuiEvent>,
 ) -> anyhow::Result<egui::ColorImage> {
+    if let Some(source) = &context {
+        if let Some(path) = crate::desktop_backup::restored_path(s, &source.message, source.preview)
+        {
+            if tokio::fs::symlink_metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 64 * 1024 * 1024)
+            {
+                let key = key.to_owned();
+                let restored = tokio::task::spawn_blocking(move || {
+                    let bytes = std::fs::read(path)?;
+                    let image = crate::desktop_backup::preview_image(&bytes, &key)?;
+                    Ok(egui::ColorImage::from_rgba_unmultiplied(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    ))
+                })
+                .await?;
+                // An unsupported local encoding must not strand a valid remote attachment.
+                if restored.is_ok() {
+                    return restored;
+                }
+            }
+        }
+    }
     let first = fetch_gui_image(s, crate::storage::root(), key, url).await;
     let should = first
         .as_ref()
@@ -3382,6 +3667,30 @@ async fn send_attachment_batch(
                 message,
             });
             ctx.request_repaint();
+        });
+    }
+}
+
+async fn publish_pins(s: &Session, snapshot: crate::server_pins::Snapshot, tx: &Sender<GuiEvent>) {
+    if !s.is_active() {
+        return;
+    }
+    let account = s.clone();
+    let saved = snapshot.clone();
+    let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
+        if !account.is_active(){return Ok(());}
+        let store=crate::store::MessageStore::open(account.history_path())?;
+        store.conn.execute("INSERT INTO tool_config(key,value) VALUES('server_pins',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&saved)?])?;Ok(())
+    }).await;
+    if !matches!(result, Ok(Ok(()))) {
+        let _ = tx.send(GuiEvent::StatusUpdate(
+            "Không lưu được danh sách ghim server".into(),
+        ));
+    }
+    if s.is_active() {
+        let _ = tx.send(GuiEvent::ServerPins {
+            owner: s.account_key().into(),
+            snapshot,
         });
     }
 }

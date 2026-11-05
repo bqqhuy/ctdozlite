@@ -80,3 +80,6 @@ pub const RELEASE_REDIRECT_HOSTS: &[&str] = &[
     "objects.githubusercontent.com",
     "api.github.com",
 ];
+
+/// PC 26.11.10 getnuid adapter, command 12390.
+pub const ZNOISE: &str = "https://zwid.api.zalo.me";

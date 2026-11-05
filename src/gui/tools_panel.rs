@@ -22,6 +22,12 @@ pub(super) struct ToolsPanel {
 
 #[derive(Clone)]
 pub enum ToolsCommand {
+    SearchPage(crate::search::Request),
+    OpenSearchHit {
+        generation: u64,
+        thread: String,
+        id: String,
+    },
     OpenHit {
         thread: String,
         id: String,
@@ -63,6 +69,22 @@ pub enum ToolsCommand {
 }
 
 pub enum ToolsResult {
+    SearchOpenFailed {
+        generation: u64,
+        thread: String,
+        id: String,
+        error: String,
+    },
+    SearchPage {
+        request: crate::search::Request,
+        result: Result<crate::search::Page, String>,
+        senders: Vec<crate::search::Sender>,
+    },
+    SearchOpened {
+        generation: u64,
+        thread: Box<Thread>,
+        id: String,
+    },
     ScheduleSaved {
         request: Option<u64>,
         thread: String,
@@ -112,7 +134,7 @@ impl ZaloGuiApp {
             self.tools_command(ToolsCommand::Load);
         }
         let mut open = true;
-        egui::Window::new("Tiện ích hội thoại")
+        egui::Window::new(crate::i18n::tr("Tiện ích hội thoại"))
             .id(Id::new("account-tools"))
             .open(&mut open)
             .default_width(600.0)
@@ -130,7 +152,7 @@ impl ZaloGuiApp {
                     .iter()
                     .enumerate()
                     {
-                        ui.selectable_value(&mut self.tools.tab, i, *label);
+                        ui.selectable_value(&mut self.tools.tab, i, crate::i18n::tr(label));
                     }
                 });
                 ui.separator();
@@ -149,11 +171,13 @@ impl ZaloGuiApp {
         self.tools.open = open;
     }
     fn render_tools_search(&mut self, ui: &mut egui::Ui) {
-        ui.label("Tìm trong toàn bộ lịch sử đã lưu trên máy, kể cả tin chưa nạp vào cửa sổ chat.");
+        ui.label(crate::i18n::tr(
+            "Tìm trong toàn bộ lịch sử đã lưu trên máy, kể cả tin chưa nạp vào cửa sổ chat.",
+        ));
         ui.horizontal(|ui| {
             let response = ui.text_edit_singleline(&mut self.tools.query);
             let enter = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if ui.button("Tìm kiếm").clicked() || enter {
+            if ui.button(crate::i18n::tr("Tìm kiếm")).clicked() || enter {
                 self.tools.last_query = self.tools.query.clone();
                 self.tools_command(ToolsCommand::Search {
                     query: self.tools.query.clone(),
@@ -171,7 +195,10 @@ impl ZaloGuiApp {
                 ui.strong(&hit.thread_name);
                 ui.small(crate::clock::message_time(hit.time));
                 ui.label(&hit.text);
-                if ui.button("Mở tin trong hội thoại").clicked() {
+                if ui
+                    .button(crate::i18n::tr("Mở tin trong hội thoại"))
+                    .clicked()
+                {
                     action = Some(ToolsCommand::OpenHit {
                         thread: hit.thread_id.clone(),
                         id: hit.message_id.clone(),
@@ -184,22 +211,25 @@ impl ZaloGuiApp {
         }
     }
     fn render_tools_import(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Xuất lịch sử SQLite…").clicked() {
+        if ui.button(crate::i18n::tr("Xuất lịch sử SQLite…")).clicked() {
             self.tools_command(ToolsCommand::ExportHistory);
         }
-        ui.label(
+        ui.label(crate::i18n::tr(
             "Bản xuất chỉ gồm lịch sử tin nhắn; không chứa lịch gửi hoặc cấu hình tự trả lời.",
-        );
-        ui.label(
+        ));
+        ui.label(crate::i18n::tr(
             "Nhập lịch sử SQLite/JSON tương thích từ máy khác. Dữ liệu nguồn được mở chỉ đọc.",
-        );
+        ));
         ui.checkbox(
             &mut self.tools.import_owned,
             "Tôi xác nhận dữ liệu nguồn thuộc tài khoản đang đăng nhập",
         );
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(self.tools.import_owned, egui::Button::new("Chọn tập tin"))
+                .add_enabled(
+                    self.tools.import_owned,
+                    egui::Button::new(crate::i18n::tr("Chọn tập tin")),
+                )
                 .clicked()
             {
                 self.tools_command(ToolsCommand::Import {
@@ -208,7 +238,10 @@ impl ZaloGuiApp {
                 });
             }
             if ui
-                .add_enabled(self.tools.import_owned, egui::Button::new("Chọn thư mục"))
+                .add_enabled(
+                    self.tools.import_owned,
+                    egui::Button::new(crate::i18n::tr("Chọn thư mục")),
+                )
                 .clicked()
             {
                 self.tools_command(ToolsCommand::Import {
@@ -219,20 +252,20 @@ impl ZaloGuiApp {
         });
     }
     fn render_tools_appearance(&mut self, ui: &mut egui::Ui) {
-        ui.label("Theme hỗ trợ bảng màu dark/light trong JSON; sticker tùy chỉnh dùng các ID sticker Zalo có sẵn.");
+        ui.label(crate::i18n::tr("Theme hỗ trợ bảng màu dark/light trong JSON; sticker tùy chỉnh dùng các ID sticker Zalo có sẵn."));
         ui.horizontal(|ui| {
-            if ui.button("Nạp theme JSON").clicked() {
+            if ui.button(crate::i18n::tr("Nạp theme JSON")).clicked() {
                 self.tools_command(ToolsCommand::ReadConfig { stickers: false });
             }
-            if ui.button("Xuất theme / mẫu").clicked() {
+            if ui.button(crate::i18n::tr("Xuất theme / mẫu")).clicked() {
                 self.tools_command(ToolsCommand::ExportConfig { stickers: false });
             }
         });
         ui.horizontal(|ui| {
-            if ui.button("Nạp sticker JSON").clicked() {
+            if ui.button(crate::i18n::tr("Nạp sticker JSON")).clicked() {
                 self.tools_command(ToolsCommand::ReadConfig { stickers: true });
             }
-            if ui.button("Xuất sticker / mẫu").clicked() {
+            if ui.button(crate::i18n::tr("Xuất sticker / mẫu")).clicked() {
                 self.tools_command(ToolsCommand::ExportConfig { stickers: true });
             }
         });
@@ -240,7 +273,10 @@ impl ZaloGuiApp {
             "Đã nạp {} bộ sticker riêng",
             self.tools.config.stickers.len()
         ));
-        if ui.button("Khôi phục theme mặc định").clicked() {
+        if ui
+            .button(crate::i18n::tr("Khôi phục theme mặc định"))
+            .clicked()
+        {
             let mut config = self.tools.config.clone();
             config.theme = serde_json::Value::Null;
             self.tools_command(ToolsCommand::Save(config));
@@ -263,7 +299,10 @@ impl ZaloGuiApp {
                 }
                 let now = chrono::Local::now();
                 if ui
-                    .add_enabled(now.hour() < 18, egui::Button::new("18:00 hôm nay"))
+                    .add_enabled(
+                        now.hour() < 18,
+                        egui::Button::new(crate::i18n::tr("18:00 hôm nay")),
+                    )
                     .clicked()
                 {
                     self.tools.when_local = now
@@ -272,7 +311,7 @@ impl ZaloGuiApp {
                         .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_default();
                 }
-                if ui.button("08:00 ngày mai").clicked() {
+                if ui.button(crate::i18n::tr("08:00 ngày mai")).clicked() {
                     self.tools.when_local = now
                         .date_naive()
                         .succ_opt()
@@ -282,10 +321,10 @@ impl ZaloGuiApp {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("Sau (phút):");
+                ui.label(crate::i18n::tr("Sau (phút):"));
                 ui.add(egui::DragValue::new(&mut self.tools.schedule_minutes).range(1..=527040));
             });
-            ui.label("Hoặc giờ cụ thể (YYYY-MM-DD HH:MM):");
+            ui.label(crate::i18n::tr("Hoặc giờ cụ thể (YYYY-MM-DD HH:MM):"));
             ui.text_edit_singleline(&mut self.tools.when_local);
             if ui
                 .button(if self.tools.editing.is_some() {
@@ -320,13 +359,13 @@ impl ZaloGuiApp {
                     }
                 }
             }
-            if self.tools.editing.is_some() && ui.button("Hủy sửa").clicked() {
+            if self.tools.editing.is_some() && ui.button(crate::i18n::tr("Hủy sửa")).clicked() {
                 self.tools.editing = None;
                 self.tools.schedule_text.clear();
             }
-            ui.label(RichText::new("Tin đang chờ gửi khi app chạy và tài khoản đăng nhập. Nếu app đã đóng, tin sẽ gửi khi mở lại, kể cả đã qua giờ hẹn.").size(12.0));
+            ui.label(RichText::new(crate::i18n::tr("Tin đang chờ gửi khi app chạy và tài khoản đăng nhập. Nếu app đã đóng, tin sẽ gửi khi mở lại, kể cả đã qua giờ hẹn.")).size(12.0));
         }
-        if ui.button("Làm mới danh sách").clicked() {
+        if ui.button(crate::i18n::tr("Làm mới danh sách")).clicked() {
             self.tools_command(ToolsCommand::Load);
         }
         if self.tools.paused {
@@ -374,12 +413,12 @@ impl ZaloGuiApp {
                                 .outgoing_job
                                 .as_ref()
                                 .is_some_and(|j| j.attempt == 1)
-                            && ui.button("Sửa nội dung / giờ").clicked()
+                            && ui.button(crate::i18n::tr("Sửa nội dung / giờ")).clicked()
                         {
                             edit =
                                 Some((task.id.clone(), task.message.text.clone(), task.deliver_at));
                         }
-                        if ui.button("Hủy").clicked() {
+                        if ui.button(crate::i18n::tr("Hủy")).clicked() {
                             action = Some(ToolsCommand::Edit {
                                 id: task.id.clone(),
                                 at: None,
@@ -417,19 +456,19 @@ impl ZaloGuiApp {
         }
     }
     fn render_tools_rules(&mut self, ui: &mut egui::Ui) {
-        ui.label("Quy tắc mặc định tắt. Chỉ áp dụng cho tin mới sau lúc lưu/bật, tối đa 5 trả lời tự động mỗi phút.");
+        ui.label(crate::i18n::tr("Quy tắc mặc định tắt. Chỉ áp dụng cho tin mới sau lúc lưu/bật, tối đa 5 trả lời tự động mỗi phút."));
         let mut remove = None;
         for (i, rule) in self.tools.config.rules.iter_mut().enumerate() {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.checkbox(&mut rule.enabled, "Bật");
-                    if ui.button("Xóa quy tắc").clicked() {
+                    ui.checkbox(&mut rule.enabled, crate::i18n::tr("Bật"));
+                    if ui.button(crate::i18n::tr("Xóa quy tắc")).clicked() {
                         remove = Some(i);
                     }
                 });
-                ui.label("Từ khóa");
+                ui.label(crate::i18n::tr("Từ khóa"));
                 ui.text_edit_singleline(&mut rule.keyword);
-                ui.label("Nội dung trả lời");
+                ui.label(crate::i18n::tr("Nội dung trả lời"));
                 ui.text_edit_multiline(&mut rule.reply_text);
                 ui.horizontal(|ui| {
                     let mode = match rule.mode.as_str() {
@@ -468,7 +507,9 @@ impl ZaloGuiApp {
         if let Some(i) = remove {
             self.tools.config.rules.remove(i);
         }
-        if self.tools.config.rules.len() < 64 && ui.button("Thêm quy tắc").clicked() {
+        if self.tools.config.rules.len() < 64
+            && ui.button(crate::i18n::tr("Thêm quy tắc")).clicked()
+        {
             self.tools.config.rules.push(crate::tools::ReplyRule {
                 id: crate::param_cipher::random_hex(12),
                 keyword: String::new(),
@@ -479,7 +520,7 @@ impl ZaloGuiApp {
                 enabled_since: 0,
             });
         }
-        if ui.button("Lưu các quy tắc").clicked() {
+        if ui.button(crate::i18n::tr("Lưu các quy tắc")).clicked() {
             self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
         }
     }

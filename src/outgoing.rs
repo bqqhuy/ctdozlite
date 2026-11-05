@@ -81,6 +81,18 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
         .outgoing_job
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Thiếu dữ liệu gửi lại"))?;
+    if job.is_group {
+        let snapshot = crate::group_state::snapshot(s, to, false).await?;
+        anyhow::ensure!(
+            snapshot.can_send(s.account_key())?,
+            "Nhóm không cho phép tài khoản này gửi tin"
+        );
+    }
+    if let Payload::Forward(original) = &job.payload {
+        let (source, group) = crate::chat::forward_source(original)
+            .ok_or_else(|| anyhow::anyhow!("Thiếu nguồn chuyển tiếp để xác minh quyền chia sẻ"))?;
+        crate::conversation_policy::require_shareable(s, &source, group).await?;
+    }
     let id = message.client_message_id.parse()?;
     let mut sent = message.clone();
     let response = match &job.payload {

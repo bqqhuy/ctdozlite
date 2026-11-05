@@ -616,6 +616,13 @@ fn direct_zalo_photo(text: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SidebarPresentation {
+    #[serde(skip)]
+    pub metadata_verified: bool,
+    pub reaction_preview: Option<crate::reactions::Preview>,
+    #[serde(skip)]
+    pub reaction_preview_fresh: bool,
+    /// Latest server group send policy; absent means metadata has not been loaded.
+    pub send_policy: Option<GroupSendPolicy>,
     /// Opaque sync partition identity; never used as an outbound recipient ID.
     pub global_id: String,
     pub members: Vec<SidebarMember>,
@@ -626,6 +633,58 @@ pub struct SidebarPresentation {
     pub last_sender: String,
     pub last_sender_id: String,
     pub last_outgoing: bool,
+}
+
+/// Server group lock policy; role decisions use account UID, never display names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GroupSendPolicy {
+    /// Whether ordinary members are prevented from posting.
+    pub locked: bool,
+    /// Creator and administrator UIDs as supplied by group metadata.
+    pub managers: Vec<String>,
+}
+impl GroupSendPolicy {
+    /// Parse the observed getmg-v2 fields without inferring roles from member order.
+    pub fn parse(info: &Value) -> Option<Self> {
+        let raw = info.pointer("/setting/lockSendMsg")?;
+        let locked = match raw {
+            Value::Bool(value) => *value,
+            Value::Number(value) => match value.as_i64()? {
+                0 => false,
+                1 => true,
+                _ => return None,
+            },
+            Value::String(value) => match value.as_str() {
+                "0" => false,
+                "1" => true,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let mut managers = Vec::new();
+        if let Some(creator) = pick_str(info, &["creatorId"]) {
+            managers.push(creator);
+        }
+        if let Some(admins) = info.get("adminIds").and_then(Value::as_array) {
+            for admin in admins {
+                let id = admin
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| admin.as_u64().map(|v| v.to_string()));
+                if let Some(id) = id {
+                    if !managers.contains(&id) {
+                        managers.push(id);
+                    }
+                }
+            }
+        }
+        Some(Self { locked, managers })
+    }
+
+    /// A locked group requires a known management role before sending.
+    pub fn allows(&self, uid: &str) -> bool {
+        !self.locked || (!uid.is_empty() && self.managers.iter().any(|id| id == uid))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -707,6 +766,47 @@ impl Thread {
     }
 
     pub fn sidebar_preview(&self) -> String {
+        self.sidebar_preview_with_reactor(None)
+    }
+    /// A resolved profile name does not imply that the reactor is a current group member.
+    pub fn sidebar_preview_with_reactor(&self, reactor_name: Option<&str>) -> String {
+        if let Some(reaction) = &self.presentation.reaction_preview {
+            let message_ts = self
+                .messages
+                .iter()
+                .map(|m| crate::clock::normalize_ts_ms(m.ts))
+                .chain(std::iter::once(crate::clock::normalize_ts_ms(
+                    self.presentation.last_message_ts,
+                )))
+                .max()
+                .unwrap_or(0);
+            if reaction.ts >= message_ts {
+                let who = if reaction.by_self {
+                    "Bạn"
+                } else {
+                    self.presentation
+                        .members
+                        .iter()
+                        .find(|member| member.id == reaction.reactor && !member.name.is_empty())
+                        .map(|member| member.name.as_str())
+                        .unwrap_or(reactor_name.unwrap_or(if self.is_group {
+                            &reaction.reactor
+                        } else {
+                            &self.name
+                        }))
+                };
+                return format!(
+                    "{who} đã thả {} vào {}",
+                    reaction.emoji,
+                    if reaction.target_by_self {
+                        "tin nhắn của bạn"
+                    } else {
+                        "một tin nhắn"
+                    }
+                );
+            }
+        }
+
         let latest = self
             .messages
             .iter()
@@ -761,6 +861,12 @@ impl Thread {
             .chain(std::iter::once(crate::clock::normalize_ts_ms(
                 self.presentation.last_message_ts,
             )))
+            .chain(
+                self.presentation
+                    .reaction_preview
+                    .as_ref()
+                    .map(|reaction| reaction.ts),
+            )
             .max()
             .unwrap_or(0)
     }
@@ -776,6 +882,10 @@ impl Thread {
 
     /// Parse only group roster metadata observed in the original getmg-v2 consumer.
     pub fn apply_group_sidebar_metadata(&mut self, info: &Value) {
+        self.presentation.metadata_verified = true;
+        if let Some(policy) = GroupSendPolicy::parse(info) {
+            self.presentation.send_policy = Some(policy);
+        }
         if let Some(id) = pick_str(info, &["globalId"]) {
             self.presentation.global_id = id;
         }
@@ -982,7 +1092,7 @@ pub(crate) fn server_message_id(message: &ChatMessage) -> Option<String> {
     }
 }
 
-fn client_message_id(message: &ChatMessage) -> Option<String> {
+pub(crate) fn client_message_id(message: &ChatMessage) -> Option<String> {
     let wire = wire_identity(message.wire_ref.client_id.as_ref());
     if message.client_message_id.trim().is_empty() || message.client_message_id == "0" {
         wire
@@ -1177,6 +1287,24 @@ pub fn merge_thread_into(
     }
     if !incoming.presentation.global_id.is_empty() {
         target.presentation.global_id = incoming.presentation.global_id.clone();
+    }
+    if incoming.presentation.send_policy.is_some() {
+        target.presentation.send_policy = incoming.presentation.send_policy.clone();
+    }
+    if incoming.presentation.reaction_preview_fresh
+        || incoming
+            .presentation
+            .reaction_preview
+            .as_ref()
+            .is_some_and(|new| {
+                target
+                    .presentation
+                    .reaction_preview
+                    .as_ref()
+                    .is_none_or(|old| new.ts > old.ts)
+            })
+    {
+        target.presentation.reaction_preview = incoming.presentation.reaction_preview.clone();
     }
     target.is_group = target.is_group || incoming.is_group;
     target.unread.merge_metadata(&incoming.unread);
@@ -3901,6 +4029,7 @@ pub fn icon_to_emoji(icon: &str) -> &'static str {
 /// Map a visual reaction emoji or Zalo reaction code to `(rIcon, rType)` (`compact-app-pc.js:10848900`).
 pub fn reaction_code_and_type(emoji_or_code: &str) -> (&'static str, i32) {
     match emoji_or_code {
+        "" | "/-clear" => ("", -1),
         "👍" | "/-strong" => ("/-strong", 3),
         "❤️" | "❤" | "/-heart" => ("/-heart", 5),
         "😆" | ":>" => (":>", 0),
@@ -3922,10 +4051,7 @@ pub async fn send_reaction(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    let now = next_client_message_id();
 
     let (r_icon, r_type) = reaction_code_and_type(reaction);
     let g_msg_id_val = server_message_id(msg).context("Thiếu ID máy chủ của tin nhắn")?;
@@ -3938,7 +4064,7 @@ pub async fn send_reaction(
         "rMsg": [{
             "gMsgID": g_msg_id_val,
             "cMsgID": c_msg_id,
-            "msgType": if msg.sticker_id.is_some() { 5 } else { 1 }
+            "msgType": reaction_message_type(msg)?
         }],
         "rIcon": r_icon,
         "rType": r_type,
@@ -3958,7 +4084,8 @@ pub async fn send_reaction(
             .trim_start_matches('G');
         (
             format!(
-                "https://reaction.api.zaloapp.com/api/group/reaction?{}",
+                "{}/api/group/reaction?{}",
+                s.domains.reaction.trim_end_matches('/'),
                 s.common_params()
             ),
             obj(&[
@@ -3970,7 +4097,8 @@ pub async fn send_reaction(
     } else {
         (
             format!(
-                "https://reaction.api.zaloapp.com/api/message/reaction?{}",
+                "{}/api/message/reaction?{}",
+                s.domains.reaction.trim_end_matches('/'),
                 s.common_params()
             ),
             obj(&[("react_list", react_list), ("toid", json!(to_id))]),
@@ -3979,7 +4107,40 @@ pub async fn send_reaction(
 
     let params = s.encoded_params(&body)?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
-    confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    let mut result = confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)?;
+    result["client_action_id"] = json!(now.to_string());
+    Ok(result)
+}
+
+/// Preserve the PC internal message kind; archive numeric codes are not reaction codes.
+pub fn reaction_message_type(msg: &ChatMessage) -> Result<i64> {
+    use crate::message_model::MessageKind as K;
+    let kind = if msg.kind == K::Unknown {
+        if msg.sticker_id.is_some() {
+            K::Sticker
+        } else {
+            match crate::message_view::media(msg).kind {
+                crate::message_view::MediaKind::Photo => K::Photo,
+                crate::message_view::MediaKind::Video => K::Video,
+                crate::message_view::MediaKind::File => K::File,
+                _ => K::Text,
+            }
+        }
+    } else {
+        msg.kind
+    };
+    Ok(match kind {
+        K::Text => 1,
+        K::Photo => 2,
+        K::Voice => 3,
+        K::Sticker => 4,
+        K::Contact | K::Link => 6,
+        K::Gif => 7,
+        K::Location => 17,
+        K::Video => 18,
+        K::File => 19,
+        _ => anyhow::bail!("Loại tin này chưa hỗ trợ thả cảm xúc"),
+    })
 }
 
 /// Delete a message for me (`deleteOneOneMessageV2` / `deleteGroupMessageV2` @ `compact-app-pc.js:14373319`, cmd `11779` / `11834`).
@@ -4168,12 +4329,15 @@ pub async fn get_pinned(s: &Session) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    let body = obj(&[("imei", json!(s.imei))]);
+    let params = s.encoded_params(&body)?;
     let url = format!(
-        "{}/api/pinconvers/list?{}",
+        "{}/api/pinconvers/list?{}&params={params}",
         s.domains.conversation,
         s.common_params()
     );
-    s.get(&url).await
+    let response = s.get(&url).await?;
+    Ok(s.maybe_decrypt(response, s.session_key_bytes()).await)
 }
 
 /// `GET /api/group/history` (cmd 11240) — group message history.
@@ -4308,7 +4472,7 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
             }
         })
         .collect();
-    let removed = resolve_group_metadata(s, &mut groups).await?;
+    let removed = crate::group_metadata::refresh(s, map, &mut groups).await?;
     groups.retain(|group| !removed.contains(&group.id));
     Ok(groups)
 }
@@ -4398,7 +4562,7 @@ pub(crate) async fn resolve_sync_ids(
 }
 
 /// Resolve names for known group IDs without reloading all memberships.
-async fn resolve_group_metadata(
+pub(crate) async fn resolve_group_metadata(
     s: &Session,
     groups: &mut [Thread],
 ) -> Result<std::collections::HashSet<String>> {
@@ -6885,94 +7049,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod group_metadata_tests {
-    use super::*;
-    #[tokio::test]
-    async fn requests_missing_metadata_with_zero_version_and_decodes_group_name() {
-        use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for step in 0..2 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut input = Vec::new();
-                let header_end = loop {
-                    let mut b = [0; 1024];
-                    let n = stream.read(&mut b).unwrap();
-                    assert!(n > 0);
-                    input.extend_from_slice(&b[..n]);
-                    if let Some(end) = input.windows(4).position(|s| s == b"\r\n\r\n") {
-                        break end + 4;
-                    }
-                };
-                let header = String::from_utf8_lossy(&input[..header_end]).to_string();
-                if step == 1 {
-                    assert!(header.starts_with("POST /api/group/getmg-v2?"));
-                    let length: usize = header
-                        .lines()
-                        .find_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|s| s.trim().parse().unwrap())
-                        })
-                        .unwrap();
-                    while input.len() < header_end + length {
-                        let mut b = [0; 1024];
-                        let n = stream.read(&mut b).unwrap();
-                        assert!(n > 0);
-                        input.extend_from_slice(&b[..n]);
-                    }
-                    let form = String::from_utf8_lossy(&input[header_end..]);
-                    let url = reqwest::Url::parse(&format!("http://fixture/?{form}")).unwrap();
-                    let params = url
-                        .query_pairs()
-                        .find(|(key, _)| key == "params")
-                        .unwrap()
-                        .1
-                        .to_string();
-                    let decoded = crate::crypto::decode_aes(&[0; 32], &params).unwrap();
-                    let body: Value = serde_json::from_str(&decoded).unwrap();
-                    let versions: Value =
-                        serde_json::from_str(body["gridVerMap"].as_str().unwrap()).unwrap();
-                    assert_eq!(versions, json!({"123":0}));
-                }
-                let data = if step == 0 {
-                    json!({"gridVerMap":{"123":999}})
-                } else {
-                    json!({"gridInfoMap":{"123":{"name":"Nhóm ARM64","avt":"https://example.invalid/avatar.png"}}})
-                };
-                let body = json!({"error_code":0,"data":data.to_string()}).to_string();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        let mut session = Session::new(false, false, false).unwrap();
-        session.http = reqwest::Client::builder().no_proxy().build().unwrap();
-        session.domains.group = format!("http://{addr}");
-        session.secret_key = Some(vec![0; 32]);
-        session.login = Some(crate::session::LoginInfo {
-            uin: "fixture-user".into(),
-            zpw_enk: String::new(),
-            zpw_sek: String::new(),
-            display_name: "Fixture".into(),
-            send2me_id: String::new(),
-            avatar: String::new(),
-        });
-        let groups = get_groups(&session).await.unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].name, "Nhóm ARM64");
-        server.join().unwrap();
-    }
-}
-
-#[cfg(test)]
 mod message_identity_tests {
     use super::*;
     fn message(id: &str, outgoing: bool) -> ChatMessage {
@@ -7683,5 +7759,90 @@ mod generic_name_tests {
         for name in ["Nhóm bạn thân", "Nhóm 12A1 cũ", "Người dùng mới", "An"] {
             assert!(!is_generic_thread_name(name), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod reaction_kind_regression_tests {
+    use super::*;
+    use crate::message_model::MessageKind as K;
+    #[test]
+    fn reactions_use_internal_codes_instead_of_archive_codes() {
+        for (kind, code) in [
+            (K::Text, 1),
+            (K::Photo, 2),
+            (K::Voice, 3),
+            (K::Sticker, 4),
+            (K::Link, 6),
+            (K::Video, 18),
+            (K::File, 19),
+        ] {
+            assert_eq!(
+                reaction_message_type(&ChatMessage {
+                    kind,
+                    ..Default::default()
+                })
+                .unwrap(),
+                code
+            );
+        }
+        assert!(reaction_message_type(&ChatMessage {
+            kind: K::Recall,
+            ..Default::default()
+        })
+        .is_err());
+    }
+    #[test]
+    fn local_ack_preserves_other_reactors_and_deduplicates_server_echo() {
+        let mut m = ChatMessage::default();
+        let other = crate::reactions::ReactionEvent {
+            sender_id: "other".into(),
+            client_event_id: "1".into(),
+            r_type: 5,
+            emoji: "❤️".into(),
+            ts: 100,
+            ..Default::default()
+        };
+        let mine = crate::reactions::ReactionEvent {
+            sender_id: "me".into(),
+            client_event_id: "2".into(),
+            r_type: 3,
+            emoji: "👍".into(),
+            ts: 101,
+            ..Default::default()
+        };
+        m.apply_reaction(&other);
+        m.apply_reaction(&mine);
+        let before = m.reaction_summaries.clone();
+        assert!(!m.apply_reaction(&mine));
+        assert_eq!(before, m.reaction_summaries);
+        assert_eq!(m.reaction_summaries.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod group_send_policy_tests {
+    use super::*;
+    #[test]
+    fn locked_group_requires_explicit_manager_identity() {
+        for locked in [json!(1), json!("1"), json!(true)] {
+            let policy = GroupSendPolicy::parse(&json!({
+                "setting":{"lockSendMsg":locked}, "creatorId":"owner",
+                "adminIds":["admin", 42]
+            }))
+            .unwrap();
+            assert!(policy.allows("owner"));
+            assert!(policy.allows("admin"));
+            assert!(policy.allows("42"));
+            assert!(!policy.allows("member"));
+            assert!(!policy.allows(""));
+        }
+        assert!(
+            GroupSendPolicy::parse(&json!({"setting":{"lockSendMsg":0}}))
+                .unwrap()
+                .allows("member")
+        );
+        assert!(GroupSendPolicy::parse(&json!({})).is_none());
+        assert!(GroupSendPolicy::parse(&json!({"setting":{"lockSendMsg":2}})).is_none());
     }
 }

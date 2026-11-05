@@ -145,6 +145,26 @@ pub fn summary(m: &ChatMessage) -> String {
     }
 }
 pub fn preview(t: &Thread) -> String {
+    preview_with_reactor(t, None)
+}
+/// Resolve a reactor profile without changing the message-summary fallback.
+pub fn preview_with_reactor(t: &Thread, reactor_name: Option<&str>) -> String {
+    let newest = t
+        .messages
+        .iter()
+        .map(|m| crate::clock::normalize_ts_ms(m.ts))
+        .chain(std::iter::once(crate::clock::normalize_ts_ms(
+            t.presentation.last_message_ts,
+        )))
+        .max()
+        .unwrap_or(0);
+    if t.presentation
+        .reaction_preview
+        .as_ref()
+        .is_some_and(|reaction| reaction.ts >= newest)
+    {
+        return t.sidebar_preview_with_reactor(reactor_name);
+    }
     let last = t
         .messages
         .iter()
@@ -467,6 +487,30 @@ pub fn media(m: &ChatMessage) -> Media {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reaction_activity_replaces_preview_until_a_newer_message_arrives() {
+        let mut thread = Thread {
+            name: "An".into(),
+            ..Default::default()
+        };
+        thread.presentation.reaction_preview = Some(crate::reactions::Preview {
+            reactor: "peer".into(),
+            emoji: "❤️".into(),
+            target: "m1".into(),
+            event_id: "r1".into(),
+            ts: 1_800_000_000_000,
+            by_self: false,
+            target_by_self: true,
+        });
+        assert!(preview(&thread).contains("đã thả"));
+        thread.messages.push(ChatMessage {
+            text: "Tin mới".into(),
+            ts: 1_800_000_001_000,
+            ..Default::default()
+        });
+        assert!(!preview(&thread).contains("đã thả"));
+        assert!(preview(&thread).contains("Tin mới"));
+    }
     #[test]
     fn call_provenance_is_hidden_but_ordinary_text_is_preserved() {
         let mut m = ChatMessage {

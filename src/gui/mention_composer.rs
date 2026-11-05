@@ -108,7 +108,7 @@ impl ZaloGuiApp {
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(240.0);
-                    ui.label("Nhắc đến · Enter chọn · Esc giữ dạng chữ");
+                    ui.label(crate::i18n::tr("Nhắc đến · Enter chọn · Esc giữ dạng chữ"));
                     if members.is_empty() {
                         ui.label(
                             if matches!(self.group_members_state.get(thread), Some(None)) {
@@ -118,7 +118,7 @@ impl ZaloGuiApp {
                             },
                         );
                         if matches!(self.group_members_state.get(thread), Some(Some(_)))
-                            && ui.button("Tải lại thành viên").clicked()
+                            && ui.button(crate::i18n::tr("Tải lại thành viên")).clicked()
                         {
                             if let Some(tx) = WORKER_TX.get() {
                                 if tx

@@ -76,6 +76,13 @@ pub struct Domains {
     pub profile: String,
     pub group: String,
     pub file: String,
+    #[serde(default = "default_reaction")]
+    pub reaction: String,
+    #[serde(default)]
+    pub group_board: String,
+    /// GROUP_POLL is a separate service from reminders and notes.
+    #[serde(default)]
+    pub group_poll: String,
     /// `zpw_service_map_v3.group_cloud_message[0]` — `/api/cm/getoldv2`, `/api/cm/getrecentv2`.
     #[serde(default = "default_cloud_msg")]
     pub cloud_msg: String,
@@ -138,6 +145,9 @@ impl Default for Domains {
             profile: "https://tt-profile-wpa.chat.zalo.me".into(),
             group: "https://tt-group-wpa.zaloapp.com".into(),
             file: "https://tt-files-wpa.zaloapp.com".into(),
+            reaction: default_reaction(),
+            group_board: String::new(),
+            group_poll: String::new(),
             cloud_msg: default_cloud_msg(),
             voice_call: default_voice_call(),
             sticker: default_sticker(),
@@ -161,6 +171,7 @@ impl Domains {
                 "group_cloud_message",
                 "voice_call",
                 "sticker",
+                "reaction",
             ]
             .iter()
             .filter_map(|key| crate::endpoints::service(key))
@@ -180,6 +191,7 @@ impl Domains {
             ("profile", &mut self.profile),
             ("group", &mut self.group),
             ("file", &mut self.file),
+            ("reaction", &mut self.reaction),
             ("voice_call", &mut self.voice_call),
             ("sticker", &mut self.sticker),
         ] {
@@ -327,6 +339,8 @@ impl Session {
             &self.domains.profile,
             &self.domains.friend,
             &self.domains.group,
+            &self.domains.reaction,
+            &self.domains.group_board,
             &self.domains.cloud_msg,
             &self.domains.voice_call,
             &self.domains.sticker,
@@ -455,6 +469,11 @@ impl Session {
         }) {
             self.http = c;
         }
+    }
+
+    /// Process-local identity shared by clones and replaced when login is revoked.
+    pub(crate) fn runtime_id(&self) -> usize {
+        Arc::as_ptr(&self.active) as usize
     }
 
     pub fn is_active(&self) -> bool {
@@ -701,6 +720,7 @@ impl Session {
                 "group_cloud_message",
                 "voice_call",
                 "sticker",
+                "reaction",
             ] {
                 if let Some(verified) = crate::endpoints::service(key) {
                     let candidates = self
@@ -732,13 +752,18 @@ impl Session {
                 ("conversation", &mut self.domains.convers_api),
                 ("profile", &mut self.domains.profile),
                 ("group", &mut self.domains.group),
+                ("group_board", &mut self.domains.group_board),
+                ("group_poll", &mut self.domains.group_poll),
                 ("file", &mut self.domains.file),
+                ("reaction", &mut self.domains.reaction),
                 ("group_cloud_message", &mut self.domains.cloud_msg),
                 ("voice_call", &mut self.domains.voice_call),
                 ("sticker", &mut self.domains.sticker),
             ] {
                 if let Some(v) = map.get(key).and_then(first) {
-                    *slot = v;
+                    if trusted_service_url(&v) {
+                        *slot = v;
+                    }
                 }
             }
             if let Some(v) = map.get("conversation").and_then(first) {
@@ -1465,4 +1490,10 @@ mod remembered_host_tests {
         assert_eq!(first.await.unwrap(), 1);
         assert_eq!(second.await.unwrap(), 2);
     }
+}
+
+fn default_reaction() -> String {
+    crate::endpoints::service("reaction")
+        .unwrap_or(crate::endpoints::MSG_CHAT)
+        .into()
 }

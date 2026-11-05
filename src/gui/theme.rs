@@ -81,6 +81,30 @@ impl ThemePalette {
             }
         }
     }
+    /// Keep custom foregrounds readable on every surface that shares them.
+    pub(super) fn ensure_readable_text(&mut self) {
+        let surfaces = [
+            self.bg_app,
+            self.bg_sidebar,
+            self.bg_chat_canvas,
+            self.bg_elevated,
+            self.bg_hover,
+            self.bg_selected,
+            self.bg_input,
+        ];
+        for foreground in [
+            &mut self.text_primary,
+            &mut self.text_secondary,
+            &mut self.text_muted,
+        ] {
+            *foreground = readable_foreground(*foreground, &surfaces);
+        }
+        self.bubble_in_text = readable_foreground(self.bubble_in_text, &[self.bubble_in_bg]);
+        self.bubble_in_meta = readable_foreground(self.bubble_in_meta, &[self.bubble_in_bg]);
+        self.bubble_out_text = readable_foreground(self.bubble_out_text, &[self.bubble_out_bg]);
+        self.bubble_out_meta = readable_foreground(self.bubble_out_meta, &[self.bubble_out_bg]);
+    }
+
     pub(super) fn dark() -> Self {
         // Official Atom One Dark (`one-dark-ui` + `one-dark-syntax`) color system
         Self {
@@ -190,7 +214,10 @@ impl ThemePalette {
         visuals.widgets.active.bg_fill = self.primary;
         visuals.widgets.active.weak_bg_fill = self.primary;
         visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, self.primary);
-        visuals.widgets.active.fg_stroke = Stroke::new(1.5_f32, Color32::WHITE);
+        visuals.widgets.active.fg_stroke = Stroke::new(
+            1.5_f32,
+            readable_foreground(Color32::WHITE, &[self.primary]),
+        );
         visuals.widgets.active.rounding = r;
 
         style.spacing.item_spacing = Vec2::new(8.0, 6.0);
@@ -199,6 +226,41 @@ impl ThemePalette {
         style.spacing.scroll.bar_width = 6.0;
         style.visuals = visuals;
         ctx.set_style_of(theme, style);
+    }
+}
+
+fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    fn luminance(c: Color32) -> f32 {
+        let linear = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+    }
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+fn readable_foreground(requested: Color32, backgrounds: &[Color32]) -> Color32 {
+    let minimum = |fg| {
+        backgrounds
+            .iter()
+            .map(|bg| contrast_ratio(fg, *bg))
+            .fold(f32::INFINITY, f32::min)
+    };
+    if requested.a() == 255 && minimum(requested) >= 4.5 {
+        return requested;
+    }
+    let dark = Color32::from_rgb(15, 23, 42);
+    let light = Color32::from_rgb(241, 245, 249);
+    if minimum(dark) >= minimum(light) {
+        dark
+    } else {
+        light
     }
 }
 
@@ -225,7 +287,8 @@ pub(super) fn avatar_color_for(name: &str, is_group: bool) -> Color32 {
 }
 
 pub(super) fn truncate_chars<'a>(s: &'a str, max_chars: usize) -> std::borrow::Cow<'a, str> {
-    if let Some((byte_idx, _)) = s.char_indices().nth(max_chars) {
+    use unicode_segmentation::UnicodeSegmentation;
+    if let Some((byte_idx, _)) = s.grapheme_indices(true).nth(max_chars) {
         std::borrow::Cow::Owned(format!("{}…", &s[..byte_idx]))
     } else {
         std::borrow::Cow::Borrowed(s)
@@ -262,29 +325,7 @@ pub(super) fn avatar_initials(name: &str) -> String {
 /// Fold Vietnamese text to lowercase ASCII for diacritic-insensitive search
 /// (e.g. `"Nguyễn Văn An"` -> `"nguyen van an"`).
 pub(super) fn fold_vn_search(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for raw in s.chars() {
-        for c in raw.to_lowercase() {
-            let mapped = match c {
-                'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ'
-                | 'ắ' | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-                'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
-                    'e'
-                }
-                'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-                'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ'
-                | 'ớ' | 'ợ' | 'ở' | 'ỡ' => 'o',
-                'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
-                    'u'
-                }
-                'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
-                'đ' => 'd',
-                other => other,
-            };
-            out.push(mapped);
-        }
-    }
-    out
+    crate::search::fold(s)
 }
 
 /// Check whether `haystack` matches `query_lower` (or `query_folded` without Vietnamese accents).
@@ -1001,5 +1042,44 @@ mod custom_theme_tests {
         assert_eq!(dark.text_primary, expected);
         light.apply_tools_theme(&serde_json::json!({"light":{"text_primary":"#112233"}}));
         assert_eq!(light.text_primary, Color32::from_rgb(17, 34, 51));
+    }
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    #[test]
+    fn light_custom_white_foregrounds_remain_readable() {
+        let mut palette = ThemePalette::light();
+        palette.apply_tools_theme(&serde_json::json!({"light":{
+            "text_primary":"#ffffff", "text_secondary":"#ffffff",
+            "text_muted":"#ffffff", "bubble_out_text":"#ffffff"
+        }}));
+        palette.ensure_readable_text();
+        for background in [
+            palette.bg_app,
+            palette.bg_sidebar,
+            palette.bg_elevated,
+            palette.bg_input,
+            palette.bg_hover,
+            palette.bg_selected,
+        ] {
+            assert!(contrast_ratio(palette.text_primary, background) >= 4.5);
+            assert!(contrast_ratio(palette.text_secondary, background) >= 4.5);
+            assert!(contrast_ratio(palette.text_muted, background) >= 4.5);
+        }
+        assert!(contrast_ratio(palette.bubble_out_text, palette.bubble_out_bg) >= 4.5);
+    }
+}
+
+#[cfg(test)]
+mod name_truncation_tests {
+    use super::*;
+    #[test]
+    fn truncation_preserves_combining_accents_and_joined_emoji() {
+        assert_eq!(truncate_chars("A👨‍👩‍👧‍👦B", 2), "A👨‍👩‍👧‍👦…");
+        assert_eq!(truncate_chars("a\u{0301}b", 1), "a\u{0301}…");
+        assert_eq!(truncate_chars("🇻🇳", 1), "🇻🇳");
     }
 }

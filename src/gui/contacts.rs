@@ -71,16 +71,19 @@ impl ZaloGuiApp {
             )
             .show(ctx, |ui| {
                 ui.label(
-                    RichText::new("Danh bạ")
+                    RichText::new(crate::i18n::tr("Danh bạ"))
                         .size(16.0)
                         .strong()
                         .color(pal.text_primary),
                 );
+                if ui.button("Tạo nhóm").clicked() {
+                    self.open_group_panel(String::new(), true, true);
+                }
                 ui.add_space(10.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.contacts_query)
                         .id(Id::new("contacts_search"))
-                        .hint_text("Tìm theo tên")
+                        .hint_text(crate::i18n::tr("Tìm theo tên"))
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(12.0);
@@ -204,7 +207,7 @@ impl ZaloGuiApp {
                                 );
                                 if response
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Mở hội thoại")
+                                    .on_hover_text(crate::i18n::tr("Mở hội thoại"))
                                     .clicked()
                                 {
                                     open = Some(index);

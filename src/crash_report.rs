@@ -34,8 +34,9 @@ pub fn install() {
                     .unwrap_or_default();
                 let phases = PHASES.try_lock().map(|p| p.join(" > ")).unwrap_or_default();
                 let report = format!(
-                    "version={} arch={} time={} source={} phases={}\n",
+                    "version={} product={} arch={} time={} source={} phases={}\n",
                     env!("CARGO_PKG_VERSION"),
+                    crate::PRODUCT_VERSION,
                     std::env::consts::ARCH,
                     crate::login::unix_now(),
                     source,

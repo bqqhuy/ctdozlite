@@ -78,7 +78,11 @@ pub fn preview_image(bytes: &[u8], key: &str) -> anyhow::Result<image::RgbaImage
     } else {
         512
     };
-    let mut rgba = image.thumbnail(maximum, maximum).to_rgba8();
+    let mut rgba = if image.width() <= maximum && image.height() <= maximum {
+        image.to_rgba8()
+    } else {
+        image.thumbnail(maximum, maximum).to_rgba8()
+    };
     if key.starts_with("ava_") {
         let side = rgba.width().min(rgba.height());
         anyhow::ensure!(side > 0, "Empty avatar");

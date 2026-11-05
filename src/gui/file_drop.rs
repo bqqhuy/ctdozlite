@@ -261,10 +261,14 @@ impl ZaloGuiApp {
                 ui.label(
                     RichText::new(format!("{} tệp chờ gửi", items.len())).color(pal.text_secondary),
                 )
-                .on_hover_text(
+                .on_hover_text(crate::i18n::tr(
                     "Nhập chú thích bên dưới. Tệp chờ chỉ được giữ trong phiên làm việc này.",
-                );
-                if ui.button("×").on_hover_text("Bỏ tất cả tệp chờ").clicked() {
+                ));
+                if ui
+                    .button("×")
+                    .on_hover_text(crate::i18n::tr("Bỏ tất cả tệp chờ"))
+                    .clicked()
+                {
                     items.clear();
                 }
             });
@@ -312,7 +316,7 @@ impl ZaloGuiApp {
                             });
                             if ui
                                 .button("×")
-                                .on_hover_text("Bỏ tệp khỏi danh sách chờ")
+                                .on_hover_text(crate::i18n::tr("Bỏ tệp khỏi danh sách chờ"))
                                 .clicked()
                             {
                                 remove = Some(index);

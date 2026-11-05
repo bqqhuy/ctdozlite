@@ -150,86 +150,28 @@ pub struct SearchHit {
 }
 /// Search all stored rows without hydrating histories into GUI memory.
 pub fn search(store: &MessageStore, query: &str, hidden: bool) -> Result<Vec<SearchHit>> {
-    ensure!(query.len() <= 512, "Từ khóa quá dài");
-    if query.trim().len() < 2 {
-        return Ok(Vec::new());
-    }
-    let needle = fold(query.trim());
-    store.conn.create_scalar_function(
-        "ctdo_fold",
-        1,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
-            | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        move |ctx| Ok(fold(&ctx.get::<String>(0)?)),
-    )?;
-    store.conn.create_scalar_function(
-        "ctdo_visible",
-        2,
-        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
-            | rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let id = ctx.get::<String>(0)?;
-            if id.starts_with("call_") {
-                return Ok(false);
-            }
-            let raw = ctx.get::<String>(1)?;
-            let mut m = ChatMessage {
-                id,
-                ..Default::default()
-            };
-            if raw.len() <= 1024 * 1024 {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(state) = v.get("message_state") {
-                        let _ = m.restore_state(state);
-                    } else {
-                        m.history_source = Some(v);
-                    }
-                }
-            }
-            Ok(!crate::message_view::is_call_log(&m))
+    let page = crate::search::query(
+        store,
+        &crate::search::Request {
+            query: query.into(),
+            category: crate::search::Category::Messages,
+            hidden,
+            ..Default::default()
         },
     )?;
-    let pattern = format!(
-        "%{}%",
-        needle
-            .replace('!', "!!")
-            .replace('%', "!%")
-            .replace('_', "!_")
-    );
-    let mut statement=store.conn.prepare("SELECT m.thread_id,m.msg_id,COALESCE(m.text,''),m.ts,COALESCE(t.name,m.thread_id) FROM messages m LEFT JOIN threads t ON t.thread_id=m.thread_id LEFT JOIN thread_preferences p ON p.thread_id=m.thread_id WHERE (?2 OR COALESCE(p.is_hidden,0)=0) AND m.msg_id NOT GLOB 'call_*' AND COALESCE(m.msg_type,'') NOT IN ('chat.call','call','voip') AND ctdo_visible(m.msg_id,COALESCE(m.raw_json,'')) AND ctdo_fold(COALESCE(m.text,'')) LIKE ?1 ESCAPE '!' ORDER BY m.ts DESC LIMIT 50")?;
-    let rows = statement.query_map(params![pattern, hidden], |r| {
-        Ok(SearchHit {
-            thread_id: r.get(0)?,
-            message_id: r.get(1)?,
-            text: r.get(2)?,
-            time: r.get(3)?,
-            thread_name: r.get(4)?,
+    Ok(page
+        .hits
+        .into_iter()
+        .map(|h| SearchHit {
+            thread_id: h.thread,
+            message_id: h.id,
+            text: h.text,
+            time: h.ts,
+            thread_name: h.thread_name,
         })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+        .collect())
 }
-fn fold(value: &str) -> String {
-    value
-        .to_lowercase()
-        .chars()
-        .map(|c| match c {
-            'à' | 'á' | 'ạ' | 'ả' | 'ã' | 'â' | 'ầ' | 'ấ' | 'ậ' | 'ẩ' | 'ẫ' | 'ă' | 'ằ' | 'ắ'
-            | 'ặ' | 'ẳ' | 'ẵ' => 'a',
-            'è' | 'é' | 'ẹ' | 'ẻ' | 'ẽ' | 'ê' | 'ề' | 'ế' | 'ệ' | 'ể' | 'ễ' => {
-                'e'
-            }
-            'ì' | 'í' | 'ị' | 'ỉ' | 'ĩ' => 'i',
-            'ò' | 'ó' | 'ọ' | 'ỏ' | 'õ' | 'ô' | 'ồ' | 'ố' | 'ộ' | 'ổ' | 'ỗ' | 'ơ' | 'ờ' | 'ớ'
-            | 'ợ' | 'ở' | 'ỡ' => 'o',
-            'ù' | 'ú' | 'ụ' | 'ủ' | 'ũ' | 'ư' | 'ừ' | 'ứ' | 'ự' | 'ử' | 'ữ' => {
-                'u'
-            }
-            'ỳ' | 'ý' | 'ỵ' | 'ỷ' | 'ỹ' => 'y',
-            'đ' => 'd',
-            other => other,
-        })
-        .collect()
-}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scheduled {
     pub id: String,
@@ -475,6 +417,7 @@ pub fn paused(store: &MessageStore) -> Result<bool> {
 }
 /// Load a bounded local context around one exact search result, without network I/O.
 pub fn open_hit(store: &MessageStore, thread: &str, id: &str) -> Result<Thread> {
+    crate::crash_report::phase("history_search_open_exact_hit");
     ensure!(thread.len() <= 512 && id.len() <= 512, "Định danh quá dài");
     let ts: i64 = store
         .conn
@@ -606,10 +549,19 @@ pub(crate) fn media_neighbor(
     })
     .transpose()
 }
-fn restore_import_metadata(message: &mut ChatMessage, raw: &str) -> Result<()> {
+pub(crate) fn restore_import_metadata(message: &mut ChatMessage, raw: &str) -> Result<()> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) {
         if let Some(state) = value.get("message_state") {
             message.restore_state(state)?;
+        } else {
+            message.history_source = Some(value.clone());
+            message.wire_ref = crate::message_model::WireMessageRef::from_raw(&value);
+            if let Some(kind) = value.get("msgType").and_then(serde_json::Value::as_str) {
+                let kind = crate::message_model::MessageKind::from_wire_name(kind);
+                if kind != crate::message_model::MessageKind::Unknown {
+                    message.kind = kind;
+                }
+            }
         }
         let mut encoded = serde_json::to_value(&*message)?;
         for key in [
@@ -638,6 +590,7 @@ fn restore_import_metadata(message: &mut ChatMessage, raw: &str) -> Result<()> {
             }
         }
         *message = serde_json::from_value(encoded)?;
+        message.hydrate_media_metadata();
     }
     Ok(())
 }
@@ -1113,6 +1066,14 @@ pub fn export_history(
     owner: &str,
     active: &dyn Fn() -> bool,
 ) -> Result<usize> {
+    while !crate::message_lifecycle::backfill(&store.conn)? {
+        ensure!(active(), "Đã dừng xuất lịch sử");
+    }
+    while !crate::message_lifecycle::purge(&store.conn, crate::login::unix_now() * 1000)?.is_empty()
+    {
+        ensure!(active(), "Đã dừng xuất lịch sử");
+    }
+
     use std::io::Write;
     ensure!(!owner.is_empty() && active(), "Đã đăng xuất");
     ensure!(
@@ -1150,7 +1111,7 @@ pub fn export_history(
                 "INSERT INTO threads VALUES(?1,?2,?3,?4)",
             )
         } else {
-            ("SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json FROM messages","INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+            ("SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json FROM messages m WHERE NOT EXISTS(SELECT 1 FROM conversation_policies p WHERE p.thread_id=m.thread_id AND p.is_group=COALESCE((SELECT is_group FROM threads WHERE thread_id=m.thread_id),0) AND p.is_protected=1)","INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")
         };
         let mut read = snapshot.prepare(select)?;
         let count = read.column_count();

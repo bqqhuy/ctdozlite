@@ -28,53 +28,81 @@ fn valid(bytes: &[u8]) -> bool {
 }
 #[cfg(windows)]
 pub fn play() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static PLAYING: AtomicBool = AtomicBool::new(false);
-    if PLAYING.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    if std::thread::Builder::new()
-        .name("notification-audio".into())
-        .spawn(|| {
-            struct Guard;
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    PLAYING.store(false, Ordering::Release);
+    use std::sync::{
+        mpsc::{sync_channel, SyncSender},
+        OnceLock,
+    };
+    static PLAYER: OnceLock<Option<SyncSender<()>>> = OnceLock::new();
+    let sender = PLAYER.get_or_init(|| {
+        let (tx, rx) = sync_channel(1);
+        match std::thread::Builder::new()
+            .name("notification-audio".into())
+            .spawn(move || {
+                #[link(name = "winmm")]
+                extern "system" {
+                    fn mciSendStringW(
+                        command: *const u16,
+                        result: *mut u16,
+                        len: u32,
+                        callback: isize,
+                    ) -> u32;
                 }
+                let command = |text: &str| {
+                    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                    // SAFETY: MCI copies the NUL-terminated buffer; no shell is involved.
+                    unsafe { mciSendStringW(wide.as_ptr(), std::ptr::null_mut(), 0, 0) }
+                };
+                let mut opened = false;
+                let mut last = None;
+                while rx.recv().is_ok() {
+                    if last.is_some_and(|at: std::time::Instant| {
+                        at.elapsed() < std::time::Duration::from_millis(500)
+                    }) {
+                        continue;
+                    }
+                    let file = path();
+                    let path = file.to_string_lossy();
+                    if !file.is_file() || path.contains(['"', '\0']) {
+                        continue;
+                    }
+                    if !opened {
+                        let code = command(&format!(
+                            "open \"{path}\" type mpegvideo alias ctdoz_notification"
+                        ));
+                        if code != 0 {
+                            crate::logger::log_error(
+                                "notification_audio",
+                                &format!("open_failed code={code}"),
+                            );
+                            continue;
+                        }
+                        opened = true;
+                    }
+                    last = Some(std::time::Instant::now());
+                    let code = command("play ctdoz_notification from 0 wait");
+                    if code != 0 {
+                        crate::logger::log_error(
+                            "notification_audio",
+                            &format!("play_failed code={code}"),
+                        );
+                        // Best-effort decoder cleanup allows the next notice to reopen it.
+                        command("close ctdoz_notification");
+                        opened = false;
+                    }
+                }
+                if opened {
+                    command("close ctdoz_notification");
+                }
+            }) {
+            Ok(_) => Some(tx),
+            Err(_) => {
+                crate::logger::log_error("notification_audio", "Cannot start audio worker");
+                None
             }
-            let _guard = Guard;
-            let path = path();
-            if !path.is_file() {
-                return;
-            }
-            let path = path.to_string_lossy();
-            if path.contains(['"', '\0']) {
-                return;
-            }
-            #[link(name = "winmm")]
-            extern "system" {
-                fn mciSendStringW(
-                    command: *const u16,
-                    result: *mut u16,
-                    len: u32,
-                    callback: isize,
-                ) -> u32;
-            }
-            let command = |s: &str| {
-                let s: Vec<u16> = s.encode_utf16().chain(Some(0)).collect(); // SAFETY: MCI copies this NUL-terminated command; no shell is involved.
-                unsafe { mciSendStringW(s.as_ptr(), std::ptr::null_mut(), 0, 0) }
-            };
-            if command(&format!(
-                "open \"{path}\" type mpegvideo alias ctdoz_notification"
-            )) == 0
-            {
-                let _ = command("play ctdoz_notification from 0 wait");
-                let _ = command("close ctdoz_notification");
-            }
-        })
-        .is_err()
-    {
-        PLAYING.store(false, Ordering::Release);
+        }
+    });
+    if let Some(sender) = sender {
+        let _ = sender.try_send(());
     }
 }
 #[cfg(not(windows))]

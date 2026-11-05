@@ -1,5 +1,5 @@
 /// User-visible fork release identifier, independent of the numeric Windows file version.
-pub const PRODUCT_VERSION: &str = "v0.005-arm";
+pub const PRODUCT_VERSION: &str = "v0.007-arm";
 
 pub mod call;
 pub mod chat;
@@ -119,3 +119,29 @@ mod attachment_cache;
 
 #[cfg(windows)]
 mod drop_cursor_windows;
+
+pub mod search;
+
+pub mod server_pins;
+
+pub mod board;
+
+pub mod i18n;
+
+pub mod group_state;
+
+pub mod groups;
+
+pub mod desktop_backup;
+mod desktop_backup_format;
+
+pub mod message_lifecycle;
+
+pub mod conversation_policy;
+
+pub mod group_content;
+
+mod reaction_pipeline;
+
+mod group_metadata;
+mod history_open;

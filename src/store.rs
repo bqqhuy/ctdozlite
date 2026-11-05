@@ -70,7 +70,10 @@ impl MessageStore {
         };
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 8, "Database requires a newer application version");
+        anyhow::ensure!(
+            schema <= 10,
+            "Database requires a newer application version"
+        );
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -188,6 +191,15 @@ impl MessageStore {
                 PRAGMA user_version=8;")?;
             migration.commit()?;
         }
+        crate::search::register(&conn)?;
+        if schema < 9 {
+            crate::search::migrate(&conn)?;
+        }
+        crate::message_lifecycle::register(&conn)?;
+        if schema < 10 {
+            crate::message_lifecycle::migrate(&conn)?;
+        }
+        crate::message_lifecycle::backfill(&conn)?;
         Ok(Self { conn })
     }
 
@@ -649,7 +661,7 @@ impl MessageStore {
         Ok(())
     }
 
-    fn is_deleted_message(&self, message: &StoredMessage) -> Result<bool> {
+    pub(crate) fn is_deleted_message(&self, message: &StoredMessage) -> Result<bool> {
         let raw = serde_json::from_str::<serde_json::Value>(&message.raw_json).unwrap_or_default();
         let client = raw
             .pointer("/message_state/client_message_id")
@@ -704,13 +716,15 @@ impl MessageStore {
                     .as_ref()
                     .map(serde_json::Value::to_string)
                     .unwrap_or_default();
-                if self.is_deleted_identity(
-                    &thread.id,
-                    &key,
-                    &message.client_message_id,
-                    message.is_outgoing,
-                    &sender,
-                )? {
+                if crate::message_lifecycle::expired(&message, crate::login::unix_now() * 1000)
+                    || self.is_deleted_identity(
+                        &thread.id,
+                        &key,
+                        &message.client_message_id,
+                        message.is_outgoing,
+                        &sender,
+                    )?
+                {
                     removed = true;
                 } else {
                     kept.push(message);
@@ -987,28 +1001,35 @@ impl MessageStore {
 
     /// Retrieve the newest `limit` messages in chronological order.
     pub fn messages_for(&self, thread_id: &str, limit: usize) -> Result<Vec<StoredMessage>> {
+        crate::message_lifecycle::purge(&self.conn, crate::login::unix_now() * 1000)?;
         let mut stmt = self.conn.prepare(
             "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
              FROM (
                 SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json
-                FROM messages WHERE thread_id = ?1 ORDER BY ts DESC, msg_id DESC LIMIT ?2
+                FROM messages WHERE thread_id = ?1
+                AND NOT EXISTS (SELECT 1 FROM message_expiry e
+                    WHERE e.thread_id=messages.thread_id AND e.msg_id=messages.msg_id AND e.expires_at<=?3)
+                ORDER BY ts DESC, msg_id DESC LIMIT ?2
              ) ORDER BY ts ASC, msg_id ASC",
         )?;
 
-        let rows = stmt.query_map(params![thread_id, limit as i64], |row| {
-            let is_outgoing_num: i64 = row.get(7)?;
-            Ok(StoredMessage {
-                msg_id: row.get(0)?,
-                thread_id: row.get(1)?,
-                sender_id: row.get(2).unwrap_or_default(),
-                sender_name: row.get(3).unwrap_or_default(),
-                text: row.get(4).unwrap_or_default(),
-                msg_type: row.get(5).unwrap_or_default(),
-                ts: row.get(6)?,
-                is_outgoing: is_outgoing_num != 0,
-                raw_json: row.get(8).unwrap_or_default(),
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![thread_id, limit as i64, crate::login::unix_now() * 1000],
+            |row| {
+                let is_outgoing_num: i64 = row.get(7)?;
+                Ok(StoredMessage {
+                    msg_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    sender_id: row.get(2).unwrap_or_default(),
+                    sender_name: row.get(3).unwrap_or_default(),
+                    text: row.get(4).unwrap_or_default(),
+                    msg_type: row.get(5).unwrap_or_default(),
+                    ts: row.get(6)?,
+                    is_outgoing: is_outgoing_num != 0,
+                    raw_json: row.get(8).unwrap_or_default(),
+                })
+            },
+        )?;
 
         let mut list = Vec::new();
         for r in rows {
@@ -1115,6 +1136,18 @@ impl MessageStore {
 
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
+            use rusqlite::OptionalExtension;
+            if let Some(raw) = self
+                .conn
+                .query_row(
+                    "SELECT data FROM reaction_previews WHERE thread_id=?1",
+                    [&t.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+            {
+                t.presentation.reaction_preview = serde_json::from_str(&raw).ok();
+            }
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
                 let time = if sm.ts > 0 {
@@ -1232,6 +1265,9 @@ impl MessageStore {
                             "Invalid optional message state; retained base message",
                         );
                     }
+                }
+                if crate::message_lifecycle::expired(&cm, crate::login::unix_now() * 1000) {
+                    continue;
                 }
                 if cm.text == "[Tin nhắn đã thu hồi]" {
                     cm.mark_recalled();
@@ -2296,7 +2332,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                8
+                10
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -2468,7 +2504,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            8
+            10
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,

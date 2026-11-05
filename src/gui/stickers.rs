@@ -1230,17 +1230,17 @@ impl ZaloGuiApp {
                     StickerTab::Store => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new("Lọc bộ nhãn:")
+                                RichText::new(crate::i18n::tr("Lọc bộ nhãn:"))
                                     .size(12.0)
                                     .color(pal.text_secondary),
                             );
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.sticker_store_filter)
-                                    .hint_text("Tìm trong 390+ bộ nhãn Zalo (VD: Zapy, Mèo, Gấu, Tết, Cò Lõ…)")
+                                    .hint_text(crate::i18n::tr("Tìm trong 390+ bộ nhãn Zalo (VD: Zapy, Mèo, Gấu, Tết, Cò Lõ…)"))
                                     .desired_width(340.0),
                             );
                             if !self.sticker_store_filter.is_empty()
-                                && ui.small_button("Xóa").clicked()
+                                && ui.small_button(crate::i18n::tr("Xóa")).clicked()
                             {
                                 self.sticker_store_filter.clear();
                             }
@@ -1261,7 +1261,7 @@ impl ZaloGuiApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(36.0);
                                 ui.spinner();
-                                ui.label("Đang tải danh mục Kho Nhãn Dán Zalo…");
+                                ui.label(crate::i18n::tr("Đang tải danh mục Kho Nhãn Dán Zalo…"));
                             });
                             return;
                         }
@@ -1405,7 +1405,7 @@ impl ZaloGuiApp {
                         let mut trigger_kw: Option<String> = None;
                         ui.horizontal(|ui| {
                             let te = egui::TextEdit::singleline(&mut self.sticker_search_query)
-                                .hint_text("Gõ để tự động tìm nhãn dán (xin chào, cảm ơn, khóc, nhớ, cố lên, mệt quá…)")
+                                .hint_text(crate::i18n::tr("Gõ để tự động tìm nhãn dán (xin chào, cảm ơn, khóc, nhớ, cố lên, mệt quá…)"))
                                 .desired_width(250.0);
                             let resp = ui.add(te);
                             if resp.changed() {
@@ -1477,14 +1477,14 @@ impl ZaloGuiApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(28.0);
                                 ui.spinner();
-                                ui.label("Đang tìm nhãn dán phù hợp…");
+                                ui.label(crate::i18n::tr("Đang tìm nhãn dán phù hợp…"));
                             });
                         } else if items.is_empty() {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(28.0);
                                 ui.label(
                                     RichText::new(
-                                        "Chọn một từ khóa gợi ý bên trên hoặc nhập từ khóa để tìm nhãn dán Zalo.",
+                                        crate::i18n::tr("Chọn một từ khóa gợi ý bên trên hoặc nhập từ khóa để tìm nhãn dán Zalo."),
                                     )
                                     .size(12.5)
                                     .color(pal.text_muted),
@@ -1518,7 +1518,7 @@ impl ZaloGuiApp {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(36.0);
                                 ui.spinner();
-                                ui.label("Đang tải bộ nhãn dán từ máy chủ Zalo…");
+                                ui.label(crate::i18n::tr("Đang tải bộ nhãn dán từ máy chủ Zalo…"));
                             });
                         }
                     }
@@ -1924,7 +1924,7 @@ impl ZaloGuiApp {
                                             if cell_resp
                                                 .on_hover_cursor(CursorIcon::PointingHand)
                                                 .on_hover_text(
-                                                    "Bấm để gửi nhãn dán (hoặc dùng phím ↑ ← → Enter)",
+                                                    crate::i18n::tr("Bấm để gửi nhãn dán (hoặc dùng phím ↑ ← → Enter)"),
                                                 )
                                                 .clicked()
                                             {
@@ -1955,7 +1955,7 @@ impl ZaloGuiApp {
                                 );
                                 if close_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Ẩn thanh gợi ý nhãn dán (Esc)")
+                                    .on_hover_text(crate::i18n::tr("Ẩn thanh gợi ý nhãn dán (Esc)"))
                                     .clicked()
                                 {
                                     dismiss_clicked = true;
@@ -1988,7 +1988,7 @@ impl ZaloGuiApp {
                                 }
                                 if more_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
-                                    .on_hover_text("Xem thêm nhãn dán cho từ khóa này")
+                                    .on_hover_text(crate::i18n::tr("Xem thêm nhãn dán cho từ khóa này"))
                                     .clicked()
                                 {
                                     open_search_clicked = true;

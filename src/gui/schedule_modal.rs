@@ -112,7 +112,7 @@ impl ZaloGuiApp {
         let mut submit = false;
         let mut close = false;
         let now = chrono::Local::now();
-        let response=egui::Window::new("Hẹn giờ gửi tin nhắn").id(Id::new("quick_schedule"))
+        let response=egui::Window::new(crate::i18n::tr("Hẹn giờ gửi tin nhắn")).id(Id::new("quick_schedule"))
             .order(egui::Order::Foreground).anchor(egui::Align2::CENTER_CENTER,Vec2::ZERO)
             .open(&mut open).collapsible(false).resizable(false)
             .default_width((screen.width()-48.0).clamp(220.0,460.0))
@@ -120,7 +120,7 @@ impl ZaloGuiApp {
                 egui::ScrollArea::vertical().max_height((screen.height()-112.0).max(80.0)).show(ui,|ui|{
                     if draft.pending_at.is_some(){ui.disable();}
                     ui.label(RichText::new(format!("Gửi tới: {}",draft.name)).strong());
-                    ui.add(egui::TextEdit::multiline(&mut draft.text).desired_rows(3).desired_width(f32::INFINITY).hint_text("Nội dung tin nhắn"));
+                    ui.add(egui::TextEdit::multiline(&mut draft.text).desired_rows(3).desired_width(f32::INFINITY).hint_text(crate::i18n::tr("Nội dung tin nhắn")));
                     ui.add_space(8.0);
                     let width=((ui.available_width()-8.0)/2.0).max(80.0);
                     egui::Grid::new("quick_schedule_presets").spacing(Vec2::splat(8.0)).show(ui,|ui|{
@@ -138,19 +138,19 @@ impl ZaloGuiApp {
                         }
                     });
                     ui.add_space(8.0);
-                    ui.horizontal(|ui|{ui.label("Sau (phút):");ui.add(egui::DragValue::new(&mut draft.minutes).range(1..=527040));});
-                    ui.label("Hoặc giờ cụ thể (YYYY-MM-DD HH:MM):");
+                    ui.horizontal(|ui|{ui.label(crate::i18n::tr("Sau (phút):"));ui.add(egui::DragValue::new(&mut draft.minutes).range(1..=527040));});
+                    ui.label(crate::i18n::tr("Hoặc giờ cụ thể (YYYY-MM-DD HH:MM):"));
                     ui.text_edit_singleline(&mut draft.when);
                     if let Some(tools_panel::ToolsCommand::Schedule{at,..})=draft.command(&self.user_uin,now.timestamp()) {
                         if let Some(time)=chrono::Local.timestamp_opt(at,0).single(){ui.label(format!("Giờ gửi: {}",time.format("%d/%m/%Y %H:%M")));}
                     }
                     egui::Frame::none().fill(pal.bg_elevated).stroke(Stroke::new(1.0_f32,pal.primary)).rounding(Rounding::same(8.0)).inner_margin(Margin::same(10.0)).show(ui,|ui|{
-                        ui.label(RichText::new("Lịch được lưu trên máy này. App cần chạy và tài khoản đăng nhập để gửi; khi mở lại có thể gửi trễ. Đây không phải lịch gửi trên máy chủ Zalo.").color(pal.text_primary).size(12.0));
+                        ui.label(RichText::new(crate::i18n::tr("Lịch được lưu trên máy này. App cần chạy và tài khoản đăng nhập để gửi; khi mở lại có thể gửi trễ. Đây không phải lịch gửi trên máy chủ Zalo.")).color(pal.text_primary).size(12.0));
                     });
                     if !draft.error.is_empty(){ui.colored_label(Color32::from_rgb(225,80,80),&draft.error);}
                     ui.horizontal(|ui|{
-                        close=ui.button("Hủy").clicked();
-                        submit=ui.add_enabled(!draft.text.trim().is_empty(),egui::Button::new("Hẹn giờ gửi").fill(pal.primary)).clicked();
+                        close=ui.button(crate::i18n::tr("Hủy")).clicked();
+                        submit=ui.add_enabled(!draft.text.trim().is_empty(),egui::Button::new(crate::i18n::tr("Hẹn giờ gửi")).fill(pal.primary)).clicked();
                     });
                 });
             });

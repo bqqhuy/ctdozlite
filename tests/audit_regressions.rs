@@ -72,6 +72,7 @@ fn session(host: &str) -> Session {
     s.domains.chat = host.into();
     s.domains.group = host.into();
     s.domains.file = host.into();
+    s.domains.conversation = host.into();
     s
 }
 fn quote() -> ChatMessage {
@@ -430,10 +431,11 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
                     .to_owned(),
             );
             let body = match paths.len() {
-                1 => Some(
+                1 | 2 => Some(r#"{"error_code":0,"data":{"convers":[]}}"#),
+                3 => Some(
                     r#"{"error_code":0,"data":{"normal":"https://photo.zdn.vn/copy","thumb":"https://photo.zdn.vn/thumb"}}"#,
                 ),
-                2 => None, // The send reached the server, but its acknowledgement was lost.
+                4 => None, // The send reached the server, but its acknowledgement was lost.
                 _ => Some(r#"{"error_code":1,"data":{}}"#),
             };
             if let Some(body) = body {
@@ -461,9 +463,9 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
     let paths = server.await.unwrap();
     assert_eq!(
         paths.len(),
-        2,
+        4,
         "A send failure must not restart media preparation"
     );
-    assert!(paths[0].starts_with("POST /api/message/renewlink"));
-    assert!(paths[1].starts_with("POST /api/message/forward"));
+    assert!(paths[2].starts_with("POST /api/message/renewlink"));
+    assert!(paths[3].starts_with("POST /api/message/forward"));
 }

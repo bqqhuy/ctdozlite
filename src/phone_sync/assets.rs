@@ -79,6 +79,7 @@ async fn download_to_once<F: FnMut(u64, Option<u64>)>(
     path: &Path,
     session: &crate::session::Session,
     cancel: &std::sync::atomic::AtomicBool,
+    limit: usize,
     mut progress: F,
 ) -> Result<()> {
     use tokio::io::AsyncWriteExt;
@@ -109,7 +110,7 @@ async fn download_to_once<F: FnMut(u64, Option<u64>)>(
         );
         let expected = response.content_length();
         ensure!(
-            expected.is_none_or(|n| n <= DOWNLOAD_LIMIT as u64),
+            expected.is_none_or(|n| n <= limit as u64),
             "Sync container exceeds limit"
         );
         let mut options = tokio::fs::OpenOptions::new();
@@ -128,7 +129,7 @@ async fn download_to_once<F: FnMut(u64, Option<u64>)>(
                 "Đã dừng tải lịch sử"
             );
             ensure!(
-                chunk.len() <= DOWNLOAD_LIMIT.saturating_sub(total),
+                chunk.len() <= limit.saturating_sub(total),
                 "Sync container exceeds limit"
             );
             file.write_all(&chunk).await?;
@@ -160,7 +161,7 @@ pub(super) async fn download_to<F: FnMut(u64, Option<u64>)>(
     cancel: &std::sync::atomic::AtomicBool,
     mut progress: F,
 ) -> Result<()> {
-    let result = download_to_once(raw, path, session, cancel, &mut progress).await;
+    let result = download_to_once(raw, path, session, cancel, DOWNLOAD_LIMIT, &mut progress).await;
     if result
         .as_ref()
         .err()
@@ -174,7 +175,7 @@ pub(super) async fn download_to<F: FnMut(u64, Option<u64>)>(
             Err(_) => anyhow::bail!("Không dọn được gói tải dở"),
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        return download_to_once(raw, path, session, cancel, progress).await;
+        return download_to_once(raw, path, session, cancel, DOWNLOAD_LIMIT, progress).await;
     }
     result
 }
@@ -214,6 +215,16 @@ pub(super) async fn codec(cache: &Path) -> Result<Vec<u8>> {
     .await??;
     Ok(bytes)
 }
+/// Stream a whole V1 backup under a separate cap; never attach account cookies.
+pub(super) async fn download_backup(
+    raw: &str,
+    path: &Path,
+    session: &crate::session::Session,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    download_to_once(raw, path, session, cancel, 512 * 1024 * 1024, |_, _| {}).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
