@@ -1,0 +1,14 @@
+---
+description: Repository instructions and shared Karpathy-inspired coding discipline
+alwaysApply: true
+---
+
+Before implementing, reviewing or refactoring, read @AGENTS.md at the repository
+root, including its Karpathy-inspired coding discipline and applicable standards.
+That file is canonical; this rule adds no separate policy or permission requirement.
+
+State material assumptions, keep the solution simple and changes scoped, preserve
+unrelated work, and verify observable success criteria. Continue authorized work;
+ask only about material unresolved decisions. Read the active release plan and
+spec/plan/tasks/verification, retaining the distinction between code, tests and
+native/device acceptance. Graphify is a navigation aid, not proof of completion.

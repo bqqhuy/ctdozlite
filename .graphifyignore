@@ -1,0 +1,23 @@
+# Runtime data and credentials must never enter a development graph.
+**/session*.json
+**/session*.dat
+**/*.db
+**/*.db-*
+**/*.jsonl
+**/*.log
+**/.env*
+**/*cookies*
+**/*cache*.json
+hidden_membership.json
+account_metadata_cache.json
+data/
+dump/
+raw/
+# Analyze project code, not dependencies, build products or reverse-engineering dumps.
+target/
+vendor/
+graphify-out/
+research*/
+scratch/
+
+web-bundle/

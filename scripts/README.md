@@ -5,3 +5,6 @@
 `decode_voip_log.py` hỗ trợ phân tích log giao thức đã thu thập có chủ đích. Log có thể chứa dữ liệu riêng tư; không đưa lên issue công khai.
 
 `xwin-build-arm64.sh` build chéo bản ARM64 từ Linux bằng `cargo-xwin` để kiểm tra nhanh (`./scripts/xwin-build-arm64.sh build --bin ctdozlite` hoặc `... clippy --all-targets -- -D warnings`). Script tải CRT MSVC và Windows SDK của Microsoft về `~/.cache/cargo-xwin`; chạy script là chấp nhận giấy phép của chúng. Bản phát hành vẫn build và test native bằng `build-windows-arm64.ps1`.
+
+`graphify.sh` tạo đồ thị AST cục bộ và nhập roadmap/spec/task có nguồn để rà soát, tra cứu tác động thay đổi;
+xem [hướng dẫn Graphify](../docs/GRAPHIFY.md). Không tham gia build/release.

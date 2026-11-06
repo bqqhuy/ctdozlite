@@ -78,3 +78,35 @@ standards/ADRs and GitHub ticket lifecycle remain canonical. Use the current bra
 and respect existing authorization; do not invoke automatic workflows or release
 operations as a side effect of Spec Kit. Update command sources in
 `.specify/templates/overrides/`, then regenerate skills with the pinned CLI.
+
+## Karpathy-inspired coding discipline
+
+Apply these principles when implementing, reviewing, or refactoring, alongside the
+repository standards above. They are adapted from
+[multica-ai/andrej-karpathy-skills](https://github.com/multica-ai/andrej-karpathy-skills),
+reviewed at commit `2c606141936f1eeef17fa3043a72095b4765b9c2`.
+These are community guidelines inspired by Karpathy, not a claim of his authorship
+or endorsement. User instructions and existing protocol/security requirements take
+precedence; this section does not authorize additional work or external actions.
+
+1. **Think before coding.** State material assumptions and tradeoffs. Resolve routine
+   choices from repository/session evidence and continue authorized work. Ask only
+   when missing information materially affects correctness, scope or an irreversible
+   decision; do not repeatedly seek approval already given. Distinguish source evidence,
+   inference, test results and device acceptance.
+2. **Simplicity first.** Implement the smallest coherent solution satisfying the agreed
+   scope. Do not add speculative features, dependencies, configuration or abstractions.
+   Keep required validation, account isolation and protocol/error handling intact.
+3. **Surgical changes.** Preserve other work in the shared branch. Match local style,
+   avoid unrelated rewrites, and remove only leftovers created by the current change.
+   Broader cleanup is appropriate when explicitly requested; trace each change to that
+   scope and report unrelated findings instead of silently altering them.
+4. **Goal-driven execution.** Define observable success criteria, implement, and run
+   relevant checks until resolved. For a bug, use a focused regression where practical;
+   trivial documentation or reversible edits do not require invented tests. Scale
+   checks to risk, report checks actually run and remaining limitations. A passing
+   model/fixture test does not certify Zalo interoperability or native/device behavior.
+
+These rules apply regardless of assistant vendor. Agent entry points and optional
+skills delegate here rather than maintaining separate policies or task status.
+See [multi-assistant setup](docs/AI_ASSISTANTS.md).

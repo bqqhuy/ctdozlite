@@ -1,0 +1,438 @@
+{
+  "schema_version": 1,
+  "roadmap": "docs/ROADMAP_ZALO_PARITY.md",
+  "gap_source": "docs/ZALO_FEATURE_API_GAPS.md",
+  "releases": {
+    "v0.008-arm": {
+      "blocks": [
+        "R0",
+        "R8",
+        "R9",
+        "R10"
+      ],
+      "status": "code_and_fixtures_device_acceptance_pending",
+      "specs": [
+        "005-ui-customization",
+        "006-stranger-inbox",
+        "007-call-multidevice",
+        "008-account-group-state"
+      ]
+    },
+    "v0.009-arm": {
+      "blocks": [
+        "R11",
+        "R12",
+        "R13"
+      ],
+      "status": "planned",
+      "specs": []
+    },
+    "v0.010-arm": {
+      "blocks": [
+        "R14"
+      ],
+      "status": "planned",
+      "specs": []
+    },
+    "v0.011-arm": {
+      "blocks": [
+        "R15"
+      ],
+      "status": "planned",
+      "specs": []
+    }
+  },
+  "blocks": {
+    "R0": [],
+    "R8": [
+      "A01",
+      "A02",
+      "A03",
+      "A08",
+      "B02"
+    ],
+    "R9": [
+      "A04",
+      "A05",
+      "A06",
+      "A07",
+      "A10",
+      "A11",
+      "B01",
+      "B10"
+    ],
+    "R10": [
+      "A12",
+      "A13",
+      "A14",
+      "A15",
+      "B03"
+    ],
+    "R11": [
+      "A16",
+      "A17",
+      "B06",
+      "B08",
+      "B09",
+      "B12"
+    ],
+    "R12": [
+      "A18",
+      "B04",
+      "B07"
+    ],
+    "R13": [
+      "A09",
+      "A19",
+      "B02",
+      "C02"
+    ],
+    "R14": [
+      "A20",
+      "B05",
+      "B11"
+    ],
+    "R15": [
+      "C01",
+      "C02",
+      "C03",
+      "C04"
+    ]
+  },
+  "carryover_specs": {
+    "001-group-governance": "R10",
+    "002-message-media-lifecycle": "R11",
+    "003-history-restoration": "R14",
+    "004-desktop-interaction": "R8"
+  },
+  "evidence": [
+    "re-notes/31-v007-contracts.md",
+    "re-notes/32-v008-stranger-conversation-review.md",
+    "re-notes/33-v008-api-gap-inventory.md",
+    "re-notes/34-v008-implementation-contracts.md",
+    "re-notes/35-v008-state-lifecycle-and-source-bindings.md",
+    "docs/adr/0034-hidden-chat-pin-compatibility.md"
+  ],
+  "bindings": [
+    {
+      "spec": "005-ui-customization",
+      "requirements": [
+        "UI-01"
+      ],
+      "code": [
+        "src/gui/worker.rs",
+        "src/gui/modals.rs"
+      ],
+      "tests": []
+    },
+    {
+      "spec": "005-ui-customization",
+      "requirements": [
+        "UI-02",
+        "UI-03"
+      ],
+      "code": [
+        "src/gui/theme.rs",
+        "src/gui/modals.rs"
+      ],
+      "tests": []
+    },
+    {
+      "spec": "005-ui-customization",
+      "requirements": [
+        "UI-04",
+        "UI-05",
+        "UI-06"
+      ],
+      "code": [
+        "src/gui.rs",
+        "src/gui/workspace.rs",
+        "src/gui/modals.rs"
+      ],
+      "tests": []
+    },
+    {
+      "spec": "006-stranger-inbox",
+      "requirements": [
+        "S-01",
+        "S-02",
+        "S-03"
+      ],
+      "code": [
+        "src/inbox.rs",
+        "src/account_metadata.rs",
+        "src/live_updates.rs",
+        "src/gui/workspace.rs"
+      ],
+      "tests": [
+        "src/inbox.rs::incomplete_metadata_never_moves_a_thread_into_the_stranger_box",
+        "src/inbox.rs::an_acknowledged_reply_survives_an_older_negative_preview"
+      ]
+    },
+    {
+      "spec": "006-stranger-inbox",
+      "requirements": [
+        "S-04",
+        "S-06"
+      ],
+      "code": [
+        "src/privacy.rs",
+        "src/desktop_notice.rs",
+        "src/gui.rs"
+      ],
+      "tests": [
+        "src/privacy.rs::display_setting_is_distinct_from_receive_permission_and_unknown_stays_unknown"
+      ]
+    },
+    {
+      "spec": "006-stranger-inbox",
+      "requirements": [
+        "S-05"
+      ],
+      "code": [
+        "src/contact_actions.rs",
+        "src/gui/contact_panel.rs"
+      ],
+      "tests": [
+        "src/contact_actions.rs::blocked_pages_require_explicit_pagination_and_reports_do_not_bundle_other_mutations"
+      ]
+    },
+    {
+      "spec": "007-call-multidevice",
+      "requirements": [
+        "C-01",
+        "C-02",
+        "C-03",
+        "C-04",
+        "C-05",
+        "C-06",
+        "C-07"
+      ],
+      "code": [
+        "src/call.rs",
+        "src/call_lifecycle.rs",
+        "src/gui.rs",
+        "src/gui/modals.rs"
+      ],
+      "tests": [
+        "src/call_lifecycle.rs::only_the_pending_matching_receiver_with_explicit_self_actor_is_dismissed",
+        "src/call_lifecycle.rs::terminal_history_is_account_scoped_bounded_and_expires",
+        "src/call_lifecycle.rs::missing_or_invalid_status_is_not_success"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "A-01"
+      ],
+      "code": [
+        "src/contact_actions.rs",
+        "src/labels.rs",
+        "src/archive.rs",
+        "src/unread.rs",
+        "src/account_metadata.rs"
+      ],
+      "tests": [
+        "src/labels.rs::assigning_a_group_preserves_the_direct_peer_and_unrelated_server_fields"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "A-02",
+        "A-03"
+      ],
+      "code": [
+        "src/hidden_chat.rs",
+        "src/gui/hidden_panel.rs",
+        "src/gui/account_state.rs",
+        "src/gui/worker.rs"
+      ],
+      "tests": [
+        "src/hidden_chat.rs::verifier_is_memory_only_and_account_scoped",
+        "src/hidden_chat.rs::offline_cache_contains_no_pin_and_cannot_unlock",
+        "src/hidden_chat.rs::five_failed_attempts_cannot_be_bypassed_by_a_normal_refresh"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "A-04"
+      ],
+      "code": [
+        "src/profile.rs",
+        "src/avatar.rs",
+        "src/avatar_history.rs",
+        "src/contact_actions.rs"
+      ],
+      "tests": [
+        "src/contact_actions.rs::username_lookup_is_a_bounded_read_and_does_not_add_a_friend"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "A-05"
+      ],
+      "code": [
+        "src/last_activity.rs",
+        "src/privacy.rs",
+        "src/account_controls.rs"
+      ],
+      "tests": [
+        "src/account_controls.rs::activity_controls_do_not_trigger_account_wide_sync"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "G-06",
+        "G-07"
+      ],
+      "code": [
+        "src/groups.rs",
+        "src/group_state.rs",
+        "src/group_entry.rs",
+        "src/account_controls.rs",
+        "src/gui/group_panel.rs"
+      ],
+      "tests": [
+        "src/group_state.rs::missing_and_removed_group_never_grant_send_permission",
+        "src/group_state.rs::numeric_creator_and_admin_ids_keep_their_roles",
+        "src/account_controls.rs::a_chat_payload_cannot_impersonate_a_hidden_or_group_control"
+      ]
+    },
+    {
+      "spec": "008-account-group-state",
+      "requirements": [
+        "G-08"
+      ],
+      "code": [
+        "src/group_content.rs"
+      ],
+      "tests": [
+        "src/group_content.rs::content_identity_and_kind_must_match_the_request_scoped_list"
+      ]
+    }
+  ],
+  "gap_bindings": {
+    "A01": [
+      "006-stranger-inbox",
+      "S-01",
+      "S-02",
+      "S-03"
+    ],
+    "A02": [
+      "006-stranger-inbox",
+      "S-05"
+    ],
+    "A03": [
+      "006-stranger-inbox",
+      "S-05"
+    ],
+    "A04": [
+      "008-account-group-state",
+      "A-01"
+    ],
+    "A05": [
+      "008-account-group-state",
+      "A-01"
+    ],
+    "A06": [
+      "008-account-group-state",
+      "A-01"
+    ],
+    "A07": [
+      "008-account-group-state",
+      "A-02",
+      "A-03"
+    ],
+    "A08": [
+      "006-stranger-inbox",
+      "S-04",
+      "S-06"
+    ],
+    "A10": [
+      "008-account-group-state",
+      "A-04"
+    ],
+    "A11": [
+      "008-account-group-state",
+      "A-04"
+    ],
+    "A12": [
+      "008-account-group-state",
+      "G-06",
+      "G-07"
+    ],
+    "A13": [
+      "008-account-group-state",
+      "G-07"
+    ],
+    "A14": [
+      "008-account-group-state",
+      "G-07"
+    ],
+    "A15": [
+      "008-account-group-state",
+      "G-07"
+    ],
+    "B01": [
+      "008-account-group-state",
+      "A-01"
+    ],
+    "B02": [
+      "006-stranger-inbox",
+      "S-04"
+    ],
+    "B03": [
+      "008-account-group-state",
+      "G-06"
+    ],
+    "B04": [
+      "008-account-group-state",
+      "G-08"
+    ],
+    "B10": [
+      "008-account-group-state",
+      "A-05"
+    ]
+  },
+  "spec_blocks": {
+    "005-ui-customization": [
+      "R8"
+    ],
+    "006-stranger-inbox": [
+      "R8"
+    ],
+    "007-call-multidevice": [
+      "R0"
+    ],
+    "008-account-group-state": [
+      "R9",
+      "R10"
+    ]
+  },
+  "dependencies": [
+    {
+      "from": "R10",
+      "to": "R8",
+      "relation": "depends_on_state_foundation"
+    },
+    {
+      "from": "R11",
+      "to": "R10",
+      "relation": "depends_on_group_permissions"
+    },
+    {
+      "from": "R12",
+      "to": "R10",
+      "relation": "depends_on_group_permissions"
+    },
+    {
+      "from": "R14",
+      "to": "R13",
+      "relation": "requires_key_model_research"
+    }
+  ]
+}
