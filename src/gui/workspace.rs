@@ -3316,6 +3316,34 @@ impl ZaloGuiApp {
                                             }
                                         }
 
+                                        // 4) Microphone Voice Recording Button
+                                        let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
+                                        let (mic_rect, mic_resp) = ui.allocate_exact_size(
+                                            Vec2::new(34.0, 34.0),
+                                            Sense::click(),
+                                        );
+                                        if is_voice_active || mic_resp.hovered() {
+                                            ui.painter().rect_filled(
+                                                mic_rect,
+                                                Rounding::same(8.0),
+                                                if is_voice_active { pal.danger.linear_multiply(0.18) } else { pal.bg_hover },
+                                            );
+                                        }
+                                        ui.painter().text(
+                                            mic_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            lucide::MIC,
+                                            FontId::proportional(16.0),
+                                            if is_voice_active { pal.danger } else { pal.text_secondary },
+                                        );
+                                        if mic_resp
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .on_hover_text(crate::i18n::tr("Thu âm & gửi tin nhắn thoại"))
+                                            .clicked()
+                                        {
+                                            self.toggle_voice_recorder();
+                                        }
+
                                         // Vertical hairline separator
                                         let (sep_r, _) = ui.allocate_exact_size(
                                             Vec2::new(8.0, 20.0),
@@ -3365,7 +3393,14 @@ impl ZaloGuiApp {
                                             .min_scrolled_height(0.0)
                                             .max_height(editor_height)
                                             .stick_to_bottom(true)
-                                            .show(ui, |ui| text_edit.show(ui))
+                                            .show(ui, |ui| {
+                                                if self.voice_recorder.is_some() || self.recorded_voice_samples.is_some() {
+                                                    self.render_voice_recording_bar(ui, &thread_id, is_group, pal, input_w);
+                                                    text_edit.show(ui)
+                                                } else {
+                                                    text_edit.show(ui)
+                                                }
+                                            })
                                             .inner;
                                         let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
                                         let response = output.response;
@@ -3469,7 +3504,8 @@ impl ZaloGuiApp {
                                             if button.on_hover_text(crate::i18n::tr("Hẹn giờ gửi tin nhắn")).on_hover_cursor(CursorIcon::PointingHand).clicked(){self.open_quick_schedule();}
                                         }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let can_send = !self.input_message.trim().is_empty()
+                                        let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
+                                        let can_send = is_voice_active || !self.input_message.trim().is_empty()
                                             || self.pending_clipboard_image.is_some() || self.attachment_drafts.len(&thread_id)>0;
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
                                             Vec2::new(send_btn_w, 34.0),
@@ -3547,7 +3583,10 @@ impl ZaloGuiApp {
                                             })
                                             .clicked();
 
-                                        if (send_clicked || enter_pressed) && self.attachment_drafts.len(&thread_id) > 0 {
+                                        if (send_clicked || enter_pressed) && is_voice_active {
+                                            self.send_voice_recording(&thread_id, is_group);
+                                            response.request_focus();
+                                        } else if (send_clicked || enter_pressed) && self.attachment_drafts.len(&thread_id) > 0 {
                                             self.send_attachment_draft(ctx,&thread_id,is_group);
                                             response.request_focus();
                                         } else if send_selected_sticker.is_some() && attachment_count > 0 {
@@ -4774,5 +4813,145 @@ impl ZaloGuiApp {
                 data.remove::<String>(Id::new("reaction_details_filter"));
             });
         }
+    }
+
+    fn toggle_voice_recorder(&mut self) {
+        if self.voice_recorder.is_some() {
+            let rec = self.voice_recorder.take().unwrap();
+            let (samples, rate, dur) = rec.finish();
+            if !samples.is_empty() && dur.as_secs_f32() >= 0.3 {
+                self.recorded_voice_samples = Some((samples, rate, dur));
+            }
+        } else {
+            if let Some(prev) = self.voice_preview.take() {
+                prev.stop();
+            }
+            self.recorded_voice_samples = None;
+            match crate::voice::VoiceRecorder::start() {
+                Ok(rec) => {
+                    self.voice_recorder = Some(rec);
+                }
+                Err(e) => {
+                    self.status_msg = format!("Lỗi bật micro: {e}");
+                }
+            }
+        }
+    }
+
+    fn cancel_voice_recording(&mut self) {
+        if let Some(rec) = self.voice_recorder.take() {
+            rec.cancel();
+        }
+        if let Some(prev) = self.voice_preview.take() {
+            prev.stop();
+        }
+        self.recorded_voice_samples = None;
+    }
+
+    fn send_voice_recording(&mut self, thread_id: &str, is_group: bool) {
+        let (samples, rate, dur) = if let Some((s, r, d)) = self.recorded_voice_samples.take() {
+            (s, r, d)
+        } else if let Some(rec) = self.voice_recorder.take() {
+            rec.finish()
+        } else {
+            return;
+        };
+        if let Some(prev) = self.voice_preview.take() {
+            prev.stop();
+        }
+        let resampled = crate::voice::resample_to_16k(&samples, rate);
+        let wav = crate::voice::pcm_to_wav(&resampled, crate::voice::VOICE_SAMPLE_RATE);
+        let duration_secs = dur.as_secs().max(1) as u32;
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::SendVoiceMessage {
+                to_id: thread_id.to_string(),
+                is_group,
+                wav_bytes: wav,
+                duration_secs,
+            });
+        }
+        self.status_msg = "Đang gửi tin nhắn thoại…".into();
+    }
+
+    fn render_voice_recording_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        thread_id: &str,
+        is_group: bool,
+        pal: &ThemePalette,
+        input_w: f32,
+    ) {
+        ui.allocate_ui_with_layout(
+            Vec2::new(input_w, 34.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                let is_recording = self.voice_recorder.is_some();
+                if is_recording {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+                    ui.label(RichText::new("🔴 Ghi âm…").color(pal.danger).strong().size(12.5));
+                } else {
+                    ui.label(RichText::new("⏹ Đã ghi âm").color(pal.primary).strong().size(12.5));
+                }
+
+                let dur = if let Some(ref rec) = self.voice_recorder {
+                    rec.duration()
+                } else if let Some((_, _, d)) = self.recorded_voice_samples {
+                    d
+                } else {
+                    std::time::Duration::ZERO
+                };
+                let total_secs = dur.as_secs();
+                ui.label(
+                    RichText::new(format!("{:02}:{:02}", total_secs / 60, total_secs % 60))
+                        .color(pal.text_primary)
+                        .strong()
+                        .size(12.5),
+                );
+
+                ui.add_space(6.0);
+
+                let waveform = if let Some(ref rec) = self.voice_recorder {
+                    rec.waveform()
+                } else {
+                    vec![0.3, 0.5, 0.8, 0.4, 0.6, 0.3, 0.7, 0.9, 0.5, 0.4]
+                };
+                let bar_count = 14;
+                let bar_w = 4.0;
+                for level in waveform.iter().rev().take(bar_count) {
+                    let h = (level * 20.0).clamp(4.0, 20.0);
+                    let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w, 20.0), Sense::hover());
+                    let bar_rect = Rect::from_center_size(rect.center(), Vec2::new(bar_w - 1.0, h));
+                    ui.painter().rect_filled(
+                        bar_rect,
+                        Rounding::same(1.0),
+                        if is_recording { pal.danger } else { pal.primary },
+                    );
+                }
+
+                ui.add_space(6.0);
+
+                if !is_recording {
+                    let playing = self.voice_preview.as_ref().is_some_and(|p| p.is_playing());
+                    let lbl = if playing { "⏸ Tạm dừng" } else { "▶ Nghe thử" };
+                    if ui.small_button(lbl).clicked() {
+                        if playing {
+                            if let Some(prev) = self.voice_preview.take() {
+                                prev.stop();
+                            }
+                        } else if let Some((ref samples, rate, _)) = self.recorded_voice_samples {
+                            if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples.clone(), rate) {
+                                self.voice_preview = Some(prev);
+                            }
+                        }
+                    }
+                } else if ui.small_button("⏹ Dừng").clicked() {
+                    self.toggle_voice_recorder();
+                }
+
+                if ui.small_button(RichText::new(lucide::X).color(pal.danger)).clicked() {
+                    self.cancel_voice_recording();
+                }
+            },
+        );
     }
 }

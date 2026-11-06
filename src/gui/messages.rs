@@ -805,6 +805,10 @@ pub(super) fn render_message_body(
         return render_contact_card_widget(ui, msg, pal, outgoing, max_text_width);
     }
 
+    if msg.kind == crate::message_model::MessageKind::Voice || msg.text.starts_with("[Tin nhắn thoại]") {
+        return render_voice_message_widget(ui, msg, pal, outgoing, max_text_width);
+    }
+
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
         let mentions =
             crate::rich_text::mention_styles(msg.wire_ref.fields.get("mentions"), &msg.text);
@@ -1717,6 +1721,60 @@ pub(super) fn bubble_context_menu(
         }
     });
     action
+}
+
+pub(super) fn render_voice_message_widget(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let card_w = max_text_width.min(260.0).max(180.0);
+    let (text_col, meta_col) = if outgoing {
+        (pal.bubble_out_text, pal.bubble_out_meta)
+    } else {
+        (pal.bubble_in_text, pal.bubble_in_meta)
+    };
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(card_w, 36.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            let btn_resp = ui.button("▶");
+            if btn_resp.clicked() {
+                if let Some(ref url) = msg.link_url {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::DownloadMedia {
+                            url: url.clone(),
+                            name: "voice.wav".into(),
+                            play: true,
+                            open: false,
+                            context: None,
+                        });
+                    }
+                }
+            }
+
+            let bar_count = 18;
+            let available_w = (card_w - 90.0).max(40.0);
+            let bar_w = (available_w / bar_count as f32).max(2.0);
+            for i in 0..bar_count {
+                let h = 6.0 + ((i as f32 * 1.7 + (msg.ts % 10) as f32).sin().abs() * 16.0);
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w - 1.0, 24.0), Sense::hover());
+                let bar_rect = Rect::from_center_size(rect.center(), Vec2::new(bar_w - 1.5, h));
+                ui.painter().rect_filled(bar_rect, Rounding::same(1.0), pal.primary);
+            }
+
+            let dur_label = if let Some(stripped) = msg.text.strip_prefix("[Tin nhắn thoại] (") {
+                stripped.trim_end_matches(')').trim()
+            } else {
+                "0:05"
+            };
+            ui.label(RichText::new(dur_label).size(12.0).color(meta_col));
+        },
+    );
+    None
 }
 
 pub(super) fn render_contact_card_widget(

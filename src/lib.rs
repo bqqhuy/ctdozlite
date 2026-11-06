@@ -23,6 +23,7 @@ pub mod tui;
 pub mod ui;
 pub mod video;
 pub mod voip_log;
+pub mod voice;
 
 #[cfg(windows)]
 mod windows_video;

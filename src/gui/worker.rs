@@ -302,6 +302,12 @@ pub enum WorkerCmd {
         is_group: bool,
         messages: Vec<ChatMessage>,
     },
+    SendVoiceMessage {
+        to_id: String,
+        is_group: bool,
+        wav_bytes: Vec<u8>,
+        duration_secs: u32,
+    },
     SendSticker {
         to_id: String,
         sticker_id: u64,
@@ -2699,6 +2705,80 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let s=session.lock().await.clone();
                             if !s.is_active() || s.account_key()!=owner || batch.files.len()>16 {continue;}
                             tokio::spawn(send_attachment_batch(s,batch,gui_tx.clone(),egui_ctx.clone()));
+                        }
+                        WorkerCmd::SendVoiceMessage {
+                            to_id,
+                            is_group,
+                            wav_bytes,
+                            duration_secs,
+                        } => {
+                            let session_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                if !s.is_active() {
+                                    return;
+                                }
+                                let owner = s.account_key().to_owned();
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                let voice_dir = std::env::temp_dir().join("ctdozlite_voice");
+                                let _ = tokio::fs::create_dir_all(&voice_dir).await;
+                                let temp_file = voice_dir.join(format!("voice_{now}.wav"));
+                                if let Err(e) = tokio::fs::write(&temp_file, &wav_bytes).await {
+                                    let _ = events.send(GuiEvent::StatusUpdate(format!("L\u1ed7i l\u01b0u t\u1ec7p \xe2m thanh: {e}")));
+                                    return;
+                                }
+                                let stamp = crate::outgoing::FileStamp::read(&temp_file).await.ok();
+                                let caption = format!("[Tin nh\u1eafn tho\u1ea1i] ({duration_secs}s)");
+                                let mut message = crate::outgoing::pending(
+                                    caption.clone(),
+                                    is_group,
+                                    crate::outgoing::Payload::Attachment {
+                                        path: temp_file.clone(),
+                                        caption: caption.clone(),
+                                        stamp,
+                                        hd_source: None,
+                                    },
+                                );
+                                message.kind = crate::message_model::MessageKind::Voice;
+                                let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+                                    return;
+                                };
+                                persist_outgoing(&s, &to_id, &message).await;
+                                let _ = events.send(GuiEvent::OutgoingState {
+                                    owner: owner.clone(),
+                                    thread_id: to_id.clone(),
+                                    message: message.clone(),
+                                });
+                                ctx.request_repaint();
+
+                                match crate::outgoing::send(&s, &to_id, &message).await {
+                                    Ok(mut sent) => {
+                                        sent.kind = crate::message_model::MessageKind::Voice;
+                                        message = sent;
+                                        let _ = events.send(GuiEvent::StatusUpdate("\u0110\xe3 g\u1eedi tin nh\u1eafn tho\u1ea1i".into()));
+                                    }
+                                    Err(error) => {
+                                        message.delivery = crate::message_model::DeliveryState::Failed;
+                                        if let Some(job) = message.outgoing_job.as_mut() {
+                                            job.error = crate::outgoing::failure_message(&error);
+                                        }
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("G\u1eedi tin nh\u1eafn tho\u1ea1i th\u1ea5t b\u1ea1i: {error}")));
+                                    }
+                                }
+                                persist_outgoing(&s, &to_id, &message).await;
+                                drop(active);
+                                let _ = events.send(GuiEvent::OutgoingState {
+                                    owner,
+                                    thread_id: to_id,
+                                    message,
+                                });
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::PickAndSendAttachment {to_id,is_group,images_only,caption,preset_path,photo_original} => {
                             let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();

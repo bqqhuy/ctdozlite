@@ -1121,6 +1121,28 @@ impl ZaloGuiApp {
             .show(ui, |ui| {
                 ui.set_height(248.0);
 
+                // 0. Quick Vietnamese Keyword Search Bar
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("🔍").size(13.0).color(pal.text_secondary));
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.sticker_search_query)
+                            .hint_text(crate::i18n::tr("Tìm sticker tiếng Việt (xin chào, cảm ơn, haha, ok, buồn, khóc, yêu, nhớ…)"))
+                            .desired_width(ui.available_width() - 85.0),
+                    );
+                    if resp.changed() {
+                        if self.sticker_tab != StickerTab::Search && !self.sticker_search_query.trim().is_empty() {
+                            self.sticker_tab = StickerTab::Search;
+                        }
+                        self.last_sticker_search_edit_at = std::time::Instant::now();
+                    }
+                    if !self.sticker_search_query.is_empty() && ui.small_button(crate::i18n::tr("Xóa")).clicked() {
+                        self.sticker_search_query.clear();
+                        self.sticker_tab = StickerTab::Popular;
+                    }
+                });
+
+                ui.add_space(3.0);
+
                 // 1. Top Pack & Store Navigation Bar
                 ui.horizontal(|ui| {
                     let store_count_lbl = if !self.sticker_store_packs.is_empty() {
