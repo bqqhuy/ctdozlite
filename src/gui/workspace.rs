@@ -2614,10 +2614,10 @@ impl ZaloGuiApp {
                                                     } else {
                                                         let raw = msg.wire_ref.sender.as_ref();
                                                         if let Some(uid) = raw.and_then(|v| v.as_str()) {
-                                                            self.sender_avatar_for(uid)
+                                                            sender_avatar_for(&self.threads, uid)
                                                         } else if let Some(n) = raw.and_then(|v| v.as_u64()) {
                                                             let num_s = n.to_string();
-                                                            self.sender_avatar_for(&num_s)
+                                                            sender_avatar_for(&self.threads, &num_s)
                                                         } else {
                                                             None
                                                         }
@@ -4260,16 +4260,21 @@ impl ZaloGuiApp {
     }
 }
 
+/// Lookup avatar for a direct contact without allocating a map each frame.
+fn sender_avatar_for<'a>(threads: &'a [Thread], sender_id: &str) -> Option<&'a str> {
+    if sender_id.is_empty() {
+        return None;
+    }
+    threads
+        .iter()
+        .find(|t| !t.is_group && (t.id == sender_id || t.presentation.global_id == sender_id))
+        .and_then(|t| t.avatar.as_deref())
+}
+
 impl ZaloGuiApp {
     /// Lookup avatar for a direct contact without allocating a map each frame.
     pub(super) fn sender_avatar_for(&self, sender_id: &str) -> Option<&str> {
-        if sender_id.is_empty() {
-            return None;
-        }
-        self.threads
-            .iter()
-            .find(|t| !t.is_group && (t.id == sender_id || t.presentation.global_id == sender_id))
-            .and_then(|t| t.avatar.as_deref())
+        sender_avatar_for(&self.threads, sender_id)
     }
 
     /// "Thành viên nhóm" section of the info drawer: count, search, roles.
