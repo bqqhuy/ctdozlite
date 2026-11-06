@@ -480,6 +480,15 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    BatchRecallCompleted {
+        thread_id: String,
+        recalled_ids: Vec<String>,
+        count: usize,
+    },
+    BatchForwardCompleted {
+        target_id: String,
+        count: usize,
+    },
     LoggedOut,
     DownloadFolderPicked(Option<Result<std::path::PathBuf, String>>),
     DownloadFolderFailed(String),
@@ -848,6 +857,12 @@ pub struct ZaloGuiApp {
     last_sync_was_history: bool,
     settings_modal_open: bool,
     download_picker_pending: bool,
+    batch_selection_mode: bool,
+    selected_msg_ids: HashSet<String>,
+    send_contact_modal_open: bool,
+    send_contact_query: String,
+    batch_forward_modal_open: bool,
+    batch_forward_target_id: Option<String>,
     settings_tab: SettingsTab,
     settings: AppSettings,
 
@@ -1119,6 +1134,12 @@ impl ZaloGuiApp {
             last_sync_was_history: true,
             settings_modal_open: false,
             download_picker_pending: false,
+            batch_selection_mode: false,
+            selected_msg_ids: HashSet::new(),
+            send_contact_modal_open: false,
+            send_contact_query: String::new(),
+            batch_forward_modal_open: false,
+            batch_forward_target_id: None,
             settings_tab: SettingsTab::General,
             tools: tools_panel::ToolsPanel::default(),
             history_search: Default::default(),
@@ -4341,6 +4362,27 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
+                }
+                GuiEvent::BatchRecallCompleted {
+                    thread_id,
+                    recalled_ids,
+                    count,
+                } => {
+                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                        for m in &mut t.messages {
+                            if recalled_ids.contains(&m.id) {
+                                m.mark_recalled();
+                            }
+                        }
+                    }
+                    self.batch_selection_mode = false;
+                    self.selected_msg_ids.clear();
+                    self.status_msg = format!("Đã thu hồi {count} tin nhắn cho mọi người");
+                }
+                GuiEvent::BatchForwardCompleted { target_id: _, count } => {
+                    self.batch_selection_mode = false;
+                    self.selected_msg_ids.clear();
+                    self.status_msg = format!("Đã chuyển tiếp {count} tin nhắn");
                 }
             }
         }

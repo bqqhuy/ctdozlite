@@ -801,6 +801,10 @@ pub(super) fn render_message_body(
         return None;
     }
 
+    if msg.kind == crate::message_model::MessageKind::Contact || msg.contact_id.is_some() {
+        return render_contact_card_widget(ui, msg, pal, outgoing, max_text_width);
+    }
+
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
         let mentions =
             crate::rich_text::mention_styles(msg.wire_ref.fields.get("mentions"), &msg.text);
@@ -1514,6 +1518,9 @@ pub(super) enum BubbleAction {
         sender: String,
         time: String,
     },
+    EnterSelectionMode,
+    OpenContactConversation(String),
+    ViewContact(String),
 }
 
 /// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.
@@ -1699,7 +1706,83 @@ pub(super) fn bubble_context_menu(
             action = Some(BubbleAction::DeleteForMe);
             ui.close_menu();
         }
+        ui.separator();
+        if ui
+            .button(crate::i18n::tr("Chọn nhiều tin"))
+            .clicked()
+        {
+            action = Some(BubbleAction::EnterSelectionMode);
+            ui.close_menu();
+        }
     });
+    action
+}
+
+pub(super) fn render_contact_card_widget(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let mut action = None;
+    let card_w = max_text_width.min(280.0).max(200.0);
+    let (text_col, meta_col) = if outgoing {
+        (pal.bubble_out_text, pal.bubble_out_meta)
+    } else {
+        (pal.bubble_in_text, pal.bubble_in_meta)
+    };
+
+    let name = msg.contact_name.as_deref().unwrap_or("Liên hệ");
+    let phone = msg.contact_phone.as_deref().unwrap_or("");
+    let contact_id = msg.contact_id.as_deref().unwrap_or("");
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(card_w, 0.0),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.set_width(card_w);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📇 Danh thiếp").size(12.0).color(meta_col));
+            });
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+                let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                ui.painter().circle_filled(rect.center(), 20.0, pal.primary_hover);
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    initial,
+                    FontId::proportional(18.0),
+                    Color32::WHITE,
+                );
+
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(name).strong().size(14.5).color(text_col));
+                    if !phone.is_empty() {
+                        ui.label(RichText::new(phone).size(12.0).color(meta_col));
+                    }
+                });
+            });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(4.0);
+
+            ui.horizontal(|ui| {
+                if !contact_id.is_empty() {
+                    if ui.button(crate::i18n::tr("Nhắn tin")).clicked() {
+                        action = Some(BubbleAction::OpenContactConversation(contact_id.to_string()));
+                    }
+                    if ui.button(crate::i18n::tr("Thông tin")).clicked() {
+                        action = Some(BubbleAction::ViewContact(contact_id.to_string()));
+                    }
+                }
+            });
+        },
+    );
     action
 }
 

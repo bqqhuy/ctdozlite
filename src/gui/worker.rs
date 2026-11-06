@@ -284,6 +284,24 @@ pub enum WorkerCmd {
         is_group: bool,
         msg: ChatMessage,
     },
+    SendContactCard {
+        to_id: String,
+        is_group: bool,
+        contact_id: String,
+        contact_name: String,
+        phone: String,
+        avatar: String,
+    },
+    BatchRecall {
+        to_id: String,
+        is_group: bool,
+        messages: Vec<ChatMessage>,
+    },
+    BatchForward {
+        to_id: String,
+        is_group: bool,
+        messages: Vec<ChatMessage>,
+    },
     SendSticker {
         to_id: String,
         sticker_id: u64,
@@ -2413,6 +2431,111 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         )));
                                     }
                                 }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SendContactCard {
+                            to_id,
+                            is_group,
+                            contact_id,
+                            contact_name,
+                            phone,
+                            avatar,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let client_id = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as u64)
+                                    .unwrap_or(0);
+                                match crate::chat::send_contact_card(&s, &to_id, is_group, &contact_id, &contact_name, &phone, &avatar, client_id).await {
+                                    Ok(_) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Đã gửi danh thiếp: {contact_name}")));
+                                    }
+                                    Err(e) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Gửi danh thiếp thất bại: {e}")));
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::BatchRecall {
+                            to_id,
+                            is_group,
+                            messages,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let mut targets = Vec::new();
+                                let mut recalled_ids = Vec::new();
+                                for msg in &messages {
+                                    let cli_id = crate::chat::client_message_id(msg).unwrap_or(0);
+                                    let srv_id = crate::chat::server_message_id(msg).unwrap_or_default();
+                                    if !srv_id.is_empty() {
+                                        targets.push(crate::chat::UndoTargetItem {
+                                            cli_msg_id: std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_millis() as u64)
+                                                .unwrap_or(0),
+                                            cli_msg_id_undo: cli_id.to_string(),
+                                            global_msg_id: srv_id,
+                                        });
+                                        recalled_ids.push(msg.id.clone());
+                                    }
+                                }
+                                if !targets.is_empty() {
+                                    match crate::chat::multi_undo_messages(&s, &to_id, is_group, &targets).await {
+                                        Ok(_) => {
+                                            for msg in &messages {
+                                                let mut r = msg.clone();
+                                                r.mark_recalled();
+                                                persist_outgoing(&s, &to_id, &r).await;
+                                            }
+                                            let count = targets.len();
+                                            let _ = gui_tx_clone.send(GuiEvent::BatchRecallCompleted {
+                                                thread_id: to_id,
+                                                recalled_ids,
+                                                count,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Thu hồi hàng loạt thất bại: {e}")));
+                                        }
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::BatchForward {
+                            to_id,
+                            is_group,
+                            messages,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = session_clone.lock().await.clone();
+                                let mut count = 0;
+                                for msg in messages {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as u64)
+                                        .unwrap_or(0);
+                                    if crate::chat::forward_message_with_client_id(&s, &to_id, is_group, &msg, now).await.is_ok() {
+                                        count += 1;
+                                    }
+                                }
+                                let _ = gui_tx_clone.send(GuiEvent::BatchForwardCompleted {
+                                    target_id: to_id,
+                                    count,
+                                });
                                 ctx_clone.request_repaint();
                             });
                         }

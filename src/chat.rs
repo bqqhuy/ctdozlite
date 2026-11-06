@@ -74,6 +74,14 @@ pub struct ChatMessage {
     pub history_source: Option<Value>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub resolved_mention_uids: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_avatar: Option<String>,
 }
 
 impl ChatMessage {
@@ -4292,6 +4300,131 @@ pub async fn recall_message(
     }
 }
 
+/// Send a contact card to a 1-1 conversation or group (`/api/message/contact` cmd 11774 or `/api/group/contact` cmd 11827).
+pub async fn send_contact_card(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    contact_id: &str,
+    contact_name: &str,
+    phone: &str,
+    avatar: &str,
+    client_id: u64,
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    if is_group {
+        let clean_grid = to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G');
+        let body = obj(&[
+            ("grid", json!(clean_grid)),
+            ("clientId", json!(client_id)),
+            ("contactId", json!(contact_id)),
+            ("contactName", json!(contact_name)),
+            ("phone", json!(phone)),
+            ("avatar", json!(avatar)),
+            ("visibility", json!(0)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{}/api/group/contact?{}", s.domains.group, s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    } else {
+        let host = if s.domains.chat.contains("-msg-chat.")
+            || s.domains.chat.contains("tt-chat2-wpa")
+            || s.domains.chat.is_empty()
+        {
+            "https://tt-chat3-wpa.api.zaloapp.com"
+        } else {
+            &s.domains.chat
+        };
+        let body = obj(&[
+            ("toId", json!(to_id)),
+            ("clientId", json!(client_id)),
+            ("contactId", json!(contact_id)),
+            ("contactName", json!(contact_name)),
+            ("phone", json!(phone)),
+            ("avatar", json!(avatar)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{host}/api/message/contact?{}", s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    }
+}
+
+/// Target descriptor for multi-undo batch request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UndoTargetItem {
+    pub cli_msg_id: u64,
+    pub cli_msg_id_undo: String,
+    pub global_msg_id: String,
+}
+
+/// Batch recall / multi-undo messages for everyone (`undoMultiMessage` cmd 12115 / 12116).
+pub async fn multi_undo_messages(
+    s: &Session,
+    to_id: &str,
+    is_group: bool,
+    targets: &[UndoTargetItem],
+) -> Result<Value> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    if targets.is_empty() {
+        return Ok(json!({"error_code": 0}));
+    }
+    let msgs: Vec<Value> = targets
+        .iter()
+        .map(|t| {
+            json!({
+                "cliMsgId": t.cli_msg_id,
+                "cliMsgIdUndo": t.cli_msg_id_undo,
+                "globalMsgId": t.global_msg_id,
+            })
+        })
+        .collect();
+
+    if is_group {
+        let clean_grid = to_id
+            .trim_start_matches("group_")
+            .trim_start_matches('g')
+            .trim_start_matches('G');
+        let body = obj(&[
+            ("grid", json!(clean_grid)),
+            ("msgs", json!(msgs)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{}/api/group/multi_undomsg?{}", s.domains.group, s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    } else {
+        let host = if s.domains.chat.contains("-msg-chat.")
+            || s.domains.chat.contains("tt-chat2-wpa")
+            || s.domains.chat.is_empty()
+        {
+            "https://tt-chat3-wpa.api.zaloapp.com"
+        } else {
+            &s.domains.chat
+        };
+        let body = obj(&[
+            ("toid", json!(to_id)),
+            ("msgs", json!(msgs)),
+            ("imei", json!(s.imei)),
+        ]);
+        let params = s.encoded_params(&body)?;
+        let url = format!("{host}/api/message/multi_undo?{}", s.common_params());
+        let resp = s.post_form(&url, format!("params={params}")).await?;
+        confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    }
+}
+
 /// `GET /api/preloadconvers/get-last-msgs` (cmd 10053).
 ///
 /// [O] request: GET `{convers_api}/api/preloadconvers/get-last-msgs?{common}&params={encodeAES(json)}`
@@ -5521,6 +5654,55 @@ fn extract_link_info(v: &Value) -> LinkInfo {
         _ => (None, None, None, None, None),
     }
 }
+
+type ContactInfo = (Option<String>, Option<String>, Option<String>, Option<String>);
+
+fn extract_contact_info(v: &Value) -> ContactInfo {
+    match v {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.starts_with('{') && trimmed.ends_with('}') {
+                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                    return extract_contact_info(&parsed);
+                }
+            }
+            (None, None, None, None)
+        }
+        Value::Object(o) => {
+            let id = o
+                .get("contactId")
+                .or_else(|| o.get("userId"))
+                .or_else(|| o.get("contactUid"))
+                .or_else(|| o.get("uid"))
+                .and_then(|val| match val {
+                    Value::String(s) => Some(s.clone()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                });
+            let name = o
+                .get("contactName")
+                .or_else(|| o.get("name"))
+                .or_else(|| o.get("displayName"))
+                .or_else(|| o.get("dName"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let phone = o
+                .get("phone")
+                .or_else(|| o.get("phoneNumber"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let avatar = o
+                .get("avatar")
+                .or_else(|| o.get("thumb"))
+                .or_else(|| o.get("avatarUrl"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (id, name, phone, avatar)
+        }
+        _ => (None, None, None, None),
+    }
+}
+
 pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
@@ -5542,10 +5724,20 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let (link_url, link_title, link_desc, link_thumb, link_src) = raw_content_val
         .map(extract_link_info)
         .unwrap_or((None, None, None, None, None));
+    let (contact_id, contact_name, contact_phone, contact_avatar) = raw_content_val
+        .map(extract_contact_info)
+        .unwrap_or((None, None, None, None));
 
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
+    if (msg_type == "chat.contact" || msg_type == "contact") && (content.is_empty() || content.starts_with('{')) {
+        if let Some(ref name) = contact_name {
+            content = format!("[Danh thiếp] {name}");
+        } else {
+            content = "[Danh thiếp]".to_string();
+        }
+    }
     // Styles index the original text; generated labels below never carry styles.
     let content_for_styles = content.clone();
     let is_undo_type = matches!(msg_type.as_str(), "chat.undo" | "undo" | "31");
@@ -5725,6 +5917,10 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
         link_thumb,
         link_src,
         text_styles,
+        contact_id,
+        contact_name,
+        contact_phone,
+        contact_avatar,
         ..Default::default()
     };
     message.hydrate_media_metadata();
@@ -7924,5 +8120,71 @@ mod volatile_group_policy_tests {
         )
         .unwrap();
         assert!(legacy.send_policy.is_none());
+    }
+}
+
+#[cfg(test)]
+mod contact_and_batch_tests {
+    use super::*;
+
+    #[test]
+    fn parse_chat_contact_message() {
+        let wire = json!({
+            "msgId": "12345",
+            "cliMsgId": "67890",
+            "msgType": "chat.contact",
+            "content": {
+                "contactId": "987654321",
+                "contactName": "Nguyễn Văn A",
+                "phone": "0912345678",
+                "avatar": "https://example.invalid/avatar.png"
+            },
+            "uidFrom": "111222333",
+            "ts": 1700000000000_i64,
+        });
+        let msg = parse_chat_message(&wire).expect("should parse contact message");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::Contact);
+        assert_eq!(msg.contact_id.as_deref(), Some("987654321"));
+        assert_eq!(msg.contact_name.as_deref(), Some("Nguyễn Văn A"));
+        assert_eq!(msg.contact_phone.as_deref(), Some("0912345678"));
+        assert_eq!(msg.contact_avatar.as_deref(), Some("https://example.invalid/avatar.png"));
+        assert_eq!(msg.text, "[Danh thiếp] Nguyễn Văn A");
+    }
+
+    #[test]
+    fn parse_contact_json_string_content() {
+        let wire = json!({
+            "msgId": "22222",
+            "cliMsgId": "33333",
+            "msgType": "contact",
+            "content": "{\"userId\":\"55555\",\"name\":\"Trần Thị B\"}",
+            "uidFrom": "111222333",
+            "ts": 1700000001000_i64,
+        });
+        let msg = parse_chat_message(&wire).expect("should parse string-encoded contact");
+        assert_eq!(msg.kind, crate::message_model::MessageKind::Contact);
+        assert_eq!(msg.contact_id.as_deref(), Some("55555"));
+        assert_eq!(msg.contact_name.as_deref(), Some("Trần Thị B"));
+        assert_eq!(msg.text, "[Danh thiếp] Trần Thị B");
+    }
+
+    #[test]
+    fn contact_serialization_roundtrip() {
+        let msg = ChatMessage {
+            id: "msg_1".into(),
+            kind: crate::message_model::MessageKind::Contact,
+            contact_id: Some("user_99".into()),
+            contact_name: Some("Lê Văn C".into()),
+            contact_phone: Some("0988776655".into()),
+            contact_avatar: Some("https://img.zalo.me/ava.jpg".into()),
+            text: "[Danh thiếp] Lê Văn C".into(),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&msg).expect("serialization");
+        let deserialized: ChatMessage = serde_json::from_str(&serialized).expect("deserialization");
+        assert_eq!(deserialized.contact_id.as_deref(), Some("user_99"));
+        assert_eq!(deserialized.contact_name.as_deref(), Some("Lê Văn C"));
+        assert_eq!(deserialized.contact_phone.as_deref(), Some("0988776655"));
+        assert_eq!(deserialized.contact_avatar.as_deref(), Some("https://img.zalo.me/ava.jpg"));
     }
 }

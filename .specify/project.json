@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "default_feature": "specs/008-account-group-state",
-  "release_scope": "docs/releases/v0.008-arm-plan.md",
+  "default_feature": "specs/009-rich-media-messaging",
+  "release_scope": "docs/releases/v0.009-arm-plan.md",
   "features": [
     "specs/001-group-governance",
     "specs/002-message-media-lifecycle",
@@ -10,7 +10,8 @@
     "specs/005-ui-customization",
     "specs/006-stranger-inbox",
     "specs/007-call-multidevice",
-    "specs/008-account-group-state"
+    "specs/008-account-group-state",
+    "specs/009-rich-media-messaging"
   ],
   "roadmap": "docs/ROADMAP_ZALO_PARITY.md"
 }

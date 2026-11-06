@@ -2618,6 +2618,16 @@ impl ZaloGuiApp {
                                                             None
                                                         }
                                                     };
+                                                    if self.batch_selection_mode && !msg.id.is_empty() {
+                                                        let mut sel = self.selected_msg_ids.contains(&msg.id);
+                                                        if ui.checkbox(&mut sel, "").changed() {
+                                                            if sel {
+                                                                self.selected_msg_ids.insert(msg.id.clone());
+                                                            } else {
+                                                                self.selected_msg_ids.remove(&msg.id);
+                                                            }
+                                                        }
+                                                    }
                                                     if let Some(action) = render_chat_bubble(
                                                         ui,
                                                         msg,
@@ -2682,6 +2692,52 @@ impl ZaloGuiApp {
                     self.chat_anchor=if away_from_bottom {
                         if restore&&anchor_delta.is_some(){previous_anchor}else{next_anchor.map(|(id,offset)|(thread_id.clone(),id,offset))}
                     }else{None};
+                    if self.batch_selection_mode {
+                        egui::Area::new(Id::new(("batch_action_bar", &thread_id)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(message_scroll.inner_rect.left_bottom() + Vec2::new(16.0, -44.0))
+                            .show(ctx, |ui| {
+                                egui::Frame::none()
+                                    .fill(pal.bg_elevated)
+                                    .stroke(Stroke::new(1.0, pal.border))
+                                    .rounding(Rounding::same(8.0))
+                                    .inner_margin(Margin::symmetric(12.0, 6.0))
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(format!("Đã chọn: {} tin", self.selected_msg_ids.len())).strong().color(pal.text_primary));
+                                            ui.separator();
+                                            let can_act = !self.selected_msg_ids.is_empty();
+                                            if ui.add_enabled(can_act, egui::Button::new(crate::i18n::tr("Chuyển tiếp"))).clicked() {
+                                                self.batch_forward_modal_open = true;
+                                            }
+                                            let all_outgoing = if let Some(t) = self.threads.get(self.selected_thread_index) {
+                                                t.messages.iter()
+                                                    .filter(|m| self.selected_msg_ids.contains(&m.id))
+                                                    .all(|m| m.is_outgoing && m.text.trim() != "[Tin nhắn đã thu hồi]")
+                                            } else { false };
+                                            if ui.add_enabled(can_act && all_outgoing, egui::Button::new(crate::i18n::tr("Thu hồi cho mọi người"))).clicked() {
+                                                if let Some(tx) = WORKER_TX.get() {
+                                                    if let Some(t) = self.threads.get(self.selected_thread_index) {
+                                                        let to_recall: Vec<ChatMessage> = t.messages.iter()
+                                                            .filter(|m| self.selected_msg_ids.contains(&m.id))
+                                                            .cloned()
+                                                            .collect();
+                                                        let _ = tx.send(WorkerCmd::BatchRecall {
+                                                            to_id: thread_id.clone(),
+                                                            is_group,
+                                                            messages: to_recall,
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                            if ui.button(crate::i18n::tr("Hủy")).clicked() {
+                                                self.batch_selection_mode = false;
+                                                self.selected_msg_ids.clear();
+                                            }
+                                        });
+                                    });
+                            });
+                    }
                     if away_from_bottom {
                         egui::Area::new(Id::new(("newest_button", &thread_id)))
                             .order(egui::Order::Foreground)
@@ -2895,6 +2951,21 @@ impl ZaloGuiApp {
                                             msg: m,
                                         });
                                     }
+                                }
+                                BubbleAction::EnterSelectionMode => {
+                                    self.batch_selection_mode = true;
+                                    self.selected_msg_ids.clear();
+                                    self.selected_msg_ids.insert(m.id.clone());
+                                }
+                                BubbleAction::OpenContactConversation(uid) => {
+                                    if let Some(idx) = self.threads.iter().position(|t| t.id == uid) {
+                                        self.selected_thread_index = idx;
+                                    } else {
+                                        self.open_contact_panel(uid);
+                                    }
+                                }
+                                BubbleAction::ViewContact(uid) => {
+                                    self.open_contact_panel(uid);
                                 }
                                 BubbleAction::OpenImagePopup {
                                     tex_key,
@@ -3450,6 +3521,11 @@ impl ZaloGuiApp {
 
                                         send_resp.context_menu(|ui|{
                                             if ui.button(crate::i18n::tr("Nhãn dán…")).clicked(){self.sticker_picker_open = !self.sticker_picker_open;ui.close_menu();}
+                                            if ui.button(crate::i18n::tr("Gửi danh thiếp…")).clicked() {
+                                                self.send_contact_modal_open = true;
+                                                self.send_contact_query.clear();
+                                                ui.close_menu();
+                                            }
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
                                                     if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
@@ -3668,6 +3744,127 @@ impl ZaloGuiApp {
         self.render_group_content(ctx);
         self.render_downloads(ctx);
         self.render_quick_schedule(ctx, pal);
+        self.render_send_contact_modal(ctx, pal);
+        self.render_batch_forward_modal(ctx, pal);
+    }
+
+    fn render_send_contact_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.send_contact_modal_open {
+            return;
+        }
+        let mut open = self.send_contact_modal_open;
+        let mut chosen_contact = None;
+        egui::Window::new("Gửi danh thiếp")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("🔍");
+                    ui.text_edit_singleline(&mut self.send_contact_query);
+                });
+                ui.separator();
+                let query = self.send_contact_query.trim().to_lowercase();
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for t in &self.threads {
+                        if t.is_group || t.id.starts_with("group_") || t.id == self.user_uin {
+                            continue;
+                        }
+                        if !query.is_empty() && !t.name.to_lowercase().contains(&query) {
+                            continue;
+                        }
+                        ui.horizontal(|ui| {
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            let initial = t.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                            ui.painter().circle_filled(rect.center(), 14.0, pal.primary_hover);
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                initial,
+                                FontId::proportional(13.0),
+                                Color32::WHITE,
+                            );
+                            if ui.button(&t.name).clicked() {
+                                chosen_contact = Some((t.id.clone(), t.name.clone(), t.avatar.clone().unwrap_or_default()));
+                            }
+                        });
+                        ui.add_space(2.0);
+                    }
+                });
+                ui.separator();
+                if ui.button("Đóng").clicked() {
+                    open = false;
+                }
+            });
+        self.send_contact_modal_open = open;
+        if let Some((cid, cname, cava)) = chosen_contact {
+            self.send_contact_modal_open = false;
+            if let Some(t) = self.threads.get(self.selected_thread_index) {
+                let to_id = t.id.clone();
+                let is_group = t.is_group;
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::SendContactCard {
+                        to_id,
+                        is_group,
+                        contact_id: cid,
+                        contact_name: cname,
+                        phone: String::new(),
+                        avatar: cava,
+                    });
+                }
+            }
+        }
+    }
+
+    fn render_batch_forward_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.batch_forward_modal_open {
+            return;
+        }
+        let mut open = self.batch_forward_modal_open;
+        let mut chosen_target = None;
+        egui::Window::new("Chuyển tiếp tin nhắn")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(format!("Chuyển tiếp {} tin nhắn đã chọn đến:", self.selected_msg_ids.len())).color(pal.text_primary));
+                ui.separator();
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for t in &self.threads {
+                        if ui.button(&t.name).clicked() {
+                            chosen_target = Some((t.id.clone(), t.is_group));
+                        }
+                        ui.add_space(2.0);
+                    }
+                });
+                ui.separator();
+                if ui.button("Hủy").clicked() {
+                    open = false;
+                }
+            });
+        self.batch_forward_modal_open = open;
+        if let Some((target_id, is_group)) = chosen_target {
+            self.batch_forward_modal_open = false;
+            if let Some(t) = self.threads.get(self.selected_thread_index) {
+                let selected: Vec<ChatMessage> = t.messages.iter()
+                    .filter(|m| self.selected_msg_ids.contains(&m.id))
+                    .cloned()
+                    .collect();
+                if !selected.is_empty() {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::BatchForward {
+                            to_id: target_id,
+                            is_group,
+                            messages: selected,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
