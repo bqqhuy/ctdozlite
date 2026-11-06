@@ -7,6 +7,8 @@
 - [x] Test serialization roundtrip của `ChatMessage` có contact metadata (`contact_and_batch_tests::contact_serialization_roundtrip`).
 - [x] Test tạo request batch cho `multi_undo_messages` với descriptor `{ cliMsgId, cliMsgIdUndo, globalMsgId }`.
 - [x] Test tính toán zoom, pan offset, duyệt gallery trong Media Viewer (`ImageViewerModal`).
+- [x] Test RIFF WAV 44-byte header generation, RMS computation, và tỷ lệ resample 16kHz (`src/voice.rs::tests`).
+- [x] Test tìm kiếm từ khóa sticker tiếng Việt và chuyển đổi tab Search (`src/gui/stickers.rs`).
 
 ## 2. Tiêu chí kiểm thử trên thiết bị thật (Windows 11 ARM64 Native)
 - [ ] Gửi danh thiếp tới tài khoản Zalo PC / Mobile thật: kiểm tra hiển thị đúng tên, avatar, số điện thoại.
