@@ -3619,6 +3619,16 @@ impl ZaloGuiApp {
                                                 self.send_contact_query.clear();
                                                 ui.close_menu();
                                             }
+                                            if ui.button(crate::i18n::tr("Tin nhắn nhanh…")).clicked() {
+                                                self.tools.open = true;
+                                                self.tools.tab = 6;
+                                                ui.close_menu();
+                                            }
+                                            if ui.button(crate::i18n::tr("Giao việc & Bình chọn…")).clicked() {
+                                                self.tools.open = true;
+                                                self.tools.tab = 5;
+                                                ui.close_menu();
+                                            }
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
                                                     if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
@@ -3689,6 +3699,11 @@ impl ZaloGuiApp {
                                                 }
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
+                                            if self.input_message.starts_with('/') {
+                                                if let Some(expanded) = self.tools.quick_messages.expand(&self.input_message) {
+                                                    self.input_message = expanded.to_string();
+                                                }
+                                            }
                                             self.composer_mentions.edit(&self.input_message);
                                             let draft = self.composer_mentions.trimmed();
                                             let text = draft.text.clone();

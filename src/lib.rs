@@ -24,6 +24,10 @@ pub mod ui;
 pub mod video;
 pub mod voip_log;
 pub mod voice;
+pub mod todo;
+pub mod poll;
+pub mod quick_message;
+pub mod device;
 
 #[cfg(windows)]
 mod windows_video;

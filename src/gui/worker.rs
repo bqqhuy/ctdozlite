@@ -374,6 +374,9 @@ pub enum WorkerCmd {
         enable: bool,
         is_group: bool,
     },
+    KickDevice {
+        device_id: String,
+    },
     EndCall {
         call_id: Option<i64>,
     },
@@ -2840,6 +2843,23 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             call_bridge.end_call_for(call_id);
 
                             egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::KickDevice { device_id } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::device::kick_remote_device(&s, &device_id).await {
+                                    Ok(_) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate("Đã đăng xuất thiết bị từ xa".into()));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi đăng xuất thiết bị: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::CheckFriendStatus { user_id } => {
                             let session_clone = session.clone();

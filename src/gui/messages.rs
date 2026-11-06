@@ -809,6 +809,14 @@ pub(super) fn render_message_body(
         return render_voice_message_widget(ui, msg, pal, outgoing, max_text_width);
     }
 
+    if msg.text.starts_with("[Giao việc]") || msg.text.starts_with("[Nhắc việc]") {
+        return render_todo_widget(ui, msg, pal, outgoing, max_text_width);
+    }
+
+    if msg.text.starts_with("[Bình chọn]") || msg.text.starts_with("[Bình chọn mới]") {
+        return render_poll_widget(ui, msg, pal, outgoing, max_text_width);
+    }
+
     let Some((caption, url, domain)) = extract_message_link_view(msg) else {
         let mentions =
             crate::rich_text::mention_styles(msg.wire_ref.fields.get("mentions"), &msg.text);
@@ -1772,6 +1780,74 @@ pub(super) fn render_voice_message_widget(
                 "0:05"
             };
             ui.label(RichText::new(dur_label).size(12.0).color(meta_col));
+        },
+    );
+    None
+}
+
+pub(super) fn render_todo_widget(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let card_w = max_text_width.min(280.0).max(200.0);
+    let (text_col, meta_col) = if outgoing {
+        (pal.bubble_out_text, pal.bubble_out_meta)
+    } else {
+        (pal.bubble_in_text, pal.bubble_in_meta)
+    };
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(card_w, 64.0),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📋 Giao việc").color(pal.primary).strong().size(13.0));
+            });
+            let task_text = msg.text.strip_prefix("[Giao việc]")
+                .or_else(|| msg.text.strip_prefix("[Nhắc việc]"))
+                .unwrap_or(&msg.text)
+                .trim();
+            ui.label(RichText::new(task_text).color(text_col).size(13.5));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⏳ Trạng thái: Đang thực hiện").color(meta_col).size(11.5));
+            });
+        },
+    );
+    None
+}
+
+pub(super) fn render_poll_widget(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    pal: &ThemePalette,
+    outgoing: bool,
+    max_text_width: f32,
+) -> Option<BubbleAction> {
+    let card_w = max_text_width.min(280.0).max(200.0);
+    let (text_col, meta_col) = if outgoing {
+        (pal.bubble_out_text, pal.bubble_out_meta)
+    } else {
+        (pal.bubble_in_text, pal.bubble_in_meta)
+    };
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(card_w, 72.0),
+        Layout::top_down(Align::Min),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("📊 Bình chọn nhóm").color(pal.primary).strong().size(13.0));
+            });
+            let question = msg.text.strip_prefix("[Bình chọn]")
+                .or_else(|| msg.text.strip_prefix("[Bình chọn mới]"))
+                .unwrap_or(&msg.text)
+                .trim();
+            ui.label(RichText::new(question).color(text_col).strong().size(13.5));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Bấm để xem và bình chọn").color(meta_col).size(11.5));
+            });
         },
     );
     None

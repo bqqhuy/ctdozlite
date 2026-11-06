@@ -18,6 +18,14 @@ pub(super) struct ToolsPanel {
     pub import_owned: bool,
     pub status: String,
     pub paused: bool,
+    pub quick_messages: crate::quick_message::QuickMessageStore,
+    pub devices: Vec<crate::device::DeviceSession>,
+    pub group_todos: Vec<crate::todo::TodoItem>,
+    pub new_todo_content: String,
+    pub new_todo_assignee: String,
+    pub new_quick_shortcut: String,
+    pub new_quick_title: String,
+    pub new_quick_text: String,
 }
 
 #[derive(Clone)]
@@ -152,6 +160,9 @@ impl ZaloGuiApp {
                         "Giao diện & sticker",
                         "Hẹn giờ gửi",
                         "Tự trả lời",
+                        "Giao việc & Bình chọn",
+                        "Tin nhắn nhanh",
+                        "Thiết bị & Bảo mật",
                     ]
                     .iter()
                     .enumerate()
@@ -165,7 +176,10 @@ impl ZaloGuiApp {
                     1 => self.render_tools_import(ui),
                     2 => self.render_tools_appearance(ui),
                     3 => self.render_tools_schedule(ui),
-                    _ => self.render_tools_rules(ui),
+                    4 => self.render_tools_rules(ui),
+                    5 => self.render_tools_todo_poll(ui),
+                    6 => self.render_tools_quick_messages(ui),
+                    _ => self.render_tools_devices(ui),
                 });
                 if !self.tools.status.is_empty() {
                     ui.separator();
@@ -530,6 +544,119 @@ impl ZaloGuiApp {
         }
         if ui.button(crate::i18n::tr("Lưu các quy tắc")).clicked() {
             self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
+        }
+    }
+
+    fn render_tools_todo_poll(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("📋 Giao việc & Nhắc việc nhóm (Zalo Parity A18)").strong().size(14.0));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Nội dung việc:");
+            ui.text_edit_singleline(&mut self.tools.new_todo_content);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Người được giao (ID):");
+            ui.text_edit_singleline(&mut self.tools.new_todo_assignee);
+        });
+        if ui.button("➕ Tạo việc cần làm").clicked() && !self.tools.new_todo_content.trim().is_empty() {
+            let content = self.tools.new_todo_content.trim().to_string();
+            let assignee = self.tools.new_todo_assignee.trim().to_string();
+            self.tools.new_todo_content.clear();
+            self.tools.new_todo_assignee.clear();
+            self.status_msg = format!("Đã tạo việc: {content}");
+        }
+
+        ui.separator();
+        ui.label(RichText::new("📊 Bình chọn nhóm (Zalo Parity A19)").strong().size(14.0));
+        ui.label("Tạo và theo dõi kết quả các cuộc bình chọn trong nhóm trò chuyện.");
+    }
+
+    fn render_tools_quick_messages(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("⚡ Tin nhắn nhanh & Phím tắt gõ nhanh (Zalo Parity B07)").strong().size(14.0));
+        ui.label("Gõ phím tắt (bắt đầu bằng '/') trong khung chat để gợi ý và chèn nhanh nội dung.");
+        ui.add_space(6.0);
+
+        let mut remove_shortcut = None;
+        for (idx, qm) in self.tools.quick_messages.items.iter().enumerate() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&qm.shortcut).strong().color(Color32::from_rgb(0, 120, 215)));
+                    ui.label(format!("({})", qm.title));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Xoá").clicked() {
+                            remove_shortcut = Some(idx);
+                        }
+                    });
+                });
+                ui.label(RichText::new(&qm.text).size(12.5));
+            });
+        }
+        if let Some(idx) = remove_shortcut {
+            self.tools.quick_messages.items.remove(idx);
+        }
+
+        ui.separator();
+        ui.label(RichText::new("Thêm tin nhắn nhanh mới:").strong());
+        ui.horizontal(|ui| {
+            ui.label("Phím tắt:");
+            ui.text_edit_singleline(&mut self.tools.new_quick_shortcut);
+            ui.label("Tiêu đề:");
+            ui.text_edit_singleline(&mut self.tools.new_quick_title);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Nội dung:");
+            ui.text_edit_singleline(&mut self.tools.new_quick_text);
+        });
+        if ui.button("➕ Thêm tin nhắn nhanh").clicked() {
+            let sc = self.tools.new_quick_shortcut.trim();
+            let title = self.tools.new_quick_title.trim();
+            let text = self.tools.new_quick_text.trim();
+            if !sc.is_empty() && !text.is_empty() {
+                let shortcut = if sc.starts_with('/') { sc.to_string() } else { format!("/{sc}") };
+                self.tools.quick_messages.upsert(shortcut, title.into(), text.into());
+                self.tools.new_quick_shortcut.clear();
+                self.tools.new_quick_title.clear();
+                self.tools.new_quick_text.clear();
+            }
+        }
+    }
+
+    fn render_tools_devices(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🔒 Quản lý thiết bị đăng nhập & Bảo mật (Zalo Parity C02)").strong().size(14.0));
+        ui.label("Danh sách các phiên và thiết bị đang đăng nhập tài khoản Zalo.");
+        ui.add_space(6.0);
+
+        if self.tools.devices.is_empty() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("💻");
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Thiết bị hiện tại (Windows 11 ARM64)").strong());
+                        ui.label(RichText::new("Đang hoạt động • Phiên làm việc này").size(12.0).color(Color32::from_rgb(0, 180, 80)));
+                    });
+                });
+            });
+        } else {
+            for dev in &self.tools.devices {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(if dev.platform.contains("Windows") { "💻" } else if dev.platform.contains("Web") { "🌐" } else { "📱" });
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&dev.name).strong());
+                            ui.label(RichText::new(format!("Hệ điều hành: {} • Vị trí: {}", dev.platform, dev.location)).size(12.0));
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if dev.is_current {
+                                ui.label(RichText::new("Thiết bị này").color(Color32::from_rgb(0, 180, 80)).strong());
+                            } else if ui.button("Đăng xuất từ xa").clicked() {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::KickDevice { device_id: dev.device_id.clone() });
+                                }
+                            }
+                        });
+                    });
+                });
+            }
         }
     }
 }
