@@ -3366,44 +3366,53 @@ impl ZaloGuiApp {
                                         self.composer_ime_active = ime_active;
                                         let mut enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
-                                        let rows = composer_rows(&self.input_message);
-                                        let mention_draft = self.composer_mentions.clone();
-                                        let mut mention_layouter = |ui: &egui::Ui, text: &str, width: f32| {
-                                            ui.fonts(|fonts|fonts.layout_job(super::mention_composer::mention_layout(text, &mention_draft, width, pal)))
-                                        };
-                                        let text_edit =
-                                            egui::TextEdit::multiline(&mut self.input_message)
-                                                .layouter(&mut mention_layouter)
-                                                .font(FontId::proportional(14.0))
-                                                .id(composer_id)
-                                                .frame(false)
-                                                .hint_text(if attachment_count>0 {"Nhập chú thích cho tệp…".into()}else if input_w<110.0 {"Nhập tin…".into()}else if input_w<180.0 {"Nhập tin nhắn…".into()}else{format!(
-                                                    "Nhập tin nhắn tới {}...",
-                                                    truncate_chars(&thread_name, 16)
-                                                )})
-                                                .margin(Margin::symmetric(6.0, 7.0))
-                                                .desired_rows(rows)
-                                                .desired_width(input_w);
-
-                                        let output = egui::ScrollArea::vertical()
-                                            .id_salt(("chat_composer_scroll", &thread_id))
-                                            .max_width(input_w)
-                                            .min_scrolled_width(input_w)
-                                            .auto_shrink([false, true])
-                                            .min_scrolled_height(0.0)
-                                            .max_height(editor_height)
-                                            .stick_to_bottom(true)
-                                            .show(ui, |ui| {
-                                                if self.voice_recorder.is_some() || self.recorded_voice_samples.is_some() {
+                                        let (response, cursor) = if is_voice_active {
+                                            egui::ScrollArea::vertical()
+                                                .id_salt(("chat_composer_scroll", &thread_id))
+                                                .max_width(input_w)
+                                                .min_scrolled_width(input_w)
+                                                .auto_shrink([false, true])
+                                                .min_scrolled_height(0.0)
+                                                .max_height(editor_height)
+                                                .stick_to_bottom(true)
+                                                .show(ui, |ui| {
                                                     self.render_voice_recording_bar(ui, &thread_id, is_group, pal, input_w);
-                                                    text_edit.show(ui)
-                                                } else {
-                                                    text_edit.show(ui)
-                                                }
-                                            })
-                                            .inner;
-                                        let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
-                                        let response = output.response;
+                                                });
+                                            let (_, resp) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
+                                            (resp, 0)
+                                        } else {
+                                            let rows = composer_rows(&self.input_message);
+                                            let mention_draft = self.composer_mentions.clone();
+                                            let mut mention_layouter = |ui: &egui::Ui, text: &str, width: f32| {
+                                                ui.fonts(|fonts|fonts.layout_job(super::mention_composer::mention_layout(text, &mention_draft, width, pal)))
+                                            };
+                                            let text_edit =
+                                                egui::TextEdit::multiline(&mut self.input_message)
+                                                    .layouter(&mut mention_layouter)
+                                                    .font(FontId::proportional(14.0))
+                                                    .id(composer_id)
+                                                    .frame(false)
+                                                    .hint_text(if attachment_count>0 {"Nhập chú thích cho tệp…".into()}else if input_w<110.0 {"Nhập tin…".into()}else if input_w<180.0 {"Nhập tin nhắn…".into()}else{format!(
+                                                        "Nhập tin nhắn tới {}...",
+                                                        truncate_chars(&thread_name, 16)
+                                                    )})
+                                                    .margin(Margin::symmetric(6.0, 7.0))
+                                                    .desired_rows(rows)
+                                                    .desired_width(input_w);
+
+                                            let output = egui::ScrollArea::vertical()
+                                                .id_salt(("chat_composer_scroll", &thread_id))
+                                                .max_width(input_w)
+                                                .min_scrolled_width(input_w)
+                                                .auto_shrink([false, true])
+                                                .min_scrolled_height(0.0)
+                                                .max_height(editor_height)
+                                                .stick_to_bottom(true)
+                                                .show(ui, |ui| text_edit.show(ui))
+                                                .inner;
+                                            let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
+                                            (output.response, cursor)
+                                        };
                                         if !file_drag_active {self.mention_suggestions(ui, &thread_id, cursor, &response, &mut enter_send, ime_blocks_enter);}
                                         else {enter_send=false;}
                                         if self.composer_focus_pending {
@@ -4938,8 +4947,8 @@ impl ZaloGuiApp {
                             if let Some(prev) = self.voice_preview.take() {
                                 prev.stop();
                             }
-                        } else if let Some((ref samples, rate, _)) = self.recorded_voice_samples {
-                            if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples.clone(), rate) {
+                        } else if let Some((samples, rate)) = self.recorded_voice_samples.as_ref().map(|(s, r, _)| (s.clone(), *r)) {
+                            if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples, rate) {
                                 self.voice_preview = Some(prev);
                             }
                         }
