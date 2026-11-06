@@ -38,7 +38,13 @@ function Get-Dumpbin {
 $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
 if (-not $SkipTests) {
-    Invoke-Checked cargo @('test', '--locked', '--all-targets', '--target', $target)
+    $testOutput = & cargo test --locked --all-targets --target $target 2>&1
+    $testOutput | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        $failedLines = ($testOutput | Select-String 'failures:','FAILED','panicked at','error:' -Context 1,1) -join " "
+        Write-Host "::error::Cargo test failure summary: $failedLines"
+        throw "cargo test failed with exit code $LASTEXITCODE"
+    }
     # Public codec only; no account/session/phone connection is used by this test.
     $codecPath = Join-Path ([IO.Path]::GetTempPath()) ('ctdoz-codec-' + [guid]::NewGuid().ToString() + '.wasm')
     $previousCodec = $env:CTDOZ_CODEC_TEST_PATH
