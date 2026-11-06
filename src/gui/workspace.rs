@@ -3757,6 +3757,7 @@ impl ZaloGuiApp {
         }
         let mut open = self.send_contact_modal_open;
         let mut chosen_contact = None;
+        let mut close_modal = false;
         egui::Window::new("Gửi danh thiếp")
             .open(&mut open)
             .collapsible(false)
@@ -3798,9 +3799,12 @@ impl ZaloGuiApp {
                 });
                 ui.separator();
                 if ui.button("Đóng").clicked() {
-                    open = false;
+                    close_modal = true;
                 }
             });
+        if close_modal {
+            open = false;
+        }
         self.send_contact_modal_open = open;
         if let Some((cid, cname, cava)) = chosen_contact {
             self.send_contact_modal_open = false;
@@ -3827,6 +3831,7 @@ impl ZaloGuiApp {
         }
         let mut open = self.batch_forward_modal_open;
         let mut chosen_target = None;
+        let mut close_modal = false;
         egui::Window::new("Chuyển tiếp tin nhắn")
             .open(&mut open)
             .collapsible(false)
@@ -3846,9 +3851,12 @@ impl ZaloGuiApp {
                 });
                 ui.separator();
                 if ui.button("Hủy").clicked() {
-                    open = false;
+                    close_modal = true;
                 }
             });
+        if close_modal {
+            open = false;
+        }
         self.batch_forward_modal_open = open;
         if let Some((target_id, is_group)) = chosen_target {
             self.batch_forward_modal_open = false;

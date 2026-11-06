@@ -5290,6 +5290,10 @@ pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
         link_src,
         history_source,
         resolved_mention_uids,
+        contact_id,
+        contact_name,
+        contact_phone,
+        contact_avatar,
     } = message;
     serde_json::to_writer(
         &mut writer,
@@ -5332,6 +5336,12 @@ pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
                 link_src,
                 history_source,
                 resolved_mention_uids,
+            ),
+            (
+                contact_id,
+                contact_name,
+                contact_phone,
+                contact_avatar,
             ),
         ),
     )
