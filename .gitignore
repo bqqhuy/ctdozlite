@@ -47,3 +47,7 @@ Thumbs.db
 # Protected credentials and explicit portable data
 session.dat
 data/
+
+# Account-scoped privacy metadata (never commit runtime account data)
+hidden_membership.json
+account_metadata_cache.json

@@ -15,9 +15,11 @@ pub(super) enum StickerTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ThreadFilter {
+    Strangers,
     All,
     Direct,
     Groups,
+    Archived,
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -225,7 +225,7 @@ async fn detail(s: &Session, id: &str) -> Result<Poll> {
         !id.is_empty() && id.len() <= 128,
         "ID bình chọn không hợp lệ"
     );
-    parse_poll(
+    let poll = parse_poll(
         call(
             s,
             &s.domains.group_poll,
@@ -236,7 +236,9 @@ async fn detail(s: &Session, id: &str) -> Result<Poll> {
         )
         .await?,
         s.account_key(),
-    )
+    )?;
+    ensure!(poll.id == id, "Chi tiết trả về không khớp ID bình chọn");
+    Ok(poll)
 }
 /// Execute one group content intent against services returned at login.
 /// # Errors
@@ -247,6 +249,18 @@ pub async fn execute(s: &Session, group: &str, action: &Action) -> Result<Reply>
         "Chưa đăng nhập"
     );
     let grid = clean(group)?;
+    match action {
+        Action::PollDetail { id }
+        | Action::Vote { id, .. }
+        | Action::AddOption { id, .. }
+        | Action::EndPoll { id } => {
+            let state = group_state::snapshot(s, group, false).await?;
+            ensure!(!state.removed, "Bạn không còn trong nhóm");
+            require_item(s, group, id, 3).await?;
+        }
+        _ => {}
+    }
+
     let mut reply = Reply {
         changed: action.mutation(),
         ..Default::default()
@@ -313,13 +327,18 @@ pub async fn execute(s: &Session, group: &str, action: &Action) -> Result<Reply>
                 reply.polls = Some(polls);
             }
         }
-        Action::SaveNote { id, text, creator } => {
+        Action::SaveNote {
+            id,
+            text,
+            creator: _,
+        } => {
             ensure!(
                 !text.trim().is_empty() && text.len() <= 4000,
                 "Ghi chú phải có từ 1 đến 4000 byte"
             );
             create_allowed(s, group, false).await?;
-            if id.is_some() {
+            if let Some(id) = id {
+                let creator = require_item(s, group, id, 1).await?;
                 let state = group_state::snapshot(s, group, false).await?;
                 ensure!(
                     creator == s.account_key() || state.manager(s.account_key()),
@@ -345,7 +364,8 @@ pub async fn execute(s: &Session, group: &str, action: &Action) -> Result<Reply>
             )
             .await?;
         }
-        Action::RemoveNote { id, creator } => {
+        Action::RemoveNote { id, creator: _ } => {
+            let creator = require_item(s, group, id, 1).await?;
             ensure!(!id.is_empty() && id.len() <= 128, "ID ghi chú không hợp lệ");
             let state = group_state::snapshot(s, group, true).await?;
             ensure!(
@@ -471,5 +491,149 @@ mod tests {
         assert!(poll.anonymous);
         assert_eq!(poll.options[0].votes, Some(9));
         assert!(!poll.options[0].selected);
+    }
+}
+
+#[derive(Clone)]
+struct Binding {
+    at: std::time::Instant,
+    creator: String,
+    revision: u64,
+}
+type BindingKey = (usize, String, String, u8, String);
+static BINDINGS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<BindingKey, Binding>>,
+> = std::sync::OnceLock::new();
+fn scoped_item(raw: &Value, kind: u8, wanted: &str) -> Result<Option<String>> {
+    if raw
+        .get("boardType")
+        .and_then(crate::api_response::integer)
+        .is_some_and(|value| value != i64::from(kind))
+    {
+        return Ok(None);
+    }
+    let raw = if raw.get("boardType").is_some() {
+        object(raw.get("data").context("Thiếu nội dung bảng tin")?)?
+    } else {
+        object(raw)?
+    };
+    if kind == 3 {
+        if id(raw.get("poll_id")).as_deref() == Some(wanted) {
+            return Ok(Some(id(raw.get("creator")).unwrap_or_default()));
+        }
+    } else if id(raw.get("id")).as_deref() == Some(wanted)
+        && raw.get("type").and_then(crate::api_response::integer) == Some(0)
+        && raw
+            .get("startTime")
+            .and_then(crate::api_response::integer)
+            .unwrap_or(0)
+            <= 0
+    {
+        return Ok(Some(crate::board::parse_item(raw)?.creator));
+    }
+    Ok(None)
+}
+/// A request-scoped board list establishes association; detail endpoints do not return group IDs.
+async fn require_item(s: &Session, group: &str, wanted: &str, kind: u8) -> Result<String> {
+    ensure!(
+        !wanted.is_empty() && wanted.len() <= 128,
+        "ID nội dung không hợp lệ"
+    );
+    let grid = clean(group)?;
+    let revision = s.group_revision.load(std::sync::atomic::Ordering::SeqCst);
+    let key = (
+        s.runtime_id(),
+        s.account_key().to_owned(),
+        grid.clone(),
+        kind,
+        wanted.to_owned(),
+    );
+    if let Ok(cache) = BINDINGS.get_or_init(Default::default).lock() {
+        if let Some(binding) = cache.get(&key).filter(|binding| {
+            binding.at.elapsed() < std::time::Duration::from_secs(300)
+                && binding.revision == revision
+        }) {
+            return Ok(binding.creator.clone());
+        }
+    }
+    let search = async {
+        let mut last = String::new();
+        let mut last_type = 0;
+        let mut seen = std::collections::HashSet::new();
+        for page in 1..=200 {
+            let data=call(s,&s.domains.group_board,"/api/board/list",json!({"group_id":grid,"board_type":kind,"page":page,"count":50,"last_id":last,"last_type":last_type,"imei":s.imei}),true,false).await?;
+            let rows = data
+                .get("items")
+                .and_then(Value::as_array)
+                .or_else(|| data.as_array())
+                .context("Thiếu danh sách xác minh nguồn nội dung")?;
+            ensure!(rows.len() <= 50, "Trang xác minh nội dung quá lớn");
+            for row in rows {
+                if let Some(creator) = scoped_item(row, kind, wanted)? {
+                    return Ok(creator);
+                }
+            }
+            if rows.len() < 50 {
+                anyhow::bail!(
+                    "Không tìm thấy nội dung trong nhóm nguồn; tải lại danh sách của nhóm"
+                );
+            }
+            let tail = rows.last().context("Thiếu cursor nội dung")?;
+            let raw = object(tail.get("data").unwrap_or(tail))?;
+            last = id(raw.get("id").or_else(|| raw.get("poll_id")))
+                .context("Thiếu cursor nội dung")?;
+            last_type = tail
+                .get("boardType")
+                .and_then(crate::api_response::integer)
+                .context("Thiếu loại cursor nội dung")?;
+            ensure!(
+                seen.insert((last.clone(), last_type)),
+                "Cursor nội dung không tiến"
+            );
+        }
+        anyhow::bail!("Danh sách nội dung vượt giới hạn xác minh")
+    };
+    let creator = tokio::time::timeout(std::time::Duration::from_secs(15), search)
+        .await
+        .context("Hết giờ xác minh nguồn nội dung; tải lại danh sách nhóm")??;
+    ensure!(
+        revision == s.group_revision.load(std::sync::atomic::Ordering::SeqCst),
+        "Quyền nhóm thay đổi trong lúc xác minh nội dung; tải lại"
+    );
+    if let Ok(mut cache) = BINDINGS.get_or_init(Default::default).lock() {
+        cache.retain(|_, binding| binding.at.elapsed() < std::time::Duration::from_secs(300));
+        if cache.len() >= 2048 {
+            if let Some(old) = cache
+                .iter()
+                .min_by_key(|(_, binding)| binding.at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&old);
+            }
+        }
+        cache.insert(
+            key,
+            Binding {
+                at: std::time::Instant::now(),
+                creator: creator.clone(),
+                revision,
+            },
+        );
+    }
+    Ok(creator)
+}
+#[cfg(test)]
+mod source_scope_tests {
+    use super::*;
+    #[test]
+    fn content_identity_and_kind_must_match_the_request_scoped_list() {
+        let poll = json!({"boardType":3,"data":{"poll_id":12,"creator":"99"}});
+        assert_eq!(scoped_item(&poll, 3, "12").unwrap().as_deref(), Some("99"));
+        assert!(scoped_item(&poll, 3, "13").unwrap().is_none());
+        assert!(scoped_item(&poll, 1, "12").unwrap().is_none());
+        let note = json!({"boardType":1,"data":{"id":"n1","type":0,"startTime":0,"creatorId":"77","params":{"title":"Ghi chú"}}});
+        assert_eq!(scoped_item(&note, 1, "n1").unwrap().as_deref(), Some("77"));
+        let reminder = json!({"id":"n1","type":0,"startTime":1,"creatorId":"77"});
+        assert!(scoped_item(&reminder, 1, "n1").unwrap().is_none());
     }
 }

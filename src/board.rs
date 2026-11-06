@@ -71,24 +71,8 @@ fn object(v: &Value) -> Result<Value> {
     }
 }
 /// Peel only response envelopes; never classify missing fields as an empty list.
-pub fn data(mut value: Value) -> Result<Value> {
-    for _ in 0..4 {
-        value = object(&value)?;
-        if let Some(code) = value.get("error_code") {
-            let code = code
-                .as_i64()
-                .or_else(|| code.as_str()?.parse().ok())
-                .context("Mã trả về bảng tin không hợp lệ")?;
-            ensure!(code == 0, "Máy chủ từ chối thao tác bảng tin ({code})");
-            value = value
-                .get("data")
-                .cloned()
-                .context("Thiếu dữ liệu bảng tin")?;
-        } else {
-            return Ok(value);
-        }
-    }
-    anyhow::bail!("Phản hồi bảng tin có quá nhiều lớp")
+pub fn data(value: Value) -> Result<Value> {
+    crate::api_response::data(value, 256 * 1024, false)
 }
 /// Parse list/detail fields used by the PC reminder adapters.
 pub fn parse_item(value: Value) -> Result<Item> {

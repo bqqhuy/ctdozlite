@@ -125,6 +125,7 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        self.render_hidden_panel(ctx);
         if self.policy_panel.snapshot.is_none()
             && !self.policy_panel.pending
             && self.policy_panel.status.is_empty()
@@ -666,12 +667,14 @@ impl ZaloGuiApp {
                             ui.toggle_value(&mut self.unread_only, "Chưa đọc");
 
                             // Clean Underline Segmented Tabs (`Tất cả`, `Cá nhân`, `Nhóm`) + `Đã ghim (1)`
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 16.0;
                                 for (filter, label) in [
                                     (ThreadFilter::All, "Tất cả"),
                                     (ThreadFilter::Direct, "Cá nhân"),
                                     (ThreadFilter::Groups, "Nhóm"),
+                                    (ThreadFilter::Archived, "Lưu trữ"),
+                                    (ThreadFilter::Strangers, "Người lạ"),
                                 ] {
                                     let active = self.thread_filter == filter;
                                     let text_w = ui.fonts(|f| {
@@ -812,24 +815,40 @@ impl ZaloGuiApp {
                         });
                 }
 
+                if ui.button("Hội thoại ẩn / PIN…").clicked(){self.hidden_panel.open=true;}
+                if !self.metadata_status.is_empty(){ui.label(&self.metadata_status);}
+                if !self.hidden_panel.view.ready {ui.label("Chưa xác minh danh sách ẩn. Mở mục PIN để tải lại.");}
                 if self.conversation_preferences.values().any(|p| p.hidden) {
                     ui.checkbox(
                         &mut self.show_hidden_conversations,
                         "Hiện cả hội thoại đã ẩn",
                     );
                 }
+                if self.thread_filter==ThreadFilter::Strangers {ui.label(match self.inbox_policy.direct {Some(true)=>"Tài khoản đang hiện trực tiếp tin người lạ trong danh sách chung.",None=>"Chưa xác minh thiết lập; các hội thoại chưa bị chuyển khỏi danh sách chung.",Some(false)=>"Tin người lạ chưa trả lời. Mở xem không tự kết bạn hay gửi trạng thái đã xem."});}
+                if ui.button("Phân loại hội thoại…").clicked(){self.open_labels(None);}
+                if let Some(id)=self.labels_panel.filter {
+                    if let Some(label)=self.labels_panel.snapshot.as_ref().and_then(|snapshot|snapshot.labels.iter().find(|label|label.id==id)) {
+                        ui.label(format!("Đang lọc: {}",label.text));
+                    }
+                    if ui.button("Bỏ lọc phân loại").clicked(){self.labels_panel.filter=None;}
+                }
+                let selected_label=self.labels_panel.filter.and_then(|id|self.labels_panel.snapshot.as_ref().and_then(|snapshot|snapshot.labels.iter().find(|label|label.id==id)));
                 let mut filtered_indices: Vec<usize> = self
                     .threads
                     .iter()
                     .enumerate()
                     .filter(|(_, t)| {
                         let pass_filter = match self.thread_filter {
-                            ThreadFilter::All => true,
-                            ThreadFilter::Direct => !t.is_group,
+                            ThreadFilter::All => self.inbox_placement(t)!=crate::inbox::Placement::StrangerBox,
+                            ThreadFilter::Strangers => self.inbox_placement(t)==crate::inbox::Placement::StrangerBox,
+                            ThreadFilter::Direct => !t.is_group && self.inbox_placement(t)!=crate::inbox::Placement::StrangerBox,
                             ThreadFilter::Groups => t.is_group,
+                            ThreadFilter::Archived => t.presentation.archived==Some(true),
                         };
-                        pass_filter
-                            && (!self.unread_only || self.unread_counts.get(&t.id).copied().unwrap_or(0) > 0 || t.unread.has_unread_mentions())
+                        let pass_label=self.labels_panel.filter.is_none() || selected_label.is_some_and(|label|crate::server_pins::identity(&t.id,t.is_group).ok().is_some_and(|identity|label.contains(&identity)));
+                        self.private_access(&t.id,t.is_group) && (self.hidden_panel.show_in_sidebar || !crate::server_pins::identity(&t.id,t.is_group).ok().is_some_and(|id|self.hidden_panel.view.ids.contains(&id))) && pass_filter && pass_label
+                            && (self.thread_filter==ThreadFilter::Archived || t.presentation.archived!=Some(true))
+                            && (!self.unread_only || self.unread_counts.get(&t.id).copied().unwrap_or(0) > 0 || t.unread.has_unread_mentions() || t.unread.marked_unread)
                             && (self.show_hidden_conversations
                                 || !self
                                     .conversation_preferences
@@ -856,6 +875,7 @@ impl ZaloGuiApp {
                 let mut preference_action = None;
                 let mut clear_history_action = None;
                 let mut read_action = None;
+                let mut manual_mark_action = None;
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut mention_target: Option<(String, String)> = None;
 
@@ -945,6 +965,15 @@ impl ZaloGuiApp {
                                         },
                                     ));
                                     ui.close_menu();
+                                }
+                                if ui.button("Ẩn bằng PIN trên máy chủ…").clicked(){self.hidden_panel.open=true;self.hidden_panel.target=Some((t.id.clone(),t.is_group,true));ui.close_menu();}
+                                if ui.add_enabled(!self.manual_mark_pending,egui::Button::new("Tải lại dấu chưa đọc máy chủ")).clicked() {manual_mark_action=Some((t.id.clone(),t.is_group,crate::unread::MarkAction::Refresh));ui.close_menu();}
+                                if !self.manual_mark_uncertain && !self.manual_mark_pending {
+                                    if t.unread.marked_unread {
+                                        if ui.button("Bỏ dấu chưa đọc trên máy chủ").clicked() {manual_mark_action=Some((t.id.clone(),t.is_group,crate::unread::MarkAction::Remove));ui.close_menu();}
+                                    } else if let Some(message)=t.messages.iter().max_by_key(|message|message.ts) {
+                                        if ui.button("Đánh dấu chưa đọc trên máy chủ").clicked() {manual_mark_action=Some((t.id.clone(),t.is_group,crate::unread::MarkAction::Add(Box::new(message.clone()))));ui.close_menu();}
+                                    }
                                 }
                                 if ui.button(crate::i18n::tr("Đánh dấu đã đọc trên máy này")).clicked() {
                                     read_action = Some(t.id.clone());
@@ -1153,6 +1182,7 @@ impl ZaloGuiApp {
                         });
                     }
                 }
+                if let Some((target,group,action))=manual_mark_action {self.manual_mark_command(target,group,action);}
                 if let Some(id) = read_action {
                     if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
                         thread.unread.read_visible(&thread.messages);
@@ -1199,15 +1229,19 @@ impl ZaloGuiApp {
             });
 
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
-        let thread_meta = self.threads.get(self.selected_thread_index).map(|t| {
-            (
-                t.id.clone(),
-                t.name.clone(),
-                t.avatar.clone(),
-                t.is_group,
-                t.messages.len(),
-            )
-        });
+        let thread_meta = self
+            .threads
+            .get(self.selected_thread_index)
+            .filter(|t| self.private_access(&t.id, t.is_group))
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.name.clone(),
+                    t.avatar.clone(),
+                    t.is_group,
+                    t.messages.len(),
+                )
+            });
 
         // -------------------------------------------------------------------
         // 3. COLLAPSIBLE RIGHT CONVERSATION INFO DRAWER (responsive width)
@@ -1412,10 +1446,20 @@ impl ZaloGuiApp {
                                 ui.add_space(8.0);
                                 if d_is_group && ui.button("Ghi chú & bình chọn").clicked(){self.open_group_content(d_id.clone());}
                                 if ui.button("Tin tự xóa & chặn chia sẻ").clicked(){self.policy_panel.confirm=None;self.policy_panel.target=Some((d_id.clone(),d_is_group));self.policy_panel.ttl=self.policy_panel.snapshot.as_ref().map(|snapshot|snapshot.ttl(d_id,d_is_group)).unwrap_or(0);self.policy_command(crate::conversation_policy::Action::Read);}
+                                if !d_is_group && d_id!=&self.user_uin && !d_name.contains("Cloud của tôi") && ui.button("Liên hệ · Biệt danh · Chặn").clicked() { self.open_contact_panel(d_id.clone()); }
                                 if ui.button(if d_is_group {"Quản lý nhóm"}else{"Nhóm chung"}).clicked(){
                                     self.open_group_panel(d_id.clone(),d_is_group,false);
                                     if d_is_group {if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::FetchGroupMembers{group_id:d_id.clone()});}}
                                 }
+                                ui.add_enabled_ui(!self.archive_pending,|ui| {
+                                    if ui.button("Tải trạng thái lưu trữ máy chủ").clicked() {self.archive_command(d_id.clone(),d_is_group,None);}
+                                    if !self.archive_uncertain {
+                                        if let Some(archived)=self.threads.iter().find(|thread|thread.id==*d_id && thread.is_group==d_is_group).and_then(|thread|thread.presentation.archived) {
+                                            if ui.button(if archived {"Đưa về hội thoại chính"}else{"Lưu trữ hội thoại trên máy chủ"}).clicked() {self.archive_command(d_id.clone(),d_is_group,Some(!archived));}
+                                        }
+                                    }
+                                });
+                                if ui.button("Phân loại hội thoại trên máy chủ").clicked(){self.open_labels(Some((d_id.clone(),d_is_group)));}
                                 if ui.button(crate::i18n::tr("Nhắc hẹn & tin ghim Zalo")).clicked(){self.open_server_board(d_id.clone(),d_is_group,String::new());}
                                 if ui.button(crate::i18n::tr("Xem thư viện · File · Link")).clicked() {
                                     self.open_history_search(Some(d_id.clone()),crate::search::Category::Visual,String::new());
@@ -2717,8 +2761,8 @@ impl ZaloGuiApp {
                                         }
                                     }
                                 }
-                                BubbleAction::Reply => self.replying_to = Some(m),
-                                BubbleAction::DoubleClickReply => { if self.settings.double_click_to_reply {self.replying_to=Some(m);} },
+                                BubbleAction::Reply => { self.replying_to = Some(m); ctx.memory_mut(|memory|memory.request_focus(Id::new(("chat_composer_input",&thread_id)))); },
+                                BubbleAction::DoubleClickReply => { if self.settings.double_click_to_reply {self.replying_to=Some(m);ctx.memory_mut(|memory|memory.request_focus(Id::new(("chat_composer_input",&thread_id))));} },
                                 BubbleAction::JumpToQuoted(reference) => {
                                     let index = self
                                         .threads
@@ -3548,6 +3592,10 @@ impl ZaloGuiApp {
         tid: String,
         is_group: bool,
     ) {
+        if !self.private_access(&tid, is_group) {
+            self.hidden_panel.open = true;
+            return;
+        }
         if self.selected_thread_index != idx {
             self.replying_to = None;
             self.filter_starred_only = false;
@@ -3603,6 +3651,11 @@ impl ZaloGuiApp {
         self.render_history_search(ctx);
         self.render_server_board(ctx);
         self.render_group_panel(ctx);
+        self.render_group_entry(ctx);
+        self.render_contact_panel(ctx);
+        self.render_labels_panel(ctx);
+        self.render_own_profile(ctx);
+        self.render_avatar_panel(ctx);
         self.render_backup_panel(ctx);
         self.render_policy_panel(ctx);
         self.render_group_content(ctx);
@@ -4123,7 +4176,10 @@ mod chat_layout_key_tests {
 impl ZaloGuiApp {
     /// Who is typing in this conversation, while the indicator is still fresh.
     fn typing_label(&mut self, thread_id: &str, is_group: bool) -> Option<String> {
-        if !self.settings.show_typing {
+        if !self.settings.show_typing
+            || !self.private_access(thread_id, is_group)
+            || !self.inbox_policy.permits_typing(thread_id, is_group)
+        {
             return None;
         }
         let key = (
@@ -4157,13 +4213,13 @@ impl ZaloGuiApp {
 
     /// Send a typing signal at most every `TYPING_SEND_EVERY` per conversation.
     fn maybe_send_typing(&mut self, thread_id: &str, is_group: bool) {
-        if !self.settings.send_typing {
+        if !self.settings.send_typing
+            || !self.private_access(thread_id, is_group)
+            || !self.inbox_policy.permits_typing(thread_id, is_group)
+        {
             return;
         }
-        let cloud = self
-            .threads
-            .iter()
-            .any(|t| t.id == thread_id && !t.is_group && t.name.contains("Cloud của tôi"));
+        let cloud = !self.own_cloud_id.is_empty() && thread_id == self.own_cloud_id;
         if cloud {
             return;
         }
@@ -4350,7 +4406,10 @@ impl ZaloGuiApp {
         else {
             return;
         };
-        if !self.is_logged_in || owner != self.user_uin {
+        if !self.is_logged_in
+            || owner != self.user_uin
+            || !self.private_access(&thread_id, thread_id.starts_with('g'))
+        {
             ctx.data_mut(|data| data.remove::<(String, String, ChatMessage)>(key));
             return;
         }

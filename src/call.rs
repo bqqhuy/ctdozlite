@@ -322,12 +322,15 @@ pub fn trace_line(tag: &str, body: impl AsRef<str>) {
 }
 
 /// Execute the exact Zalo signaling HTTP endpoint for a native `sendSignal` command (`handleSendSignal`).
-/// Every request/response pair is mirrored into `call_trace.log`.
+/// Trace command/status metadata only; media parameters and session keys stay out of logs.
 pub async fn dispatch_send_signal(s: &Session, command: i64, n: &Value) -> Result<Value> {
-    trace_line("SIG>", json!({"command":command,"payload":n}).to_string());
+    trace_line(
+        "SIG>",
+        json!({"command":command,"fields":n.as_object().map(|value|value.len())}).to_string(),
+    );
     let result = dispatch_send_signal_inner(s, command, n).await;
     match &result {
-        Ok(v) => trace_line("SIG<", json!({"command":command,"payload":v}).to_string()),
+        Ok(v) => trace_line("SIG<", json!({"command":command,"status":v.get("status").and_then(crate::api_response::integer)}).to_string()),
         Err(e) => trace_line("SIG!", format!("cmd={command} err={e}")),
     }
     result
@@ -840,6 +843,9 @@ pub fn event_media_params(data: &Value) -> Value {
     let Some(raw) = data.get("params").and_then(Value::as_str) else {
         return Value::Null;
     };
+    if raw.len() > 64 * 1024 {
+        return Value::Null;
+    }
     let trimmed = raw.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
         return Value::Null;
@@ -857,6 +863,15 @@ pub fn extract_voip_controls(data_node: &Value) -> Vec<Value> {
         let Some(mut content) = item.get("content").cloned() else {
             continue;
         };
+        if let Some(raw) = content.as_str() {
+            if raw.len() > 64 * 1024 {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            content = parsed;
+        }
         let act_type = content
             .get("act_type")
             .and_then(Value::as_str)
@@ -865,6 +880,9 @@ pub fn extract_voip_controls(data_node: &Value) -> Vec<Value> {
             continue;
         }
         if let Some(data_str) = content.get("data").and_then(Value::as_str) {
+            if data_str.len() > 64 * 1024 {
+                continue;
+            }
             let trimmed = data_str.trim();
             if trimmed.starts_with('{') || trimmed.starts_with('[') {
                 if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
@@ -891,7 +909,11 @@ pub async fn poll_voip_controls(s: &Session, state: &mut CtrlPollState) -> Resul
 pub async fn poll_control_events(
     s: &Session,
     state: &mut CtrlPollState,
-) -> Result<(Vec<Value>, Vec<crate::mute_sync::MuteChange>)> {
+) -> Result<(
+    Vec<Value>,
+    Vec<crate::mute_sync::MuteChange>,
+    crate::account_controls::Impact,
+)> {
     if s.login.is_none() {
         bail!("chưa đăng nhập");
     }
@@ -918,7 +940,11 @@ pub async fn poll_control_events(
     if is_initial_cursor {
         // First poll with cursor "1" only syncs `lastActionId` to the server's latest cursor;
         // discard historical replay events from previous sessions.
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            crate::account_controls::Impact::default(),
+        ));
     }
     crate::upload_events::deliver(s.account_key(), data_node);
     let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
@@ -926,15 +952,10 @@ pub async fn poll_control_events(
     if !events.is_empty() {
         trace_line(
             "CTRL",
-            format!(
-                "n={} lastActionId={} raw={}",
-                events.len(),
-                state.last_action_id,
-                data_node
-            ),
+            format!("n={} lastActionId={}", events.len(), state.last_action_id),
         );
     }
-    Ok((events, mutes))
+    Ok((events, mutes, crate::account_controls::parse(data_node)))
 }
 
 // ---------------------------------------------------------------------------
@@ -2088,6 +2109,7 @@ impl CallBridge {
         let cmd_tx_inner = cmd_tx.clone();
 
         tokio::spawn(async move {
+            let mut terminal_calls = crate::call_lifecycle::TerminalCalls::default();
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     CallEngineCmd::MakeCall {
@@ -2096,12 +2118,16 @@ impl CallBridge {
                         is_video,
                         is_group,
                     } => {
+                        let gui_owner = session.lock().await.account_key().to_owned();
                         // Outbound-dial lock: refuse everything but the three test accounts before
                         // any server contact, and surface it in the call overlay.
                         if let Err(e) =
                             ensure_call_target_allowed(&partner_id, &partner_name, is_group)
                         {
                             let _ = gui_tx.send(GuiEvent::CallRejected {
+                                owner: gui_owner.clone(),
+                                partner_id: partner_id.clone(),
+                                call_id: None,
                                 code: -403,
                                 reason: e.to_string(),
                             });
@@ -2115,6 +2141,9 @@ impl CallBridge {
                                 .unwrap_or_else(|e| Err(e.into()))
                             {
                                 let _ = gui_tx.send(GuiEvent::CallRejected {
+                                    owner: gui_owner.clone(),
+                                    partner_id: partner_id.clone(),
+                                    call_id: None,
                                     code: -503,
                                     reason: error.to_string(),
                                 });
@@ -2123,6 +2152,7 @@ impl CallBridge {
                             }
                         }
                         let s_snap = session.lock().await.clone();
+                        let gui_owner = s_snap.account_key().to_owned();
 
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2312,6 +2342,9 @@ impl CallBridge {
                                         }
                                         if let Err(error) = validate_outgoing_allocation(&resp) {
                                             let _ = gui_tx_clone.send(GuiEvent::CallRejected {
+                                                owner: gui_owner.clone(),
+                                                partner_id: partner_id.clone(),
+                                                call_id: None,
                                                 code: -502,
                                                 reason: error.to_string(),
                                             });
@@ -2515,11 +2548,15 @@ impl CallBridge {
                                             extra_legs: Vec::new(),
                                         });
                                         let _ = gui_tx_clone.send(GuiEvent::CallIdentity {
+                                            owner: gui_owner.clone(),
                                             thread_id: partner_id.clone(),
                                             call_id: real_call_id,
                                         });
-                                        let _ = gui_tx_clone
-                                            .send(GuiEvent::CallStateChanged("calling".into()));
+                                        let _ = gui_tx_clone.send(GuiEvent::CallStateChanged {
+                                            owner: gui_owner.clone(),
+                                            call_id: real_call_id,
+                                            state: "calling".into(),
+                                        });
                                         let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                             "🔔 Đang gọi nhóm {grp_name} (ID #{real_call_id})…"
                                         )));
@@ -2527,7 +2564,7 @@ impl CallBridge {
                                         return;
                                     }
                                 }
-                                let _ = gui_tx_clone.send(GuiEvent::CallRejected { code: status_12433, reason: "Không thể mở phòng gọi nhóm trên máy chủ; chưa bắt đầu cuộc gọi".into() });
+                                let _ = gui_tx_clone.send(GuiEvent::CallRejected { owner:gui_owner.clone(),partner_id:partner_id.clone(),call_id:None, code: status_12433, reason: "Không thể mở phòng gọi nhóm trên máy chủ; chưa bắt đầu cuộc gọi".into() });
                                 ctx_clone.request_repaint();
                                 return;
                             }
@@ -2721,6 +2758,9 @@ impl CallBridge {
 
                             if dialed_legs.is_empty() {
                                 let _ = gui_tx_clone.send(GuiEvent::CallRejected {
+                                    owner: gui_owner.clone(),
+                                    partner_id: partner_id.clone(),
+                                    call_id: None,
                                     code: last_err_code,
                                     reason: last_err_reason.clone(),
                                 });
@@ -2775,10 +2815,15 @@ impl CallBridge {
                                 extra_legs: dialed_legs,
                             });
                             let _ = gui_tx_clone.send(GuiEvent::CallIdentity {
+                                owner: gui_owner.clone(),
                                 thread_id: partner_id.clone(),
                                 call_id: primary_cid,
                             });
-                            let _ = gui_tx_clone.send(GuiEvent::CallStateChanged("calling".into()));
+                            let _ = gui_tx_clone.send(GuiEvent::CallStateChanged {
+                                owner: gui_owner.clone(),
+                                call_id: primary_cid,
+                                state: "calling".into(),
+                            });
                             let status_txt = if n_ringing > 1 {
                                 format!(
                                     "🔔 Đang đổ chuông tới {n_ringing} thành viên trong {partner_name}…"
@@ -2798,6 +2843,7 @@ impl CallBridge {
                         expected_call_id,
                     } => {
                         let s_snap = session.lock().await.clone();
+                        let gui_owner = s_snap.account_key().to_owned();
                         let active_clone = active_call.clone();
                         let gui_tx_clone = gui_tx.clone();
                         let ctx_clone = egui_ctx.clone();
@@ -2870,8 +2916,11 @@ impl CallBridge {
                                             call_trace!("Native media unavailable");
                                         }
                                     }
-                                    let _ = gui_tx_clone
-                                        .send(GuiEvent::CallStateChanged("connected".into()));
+                                    let _ = gui_tx_clone.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: st.call_id,
+                                        state: "connected".into(),
+                                    });
                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
                                         "🟢 Đang trong cuộc gọi với {}",
                                         st.partner_name
@@ -2879,9 +2928,13 @@ impl CallBridge {
                                 } else {
                                     let partner_id = st.partner_id.clone();
                                     let was_video = st.is_video;
+                                    let terminal_id = st.call_id;
                                     *guard = None;
-                                    let _ = gui_tx_clone
-                                        .send(GuiEvent::CallStateChanged("free".into()));
+                                    let _ = gui_tx_clone.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: terminal_id,
+                                        state: "free".into(),
+                                    });
                                     let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
                                         thread_id: partner_id,
                                         text: if was_video {
@@ -2991,6 +3044,11 @@ impl CallBridge {
                             let thread_id = st.thread_id.clone();
                             let partner_id = st.partner_id.clone();
                             let call_id = st.call_id;
+                            terminal_calls.remember(
+                                s_snap.account_key(),
+                                call_id,
+                                std::time::Instant::now(),
+                            );
                             let call_type = CallType::from_flags(st.is_video, st.is_group) as u8;
                             let leg_call_type: u8 = if st.is_video { 3 } else { 1 };
                             let rtp_ip = st.rtp_ip.clone();
@@ -3028,7 +3086,11 @@ impl CallBridge {
                                     msg_id: format!("call_{}", crate::login::unix_now()),
                                 });
                             }
-                            let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
+                            let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                owner: s_snap.account_key().to_owned(),
+                                call_id,
+                                state: "free".into(),
+                            });
                             egui_ctx.request_repaint();
 
                             tokio::spawn(async move {
@@ -3117,6 +3179,13 @@ impl CallBridge {
 
                     CallEngineCmd::ControlEvent(voip_ctrl) => {
                         let act = voip_ctrl.get("act").and_then(Value::as_str).unwrap_or("");
+                        if act.len() > 64
+                            || !act
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        {
+                            continue;
+                        }
                         let data = voip_ctrl.get("data").cloned().unwrap_or(Value::Null);
                         trace_line(
                             "EVT",
@@ -3125,11 +3194,15 @@ impl CallBridge {
                                 voip_ctrl
                                     .get("data")
                                     .and_then(|d| d.get("ts"))
-                                    .cloned()
-                                    .unwrap_or(Value::Null)
+                                    .and_then(crate::api_response::integer)
+                                    .unwrap_or(0)
                             ),
                         );
-                        trace_line("EVT", format!("act={act} data={data}"));
+                        // Keep session/media credentials out of control diagnostics.
+                        trace_line(
+                            "EVT",
+                            format!("act={act} has_status={}", data.get("status").is_some()),
+                        );
                         crate::voip_log::log_signal_media(act, &event_media_params(&data));
                         let ev_call_id = data
                             .get("callId")
@@ -3139,8 +3212,74 @@ impl CallBridge {
                                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                             })
                             .unwrap_or(0);
+                        if ev_call_id <= 0
+                            && matches!(
+                                act,
+                                "request"
+                                    | "group_request"
+                                    | "answer"
+                                    | "group_answer"
+                                    | "end_call"
+                                    | "group_end_call"
+                                    | "cancel"
+                                    | "group_cancel"
+                                    | "ring_ring"
+                                    | "group_ring_ring"
+                            )
+                        {
+                            trace_line("EVT", format!("act={act} ignored=missing_call_identity"));
+                            continue;
+                        }
                         let s_snap = session.lock().await.clone();
+                        let owner = s_snap
+                            .login
+                            .as_ref()
+                            .map(|login| login.uin.as_str())
+                            .unwrap_or("");
+                        let now = std::time::Instant::now();
+                        if terminal_calls.contains(owner, ev_call_id, now) {
+                            continue;
+                        }
+                        // An explicit self answer can arrive before its invitation on another queue.
+                        // Only known UID namespaces qualify; a peer's answer is not our acceptance.
+                        let actor_is_self = [
+                            ("uidN", owner),
+                            (
+                                "uidFrom",
+                                s_snap
+                                    .zpw_sek
+                                    .as_deref()
+                                    .and_then(|sek| sek.split('.').nth(1))
+                                    .unwrap_or(""),
+                            ),
+                        ]
+                        .iter()
+                        .any(|(field, own)| {
+                            !own.is_empty()
+                                && data
+                                    .get(*field)
+                                    .and_then(|value| {
+                                        value
+                                            .as_str()
+                                            .map(str::to_owned)
+                                            .or_else(|| value.as_u64().map(|id| id.to_string()))
+                                    })
+                                    .is_some_and(|actor| actor == *own)
+                        });
+                        trace_line("EVT",format!("act={act} call_id={ev_call_id} status={:?} actor_self={actor_is_self}",data.get("status").and_then(crate::api_response::integer)));
+                        if matches!(act, "answer" | "group_answer")
+                            && actor_is_self
+                            && data.get("status").and_then(crate::api_response::integer) == Some(0)
+                            && active_call.lock().await.is_none()
+                        {
+                            terminal_calls.remember(owner, ev_call_id, now);
+                            continue;
+                        }
+                        if matches!(act, "end_call" | "cancel") {
+                            terminal_calls.remember(owner, ev_call_id, now);
+                        }
 
+                        let gui_owner = owner.to_owned();
                         match act {
                             "ring_ring" | "group_ring_ring" => {
                                 let mut guard = active_call.lock().await;
@@ -3154,8 +3293,11 @@ impl CallBridge {
                                     continue;
                                 }
                                 if !st.is_connected {
-                                    let _ =
-                                        gui_tx.send(GuiEvent::CallStateChanged("ringing".into()));
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: st.call_id,
+                                        state: "ringing".into(),
+                                    });
                                     let _ = gui_tx.send(GuiEvent::StatusUpdate(
                                         "🔔 Thiết bị của người nhận đang đổ chuông…".into(),
                                     ));
@@ -3163,15 +3305,13 @@ impl CallBridge {
                                 }
                             }
                             "answer" | "group_answer" => {
-                                call_trace!("[call] ctrl answer raw: {}", voip_ctrl);
-                                let status = data
-                                    .get("status")
-                                    .and_then(|v| {
-                                        v.as_i64().or_else(|| {
-                                            v.as_str().and_then(|s| s.trim().parse::<i64>().ok())
-                                        })
-                                    })
-                                    .unwrap_or(0);
+                                call_trace!("[call] ctrl answer call_id={}", ev_call_id);
+                                let Some(status) =
+                                    data.get("status").and_then(crate::api_response::integer)
+                                else {
+                                    trace_line("EVT",format!("act={act} call_id={ev_call_id} ignored=missing_answer_status"));
+                                    continue;
+                                };
                                 let mut guard = active_call.lock().await;
                                 if guard.is_none() {
                                     let self_uin = s_snap
@@ -3232,36 +3372,24 @@ impl CallBridge {
                                 let Some(st_check) = guard.as_ref() else {
                                     continue;
                                 };
-                                let actor = data
-                                    .get("uidN")
-                                    .or_else(|| data.get("uidFrom"))
-                                    .and_then(|v| {
-                                        v.as_str()
-                                            .map(str::to_owned)
-                                            .or_else(|| v.as_u64().map(|n| n.to_string()))
-                                    })
-                                    .unwrap_or_default();
-                                let actor_is_self = s_snap
-                                    .login
-                                    .as_ref()
-                                    .is_some_and(|login| !actor.is_empty() && actor == login.uin);
                                 if crate::call_lifecycle::answered_elsewhere(
                                     st_check.call_id,
                                     ev_call_id,
                                     st_check.is_caller,
                                     st_check.is_connected,
-                                    st_check.is_group,
                                     actor_is_self,
                                     status,
                                 ) {
+                                    terminal_calls.remember(owner, ev_call_id, now);
                                     guard.take();
-                                    let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
-                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(
-                                        "Cuộc gọi đã được nhận trên thiết bị khác".into(),
-                                    ));
+                                    let _ = gui_tx.send(GuiEvent::CallAnsweredElsewhere {
+                                        owner: owner.to_owned(),
+                                        call_id: ev_call_id,
+                                    });
                                     egui_ctx.request_repaint();
                                     continue;
                                 }
+                                let ui_call_id = st_check.call_id;
                                 let is_primary_leg =
                                     ev_call_id == 0 || ev_call_id == st_check.call_id;
                                 let extra_leg_idx = st_check
@@ -3443,10 +3571,7 @@ impl CallBridge {
                                         }
                                         trace_line(
                                             "MEDIA",
-                                            format!(
-                                                "start caller=true rtp={} token={} video={}",
-                                                st.rtp_ip, st.relay_token, st.is_video
-                                            ),
+                                            format!("start caller=true video={}", st.is_video),
                                         );
                                         if let (Some(rsock), Ok(target)) = (
                                             &st.udp_rtp_sock,
@@ -3528,8 +3653,11 @@ impl CallBridge {
                                             });
                                         }
                                     }
-                                    let _ =
-                                        gui_tx.send(GuiEvent::CallStateChanged("connected".into()));
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: ui_call_id,
+                                        state: "connected".into(),
+                                    });
                                     let _ = gui_tx.send(GuiEvent::StatusUpdate(
                                         "🟢 Người nhận đã bắt máy — Đang trong cuộc gọi".into(),
                                     ));
@@ -3577,6 +3705,7 @@ impl CallBridge {
                                             }
                                         }
                                     }
+                                    terminal_calls.remember(owner, ev_call_id, now);
                                     let taken = guard.take();
                                     let reason = match status {
                                         1..=4 => "Người nhận đang bận hoặc đã từ chối cuộc gọi",
@@ -3584,6 +3713,12 @@ impl CallBridge {
                                         _ => "Người nhận không trả lời cuộc gọi",
                                     };
                                     let _ = gui_tx.send(GuiEvent::CallRejected {
+                                        owner: gui_owner.clone(),
+                                        partner_id: taken
+                                            .as_ref()
+                                            .map(|state| state.thread_id.clone())
+                                            .unwrap_or_default(),
+                                        call_id: Some(ev_call_id),
                                         code: status,
                                         reason: reason.into(),
                                     });
@@ -3646,8 +3781,11 @@ impl CallBridge {
                                 if call_state == 3 && !st.is_connected {
                                     st.is_connected = true;
                                     st.started_at = std::time::Instant::now();
-                                    let _ =
-                                        gui_tx.send(GuiEvent::CallStateChanged("connected".into()));
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: st.call_id,
+                                        state: "connected".into(),
+                                    });
                                     let _ = gui_tx.send(GuiEvent::StatusUpdate(format!(
                                         "🟢 Đang trong cuộc gọi nhóm {}",
                                         st.partner_name
@@ -3747,13 +3885,20 @@ impl CallBridge {
                                         msg_id: format!("call_{}", crate::login::unix_now()),
                                     });
                                 }
-                                let _ = gui_tx.send(GuiEvent::CallStateChanged("free".into()));
+                                let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                    owner: gui_owner.clone(),
+                                    call_id: ev_call_id,
+                                    state: "free".into(),
+                                });
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate(
                                     "Cuộc gọi đã kết thúc từ phía đối phương".into(),
                                 ));
                                 egui_ctx.request_repaint();
                             }
                             "request" | "group_request" => {
+                                if ev_call_id <= 0 {
+                                    continue;
+                                }
                                 // Skip if already handling this call with a full extendData
                                 let mut is_upgrade = false;
                                 {
@@ -3764,6 +3909,8 @@ impl CallBridge {
                                                 continue;
                                             }
                                             is_upgrade = true;
+                                        } else {
+                                            continue;
                                         }
                                     }
                                 }
@@ -3801,12 +3948,7 @@ impl CallBridge {
                                         _ => None,
                                     })
                                     .unwrap_or_default();
-                                call_trace!(
-                                    "[call] incoming request call_id={} caller={} data={}",
-                                    ev_call_id,
-                                    caller_id,
-                                    data
-                                );
+                                call_trace!("[call] incoming request call_id={}", ev_call_id);
                                 let caller_name = media
                                     .get("Dname")
                                     .or_else(|| data.get("Dname"))
@@ -3935,6 +4077,7 @@ impl CallBridge {
                                 // Show incoming call window in GUI immediately (before 280ms UDP probe)
                                 if !is_upgrade {
                                     let _ = gui_tx_clone.send(GuiEvent::IncomingCall {
+                                        owner: owner.to_owned(),
                                         call_id,
                                         caller_id: caller_id.clone(),
                                         caller_name: caller_name.clone(),

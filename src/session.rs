@@ -172,6 +172,8 @@ impl Domains {
                 "voice_call",
                 "sticker",
                 "reaction",
+                "alias",
+                "label",
             ]
             .iter()
             .filter_map(|key| crate::endpoints::service(key))
@@ -264,6 +266,12 @@ pub struct SavedSession {
 
 #[derive(Clone)]
 pub struct Session {
+    runtime_generation: usize,
+    /// Shared in-memory PIN gate, never serialized with login credentials.
+    pub hidden: Arc<crate::hidden_chat::Vault>,
+    pub inbox_policy: Arc<std::sync::RwLock<crate::inbox::Policy>>,
+    /// Permission generations reject metadata fetched before an invalidating control.
+    pub group_revision: Arc<std::sync::atomic::AtomicU64>,
     active: Arc<AtomicBool>,
     pub http: Client,
     pub jar: Arc<Jar>,
@@ -283,6 +291,11 @@ pub struct Session {
     pub dump_raw: bool,
 }
 
+// Pointer addresses can be recycled while permission-cache entries are still alive.
+fn next_runtime_generation() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 impl Session {
     pub fn new(verbose: bool, dump: bool, dump_raw: bool) -> Result<Self> {
         let jar = Arc::new(Jar::default());
@@ -301,6 +314,10 @@ impl Session {
             )
             .build()?;
         Ok(Self {
+            runtime_generation: next_runtime_generation(),
+            hidden: Arc::new(crate::hidden_chat::Vault::default()),
+            inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
+            group_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             active: Arc::new(AtomicBool::new(true)),
             http,
             jar,
@@ -446,7 +463,11 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner());
         self.active.store(false, Ordering::SeqCst);
         self.active = Arc::new(AtomicBool::new(true));
+        self.runtime_generation = next_runtime_generation();
         self.login = None;
+        self.hidden = Arc::new(crate::hidden_chat::Vault::default());
+        self.inbox_policy = Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default()));
+        self.group_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         self.zpw_sek = None;
         self.secret_key = None;
         self.session_key = None;
@@ -473,7 +494,7 @@ impl Session {
 
     /// Process-local identity shared by clones and replaced when login is revoked.
     pub(crate) fn runtime_id(&self) -> usize {
-        Arc::as_ptr(&self.active) as usize
+        self.runtime_generation
     }
 
     pub fn is_active(&self) -> bool {
@@ -721,6 +742,8 @@ impl Session {
                 "voice_call",
                 "sticker",
                 "reaction",
+                "alias",
+                "label",
             ] {
                 if let Some(verified) = crate::endpoints::service(key) {
                     let candidates = self
@@ -1418,6 +1441,24 @@ mod credential_destination_tests {
 mod candidate_persistence_tests {
     use super::*;
     #[test]
+    fn label_and_alias_discovery_survive_sanitized_persistence() {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"alias":["https://alias-fallback.zalo.me"],"label":["https://label-fallback.zaloapp.com"]}}));
+        let mut restored: Domains =
+            serde_json::from_value(serde_json::to_value(&session.domains).unwrap()).unwrap();
+        restored.prefer_verified_rest();
+        for (service, host) in [
+            ("alias", "https://alias-fallback.zalo.me"),
+            ("label", "https://label-fallback.zaloapp.com"),
+        ] {
+            assert!(
+                restored.service_fallbacks[crate::endpoints::service(service).unwrap()]
+                    .iter()
+                    .any(|candidate| candidate == host)
+            );
+        }
+    }
+    #[test]
     fn discovery_retains_all_trusted_candidates_and_saved_candidates_are_sanitized() {
         let mut s = Session::new(false, false, false).unwrap();
         s.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"chat":["https://fallback-one.zalo.me","https://fallback-two.zaloapp.com","https://attacker.invalid"]}}));
@@ -1496,4 +1537,23 @@ fn default_reaction() -> String {
     crate::endpoints::service("reaction")
         .unwrap_or(crate::endpoints::MSG_CHAT)
         .into()
+}
+
+#[cfg(test)]
+mod runtime_generation_tests {
+    use super::*;
+    #[test]
+    fn revoked_runtimes_cannot_reuse_permission_cache_identity() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let clone = session.clone();
+        let original = session.runtime_id();
+        assert_eq!(clone.runtime_id(), original);
+        let other = Session::new(false, false, false).unwrap();
+        assert_ne!(other.runtime_id(), original);
+        session.logout();
+        assert_ne!(session.runtime_id(), original);
+        assert_eq!(clone.runtime_id(), original);
+        assert!(!clone.is_active());
+        assert!(!session.hidden.view("old").ready);
+    }
 }

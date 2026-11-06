@@ -1,5 +1,5 @@
 /// User-visible fork release identifier, independent of the numeric Windows file version.
-pub const PRODUCT_VERSION: &str = "v0.007-arm";
+pub const PRODUCT_VERSION: &str = "v0.008-arm";
 
 pub mod call;
 pub mod chat;
@@ -130,7 +130,16 @@ pub mod i18n;
 
 pub mod group_state;
 
+pub mod api_response;
+pub mod archive;
+pub mod avatar;
+pub mod contact_actions;
+pub mod group_entry;
 pub mod groups;
+pub mod inbox;
+pub mod labels;
+pub mod privacy;
+pub mod profile;
 
 pub mod desktop_backup;
 mod desktop_backup_format;
@@ -145,3 +154,12 @@ mod reaction_pipeline;
 
 mod group_metadata;
 mod history_open;
+
+pub mod avatar_history;
+
+pub mod last_activity;
+
+pub mod hidden_chat;
+
+pub mod account_controls;
+pub mod account_metadata;

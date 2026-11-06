@@ -111,6 +111,26 @@ pub fn publish(notice: Notice, count: usize) {
         s.notice = Some(notice);
     }
 }
+/// Retract account previews after a privacy relock, including a pending activation/avatar.
+pub fn clear_previews(owner: &str) {
+    if let Ok(mut state) = STATE.lock() {
+        if state.owner == owner {
+            state.notice = None;
+            state.sequence = state.sequence.wrapping_add(1);
+        }
+    }
+    if let Ok(mut activation) = ACTIVATION.lock() {
+        if activation
+            .as_ref()
+            .is_some_and(|notice| notice.owner == owner)
+        {
+            *activation = None;
+        }
+    }
+    if let Ok(mut avatars) = AVATARS.lock() {
+        avatars.retain(|avatar| avatar.owner != owner);
+    }
+}
 pub fn snapshot() -> Snapshot {
     STATE.lock().map(|s| s.clone()).unwrap_or_default()
 }
@@ -155,6 +175,9 @@ impl Popup {
         }
         if s.sequence != self.seen {
             self.seen = s.sequence;
+            if s.notice.is_none() {
+                self.close();
+            }
             if s.enabled && background {
                 if let Some(n) = &s.notice {
                     if self.current.is_some() {
@@ -262,5 +285,37 @@ mod lifetime_tests {
         assert!(p.exit_at.is_some());
         p.update(&s, now + Duration::from_millis(19160), true);
         assert!(p.current.is_none());
+    }
+}
+
+#[cfg(test)]
+mod privacy_tests {
+    use super::*;
+    #[test]
+    fn clearing_the_notice_sequence_retracts_current_and_pending_cards() {
+        let now = std::time::Instant::now();
+        let notice = Notice {
+            owner: "owner".into(),
+            thread_id: "12".into(),
+            message_id: "1".into(),
+            title: "Tên".into(),
+            body: "Nội dung".into(),
+            avatar: None,
+        };
+        let mut snapshot = Snapshot {
+            owner: "owner".into(),
+            enabled: true,
+            sequence: 1,
+            notice: Some(notice),
+            ..Default::default()
+        };
+        let mut popup = Popup::default();
+        popup.update(&snapshot, now, true);
+        assert!(popup.current.is_some());
+        snapshot.sequence = 2;
+        snapshot.notice = None;
+        popup.update(&snapshot, now, true);
+        assert!(popup.current.is_none());
+        assert!(popup.pending.is_none());
     }
 }

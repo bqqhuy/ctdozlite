@@ -6,6 +6,7 @@ use std::{collections::HashMap, sync::Mutex};
 struct Baseline {
     read_ids: std::collections::HashSet<String>,
     unread: crate::unread::UnreadState,
+    inbox: crate::inbox::Metadata,
 }
 
 /// Coalesced, account-worker-owned live delivery mailbox.
@@ -14,6 +15,8 @@ pub struct LiveUpdates {
     // One short ownership lock covers snapshots only, never disk/network/render work.
     pending: Mutex<(HashMap<String, Thread>, bool)>,
     muted: Mutex<std::collections::HashSet<String>>,
+    suppressed: Mutex<std::collections::HashSet<String>>,
+    metadata_needed: std::sync::atomic::AtomicBool,
     baselines: Mutex<HashMap<String, Baseline>>,
     alerts: Mutex<(HashMap<String, u128>, bool)>,
     notice: Mutex<Option<crate::desktop_notice::Notice>>,
@@ -63,6 +66,11 @@ impl LiveUpdates {
                             && !seed
                                 .as_ref()
                                 .is_some_and(|baseline| baseline.unread.is_muted())
+                            && !self
+                                .suppressed
+                                .lock()
+                                .map(|ids| ids.contains(&thread.id))
+                                .unwrap_or(true)
                             && !muted.contains(&thread.id)
                         {
                             alerts.1 = true;
@@ -140,6 +148,21 @@ impl LiveUpdates {
         state.1 = true;
         true
     }
+    pub(crate) fn request_metadata(&self) {
+        self.metadata_needed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn take_metadata_request(&self) -> bool {
+        self.metadata_needed
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+    pub(crate) fn inbox_metadata(&self, id: &str) -> crate::inbox::Metadata {
+        self.baselines
+            .lock()
+            .ok()
+            .and_then(|baselines| baselines.get(id).map(|baseline| baseline.inbox.clone()))
+            .unwrap_or_default()
+    }
     pub(crate) fn seed(&self, threads: &[Thread]) {
         if let Ok(mut counts) = self.counts.lock() {
             for t in threads {
@@ -178,6 +201,7 @@ impl LiveUpdates {
                 (
                     thread.id.clone(),
                     Baseline {
+                        inbox: thread.presentation.inbox.clone(),
                         read_ids,
                         unread: thread.unread.clone(),
                     },
@@ -197,8 +221,28 @@ impl LiveUpdates {
     pub(crate) fn total(&self) -> usize {
         self.counts
             .lock()
-            .map(|s| s.values().copied().sum())
+            .map(|s| {
+                let suppressed = self
+                    .suppressed
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                s.iter()
+                    .filter(|(id, _)| !suppressed.contains(*id))
+                    .map(|(_, count)| *count)
+                    .sum()
+            })
             .unwrap_or(0)
+    }
+    pub(crate) fn suppress(&self, changes: impl IntoIterator<Item = (String, bool)>) {
+        if let Ok(mut ids) = self.suppressed.lock() {
+            for (id, suppressed) in changes {
+                if suppressed {
+                    ids.insert(id);
+                } else {
+                    ids.remove(&id);
+                }
+            }
+        }
     }
     pub(crate) fn set_muted(&self, values: &HashMap<String, crate::store::ConversationPreference>) {
         *self.muted.lock().unwrap_or_else(|e| e.into_inner()) = values
@@ -480,5 +524,31 @@ mod notification_contract_tests {
             ..Default::default()
         }]);
         assert!(q.take_notice().is_none());
+    }
+}
+
+#[cfg(test)]
+mod inbox_metadata_tests {
+    use super::*;
+    #[test]
+    fn acknowledged_reply_metadata_survives_an_incoming_page_without_preview_fields() {
+        let updates = LiveUpdates::default();
+        let mut thread = Thread {
+            id: "12".into(),
+            ..Default::default()
+        };
+        thread.presentation.inbox = crate::inbox::Metadata {
+            responded_by_me: Some(true),
+            outside: Some(0),
+            official_account: Some(false),
+        };
+        updates.seed(&[thread]);
+        let mut metadata = updates.inbox_metadata("12");
+        metadata.merge(&crate::inbox::Metadata::default(), true);
+        assert_eq!(metadata.responded_by_me, Some(true));
+        assert!(!updates.take_metadata_request());
+        updates.request_metadata();
+        assert!(updates.take_metadata_request());
+        assert!(!updates.take_metadata_request());
     }
 }

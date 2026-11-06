@@ -18,6 +18,13 @@ pub(super) struct GroupPanel {
     pub member: String,
     pub status: String,
     pub confirm: Option<crate::groups::Action>,
+    pub link: Option<serde_json::Value>,
+    pub link_qr: Option<egui::TextureHandle>,
+    pub pending_members: Vec<(String, String)>,
+    pub blocked_members: Vec<String>,
+    pub blocked_page: u32,
+    pub blocked_more: bool,
+    pub community: Option<crate::groups::CommunityQuota>,
 }
 impl ZaloGuiApp {
     pub(super) fn open_group_panel(&mut self, target: String, group: bool, create: bool) {
@@ -81,9 +88,13 @@ impl ZaloGuiApp {
         })
         .id(Id::new("group-panel"))
         .open(&mut open)
-        .default_width(480.0)
-        .max_height((ctx.screen_rect().height() - 80.0).max(200.0))
+            .vscroll(true)
+            .min_width(120.0)
+            .max_width((ctx.screen_rect().width()-32.0).max(180.0))
+            .max_height((ctx.screen_rect().height()-64.0).max(100.0))
+        .default_width(480.0_f32.min((ctx.screen_rect().width()-48.0).max(160.0)))
         .show(ctx, |ui| {
+                ui.style_mut().wrap_mode=Some(egui::TextWrapMode::Wrap);
             if self.groups_panel.pending {
                 ui.spinner();
             }
@@ -114,6 +125,7 @@ impl ZaloGuiApp {
                 }
                 return;
             }
+            if !self.groups_panel.create && ui.button("Báo cáo nhóm…").clicked(){self.open_group_report(self.groups_panel.target.clone());}
             let state = self
                 .groups_panel
                 .info
@@ -127,17 +139,163 @@ impl ZaloGuiApp {
                 .is_some_and(|state| state.manager(&self.user_uin));
             let owner = state
                 .as_ref()
-                .is_some_and(|state| state.creator() == Some(&self.user_uin));
+                .is_some_and(|state| state.creator_is(&self.user_uin));
             ui.add_enabled_ui(
                 !self.groups_panel.pending && !self.groups_panel.needs_refresh,
                 |ui| {
                     if self.groups_panel.create {
                         ui.label("Tên nhóm");
-                        ui.text_edit_singleline(&mut self.groups_panel.name);
+                        ui.add(egui::TextEdit::singleline(&mut self.groups_panel.name).desired_width(ui.available_width()));
+                    }
+                    if !self.groups_panel.create && state.is_some() {
+                        let can_avatar = manager
+                            || state.as_ref().is_some_and(|snapshot| {
+                                snapshot
+                                    .info
+                                    .pointer("/setting/blockName")
+                                    .and_then(crate::api_response::integer)
+                                    == Some(0)
+                            });
+                        if ui
+                            .add_enabled(can_avatar, egui::Button::new("Thay ảnh đại diện nhóm…"))
+                            .clicked()
+                        {
+                            self.open_avatar(crate::avatar::Target::Group(
+                                self.groups_panel.target.clone(),
+                            ));
+                        }
+                        ui.collapsing("Thông tin và thiết lập nhóm", |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.groups_panel.name).desired_width((ui.available_width()-120.0).max(64.0)));
+                                if ui.button("Đổi tên nhóm").clicked() {
+                                    self.groups_panel.confirm =
+                                        Some(crate::groups::Action::Rename {
+                                            name: self.groups_panel.name.clone(),
+                                        });
+                                }
+                            });
+                            if manager {
+                                for (setting, label) in [
+                                    (
+                                        crate::groups::Setting::LockName,
+                                        "Chỉ quản trị viên đổi tên",
+                                    ),
+                                    (
+                                        crate::groups::Setting::LockPoll,
+                                        "Chỉ quản trị viên tạo bình chọn",
+                                    ),
+                                    (
+                                        crate::groups::Setting::LockPost,
+                                        "Chỉ quản trị viên tạo ghi chú",
+                                    ),
+                                    (
+                                        crate::groups::Setting::LockSend,
+                                        "Chỉ quản trị viên gửi tin",
+                                    ),
+                                    (
+                                        crate::groups::Setting::ApproveMembers,
+                                        "Duyệt thành viên mới",
+                                    ),
+                                ] {
+                                    if let Some(value) = state
+                                        .as_ref()
+                                        .and_then(|snapshot| snapshot.info.get("setting"))
+                                        .and_then(|settings| settings.get(setting.key()))
+                                        .and_then(serde_json::Value::as_i64)
+                                        .filter(|value| matches!(value, 0 | 1))
+                                    {
+                                        let mut enabled = value == 1;
+                                        if ui.checkbox(&mut enabled, label).changed() {
+                                            self.groups_panel.confirm =
+                                                Some(crate::groups::Action::Setting {
+                                                    setting,
+                                                    enabled,
+                                                });
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        ui.collapsing("Cộng đồng",|ui| {
+                            if ui.button("Kiểm tra điều kiện nâng cấp").clicked(){intent=Some(crate::groups::Action::CommunityQuota);}
+                            if let Some(quota)=&self.groups_panel.community {
+                                ui.label(if quota.can_upgrade {"Máy chủ cho phép nâng cấp"}else{"Máy chủ chưa cho phép nâng cấp"});
+                                if let Some(message)=&quota.message {ui.label(message);}
+                                if owner && quota.can_upgrade && state.as_ref().and_then(|state|state.info.get("type")).and_then(crate::api_response::integer)==Some(1) && ui.button("Nâng cấp nhóm thành cộng đồng…").clicked(){self.groups_panel.confirm=Some(crate::groups::Action::UpgradeCommunity);}
+                            }
+                        });
+                        ui.collapsing("Link mời và duyệt thành viên", |ui| {
+                            if ui.button("Xem link mời").clicked() {
+                                intent = Some(crate::groups::Action::Link);
+                            }
+                            if let Some(link) = &self.groups_panel.link {
+                                match crate::groups::shareable_link(link,crate::login::unix_now()*1000) {
+                                    Ok(url)=>{
+                                        ui.label(url);
+                                        if ui.button("Sao chép link").clicked(){ui.output_mut(|output|output.copied_text=url.to_owned());}
+                                        if ui.button("Hiện mã QR mời nhóm").clicked(){
+                                            match group_link_qr(ui.ctx(),url) {Ok(texture)=>self.groups_panel.link_qr=Some(texture),Err(error)=>self.groups_panel.status=error.to_string()}
+                                        }
+                                        if let Some(qr)=&self.groups_panel.link_qr {ui.image((qr.id(),Vec2::splat(ui.available_width().min(240.0))));}
+                                    }
+                                    Err(error)=>{ui.label(error.to_string());self.groups_panel.link_qr=None;}
+                                }
+                            }
+                            if manager {
+                                if ui.button("Danh sách chặn vào nhóm").clicked() {
+                                    intent = Some(crate::groups::Action::Blocked { page: 1 });
+                                }
+                                for uid in &self.groups_panel.blocked_members {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(uid);
+                                        if ui.button("Bỏ chặn vào nhóm").clicked() {
+                                            self.groups_panel.confirm =
+                                                Some(crate::groups::Action::Ban {
+                                                    members: vec![uid.clone()],
+                                                    blocked: false,
+                                                });
+                                        }
+                                    });
+                                }
+                                if self.groups_panel.blocked_more
+                                    && self.groups_panel.blocked_page < 100
+                                    && ui.button("Trang chặn tiếp").clicked()
+                                {
+                                    intent = Some(crate::groups::Action::Blocked {
+                                        page: self.groups_panel.blocked_page + 1,
+                                    });
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("Tạo link mới").clicked() {
+                                        self.groups_panel.confirm =
+                                            Some(crate::groups::Action::RenewLink);
+                                    }
+                                    if ui.button("Tắt link mời").clicked() {
+                                        self.groups_panel.confirm =
+                                            Some(crate::groups::Action::DisableLink);
+                                    }
+                                    if ui.button("Tải danh sách chờ duyệt").clicked() {
+                                        intent = Some(crate::groups::Action::Pending);
+                                    }
+                                });
+                                egui::ScrollArea::vertical().id_salt("group-pending-list").max_height(180.0).show_rows(ui,24.0,self.groups_panel.pending_members.len(),|ui,range| {
+                                    for index in range {
+                                        let (uid,name)=&self.groups_panel.pending_members[index];
+                                        ui.horizontal(|ui| {
+                                            let width=(ui.available_width()-115.0).max(20.0);
+                                            ui.add_sized([width,24.0],egui::Label::new(name).truncate()).on_hover_text(format!("{name} • {uid}"));
+                                            for (label,approve) in [("Duyệt",true),("Từ chối",false)] {
+                                                if ui.button(label).clicked(){self.groups_panel.confirm=Some(crate::groups::Action::Review {members:vec![uid.clone()],approve});}
+                                            }
+                                        });
+                                    }
+                                });
+                            }
+                        });
                     }
                     if self.groups_panel.create || state.is_some() {
                         ui.label("Chọn liên hệ để mời");
-                        ui.text_edit_singleline(&mut self.groups_panel.query);
+                        ui.add(egui::TextEdit::singleline(&mut self.groups_panel.query).desired_width(ui.available_width()));
                         let query = crate::search::fold(&self.groups_panel.query);
                         egui::ScrollArea::vertical()
                             .id_salt("group-contact-picker")
@@ -224,6 +382,15 @@ impl ZaloGuiApp {
                                     member: self.groups_panel.member.clone(),
                                 });
                             }
+                            if manager
+                                && !self.groups_panel.member.is_empty()
+                                && ui.button("Chặn thành viên vào lại nhóm").clicked()
+                            {
+                                self.groups_panel.confirm = Some(crate::groups::Action::Ban {
+                                    members: vec![self.groups_panel.member.clone()],
+                                    blocked: true,
+                                });
+                            }
                             if owner {
                                 if ui.button("Thêm phó nhóm").clicked() {
                                     self.groups_panel.confirm =
@@ -260,6 +427,27 @@ impl ZaloGuiApp {
             if let Some(action) = self.groups_panel.confirm.clone() {
                 ui.separator();
                 let text = match &action {
+                    crate::groups::Action::UpgradeCommunity=>"Nâng cấp nhóm thành cộng đồng? Fork không có thao tác hoàn tác về nhóm thường.".into(),
+                    crate::groups::Action::Rename { name } => {
+                        format!("Đổi tên nhóm thành “{name}”?")
+                    }
+                    crate::groups::Action::Setting { .. } => {
+                        "Thay đổi thiết lập nhóm cho mọi thành viên?".into()
+                    }
+                    crate::groups::Action::RenewLink => {
+                        "Tạo link mời mới? Link cũ sẽ hết hiệu lực.".into()
+                    }
+                    crate::groups::Action::DisableLink => "Tắt link mời nhóm?".into(),
+                    crate::groups::Action::Review { members, approve } => format!(
+                        "{} {} người đang chờ?",
+                        if *approve { "Duyệt" } else { "Từ chối" },
+                        members.len()
+                    ),
+                    crate::groups::Action::Ban { members, blocked } => format!(
+                        "{} vào lại nhóm đối với {} người?",
+                        if *blocked { "Chặn" } else { "Bỏ chặn" },
+                        members.len()
+                    ),
                     crate::groups::Action::Disband => "Giải tán nhóm cho tất cả thành viên?".into(),
                     crate::groups::Action::Leave => {
                         "Rời nhóm? Lịch sử cục bộ được giữ nguyên.".into()
@@ -284,7 +472,7 @@ impl ZaloGuiApp {
                     _ => String::new(),
                 };
                 ui.label(text);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui
                         .add_enabled(!self.groups_panel.pending, egui::Button::new("Xác nhận"))
                         .clicked()
@@ -317,4 +505,33 @@ impl ZaloGuiApp {
             self.groups_panel.open = false;
         }
     }
+}
+
+fn group_link_qr(ctx: &egui::Context, url: &str) -> anyhow::Result<egui::TextureHandle> {
+    let code = qrcode::QrCode::new(url.as_bytes())?;
+    let width = code.width();
+    let scale = if width > 100 { 4 } else { 6 };
+    let side = (width + 8) * scale;
+    anyhow::ensure!(side <= 1024, "Link quá dài để hiển thị QR");
+    let mut pixels = vec![Color32::WHITE; side * side];
+    for y in 0..width {
+        for x in 0..width {
+            if code[(x, y)] == qrcode::Color::Dark {
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        pixels[((y + 4) * scale + dy) * side + (x + 4) * scale + dx] =
+                            Color32::BLACK;
+                    }
+                }
+            }
+        }
+    }
+    Ok(ctx.load_texture(
+        "group-invite-qr",
+        egui::ColorImage {
+            size: [side, side],
+            pixels,
+        },
+        egui::TextureOptions::NEAREST,
+    ))
 }

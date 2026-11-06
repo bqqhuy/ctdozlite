@@ -28,6 +28,10 @@ pub enum ToolsCommand {
         thread: String,
         id: String,
     },
+    OpenThread {
+        thread: String,
+        group: bool,
+    },
     OpenHit {
         thread: String,
         id: String,
@@ -286,6 +290,7 @@ impl ZaloGuiApp {
         if let Some((id, name, group)) = self
             .threads
             .get(self.selected_thread_index)
+            .filter(|t| self.private_access(&t.id, t.is_group))
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
         {
             ui.label(format!("Gửi tới: {name}"));
@@ -380,6 +385,9 @@ impl ZaloGuiApp {
         let mut action = None;
         let mut edit = None;
         for task in &self.tools.tasks {
+            if !self.private_access(&task.thread_id, task.thread_id.starts_with('g')) {
+                continue;
+            }
             let name = self
                 .threads
                 .iter()

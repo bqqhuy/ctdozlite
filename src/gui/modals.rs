@@ -52,6 +52,10 @@ impl ZaloGuiApp {
                             );
                         }
 
+                        if ui.button("Hồ sơ của tôi…").clicked() {
+                            self.open_own_profile();
+                            close_menu = true;
+                        }
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);
@@ -857,9 +861,9 @@ impl ZaloGuiApp {
                                                             RichText::new(truncate_chars(&self.settings.download_dir, 36))
                                                                 .size(12.0)
                                                                 .color(pal.text_muted),
-                                                        );
+                                                        ).on_hover_text(&self.settings.download_dir);
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            if ui.button(crate::i18n::tr("Thay đổi")).clicked() {
+                                                            if ui.add_enabled(!self.download_picker_pending,egui::Button::new(crate::i18n::tr("Thay đổi"))).clicked() {
                                                                 pick_dl_dir = true;
                                                             }
                                                             if ui.button(crate::i18n::tr("Mở thư mục")).clicked() {
@@ -947,8 +951,7 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Privacy => {
-                                            ui.heading(crate::i18n::tr("Quyền riêng tư tài khoản"));
-                                            ui.label(crate::i18n::tr("Các thiết lập quyền riêng tư trên máy chủ chưa được tích hợp. Hãy thay đổi trên ứng dụng Zalo chính thức; các nút cũ chỉ lưu cục bộ nên đã được gỡ để tránh hiểu nhầm."));
+                                            self.render_server_privacy(ui);
                                         }
                                         SettingsTab::Sync => {
                                             if ui.button("Nhập backup Zalo Desktop V2…").clicked(){self.backup_panel.open=true;open=false;}
@@ -1031,6 +1034,7 @@ impl ZaloGuiApp {
                                                 });
                                         }
                                         SettingsTab::Appearance => {
+                                            self.appearance_controls(ui);
                                             ui.label(RichText::new(crate::i18n::tr("Cài đặt giao diện")).color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(8.0);
                                             egui::Frame::none()
@@ -1219,7 +1223,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(crate::i18n::tr("Mã PIN")).color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.hidden_chat_pin_enabled, pal);
+                                                            if ui.button("Quản lý PIN máy chủ…").clicked(){self.hidden_panel.open=true;}
                                                         });
                                                     });
                                                 });
@@ -1400,22 +1404,39 @@ impl ZaloGuiApp {
             }
             self.show_toast("Đang cập nhật hội thoại và tin gần đây…");
         }
-        if pick_dl_dir {
+        if pick_dl_dir && !self.download_picker_pending {
+            self.download_picker_pending = true;
             let tx = self.event_tx.clone();
             let context = ctx.clone();
             std::thread::spawn(move || {
-                if let Some(path) = pick_native_folder_dialog() {
-                    let _ = tx.send(GuiEvent::DownloadFolderPicked(path));
-                    context.request_repaint();
-                }
+                let result = pick_native_folder_dialog().map(|path| {
+                    validate_download_folder(&path)
+                        .map(|()| path)
+                        .map_err(|error| format!("Không dùng được thư mục tải về: {error}"))
+                });
+                let _ = tx.send(GuiEvent::DownloadFolderPicked(result));
+                context.request_repaint();
             });
         }
         if open_dl_dir {
             let p = std::path::PathBuf::from(&self.settings.download_dir);
-            let _ = std::fs::create_dir_all(&p);
-            if !crate::platform::open_folder(std::path::Path::new(&p)) {
-                self.show_toast("Không mở được thư mục tải về");
-            }
+            let tx = self.event_tx.clone();
+            let context = ctx.clone();
+            std::thread::spawn(move || {
+                let result = std::fs::create_dir_all(&p)
+                    .map_err(|_| "Không tạo được thư mục tải về")
+                    .and_then(|()| {
+                        if crate::platform::open_folder(&p) {
+                            Ok(())
+                        } else {
+                            Err("Không mở được thư mục tải về")
+                        }
+                    });
+                if let Err(message) = result {
+                    let _ = tx.send(GuiEvent::DownloadFolderFailed(message.into()));
+                    context.request_repaint();
+                }
+            });
         }
 
         if !open {
@@ -2260,22 +2281,33 @@ impl ZaloGuiApp {
         if self.forward_msg.is_none() {
             return;
         }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.forward_msg = None;
+            self.forward_filter.clear();
+            return;
+        }
         let preview = self
             .forward_msg
             .as_ref()
-            .map(|m| {
-                if m.sticker_id.is_some() {
-                    "[Nhãn dán]".to_string()
-                } else {
-                    truncate_chars(&m.text, 80).into_owned()
-                }
-            })
+            .map(|m| truncate_chars(&crate::message_view::summary(m), 80).into_owned())
             .unwrap_or_default();
-        let query = self.forward_filter.to_lowercase();
+        let query = crate::search::fold(self.forward_filter.trim());
         let candidates: Vec<(String, String, bool)> = self
             .threads
             .iter()
-            .filter(|t| query.is_empty() || t.name.to_lowercase().contains(&query))
+            .filter(|t| {
+                self.private_access(&t.id, t.is_group)
+                    && !self
+                        .conversation_preferences
+                        .get(&t.id)
+                        .is_some_and(|prefs| prefs.hidden)
+            })
+            .filter(|t| {
+                query.is_empty()
+                    || crate::search::fold(&t.name).contains(&query)
+                    || t.id.contains(&query)
+            })
+            .take(500)
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
             .collect();
         let mut open = true;
@@ -2285,7 +2317,10 @@ impl ZaloGuiApp {
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(360.0, 420.0))
+            .fixed_size(Vec2::new(
+                360.0_f32.min((ctx.screen_rect().width() - 32.0).max(220.0)),
+                420.0_f32.min((ctx.screen_rect().height() - 64.0).max(180.0)),
+            ))
             .show(ctx, |ui| {
                 ui.label(
                     RichText::new(format!("Nội dung: {preview}"))
@@ -2300,13 +2335,13 @@ impl ZaloGuiApp {
                 );
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
-                    .max_height(320.0)
+                    .max_height((ctx.screen_rect().height() - 200.0).clamp(80.0, 320.0))
                     .show(ui, |ui| {
                         for (id, name, is_group) in &candidates {
                             let label = if *is_group {
-                                format!("[Nhóm] {name}")
+                                format!("[Nhóm] {name} • {id}")
                             } else {
-                                name.clone()
+                                format!("{name} • {id}")
                             };
                             let btn = egui::Button::new(RichText::new(label).size(13.5))
                                 .fill(pal.bg_input);
@@ -2321,13 +2356,23 @@ impl ZaloGuiApp {
                     });
             });
         if let Some((target_id, target_is_group)) = chosen {
-            if let (Some(msg), Some(tx)) = (self.forward_msg.take(), WORKER_TX.get()) {
-                let _ = tx.send(WorkerCmd::Forward {
-                    target_id,
-                    target_is_group,
-                    msg,
-                });
-                self.status_msg = "Đang chuyển tiếp…".into();
+            if let (Some(msg), Some(tx)) = (self.forward_msg.as_ref(), WORKER_TX.get()) {
+                if tx
+                    .send(WorkerCmd::Forward {
+                        target_id,
+                        target_is_group,
+                        msg: msg.clone(),
+                    })
+                    .is_ok()
+                {
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
+                    self.status_msg = "Đang chuyển tiếp…".into();
+                } else {
+                    self.show_toast("Worker chưa sẵn sàng; tin chưa được chuyển tiếp");
+                }
+            } else {
+                self.show_toast("Worker chưa sẵn sàng; tin chưa được chuyển tiếp");
             }
         } else if !open {
             self.forward_msg = None;
@@ -2335,7 +2380,11 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn open_media_viewer(&mut self, thread_id: &str, message: &ChatMessage) {
-        let Some(thread) = self.threads.iter().find(|t| t.id == thread_id) else {
+        let Some(thread) = self
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id && self.private_access(&t.id, t.is_group))
+        else {
             return;
         };
         let media = crate::message_view::media(message);
@@ -3064,5 +3113,33 @@ impl ZaloGuiApp {
                     ui.end_row();
                 });
             });
+    }
+}
+
+/// Verify the selected directory with an isolated temporary file, outside the UI thread.
+fn validate_download_folder(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(path.is_dir(), "Thư mục không còn tồn tại");
+    let mut probe = tempfile::Builder::new()
+        .prefix(".ctdozlite-write-")
+        .tempfile_in(path)?;
+    probe.write_all(b"write-check")?;
+    probe.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod download_folder_tests {
+    use super::*;
+    #[test]
+    fn validation_preserves_directory_and_rejects_files_or_missing_paths() {
+        let root = tempfile::tempdir().unwrap();
+        validate_download_folder(root.path()).unwrap();
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let file = root.path().join("a-file");
+        std::fs::write(&file, b"keep").unwrap();
+        assert!(validate_download_folder(&file).is_err());
+        assert!(validate_download_folder(&root.path().join("missing")).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"keep");
     }
 }

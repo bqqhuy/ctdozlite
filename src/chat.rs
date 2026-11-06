@@ -616,12 +616,17 @@ fn direct_zalo_photo(text: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SidebarPresentation {
+    pub inbox: crate::inbox::Metadata,
+    pub server_alias: Option<String>,
+    pub base_name: Option<String>,
+    pub archived: Option<bool>,
     #[serde(skip)]
     pub metadata_verified: bool,
     pub reaction_preview: Option<crate::reactions::Preview>,
     #[serde(skip)]
     pub reaction_preview_fresh: bool,
-    /// Latest server group send policy; absent means metadata has not been loaded.
+    /// Volatile permissions must be fetched again; membership versions do not validate cached ACLs.
+    #[serde(skip)]
     pub send_policy: Option<GroupSendPolicy>,
     /// Opaque sync partition identity; never used as an outbound recipient ID.
     pub global_id: String,
@@ -1284,6 +1289,15 @@ pub fn merge_thread_into(
                 >= avatar_url_time(target.avatar.as_deref()))
     {
         target.avatar = incoming.avatar;
+    }
+    target
+        .presentation
+        .inbox
+        .merge(&incoming.presentation.inbox, incoming_id_is_authoritative);
+    if incoming.presentation.archived.is_some()
+        && (incoming_id_is_authoritative || target.presentation.archived.is_none())
+    {
+        target.presentation.archived = incoming.presentation.archived;
     }
     if !incoming.presentation.global_id.is_empty() {
         target.presentation.global_id = incoming.presentation.global_id.clone();
@@ -4566,6 +4580,7 @@ pub(crate) async fn resolve_group_metadata(
     s: &Session,
     groups: &mut [Thread],
 ) -> Result<std::collections::HashSet<String>> {
+    let revision = s.group_revision.load(std::sync::atomic::Ordering::SeqCst);
     let mut removed = std::collections::HashSet::new();
     for chunk in groups.chunks_mut(50) {
         let versions: serde_json::Map<String, Value> =
@@ -4619,6 +4634,11 @@ pub(crate) async fn resolve_group_metadata(
                 // Retain membership and previously verified names on partial outage.
                 crate::logger::log_error("group metadata", &e.to_string());
             }
+        }
+    }
+    if revision != s.group_revision.load(std::sync::atomic::Ordering::SeqCst) {
+        for group in groups {
+            group.presentation.send_policy = None;
         }
     }
     Ok(removed)
@@ -4736,7 +4756,8 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
         .filter(|t| {
             !t.is_group
                 && !t.name.contains("Cloud của tôi")
-                && (t.name.starts_with("Người dùng ")
+                && (t.presentation.inbox.official_account.is_none()
+                    || t.name.starts_with("Người dùng ")
                     || t.name.is_empty()
                     || t.avatar.as_deref().unwrap_or("").is_empty())
         })
@@ -4748,6 +4769,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
             if let Ok(profiles) = get_mini_profiles(s, chunk).await {
                 for t in threads.iter_mut() {
                     if let Some(p) = profiles.get(&t.id) {
+                        t.presentation.inbox.apply_profile(p);
                         if t.name.starts_with("Người dùng ") || t.name.is_empty() {
                             if let Some(name) =
                                 pick_str(p, &["zaloName", "displayName", "name", "display_name"])
@@ -5948,6 +5970,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
 
             if let Some(thread_index) = threads.iter().position(|thread| thread.id == tid) {
                 let t = &mut threads[thread_index];
+                t.presentation.inbox.apply(entry);
                 let identities = &mut message_indices[thread_index];
                 if thread_is_group {
                     t.is_group = true;
@@ -6013,7 +6036,14 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
                 identities.insert(&parsed, 0);
                 message_indices.push(identities);
                 threads.push(Thread {
-                    presentation: Default::default(),
+                    presentation: SidebarPresentation {
+                        inbox: {
+                            let mut metadata = crate::inbox::Metadata::default();
+                            metadata.apply(entry);
+                            metadata
+                        },
+                        ..Default::default()
+                    },
                     unread: Default::default(),
                     id: tid,
                     name: default_name,
@@ -6146,42 +6176,50 @@ pub enum FriendshipStatus {
 /// Parse `/api/friend/reqstatus` (`cmd 11430`) JSON into `FriendshipStatus`
 /// (`compact-app-pc.js:8351970`: `is_friend`, `is_requested` = I requested you, `is_requesting` = you requested me).
 pub fn parse_friendship_status_response(resp: &Value) -> FriendshipStatus {
-    let d = resp
-        .get("data")
-        .and_then(|x| x.get("data").or(Some(x)))
-        .unwrap_or(resp);
-    let is_friend = d
-        .get("is_friend")
-        .or_else(|| d.get("isFriend"))
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
-        })
-        .unwrap_or(0);
-    if is_friend == 1 {
+    let mut d = resp;
+    for _ in 0..4 {
+        if d.get("error_code")
+            .is_some_and(|code| crate::api_response::integer(code) != Some(0))
+        {
+            return FriendshipStatus::Unknown;
+        }
+        if let Some(inner) = d.get("data").filter(|data| data.is_object()) {
+            d = inner;
+        } else {
+            break;
+        }
+    }
+    let flag = |snake: &str, camel: &str| {
+        let value = d.get(snake).or_else(|| d.get(camel))?;
+        match value {
+            Value::Bool(value) => Some(*value),
+            _ => match crate::api_response::integer(value)? {
+                0 => Some(false),
+                1 => Some(true),
+                _ => None,
+            },
+        }
+    };
+    if resp
+        .get("error_code")
+        .is_some_and(|code| crate::api_response::integer(code) != Some(0))
+    {
+        return FriendshipStatus::Unknown;
+    }
+    let friend = flag("is_friend", "isFriend");
+    let incoming = flag("is_requesting", "isRequesting");
+    let outgoing = flag("is_requested", "isRequested");
+    if friend == Some(true) {
         return FriendshipStatus::Friend;
     }
-    let is_requesting = d
-        .get("is_requesting")
-        .or_else(|| d.get("isRequesting"))
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
-        })
-        .unwrap_or(0);
-    if is_requesting == 1 {
+    if incoming == Some(true) {
         return FriendshipStatus::IncomingPending;
     }
-    let is_requested = d
-        .get("is_requested")
-        .or_else(|| d.get("isRequested"))
-        .and_then(|v| {
-            v.as_i64()
-                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
-        })
-        .unwrap_or(0);
-    if is_requested == 1 {
+    if outgoing == Some(true) {
         return FriendshipStatus::OutgoingPending;
+    }
+    if friend != Some(false) || incoming != Some(false) || outgoing != Some(false) {
+        return FriendshipStatus::Unknown;
     }
     FriendshipStatus::Stranger
 }
@@ -6970,6 +7008,22 @@ mod tests {
             parse_friendship_status_response(&r_stranger),
             FriendshipStatus::Stranger
         );
+    }
+
+    #[test]
+    fn incomplete_friendship_metadata_is_unknown_not_stranger() {
+        for response in [
+            json!({}),
+            json!({"error_code":0,"data":{}}),
+            json!({"data":{"is_friend":0}}),
+            json!({"error_code":600,"data":{"is_friend":0,"is_requested":0,"is_requesting":0}}),
+            json!({"error_code":0,"data":{"error_code":600,"data":{"is_friend":0,"is_requested":0,"is_requesting":0}}}),
+        ] {
+            assert_eq!(
+                parse_friendship_status_response(&response),
+                FriendshipStatus::Unknown
+            );
+        }
     }
 
     #[test]
@@ -7844,5 +7898,31 @@ mod group_send_policy_tests {
         );
         assert!(GroupSendPolicy::parse(&json!({})).is_none());
         assert!(GroupSendPolicy::parse(&json!({"setting":{"lockSendMsg":2}})).is_none());
+    }
+}
+
+#[cfg(test)]
+mod volatile_group_policy_tests {
+    use super::*;
+    #[test]
+    fn cached_sidebar_metadata_never_reinstates_an_old_group_send_permission() {
+        let metadata = SidebarPresentation {
+            send_policy: Some(GroupSendPolicy {
+                locked: false,
+                managers: vec!["12".into()],
+            }),
+            member_count: Some(50),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&metadata).unwrap();
+        assert!(json.get("send_policy").is_none());
+        let restored: SidebarPresentation = serde_json::from_value(json).unwrap();
+        assert!(restored.send_policy.is_none());
+        assert_eq!(restored.member_count, Some(50));
+        let legacy: SidebarPresentation = serde_json::from_value(
+            serde_json::json!({"send_policy":{"locked":false,"managers":["12"]}}),
+        )
+        .unwrap();
+        assert!(legacy.send_policy.is_none());
     }
 }

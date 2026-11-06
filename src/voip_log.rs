@@ -578,27 +578,25 @@ impl WireLog {
     }
 }
 
-/// Log the remote media parameters that settle the payload type: `codec` and `extendData`.
-/// `params` is the parsed `data.params` object of a control event (see `call::event_media_params`).
+/// Record signalling shape without retaining session material, media tokens or relay addresses.
+/// `params` is the parsed `data.params` object of a control event.
 pub fn log_signal_media(act: &str, params: &serde_json::Value) {
     if params.is_null() {
         return;
     }
-    let cut = |v: Option<&serde_json::Value>| -> String {
-        let s = match v {
-            None => "-".to_string(),
-            Some(serde_json::Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-        };
-        s.chars().take(1500).collect()
+    let length = |key| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map_or(0, str::len)
     };
     line(
         "SIG",
         format!(
-            "act={act} codec={} extendData={} rtpIP={}",
-            cut(params.get("codec")),
-            cut(params.get("extendData")),
-            cut(params.get("rtpIP")),
+            "act={act} has_codec={} extend_bytes={} has_relay={}",
+            params.get("codec").is_some(),
+            length("extendData"),
+            params.get("rtpIP").is_some()
         ),
     );
 }

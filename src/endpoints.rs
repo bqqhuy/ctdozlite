@@ -83,3 +83,6 @@ pub const RELEASE_REDIRECT_HOSTS: &[&str] = &[
 
 /// PC 26.11.10 getnuid adapter, command 12390.
 pub const ZNOISE: &str = "https://zwid.api.zalo.me";
+
+/// Public group invitation URLs recognized by the official join flow.
+pub const GROUP_INVITE_HOST: &str = "zalo.me";

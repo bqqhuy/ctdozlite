@@ -30,9 +30,15 @@ impl Snapshot {
     pub fn creator(&self) -> Option<&str> {
         self.info.get("creatorId")?.as_str()
     }
+    /// Creator IDs may be encoded as strings or integers by the group endpoints.
+    pub fn creator_is(&self, uid: &str) -> bool {
+        self.info.get("creatorId").is_some_and(|value| {
+            value.as_str() == Some(uid) || value.as_u64().is_some_and(|id| id.to_string() == uid)
+        })
+    }
     /// Whether a user has a management role in the current snapshot.
     pub fn manager(&self, uid: &str) -> bool {
-        self.creator() == Some(uid)
+        self.creator_is(uid)
             || self
                 .info
                 .get("adminIds")
@@ -56,14 +62,22 @@ const FRESH: Duration = Duration::from_secs(15);
 
 /// Invalidate permissions after a group mutation or a relevant server control.
 pub fn invalidate(session: &Session, group: Option<&str>) {
+    session
+        .group_revision
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let group = group.and_then(|group| canonical_group(group).ok());
     if let Ok(mut cache) = CACHE.get_or_init(Default::default).lock() {
         cache.retain(|(runtime, owner, id), _| {
             *runtime != session.runtime_id()
                 || owner != session.account_key()
-                || group.is_some_and(|group| id != group)
+                || group.as_ref().is_some_and(|group| id != group)
         });
     }
 }
+fn canonical_group(group: &str) -> Result<String> {
+    Ok(crate::server_pins::identity(group, true)?[1..].to_owned())
+}
+
 /// Fetch once for concurrent sends; no cache lock is held while awaiting network I/O.
 /// # Errors
 /// Propagates metadata/authentication errors; absent permissions never become success.
@@ -72,6 +86,11 @@ pub async fn snapshot(session: &Session, group: &str, refresh: bool) -> Result<S
         session.is_active() && !session.account_key().is_empty(),
         "Phiên làm việc đã đóng"
     );
+    let revision = session
+        .group_revision
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let canonical = canonical_group(group)?;
+    let group = canonical.as_str();
     let key = (
         session.runtime_id(),
         session.account_key().to_owned(),
@@ -136,6 +155,13 @@ pub async fn snapshot(session: &Session, group: &str, refresh: bool) -> Result<S
         })
         .await;
     ensure!(session.is_active(), "Phiên làm việc đã đóng");
+    ensure!(
+        revision
+            == session
+                .group_revision
+                .load(std::sync::atomic::Ordering::SeqCst),
+        "Quyền nhóm đã thay đổi; cần tải lại"
+    );
     result.clone().map_err(anyhow::Error::msg)
 }
 
@@ -143,6 +169,14 @@ pub async fn snapshot(session: &Session, group: &str, refresh: bool) -> Result<S
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn group_aliases_share_one_permission_cache_identity() {
+        for group in ["123", "g123", "group_123"] {
+            assert_eq!(canonical_group(group).unwrap(), "123");
+        }
+        assert!(canonical_group("not-a-group").is_err());
+    }
+
     #[test]
     fn missing_and_removed_group_never_grant_send_permission() {
         let absent = Snapshot {
@@ -164,5 +198,23 @@ mod tests {
         };
         assert!(value.can_send("admin").unwrap());
         assert!(!value.can_send("member").unwrap());
+    }
+}
+
+#[cfg(test)]
+mod numeric_role_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn numeric_creator_and_admin_ids_keep_their_roles() {
+        let snapshot = Snapshot {
+            info: json!({"creatorId":12,"adminIds":["34",56]}),
+            removed: false,
+        };
+        assert!(snapshot.creator_is("12"));
+        assert!(snapshot.manager("12"));
+        assert!(snapshot.manager("34"));
+        assert!(snapshot.manager("56"));
+        assert!(!snapshot.manager("99"));
     }
 }

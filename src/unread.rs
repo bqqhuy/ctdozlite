@@ -436,7 +436,15 @@ pub fn parse_manual_unread_marks(response: &Value) -> anyhow::Result<Vec<ManualU
 
 pub fn merge_manual_unread_marks(threads: &mut [Thread], marks: &[ManualUnreadMark]) {
     for thread in threads {
-        thread.unread.marked_unread = marks.iter().any(|mark| mark.thread_id == thread.id);
+        thread.unread.marked_unread = marks.iter().any(|mark| {
+            crate::server_pins::identity(&thread.id, thread.is_group)
+                .ok()
+                .zip(
+                    crate::server_pins::identity(&mark.thread_id, mark.thread_id.starts_with('g'))
+                        .ok(),
+                )
+                .is_some_and(|(thread, mark)| thread == mark)
+        });
         thread.unread.settings_fresh = true;
         thread.unread.fresh = true;
     }
@@ -557,5 +565,154 @@ mod foreground_mention_tests {
         assert!(state.has_unread_mentions());
         state.mention_ids.remove("2");
         assert!(!state.has_unread_mentions());
+    }
+}
+
+/// One explicit server manual-mark intent; viewing a conversation does not invoke it.
+#[derive(Clone, Debug)]
+pub enum MarkAction {
+    Refresh,
+    Add(Box<ChatMessage>),
+    Remove,
+}
+/// Build the PC adapter's double-encoded `param` body.
+/// # Errors
+/// Adding a mark requires an exact latest message identity, sender UID and timestamp.
+pub fn manual_mark_params(
+    session: &crate::session::Session,
+    target: &str,
+    group: bool,
+    action: &MarkAction,
+    now: i64,
+) -> anyhow::Result<(&'static str, Value)> {
+    use anyhow::{ensure, Context};
+    let identity = crate::server_pins::identity(target, group)?;
+    let bare = if group { &identity[1..] } else { &identity };
+    let mut inner = serde_json::json!({"convsGroup":[],"convsUser":[]});
+    let key = if group { "convsGroup" } else { "convsUser" };
+    let path = match action {
+        MarkAction::Refresh => anyhow::bail!("Đọc dấu chưa đọc không cần tham số cập nhật"),
+        MarkAction::Add(message) => {
+            let from = if message.is_outgoing {
+                session.account_key().to_owned()
+            } else {
+                crate::chat::sidebar_sender_id(message)
+                    .context("Chưa xác minh người gửi của tin cuối")?
+            };
+            let client = &message.client_message_id;
+            // PC MarkUnreadFetcher.add stamps the action time, not the message timestamp.
+            let ts = now;
+            ensure!(
+                !client.is_empty()
+                    && client.len() <= 64
+                    && client.bytes().all(|b| b.is_ascii_digit())
+                    && !from.is_empty()
+                    && from.len() <= 32
+                    && from.bytes().all(|b| b.is_ascii_digit())
+                    && ts > 0,
+                "Chưa có đủ định danh tin cuối để đánh dấu trên máy chủ"
+            );
+            inner[key] = serde_json::json!([{"id":bare,"cliMsgId":client,"fromUid":from,"ts":ts}]);
+            inner["imei"] = serde_json::json!(session.imei);
+            "/api/conv/addUnreadMark"
+        }
+        MarkAction::Remove => {
+            ensure!(now > 0, "Mốc thời gian không hợp lệ");
+            inner[key] = serde_json::json!([bare]);
+            inner["convsGroupData"] = serde_json::json!([]);
+            inner["convsUserData"] = serde_json::json!([]);
+            inner[if group {
+                "convsGroupData"
+            } else {
+                "convsUserData"
+            }] = serde_json::json!([{"id":bare,"ts":now}]);
+            "/api/conv/removeUnreadMark"
+        }
+    };
+    Ok((
+        path,
+        serde_json::json!({"param":serde_json::to_string(&inner)?}),
+    ))
+}
+/// Execute at most one mutation and reconcile all marks after an explicit acknowledgement.
+/// # Errors
+/// Returns uncertain acknowledgement/transport failures without retrying a mutation.
+pub async fn update_manual_mark(
+    session: &crate::session::Session,
+    target: &str,
+    group: bool,
+    action: &MarkAction,
+) -> anyhow::Result<Vec<ManualUnreadMark>> {
+    anyhow::ensure!(
+        session.is_active() && !session.account_key().is_empty(),
+        "Phiên tài khoản đã thay đổi"
+    );
+    if !matches!(action, MarkAction::Refresh) {
+        let (path, body) = manual_mark_params(
+            session,
+            target,
+            group,
+            action,
+            crate::login::unix_now() * 1000,
+        )?;
+        let params = session.encoded_params(&body)?;
+        let raw = session
+            .post_form(
+                &format!(
+                    "{}{path}?{}",
+                    session.domains.conversation,
+                    session.common_params()
+                ),
+                format!("params={params}"),
+            )
+            .await?;
+        let raw = session
+            .maybe_decrypt(raw, session.session_key_bytes())
+            .await;
+        anyhow::ensure!(
+            raw.get("error_code").is_some(),
+            "Thiếu xác nhận đánh dấu từ máy chủ"
+        );
+        crate::api_response::checked_data(raw)?;
+    }
+    anyhow::ensure!(session.is_active(), "Phiên tài khoản đã thay đổi");
+    let marks = fetch_manual_unread_marks(session).await?;
+    if !matches!(action, MarkAction::Refresh) {
+        let expected = crate::server_pins::identity(target, group)?;
+        let present = marks.iter().find(|mark| mark.thread_id == expected);
+        let applied = match action {
+            MarkAction::Add(message) => {
+                present.is_some_and(|mark| mark.client_message_id == message.client_message_id)
+            }
+            MarkAction::Remove => present.is_none(),
+            MarkAction::Refresh => true,
+        };
+        anyhow::ensure!(
+            applied,
+            "Chưa xác nhận máy chủ đã áp dụng dấu chưa đọc; tải lại trước khi thử tiếp"
+        );
+    }
+    Ok(marks)
+}
+#[cfg(test)]
+mod manual_mutation_tests {
+    use super::*;
+    #[test]
+    fn mark_requires_message_identity_and_preserves_the_pc_nested_param() {
+        let session = crate::session::Session::new(false, false, false).unwrap();
+        let (path, params) =
+            manual_mark_params(&session, "g123", true, &MarkAction::Remove, 1700000000000).unwrap();
+        assert_eq!(path, "/api/conv/removeUnreadMark");
+        let inner: Value = serde_json::from_str(params["param"].as_str().unwrap()).unwrap();
+        assert_eq!(inner["convsGroup"], serde_json::json!(["123"]));
+        assert_eq!(inner["convsGroupData"][0]["ts"], 1700000000000_i64);
+        assert!(manual_mark_params(
+            &session,
+            "123",
+            false,
+            &MarkAction::Add(Box::default()),
+            1700000000000
+        )
+        .is_err());
     }
 }

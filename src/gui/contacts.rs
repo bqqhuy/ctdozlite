@@ -1,7 +1,7 @@
 //! Contacts page: friends and groups from loaded conversations, grouped A–Z.
 //!
 //! Lists only identities the client already holds (friend list and conversations); it shows
-//! no invitations because the client does not fetch them.
+//! Group invitations and public username lookup use separate account-scoped panels.
 
 use super::*;
 
@@ -51,9 +51,28 @@ pub(super) fn contact_sections(
 }
 
 impl ZaloGuiApp {
+    fn visible_contact_sections(&self, tab: ContactsTab, query: &str) -> Vec<(char, Vec<usize>)> {
+        let mut sections =
+            contact_sections(&self.threads, &self.conversation_preferences, tab, query);
+        for (_, indices) in &mut sections {
+            indices.retain(|index| {
+                let thread = &self.threads[*index];
+                self.private_access(&thread.id, thread.is_group)
+                    && (thread.is_group
+                        || self
+                            .inbox_policy
+                            .friends
+                            .as_ref()
+                            .is_none_or(|friends| friends.contains(&thread.id)))
+            });
+        }
+        sections.retain(|(_, indices)| !indices.is_empty());
+        sections
+    }
+
     pub(super) fn render_contacts_page(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let count = |tab| {
-            contact_sections(&self.threads, &self.conversation_preferences, tab, "")
+            self.visible_contact_sections(tab, "")
                 .iter()
                 .map(|(_, items)| items.len())
                 .sum::<usize>()
@@ -70,12 +89,18 @@ impl ZaloGuiApp {
                     .inner_margin(Margin::symmetric(12.0, 14.0)),
             )
             .show(ctx, |ui| {
+                if ui.button("Tra cứu username / bạn thân…").clicked() {
+                    self.open_username_lookup();
+                }
                 ui.label(
                     RichText::new(crate::i18n::tr("Danh bạ"))
                         .size(16.0)
                         .strong()
                         .color(pal.text_primary),
                 );
+                if ui.button("Lời mời nhóm / Tham gia qua link…").clicked() {
+                    self.open_group_entry();
+                }
                 if ui.button("Tạo nhóm").clicked() {
                     self.open_group_panel(String::new(), true, true);
                 }
@@ -122,12 +147,7 @@ impl ZaloGuiApp {
                 }
             });
 
-        let sections = contact_sections(
-            &self.threads,
-            &self.conversation_preferences,
-            self.contacts_tab,
-            &self.contacts_query,
-        );
+        let sections = self.visible_contact_sections(self.contacts_tab, &self.contacts_query);
         let mut open: Option<usize> = None;
         egui::CentralPanel::default()
             .frame(

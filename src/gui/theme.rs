@@ -975,7 +975,11 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
     }
     mono.push("lucide_font".to_owned());
 
-    ctx.set_fonts(fonts);
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("available-ui-fonts"), fonts.clone()));
+    let family = ctx
+        .data(|data| data.get_temp::<String>(egui::Id::new("preferred-ui-font")))
+        .unwrap_or_default();
+    select_font(ctx, &family);
 }
 
 #[cfg(test)]
@@ -1081,5 +1085,204 @@ mod name_truncation_tests {
         assert_eq!(truncate_chars("A👨‍👩‍👧‍👦B", 2), "A👨‍👩‍👧‍👦…");
         assert_eq!(truncate_chars("a\u{0301}b", 1), "a\u{0301}…");
         assert_eq!(truncate_chars("🇻🇳", 1), "🇻🇳");
+    }
+}
+
+/// Persist only bundled/installed choices; configuration never loads arbitrary font paths.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
+pub(super) struct AppearanceSettings {
+    pub font: String,
+    pub zoom: f32,
+    pub custom_colors: bool,
+    pub primary: [u8; 3],
+    pub accent: [u8; 3],
+    pub bubble: [u8; 3],
+}
+impl Default for AppearanceSettings {
+    fn default() -> Self {
+        Self {
+            font: "bundled".into(),
+            zoom: 1.0,
+            custom_colors: false,
+            primary: [0, 104, 255],
+            accent: [55, 156, 90],
+            bubble: [220, 237, 255],
+        }
+    }
+}
+impl AppearanceSettings {
+    pub(super) fn apply_context(&self, ctx: &egui::Context) {
+        let zoom = if self.zoom.is_finite() {
+            self.zoom.clamp(0.8, 1.5)
+        } else {
+            1.0
+        };
+        ctx.set_zoom_factor(zoom);
+        select_font(ctx, &self.font);
+    }
+    pub(super) fn apply_palette(&self, palette: &mut ThemePalette) {
+        if self.custom_colors {
+            palette.primary = Color32::from_rgb(self.primary[0], self.primary[1], self.primary[2]);
+            // Existing primary-filled buttons use white text. Keep their contrast while
+            // choosing a separate readable foreground for links and selected labels.
+            while contrast_ratio(Color32::WHITE, palette.primary) < 4.5 {
+                palette.primary = Color32::from_rgb(
+                    (f32::from(palette.primary.r()) * 0.9) as u8,
+                    (f32::from(palette.primary.g()) * 0.9) as u8,
+                    (f32::from(palette.primary.b()) * 0.9) as u8,
+                );
+            }
+            palette.primary_hover = readable_foreground(
+                Color32::from_rgb(self.primary[0], self.primary[1], self.primary[2]),
+                &[palette.bg_app, palette.bg_sidebar, palette.bg_elevated],
+            );
+            palette.accent_online = readable_foreground(
+                Color32::from_rgb(self.accent[0], self.accent[1], self.accent[2]),
+                &[palette.bg_app, palette.bg_sidebar],
+            );
+            palette.bubble_out_bg =
+                Color32::from_rgb(self.bubble[0], self.bubble[1], self.bubble[2]);
+        }
+    }
+}
+
+fn select_font(ctx: &egui::Context, choice: &str) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new("preferred-ui-font"), choice.to_owned()));
+    let Some(mut fonts) = ctx
+        .data(|data| data.get_temp::<egui::FontDefinitions>(egui::Id::new("available-ui-fonts")))
+    else {
+        return;
+    };
+    let primary = match choice {
+        "system" if fonts.font_data.contains_key("vietnamese_font") => "vietnamese_font",
+        _ => "bundled_sans",
+    };
+    let family = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    family.retain(|name| name != primary);
+    family.insert(0, primary.to_owned());
+    ctx.set_fonts(fonts);
+}
+
+impl ZaloGuiApp {
+    pub(super) fn appearance_controls(&mut self, ui: &mut egui::Ui) {
+        let before = self.settings.appearance.clone();
+        let settings = &mut self.settings.appearance;
+        ui.separator();
+        ui.label("Phông chữ và kích thước");
+        egui::ComboBox::from_id_salt("ui-font")
+            .selected_text(if settings.font == "system" {
+                "Phông hệ thống (có dự phòng)"
+            } else {
+                "Be Vietnam Pro"
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut settings.font, "bundled".into(), "Be Vietnam Pro");
+                ui.selectable_value(
+                    &mut settings.font,
+                    "system".into(),
+                    "Phông hệ thống (có dự phòng)",
+                );
+            });
+        ui.add(egui::Slider::new(&mut settings.zoom, 0.8..=1.5).text("Tỷ lệ giao diện"));
+        ui.horizontal_wrapped(|ui| {
+            for (label, zoom) in [("Nhỏ", 0.9), ("Chuẩn", 1.0), ("Lớn", 1.2)] {
+                if ui.button(label).clicked() {
+                    settings.zoom = zoom;
+                }
+            }
+        });
+        ui.checkbox(&mut settings.custom_colors, "Tùy chỉnh màu");
+        if settings.custom_colors {
+            ui.horizontal_wrapped(|ui| {
+                for (name, primary, accent, bubble) in [
+                    ("Xanh dương", [0, 104, 255], [0, 130, 110], [220, 238, 255]),
+                    ("Xanh lá", [0, 120, 85], [30, 110, 160], [218, 242, 228]),
+                    ("Tím", [110, 70, 190], [0, 125, 130], [238, 226, 250]),
+                ] {
+                    if ui.button(name).clicked() {
+                        settings.primary = primary;
+                        settings.accent = accent;
+                        settings.bubble = bubble;
+                    }
+                }
+            });
+            for (label, rgb) in [
+                ("Màu chính", &mut settings.primary),
+                ("Trạng thái", &mut settings.accent),
+                ("Bong bóng gửi", &mut settings.bubble),
+            ] {
+                ui.horizontal(|ui| {
+                    ui.label(label);
+                    ui.color_edit_button_srgb(rgb);
+                });
+            }
+        }
+        if ui.button("Khôi phục giao diện mặc định").clicked() {
+            *settings = Default::default();
+        }
+        if *settings != before {
+            self.theme_dirty = true;
+            // Save once after interaction rather than for every frame of a color drag.
+            ui.ctx().request_repaint();
+        }
+        if ui.button("Lưu tùy chỉnh giao diện").clicked() {
+            self.save_settings();
+        }
+        let palette = self.palette();
+        egui::Frame::none()
+            .fill(palette.bubble_out_bg)
+            .inner_margin(8.0)
+            .rounding(8.0)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Xem trước: Tiếng Việt có dấu • 😀")
+                        .color(palette.bubble_out_text),
+                );
+                ui.label(RichText::new("12:30 • Đã gửi").color(palette.bubble_out_meta));
+            });
+    }
+}
+
+#[cfg(test)]
+mod customization_tests {
+    use super::*;
+    #[test]
+    fn custom_bubble_keeps_text_readable_in_both_modes_and_settings_roundtrip() {
+        let settings = AppearanceSettings {
+            custom_colors: true,
+            bubble: [255, 255, 255],
+            ..Default::default()
+        };
+        let parsed: AppearanceSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(settings, parsed);
+        for mut palette in [ThemePalette::light(), ThemePalette::dark()] {
+            settings.apply_palette(&mut palette);
+            palette.ensure_readable_text();
+            assert!(contrast_ratio(Color32::WHITE, palette.primary) >= 4.5);
+            assert!(contrast_ratio(palette.bubble_out_text, palette.bubble_out_bg) >= 4.5);
+            assert!(contrast_ratio(palette.bubble_out_meta, palette.bubble_out_bg) >= 4.5);
+        }
+    }
+    #[test]
+    fn unknown_font_and_invalid_scale_fall_back_without_reading_paths() {
+        let ctx = egui::Context::default();
+        setup_custom_fonts(&ctx);
+        AppearanceSettings {
+            font: "../../untrusted.ttf".into(),
+            zoom: f32::NAN,
+            ..Default::default()
+        }
+        .apply_context(&ctx);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.label("Tiếng Việt 😀");
+            });
+        });
+        assert_eq!(ctx.zoom_factor(), 1.0);
     }
 }

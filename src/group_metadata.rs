@@ -52,7 +52,8 @@ pub(crate) async fn refresh(
             group.presentation.members = cached.presentation.members.clone();
             group.presentation.member_count = cached.presentation.member_count;
             group.presentation.global_id = cached.presentation.global_id.clone();
-            group.presentation.send_policy = cached.presentation.send_policy.clone();
+            // Membership versions authorize display caching, not current send permissions.
+            group.presentation.send_policy = None;
         } else {
             missing.push(group.clone());
         }
@@ -82,6 +83,24 @@ pub(crate) async fn refresh(
         for (id,version,data) in saved {tx.execute("INSERT INTO group_metadata VALUES(?1,?2,?3) ON CONFLICT(thread_id) DO UPDATE SET version=excluded.version,data=excluded.data",rusqlite::params![id,version,data])?;}tx.commit()?;Ok(())}).await??;
     Ok(removed)
 }
+/// Forget derived display metadata after a group mutation, even when its membership version is unchanged.
+/// # Errors
+/// Returns local cache errors; no history, messages or membership state is deleted.
+pub(crate) async fn invalidate(session: &Session, group: &str) -> Result<()> {
+    let identity = crate::server_pins::identity(group, true)?;
+    let bare = identity[1..].to_owned();
+    let account = session.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let store = crate::store::MessageStore::open(account.history_path())?;
+        store.conn.execute(
+            "DELETE FROM group_metadata WHERE thread_id IN (?1,?2,?3)",
+            rusqlite::params![bare, identity, format!("group_{bare}")],
+        )?;
+        Ok(())
+    })
+    .await?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

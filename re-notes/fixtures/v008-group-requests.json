@@ -1,0 +1,11 @@
+[
+  {"case":"rename","path":"/api/group/updateinfo","get":false,"body":{"grid":"123","gname":"Nhóm 😀","imei":""}},
+  {"case":"lock_name","path":"/api/group/setting/update","get":true,"body":{"grid":"123","blockName":1,"imei":""}},
+  {"case":"approval","path":"/api/group/setting/update","get":true,"body":{"grid":"123","joinAppr":1,"imei":""}},
+  {"case":"link","path":"/api/group/link/detail","get":true,"body":{"grid":"123","imei":""}},
+  {"case":"disable_link","path":"/api/group/link/disable","get":true,"body":{"grid":"123"}},
+  {"case":"pending","path":"/api/group/pending-mems/list","get":true,"body":{"grid":"123","imei":""}},
+  {"case":"review","path":"/api/group/pending-mems/review","get":true,"body":{"grid":"123","members":["456"],"isApprove":1}},
+  {"case":"blocked","path":"/api/group/blockedmems/list","get":true,"body":{"grid":"123","page":1,"count":50,"imei":""}},
+  {"case":"ban","path":"/api/group/blockedmems/add","get":true,"body":{"grid":"123","members":["456"]}}
+]

@@ -1,5 +1,6 @@
 use super::*;
 pub(super) struct DownloadView {
+    pub thread: Option<(String, bool)>,
     pub name: String,
     pub bytes: u64,
     pub total: Option<u64>,
@@ -49,6 +50,8 @@ impl ZaloGuiApp {
                                         if ui.button(crate::i18n::tr("Mở tệp")).clicked() {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::OpenDownloaded {
+                                                    owner: self.user_uin.clone(),
+                                                    thread: d.thread.clone(),
                                                     path: path.clone(),
                                                     folder: false,
                                                 });
@@ -57,6 +60,8 @@ impl ZaloGuiApp {
                                         if ui.button(crate::i18n::tr("Mở thư mục")).clicked() {
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::OpenDownloaded {
+                                                    owner: self.user_uin.clone(),
+                                                    thread: d.thread.clone(),
                                                     path: path.clone(),
                                                     folder: true,
                                                 });
