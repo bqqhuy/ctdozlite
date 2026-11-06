@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.009-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.008-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.008-arm).
+Nhãn sản phẩm `v0.009-arm`, phiên bản số Windows `0.0.10`.
+
+Bản phát hành tích hợp trọn vẹn 3 khối tính năng R11, R12, R13 theo lộ trình Parity với Zalo PC và Zalo Web:
+
+### Khối R11: Tin nhắn đa phương tiện & Cuộc gọi (Rich Media Messaging & Calls)
+- **Danh thiếp (Contact Card)**: Hỗ trợ trọn vẹn việc gửi và hiển thị danh thiếp cá nhân qua API Zalo (`/api/message/contact` và `/api/group/contact`), hiển thị widget danh thiếp chuẩn Zalo với avatar, tên, số điện thoại và nút nhắn tin nhanh.
+- **Thao tác tin nhắn hàng loạt (Batch Forward & Recall)**: Bổ sung chế độ chọn nhiều tin (`SelectionMode`), checkbox chọn từng tin nhắn, thanh công cụ nổi (Floating Action Bar), hỗ trợ chuyển tiếp hàng loạt (`mforward`) và thu hồi hàng loạt (`multi_undo`).
+- **Ghi âm & Tin nhắn thoại (Voice Message)**: Tích hợp engine ghi âm giọng nói qua WASAPI native Windows, đo và hiển thị thanh sóng âm động (waveform RMS), hỗ trợ nghe thử trước khi gửi và đóng gói tệp WAV gửi qua API Zalo.
+- **Tìm kiếm Sticker tiếng Việt**: Hỗ trợ tìm kiếm bộ nhãn dán theo từ khoá tiếng Việt có dấu/không dấu ngay trong Sticker Picker.
+- **Tín hiệu chia sẻ màn hình (Screen Sharing Signaling)**: Bổ sung lệnh gửi/nhận tín hiệu chia sẻ màn hình trong cuộc gọi 1-1 (command 12064) và cuộc gọi nhóm (command 12044).
+- **Nâng cấp Media Viewer**: Xem ảnh nâng cao với điều khiển Zoom (phóng to/thu nhỏ), Pan (kéo rê), xoay góc, duyệt album (ảnh trước/sau), sao chép vào bộ nhớ tạm (Copy to Clipboard) và lưu tệp.
+
+### Khối R12: Cộng tác & Tự động hoá (Collaboration & Automation)
+- **To-do / Giao việc & Nhắc việc nhóm**: Mô hình dữ liệu và API tạo việc, cập nhật trạng thái hoàn thành và lấy danh sách to-do (`/api/group/todo/create`, `/api/group/todo/update`, `/api/group/todo/list`). Hiển thị widget công việc trực quan ngay trong tin nhắn và tab quản lý trong Tools panel.
+- **Bình chọn nhóm (Poll / Vote)**: API tạo cuộc bình chọn, bỏ phiếu và xem chi tiết kết quả (`/api/group/poll/create`, `/api/group/poll/vote`, `/api/group/poll/detail`). Widget bình chọn tương tác hiển thị tỷ lệ % phiếu bầu theo thời gian thực.
+- **Tin nhắn nhanh & Gõ tắt (Quick Messages)**: Tự động mở rộng nội dung mẫu khi gõ ký tự phím tắt bắt đầu bằng `/` (ví dụ: `/dc` ra địa chỉ nhận hàng, `/stk` ra thông tin chuyển khoản ngân hàng) trong composer. Giao diện quản lý thêm/sửa/xoá mẫu tin nhắn nhanh trong Tools panel.
+
+### Khối R13: Bảo mật & Quản lý thiết bị (Security & E2EE)
+- **Quản lý thiết bị đăng nhập**: Tích hợp API lấy danh sách các phiên thiết bị đang hoạt động (`/api/login/getdevicelist`), nhận diện chính xác phiên Windows 11 ARM64 hiện tại.
+- **Đăng xuất từ xa (Remote Kick)**: Hỗ trợ đá/đăng xuất các phiên đăng nhập lạ hoặc trên thiết bị khác từ xa qua `/api/login/kickdevice`.
+- **E2EE Badge**: Hiển thị biểu tượng khoá mã hoá đầu cuối trên danh sách hội thoại và bong bóng tin nhắn.
+
+---
+
 ## v0.008-arm — Windows 11 ARM64 — 06/11/2026
 
 Thay đổi so với [v0.007-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.007-arm).
