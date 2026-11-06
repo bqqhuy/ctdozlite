@@ -3368,6 +3368,24 @@ impl ZaloGuiApp {
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                                         let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
                                         let (response, cursor) = if is_voice_active {
+                                            let is_recording = self.voice_recorder.is_some();
+                                            let dur = if let Some(ref rec) = self.voice_recorder {
+                                                rec.duration()
+                                            } else if let Some((_, _, ref d)) = self.recorded_voice_samples {
+                                                *d
+                                            } else {
+                                                std::time::Duration::ZERO
+                                            };
+                                            let fallback_wave = vec![0.3, 0.5, 0.8, 0.4, 0.6, 0.3, 0.7, 0.9, 0.5, 0.4];
+                                            let waveform = if let Some(ref rec) = self.voice_recorder {
+                                                rec.waveform()
+                                            } else {
+                                                fallback_wave
+                                            };
+                                            let is_preview_playing = self.voice_preview.as_ref().is_some_and(|p| p.is_playing());
+                                            let preview_samples = self.recorded_voice_samples.as_ref().map(|(s, r, _)| (s.clone(), *r));
+
+                                            let mut action = VoiceBarAction::None;
                                             egui::ScrollArea::vertical()
                                                 .id_salt(("chat_composer_scroll", &thread_id))
                                                 .max_width(input_w)
@@ -3377,8 +3395,34 @@ impl ZaloGuiApp {
                                                 .max_height(editor_height)
                                                 .stick_to_bottom(true)
                                                 .show(ui, |ui| {
-                                                    self.render_voice_recording_bar(ui, &thread_id, is_group, pal, input_w);
+                                                    action = Self::render_voice_recording_bar(
+                                                        ui,
+                                                        pal,
+                                                        input_w,
+                                                        is_recording,
+                                                        dur,
+                                                        &waveform,
+                                                        is_preview_playing,
+                                                        preview_samples,
+                                                    );
                                                 });
+
+                                            match action {
+                                                VoiceBarAction::StopRecording => self.toggle_voice_recorder(),
+                                                VoiceBarAction::CancelRecording => self.cancel_voice_recording(),
+                                                VoiceBarAction::StopPreview => {
+                                                    if let Some(prev) = self.voice_preview.take() {
+                                                        prev.stop();
+                                                    }
+                                                }
+                                                VoiceBarAction::TogglePreview(samples, rate) => {
+                                                    if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples, rate) {
+                                                        self.voice_preview = Some(prev);
+                                                    }
+                                                }
+                                                VoiceBarAction::None => {}
+                                            }
+
                                             let (_, resp) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
                                             (resp, 0)
                                         } else {
@@ -4884,18 +4928,20 @@ impl ZaloGuiApp {
     }
 
     fn render_voice_recording_bar(
-        &mut self,
         ui: &mut egui::Ui,
-        thread_id: &str,
-        is_group: bool,
         pal: &ThemePalette,
         input_w: f32,
-    ) {
+        is_recording: bool,
+        dur: std::time::Duration,
+        waveform: &[f32],
+        is_preview_playing: bool,
+        preview_samples: Option<(Vec<f32>, u32)>,
+    ) -> VoiceBarAction {
+        let mut action = VoiceBarAction::None;
         ui.allocate_ui_with_layout(
             Vec2::new(input_w, 34.0),
             Layout::left_to_right(Align::Center),
             |ui| {
-                let is_recording = self.voice_recorder.is_some();
                 if is_recording {
                     ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
                     ui.label(RichText::new("🔴 Ghi âm…").color(pal.danger).strong().size(12.5));
@@ -4903,13 +4949,6 @@ impl ZaloGuiApp {
                     ui.label(RichText::new("⏹ Đã ghi âm").color(pal.primary).strong().size(12.5));
                 }
 
-                let dur = if let Some(ref rec) = self.voice_recorder {
-                    rec.duration()
-                } else if let Some((_, _, ref d)) = self.recorded_voice_samples {
-                    *d
-                } else {
-                    std::time::Duration::ZERO
-                };
                 let total_secs = dur.as_secs();
                 ui.label(
                     RichText::new(format!("{:02}:{:02}", total_secs / 60, total_secs % 60))
@@ -4920,11 +4959,6 @@ impl ZaloGuiApp {
 
                 ui.add_space(6.0);
 
-                let waveform = if let Some(ref rec) = self.voice_recorder {
-                    rec.waveform()
-                } else {
-                    vec![0.3, 0.5, 0.8, 0.4, 0.6, 0.3, 0.7, 0.9, 0.5, 0.4]
-                };
                 let bar_count = 14;
                 let bar_w = 4.0;
                 for level in waveform.iter().rev().take(bar_count) {
@@ -4941,27 +4975,31 @@ impl ZaloGuiApp {
                 ui.add_space(6.0);
 
                 if !is_recording {
-                    let playing = self.voice_preview.as_ref().is_some_and(|p| p.is_playing());
-                    let lbl = if playing { "⏸ Tạm dừng" } else { "▶ Nghe thử" };
+                    let lbl = if is_preview_playing { "⏸ Tạm dừng" } else { "▶ Nghe thử" };
                     if ui.small_button(lbl).clicked() {
-                        if playing {
-                            if let Some(prev) = self.voice_preview.take() {
-                                prev.stop();
-                            }
-                        } else if let Some((samples, rate)) = self.recorded_voice_samples.as_ref().map(|(s, r, _)| (s.clone(), *r)) {
-                            if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples, rate) {
-                                self.voice_preview = Some(prev);
-                            }
+                        if is_preview_playing {
+                            action = VoiceBarAction::StopPreview;
+                        } else if let Some((samples, rate)) = preview_samples {
+                            action = VoiceBarAction::TogglePreview(samples, rate);
                         }
                     }
                 } else if ui.small_button("⏹ Dừng").clicked() {
-                    self.toggle_voice_recorder();
+                    action = VoiceBarAction::StopRecording;
                 }
 
                 if ui.small_button(RichText::new(lucide::X).color(pal.danger)).clicked() {
-                    self.cancel_voice_recording();
+                    action = VoiceBarAction::CancelRecording;
                 }
             },
         );
+        action
     }
+}
+
+enum VoiceBarAction {
+    None,
+    StopRecording,
+    CancelRecording,
+    TogglePreview(Vec<f32>, u32),
+    StopPreview,
 }

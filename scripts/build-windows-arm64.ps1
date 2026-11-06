@@ -43,7 +43,8 @@ if (-not $SkipTests) {
     $testOutput | Write-Host
     $testOutput | Set-Content dist/cargo-test.log -Encoding utf8
     if ($LASTEXITCODE -ne 0) {
-        $errMatches = @($testOutput | Select-String 'error\[' -Context 0,4 | Select-Object -First 10)
+        $cleanOutput = $testOutput -replace "\x1b\[[0-9;]*[a-zA-Z]", ""
+        $errMatches = @($cleanOutput | Select-String -Pattern 'error(\[[A-Z0-9]+\])?:' -Context 0,5 | Select-Object -First 10)
         if ($errMatches.Count -gt 0) {
             $lines = @()
             foreach ($m in $errMatches) {
@@ -52,8 +53,8 @@ if (-not $SkipTests) {
             }
             $match = $lines -join "`n"
         } else {
-            $match = ($testOutput | Select-String 'failures:' -Context 0,20) -join "`n"
-            if (-not $match) { $match = ($testOutput | Select-Object -Last 25) -join "`n" }
+            $match = ($cleanOutput | Select-String 'failures:' -Context 0,20) -join "`n"
+            if (-not $match) { $match = ($cleanOutput | Select-Object -Last 35) -join "`n" }
         }
         $encoded = $match.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
         Write-Host "::error::$encoded"
