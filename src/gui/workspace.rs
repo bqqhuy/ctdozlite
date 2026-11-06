@@ -2407,14 +2407,16 @@ impl ZaloGuiApp {
                         .threads
                         .get(self.selected_thread_index)
                         .map(|t| chat_layout_key(&thread_id, &t.messages, render_limit))
-                        .unwrap_or_default() ^ self.chat_geometry_revision.rotate_left(7) ^ (ui.available_width().to_bits() as u64).rotate_left(17) ^ (ctx.pixels_per_point().to_bits() as u64);
-                    let layout_changed=layout_key!=self.chat_layout_key;
-                    let previous_anchor=self.chat_anchor.clone().filter(|(thread,_,_)| thread==&thread_id);
-                    let mut next_anchor=None;
-                    let mut anchor_delta=None;
+                        .unwrap_or_default()
+                        ^ self.chat_geometry_revision.rotate_left(7)
+                        ^ (((ui.available_width() as u32) / 32) as u64).rotate_left(17)
+                        ^ ((ctx.pixels_per_point() * 100.0) as u64);
+                    let layout_changed = layout_key != self.chat_layout_key;
+                    let previous_anchor = self.chat_anchor.clone().filter(|(thread, _, _)| thread == &thread_id);
+                    let mut next_anchor = None;
+                    let mut anchor_delta = None;
                     if layout_changed {
                         self.chat_layout_key = layout_key;
-                        ctx.request_discard("chat message list changed");
                     }
                     // Measure visual wrapping, not only explicit newlines: the info drawer
                     // can leave a narrow editor even on a wide desktop window.
@@ -2442,13 +2444,15 @@ impl ZaloGuiApp {
                         (ui.available_height() - 48.0 - picker_reserve - editor_height - notice_height).max(0.0);
 
                     let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
-                    let content_protected=self.content_protected(&thread_id,is_group);
+                    let content_protected = self.content_protected(&thread_id, is_group);
+                    let is_away_from_bottom = self.chat_anchor.as_ref().is_some_and(|(t, _, _)| t == &thread_id);
+                    let stick_to_bottom = !is_away_from_bottom && jump_index.is_none();
                     let message_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .min_scrolled_height(0.0)
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
-                        .stick_to_bottom(jump_index.is_none())
+                        .stick_to_bottom(stick_to_bottom)
                         .show(ui, |ui| {
                             if content_protected {ui.style_mut().interaction.selectable_labels=false;}
                             egui::Frame::none()
@@ -2506,7 +2510,6 @@ impl ZaloGuiApp {
                                                 });
                                             }
                                             let only_starred = self.filter_starred_only;
-                                            let avatar_by_sender:std::collections::HashMap<String,String>=self.threads.iter().filter(|t|!t.is_group).filter_map(|t|t.avatar.as_ref().map(|a|(t,a))).flat_map(|(t,a)|[(t.id.clone(),a.clone()),(t.presentation.global_id.clone(),a.clone())]).filter(|(id,_)|!id.is_empty()).collect();
                                             let visible_indices: Vec<usize> = thread
                                                 .messages
                                                 .iter()
@@ -2609,7 +2612,15 @@ impl ZaloGuiApp {
                                                     let sender_ava_opt = if !is_group {
                                                         thread_avatar.as_deref()
                                                     } else {
-                                                        msg.wire_ref.sender.as_ref().and_then(|v|v.as_str().map(str::to_owned).or_else(||v.as_u64().map(|n|n.to_string()))).and_then(|id|avatar_by_sender.get(&id)).map(String::as_str)
+                                                        let raw = msg.wire_ref.sender.as_ref();
+                                                        if let Some(uid) = raw.and_then(|v| v.as_str()) {
+                                                            self.sender_avatar_for(uid)
+                                                        } else if let Some(n) = raw.and_then(|v| v.as_u64()) {
+                                                            let num_s = n.to_string();
+                                                            self.sender_avatar_for(&num_s)
+                                                        } else {
+                                                            None
+                                                        }
                                                     };
                                                     if let Some(action) = render_chat_bubble(
                                                         ui,
@@ -4250,6 +4261,17 @@ impl ZaloGuiApp {
 }
 
 impl ZaloGuiApp {
+    /// Lookup avatar for a direct contact without allocating a map each frame.
+    pub(super) fn sender_avatar_for(&self, sender_id: &str) -> Option<&str> {
+        if sender_id.is_empty() {
+            return None;
+        }
+        self.threads
+            .iter()
+            .find(|t| !t.is_group && (t.id == sender_id || t.presentation.global_id == sender_id))
+            .and_then(|t| t.avatar.as_deref())
+    }
+
     /// "Thành viên nhóm" section of the info drawer: count, search, roles.
     fn render_group_members(&mut self, ui: &mut egui::Ui, group_id: &str, pal: &ThemePalette) {
         let request = |app: &mut Self| {

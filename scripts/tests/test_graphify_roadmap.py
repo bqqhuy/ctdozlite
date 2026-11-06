@@ -37,7 +37,7 @@ class RoadmapTests(unittest.TestCase):
     def write(self, path, content):
         file = self.root / path
         file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(content)
+        file.write_text(content, encoding="utf-8")
 
     def test_rebuild_is_idempotent_and_does_not_promote_device_acceptance(self):
         graph, stats = module.enrich(self.root, self.graph, self.manifest)

@@ -278,7 +278,7 @@ def main() -> None:
     root = args.root.resolve()
     manifest = json.loads((root / "tools/graphify/roadmap.json").read_text())
     output = root / "graphify-out"
-    graph, stats = enrich(root, json.loads((root / args.ast_graph).read_text()), manifest)
+    graph, stats = enrich(root, json.loads((root / args.ast_graph).read_text(encoding="utf-8")), manifest)
     atomic_write(output / "graph.json", json.dumps(graph, ensure_ascii=False, indent=2) + "\n")
     atomic_write(output / "ROADMAP_REPORT.md", report(graph, stats))
     atomic_write(output / "ROADMAP_INDEX.json", json.dumps(stats, ensure_ascii=False, indent=2) + "\n")
