@@ -1,20 +1,16 @@
 # Changelog
 
-## v0.008b-arm — Windows 11 ARM64 — 06/11/2026
-
-Bản vá ổn định và sửa lỗi hiển thị sau khi hoàn tất tích hợp v0.008:
-
-- Khung chat: Triệt tiêu hoàn toàn lỗi chớp nháy (flickering) khi cuộn và đổi hội thoại;
-  lượng tử hóa kích thước layout key loại bỏ dao động subpixel; bỏ request_discard sớm;
-  đồng bộ trạng thái stick_to_bottom theo mỏ neo tránh giật xuống đáy khi nạp lịch sử.
-- Hiệu năng giao diện: Thay thế việc cấp phát và clone HashMap avatar mỗi frame bằng
-  tra cứu slice trực tiếp (zero-allocation), tối ưu hóa tốc độ render 60 FPS.
-- Công cụ phát triển: Sửa lỗi mã hóa UTF-8 trong test script Graphify trên nền tảng Windows.
-
 ## v0.008-arm — Windows 11 ARM64 — 06/11/2026
 
 Thay đổi so với [v0.007-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.007-arm).
 Nhãn sản phẩm `v0.008-arm`, phiên bản số Windows `0.0.9`.
+
+Bản phát hành chính thức tích hợp v0.008 cùng các cải tiến tối ưu hóa hiệu năng:
+
+- Hiệu năng giao diện: Thay thế việc cấp phát và clone HashMap avatar mỗi frame bằng
+  tra cứu slice trực tiếp (zero-allocation), tối ưu hóa tốc độ render 60 FPS.
+- Công cụ phát triển: Sửa lỗi mã hóa UTF-8 trong test script Graphify trên nền tảng Windows.
+- CI/CD: Bổ sung chỉ thị annotation chi tiết cho quy trình build và test native Windows ARM64.
 
 - Cuộc gọi: siết ID/actor/status; bỏ qua terminal/replay và event sai account/call;
   dọn local khi nhận ở thiết bị khác, không gửi EndCall sang cuộc gọi đang chạy trên điện thoại.
