@@ -2407,16 +2407,14 @@ impl ZaloGuiApp {
                         .threads
                         .get(self.selected_thread_index)
                         .map(|t| chat_layout_key(&thread_id, &t.messages, render_limit))
-                        .unwrap_or_default()
-                        ^ self.chat_geometry_revision.rotate_left(7)
-                        ^ (((ui.available_width() as u32) / 32) as u64).rotate_left(17)
-                        ^ ((ctx.pixels_per_point() * 100.0) as u64);
-                    let layout_changed = layout_key != self.chat_layout_key;
-                    let previous_anchor = self.chat_anchor.clone().filter(|(thread, _, _)| thread == &thread_id);
-                    let mut next_anchor = None;
-                    let mut anchor_delta = None;
+                        .unwrap_or_default() ^ self.chat_geometry_revision.rotate_left(7) ^ (ui.available_width().to_bits() as u64).rotate_left(17) ^ (ctx.pixels_per_point().to_bits() as u64);
+                    let layout_changed=layout_key!=self.chat_layout_key;
+                    let previous_anchor=self.chat_anchor.clone().filter(|(thread,_,_)| thread==&thread_id);
+                    let mut next_anchor=None;
+                    let mut anchor_delta=None;
                     if layout_changed {
                         self.chat_layout_key = layout_key;
+                        ctx.request_discard("chat message list changed");
                     }
                     // Measure visual wrapping, not only explicit newlines: the info drawer
                     // can leave a narrow editor even on a wide desktop window.
@@ -2444,15 +2442,13 @@ impl ZaloGuiApp {
                         (ui.available_height() - 48.0 - picker_reserve - editor_height - notice_height).max(0.0);
 
                     let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
-                    let content_protected = self.content_protected(&thread_id, is_group);
-                    let is_away_from_bottom = self.chat_anchor.as_ref().is_some_and(|(t, _, _)| t == &thread_id);
-                    let stick_to_bottom = !is_away_from_bottom && jump_index.is_none();
+                    let content_protected=self.content_protected(&thread_id,is_group);
                     let message_scroll = egui::ScrollArea::vertical()
                         .id_salt(Id::new(("chat_scroll", &thread_id)))
                         .min_scrolled_height(0.0)
                         .max_height(msg_area_height)
                         .auto_shrink([false, false])
-                        .stick_to_bottom(stick_to_bottom)
+                        .stick_to_bottom(jump_index.is_none())
                         .show(ui, |ui| {
                             if content_protected {ui.style_mut().interaction.selectable_labels=false;}
                             egui::Frame::none()
