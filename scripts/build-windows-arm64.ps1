@@ -6,7 +6,13 @@ $target = 'aarch64-pc-windows-msvc'
 $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "::error::$Program failed with exit code $LASTEXITCODE ($($Arguments -join ' '))"
+        throw "$Program failed with exit code $LASTEXITCODE"
+    }
+}
+trap {
+    Write-Host "::error::Build script error: $_"
 }
 function Assert-Arm64([string]$Path) {
     $bytes = [IO.File]::ReadAllBytes($Path)
@@ -189,6 +195,8 @@ try {
             $outTask.GetAwaiter().GetResult() | Set-Content $stdout -Encoding utf8
             $errTask.GetAwaiter().GetResult() | Set-Content $stderr -Encoding utf8
             if ($process.ExitCode -ne 0 -or -not (Test-Path $png)) {
+                $errContent = (Get-Content $stdout, $stderr -ErrorAction SilentlyContinue) -join " "
+                Write-Host "::error::GUI smoke $($case.Size)-$($case.Tab) failed: $errContent"
                 Get-Content $stdout, $stderr -ErrorAction SilentlyContinue | Write-Host
                 throw "GUI renderer smoke failed: $($case.Size), exit=$($process.ExitCode)"
             }
