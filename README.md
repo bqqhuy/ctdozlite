@@ -19,7 +19,10 @@ Thiết bị đích được người dùng cung cấp: **Huawei MateBook E Go G
 - **Bản phát hành:** tải từ [Releases của fork](https://github.com/bqqhuy/ctdozlite/releases), đọc ghi chú của đúng phiên bản.
 - **Bản thử nghiệm:** vào [Actions](https://github.com/bqqhuy/ctdozlite/actions/workflows/windows-arm64.yml), chọn lần chạy thành công của nhánh/commit cần thử, tải artifact **`ctdozlite-windows-arm64`**.
 
-Bản [v0.003-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.003-arm) cải thiện giao diện sáng, viewer ảnh/video, clipboard Excel, mention, popup và cache tệp. Xem [changelog so với v0.002-arm](CHANGELOG.md). Nhãn sản phẩm là `v0.003-arm`, phiên bản số Windows là `0.0.4`. Người dùng v0.002-arm cần tải/cài thủ công lần này để nhận updater mới.
+Bản **v0.008-arm** bổ sung hộp người lạ/privacy, chat ẩn PIN, nhãn/archive, hồ sơ và
+quản trị nhóm; siết vòng đời cuộc gọi đa thiết bị và tùy chỉnh giao diện. Xem
+[changelog so với v0.007-arm](CHANGELOG.md), gồm giới hạn và các ca cần thử thiết bị thật.
+Nhãn sản phẩm `v0.008-arm`, phiên bản số Windows `0.0.9`.
 
 | Tệp trong gói | Cách dùng |
 | :--- | :--- |

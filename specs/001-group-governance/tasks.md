@@ -16,3 +16,12 @@ Ticket lifecycle theo docs/standards/issue-tracker.md; các ID dưới là task 
 
 T001 là baseline. Các task độc lập có thể thực hiện tiếp khi được ủy quyền.
 T090 cần thiết bị/tài khoản thử được phép; không đánh dấu xong bằng Cargo test.
+
+## Cập nhật mã v0.008 — 06/11/2026
+
+G-T002/G-T003: control WS/LP invalidate, epoch/runtime generation, volatile ACL,
+revision chống kết quả cũ, creator numeric/string và fixture đã có. Chưa đóng phần
+control thiết bị thực. G-T004: poll/note bound board/list theo nhóm và kind, creator
+server, phân trang có giới hạn đã có mã/test; native vẫn ở G-T090. G-T005 giữ mã
+normalize nhóm chung, cần đối soát nhóm đã rời trên tài khoản thật. Xem spec008 và
+re-notes/35; không dùng kết quả Linux để đóng G-T090/G-T099.

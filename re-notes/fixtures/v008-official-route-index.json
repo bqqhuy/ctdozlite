@@ -1,0 +1,7447 @@
+{
+  "date": "2026-11-05",
+  "timezone": "Asia/Saigon",
+  "fork_baseline": "0b1e062776a4ca2515b7898ade605859b07f8730",
+  "scope": "Two saved PC/Web bundles; static numeric command routes only. Not the complete Zalo API.",
+  "sources": [
+    {
+      "file": "compact-app-pc.5c0110a3a8749b3aacde.js",
+      "sha256": "db5966d4b02771f7c32f0884be6be2ec4c9f1b49a1628ae981f535d411150869"
+    },
+    {
+      "file": "1.c72c0957b455ab70b73c.js",
+      "sha256": "29784a88e51221a64f854b059e49e68707ae58cee7a4114bc722ce028a887bf1"
+    }
+  ],
+  "warning": "Exact string mentions include tests/comments, omit dynamic routes and WebSocket equivalents, and do not establish a production call or feature completeness. Empty mentions are NOT an unused/missing API verdict. Methods, payloads and authorization still need callsite evidence.",
+  "counts": {
+    "command_path_pairs": 421,
+    "unique_paths": 421,
+    "paths_with_exact_string_mention_in_fork": 119
+  },
+  "routes": [
+    {
+      "command_id": 12200,
+      "path": "/api/alias/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976154,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2504990,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12205,
+      "path": "/api/alias/list/v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976338,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505174,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12202,
+      "path": "/api/alias/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976276,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505112,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12201,
+      "path": "/api/alias/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976214,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505050,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12076,
+      "path": "/api/archivedchat/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978794,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507630,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12077,
+      "path": "/api/archivedchat/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978861,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507697,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12049,
+      "path": "/api/autoreply/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000655,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529491,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12051,
+      "path": "/api/autoreply/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000723,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529559,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12048,
+      "path": "/api/autoreply/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000623,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529459,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12050,
+      "path": "/api/autoreply/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000689,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529525,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12140,
+      "path": "/api/board/list",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989100,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517936,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12425,
+      "path": "/api/board/listReminder",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990285,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519121,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12010,
+      "path": "/api/board/multi_unpin",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989878,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518714,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12429,
+      "path": "/api/board/oneone/create",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990011,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518847,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12432,
+      "path": "/api/board/oneone/list",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990218,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519054,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12431,
+      "path": "/api/board/oneone/remove",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990149,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518985,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12430,
+      "path": "/api/board/oneone/update",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990080,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518916,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12415,
+      "path": "/api/board/personal/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000277,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529113,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12417,
+      "path": "/api/board/personal/get",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000397,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529233,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12416,
+      "path": "/api/board/personal/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000316,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529152,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12413,
+      "path": "/api/board/personal/todo/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000189,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529025,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12426,
+      "path": "/api/board/personal/todo/ding",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000433,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529269,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12427,
+      "path": "/api/board/personal/todo/dingack",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000475,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529311,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12418,
+      "path": "/api/board/personal/todo/status",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000353,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529189,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12414,
+      "path": "/api/board/personal/todo/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000233,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529069,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12603,
+      "path": "/api/board/personal/todo/verify",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000520,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529356,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12144,
+      "path": "/api/board/pin",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989695,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518531,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12001,
+      "path": "/api/board/pin/list",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989160,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517996,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12002,
+      "path": "/api/board/pin/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989224,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518060,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12004,
+      "path": "/api/board/pinv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989634,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518470,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12141,
+      "path": "/api/board/topic/create",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs",
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989360,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518196,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12007,
+      "path": "/api/board/topic/createv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989290,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518126,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12088,
+      "path": "/api/board/topic/getReminder",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990513,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519349,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12086,
+      "path": "/api/board/topic/listResponseEvent",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990434,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519270,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12143,
+      "path": "/api/board/topic/remove",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs",
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989566,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518402,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12142,
+      "path": "/api/board/topic/update",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs",
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989498,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518334,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12087,
+      "path": "/api/board/topic/updateEventResponse",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990353,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519189,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12008,
+      "path": "/api/board/topic/updatev2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989428,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518264,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12145,
+      "path": "/api/board/unpin",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989817,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518653,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12005,
+      "path": "/api/board/unpinv2",
+      "exact_string_mentions_in_fork": [
+        "src/board.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989754,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518590,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12507,
+      "path": "/api/cm/getoldv2",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs",
+        "src/session.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999102,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527938,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12504,
+      "path": "/api/cm/getpath",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999187,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528023,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12506,
+      "path": "/api/cm/getrecentv2",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs",
+        "src/session.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999130,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527966,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12503,
+      "path": "/api/cm/mget",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999214,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528050,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12509,
+      "path": "/api/cm/pc/dl",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999238,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528074,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12508,
+      "path": "/api/cm/rgetv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999161,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527997,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12013,
+      "path": "/api/conv/addUnreadMark",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977776,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506612,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12022,
+      "path": "/api/conv/autodelete/getConvers",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978551,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507387,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12023,
+      "path": "/api/conv/autodelete/updateConvers",
+      "exact_string_mentions_in_fork": [
+        "src/conversation_policy.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978627,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507463,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12300,
+      "path": "/api/conv/cm/grOfl",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978930,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507766,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12011,
+      "path": "/api/conv/getUnreadMark",
+      "exact_string_mentions_in_fork": [
+        "src/unread.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977708,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506544,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12014,
+      "path": "/api/conv/removeUnreadMark",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977844,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506680,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12161,
+      "path": "/api/convlabel/get",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991072,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519908,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12160,
+      "path": "/api/convlabel/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989945,
+          "form": "descriptor"
+        },
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991039,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2518781,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519875,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16106,
+      "path": "/api/e2ee/pc/group/contact",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980241,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509077,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16110,
+      "path": "/api/e2ee/pc/group/deleteConv",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979833,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508669,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16109,
+      "path": "/api/e2ee/pc/group/deleteMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979793,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508629,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16105,
+      "path": "/api/e2ee/pc/group/file",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980206,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509042,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16112,
+      "path": "/api/e2ee/pc/group/forward",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980279,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509115,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16113,
+      "path": "/api/e2ee/pc/group/gif",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980098,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508934,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16102,
+      "path": "/api/e2ee/pc/group/link",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980063,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508899,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16111,
+      "path": "/api/e2ee/pc/group/mention",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979955,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508791,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16108,
+      "path": "/api/e2ee/pc/group/multiUndoMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979912,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508748,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16104,
+      "path": "/api/e2ee/pc/group/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980170,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509006,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16103,
+      "path": "/api/e2ee/pc/group/quote",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980027,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508863,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16100,
+      "path": "/api/e2ee/pc/group/sms",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979993,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508829,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16101,
+      "path": "/api/e2ee/pc/group/sticker",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980132,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508968,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16107,
+      "path": "/api/e2ee/pc/group/undoMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979874,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508710,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16006,
+      "path": "/api/e2ee/pc/message/contact",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979573,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508409,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16009,
+      "path": "/api/e2ee/pc/message/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979148,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507984,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16010,
+      "path": "/api/e2ee/pc/message/deleteconver",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979187,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508023,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16005,
+      "path": "/api/e2ee/pc/message/file",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979536,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508372,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16012,
+      "path": "/api/e2ee/pc/message/forward",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979613,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508449,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16011,
+      "path": "/api/e2ee/pc/message/gif",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979422,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508258,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16002,
+      "path": "/api/e2ee/pc/message/link",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979385,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508221,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16008,
+      "path": "/api/e2ee/pc/message/multi_undo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979269,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508105,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16004,
+      "path": "/api/e2ee/pc/message/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979498,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508334,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16003,
+      "path": "/api/e2ee/pc/message/quote",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979347,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508183,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16001,
+      "path": "/api/e2ee/pc/message/sticker",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979458,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508294,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16007,
+      "path": "/api/e2ee/pc/message/undo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979232,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508068,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16203,
+      "path": "/api/e2ee/pc/t/group/delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979714,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508550,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16204,
+      "path": "/api/e2ee/pc/t/group/seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979756,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2508592,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16200,
+      "path": "/api/e2ee/pc/t/message/delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979065,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507901,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 16201,
+      "path": "/api/e2ee/pc/t/message/seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2979109,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507945,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11177,
+      "path": "/api/enterprise/login/emailPassword",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997510,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526346,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12193,
+      "path": "/api/enterprise/profiles",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993962,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522798,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11172,
+      "path": "/api/feedback",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997782,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526618,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11427,
+      "path": "/api/friend/accept",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983811,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512647,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11422,
+      "path": "/api/friend/block",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984358,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513194,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11429,
+      "path": "/api/friend/blocklistv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984484,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513320,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11421,
+      "path": "/api/friend/closefr/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984769,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513605,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11442,
+      "path": "/api/friend/context/multiget",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983611,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512447,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12204,
+      "path": "/api/friend/feed/block",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984975,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513811,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11439,
+      "path": "/api/friend/group/related",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984064,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512900,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12230,
+      "path": "/api/friend/last-read-contact-tab",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985042,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513878,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12128,
+      "path": "/api/friend/mget-qr",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984840,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513676,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11420,
+      "path": "/api/friend/profile/get",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984552,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513388,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11440,
+      "path": "/api/friend/profile/multiget",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984696,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513532,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12231,
+      "path": "/api/friend/read-contact-tab",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985120,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513956,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11432,
+      "path": "/api/friend/recommends/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984134,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512970,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11437,
+      "path": "/api/friend/recommendsv2/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984208,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513044,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12232,
+      "path": "/api/friend/recommendsv2/read-requests",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985193,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514029,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11438,
+      "path": "/api/friend/recommendsv2/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984282,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513118,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11428,
+      "path": "/api/friend/reject",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983874,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512710,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11423,
+      "path": "/api/friend/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983748,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512584,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11430,
+      "path": "/api/friend/reqstatus",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983998,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512834,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12203,
+      "path": "/api/friend/requested/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984904,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513740,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10004,
+      "path": "/api/friend/search/by-user-name",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984620,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513456,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11424,
+      "path": "/api/friend/sendreq",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983684,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512520,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11433,
+      "path": "/api/friend/unblock",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2984420,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2513256,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11441,
+      "path": "/api/friend/undo",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983937,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512773,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12067,
+      "path": "/api/friendboard/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000818,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529654,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12065,
+      "path": "/api/friendboard/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000854,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529690,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12069,
+      "path": "/api/friendboard/multi_unpin",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000925,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529761,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12068,
+      "path": "/api/friendboard/reorder",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000888,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2529724,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12054,
+      "path": "/api/gid/decrypt",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992010,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520846,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12053,
+      "path": "/api/gid/encrypt",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991949,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520785,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11814,
+      "path": "/api/group/admins/add",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985690,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514526,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11815,
+      "path": "/api/group/admins/remove",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985756,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514592,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12407,
+      "path": "/api/group/analyse",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987852,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516688,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 13001,
+      "path": "/api/group/asyncfile/msg",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981704,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510540,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11812,
+      "path": "/api/group/blockedmems/add",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985897,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514733,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11811,
+      "path": "/api/group/blockedmems/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985825,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514661,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11813,
+      "path": "/api/group/blockedmems/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985968,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514804,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10063,
+      "path": "/api/group/change-owner",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988446,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517282,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11827,
+      "path": "/api/group/contact",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987055,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515891,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11185,
+      "path": "/api/group/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986103,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514939,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12443,
+      "path": "/api/group/create/v2",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986165,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515001,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11835,
+      "path": "/api/group/deleteconver",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987980,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516816,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11834,
+      "path": "/api/group/deletemsg",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987915,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516751,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11166,
+      "path": "/api/group/delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986230,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515066,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12119,
+      "path": "/api/group/deliveredv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986295,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515131,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11832,
+      "path": "/api/group/disperse",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986740,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515576,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11818,
+      "path": "/api/group/forward",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980469,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509305,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12017,
+      "path": "/api/group/getStatusMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988378,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517214,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11162,
+      "path": "/api/group/getgi/v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985484,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514320,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12146,
+      "path": "/api/group/getlg/e2ee",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988514,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517350,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11161,
+      "path": "/api/group/getlg/v3",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985292,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514128,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12027,
+      "path": "/api/group/getlg/v4",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985356,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514192,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12604,
+      "path": "/api/group/getmg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988180,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517016,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12028,
+      "path": "/api/group/getmg-v2",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985420,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514256,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11194,
+      "path": "/api/group/gif",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981112,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509948,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11240,
+      "path": "/api/group/history",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987789,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516625,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12173,
+      "path": "/api/group/inv-box/inv-info",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988788,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517624,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12172,
+      "path": "/api/group/inv-box/join",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988720,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517556,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12170,
+      "path": "/api/group/inv-box/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988580,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517416,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12171,
+      "path": "/api/group/inv-box/mdel-inv",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988648,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517484,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11186,
+      "path": "/api/group/invite",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986613,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515449,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12605,
+      "path": "/api/group/invite/multi",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988241,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517077,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12444,
+      "path": "/api/group/invite/v2",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986675,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515511,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11187,
+      "path": "/api/group/kickout",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986550,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515386,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12606,
+      "path": "/api/group/kickout/multi",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988309,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517145,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11189,
+      "path": "/api/group/leave",
+      "exact_string_mentions_in_fork": [
+        "src/groups.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986042,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514878,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11821,
+      "path": "/api/group/link/detail",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987249,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516085,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11823,
+      "path": "/api/group/link/disable",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987380,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516216,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11824,
+      "path": "/api/group/link/ginfo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987448,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516284,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11825,
+      "path": "/api/group/link/join",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987514,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516350,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11822,
+      "path": "/api/group/link/new",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987316,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516152,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11198,
+      "path": "/api/group/mention",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986992,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515828,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12442,
+      "path": "/api/group/mforward",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980597,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509433,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12116,
+      "path": "/api/group/multi_undomsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988111,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516947,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10064,
+      "path": "/api/group/pending-mems/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987579,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516415,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10065,
+      "path": "/api/group/pending-mems/review",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987652,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516488,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11826,
+      "path": "/api/group/photo_original/send",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981844,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510680,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11820,
+      "path": "/api/group/photo_original/upload",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982440,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511276,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11830,
+      "path": "/api/group/photo_url",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980786,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509622,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12181,
+      "path": "/api/group/quota/community",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988933,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517769,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12182,
+      "path": "/api/group/quota/members-comm",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2989004,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517840,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11197,
+      "path": "/api/group/quote",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986931,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515767,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12424,
+      "path": "/api/group/react_delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998845,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527681,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12449,
+      "path": "/api/group/react_seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998883,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527719,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12411,
+      "path": "/api/group/reaction",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998951,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527787,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11167,
+      "path": "/api/group/seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986362,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515198,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12124,
+      "path": "/api/group/seenv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986422,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515258,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11193,
+      "path": "/api/group/sendlink",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986867,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515703,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11169,
+      "path": "/api/group/sendmp3",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981237,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510073,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11163,
+      "path": "/api/group/sendmsg",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986804,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515640,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11164,
+      "path": "/api/group/sendpt",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980661,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509497,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11816,
+      "path": "/api/group/setting/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985620,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514456,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11190,
+      "path": "/api/group/sharefile",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981509,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510345,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11191,
+      "path": "/api/group/sharefile_full",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981372,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510208,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11165,
+      "path": "/api/group/sticker",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987118,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515954,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11829,
+      "path": "/api/group/topic/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987181,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516017,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11196,
+      "path": "/api/group/typing",
+      "exact_string_mentions_in_fork": [
+        "src/presence.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2987727,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516563,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11192,
+      "path": "/api/group/undomsg",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988048,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2516884,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11195,
+      "path": "/api/group/upavatar",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981640,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510476,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11188,
+      "path": "/api/group/updateinfo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2986484,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2515320,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12180,
+      "path": "/api/group/upgrade/community",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2988860,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2517696,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12652,
+      "path": "/api/group/upload/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983408,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512244,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12607,
+      "path": "/api/group/userctx/multiget",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2985548,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2514384,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12061,
+      "path": "/api/group/video/file/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982810,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511646,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12062,
+      "path": "/api/group/video/thumb/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982958,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511794,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12063,
+      "path": "/api/group/voice/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983108,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511944,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12672,
+      "path": "/api/group/zcloud-upload/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983547,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512383,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 10049,
+      "path": "/api/hiddenconvers/add-remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978256,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507092,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10048,
+      "path": "/api/hiddenconvers/get-all",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978185,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507021,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10051,
+      "path": "/api/hiddenconvers/reset",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978404,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507240,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10050,
+      "path": "/api/hiddenconvers/update-pin",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978330,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507166,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12260,
+      "path": "/api/lan/friends",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999887,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528723,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12262,
+      "path": "/api/lan/leave",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999944,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528780,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12261,
+      "path": "/api/lan/samemacs",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999971,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528807,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12264,
+      "path": "/api/lan/status",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999859,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528695,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12263,
+      "path": "/api/lan/submit",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999916,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528752,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11346,
+      "path": "/api/login/actlistv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998510,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527346,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11160,
+      "path": "/api/login/chkUpdate",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997686,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526522,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11179,
+      "path": "/api/login/completeRemoveData",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998710,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527546,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11341,
+      "path": "/api/login/fbAuth",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997913,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526749,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11339,
+      "path": "/api/login/fblogout",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998451,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527287,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11337,
+      "path": "/api/login/getActiveCodeByZalo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998190,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527026,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11325,
+      "path": "/api/login/getCaptcha",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997440,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526276,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11343,
+      "path": "/api/login/getFbAuthInfo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997877,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526713,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11134,
+      "path": "/api/login/getLoginInfo",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs",
+        "src/login.rs",
+        "src/param_cipher.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997718,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526554,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11323,
+      "path": "/api/login/getServerInfo",
+      "exact_string_mentions_in_fork": [
+        "src/login.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997557,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526393,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11322,
+      "path": "/api/login/getSupportCountry",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997807,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526643,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12382,
+      "path": "/api/login/hasNewMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998638,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527474,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11338,
+      "path": "/api/login/linkFacebook",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998276,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527112,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11135,
+      "path": "/api/login/logOut",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997753,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526589,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11336,
+      "path": "/api/login/loginByFacebook",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997942,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526778,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12601,
+      "path": "/api/login/loginByFacebookWithSecure",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997980,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526816,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11176,
+      "path": "/api/login/loginByPasswv2",
+      "exact_string_mentions_in_fork": [
+        "src/login.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997473,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526309,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12021,
+      "path": "/api/login/loginByResetPwd",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998374,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527210,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11327,
+      "path": "/api/login/popup",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998482,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527318,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11133,
+      "path": "/api/login/reqqr",
+      "exact_string_mentions_in_fork": [
+        "src/qr.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997412,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526248,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11329,
+      "path": "/api/login/setting",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997847,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526683,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12600,
+      "path": "/api/login/ssoSyncMp3",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998605,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527441,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12220,
+      "path": "/api/media/oneone/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991675,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520511,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12221,
+      "path": "/api/media/oneone/preview",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991709,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520545,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12222,
+      "path": "/api/media/oneone/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991746,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520582,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11841,
+      "path": "/api/mediastore/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991509,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520345,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11843,
+      "path": "/api/mediastore/preview",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991541,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520377,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11842,
+      "path": "/api/mediastore/remove",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991576,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520412,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11777,
+      "path": "/api/message/asyncfile/msg",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981773,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510609,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11776,
+      "path": "/api/message/asyncfile/upload",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982736,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511572,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12700,
+      "path": "/api/message/cancel_pull_mobile_msg",
+      "exact_string_mentions_in_fork": [
+        "src/phone_sync/legacy.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982136,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510972,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11774,
+      "path": "/api/message/contact",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977058,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505894,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11779,
+      "path": "/api/message/delete",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977251,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506087,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12003,
+      "path": "/api/message/delete_snapshot_mobile_msg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982216,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511052,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11778,
+      "path": "/api/message/deleteconver",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977315,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506151,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11153,
+      "path": "/api/message/delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976438,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505274,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12117,
+      "path": "/api/message/deliveredv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976505,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505341,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11743,
+      "path": "/api/message/effect/get",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995574,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524410,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11742,
+      "path": "/api/message/effects",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995152,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523988,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12114,
+      "path": "/api/message/fetchImportant",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976744,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505580,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11199,
+      "path": "/api/message/forward",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs",
+        "src/video_meta.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980532,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509368,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12016,
+      "path": "/api/message/getStatusMsg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977593,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506429,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12096,
+      "path": "/api/message/get_backupmsginfo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982300,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511136,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12412,
+      "path": "/api/message/get_crossdb",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981996,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510832,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11292,
+      "path": "/api/message/gif",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980984,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509820,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11294,
+      "path": "/api/message/giphy/cates",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995952,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524788,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11298,
+      "path": "/api/message/giphy/dicts",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996099,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524935,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11295,
+      "path": "/api/message/giphy/gifs",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995988,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524824,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11299,
+      "path": "/api/message/giphy/gifsbydict",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996135,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524971,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11297,
+      "path": "/api/message/giphy/search",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996062,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524898,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11296,
+      "path": "/api/message/giphy/trending",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996023,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524859,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11749,
+      "path": "/api/message/guggy/default",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995834,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524670,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11750,
+      "path": "/api/message/guggy/search",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995872,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524708,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11286,
+      "path": "/api/message/link",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976996,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505832,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12440,
+      "path": "/api/message/mforward",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980918,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509754,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12115,
+      "path": "/api/message/multi_undo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977447,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506283,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11285,
+      "path": "/api/message/parselink",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980337,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509173,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11152,
+      "path": "/api/message/photo",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980723,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509559,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11773,
+      "path": "/api/message/photo_original/send",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981919,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510755,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11772,
+      "path": "/api/message/photo_original/upload",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982517,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511353,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11775,
+      "path": "/api/message/photo_url",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980851,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509687,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11771,
+      "path": "/api/message/quote",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977188,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506024,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12423,
+      "path": "/api/message/react_delivered",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998805,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527641,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12448,
+      "path": "/api/message/react_seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998916,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527752,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12410,
+      "path": "/api/message/reaction",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998982,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527818,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12094,
+      "path": "/api/message/renewlink",
+      "exact_string_mentions_in_fork": [
+        "src/media_renew.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981045,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509881,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12400,
+      "path": "/api/message/scanurl",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982375,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511211,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11150,
+      "path": "/api/message/seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976574,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505410,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12118,
+      "path": "/api/message/seenv2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976636,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505472,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11145,
+      "path": "/api/message/sharefile",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981442,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510278,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11146,
+      "path": "/api/message/sharefile_full",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981300,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510136,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11151,
+      "path": "/api/message/sms",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976935,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505771,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11154,
+      "path": "/api/message/sticker",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977123,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505959,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12190,
+      "path": "/api/message/sticker/ai/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995692,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524528,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11156,
+      "path": "/api/message/sticker/category/detail",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995279,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524115,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11155,
+      "path": "/api/message/sticker/category/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995184,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524020,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12020,
+      "path": "/api/message/sticker/category/list/v2",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995230,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524066,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11284,
+      "path": "/api/message/sticker/category/sticker_detail",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995374,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524210,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11745,
+      "path": "/api/message/sticker/personalized/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995732,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524568,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11746,
+      "path": "/api/message/sticker/personalized/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995782,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524618,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11748,
+      "path": "/api/message/sticker/recommended",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995648,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524484,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11747,
+      "path": "/api/message/sticker/search",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995609,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524445,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11279,
+      "path": "/api/message/sticker/sticker_detail",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995327,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524163,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11740,
+      "path": "/api/message/sticker/suggest/keywords",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995430,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524266,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11741,
+      "path": "/api/message/sticker/suggest/stickers",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995479,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524315,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11751,
+      "path": "/api/message/sticker/suggestion",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995909,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524745,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12015,
+      "path": "/api/message/sticker/tenor/mapping",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995528,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2524364,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11144,
+      "path": "/api/message/typing",
+      "exact_string_mentions_in_fork": [
+        "src/presence.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2976816,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2505652,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11281,
+      "path": "/api/message/undo",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977385,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506221,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12651,
+      "path": "/api/message/upload/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983371,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512207,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11293,
+      "path": "/api/message/upthumb",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2980404,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2509240,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12058,
+      "path": "/api/message/video/file/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982883,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511719,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12059,
+      "path": "/api/message/video/thumb/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983032,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511868,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12060,
+      "path": "/api/message/voice/upload",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983176,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512012,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11148,
+      "path": "/api/message/voicemp3",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981171,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510007,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12671,
+      "path": "/api/message/zcloud-upload/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983503,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512339,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12120,
+      "path": "/api/pinconvers/list",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977915,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506751,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12121,
+      "path": "/api/pinconvers/update",
+      "exact_string_mentions_in_fork": [
+        "src/server_pins.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977980,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506816,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12122,
+      "path": "/api/pinconvers/updatev2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978047,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506883,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12080,
+      "path": "/api/poll/create",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990607,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519443,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12081,
+      "path": "/api/poll/detail",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990668,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519504,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12089,
+      "path": "/api/poll/end",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990913,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519749,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12083,
+      "path": "/api/poll/option/add",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990729,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519565,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12085,
+      "path": "/api/poll/share",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990853,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519689,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12084,
+      "path": "/api/poll/vote",
+      "exact_string_mentions_in_fork": [
+        "src/group_content.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2990794,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2519630,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 10053,
+      "path": "/api/preloadconvers/get-last-msgs",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978473,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2507309,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12009,
+      "path": "/api/preloadconvers/get-last-seen",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2977515,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506351,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12073,
+      "path": "/api/prodcatalog/catalog/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999580,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528416,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12079,
+      "path": "/api/prodcatalog/catalog/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999668,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528504,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12038,
+      "path": "/api/prodcatalog/catalog/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999758,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528594,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12031,
+      "path": "/api/prodcatalog/catalog/register",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999712,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528548,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12078,
+      "path": "/api/prodcatalog/catalog/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999624,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528460,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12040,
+      "path": "/api/prodcatalog/product/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999319,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528155,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12042,
+      "path": "/api/prodcatalog/product/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999407,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528243,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12039,
+      "path": "/api/prodcatalog/product/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999496,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528332,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12127,
+      "path": "/api/prodcatalog/product/mdelete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999451,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528287,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12041,
+      "path": "/api/prodcatalog/product/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999363,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528199,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12057,
+      "path": "/api/prodcatalog/product/view",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999538,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528374,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12036,
+      "path": "/api/product/upload/photo",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2982596,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2511432,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11819,
+      "path": "/api/profile/upavatar",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2981574,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2510410,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12029,
+      "path": "/api/quickmessage/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994991,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523827,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12032,
+      "path": "/api/quickmessage/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995063,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523899,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12025,
+      "path": "/api/quickmessage/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994957,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523793,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12026,
+      "path": "/api/quickmessage/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2995027,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523863,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12450,
+      "path": "/api/react/gLastSn",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2999015,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527851,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12125,
+      "path": "/api/recentsearch/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000063,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528899,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12126,
+      "path": "/api/recentsearch/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3000098,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2528934,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11331,
+      "path": "/api/register/getActiveCodeBySms",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998100,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526936,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11332,
+      "path": "/api/register/getActiveCodeByVoice",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998144,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526980,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12018,
+      "path": "/api/register/signUpWithPwd",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998412,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527248,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11333,
+      "path": "/api/register/validateActiveCode",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998232,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527068,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11347,
+      "path": "/api/register/verifyExt",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998065,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526901,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11330,
+      "path": "/api/register/verifyPhone",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998028,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526864,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15295,
+      "path": "/api/report/abuse-v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992297,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521133,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12113,
+      "path": "/api/setting/me",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997593,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526429,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12110,
+      "path": "/api/setting/rating",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998542,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527378,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12033,
+      "path": "/api/setting/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997620,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526456,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12451,
+      "path": "/api/social/avatar-list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994566,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523402,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12452,
+      "path": "/api/social/del-avatars",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994634,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523470,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12151,
+      "path": "/api/social/ekyc/push-oa",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992885,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521721,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12072,
+      "path": "/api/social/friend/active-pcweb",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994172,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523008,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12074,
+      "path": "/api/social/friend/get-bizacc",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993888,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522724,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11141,
+      "path": "/api/social/friend/getclosedfriends",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992141,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520977,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11137,
+      "path": "/api/social/friend/getfriends",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991875,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520711,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12134,
+      "path": "/api/social/friend/getminiprofiles",
+      "exact_string_mentions_in_fork": [
+        "src/chat.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994487,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523323,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11140,
+      "path": "/api/social/friend/getprofiles/v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992362,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521198,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11290,
+      "path": "/api/social/friend/onlines",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993096,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521932,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11862,
+      "path": "/api/social/friend/phonebook",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993167,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522003,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12428,
+      "path": "/api/social/friend/phonebook/v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993240,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522076,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11138,
+      "path": "/api/social/friend/verify",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2991805,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520641,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12030,
+      "path": "/api/social/group/members",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992071,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2520907,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12681,
+      "path": "/api/social/oa/block",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994771,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523607,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11863,
+      "path": "/api/social/oa/convertid",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993391,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522227,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12682,
+      "path": "/api/social/oa/unblock",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994836,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523672,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11860,
+      "path": "/api/social/profile/avatar",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992440,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521276,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12153,
+      "path": "/api/social/profile/avatar-url",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992511,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521347,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12131,
+      "path": "/api/social/profile/biz-off-remind",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994408,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523244,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12130,
+      "path": "/api/social/profile/biz-register-trial",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994325,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523161,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12152,
+      "path": "/api/social/profile/biz-register-trial-v2",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992954,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521790,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12135,
+      "path": "/api/social/profile/changefgtobg",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994248,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523084,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11143,
+      "path": "/api/social/profile/deactive",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993668,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522504,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11864,
+      "path": "/api/social/profile/extra",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993460,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522296,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11280,
+      "path": "/api/social/profile/getmute",
+      "exact_string_mentions_in_fork": [
+        "src/mute_sync.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992658,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521494,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12012,
+      "path": "/api/social/profile/getrank",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993816,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522652,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12090,
+      "path": "/api/social/profile/lastOnline",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993741,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522577,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11139,
+      "path": "/api/social/profile/me-v2",
+      "exact_string_mentions_in_fork": [
+        "src/session.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994031,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522867,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11865,
+      "path": "/api/social/profile/mode",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993530,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522366,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11142,
+      "path": "/api/social/profile/ping",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993599,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522435,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 31582,
+      "path": "/api/social/profile/reportabuse",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992221,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521057,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11288,
+      "path": "/api/social/profile/setmute",
+      "exact_string_mentions_in_fork": [
+        "src/mute_sync.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992586,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521422,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11291,
+      "path": "/api/social/profile/status",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992730,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521566,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12075,
+      "path": "/api/social/profile/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994101,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522937,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11289,
+      "path": "/api/social/profile/updatelang",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993316,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2522152,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12150,
+      "path": "/api/social/profile/verification/status",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2992801,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521637,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12453,
+      "path": "/api/social/reuse-avatar",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2994702,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2523538,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 11233,
+      "path": "/api/suggestconvers/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2978116,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2506952,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 12111,
+      "path": "/api/syncmsg/confirm",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998573,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527409,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12888,
+      "path": "/api/transfer-sync-v2/request-sync",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2983246,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2512082,
+          "form": "descriptor"
+        }
+      ]
+    },
+    {
+      "command_id": 15220,
+      "path": "/api/transfer/card",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001231,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530067,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15309,
+      "path": "/api/transfer/conf",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001361,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530197,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15306,
+      "path": "/api/transfer/create",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001262,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530098,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15308,
+      "path": "/api/transfer/delete",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001328,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530164,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15298,
+      "path": "/api/transfer/list",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001392,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530228,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 15307,
+      "path": "/api/transfer/update",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3001295,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2530131,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12019,
+      "path": "/api/update/checkHasPassword",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998670,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527506,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11335,
+      "path": "/api/update/password",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998342,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527178,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11334,
+      "path": "/api/update/profile",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2998311,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2527147,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12066,
+      "path": "/api/update/setting/2FA",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997651,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526487,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11303,
+      "path": "/api/voicecall/answer",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996339,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525175,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11304,
+      "path": "/api/voicecall/answerack",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996372,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525208,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11305,
+      "path": "/api/voicecall/cancel",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996408,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525244,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12006,
+      "path": "/api/voicecall/conf",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997132,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525968,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11306,
+      "path": "/api/voicecall/endcall",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996441,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525277,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12435,
+      "path": "/api/voicecall/group/adduser",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996738,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525574,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12436,
+      "path": "/api/voicecall/group/answer",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996778,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525614,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12098,
+      "path": "/api/voicecall/group/broadcast",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997090,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525926,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12437,
+      "path": "/api/voicecall/group/cancel",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996817,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525653,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12438,
+      "path": "/api/voicecall/group/endcall",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996856,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525692,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12446,
+      "path": "/api/voicecall/group/finish",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996975,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525811,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12043,
+      "path": "/api/voicecall/group/join",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997253,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526089,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12447,
+      "path": "/api/voicecall/group/notify",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997014,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525850,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12097,
+      "path": "/api/voicecall/group/ping",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997053,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525889,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12434,
+      "path": "/api/voicecall/group/request",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996698,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525534,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12433,
+      "path": "/api/voicecall/group/requestcall",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996654,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525490,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12439,
+      "path": "/api/voicecall/group/ringring",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996896,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525732,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12044,
+      "path": "/api/voicecall/group/sharescreen",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997290,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526126,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12445,
+      "path": "/api/voicecall/group/state",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996937,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525773,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11307,
+      "path": "/api/voicecall/holdreq",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996475,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525311,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11308,
+      "path": "/api/voicecall/holdresp",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996509,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525345,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11311,
+      "path": "/api/voicecall/logendcall",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996617,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525453,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11301,
+      "path": "/api/voicecall/request",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996270,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525106,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12056,
+      "path": "/api/voicecall/requestaudio2video",
+      "exact_string_mentions_in_fork": [],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997163,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525999,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11300,
+      "path": "/api/voicecall/requestcall",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996232,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525068,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12064,
+      "path": "/api/voicecall/requestsharescreen",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2997208,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2526044,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11302,
+      "path": "/api/voicecall/ringring",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996304,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525140,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11309,
+      "path": "/api/voicecall/unholdreq",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996544,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525380,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 11310,
+      "path": "/api/voicecall/unholdresp",
+      "exact_string_mentions_in_fork": [
+        "src/call.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2996580,
+          "form": "numeric-helper"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2525416,
+          "form": "numeric-helper"
+        }
+      ]
+    },
+    {
+      "command_id": 12390,
+      "path": "/api/znoise",
+      "exact_string_mentions_in_fork": [
+        "src/phone_sync/legacy.rs"
+      ],
+      "evidence": [
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 2993040,
+          "form": "descriptor"
+        },
+        {
+          "source": "compact-app-pc.5c0110a3a8749b3aacde.js",
+          "offset": 3003135,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2521876,
+          "form": "descriptor"
+        },
+        {
+          "source": "1.c72c0957b455ab70b73c.js",
+          "offset": 2531971,
+          "form": "descriptor"
+        }
+      ]
+    }
+  ]
+}
