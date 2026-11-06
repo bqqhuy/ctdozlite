@@ -257,7 +257,7 @@ pub fn resample_to_16k(samples: &[f32], source_rate: u32) -> Vec<f32> {
         let frac = (src_idx - left_idx as f64) as f32;
 
         let sample = if left_idx < samples.len() {
-            samples[left_idx] * (1.0 - frac) + samples[right_idx] * frac
+            samples[left_idx] * (1.0_f32 - frac) + samples[right_idx] * frac
         } else {
             0.0
         };
@@ -300,7 +300,7 @@ impl VoicePreviewPlayer {
                 let right = (left + 1).min(samples.len().saturating_sub(1));
                 let frac = (src_idx - left as f64) as f32;
                 let val = if left < samples.len() {
-                    samples[left] * (1.0 - frac) + samples[right] * frac
+                    samples[left] * (1.0_f32 - frac) + samples[right] * frac
                 } else {
                     0.0
                 };

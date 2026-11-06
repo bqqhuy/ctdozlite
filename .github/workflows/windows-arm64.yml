@@ -73,6 +73,13 @@ jobs:
       - name: Tests, native PE smoke check and package
         shell: pwsh
         run: ./scripts/build-windows-arm64.ps1
+      - name: Print cargo test log on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path dist/cargo-test.log) {
+            Get-Content dist/cargo-test.log -Tail 150
+          }
       - name: Upload renderer diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
