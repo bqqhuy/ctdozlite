@@ -58,13 +58,13 @@ pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Vec<DeviceS
 pub async fn get_logged_in_devices(s: &Session) -> Result<Vec<DeviceSession>> {
     let url = format!("{}/api/login/getdevicelist", s.domains.chat);
     let payload = json!({
-        "imei": s.imei.clone().unwrap_or_default(),
+        "imei": s.imei,
     });
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(parse_device_list(&decrypted, s.imei.as_deref()))
+    Ok(parse_device_list(&decrypted, Some(&s.imei)))
 }
 
 /// Call `/api/login/kickdevice` to remotely log out a device.
@@ -72,7 +72,7 @@ pub async fn kick_remote_device(s: &Session, target_device_id: &str) -> Result<V
     let url = format!("{}/api/login/kickdevice", s.domains.chat);
     let payload = json!({
         "target_device_id": target_device_id,
-        "imei": s.imei.clone().unwrap_or_default(),
+        "imei": s.imei,
     });
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số đăng xuất thiết bị thất bại")?;
