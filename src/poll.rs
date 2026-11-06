@@ -111,9 +111,9 @@ pub async fn create_group_poll(
     allow_add_opt: bool,
     hide_voters: bool,
 ) -> Result<Value> {
-    let url = s.url("group", "/api/group/poll/create");
+    let url = format!("{}/api/group/poll/create", s.domains.group);
     let payload = build_create_poll_params(grid, question, options, multi_choice, allow_add_opt, hide_voters);
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số tạo bình chọn thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
@@ -125,12 +125,12 @@ pub async fn vote_group_poll(
     poll_id: i64,
     option_ids: &[i64],
 ) -> Result<Value> {
-    let url = s.url("group", "/api/group/poll/vote");
+    let url = format!("{}/api/group/poll/vote", s.domains.group);
     let payload = json!({
         "poll_id": poll_id,
         "option_ids": option_ids,
     });
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số bỏ phiếu thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
@@ -141,12 +141,12 @@ pub async fn get_group_poll_detail(
     s: &Session,
     poll_id: i64,
 ) -> Result<Option<PollItem>> {
-    let url = s.url("group", "/api/group/poll/detail");
+    let url = format!("{}/api/group/poll/detail", s.domains.group);
     let payload = json!({ "poll_id": poll_id });
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số xem bình chọn thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await?;
+    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
     Ok(parse_poll_item(&decrypted))
 }
 

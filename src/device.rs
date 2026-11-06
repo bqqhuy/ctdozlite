@@ -56,25 +56,25 @@ pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Vec<DeviceS
 
 /// Call `/api/login/getdevicelist` to retrieve active devices.
 pub async fn get_logged_in_devices(s: &Session) -> Result<Vec<DeviceSession>> {
-    let url = s.url("chat", "/api/login/getdevicelist");
+    let url = format!("{}/api/login/getdevicelist", s.domains.chat);
     let payload = json!({
         "imei": s.imei.clone().unwrap_or_default(),
     });
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await?;
+    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
     Ok(parse_device_list(&decrypted, s.imei.as_deref()))
 }
 
 /// Call `/api/login/kickdevice` to remotely log out a device.
 pub async fn kick_remote_device(s: &Session, target_device_id: &str) -> Result<Value> {
-    let url = s.url("chat", "/api/login/kickdevice");
+    let url = format!("{}/api/login/kickdevice", s.domains.chat);
     let payload = json!({
         "target_device_id": target_device_id,
         "imei": s.imei.clone().unwrap_or_default(),
     });
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số đăng xuất thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)

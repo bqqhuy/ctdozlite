@@ -122,9 +122,9 @@ pub async fn create_group_todo(
     assignee_id: &str,
     deadline_ts: i64,
 ) -> Result<Value> {
-    let url = s.url("group", "/api/group/todo/create");
+    let url = format!("{}/api/group/todo/create", s.domains.group);
     let payload = build_create_todo_params(grid, content, assignee_id, deadline_ts);
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số tạo to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
@@ -139,9 +139,9 @@ pub async fn update_group_todo(
     assignee_id: Option<&str>,
     deadline_ts: Option<i64>,
 ) -> Result<Value> {
-    let url = s.url("group", "/api/group/todo/update");
+    let url = format!("{}/api/group/todo/update", s.domains.group);
     let payload = build_update_todo_params(todo_id, grid, status, assignee_id, deadline_ts);
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số cập nhật to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
@@ -152,12 +152,12 @@ pub async fn list_group_todos(
     s: &Session,
     grid: &str,
 ) -> Result<Vec<TodoItem>> {
-    let url = s.url("group", "/api/group/todo/list");
+    let url = format!("{}/api/group/todo/list", s.domains.group);
     let payload = json!({ "grid": grid });
-    let params = s.param_cipher_v2(&payload.to_string())
+    let params = s.encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await?;
+    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
     Ok(parse_todo_list(&decrypted))
 }
 
