@@ -2735,11 +2735,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let _ = tokio::fs::create_dir_all(&voice_dir).await;
                                 let temp_file = voice_dir.join(format!("voice_{now}.wav"));
                                 if let Err(e) = tokio::fs::write(&temp_file, &wav_bytes).await {
-                                    let _ = events.send(GuiEvent::StatusUpdate(format!("L\u1ed7i l\u01b0u t\u1ec7p \xe2m thanh: {e}")));
+                                    let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi lưu tệp âm thanh: {e}")));
                                     return;
                                 }
                                 let stamp = crate::outgoing::FileStamp::read(&temp_file).await.ok();
-                                let caption = format!("[Tin nh\u1eafn tho\u1ea1i] ({duration_secs}s)");
+                                let caption = format!("[Tin nhắn thoại] ({duration_secs}s)");
                                 let mut message = crate::outgoing::pending(
                                     caption.clone(),
                                     is_group,
@@ -2766,14 +2766,14 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Ok(mut sent) => {
                                         sent.kind = crate::message_model::MessageKind::Voice;
                                         message = sent;
-                                        let _ = events.send(GuiEvent::StatusUpdate("\u0110\xe3 g\u1eedi tin nh\u1eafn tho\u1ea1i".into()));
+                                        let _ = events.send(GuiEvent::StatusUpdate("Đã gửi tin nhắn thoại".into()));
                                     }
                                     Err(error) => {
                                         message.delivery = crate::message_model::DeliveryState::Failed;
                                         if let Some(job) = message.outgoing_job.as_mut() {
                                             job.error = crate::outgoing::failure_message(&error);
                                         }
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("G\u1eedi tin nh\u1eafn tho\u1ea1i th\u1ea5t b\u1ea1i: {error}")));
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Gửi tin nhắn thoại thất bại: {error}")));
                                     }
                                 }
                                 persist_outgoing(&s, &to_id, &message).await;
