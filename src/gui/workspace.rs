@@ -3366,6 +3366,7 @@ impl ZaloGuiApp {
                                         self.composer_ime_active = ime_active;
                                         let mut enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                                        let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
                                         let (response, cursor) = if is_voice_active {
                                             egui::ScrollArea::vertical()
                                                 .id_salt(("chat_composer_scroll", &thread_id))
