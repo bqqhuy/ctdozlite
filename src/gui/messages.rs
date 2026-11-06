@@ -1731,7 +1731,7 @@ pub(super) fn render_voice_message_widget(
     max_text_width: f32,
 ) -> Option<BubbleAction> {
     let card_w = max_text_width.min(260.0).max(180.0);
-    let (text_col, meta_col) = if outgoing {
+    let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)

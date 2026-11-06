@@ -4905,8 +4905,8 @@ impl ZaloGuiApp {
 
                 let dur = if let Some(ref rec) = self.voice_recorder {
                     rec.duration()
-                } else if let Some((_, _, d)) = self.recorded_voice_samples {
-                    d
+                } else if let Some((_, _, ref d)) = self.recorded_voice_samples {
+                    *d
                 } else {
                     std::time::Duration::ZERO
                 };

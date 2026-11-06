@@ -43,9 +43,18 @@ if (-not $SkipTests) {
     $testOutput | Write-Host
     $testOutput | Set-Content dist/cargo-test.log -Encoding utf8
     if ($LASTEXITCODE -ne 0) {
-        $match = ($testOutput | Select-String 'failures:' -Context 0,20) -join "`n"
-        if (-not $match) { $match = ($testOutput | Select-String 'error\[','error:','FAILED','panicked at' -Context 0,2) -join "`n" }
-        if (-not $match) { $match = ($testOutput | Select-Object -Last 20) -join "`n" }
+        $errMatches = @($testOutput | Select-String 'error\[' -Context 0,4 | Select-Object -First 10)
+        if ($errMatches.Count -gt 0) {
+            $lines = @()
+            foreach ($m in $errMatches) {
+                $lines += $m.Line
+                if ($m.Context.PostContext) { $lines += $m.Context.PostContext }
+            }
+            $match = $lines -join "`n"
+        } else {
+            $match = ($testOutput | Select-String 'failures:' -Context 0,20) -join "`n"
+            if (-not $match) { $match = ($testOutput | Select-Object -Last 25) -join "`n" }
+        }
         $encoded = $match.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
         Write-Host "::error::$encoded"
         throw "cargo test failed with exit code $LASTEXITCODE"
