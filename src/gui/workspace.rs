@@ -2621,11 +2621,7 @@ impl ZaloGuiApp {
                                                     if self.batch_selection_mode && !msg.id.is_empty() {
                                                         let mut sel = self.selected_msg_ids.contains(&msg.id);
                                                         if ui.checkbox(&mut sel, "").changed() {
-                                                            if sel {
-                                                                self.selected_msg_ids.insert(msg.id.clone());
-                                                            } else {
-                                                                self.selected_msg_ids.remove(&msg.id);
-                                                            }
+                                                            pending_action = Some((idx, BubbleAction::ToggleSelect(msg.id.clone())));
                                                         }
                                                     }
                                                     if let Some(action) = render_chat_bubble(
@@ -2956,6 +2952,13 @@ impl ZaloGuiApp {
                                     self.batch_selection_mode = true;
                                     self.selected_msg_ids.clear();
                                     self.selected_msg_ids.insert(m.id.clone());
+                                }
+                                BubbleAction::ToggleSelect(id) => {
+                                    if self.selected_msg_ids.contains(&id) {
+                                        self.selected_msg_ids.remove(&id);
+                                    } else {
+                                        self.selected_msg_ids.insert(id);
+                                    }
                                 }
                                 BubbleAction::OpenContactConversation(uid) => {
                                     if let Some(idx) = self.threads.iter().position(|t| t.id == uid) {

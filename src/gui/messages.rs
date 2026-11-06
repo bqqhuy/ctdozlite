@@ -1521,6 +1521,7 @@ pub(super) enum BubbleAction {
     EnterSelectionMode,
     OpenContactConversation(String),
     ViewContact(String),
+    ToggleSelect(String),
 }
 
 /// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.

@@ -44,7 +44,8 @@ if (-not $SkipTests) {
     $testOutput | Set-Content dist/cargo-test.log -Encoding utf8
     if ($LASTEXITCODE -ne 0) {
         $match = ($testOutput | Select-String 'failures:' -Context 0,20) -join "`n"
-        if (-not $match) { $match = ($testOutput | Select-String 'FAILED','panicked at' -Context 2,5) -join "`n" }
+        if (-not $match) { $match = ($testOutput | Select-String 'error\[','error:','FAILED','panicked at' -Context 0,2) -join "`n" }
+        if (-not $match) { $match = ($testOutput | Select-Object -Last 20) -join "`n" }
         $encoded = $match.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
         Write-Host "::error::$encoded"
         throw "cargo test failed with exit code $LASTEXITCODE"

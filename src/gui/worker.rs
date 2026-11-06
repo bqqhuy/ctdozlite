@@ -2475,7 +2475,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let mut targets = Vec::new();
                                 let mut recalled_ids = Vec::new();
                                 for msg in &messages {
-                                    let cli_id = crate::chat::client_message_id(msg).unwrap_or(0);
+                                    let cli_id = crate::chat::client_message_id(msg).unwrap_or_default();
                                     let srv_id = crate::chat::server_message_id(msg).unwrap_or_default();
                                     if !srv_id.is_empty() {
                                         targets.push(crate::chat::UndoTargetItem {
@@ -2483,7 +2483,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .map(|d| d.as_millis() as u64)
                                                 .unwrap_or(0),
-                                            cli_msg_id_undo: cli_id.to_string(),
+                                            cli_msg_id_undo: cli_id,
                                             global_msg_id: srv_id,
                                         });
                                         recalled_ids.push(msg.id.clone());
