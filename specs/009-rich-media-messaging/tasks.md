@@ -7,5 +7,5 @@
 - [x] [R11-T05] [M-03] Nâng cấp Media Viewer với điều khiển tương tác (Zoom, Pan, Rotate, Next/Prev gallery, Copy to Clipboard, Save as).
 - [x] [R11-T06] [M-04] Xây dựng Audio Capture qua WASAPI/cpal, đo waveform, nghe thử và gửi Voice Message qua API Zalo.
 - [x] [R11-T07] [M-05] Tìm kiếm Sticker theo từ khóa tiếng Việt trong Sticker Picker.
-- [ ] [R11-T08] [M-06] Kiểm tra tín hiệu chia sẻ màn hình trong cuộc gọi.
+- [x] [R11-T08] [M-06] Kiểm tra tín hiệu chia sẻ màn hình trong cuộc gọi.
 - [ ] [R11-T09] Nghiệm thu tổng hợp trên Windows 11 ARM64 (checklist trong `verification.md`).

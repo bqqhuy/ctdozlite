@@ -368,6 +368,12 @@ pub enum WorkerCmd {
         is_on_mic: bool,
         is_on_cam: bool,
     },
+    RequestShareScreen {
+        call_id: i64,
+        partner_id: String,
+        enable: bool,
+        is_group: bool,
+    },
     EndCall {
         call_id: Option<i64>,
     },
@@ -2819,6 +2825,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             is_on_cam,
                         } => {
                             call_bridge.set_media_state(is_on_mic, is_on_cam);
+                            egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::RequestShareScreen {
+                            call_id,
+                            partner_id,
+                            enable,
+                            is_group,
+                        } => {
+                            call_bridge.request_share_screen(call_id, &partner_id, enable, is_group);
                             egui_ctx.request_repaint();
                         }
                         WorkerCmd::EndCall { call_id } => {

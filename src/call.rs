@@ -2090,6 +2090,12 @@ enum CallEngineCmd {
     EndCall {
         expected_call_id: Option<i64>,
     },
+    RequestShareScreen {
+        call_id: i64,
+        partner_id: String,
+        enable: bool,
+        is_group: bool,
+    },
     ControlEvent(Value),
 }
 
@@ -3024,6 +3030,48 @@ impl CallBridge {
                         }
                     }
 
+                    CallEngineCmd::RequestShareScreen {
+                        call_id,
+                        partner_id,
+                        enable,
+                        is_group,
+                    } => {
+                        let s_clone = session.clone();
+                        let gui_tx_clone = gui_tx.clone();
+                        tokio::spawn(async move {
+                            let s = s_clone.lock().await.clone();
+                            let status = if enable { 1 } else { 0 };
+                            let res = if is_group {
+                                let payload = build_group_share_screen_request(
+                                    s.account_key(),
+                                    call_id,
+                                    &partner_id,
+                                    status,
+                                    1,
+                                    1,
+                                    "",
+                                );
+                                dispatch_send_signal(&s, 12044, &payload).await
+                            } else {
+                                let payload = build_share_screen_request(&partner_id, call_id, status);
+                                dispatch_send_signal(&s, 12064, &payload).await
+                            };
+                            match res {
+                                Ok(_) => {
+                                    let action = if enable { "Bắt đầu" } else { "Dừng" };
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "{action} chia sẻ màn hình"
+                                    )));
+                                }
+                                Err(e) => {
+                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
+                                        "Lỗi chia sẻ màn hình: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    }
+
                     CallEngineCmd::EndCall { expected_call_id } => {
                         let s_snap = session.lock().await.clone();
                         let taken = {
@@ -3793,6 +3841,17 @@ impl CallBridge {
                                     egui_ctx.request_repaint();
                                 }
                             }
+                            "sharescreen" | "group_sharescreen" | "requestsharescreen" => {
+                                let status = data.get("status").and_then(crate::api_response::integer).unwrap_or(0);
+                                let is_sharing = status == 1;
+                                let msg = if is_sharing {
+                                    "🖥️ Đối phương bắt đầu chia sẻ màn hình"
+                                } else {
+                                    "🖥️ Đối phương dừng chia sẻ màn hình"
+                                };
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate(msg.into()));
+                                egui_ctx.request_repaint();
+                            }
                             "end_call" | "cancel" | "group_end_call" | "group_cancel" => {
                                 let mut guard = active_call.lock().await;
                                 let Some(ref st_check) = *guard else {
@@ -4221,11 +4280,68 @@ impl CallBridge {
     pub fn end_call(&self) {
         self.end_call_for(None);
     }
+
+    /// Request start or stop screen sharing in active call (1-1 or group).
+    pub fn request_share_screen(&self, call_id: i64, partner_id: &str, enable: bool, is_group: bool) {
+        let _ = self.cmd_tx.send(CallEngineCmd::RequestShareScreen {
+            call_id,
+            partner_id: partner_id.to_string(),
+            enable,
+            is_group,
+        });
+    }
+}
+
+/// Build signal payload for 1-1 screen sharing request (cmd 12064 -> `/api/voicecall/requestsharescreen`).
+pub fn build_share_screen_request(uid_to: &str, call_id: i64, status: i32) -> Value {
+    json!({
+        "uidTo": uid_to,
+        "callId": call_id,
+        "status": status,
+    })
+}
+
+/// Build signal payload for group screen sharing request (cmd 12044 -> `/api/voicecall/group/sharescreen`).
+pub fn build_group_share_screen_request(
+    user_id: &str,
+    call_id: i64,
+    host_call: &str,
+    status: i32,
+    audio_state: i32,
+    video_state: i32,
+    data: &str,
+) -> Value {
+    json!({
+        "userId": user_id,
+        "callId": call_id,
+        "hostCall": host_call,
+        "status": status,
+        "audiostate": audio_state,
+        "videostate": video_state,
+        "data": data,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_sharing_signal_payloads_match_zalo_routes() {
+        let one_to_one = build_share_screen_request("user_123", 998877, 1);
+        assert_eq!(one_to_one["uidTo"], "user_123");
+        assert_eq!(one_to_one["callId"], 998877);
+        assert_eq!(one_to_one["status"], 1);
+
+        let group_sig = build_group_share_screen_request("my_uid", 554433, "host_99", 0, 1, 0, "token_xyz");
+        assert_eq!(group_sig["userId"], "my_uid");
+        assert_eq!(group_sig["callId"], 554433);
+        assert_eq!(group_sig["hostCall"], "host_99");
+        assert_eq!(group_sig["status"], 0);
+        assert_eq!(group_sig["audiostate"], 1);
+        assert_eq!(group_sig["videostate"], 0);
+        assert_eq!(group_sig["data"], "token_xyz");
+    }
 
     #[test]
     fn invalid_allocation_never_starts_an_empty_media_session() {
