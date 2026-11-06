@@ -5741,7 +5741,7 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
-    if (msg_type == "chat.contact" || msg_type == "contact") && (content.is_empty() || content.starts_with('{')) {
+    if msg_type == "chat.contact" || msg_type == "contact" || msg_type == "12" {
         if let Some(ref name) = contact_name {
             content = format!("[Danh thiếp] {name}");
         } else {
