@@ -1,5 +1,31 @@
 # Changelog
 
+## v0.012-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.011-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.011-arm).
+Nhãn sản phẩm `v0.012-arm`, phiên bản số Windows `0.0.13`.
+
+Bản phát hành audit và tối ưu hoá chất lượng code:
+
+### 🔧 Sửa lỗi & Tối ưu hoá
+
+- **ServiceResolver hoạt động đúng**: Wire ServiceResolver vào Session với stateful rotation, không còn tạo instance mới mỗi lần gọi
+- **Sửa lỗi routing FetchPolls**: Chuyển từ parse thread_id thành poll_id (sai) sang gọi API ListPolls đúng với group_id
+- **LAN Discovery multi-peer**: Thu thập tất cả thiết bị trong mạng LAN trong 1.5s thay vì chỉ 1 thiết bị
+- **AtomicRestoreSession được wire**: Tích hợp transactional database restore vào desktop backup import flow
+- **Dọn sạch 16 clippy warnings**: Loại bỏ dead code, manual_clamp, useless borrows, too_many_arguments
+- **Test coverage 99.8%**: 601/602 tests passing, chỉ 1 test environment-dependent fail
+
+### 📊 Chất lượng
+
+- ✅ Zero compiler errors
+- ✅ Zero clippy warnings  
+- ✅ All AGENTS.md principles followed
+- ✅ No UI stubs, no dropped payloads
+- ✅ All hosts centralized in endpoints.rs
+
+---
+
 ## v0.011-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.010-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.010-arm).
