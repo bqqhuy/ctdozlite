@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.014-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.013-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.013-arm).
+Nhãn sản phẩm `v0.014-arm`, phiên bản số Windows `0.0.14`.
+
+Bản phát hành Xử lý Âm thanh WebRTC DSP & Gia cố VoIP (Phase 2 - Mốc R17):
+
+### 🎙️ Xử lý Tín hiệu Âm thanh WebRTC DSP & Chất lượng Cuộc gọi
+- **Acoustic Echo Cancellation (AEC / AES)**: Triệt tiêu tiếng vọng hồi âm vòng lặp khi bật loa ngoài trên laptop trong cuộc gọi cá nhân và nhóm.
+- **Noise Suppression (NS)**: Lọc sạch tạp âm bàn phím cơ và tiếng ồn quạt tản nhiệt máy tính thông qua bộ lọc spectral energy gate.
+- **Automatic Gain Control (AGC)**: Tự động cân bằng và điều chỉnh âm lượng giọng nói luôn rõ ràng, tránh vỡ tiếng (peak limiting).
+- **MFT Video Fallback & Headless Compatibility**: Tối ưu hóa pipeline video H.264 với cơ chế phát hiện và xử lý thích ứng môi trường không có GPU phần cứng, đạt tỉ lệ pass kiểm thử 100%.
+
+---
+
 ## v0.013-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.012-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.012-arm).

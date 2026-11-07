@@ -407,6 +407,76 @@ fn clear_rtcp_inbox() {
     }
 }
 
+/// Real-time audio digital signal processor providing Acoustic Echo Cancellation (AEC),
+/// Noise Suppression (NS), and Automatic Gain Control (AGC) for VoIP audio calls.
+#[derive(Clone, Debug)]
+pub struct AudioProcessor {
+    /// Target RMS amplitude for AGC (0.15 = ~-16 dBFS).
+    pub target_rms: f32,
+    /// Current gain factor applied to voice.
+    pub current_gain: f32,
+    /// Noise floor threshold estimate.
+    pub noise_floor: f32,
+    /// Echo suppression attenuation factor (0.0 to 1.0).
+    pub echo_suppression_factor: f32,
+}
+
+impl Default for AudioProcessor {
+    fn default() -> Self {
+        Self {
+            target_rms: 0.15,
+            current_gain: 1.0,
+            noise_floor: 0.015,
+            echo_suppression_factor: 0.15,
+        }
+    }
+}
+
+impl AudioProcessor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Process a frame of captured microphone samples with acoustic echo cancellation
+    /// using reference speaker energy, plus noise gating and AGC.
+    pub fn process_capture(&mut self, samples: &mut [f32], speaker_energy: f32) {
+        if samples.is_empty() {
+            return;
+        }
+
+        // 1. Acoustic Echo Suppression (AES/AEC)
+        if speaker_energy > 0.03 {
+            let suppression = (1.0 - (speaker_energy * 2.0).min(0.85)) * self.echo_suppression_factor;
+            for s in samples.iter_mut() {
+                *s *= suppression;
+            }
+        }
+
+        // 2. Compute RMS of capture
+        let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
+        let rms = (sum_sq / samples.len() as f32).sqrt();
+
+        // 3. Noise Suppression (NS) - soft gate when signal is below noise floor
+        if rms < self.noise_floor {
+            let gate = (rms / self.noise_floor).powi(2);
+            for s in samples.iter_mut() {
+                *s *= gate;
+            }
+            return;
+        }
+
+        // 4. Automatic Gain Control (AGC) with peak limiting
+        if rms > 0.001 {
+            let desired_gain = (self.target_rms / rms).clamp(0.5, 4.0);
+            self.current_gain = self.current_gain * 0.9 + desired_gain * 0.1;
+        }
+
+        for s in samples.iter_mut() {
+            *s = (*s * self.current_gain).clamp(-1.0, 1.0);
+        }
+    }
+}
+
 /// True if a raw relay-framed datagram is RTCP (PT 200..=207) containing a PLI or FIR.
 #[cfg(test)]
 fn wire_requests_keyframe(wire: &[u8]) -> bool {
@@ -2651,5 +2721,29 @@ mod group_media_tests {
             "two peers must not double playback latency"
         );
         assert_eq!(mixer.sources.len(), 2);
+    }
+    #[test]
+    fn audio_processor_cancels_echo_and_suppresses_noise() {
+        let mut ap = AudioProcessor::new();
+        // Test 1: Loud speaker output suppresses mic capture
+        let mut mic_echo = vec![0.5; FRAME_SAMPLES];
+        let loud_speaker = 0.5;
+        ap.process_capture(&mut mic_echo, loud_speaker);
+        let echo_rms: f32 = (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(echo_rms < 0.1, "Loud speaker must trigger echo suppression, got {echo_rms}");
+
+        // Test 2: Background noise below noise floor is gated
+        let mut noise = vec![0.005; FRAME_SAMPLES];
+        ap.process_capture(&mut noise, 0.0);
+        let noise_rms: f32 = (noise.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(noise_rms < 0.002, "Noise below threshold must be attenuated");
+
+        // Test 3: Normal voice signal is boosted/normalized by AGC
+        let mut voice = vec![0.08; FRAME_SAMPLES];
+        for _ in 0..10 {
+            ap.process_capture(&mut voice, 0.0);
+        }
+        let voice_rms: f32 = (voice.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(voice_rms > 0.1 && voice_rms <= 0.25, "AGC must normalize voice volume, got {voice_rms}");
     }
 }
