@@ -603,3 +603,49 @@ mod tests {
             .is_err());
     }
 }
+
+
+/// Descriptor for BinNet sync frames, preserving unknown opcodes and raw payload without guessing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BinNetDescriptor {
+    pub opcode: u16,
+    pub payload: Vec<u8>,
+    pub is_known: bool,
+}
+
+impl BinNetDescriptor {
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 2 {
+            return None;
+        }
+        let opcode = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let is_known = matches!(opcode, 1 | 2 | 3 | 4 | 10 | 20 | 36);
+        Some(Self {
+            opcode,
+            payload: bytes[2..].to_vec(),
+            is_known,
+        })
+    }
+}
+
+#[cfg(test)]
+mod binnet_preservation_tests {
+    use super::*;
+
+    #[test]
+    fn test_binnet_unknown_preservation() {
+        // Opcode 999 is unknown
+        let raw_data = [0x03, 0xE7, 0xAA, 0xBB, 0xCC];
+        let desc = BinNetDescriptor::parse(&raw_data).expect("Must parse header");
+        assert_eq!(desc.opcode, 999);
+        assert!(!desc.is_known);
+        assert_eq!(desc.payload, vec![0xAA, 0xBB, 0xCC]);
+
+        // Opcode 10 is known
+        let known_data = [0x00, 0x0A, 0x11, 0x22];
+        let known_desc = BinNetDescriptor::parse(&known_data).expect("Must parse header");
+        assert_eq!(known_desc.opcode, 10);
+        assert!(known_desc.is_known);
+        assert_eq!(known_desc.payload, vec![0x11, 0x22]);
+    }
+}

@@ -163,6 +163,7 @@ impl ZaloGuiApp {
                         "Giao việc & Bình chọn",
                         "Tin nhắn nhanh",
                         "Thiết bị & Bảo mật",
+                        "Kho Media Server & zCloud",
                     ]
                     .iter()
                     .enumerate()
@@ -179,7 +180,8 @@ impl ZaloGuiApp {
                     4 => self.render_tools_rules(ui),
                     5 => self.render_tools_todo_poll(ui),
                     6 => self.render_tools_quick_messages(ui),
-                    _ => self.render_tools_devices(ui),
+                    7 => self.render_tools_devices(ui),
+                    _ => self.render_tools_server_media_zcloud(ui),
                 });
                 if !self.tools.status.is_empty() {
                     ui.separator();
@@ -619,6 +621,62 @@ impl ZaloGuiApp {
                 self.tools.new_quick_text.clear();
             }
         }
+    }
+
+    fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("📦 Kho Lưu Trữ Media Server & zCloud (Zalo Parity A20 / B05)").strong().size(14.0));
+        ui.label("Truy xuất thư viện hình ảnh, video, tệp tin và liên kết từ máy chủ Zalo cùng dữ liệu lưu trữ đám mây zCloud.");
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("🖼️ Tải Ảnh & Video").clicked() {
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchServerMedia {
+                            thread_id: thread.id.clone(),
+                            is_group: thread.is_group,
+                            media_type: 1,
+                        });
+                    }
+                }
+            }
+            if ui.button("📁 Tải Tệp tin").clicked() {
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchServerMedia {
+                            thread_id: thread.id.clone(),
+                            is_group: thread.is_group,
+                            media_type: 3,
+                        });
+                    }
+                }
+            }
+            if ui.button("🔗 Tải Liên kết").clicked() {
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchServerMedia {
+                            thread_id: thread.id.clone(),
+                            is_group: thread.is_group,
+                            media_type: 4,
+                        });
+                    }
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(RichText::new("☁️ Khôi phục & Mở tệp zCloud (A20):").strong());
+        ui.label("Nhập mã file_id để kiểm tra trạng thái và nhận khoá giải mã xem trước.");
+        ui.horizontal(|ui| {
+            ui.label("File ID:");
+            ui.text_edit_singleline(&mut self.tools.query);
+            if ui.button("🔑 Lấy khoá zCloud").clicked() && !self.tools.query.trim().is_empty() {
+                let fid = self.tools.query.trim().to_string();
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::GetCloudViewerKey { file_id: fid });
+                }
+            }
+        });
     }
 
     fn render_tools_devices(&mut self, ui: &mut egui::Ui) {

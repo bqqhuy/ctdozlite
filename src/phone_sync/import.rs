@@ -315,3 +315,81 @@ mod media_archive_tests {
         }
     }
 }
+
+
+/// An atomic snapshot session for database restoration.
+/// Preserves the original database and supports rollback on error or user cancellation.
+pub struct AtomicRestoreSession {
+    pub backup_path: std::path::PathBuf,
+    pub target_path: std::path::PathBuf,
+    pub is_committed: bool,
+}
+
+impl AtomicRestoreSession {
+    pub fn begin(db_path: &std::path::Path) -> Result<Self> {
+        let backup_path = db_path.with_extension("restore_snapshot.bak");
+        if db_path.exists() {
+            std::fs::copy(db_path, &backup_path)
+                .context("Tạo bản sao lưu tạm thời thất bại")?;
+        }
+        Ok(Self {
+            backup_path,
+            target_path: db_path.to_path_buf(),
+            is_committed: false,
+        })
+    }
+
+    pub fn commit(mut self) -> Result<()> {
+        self.is_committed = true;
+        if self.backup_path.exists() {
+            let _ = std::fs::remove_file(&self.backup_path);
+        }
+        Ok(())
+    }
+
+    pub fn rollback(&mut self) -> Result<()> {
+        if !self.is_committed && self.backup_path.exists() {
+            std::fs::copy(&self.backup_path, &self.target_path)
+                .context("Khôi phục bản sao lưu gốc thất bại")?;
+            let _ = std::fs::remove_file(&self.backup_path);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AtomicRestoreSession {
+    fn drop(&mut self) {
+        let _ = self.rollback();
+    }
+}
+
+
+#[cfg(test)]
+mod atomic_restore_tests {
+    use super::*;
+
+    #[test]
+    fn test_atomic_backup_rollback() {
+        let dir = std::env::temp_dir().join(format!("ctdoz_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_file = dir.join("messages.db");
+
+        std::fs::write(&db_file, b"original-db-content").unwrap();
+
+        // Begin session
+        let mut session = AtomicRestoreSession::begin(&db_file).unwrap();
+        assert!(session.backup_path.exists());
+
+        // Modify db (e.g. during a failed restore)
+        std::fs::write(&db_file, b"corrupted-or-partial-import").unwrap();
+
+        // Drop without commit -> triggers automatic rollback
+        drop(session);
+
+        // Content must be reverted to original
+        let restored = std::fs::read(&db_file).unwrap();
+        assert_eq!(restored, b"original-db-content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -377,6 +377,14 @@ pub enum WorkerCmd {
     KickDevice {
         device_id: String,
     },
+    FetchServerMedia {
+        thread_id: String,
+        is_group: bool,
+        media_type: u8,
+    },
+    GetCloudViewerKey {
+        file_id: String,
+    },
     EndCall {
         call_id: Option<i64>,
     },
@@ -2856,6 +2864,51 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi đăng xuất thiết bị: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchServerMedia { thread_id, is_group, media_type } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                let kind = match media_type {
+                                    1 => crate::server_media::ServerMediaType::Photo,
+                                    2 => crate::server_media::ServerMediaType::Video,
+                                    3 => crate::server_media::ServerMediaType::File,
+                                    _ => crate::server_media::ServerMediaType::Link,
+                                };
+                                let res = if is_group {
+                                    crate::server_media::fetch_group_media_store(&s, &thread_id, kind, 1, 30).await
+                                } else {
+                                    crate::server_media::fetch_direct_media_store(&s, &thread_id, kind, 1, 30).await
+                                };
+                                match res {
+                                    Ok(page) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {} mục từ kho media server", page.items.len())));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải kho media server: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::GetCloudViewerKey { file_id } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::zcloud::get_cloud_viewer_key(&s, &file_id).await {
+                                    Ok(key) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã nhận khoá giải mã zCloud: {}", &key.file_id)));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Lấy khoá zCloud thất bại: {e}")));
                                     }
                                 }
                                 ctx.request_repaint();

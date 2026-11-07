@@ -28,6 +28,8 @@ pub mod todo;
 pub mod poll;
 pub mod quick_message;
 pub mod device;
+pub mod zcloud;
+pub mod server_media;
 
 #[cfg(windows)]
 mod windows_video;
