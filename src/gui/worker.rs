@@ -3023,8 +3023,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = s_clone.lock().await.clone();
-                                let opts_ref: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
-                                match crate::poll::create_group_poll(&s, &thread_id, &question, &opts_ref).await {
+                                match crate::poll::create_group_poll(&s, &thread_id, &question, &options, false, false, false).await {
                                     Ok(_) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo cuộc bình chọn: {question}")));
                                     }
@@ -3041,9 +3040,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = s_clone.lock().await.clone();
-                                match crate::poll::get_group_poll_detail(&s, &thread_id).await {
-                                    Ok(poll) => {
+                                let poll_id = thread_id.parse::<i64>().unwrap_or(0);
+                                match crate::poll::get_group_poll_detail(&s, poll_id).await {
+                                    Ok(Some(poll)) => {
                                         let _ = events.send(GuiEvent::GroupPollsLoaded(vec![poll]));
+                                    }
+                                    Ok(None) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate("Không tìm thấy cuộc bình chọn".into()));
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải bình chọn: {e}")));

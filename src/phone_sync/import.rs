@@ -377,7 +377,7 @@ mod atomic_restore_tests {
         std::fs::write(&db_file, b"original-db-content").unwrap();
 
         // Begin session
-        let mut session = AtomicRestoreSession::begin(&db_file).unwrap();
+        let session = AtomicRestoreSession::begin(&db_file).unwrap();
         assert!(session.backup_path.exists());
 
         // Modify db (e.g. during a failed restore)

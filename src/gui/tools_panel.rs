@@ -677,7 +677,7 @@ impl ZaloGuiApp {
                         ui.label(RichText::new(format!("Tổng số phiếu: {}", poll.total_votes)).size(11.0));
                         for opt in &poll.options {
                             ui.horizontal(|ui| {
-                                ui.label(format!("• {} ({} phiếu)", opt.content, opt.votes));
+                                ui.label(format!("• {} ({} phiếu)", opt.text, opt.vote_count));
                             });
                         }
                     });
@@ -859,7 +859,7 @@ impl ZaloGuiApp {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(format!("Tệp: {fid}")).strong());
-                        ui.label(RichText::new(format!("Thuật toán: {} • Hết hạn: {}", k.algorithm, k.expires_at)).size(11.0));
+                        ui.label(RichText::new(format!("Khoá giải mã: {} • Hết hạn: {}", k.viewer_key, k.expires_at)).size(11.0));
                     });
                 });
             }
@@ -871,7 +871,7 @@ impl ZaloGuiApp {
             for item in &self.tools.server_media_items {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        let icon = match item.kind {
+                        let icon = match item.media_type {
                             crate::server_media::ServerMediaType::Photo => "🖼️",
                             crate::server_media::ServerMediaType::Video => "🎬",
                             crate::server_media::ServerMediaType::File => "📁",
@@ -879,8 +879,8 @@ impl ZaloGuiApp {
                         };
                         ui.label(icon);
                         ui.vertical(|ui| {
-                            ui.label(RichText::new(&item.name).strong());
-                            ui.label(RichText::new(format!("Kích thước: {} bytes • Người gửi: {}", item.file_size, item.sender_name)).size(11.0));
+                            ui.label(RichText::new(&item.file_name).strong());
+                            ui.label(RichText::new(format!("Kích thước: {} bytes • Người gửi: {}", item.file_size, item.sender_id)).size(11.0));
                         });
                     });
                 });
