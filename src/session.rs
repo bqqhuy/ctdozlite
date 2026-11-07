@@ -266,6 +266,7 @@ pub struct SavedSession {
 
 #[derive(Clone)]
 pub struct Session {
+    pub service_resolver: std::sync::Arc<std::sync::RwLock<crate::service_resolver::ServiceResolver>>,
     runtime_generation: usize,
     /// Shared in-memory PIN gate, never serialized with login credentials.
     pub hidden: Arc<crate::hidden_chat::Vault>,
@@ -314,6 +315,7 @@ impl Session {
             )
             .build()?;
         Ok(Self {
+            service_resolver: std::sync::Arc::new(std::sync::RwLock::new(crate::service_resolver::ServiceResolver::new())),
             runtime_generation: next_runtime_generation(),
             hidden: Arc::new(crate::hidden_chat::Vault::default()),
             inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
@@ -377,7 +379,11 @@ impl Session {
     /// Check the server without treating a transient network failure as logout.
     /// Resolve service URL via dynamic ServiceResolver with domain rotation.
     pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
-        crate::service_resolver::ServiceResolver::new().resolve_url(service, path)
+        self.service_resolver.read().unwrap().resolve_url(service, path)
+    }
+
+    pub fn record_service_failure(&self, service: &str) -> bool {
+        self.service_resolver.write().unwrap().record_failure(service)
     }
 
     pub async fn validate_session(&self) -> SessionStatus {

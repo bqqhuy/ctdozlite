@@ -15,22 +15,27 @@ pub struct ServiceResolver {
 impl ServiceResolver {
     pub fn new() -> Self {
         let mut resolver = Self::default();
-        // Populate standard default fallback mappings
+        // Populate canonical endpoints from endpoints.rs as primary, with safe fallback backups
+        let chat_primary = crate::endpoints::service("chat").unwrap_or("https://tt-chat-wpa.chat.zalo.me").to_string();
+        let group_primary = crate::endpoints::service("group").unwrap_or("https://tt-group-wpa.chat.zalo.me").to_string();
+        let profile_primary = crate::endpoints::service("profile").unwrap_or("https://tt-profile-wpa.chat.zalo.me").to_string();
+        let file_primary = crate::endpoints::service("file").unwrap_or("https://tt-files-wpa.chat.zalo.me").to_string();
+
         resolver.register_service("chat", vec![
+            chat_primary,
             "https://tt-chat3-wpa.api.zaloapp.com".into(),
-            "https://tt-chat-wpa.chat.zalo.me".into(),
         ]);
         resolver.register_service("group", vec![
+            group_primary,
             "https://tt-group-wpa.zaloapp.com".into(),
-            "https://tt-group-wpa.chat.zalo.me".into(),
         ]);
         resolver.register_service("profile", vec![
-            "https://tt-profile-wpa.chat.zalo.me".into(),
+            profile_primary,
             "https://tt-profile-wpa.zaloapp.com".into(),
         ]);
         resolver.register_service("file", vec![
+            file_primary,
             "https://tt-files-wpa.zaloapp.com".into(),
-            "https://tt-files-wpa.chat.zalo.me".into(),
         ]);
         resolver
     }
@@ -79,14 +84,14 @@ mod tests {
         let mut resolver = ServiceResolver::new();
         assert_eq!(
             resolver.resolve_url("chat", "/api/message/send"),
-            "https://tt-chat3-wpa.api.zaloapp.com/api/message/send"
+            "https://tt-chat-wpa.chat.zalo.me/api/message/send"
         );
 
         // Record failure -> rotates to secondary fallback host
         assert!(resolver.record_failure("chat"));
         assert_eq!(
             resolver.resolve_url("chat", "/api/message/send"),
-            "https://tt-chat-wpa.chat.zalo.me/api/message/send"
+            "https://tt-chat3-wpa.api.zaloapp.com/api/message/send"
         );
 
         // Unknown service falls back to default base host

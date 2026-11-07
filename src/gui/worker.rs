@@ -2962,15 +2962,28 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let mut peers = Vec::new();
                                 if let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                                     let _ = sock.set_broadcast(true);
-                                    let pkt = crate::lan_transfer::format_lan_discovery_packet("current_device", "Windows 11 ARM64", 8998);
+                                    let dev_name = format!("Windows 11 ({})", std::env::consts::ARCH);
+                                    let pkt = crate::lan_transfer::format_lan_discovery_packet("current_device", &dev_name, 8998);
                                     let _ = sock.send_to(pkt.as_bytes(), "255.255.255.255:8998").await;
                                     let mut buf = [0u8; 1024];
-                                    let now = crate::login::unix_now();
-                                    if let Ok(Ok((len, addr))) = tokio::time::timeout(std::time::Duration::from_millis(500), sock.recv_from(&mut buf)).await {
-                                        if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
-                                            if let Some(peer) = crate::lan_transfer::parse_lan_discovery_packet(msg, &addr.ip().to_string(), now) {
-                                                peers.push(peer);
+                                    let start = tokio::time::Instant::now();
+                                    let deadline = std::time::Duration::from_millis(1500);
+                                    while tokio::time::Instant::now() - start < deadline {
+                                        let remaining = deadline.saturating_sub(tokio::time::Instant::now() - start);
+                                        if remaining.is_zero() {
+                                            break;
+                                        }
+                                        if let Ok(Ok((len, addr))) = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+                                            let now = crate::login::unix_now();
+                                            if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
+                                                if let Some(peer) = crate::lan_transfer::parse_lan_discovery_packet(msg, &addr.ip().to_string(), now) {
+                                                    if !peers.iter().any(|p: &crate::lan_transfer::LanPeer| p.peer_id == peer.peer_id) {
+                                                        peers.push(peer);
+                                                    }
+                                                }
                                             }
+                                        } else {
+                                            break;
                                         }
                                     }
                                 }
@@ -3026,6 +3039,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 match crate::poll::create_group_poll(&s, &thread_id, &question, &options, false, false, false).await {
                                     Ok(_) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo cuộc bình chọn: {question}")));
+                                        if let Ok(reply) = crate::group_content::execute(&s, &thread_id, &crate::group_content::Action::ListPolls { page: 1, last: String::new(), last_type: 0 }).await {
+                                            let poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(|p| {
+                                                let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
+                                                crate::poll::PollItem {
+                                                    id: p.id.parse::<i64>().unwrap_or(0),
+                                                    grid: thread_id.clone(),
+                                                    question: p.question,
+                                                    creator_id: p.creator,
+                                                    options: p.options.into_iter().map(|o| crate::poll::PollOption {
+                                                        id: o.id,
+                                                        text: o.text,
+                                                        vote_count: o.votes.unwrap_or(0) as u32,
+                                                        is_voted_by_me: o.selected,
+                                                    }).collect(),
+                                                    multi_choice: p.multi,
+                                                    is_closed: p.closed,
+                                                    total_votes: total,
+                                                }
+                                            }).collect();
+                                            let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
+                                        }
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Tạo bình chọn thất bại: {e}")));
@@ -3040,16 +3074,32 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = s_clone.lock().await.clone();
-                                let poll_id = thread_id.parse::<i64>().unwrap_or(0);
-                                match crate::poll::get_group_poll_detail(&s, poll_id).await {
-                                    Ok(Some(poll)) => {
-                                        let _ = events.send(GuiEvent::GroupPollsLoaded(vec![poll]));
-                                    }
-                                    Ok(None) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate("Không tìm thấy cuộc bình chọn".into()));
+                                match crate::group_content::execute(&s, &thread_id, &crate::group_content::Action::ListPolls { page: 1, last: String::new(), last_type: 0 }).await {
+                                    Ok(reply) => {
+                                        let poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(|p| {
+                                            let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
+                                            crate::poll::PollItem {
+                                                id: p.id.parse::<i64>().unwrap_or(0),
+                                                grid: thread_id.clone(),
+                                                question: p.question,
+                                                creator_id: p.creator,
+                                                options: p.options.into_iter().map(|o| crate::poll::PollOption {
+                                                    id: o.id,
+                                                    text: o.text,
+                                                    vote_count: o.votes.unwrap_or(0) as u32,
+                                                    is_voted_by_me: o.selected,
+                                                }).collect(),
+                                                multi_choice: p.multi,
+                                                is_closed: p.closed,
+                                                total_votes: total,
+                                            }
+                                        }).collect();
+                                        let count = poll_items.len();
+                                        let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {count} cuộc bình chọn")));
                                     }
                                     Err(e) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải bình chọn: {e}")));
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách bình chọn: {e}")));
                                     }
                                 }
                                 ctx.request_repaint();

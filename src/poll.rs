@@ -111,7 +111,7 @@ pub async fn create_group_poll(
     allow_add_opt: bool,
     hide_voters: bool,
 ) -> Result<Value> {
-    let url = format!("{}/api/group/poll/create", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/poll/create");
     let payload = build_create_poll_params(grid, question, options, multi_choice, allow_add_opt, hide_voters);
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số tạo bình chọn thất bại")?;
@@ -125,7 +125,7 @@ pub async fn vote_group_poll(
     poll_id: i64,
     option_ids: &[i64],
 ) -> Result<Value> {
-    let url = format!("{}/api/group/poll/vote", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/poll/vote");
     let payload = json!({
         "poll_id": poll_id,
         "option_ids": option_ids,
@@ -141,7 +141,7 @@ pub async fn get_group_poll_detail(
     s: &Session,
     poll_id: i64,
 ) -> Result<Option<PollItem>> {
-    let url = format!("{}/api/group/poll/detail", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/poll/detail");
     let payload = json!({ "poll_id": poll_id });
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số xem bình chọn thất bại")?;

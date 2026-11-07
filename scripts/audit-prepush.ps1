@@ -14,12 +14,18 @@ if (!(Get-Command cargo -ErrorAction SilentlyContinue)) {
 }
 cargo --version
 
-Write-Host "`n=== [2/4] Running Local Compilation Check (cargo check --locked) ===" -ForegroundColor Cyan
+Write-Host "`n=== [2/4] Running Local Compilation & Strict Clippy Check ===" -ForegroundColor Cyan
+Write-Host "--> Checking types and compilation (cargo check --locked)..."
 cargo check --locked
 if ($LASTEXITCODE -ne 0) {
     Write-Error "cargo check failed! Fix all compiler and type errors before committing or pushing."
 }
-Write-Host "Local compilation check PASSED!" -ForegroundColor Green
+Write-Host "--> Running strict lint inspection (cargo clippy --all-targets --locked -- -D warnings)..."
+cargo clippy --all-targets --locked -- -D warnings
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "cargo clippy detected warnings or errors! Fix all lint issues before committing or pushing."
+}
+Write-Host "Local compilation & strict Clippy check PASSED!" -ForegroundColor Green
 
 Write-Host "`n=== [3/4] Scanning for Suspicious UI Stubs ===" -ForegroundColor Cyan
 $stubFound = $false

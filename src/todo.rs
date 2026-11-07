@@ -122,7 +122,7 @@ pub async fn create_group_todo(
     assignee_id: &str,
     deadline_ts: i64,
 ) -> Result<Value> {
-    let url = format!("{}/api/group/todo/create", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/todo/create");
     let payload = build_create_todo_params(grid, content, assignee_id, deadline_ts);
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số tạo to-do thất bại")?;
@@ -139,7 +139,7 @@ pub async fn update_group_todo(
     assignee_id: Option<&str>,
     deadline_ts: Option<i64>,
 ) -> Result<Value> {
-    let url = format!("{}/api/group/todo/update", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/todo/update");
     let payload = build_update_todo_params(todo_id, grid, status, assignee_id, deadline_ts);
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số cập nhật to-do thất bại")?;
@@ -152,7 +152,7 @@ pub async fn list_group_todos(
     s: &Session,
     grid: &str,
 ) -> Result<Vec<TodoItem>> {
-    let url = format!("{}/api/group/todo/list", s.domains.group);
+    let url = s.resolve_service_url("group", "/api/group/todo/list");
     let payload = json!({ "grid": grid });
     let params = s.encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách to-do thất bại")?;

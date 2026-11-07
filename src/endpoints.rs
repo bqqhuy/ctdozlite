@@ -11,15 +11,15 @@ pub const SERVICE_MAP_V3: &[(&str, &str)] = &[
     ("profile", "https://tt-profile-wpa.chat.zalo.me"),
     ("friend", "https://tt-friend-wpa.chat.zalo.me"),
     ("conversation", "https://tt-convers-wpa.chat.zalo.me"),
-    ("chat", "https://tt-chat3-wpa.api.zaloapp.com"),
-    ("group", "https://tt-group-wpa.zaloapp.com"),
+    ("chat", "https://tt-chat-wpa.chat.zalo.me"),
+    ("group", "https://tt-group-wpa.chat.zalo.me"),
     ("sticker", "https://tt-sticker-wpa.chat.zalo.me"),
     ("alias", "https://tt-alias-wpa.chat.zalo.me"),
     ("label", "https://label-wpa.chat.zalo.me"),
     ("reaction", "https://reaction.api.zaloapp.com"),
     ("emoji_status", "https://emoji-status.chat.zalo.me"),
     ("zcloud", "https://zcld.chat.zalo.me"),
-    ("file", "https://tt-files-wpa.zaloapp.com"),
+    ("file", "https://tt-files-wpa.chat.zalo.me"),
     ("voice_call", "https://voicecall-wpa.chat.zalo.me"),
 ];
 
