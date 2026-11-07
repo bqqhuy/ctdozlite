@@ -420,43 +420,6 @@ pub fn read_windows() -> Result<Option<image::RgbaImage>> {
     Ok(Some(image))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn bitmap() -> Vec<u8> {
-        let mut b = vec![0; 44];
-        b[0..4].copy_from_slice(&40u32.to_le_bytes());
-        b[4..8].copy_from_slice(&1i32.to_le_bytes());
-        b[8..12].copy_from_slice(&(-1i32).to_le_bytes());
-        b[12..14].copy_from_slice(&1u16.to_le_bytes());
-        b[14..16].copy_from_slice(&32u16.to_le_bytes());
-        b[40..44].copy_from_slice(&[2, 3, 4, 0]);
-        b
-    }
-    #[test]
-    fn top_down_rgb_without_alpha_is_opaque() {
-        assert_eq!(
-            decode_dib(&bitmap()).unwrap().get_pixel(0, 0).0,
-            [4, 3, 2, 255]
-        );
-    }
-    #[test]
-    fn truncation_and_huge_dimensions_fail_before_allocation() {
-        let mut b = bitmap();
-        b.pop();
-        assert!(decode_dib(&b).is_err());
-        b = bitmap();
-        b[8..12].copy_from_slice(&i32::MIN.to_le_bytes());
-        assert!(decode_dib(&b).is_err());
-    }
-    #[test]
-    fn invalid_compression_is_not_interpreted_as_pixels() {
-        let mut b = bitmap();
-        b[16..20].copy_from_slice(&1u32.to_le_bytes());
-        assert!(decode_dib(&b).is_err());
-    }
-}
-
 /// Copy decoded viewer pixels as a top-down DIB, without exposing a signed CDN URL.
 /// # Errors
 /// Returns clipboard ownership/allocation failures. Must run off the UI thread.
@@ -572,3 +535,41 @@ pub(crate) fn write_windows(image: &eframe::egui::ColorImage) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn bitmap() -> Vec<u8> {
+        let mut b = vec![0; 44];
+        b[0..4].copy_from_slice(&40u32.to_le_bytes());
+        b[4..8].copy_from_slice(&1i32.to_le_bytes());
+        b[8..12].copy_from_slice(&(-1i32).to_le_bytes());
+        b[12..14].copy_from_slice(&1u16.to_le_bytes());
+        b[14..16].copy_from_slice(&32u16.to_le_bytes());
+        b[40..44].copy_from_slice(&[2, 3, 4, 0]);
+        b
+    }
+    #[test]
+    fn top_down_rgb_without_alpha_is_opaque() {
+        assert_eq!(
+            decode_dib(&bitmap()).unwrap().get_pixel(0, 0).0,
+            [4, 3, 2, 255]
+        );
+    }
+    #[test]
+    fn truncation_and_huge_dimensions_fail_before_allocation() {
+        let mut b = bitmap();
+        b.pop();
+        assert!(decode_dib(&b).is_err());
+        b = bitmap();
+        b[8..12].copy_from_slice(&i32::MIN.to_le_bytes());
+        assert!(decode_dib(&b).is_err());
+    }
+    #[test]
+    fn invalid_compression_is_not_interpreted_as_pixels() {
+        let mut b = bitmap();
+        b[16..20].copy_from_slice(&1u32.to_le_bytes());
+        assert!(decode_dib(&b).is_err());
+    }
+}
+

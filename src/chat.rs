@@ -4301,6 +4301,7 @@ pub async fn recall_message(
 }
 
 /// Send a contact card to a 1-1 conversation or group (`/api/message/contact` cmd 11774 or `/api/group/contact` cmd 11827).
+#[allow(clippy::too_many_arguments)]
 pub async fn send_contact_card(
     s: &Session,
     to_id: &str,

@@ -213,7 +213,7 @@ impl ZaloGuiApp {
         #[cfg(windows)]
         {
             self.native_hwnd
-                .and_then(|hwnd| crate::drop_cursor_windows::position(hwnd))
+                .and_then(crate::drop_cursor_windows::position)
                 .map(|(x, y)| {
                     let scale = ctx.pixels_per_point();
                     egui::pos2(x as f32 / scale, y as f32 / scale)

@@ -383,6 +383,11 @@ pub fn execute(
         ..Default::default()
     };
     let importing = expected.is_some();
+    let restore_session = if importing {
+        Some(crate::phone_sync::AtomicRestoreSession::begin(&session.history_path())?)
+    } else {
+        None
+    };
     let store = MessageStore::open(session.history_path())?;
     let mut transaction = if importing {
         Some(store.conn.unchecked_transaction()?)
@@ -504,11 +509,16 @@ pub fn execute(
         Ok(())
     })();
     if result.is_err() {
+        if let Some(mut s) = restore_session {
+            let _ = s.rollback();
+        }
         // Committed batches remain; only the current batch and its new media are rolled back.
         drop(transaction);
         for path in new_files {
             let _ = std::fs::remove_file(path);
         }
+    } else if let Some(s) = restore_session {
+        s.commit()?;
     }
     result?;
     Ok(report)

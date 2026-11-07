@@ -114,7 +114,7 @@ pub fn parse_cloud_download_urls(val: &Value) -> Vec<CloudMediaDownloadUrl> {
 
 /// Call `/api/getCloudViewerKey` to retrieve an authorized decryption/viewing token.
 pub async fn get_cloud_viewer_key(s: &Session, file_id: &str) -> Result<CloudViewerKey> {
-    let host = crate::endpoints::service("zcloud").unwrap_or("https://zcld.chat.zalo.me");
+    let host = crate::endpoints::service("zcloud").context("Thiếu cấu hình endpoint zcloud")?;
     let url = format!("{host}/api/getCloudViewerKey");
     let payload = json!({
         "file_id": file_id,
@@ -129,7 +129,7 @@ pub async fn get_cloud_viewer_key(s: &Session, file_id: &str) -> Result<CloudVie
 
 /// Call `/cloudmedia/queue/pc/verify` to verify asset state on zCloud.
 pub async fn verify_cloud_media(s: &Session, file_id: &str, checksum: &str) -> Result<bool> {
-    let host = crate::endpoints::service("zcloud").unwrap_or("https://zcld.chat.zalo.me");
+    let host = crate::endpoints::service("zcloud").context("Thiếu cấu hình endpoint zcloud")?;
     let url = format!("{host}/cloudmedia/queue/pc/verify");
     let payload = json!({
         "file_id": file_id,
@@ -146,7 +146,7 @@ pub async fn verify_cloud_media(s: &Session, file_id: &str, checksum: &str) -> R
 
 /// Call `/cloudmedia/downloadurls/pc/v1` to obtain signed download links.
 pub async fn get_cloud_download_urls(s: &Session, file_ids: &[&str]) -> Result<Vec<CloudMediaDownloadUrl>> {
-    let host = crate::endpoints::service("zcloud").unwrap_or("https://zcld.chat.zalo.me");
+    let host = crate::endpoints::service("zcloud").context("Thiếu cấu hình endpoint zcloud")?;
     let url = format!("{host}/cloudmedia/downloadurls/pc/v1");
     let payload = json!({
         "file_ids": file_ids,

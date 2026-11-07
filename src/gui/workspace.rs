@@ -2695,7 +2695,7 @@ impl ZaloGuiApp {
                             .show(ctx, |ui| {
                                 egui::Frame::none()
                                     .fill(pal.bg_elevated)
-                                    .stroke(Stroke::new(1.0, pal.border))
+                                    .stroke(Stroke::new(1.0_f32, pal.border))
                                     .rounding(Rounding::same(8.0))
                                     .inner_margin(Margin::symmetric(12.0, 6.0))
                                     .show(ui, |ui| {
@@ -4585,6 +4585,7 @@ fn sender_avatar_for<'a>(threads: &'a [Thread], sender_id: &str) -> Option<&'a s
 
 impl ZaloGuiApp {
     /// Lookup avatar for a direct contact without allocating a map each frame.
+    #[allow(dead_code)]
     pub(super) fn sender_avatar_for(&self, sender_id: &str) -> Option<&str> {
         sender_avatar_for(&self.threads, sender_id)
     }
@@ -4942,6 +4943,7 @@ impl ZaloGuiApp {
         self.status_msg = "Đang gửi tin nhắn thoại…".into();
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_voice_recording_bar(
         ui: &mut egui::Ui,
         pal: &ThemePalette,

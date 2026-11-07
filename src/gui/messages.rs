@@ -1738,7 +1738,7 @@ pub(super) fn render_voice_message_widget(
     outgoing: bool,
     max_text_width: f32,
 ) -> Option<BubbleAction> {
-    let card_w = max_text_width.min(260.0).max(180.0);
+    let card_w = max_text_width.clamp(180.0, 260.0);
     let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -1792,7 +1792,7 @@ pub(super) fn render_todo_widget(
     outgoing: bool,
     max_text_width: f32,
 ) -> Option<BubbleAction> {
-    let card_w = max_text_width.min(280.0).max(200.0);
+    let card_w = max_text_width.clamp(200.0, 280.0);
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -1826,7 +1826,7 @@ pub(super) fn render_poll_widget(
     outgoing: bool,
     max_text_width: f32,
 ) -> Option<BubbleAction> {
-    let card_w = max_text_width.min(280.0).max(200.0);
+    let card_w = max_text_width.clamp(200.0, 280.0);
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
@@ -1861,7 +1861,7 @@ pub(super) fn render_contact_card_widget(
     max_text_width: f32,
 ) -> Option<BubbleAction> {
     let mut action = None;
-    let card_w = max_text_width.min(280.0).max(200.0);
+    let card_w = max_text_width.clamp(200.0, 280.0);
     let (text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {

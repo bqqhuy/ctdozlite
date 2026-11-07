@@ -873,7 +873,6 @@ pub struct ZaloGuiApp {
     send_contact_modal_open: bool,
     send_contact_query: String,
     batch_forward_modal_open: bool,
-    batch_forward_target_id: Option<String>,
     voice_recorder: Option<crate::voice::VoiceRecorder>,
     voice_preview: Option<crate::voice::VoicePreviewPlayer>,
     recorded_voice_samples: Option<(Vec<f32>, u32, std::time::Duration)>,
@@ -1153,7 +1152,6 @@ impl ZaloGuiApp {
             send_contact_modal_open: false,
             send_contact_query: String::new(),
             batch_forward_modal_open: false,
-            batch_forward_target_id: None,
             voice_recorder: None,
             voice_preview: None,
             recorded_voice_samples: None,
@@ -4385,7 +4383,7 @@ impl ZaloGuiApp {
                     self.status_msg = format!("Đã tải {} mục từ kho media server", self.tools.server_media_items.len());
                 }
                 GuiEvent::CloudViewerKeyLoaded(key) => {
-                    self.status_msg = format!("Đã nhận khoá giải mã zCloud cho tệp {}", &key.file_id);
+                    self.status_msg = format!("Đã nhận khoá giải mã zCloud cho tệp {}", key.file_id);
                     self.tools.cloud_viewer_keys.insert(key.file_id.clone(), key);
                 }
                 GuiEvent::BusinessCatalogLoaded(items) => {
@@ -4398,7 +4396,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::TwoFactorStatusLoaded(status) => {
                     let st_str = if status.is_enabled { "Đã kích hoạt" } else { "Chưa kích hoạt" };
-                    self.status_msg = format!("Xác thực 2FA: {} (SĐT: {})", st_str, &status.phone_masked);
+                    self.status_msg = format!("Xác thực 2FA: {} (SĐT: {})", st_str, status.phone_masked);
                     self.tools.two_factor_status = Some(status);
                 }
                 GuiEvent::GroupTodosLoaded(todos) => {
