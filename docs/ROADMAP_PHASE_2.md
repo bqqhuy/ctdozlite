@@ -59,7 +59,7 @@ Hiện tại, ứng dụng vẫn dựa một phần vào HTTP Polling định k�
 #### B. Điểm neo mã nguồn & Giao thức Zalo PC
 1. **WebSocket Push Transport**: `src/socket.rs`
    - Endpoint: `wss://ws-push.chat.zalo.me/ws/chat` (hoặc domain do `ServiceResolver` cung cấp).
-   - Packet Framing: Khung nhị phân Zalo Socket Header (16 bytes: `Magic`, `CmdId`, `Version`, `BodyLen`, `Seq`).
+   - Packet Framing: Khung nhị phân Zalo Socket Header 4 bytes (`u8 version | u16 LE cmd | u8 subCmd`) theo Zalo PC 26.10.11 (`src/socket.rs`).
 2. **Push Command IDs cần xử lý full-duplex**:
    - `CMD 501`: Tin nhắn văn bản / media 1-1 mới đến từ server.
    - `CMD 502`: Tin nhắn nhóm mới.
