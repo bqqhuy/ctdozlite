@@ -387,6 +387,25 @@ pub enum WorkerCmd {
     },
     GetBusinessCatalog,
     DiscoverLanPeers,
+    CreateTodo {
+        thread_id: String,
+        content: String,
+        assignee_id: String,
+        deadline_ts: i64,
+    },
+    FetchTodos {
+        thread_id: String,
+    },
+    CreatePoll {
+        thread_id: String,
+        question: String,
+        options: Vec<String>,
+    },
+    FetchPolls {
+        thread_id: String,
+    },
+    FetchDevices,
+    CheckTwoFactor,
     EndCall {
         call_id: Option<i64>,
     },
@@ -2863,6 +2882,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 match crate::device::kick_remote_device(&s, &device_id).await {
                                     Ok(_) => {
                                         let _ = events.send(GuiEvent::StatusUpdate("Đã đăng xuất thiết bị từ xa".into()));
+                                        if let Ok(devs) = crate::device::get_logged_in_devices(&s).await {
+                                            let _ = events.send(GuiEvent::DevicesLoaded(devs));
+                                        }
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi đăng xuất thiết bị: {e}")));
@@ -2890,7 +2912,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 };
                                 match res {
                                     Ok(page) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {} mục từ kho media server", page.items.len())));
+                                        let _ = events.send(GuiEvent::ServerMediaLoaded { items: page.items, media_type });
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải kho media server: {e}")));
@@ -2907,7 +2929,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let s = s_clone.lock().await.clone();
                                 match crate::zcloud::get_cloud_viewer_key(&s, &file_id).await {
                                     Ok(key) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã nhận khoá giải mã zCloud: {}", &key.file_id)));
+                                        let _ = events.send(GuiEvent::CloudViewerKeyLoaded(key));
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Lấy khoá zCloud thất bại: {e}")));
@@ -2924,7 +2946,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let s = s_clone.lock().await.clone();
                                 match crate::business::fetch_product_catalog(&s).await {
                                     Ok(items) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {} sản phẩm từ danh mục doanh nghiệp", items.len())));
+                                        let _ = events.send(GuiEvent::BusinessCatalogLoaded(items));
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh mục sản phẩm: {e}")));
@@ -2937,7 +2959,130 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let _ = events.send(GuiEvent::StatusUpdate("Đang quét thiết bị Zalo trong cùng mạng LAN…".into()));
+                                let mut peers = Vec::new();
+                                if let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                                    let _ = sock.set_broadcast(true);
+                                    let pkt = crate::lan_transfer::format_lan_discovery_packet("current_device", "Windows 11 ARM64", 8998);
+                                    let _ = sock.send_to(pkt.as_bytes(), "255.255.255.255:8998").await;
+                                    let mut buf = [0u8; 1024];
+                                    let now = crate::login::unix_now();
+                                    if let Ok(Ok((len, addr))) = tokio::time::timeout(std::time::Duration::from_millis(500), sock.recv_from(&mut buf)).await {
+                                        if let Ok(msg) = std::str::from_utf8(&buf[..len]) {
+                                            if let Some(peer) = crate::lan_transfer::parse_lan_discovery_packet(msg, &addr.ip().to_string(), now) {
+                                                peers.push(peer);
+                                            }
+                                        }
+                                    }
+                                }
+                                let count = peers.len();
+                                let _ = events.send(GuiEvent::LanPeersDiscovered(peers));
+                                let _ = events.send(GuiEvent::StatusUpdate(format!("Quét hoàn tất: tìm thấy {count} thiết bị cùng mạng LAN")));
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::CreateTodo { thread_id, content, assignee_id, deadline_ts } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::todo::create_group_todo(&s, &thread_id, &content, &assignee_id, deadline_ts).await {
+                                    Ok(_) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo việc thành công: {content}")));
+                                        if let Ok(todos) = crate::todo::list_group_todos(&s, &thread_id).await {
+                                            let _ = events.send(GuiEvent::GroupTodosLoaded(todos));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Tạo việc thất bại: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchTodos { thread_id } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::todo::list_group_todos(&s, &thread_id).await {
+                                    Ok(todos) => {
+                                        let _ = events.send(GuiEvent::GroupTodosLoaded(todos));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách to-do: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::CreatePoll { thread_id, question, options } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                let opts_ref: Vec<&str> = options.iter().map(|s| s.as_str()).collect();
+                                match crate::poll::create_group_poll(&s, &thread_id, &question, &opts_ref).await {
+                                    Ok(_) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo cuộc bình chọn: {question}")));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Tạo bình chọn thất bại: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchPolls { thread_id } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::poll::get_group_poll_detail(&s, &thread_id).await {
+                                    Ok(poll) => {
+                                        let _ = events.send(GuiEvent::GroupPollsLoaded(vec![poll]));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải bình chọn: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchDevices => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::device::get_logged_in_devices(&s).await {
+                                    Ok(devs) => {
+                                        let _ = events.send(GuiEvent::DevicesLoaded(devs));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách thiết bị: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::CheckTwoFactor => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::account_recovery::check_two_factor_status(&s).await {
+                                    Ok(status) => {
+                                        let _ = events.send(GuiEvent::TwoFactorStatusLoaded(status));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Kiểm tra 2FA thất bại: {e}")));
+                                    }
+                                }
                                 ctx.request_repaint();
                             });
                         }

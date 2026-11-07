@@ -480,6 +480,17 @@ pub enum GuiEvent {
         reason: String,
     },
     StatusUpdate(String),
+    ServerMediaLoaded {
+        items: Vec<crate::server_media::ServerMediaItem>,
+        media_type: u8,
+    },
+    CloudViewerKeyLoaded(crate::zcloud::CloudViewerKey),
+    BusinessCatalogLoaded(Vec<crate::business::ProductCatalogItem>),
+    DevicesLoaded(Vec<crate::device::DeviceSession>),
+    TwoFactorStatusLoaded(crate::account_recovery::TwoFactorStatus),
+    GroupTodosLoaded(Vec<crate::todo::TodoItem>),
+    GroupPollsLoaded(Vec<crate::poll::PollItem>),
+    LanPeersDiscovered(Vec<crate::lan_transfer::LanPeer>),
     BatchRecallCompleted {
         thread_id: String,
         recalled_ids: Vec<String>,
@@ -4368,6 +4379,39 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
+                }
+                GuiEvent::ServerMediaLoaded { items, media_type: _ } => {
+                    self.tools.server_media_items = items;
+                    self.status_msg = format!("Đã tải {} mục từ kho media server", self.tools.server_media_items.len());
+                }
+                GuiEvent::CloudViewerKeyLoaded(key) => {
+                    self.status_msg = format!("Đã nhận khoá giải mã zCloud cho tệp {}", &key.file_id);
+                    self.tools.cloud_viewer_keys.insert(key.file_id.clone(), key);
+                }
+                GuiEvent::BusinessCatalogLoaded(items) => {
+                    self.tools.catalog_items = items;
+                    self.status_msg = format!("Đã tải {} sản phẩm doanh nghiệp", self.tools.catalog_items.len());
+                }
+                GuiEvent::DevicesLoaded(devices) => {
+                    self.tools.devices = devices;
+                    self.status_msg = format!("Đã cập nhật {} thiết bị đăng nhập", self.tools.devices.len());
+                }
+                GuiEvent::TwoFactorStatusLoaded(status) => {
+                    let st_str = if status.is_enabled { "Đã kích hoạt" } else { "Chưa kích hoạt" };
+                    self.status_msg = format!("Xác thực 2FA: {} (SĐT: {})", st_str, &status.phone_masked);
+                    self.tools.two_factor_status = Some(status);
+                }
+                GuiEvent::GroupTodosLoaded(todos) => {
+                    self.tools.group_todos = todos;
+                    self.status_msg = format!("Đã tải {} việc cần làm từ nhóm", self.tools.group_todos.len());
+                }
+                GuiEvent::GroupPollsLoaded(polls) => {
+                    self.tools.group_polls = polls;
+                    self.status_msg = format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
+                }
+                GuiEvent::LanPeersDiscovered(peers) => {
+                    self.tools.lan_peers = peers;
+                    self.status_msg = format!("Đã phát hiện {} thiết bị Zalo trong mạng LAN", self.tools.lan_peers.len());
                 }
                 GuiEvent::BatchRecallCompleted {
                     thread_id,

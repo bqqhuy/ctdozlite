@@ -26,6 +26,15 @@ pub(super) struct ToolsPanel {
     pub new_quick_shortcut: String,
     pub new_quick_title: String,
     pub new_quick_text: String,
+    pub server_media_items: Vec<crate::server_media::ServerMediaItem>,
+    pub cloud_viewer_keys: std::collections::HashMap<String, crate::zcloud::CloudViewerKey>,
+    pub catalog_items: Vec<crate::business::ProductCatalogItem>,
+    pub two_factor_status: Option<crate::account_recovery::TwoFactorStatus>,
+    pub group_polls: Vec<crate::poll::PollItem>,
+    pub lan_peers: Vec<crate::lan_transfer::LanPeer>,
+    pub new_poll_question: String,
+    pub new_poll_option_1: String,
+    pub new_poll_option_2: String,
 }
 
 #[derive(Clone)]
@@ -562,17 +571,119 @@ impl ZaloGuiApp {
             ui.label("Người được giao (ID):");
             ui.text_edit_singleline(&mut self.tools.new_todo_assignee);
         });
-        if ui.button("➕ Tạo việc cần làm").clicked() && !self.tools.new_todo_content.trim().is_empty() {
-            let content = self.tools.new_todo_content.trim().to_string();
-            let assignee = self.tools.new_todo_assignee.trim().to_string();
-            self.tools.new_todo_content.clear();
-            self.tools.new_todo_assignee.clear();
-            self.status_msg = format!("Đã tạo việc: {content}");
+        ui.horizontal(|ui| {
+            if ui.button("➕ Tạo việc cần làm").clicked() && !self.tools.new_todo_content.trim().is_empty() {
+                let content = self.tools.new_todo_content.trim().to_string();
+                let assignee = self.tools.new_todo_assignee.trim().to_string();
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::CreateTodo {
+                            thread_id: thread.id.clone(),
+                            content: content.clone(),
+                            assignee_id: assignee.clone(),
+                            deadline_ts: 0,
+                        });
+                    }
+                }
+                self.tools.new_todo_content.clear();
+                self.tools.new_todo_assignee.clear();
+                self.status_msg = format!("Đang gửi lệnh tạo việc: {content}...");
+            }
+            if ui.button("🔄 Tải danh sách việc").clicked() {
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchTodos {
+                            thread_id: thread.id.clone(),
+                        });
+                    }
+                }
+            }
+        });
+
+        if !self.tools.group_todos.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(format!("Danh sách việc ({}) :", self.tools.group_todos.len())).strong());
+            for todo in &self.tools.group_todos {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        let icon = if todo.status == crate::todo::TodoStatus::Done { "✅" } else { "⏳" };
+                        ui.label(icon);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&todo.content).strong());
+                            ui.label(RichText::new(format!("Người tạo: {} • Người nhận: {}", todo.creator_id, todo.assignee_id)).size(11.0));
+                        });
+                    });
+                });
+            }
         }
 
         ui.separator();
         ui.label(RichText::new("📊 Bình chọn nhóm (Zalo Parity A19)").strong().size(14.0));
         ui.label("Tạo và theo dõi kết quả các cuộc bình chọn trong nhóm trò chuyện.");
+        ui.horizontal(|ui| {
+            ui.label("Câu hỏi:");
+            ui.text_edit_singleline(&mut self.tools.new_poll_question);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Lựa chọn 1:");
+            ui.text_edit_singleline(&mut self.tools.new_poll_option_1);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Lựa chọn 2:");
+            ui.text_edit_singleline(&mut self.tools.new_poll_option_2);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("➕ Tạo bình chọn").clicked() && !self.tools.new_poll_question.trim().is_empty() {
+                let question = self.tools.new_poll_question.trim().to_string();
+                let mut options = Vec::new();
+                if !self.tools.new_poll_option_1.trim().is_empty() {
+                    options.push(self.tools.new_poll_option_1.trim().to_string());
+                }
+                if !self.tools.new_poll_option_2.trim().is_empty() {
+                    options.push(self.tools.new_poll_option_2.trim().to_string());
+                }
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::CreatePoll {
+                            thread_id: thread.id.clone(),
+                            question: question.clone(),
+                            options,
+                        });
+                    }
+                }
+                self.tools.new_poll_question.clear();
+                self.tools.new_poll_option_1.clear();
+                self.tools.new_poll_option_2.clear();
+                self.status_msg = format!("Đang gửi lệnh tạo bình chọn: {question}...");
+            }
+            if ui.button("🔄 Tải bình chọn").clicked() {
+                if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::FetchPolls {
+                            thread_id: thread.id.clone(),
+                        });
+                    }
+                }
+            }
+        });
+
+        if !self.tools.group_polls.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new("Các cuộc bình chọn hiện tại:").strong());
+            for poll in &self.tools.group_polls {
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(&poll.question).strong().color(Color32::from_rgb(0, 120, 215)));
+                        ui.label(RichText::new(format!("Tổng số phiếu: {}", poll.total_votes)).size(11.0));
+                        for opt in &poll.options {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("• {} ({} phiếu)", opt.content, opt.votes));
+                            });
+                        }
+                    });
+                });
+            }
+        }
     }
 
     fn render_tools_quick_messages(&mut self, ui: &mut egui::Ui) {
@@ -643,17 +754,47 @@ impl ZaloGuiApp {
             }
         });
 
+        if !self.tools.catalog_items.is_empty() {
+            ui.separator();
+            ui.label(RichText::new(format!("📦 Danh mục sản phẩm ({}) :", self.tools.catalog_items.len())).strong());
+            for prod in &self.tools.catalog_items {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("🛍️");
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&prod.name).strong());
+                            ui.label(RichText::new(format!("Giá: {} đ • {}", prod.price, prod.description)).size(12.0));
+                        });
+                    });
+                });
+            }
+        }
+
         ui.separator();
         ui.label(RichText::new("📡 Thiết bị ngang hàng trong mạng LAN:").strong());
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.label("💻");
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet").strong());
-                    ui.label("Cổng mặc định: 8998 • Tự động phát hiện qua UDP multicast");
+        if self.tools.lan_peers.is_empty() {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("💻");
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet").strong());
+                        ui.label("Cổng mặc định: 8998 • Bấm quét để tìm kiếm thiết bị Zalo lân cận");
+                    });
                 });
             });
-        });
+        } else {
+            for peer in &self.tools.lan_peers {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("💻");
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&peer.device_name).strong());
+                            ui.label(RichText::new(format!("IP: {}:{} • ID: {}", peer.ip_address, peer.port, peer.peer_id)).size(12.0));
+                        });
+                    });
+                });
+            }
+        }
     }
 
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
@@ -710,12 +851,78 @@ impl ZaloGuiApp {
                 }
             }
         });
+
+        if !self.tools.cloud_viewer_keys.is_empty() {
+            ui.add_space(4.0);
+            ui.label(RichText::new("Khoá giải mã zCloud đã lưu:").strong());
+            for (fid, k) in &self.tools.cloud_viewer_keys {
+                ui.group(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("Tệp: {fid}")).strong());
+                        ui.label(RichText::new(format!("Thuật toán: {} • Hết hạn: {}", k.algorithm, k.expires_at)).size(11.0));
+                    });
+                });
+            }
+        }
+
+        if !self.tools.server_media_items.is_empty() {
+            ui.separator();
+            ui.label(RichText::new(format!("Thư viện media từ máy chủ ({}) :", self.tools.server_media_items.len())).strong());
+            for item in &self.tools.server_media_items {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        let icon = match item.kind {
+                            crate::server_media::ServerMediaType::Photo => "🖼️",
+                            crate::server_media::ServerMediaType::Video => "🎬",
+                            crate::server_media::ServerMediaType::File => "📁",
+                            crate::server_media::ServerMediaType::Link => "🔗",
+                        };
+                        ui.label(icon);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&item.name).strong());
+                            ui.label(RichText::new(format!("Kích thước: {} bytes • Người gửi: {}", item.file_size, item.sender_name)).size(11.0));
+                        });
+                    });
+                });
+            }
+        }
     }
 
     fn render_tools_devices(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("🔒 Quản lý thiết bị đăng nhập & Bảo mật (Zalo Parity C02)").strong().size(14.0));
-        ui.label("Danh sách các phiên và thiết bị đang đăng nhập tài khoản Zalo.");
+        ui.label("Danh sách các phiên và thiết bị đang đăng nhập tài khoản Zalo cùng trạng thái bảo mật.");
         ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("🔄 Làm mới thiết bị").clicked() {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::FetchDevices);
+                }
+            }
+            if ui.button("🛡️ Kiểm tra 2FA").clicked() {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::CheckTwoFactor);
+                }
+            }
+        });
+
+        if let Some(status) = &self.tools.two_factor_status {
+            ui.add_space(4.0);
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label("🛡️");
+                    ui.vertical(|ui| {
+                        let st_badge = if status.is_enabled {
+                            RichText::new("Xác thực hai lớp (2FA): ĐÃ KÍCH HOẠT").color(Color32::from_rgb(0, 180, 80)).strong()
+                        } else {
+                            RichText::new("Xác thực hai lớp (2FA): CHƯA KÍCH HOẠT").color(Color32::from_rgb(220, 100, 0)).strong()
+                        };
+                        ui.label(st_badge);
+                        ui.label(RichText::new(format!("Số điện thoại bảo vệ: {} • Ứng dụng OTP: {}", status.phone_masked, if status.has_authenticator_app { "Có" } else { "Không" })).size(12.0));
+                    });
+                });
+            });
+        }
 
         if self.tools.devices.is_empty() {
             ui.group(|ui| {
@@ -762,3 +969,23 @@ fn scheduled_time(text: &str, minutes: i64) -> Option<i64> {
     }
 }
 use chrono::{TimeZone, Timelike};
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tools_panel_initial_state() {
+        let tools = ToolsPanel::default();
+        assert!(tools.server_media_items.is_empty());
+        assert!(tools.cloud_viewer_keys.is_empty());
+        assert!(tools.catalog_items.is_empty());
+        assert!(tools.devices.is_empty());
+        assert!(tools.two_factor_status.is_none());
+        assert!(tools.group_todos.is_empty());
+        assert!(tools.group_polls.is_empty());
+        assert!(tools.lan_peers.is_empty());
+        assert!(tools.new_poll_question.is_empty());
+    }
+}

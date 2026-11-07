@@ -375,6 +375,11 @@ impl Session {
     }
 
     /// Check the server without treating a transient network failure as logout.
+    /// Resolve service URL via dynamic ServiceResolver with domain rotation.
+    pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
+        crate::service_resolver::ServiceResolver::new().resolve_url(service, path)
+    }
+
     pub async fn validate_session(&self) -> SessionStatus {
         if self.login.is_none() || self.zpw_sek.is_none() {
             return SessionStatus::Expired;
