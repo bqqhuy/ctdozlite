@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.013-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.012-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.012-arm).
+Nhãn sản phẩm `v0.013-arm`, phiên bản số Windows `0.0.13`.
+
+Bản phát hành Động cơ Realtime Push WebSocket và Đồng bộ Tức thời (Phase 2 - Mốc R16):
+
+### ⚡ Động cơ Realtime & Trải nghiệm Thời gian thực
+- **Adaptive Realtime Push Engine**: Chuyển đổi WebSocket full-duplex thành kênh truyền tải chính; tự động giãn chu kỳ polling HTTP sang chế độ keepalive 24s khi socket đang hoạt động, loại bỏ hoàn toàn tình trạng spam request và tiết kiệm pin tối đa cho Windows 11 ARM64.
+- **Failover Polling tự phục hồi**: Tự động chuyển về chế độ polling dự phòng khi kết nối WebSocket gián đoạn và tự động chuyển lại khi socket khôi phục.
+- **Instant Live Push Dispatch**: Nhận diện tức thời các frame `501` (tin 1-1), `502` (tin nhóm), `521` (thu hồi tin), `601` (trạng thái nhận/xem) và dispatch ngay vào bộ nhớ đệm SQLite + cập nhật giao diện không độ trễ.
+- **Typing Indicator & Read Receipts**: Đồng bộ trạng thái gõ phím thời gian thực và xác nhận đã nhận/đã xem hai chiều.
+
+---
+
 ## v0.012-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.011-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.011-arm).

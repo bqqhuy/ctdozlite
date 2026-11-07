@@ -925,6 +925,9 @@ pub(super) fn spawn_session_worker(
                     egui_ctx.clone(),
                 ));
 
+                let is_ws_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let is_ws_connected_poll = is_ws_connected.clone();
+
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
                     let live_updates = live_updates.clone();
@@ -934,6 +937,7 @@ pub(super) fn spawn_session_worker(
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
                     let ctx_ws = egui_ctx.clone();
+                    let is_ws_connected_reader = is_ws_connected.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
                             tokio::sync::mpsc::Receiver<crate::socket::WsEvent>,
@@ -961,6 +965,7 @@ pub(super) fn spawn_session_worker(
                                     .await
                                     {
                                         Ok(Some(ev)) => {
+                                            is_ws_connected_reader.store(true, std::sync::atomic::Ordering::SeqCst);
                                             let data_node = ev
                                                 .payload
                                                 .get("data")
@@ -1028,6 +1033,7 @@ pub(super) fn spawn_session_worker(
                                             }
                                         }
                                         Ok(None) => {
+                                            is_ws_connected_reader.store(false, std::sync::atomic::Ordering::SeqCst);
                                             ws_rx = None;
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                         }
@@ -1037,6 +1043,7 @@ pub(super) fn spawn_session_worker(
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
                             } else {
+                                is_ws_connected_reader.store(false, std::sync::atomic::Ordering::SeqCst);
                                 ws_rx = None;
                                 ws_sek.clear();
                                 tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1087,9 +1094,11 @@ pub(super) fn spawn_session_worker(
                     let session = session.clone();
                     let known = known_threads.clone();
                     let polling = is_polling.clone();
+                    let is_ws_connected = is_ws_connected_poll.clone();
                     tokio::spawn(async move {
                         let mut timer = tokio::time::interval(Duration::from_millis(1200));
                         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        let mut ws_skip_ticks: u32 = 0;
                         loop {
                             timer.tick().await;
                             if commands.strong_count() == 0 { break; }
@@ -1097,6 +1106,19 @@ pub(super) fn spawn_session_worker(
                             let s = session.lock().await;
                             if s.login.is_none() || !s.is_active() { continue; }
                             drop(s);
+
+                            // WP13-2: Adaptive Realtime Polling Engine
+                            // When WebSocket is connected, back off HTTP polling to 24s keepalive interval
+                            if is_ws_connected.load(std::sync::atomic::Ordering::SeqCst) {
+                                ws_skip_ticks = ws_skip_ticks.saturating_add(1);
+                                if ws_skip_ticks < 20 {
+                                    continue;
+                                }
+                                ws_skip_ticks = 0;
+                            } else {
+                                ws_skip_ticks = 0;
+                            }
+
                             let snapshot = known.lock().await.clone();
                             if let Some(tx) = commands.upgrade() {
                                 if tx.send(WorkerCmd::PollMessages {known_threads: snapshot}).is_err() { break; }
