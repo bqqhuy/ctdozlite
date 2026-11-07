@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.010-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.009-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.009-arm).
+Nhãn sản phẩm `v0.010-arm`, phiên bản số Windows `0.0.11`.
+
+Bản phát hành hoàn thiện Khối R14 (Lịch sử, Thư viện Server Media và zCloud):
+
+### Khối A20: zCloud media & Khôi phục dữ liệu Cloud
+- **zCloud Viewer Key & Verify**: Tích hợp các giao thức `/api/getCloudViewerKey` và `/cloudmedia/queue/pc/verify` để kiểm tra trạng thái tệp trên đám mây zCloud.
+- **Tải tệp đám mây an toàn**: Hỗ trợ lấy signed download URLs qua `/cloudmedia/downloadurls/pc/v1`, xác thực checksum MD5 và phân loại trạng thái tệp rõ ràng (`Khả dụng`, `Hết hạn`, `Chưa đồng bộ`).
+
+### Khối B05: Kho Media Server (Server Media Library)
+- **Truy xuất kho Media từ máy chủ Zalo**: Tích hợp các API `/api/mediastore/list` (nhóm) và `/api/media/oneone/list` (cá nhân).
+- **Phân loại danh mục theo chuẩn Zalo PC**: Phân tách rõ ràng 3 danh mục: Ảnh/Video, Tệp tin, Liên kết; hỗ trợ phân trang và chỉ báo nguồn dữ liệu server tách biệt với bộ nhớ SQLite cục bộ.
+
+### Khối B11: V1/BinNet và Khôi phục dữ liệu an toàn
+- **Atomic Snapshot & Rollback**: Cơ chế sao lưu và hoàn tác CSDL SQLite tự động khi import backup Desktop V2 bị lỗi hoặc người dùng huỷ bỏ (`Cancel`), đảm bảo an toàn tuyệt đối cho dữ liệu gốc.
+- **Bảo toàn BinNet Frames**: Parser frame descriptor BinNet giữ nguyên vẹn các opcode và payload `raw/Unknown` chưa hỗ trợ, không tự ý suy đoán danh tính người dùng.
+
+---
+
 ## v0.009-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.008-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.008-arm).
