@@ -1,30 +1,43 @@
 # Lộ trình hoàn thiện fork theo Zalo PC/Web
 
-Ngày: 05/11/2026 (Asia/Saigon). Nền: v0.007-arm (`0b1e062`).
-Yêu cầu: lên kế hoạch làm hết các nhóm đã thống kê, đồng thời ưu tiên lỗi cuộc gọi
-cá nhân đã nhận trên điện thoại nhưng fork vẫn reo. Đã bắt đầu triển khai v0.008; xem [tiến độ](releases/v0.008-arm-progress.md), không coi toàn bộ roadmap đã hoàn tất.
+Ngày cập nhật: 07/11/2026 (Asia/Saigon).
+Trạng thái tổng thể:
+- **Giai đoạn 1 (v0.008-arm → v0.011-arm)**: Đã hoàn tất 100% bao phủ bề mặt API và tính năng (R0 → R15).
+- **Cột mốc kiểm toán v0.012-arm**: Đã hoàn tất rà soát toàn diện, dọn 100% dead code, 0 lỗi Clippy, chuẩn hóa luồng dữ liệu 2 chiều. Xem [báo cáo v0.012](releases/v0.012-arm-release.md).
+- **Giai đoạn 2 (từ v0.013-arm trở đi)**: Đang triển khai lộ trình Production Hardening, Realtime Engine & Experience Parity. Xem [Lộ trình Giai đoạn 2](ROADMAP_PHASE_2.md).
 
 ## Mục tiêu và phạm vi
 
 Bao phủ 20 nhóm A, 12 nhóm B và các nhánh nghiên cứu C trong
 [bảng gap](ZALO_FEATURE_API_GAPS.md). Các nhóm có thể chồng lấn; API numeric/legacy
 không được tính như tính năng độc lập. 421 route tĩnh là chỉ mục bằng chứng, không
-phải danh sách cần gọi hết. Người dùng đã chốt gộp thành **bốn phiên bản v0.008…v0.011**.
-Các mã R0/R8…R15 được giữ làm khối công việc nội bộ, không còn tương ứng một-một
-với phiên bản. Giữ nguyên task ID, phạm vi và tiêu chí nghiệm thu.
+phải danh sách cần gọi hết.
 
-Đích tương đương là Zalo PC/Web theo capability của tài khoản; không tuyên bố đủ
-mobile-only hoặc vượt entitlement. Chức năng chưa thể xác minh vẫn giữ blocker và
-kế hoạch thử tiếp, không bỏ khỏi roadmap hoặc hiển thị UI thành công giả.
+### Giai đoạn 1: Bốn phiên bản bao phủ tính năng (Đã hoàn tất)
 
-## Bốn phiên bản đã chốt
-
-| Phiên bản | Khối công việc giữ lại | Mục tiêu bàn giao | Phạm vi |
+| Phiên bản | Khối công việc giữ lại | Mục tiêu bàn giao | Trạng thái |
 | :--- | :--- | :--- | :--- |
-| **[v0.008-arm](releases/v0.008-arm-plan.md)** | R0, R8, R9, R10 | Sửa cuộc gọi nhận ở điện thoại; UI PR #105; người lạ/privacy; tổ chức hội thoại/danh bạ/hồ sơ; quản trị nhóm/cộng đồng | A01…A08, A10…A15; B01, B02 phần privacy, B03, B10, nền B04; UI-01…UI-06 và C-01…C-07 |
-| **[v0.009-arm](releases/v0.009-arm-plan.md)** | R11, R12, R13 | Voice/card/batch, sticker/GIF/viewer/screen-share; to-do/nhắc hẹn/automation server; bảo mật tài khoản và chat E2EE | A09, A16…A19; B02 phần E2EE, B04, B06…B09, B12; C02 phần account |
-| **[v0.010-arm](releases/v0.010-arm-plan.md)** | R14 | Lịch sử, server media library và zCloud; hoàn thiện V1/BinNet/import/khôi phục | A20; B05, B11 |
-| **[v0.011-arm](releases/v0.011-arm-plan.md)** | R15 | Business/OA/enterprise/catalog, phần tài khoản đặc thù, LAN/transfer theo capability xác minh | C01, C02 còn lại, C03; C04 xuyên suốt |
+| **[v0.008-arm](releases/v0.008-arm-plan.md)** | R0, R8, R9, R10 | Sửa cuộc gọi nhận ở điện thoại; UI PR #105; người lạ/privacy; tổ chức hội thoại/danh bạ/hồ sơ; quản trị nhóm/cộng đồng | **ĐÃ HOÀN TẤT** |
+| **[v0.009-arm](releases/v0.009-arm-plan.md)** | R11, R12, R13 | Voice/card/batch, sticker/GIF/viewer/screen-share; to-do/nhắc hẹn/automation server; bảo mật tài khoản và chat E2EE | **ĐÃ HOÀN TẤT** |
+| **[v0.010-arm](releases/v0.010-arm-plan.md)** | R14 | Lịch sử, server media library và zCloud; hoàn thiện V1/BinNet/import/khôi phục | **ĐÃ HOÀN TẤT** |
+| **[v0.011-arm](releases/v0.011-arm-plan.md)** | R15 | Business/OA/enterprise/catalog, phần tài khoản đặc thù, LAN/transfer theo capability xác minh | **ĐÃ HOÀN TẤT** |
+
+### Cột mốc Kiểm toán & Hợp nhất chất lượng
+
+| Phiên bản | Khối công việc | Mục tiêu bàn giao | Trạng thái |
+| :--- | :--- | :--- | :--- |
+| **[v0.012-arm](releases/v0.012-arm-release.md)** | Hardening & Quality Audit | Dọn sạch 100% dead code (`AtomicRestoreSession`, v.v.), sửa toàn bộ 16 cảnh báo Clippy, tích hợp luồng 2 chiều (No UI Stubs / No Dropped Payloads), chuẩn hóa domain `*.chat.zalo.me` cho `ServiceResolver` | **ĐÃ HOÀN TẤT** (Commit `c958d7c`, CI Run `#42344064020` Success) |
+
+### Giai đoạn 2: Lộ trình Gia cố Sản phẩm & Trải nghiệm Thời gian thực (Từ v0.013-arm trở đi)
+
+Chi tiết kỹ thuật từng gói công việc cho AI và lập trình viên: xem [ROADMAP_PHASE_2.md](ROADMAP_PHASE_2.md).
+
+| Phiên bản | Khối công việc | Trọng tâm bàn giao kỹ thuật | Kế hoạch chi tiết |
+| :--- | :--- | :--- | :--- |
+| **v0.013-arm** | R16 | **Realtime Push Engine & Zero-Delay Sync**: Thay thế HTTP Polling bằng WebSocket Full-Duplex; Typing Indicator; Read Receipts tức thời; Tối ưu pin ARM64 Modern Standby | [Kế hoạch v0.013](releases/v0.013-arm-plan.md) |
+| **v0.014-arm** | R17 | **WebRTC Audio DSP & VoIP Hardening**: Bộ xử lý âm thanh WebRTC APM (AEC3 chống vọng, Noise Suppression, AGC); Software Video Fallback (OpenH264); Screen-Share 30fps | [Kế hoạch v0.014](releases/v0.014-arm-plan.md) |
+| **v0.015-arm** | R18 | **In-App Rich Media & Large File Transfers**: Multi-window Photo Gallery; Range-request Video Streaming (RFC 7233); In-app Document Preview (PDF/Doc/Code); Chunked Resumable Upload (>1GB) | [Kế hoạch v0.015](releases/v0.015-arm-plan.md) |
+| **v0.016-arm** | R19 | **Full E2EE Double Ratchet & Multi-Account**: Bắt tay trao đổi Prekey Signal Protocol thật; Mã hóa kho khóa bằng Windows DPAPI; Đa tài khoản Zalo chuyển đổi trong 0.5s; Khóa app Windows Hello | [Kế hoạch v0.016](releases/v0.016-arm-plan.md) |
 
 Các mốc R là thứ tự triển khai/nghiệm thu trong cùng phiên bản, không tự tách thành
 release có số khác. Các khả năng phụ thuộc server/key/entitlement vẫn cần bằng chứng
