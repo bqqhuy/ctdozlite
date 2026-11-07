@@ -745,6 +745,7 @@ mod tests {
         .unwrap()
     }
     #[test]
+    #[ignore = "Requires native MFT H.264 encoder/decoder (GPU or software fallback). Run with --ignored on device."]
     fn native_h264_roundtrip() -> Result<()> {
         let _runtime = Runtime::new()?;
         unsafe {
@@ -771,10 +772,9 @@ mod tests {
                 }
             }
             if decoded == 0 {
-                eprintln!("[windows_video] MFT hardware encoder produced no frames in headless environment; hardware verification skipped.");
-                return Ok(());
+                panic!("Native H.264 pipeline produced no frames — this is a regression, not an environment issue. \
+                        Check encoder/decoder initialization, MFT output draining, and frame format negotiation.");
             }
-            anyhow::ensure!(decoded > 0, "Native H.264 pipeline produced no frames");
         }
         Ok(())
     }

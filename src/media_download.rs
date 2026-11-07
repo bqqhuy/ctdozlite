@@ -349,6 +349,13 @@ mod tests {
 
 
 /// Stream a specific byte range of a media resource (RFC 7233).
+/// RFC 7233 byte-range request for seeking into remote media without full download.
+///
+/// WP15.1-B: Implementation is correct and tested, but no video player calls it yet.
+/// Wiring requires: custom IMFByteStream for MFT backed by HTTP range requests, or
+/// a different player architecture that can seek into remote URLs. Until wired, this
+/// is prep code — the v0.015 CHANGELOG claim "Tua video tức thì" is not yet true.
+/// TODO(wiring): integrate into video_player when player supports streaming sources.
 #[allow(dead_code)]
 pub async fn range_request(
     raw: &str,

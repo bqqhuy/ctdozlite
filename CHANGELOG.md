@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.015.1-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.015-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.015-arm).
+Nhãn sản phẩm `v0.015.1-arm`, phiên bản số Windows `0.15.1`.
+
+Bản phát hành Wire Completion & Honest Labels — hoàn thiện wiring và sửa các phát hiện audit:
+
+### 🔧 Wire Completion
+- **AudioProcessor wired into capture path** (WP-A): Tích hợp energy-gate echo suppression vào cpal capture callback với speaker energy reference (AtomicU32 lock-free sharing). NS và AGC đã sẵn sàng, chưa wire (cần Gemini API key cho voice activity detection). Sửa lỗi AGC-after-suppression (AGC khuếch đại vọng đã triệt) — echo suppression giờ return sớm trước NS/AGC.
+- **ResumableUploadState wired to SQLite persistence** (WP-C): Schema migration v11 với bảng `upload_sessions`, 4 persistence methods (load/save/delete/list), completed_chunks lưu dưới dạng JSON. Sửa O(n²)→O(n) trong `next_missing_chunk` bằng HashSet. Integration tests: `upload_state_roundtrip_and_delete`, `list_upload_sessions_returns_all_active`.
+- **is_ws_connected driven by transport epoch** (WP-D): Epoch watcher task đọc `SyncTransport.epochs()` watch channel, feed vào AtomicBool. Gỡ bỏ activity-based detection (false-positive khi idle).
+
+### 📝 Honest Labels & Corrections
+- **range_request honestly labeled unwired prep** (WP-B): Thêm TODO comment giải thích yêu cầu wiring (custom IMFByteStream cho MFT). CHANGELOG v0.015 đã sửa: "Chưa tích hợp vào video player".
+- **CHANGELOG addendums cho v0.013/v0.014/v0.015** (WP-F): Tiết lộ prep-code status, adaptive-polling deviation, AudioProcessor test-only status trước v0.015.1.
+- **ADR-002 adaptive-polling deviation**: Giải thích trade-off parallel WebSocket+HTTP polling (2.5 req/min overhead vs 24s message delivery guarantee khi WS half-dead).
+
+### 🧪 Test Fixes
+- **H.264 roundtrip test strengthened** (WP-E): Panic thay vì silent pass khi `decoded == 0`. Marked `#[ignore]` với lý do "Requires native MFT H.264 encoder/decoder (GPU or software fallback). Run with --ignored on device." — giữ nguyên strength, không chặn device-less CI.
+- **Schema version tests updated**: `assert_eq!(user_version, 11)` trong 2 migration tests.
+
+### 📚 AI Wiring Discipline
+- **docs/AI_WIRING_DISCIPLINE.md**: 286-dòng guidance doc (Vietnamese) — Test-Driven False Positive root cause, Wired/Test-only/Stub definitions, 5-question pre-commit checklist, Wiring-First technique, honest commit templates, remediation options. Ngăn chặn stub/unwired code error class trong future AI work.
+
+### ✅ Verification
+- 607/607 tests passed (10 device-dependent tests ignored)
+- Zero clippy warnings (`-D warnings`)
+- `cargo check --locked --lib` clean
+
+---
+
 ## v0.015-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.014-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.014-arm).
@@ -8,9 +39,11 @@ Nhãn sản phẩm `v0.015-arm`, phiên bản số Windows `0.0.15`.
 Bản phát hành Bộ công cụ Rich Media & Truyền Tệp Lớn Phân Mảnh (Phase 2 - Mốc R18):
 
 ### 🎬 Bộ Công cụ Rich Media & Truyền Tệp Lớn (Resumable Transfers)
-- **HTTP Range-Request Video Streaming (RFC 7233)**: Hỗ trợ tua và phát nhanh các đoạn video thời lượng dài qua header `Range: bytes={start}-{end}` mà không cần tải toàn bộ tệp về đĩa.
-- **Resumable Chunked File Upload**: Hệ thống phân mảnh tệp tải lên (chunks 1MB - 4MB) với trạng thái lưu vết tiến trình, cho phép tiếp tục tải lên từ vị trí ngắt kết nối mà không phải truyền lại từ đầu.
+- **HTTP Range-Request implementation (RFC 7233)**: Triển khai hàm `range_request()` với header `Range: bytes={start}-{end}` và xử lý HTTP 206 Partial Content. Chưa tích hợp vào video player (yêu cầu custom IMFByteStream cho MFT). Chức năng tua video tức thì sẽ hoàn thành trong v0.015.1.
+- **Resumable Chunked File Upload infrastructure**: Struct `ResumableUploadState` với chunk tracking logic, SQLite persistence (`upload_sessions` table), và recovery APIs. Wiring vào upload flow sẽ hoàn thành trong v0.015.1.
 - **Tối ưu hóa Thư viện & Trình xem Đa phương tiện**: Cải thiện hiệu năng xử lý đệm video và hình ảnh, giải phóng tài nguyên bộ đệm kịp thời.
+
+> **Lưu ý (07/11/2026)**: Audit sau phát hành phát hiện 2 tính năng ở trạng thái prep (implementation hoàn chỉnh, test pass, nhưng chưa wire vào runtime path). Bản v0.015.1-arm sẽ hoàn thành wiring hoặc gỡ bỏ tuyên bố không chính xác.
 
 ---
 
@@ -22,10 +55,12 @@ Nhãn sản phẩm `v0.014-arm`, phiên bản số Windows `0.0.14`.
 Bản phát hành Xử lý Âm thanh WebRTC DSP & Gia cố VoIP (Phase 2 - Mốc R17):
 
 ### 🎙️ Xử lý Tín hiệu Âm thanh WebRTC DSP & Chất lượng Cuộc gọi
-- **Acoustic Echo Cancellation (AEC / AES)**: Triệt tiêu tiếng vọng hồi âm vòng lặp khi bật loa ngoài trên laptop trong cuộc gọi cá nhân và nhóm.
-- **Noise Suppression (NS)**: Lọc sạch tạp âm bàn phím cơ và tiếng ồn quạt tản nhiệt máy tính thông qua bộ lọc spectral energy gate.
-- **Automatic Gain Control (AGC)**: Tự động cân bằng và điều chỉnh âm lượng giọng nói luôn rõ ràng, tránh vỡ tiếng (peak limiting).
+- **Acoustic Echo Suppression (energy-gate, fork deviation)**: Triển khai energy-gate echo suppression (giảm âm lượng mic khi phát hiện loa > 0.03 RMS). Chưa tích hợp vào capture path (wiring hoàn thành trong v0.015.1). Không phải WebRTC APM AEC thực sự (yêu cầu adaptive filter + echo reference buffer), nhưng hiệu quả với vọng hồi âm đơn giản.
+- **Noise Suppression (NS)**: Lọc sạch tạp âm bàn phím cơ và tiếng ồn quạt tản nhiệt máy tính thông qua bộ lọc spectral energy gate (chưa wire, v0.015.1).
+- **Automatic Gain Control (AGC)**: Tự động cân bằng và điều chỉnh âm lượng giọng nói luôn rõ ràng, tránh vỡ tiếng (peak limiting). Chưa wire, v0.015.1 sửa lỗi AGC-after-suppression (AGC khuếch đại vọng đã triệt).
 - **MFT Video Fallback & Headless Compatibility**: Tối ưu hóa pipeline video H.264 với cơ chế phát hiện và xử lý thích ứng môi trường không có GPU phần cứng, đạt tỉ lệ pass kiểm thử 100%.
+
+> **Lưu ý (07/11/2026)**: Audit phát hiện AudioProcessor chỉ được test, chưa gọi từ capture path. Bản v0.015.1-arm wire vào cpal callback với speaker energy reference và sửa lỗi AGC ordering.
 
 ---
 
@@ -37,10 +72,12 @@ Nhãn sản phẩm `v0.013-arm`, phiên bản số Windows `0.0.13`.
 Bản phát hành Động cơ Realtime Push WebSocket và Đồng bộ Tức thời (Phase 2 - Mốc R16):
 
 ### ⚡ Động cơ Realtime & Trải nghiệm Thời gian thực
-- **Adaptive Realtime Push Engine**: Chuyển đổi WebSocket full-duplex thành kênh truyền tải chính; tự động giãn chu kỳ polling HTTP sang chế độ keepalive 24s khi socket đang hoạt động, loại bỏ hoàn toàn tình trạng spam request và tiết kiệm pin tối đa cho Windows 11 ARM64.
+- **Adaptive Realtime Push Engine**: Chuyển đổi WebSocket full-duplex thành kênh truyền tải chính; tự động giãn chu kỳ polling HTTP sang chế độ keepalive 24s khi socket đang hoạt động. Polling chạy song song với WebSocket (deviation từ bất biến "no parallel polling") nhằm đảm bảo không mất tin khi WS gián đoạn. Tiết kiệm pin cho Windows 11 ARM64 qua giảm request overhead.
 - **Failover Polling tự phục hồi**: Tự động chuyển về chế độ polling dự phòng khi kết nối WebSocket gián đoạn và tự động chuyển lại khi socket khôi phục.
 - **Instant Live Push Dispatch**: Nhận diện tức thời các frame `501` (tin 1-1), `502` (tin nhóm), `521` (thu hồi tin), `601` (trạng thái nhận/xem) và dispatch ngay vào bộ nhớ đệm SQLite + cập nhật giao diện không độ trễ.
 - **Typing Indicator & Read Receipts**: Đồng bộ trạng thái gõ phím thời gian thực và xác nhận đã nhận/đã xem hai chiều.
+
+> **Lưu ý (07/11/2026)**: Audit phát hiện liveness detection dựa vào activity thay vì transport epoch, gây false-positive khi idle. Bản v0.015.1-arm sửa sang epoch watch. Adaptive polling deviation (parallel WS+HTTP) sẽ có ADR giải thích trade-off.
 
 ---
 

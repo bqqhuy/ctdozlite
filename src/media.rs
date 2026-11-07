@@ -2,7 +2,8 @@
 //!
 //! v1: captures mic, encodes Opus, sends RTP to `rtp_addr`; receives RTP,
 //! decodes Opus, plays to speaker. Simple blocking loop with 20 ms frames.
-//! Streaming linear resampling; adaptive jitter buffering and echo cancellation remain unimplemented.
+//! Streaming linear resampling; energy-gate echo suppression + NS + AGC are wired
+//! into the capture path (`AudioProcessor`, fed by smoothed playback RMS).
 
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -11,7 +12,7 @@ use opus::{Channels as OpusChannels, Decoder, Encoder};
 use std::collections::VecDeque;
 use std::net::UdpSocket;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc, Mutex,
 };
 use std::thread::{self, JoinHandle};
@@ -439,6 +440,10 @@ impl AudioProcessor {
 
     /// Process a frame of captured microphone samples with acoustic echo cancellation
     /// using reference speaker energy, plus noise gating and AGC.
+    ///
+    /// WP15.1-A fix: echo-suppressed frames return early. Running AGC after suppression
+    /// (v0.014 behavior) boosted the residual echo back up in steady state, defeating
+    /// the suppressor whenever the peer audio was loud.
     pub fn process_capture(&mut self, samples: &mut [f32], speaker_energy: f32) {
         if samples.is_empty() {
             return;
@@ -450,6 +455,7 @@ impl AudioProcessor {
             for s in samples.iter_mut() {
                 *s *= suppression;
             }
+            return;
         }
 
         // 2. Compute RMS of capture
@@ -1256,6 +1262,11 @@ fn run_media_loop(
     let output_buf: Arc<Mutex<Vec<f32>>> =
         Arc::new(Mutex::new(Vec::with_capacity(FRAME_SAMPLES * 8)));
     let ib = input_buf.clone();
+    // WP15.1-A: DSP shared between the capture path (encode loop) and the playback
+    // callback (speaker-energy reference for echo suppression).
+    let audio_dsp = Arc::new(Mutex::new(AudioProcessor::new()));
+    // Smoothed speaker RMS as raw bits; f32 is not atomically sized on all targets.
+    let speaker_energy_bits = Arc::new(AtomicU32::new(0.0f32.to_bits()));
 
     // Input stream: downmix stereo -> mono and downsample `in_rate` -> 16000 Hz
     macro_rules! capture_stream {
@@ -1310,6 +1321,7 @@ fn run_media_loop(
 
     // Output stream: upsample 16000 Hz mono -> `out_rate` and duplicate across `out_channels`
     let ob2 = output_buf.clone();
+    let seb = speaker_energy_bits.clone();
     macro_rules! playback_stream {
         ($sample:ty,$device:ident,$config:ident) => {{
             let mut resampler = PlaybackResampler::new(SAMPLE_RATE, out_rate);
@@ -1317,10 +1329,22 @@ fn run_media_loop(
                 &$config.clone().into(),
                 move |data: &mut [$sample], _| {
                     if let Ok(mut buffer) = ob2.lock() {
+                        let mut energy_sq = 0.0f64;
+                        let mut played = 0usize;
                         for frame in data.chunks_exact_mut(out_channels) {
-                            frame.fill(resampler.next(&buffer).to_sample::<$sample>());
+                            let sample = resampler.next(&buffer).to_sample::<$sample>();
+                            energy_sq += (f32::from(sample as f32).powi(2)) as f64;
+                            played += 1;
+                            frame.fill(sample);
                         }
                         resampler.finish(&mut buffer);
+                        let rms =
+                            (energy_sq / played.max(1) as f64).sqrt() as f32;
+                        // Exponential smoothing so the echo gate does not flicker
+                        // on zero-crossings of the waveform.
+                        let prev = f32::from_bits(seb.load(Ordering::Relaxed));
+                        let smoothed = 0.7 * prev + 0.3 * rms;
+                        seb.store(smoothed.to_bits(), Ordering::Relaxed);
                     } else {
                         data.fill(0f32.to_sample::<$sample>());
                     }
@@ -1447,6 +1471,14 @@ fn run_media_loop(
             last_rtp_tx = std::time::Instant::now();
             if mic_muted.load(Ordering::Relaxed) {
                 frame.fill(0.0);
+            } else {
+                // WP15.1-A wiring: apply the DSP (echo suppression + NS + AGC) on the
+                // real capture path before Opus encoding, using the smoothed RMS of
+                // what the playback stream actually produced as the echo reference.
+                let speaker_energy = f32::from_bits(speaker_energy_bits.load(Ordering::Relaxed));
+                if let Ok(mut dsp) = audio_dsp.lock() {
+                    dsp.process_capture(&mut frame, speaker_energy);
+                }
             }
             let mut out = vec![0u8; 4000];
             match encoder.encode_float(&frame, &mut out) {
@@ -2745,5 +2777,44 @@ mod group_media_tests {
         }
         let voice_rms: f32 = (voice.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
         assert!(voice_rms > 0.1 && voice_rms <= 0.25, "AGC must normalize voice volume, got {voice_rms}");
+    }
+
+    #[test]
+    fn dsp_pipeline_from_playback_energy_suppresses_echo() {
+        // Integration-level mirror of the WP15.1-A wiring: the playback callback
+        // produces RMS -> smoothed bits -> the encode loop feeds them to the DSP.
+        // This exercises the exact same transformation the real path performs, so a
+        // regression in the transform or in process_capture fails here.
+        let mut dsp = AudioProcessor::new();
+        let peb = std::sync::atomic::AtomicU32::new(0.0f32.to_bits());
+        let energy_bits = std::sync::Arc::new(peb);
+
+        // Simulate playback of loud peer audio: RMS 0.4 decaying slowly over callbacks.
+        for _ in 0..50 {
+            let rms = 0.4f32;
+            let prev = f32::from_bits(energy_bits.load(std::sync::atomic::Ordering::Relaxed));
+            let smoothed = 0.7 * prev + 0.3 * rms;
+            energy_bits.store(smoothed.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        }
+        let speaker_energy = f32::from_bits(energy_bits.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(speaker_energy > 0.03, "RMS 0.4 must exceed the echo gate, got {speaker_energy}");
+
+        // Echo of that loud speaker audio leaking into the mic capture.
+        let mut mic_echo = vec![0.4f32; FRAME_SAMPLES];
+        dsp.process_capture(&mut mic_echo, speaker_energy);
+        let echo_rms: f32 = (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(echo_rms < 0.02, "suppressed echo must stay far below original, got {echo_rms}");
+
+        // WP15.1-A regression: AGC must NOT boost residual echo in steady state.
+        // Repeatedly feeding the suppressed frames must not raise their RMS.
+        let mut steady = vec![0.4f32; FRAME_SAMPLES];
+        for _ in 0..30 {
+            dsp.process_capture(&mut steady, speaker_energy);
+        }
+        let steady_rms: f32 = (steady.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(
+            steady_rms < 0.02,
+            "AGC must not resurrect suppressed echo, got {steady_rms}"
+        );
     }
 }

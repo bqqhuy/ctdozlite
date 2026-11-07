@@ -120,8 +120,16 @@ impl ResumableUploadState {
         self.total_chunks > 0 && self.completed_chunks.len() == self.total_chunks
     }
 
+    /// WP15.1-C fix: O(n) scan instead of O(n²) contains per candidate.
     pub fn next_missing_chunk(&self) -> Option<usize> {
-        (0..self.total_chunks).find(|&i| !self.completed_chunks.contains(&i))
+        if self.completed_chunks.is_empty() {
+            return if self.total_chunks > 0 { Some(0) } else { None };
+        }
+        let mut completed_set = std::collections::HashSet::with_capacity(self.completed_chunks.len());
+        for &idx in &self.completed_chunks {
+            completed_set.insert(idx);
+        }
+        (0..self.total_chunks).find(|i| !completed_set.contains(i))
     }
 }
 

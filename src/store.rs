@@ -71,7 +71,7 @@ impl MessageStore {
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 10,
+            schema <= 11,
             "Database requires a newer application version"
         );
         conn.execute_batch(
@@ -200,6 +200,22 @@ impl MessageStore {
             crate::message_lifecycle::migrate(&conn)?;
         }
         crate::message_lifecycle::backfill(&conn)?;
+        if schema < 11 {
+            let migration = conn.unchecked_transaction()?;
+            migration.execute_batch(
+                "CREATE TABLE IF NOT EXISTS upload_sessions (
+                    upload_id TEXT PRIMARY KEY,
+                    file_name TEXT NOT NULL,
+                    total_size INTEGER NOT NULL,
+                    chunk_size INTEGER NOT NULL,
+                    total_chunks INTEGER NOT NULL,
+                    completed_chunks TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                PRAGMA user_version=11;",
+            )?;
+            migration.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -1516,6 +1532,143 @@ pub fn load_history_into_threads(
     }
 }
 
+impl MessageStore {
+    /// Load resumable upload state from persistence.
+    /// # Errors
+    /// Returns SQLite errors.
+    pub fn load_upload_state(&self, upload_id: &str) -> Result<Option<crate::upload::ResumableUploadState>> {
+        use rusqlite::OptionalExtension;
+        let row = self.conn.query_row(
+            "SELECT upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks FROM upload_sessions WHERE upload_id=?1",
+            [upload_id],
+            |r| {
+                let completed_str: String = r.get(5)?;
+                let completed_chunks: Vec<usize> = serde_json::from_str(&completed_str)
+                    .unwrap_or_default();
+                Ok(crate::upload::ResumableUploadState {
+                    upload_id: r.get(0)?,
+                    file_name: r.get(1)?,
+                    total_size: r.get(2)?,
+                    chunk_size: r.get(3)?,
+                    total_chunks: r.get(4)?,
+                    completed_chunks,
+                })
+            },
+        ).optional()?;
+        Ok(row)
+    }
+
+    /// Save or update resumable upload state.
+    /// # Errors
+    /// Returns SQLite or JSON serialization errors.
+    pub fn save_upload_state(&self, state: &crate::upload::ResumableUploadState) -> Result<()> {
+        let completed_json = serde_json::to_string(&state.completed_chunks)?;
+        self.conn.execute(
+            "INSERT INTO upload_sessions(upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(upload_id) DO UPDATE SET completed_chunks=excluded.completed_chunks, updated_at=excluded.updated_at",
+            params![
+                &state.upload_id,
+                &state.file_name,
+                state.total_size,
+                state.chunk_size,
+                state.total_chunks,
+                completed_json,
+                crate::login::unix_now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Delete completed or abandoned upload session.
+    /// # Errors
+    /// Returns SQLite errors.
+    pub fn delete_upload_state(&self, upload_id: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM upload_sessions WHERE upload_id=?1", [upload_id])?;
+        Ok(())
+    }
+
+    /// List all active upload sessions (for recovery after restart).
+    /// # Errors
+    /// Returns SQLite errors.
+    pub fn list_upload_sessions(&self) -> Result<Vec<crate::upload::ResumableUploadState>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks
+             FROM upload_sessions ORDER BY updated_at DESC"
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let completed_str: String = r.get(5)?;
+            let completed_chunks: Vec<usize> = serde_json::from_str(&completed_str)
+                .unwrap_or_default();
+            Ok(crate::upload::ResumableUploadState {
+                upload_id: r.get(0)?,
+                file_name: r.get(1)?,
+                total_size: r.get(2)?,
+                chunk_size: r.get(3)?,
+                total_chunks: r.get(4)?,
+                completed_chunks,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+#[cfg(test)]
+mod upload_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn upload_state_roundtrip_and_delete() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let mut state = crate::upload::ResumableUploadState::new(
+            "upload_abc".into(),
+            "large.zip".into(),
+            10_000_000,
+            4_000_000,
+        );
+
+        // Save initial state
+        store.save_upload_state(&state).unwrap();
+        let loaded = store.load_upload_state("upload_abc").unwrap().unwrap();
+        assert_eq!(loaded, state);
+
+        // Update state with progress
+        state.mark_chunk_complete(0);
+        state.mark_chunk_complete(2);
+        store.save_upload_state(&state).unwrap();
+
+        let reloaded = store.load_upload_state("upload_abc").unwrap().unwrap();
+        assert_eq!(reloaded.completed_chunks, vec![0, 2]);
+        assert!(!reloaded.is_complete());
+
+        // Complete and delete
+        state.mark_chunk_complete(1);
+        assert!(state.is_complete());
+        store.delete_upload_state("upload_abc").unwrap();
+        assert!(store.load_upload_state("upload_abc").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_upload_sessions_returns_all_active() {
+        let store = MessageStore::open(":memory:").unwrap();
+
+        let state1 = crate::upload::ResumableUploadState::new(
+            "up1".into(), "file1.bin".into(), 1000, 500,
+        );
+        let state2 = crate::upload::ResumableUploadState::new(
+            "up2".into(), "file2.bin".into(), 2000, 500,
+        );
+
+        store.save_upload_state(&state1).unwrap();
+        store.save_upload_state(&state2).unwrap();
+
+        let sessions = store.list_upload_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|s| s.upload_id == "up1"));
+        assert!(sessions.iter().any(|s| s.upload_id == "up2"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2332,7 +2485,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                10
+                11
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -2504,7 +2657,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            10
+            11
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,

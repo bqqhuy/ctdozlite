@@ -937,7 +937,6 @@ pub(super) fn spawn_session_worker(
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
                     let ctx_ws = egui_ctx.clone();
-                    let is_ws_connected_reader = is_ws_connected.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
                             tokio::sync::mpsc::Receiver<crate::socket::WsEvent>,
@@ -955,7 +954,17 @@ pub(super) fn spawn_session_worker(
                                     let account=s_snap.clone();let notify=metadata_notify.clone();let mut epochs=transport.epochs();let epoch_tx=gui_tx_ws.clone();let epoch_ctx=ctx_ws.clone();
                                     tokio::spawn(async move {while epochs.changed().await.is_ok(){if !account.is_active(){break;}
                                         if epochs.borrow().is_some(){account.hidden.lock();let _=epoch_tx.send(GuiEvent::Hidden {owner:account.account_key().into(),generation:None,view:account.hidden.view(account.account_key()),result:Ok(())});apply_metadata_impact(&account,crate::account_controls::Impact {all_groups:true,..Default::default()},&notify,&epoch_tx,&epoch_ctx);notify.notify_one();}}});
-                                    phone_transport_tx.send_replace(Some(transport));
+                                    phone_transport_tx.send_replace(Some(transport.clone()));
+                                    // WP15.1-D: liveness thật từ transport epoch (Some = đã auth),
+                                    // thay cho detection theo "có nhận event" (sai khi idle/half-dead).
+                                    let liveness_flag = is_ws_connected.clone();
+                                    let mut epoch_watch = transport.epochs();
+                                    tokio::spawn(async move {
+                                        loop {
+                                            liveness_flag.store(epoch_watch.borrow().is_some(), std::sync::atomic::Ordering::SeqCst);
+                                            if epoch_watch.changed().await.is_err() { break; }
+                                        }
+                                    });
                                 }
                                 if let Some(rx) = ws_rx.as_mut() {
                                     match tokio::time::timeout(
@@ -965,7 +974,8 @@ pub(super) fn spawn_session_worker(
                                     .await
                                     {
                                         Ok(Some(ev)) => {
-                                            is_ws_connected_reader.store(true, std::sync::atomic::Ordering::SeqCst);
+                                            // WP15.1-D: liveness lấy từ epoch watch (spawn ở trên),
+                                            // không set theo activity event — idle-but-connected vẫn connected.
                                             let data_node = ev
                                                 .payload
                                                 .get("data")
@@ -1033,7 +1043,6 @@ pub(super) fn spawn_session_worker(
                                             }
                                         }
                                         Ok(None) => {
-                                            is_ws_connected_reader.store(false, std::sync::atomic::Ordering::SeqCst);
                                             ws_rx = None;
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                         }
@@ -1043,7 +1052,6 @@ pub(super) fn spawn_session_worker(
                                     tokio::time::sleep(Duration::from_secs(2)).await;
                                 }
                             } else {
-                                is_ws_connected_reader.store(false, std::sync::atomic::Ordering::SeqCst);
                                 ws_rx = None;
                                 ws_sek.clear();
                                 tokio::time::sleep(Duration::from_secs(3)).await;
