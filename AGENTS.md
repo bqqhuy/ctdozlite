@@ -76,6 +76,22 @@ MUST read the corresponding standard file under `docs/standards/` before modifyi
 - **Secrets, crypto, and session handling** → `docs/standards/security-and-cryptography.md`
 - **Branches, commits, and PRs** → `docs/standards/git-flow-and-pr-matrix.md`
 
+## Zalo Reference Authority (mandatory parity check)
+
+Read [docs/ZALO_REFERENCE_ANALYSIS.md](docs/ZALO_REFERENCE_ANALYSIS.md) before any
+code work in protocol, chat, media, VoIP, security or group domains. Every change
+MUST be cross-checked against Zalo PC / Zalo Web official behaviour first:
+
+1. **Evidence before design** — locate the Zalo-native behaviour in `re-notes/`,
+   `docs/ZALO_FEATURE_API_GAPS.md` or the saved PC/Web bundle snapshots before
+   deciding an approach. Classify evidence as E1 (live capture), E2 (static bundle
+   read) or E3 (inference). E3 alone never justifies a server contract.
+2. **State the comparison** — commits/PRs/specs for protocol-adjacent work must say
+   explicitly: "Parity with Zalo PC/Web (source: re-notes/NN)", "Fork deviation
+   because …", or "Unknown — AMBIGUOUS".
+3. **Never infer a contract from a route** — the 421-route index proves existence,
+   not schema, entitlement or live availability. Route ≠ feature.
+
 ## Spec Kit pilot
 
 For the remaining v0.007 work, read `docs/SPEC_KIT.md` and the relevant feature under
