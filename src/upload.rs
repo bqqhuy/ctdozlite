@@ -80,3 +80,71 @@ impl Source {
         Ok(self.file.try_clone().await?)
     }
 }
+
+/// Resumable chunked upload tracker with checkpointing (WP15-4).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ResumableUploadState {
+    pub upload_id: String,
+    pub file_name: String,
+    pub total_size: u64,
+    pub chunk_size: usize,
+    pub total_chunks: usize,
+    pub completed_chunks: Vec<usize>,
+}
+
+impl ResumableUploadState {
+    pub fn new(upload_id: String, file_name: String, total_size: u64, chunk_size: usize) -> Self {
+        let total_chunks = if total_size == 0 {
+            0
+        } else {
+            total_size.div_ceil(chunk_size as u64) as usize
+        };
+        Self {
+            upload_id,
+            file_name,
+            total_size,
+            chunk_size,
+            total_chunks,
+            completed_chunks: Vec::new(),
+        }
+    }
+
+    pub fn mark_chunk_complete(&mut self, chunk_index: usize) {
+        if !self.completed_chunks.contains(&chunk_index) {
+            self.completed_chunks.push(chunk_index);
+            self.completed_chunks.sort_unstable();
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.total_chunks > 0 && self.completed_chunks.len() == self.total_chunks
+    }
+
+    pub fn next_missing_chunk(&self) -> Option<usize> {
+        (0..self.total_chunks).find(|&i| !self.completed_chunks.contains(&i))
+    }
+}
+
+#[cfg(test)]
+mod resumable_tests {
+    use super::*;
+
+    #[test]
+    fn resumable_upload_state_tracks_chunks_and_detects_completion() {
+        let mut state = ResumableUploadState::new("up1".into(), "large.zip".into(), 10_000_000, 4_000_000);
+        assert_eq!(state.total_chunks, 3);
+        assert_eq!(state.next_missing_chunk(), Some(0));
+        assert!(!state.is_complete());
+
+        state.mark_chunk_complete(0);
+        assert_eq!(state.next_missing_chunk(), Some(1));
+        assert!(!state.is_complete());
+
+        state.mark_chunk_complete(2);
+        assert_eq!(state.next_missing_chunk(), Some(1));
+
+        state.mark_chunk_complete(1);
+        assert_eq!(state.next_missing_chunk(), None);
+        assert!(state.is_complete());
+    }
+}

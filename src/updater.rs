@@ -706,7 +706,7 @@ mod product_version_tests {
     #[test]
     fn arm_release_serials_compare_with_legacy_versions() {
         assert!(version("v0.002-arm") < version(crate::PRODUCT_VERSION));
-        assert_eq!(version(crate::PRODUCT_VERSION), Some((0, 0, 14)));
+        assert_eq!(version(crate::PRODUCT_VERSION), Some((0, 0, 15)));
         assert!(version("v0.010-arm") > version("v0.009-arm"));
         assert_eq!(version("v0.0.3"), version("v0.003-arm"));
         for invalid in [

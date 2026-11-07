@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.015-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.014-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.014-arm).
+Nhãn sản phẩm `v0.015-arm`, phiên bản số Windows `0.0.15`.
+
+Bản phát hành Bộ công cụ Rich Media & Truyền Tệp Lớn Phân Mảnh (Phase 2 - Mốc R18):
+
+### 🎬 Bộ Công cụ Rich Media & Truyền Tệp Lớn (Resumable Transfers)
+- **HTTP Range-Request Video Streaming (RFC 7233)**: Hỗ trợ tua và phát nhanh các đoạn video thời lượng dài qua header `Range: bytes={start}-{end}` mà không cần tải toàn bộ tệp về đĩa.
+- **Resumable Chunked File Upload**: Hệ thống phân mảnh tệp tải lên (chunks 1MB - 4MB) với trạng thái lưu vết tiến trình, cho phép tiếp tục tải lên từ vị trí ngắt kết nối mà không phải truyền lại từ đầu.
+- **Tối ưu hóa Thư viện & Trình xem Đa phương tiện**: Cải thiện hiệu năng xử lý đệm video và hình ảnh, giải phóng tài nguyên bộ đệm kịp thời.
+
+---
+
 ## v0.014-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.013-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.013-arm).

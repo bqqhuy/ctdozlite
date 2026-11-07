@@ -347,6 +347,36 @@ mod tests {
     }
 }
 
+
+/// Stream a specific byte range of a media resource (RFC 7233).
+#[allow(dead_code)]
+pub async fn range_request(
+    raw: &str,
+    start_byte: u64,
+    end_byte: Option<u64>,
+    timeout: Duration,
+) -> Result<reqwest::Response> {
+    let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("Đường dẫn media không hợp lệ"))?;
+    ensure!(allowed(&url), "Nguồn media không được hỗ trợ");
+    let range_val = match end_byte {
+        Some(end) => format!("bytes={start_byte}-{end}"),
+        None => format!("bytes={start_byte}-"),
+    };
+    let r = client()?
+        .get(url)
+        .header(reqwest::header::REFERER, crate::endpoints::WEB_ORIGIN)
+        .header(reqwest::header::RANGE, range_val)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Lỗi tải đoạn media: {e}"))?;
+    ensure!(
+        r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+        "Máy chủ không hỗ trợ Range request"
+    );
+    Ok(r)
+}
+
 #[cfg(test)]
 mod response_body_tests {
     use super::*;
@@ -391,5 +421,31 @@ mod response_body_tests {
         server.join().unwrap();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn range_request_sends_proper_headers_and_handles_206() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request);
+            let req_str = String::from_utf8_lossy(&request);
+            assert!(req_str.contains("range: bytes=100-200"));
+            let body = b"partial content chunk";
+            write!(
+                socket,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 100-200/500\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+        let url = format!("http://{address}/video.mp4");
+        let resp = range_request(&url, 100, Some(200), Duration::from_secs(5)).await.unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+        server.join().unwrap();
     }
 }
