@@ -99,3 +99,9 @@ Tier 3 additionally requires: ADR link, capture/evidence reference (`re-notes/..
 - Release tags follow `v<major>.<minor>.<patch>`; `v*` triggers `.github/workflows/windows-arm64.yml`.
 - A release PR must list the artifact matrix and the tested platforms.
 - Never tag from a dirty worktree or an unsigned-off CI run.
+- **Mandatory 4-Point Release Synchronization Checklist**:
+  1. `src/lib.rs`: `PRODUCT_VERSION` must match the release tag string (e.g. `"v0.009-arm"`).
+  2. `src/updater.rs`: Updater unit test must assert the parsed version tuple.
+  3. `Cargo.toml` & `Cargo.lock`: Package version updated.
+  4. `CHANGELOG.md`: Detailed changelog entry under the release header.
+  *Note:* The build script `scripts/build-windows-arm64.ps1` guards against version mismatch and will fail immediately if `GITHUB_REF_NAME` does not equal `PRODUCT_VERSION`.

@@ -53,6 +53,12 @@ Operating guide for AI agents and humans working in this repository.
 - **Every outbound request goes through the standard path:** params → `ParamCipher v2` → `signkey` → session cookie attachment.
 - **Comments in English, user-facing strings in Vietnamese.** See the comment taxonomy below.
 - **Do not silently change protocol behaviour.** Any change to params, signing, frame IDs or cipher flow requires evidence (capture, note in `re-notes/`) and a test or documented manual verification.
+- **Release tag and version synchronization invariant.** When creating a release tag (`v*`), four locations MUST be synchronized in lockstep before tagging:
+  1. `src/lib.rs`: `pub const PRODUCT_VERSION: &str = "vX.YYY-arm";` (MUST match the Git tag name exactly).
+  2. `src/updater.rs`: Regression test `assert_eq!(version(crate::PRODUCT_VERSION), Some((major, minor, serial)));`.
+  3. `Cargo.toml` & `Cargo.lock`: Package `version = "X.Y.Z"`.
+  4. `CHANGELOG.md`: Release notes recorded under the corresponding version header.
+  The CI build runner (`scripts/build-windows-arm64.ps1`) strictly enforces `GITHUB_REF_NAME == PRODUCT_VERSION` on tagged releases; any mismatch aborts the build.
 
 ## Engineering Standards
 
