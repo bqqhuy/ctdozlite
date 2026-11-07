@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.011-arm — Windows 11 ARM64 — 07/11/2026
+
+Thay đổi so với [v0.010-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.010-arm).
+Nhãn sản phẩm `v0.011-arm`, phiên bản số Windows `0.0.12`.
+
+Bản phát hành hoàn thiện Khối R15 (Business, OA, Bảo mật tài khoản, LAN Transfer và Tương thích dịch vụ):
+
+### Khối C01: Business / OA / Enterprise / Product Catalog
+- **Danh mục sản phẩm (Product Catalog)**: Hỗ trợ tra cứu danh mục hàng hoá/sản phẩm của tài khoản qua `/api/prodcatalog/list`.
+- **Hồ sơ doanh nghiệp & OA Badge**: Nhận diện tài khoản Zalo Official Account với nhãn xác thực Verified OA và phân loại ngành hàng.
+
+### Khối C02: Bảo mật tài khoản & Xác thực 2 bước (2FA)
+- **Kiểm tra trạng thái 2FA**: Kiểm tra kích hoạt xác thực hai yếu tố qua `/api/login/check2fa`.
+- **Bảo vệ tài khoản an toàn**: Cung cấp cơ chế đổi mật khẩu `/api/login/change_pwd` và chỉ báo bảo mật.
+
+### Khối C03: Truyền tệp mạng nội bộ (LAN / Local Transfer Protocol)
+- **Phát hiện thiết bị cùng mạng LAN (LAN Discovery)**: Tự động phát hiện các máy tính đang chạy Zalo trong cùng mạng nội bộ qua UDP multicast signaling.
+- **Truyền tệp trực tiếp ngang hàng (P2P)**: Sẵn sàng kết nối truyền nhận file dung lượng lớn siêu tốc qua mạng LAN không qua trung gian máy chủ Zalo.
+
+### Khối C04: Tương thích dịch vụ & Phân giải Endpoint (Service Resolver)
+- **Phân giải URL thông minh (ServiceResolver)**: Cơ chế xoay vòng và fallback tự động sang domain dự phòng của Zalo khi cụm server chính gặp sự cố, tăng cường độ ổn định cho client.
+
+---
+
 ## v0.010-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.009-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.009-arm).

@@ -385,6 +385,8 @@ pub enum WorkerCmd {
     GetCloudViewerKey {
         file_id: String,
     },
+    GetBusinessCatalog,
+    DiscoverLanPeers,
     EndCall {
         call_id: Option<i64>,
     },
@@ -2911,6 +2913,31 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Lấy khoá zCloud thất bại: {e}")));
                                     }
                                 }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::GetBusinessCatalog => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                match crate::business::fetch_product_catalog(&s).await {
+                                    Ok(items) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {} sản phẩm từ danh mục doanh nghiệp", items.len())));
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh mục sản phẩm: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DiscoverLanPeers => {
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let _ = events.send(GuiEvent::StatusUpdate("Đang quét thiết bị Zalo trong cùng mạng LAN…".into()));
                                 ctx.request_repaint();
                             });
                         }

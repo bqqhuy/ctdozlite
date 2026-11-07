@@ -164,6 +164,7 @@ impl ZaloGuiApp {
                         "Tin nhắn nhanh",
                         "Thiết bị & Bảo mật",
                         "Kho Media Server & zCloud",
+                        "Doanh nghiệp & Truyền LAN",
                     ]
                     .iter()
                     .enumerate()
@@ -181,7 +182,8 @@ impl ZaloGuiApp {
                     5 => self.render_tools_todo_poll(ui),
                     6 => self.render_tools_quick_messages(ui),
                     7 => self.render_tools_devices(ui),
-                    _ => self.render_tools_server_media_zcloud(ui),
+                    8 => self.render_tools_server_media_zcloud(ui),
+                    _ => self.render_tools_business_lan(ui),
                 });
                 if !self.tools.status.is_empty() {
                     ui.separator();
@@ -621,6 +623,37 @@ impl ZaloGuiApp {
                 self.tools.new_quick_text.clear();
             }
         }
+    }
+
+    fn render_tools_business_lan(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("🏢 Doanh nghiệp & Truyền tệp LAN (Zalo Parity C01 / C03)").strong().size(14.0));
+        ui.label("Quản lý danh mục sản phẩm OA/Doanh nghiệp và tính năng truyền tệp siêu tốc trong mạng nội bộ LAN.");
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui.button("📋 Tải Danh mục sản phẩm").clicked() {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::GetBusinessCatalog);
+                }
+            }
+            if ui.button("🔍 Quét thiết bị cùng mạng LAN").clicked() {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::DiscoverLanPeers);
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(RichText::new("📡 Thiết bị ngang hàng trong mạng LAN:").strong());
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label("💻");
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet").strong());
+                    ui.label("Cổng mặc định: 8998 • Tự động phát hiện qua UDP multicast");
+                });
+            });
+        });
     }
 
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {

@@ -1,5 +1,5 @@
 /// User-visible fork release identifier, independent of the numeric Windows file version.
-pub const PRODUCT_VERSION: &str = "v0.010-arm";
+pub const PRODUCT_VERSION: &str = "v0.011-arm";
 
 pub mod call;
 pub mod chat;
@@ -30,6 +30,10 @@ pub mod quick_message;
 pub mod device;
 pub mod zcloud;
 pub mod server_media;
+pub mod business;
+pub mod account_recovery;
+pub mod lan_transfer;
+pub mod service_resolver;
 
 #[cfg(windows)]
 mod windows_video;
