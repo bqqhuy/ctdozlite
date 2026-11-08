@@ -1333,7 +1333,10 @@ fn run_media_loop(
                         let mut played = 0usize;
                         for frame in data.chunks_exact_mut(out_channels) {
                             let sample = resampler.next(&buffer).to_sample::<$sample>();
-                            energy_sq += (f32::from(sample as f32).powi(2)) as f64;
+                            // A31 fix: Normalize sample to [-1.0, 1.0] for RMS calculation
+                            // to_sample::<f32>() handles I16→[-1,1] and U16→[-1,1] conversion
+                            let normalized = sample.to_sample::<f32>();
+                            energy_sq += (normalized.powi(2)) as f64;
                             played += 1;
                             frame.fill(sample);
                         }
@@ -2816,5 +2819,27 @@ mod group_media_tests {
             steady_rms < 0.02,
             "AGC must not resurrect suppressed echo, got {steady_rms}"
         );
+    }
+
+    #[test]
+    fn a31_regression_sample_normalization_for_rms() {
+        use cpal::Sample;
+        // Verify that I16 and U16 samples normalize into [-1.0, 1.0] for RMS calculation
+        // rather than treating raw integer values as float energy.
+        let i16_max: i16 = i16::MAX;
+        let i16_norm: f32 = i16_max.to_sample::<f32>();
+        assert!((i16_norm - 1.0).abs() < 0.001, "i16 max must normalize close to 1.0, got {i16_norm}");
+
+        let i16_min: i16 = i16::MIN;
+        let i16_min_norm: f32 = i16_min.to_sample::<f32>();
+        assert!((i16_min_norm - (-1.0)).abs() < 0.001, "i16 min must normalize close to -1.0, got {i16_min_norm}");
+
+        let u16_silence: u16 = 32768;
+        let u16_silence_norm: f32 = u16_silence.to_sample::<f32>();
+        assert!(u16_silence_norm.abs() < 0.001, "u16 mid/silence must normalize close to 0.0, got {u16_silence_norm}");
+
+        let f32_sample: f32 = 0.5f32;
+        let f32_norm: f32 = f32_sample.to_sample::<f32>();
+        assert!((f32_norm - 0.5).abs() < f32::EPSILON, "f32 sample must be unchanged");
     }
 }
