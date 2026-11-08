@@ -76,6 +76,26 @@ pub fn pending(text: String, is_group: bool, payload: Payload) -> ChatMessage {
         ..Default::default()
     }
 }
+/// Where a plain-text payload goes (audit A01/A02).  The E2EE send is not part
+/// of the stable dispatcher until the wire format is verified against the
+/// official client (SEC-01); keeping it out of this enum makes the exclusion
+/// compile-level instead of a runtime fallback.
+enum TextRoute {
+    Link(String),
+    Group,
+    Direct,
+}
+
+fn route_text(text: &str, is_group: bool) -> TextRoute {
+    if let Some(url) = crate::chat::extract_first_url(text) {
+        TextRoute::Link(url)
+    } else if is_group {
+        TextRoute::Group
+    } else {
+        TextRoute::Direct
+    }
+}
+
 pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMessage> {
     let job = message
         .outgoing_job
@@ -110,45 +130,48 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             }
         }
         Payload::Text => {
-            // E2EE path (WP16-3): check if conversation has E2EE enabled in session
-            // For now, defer to chat.rs helper which checks conversation metadata
-            if !job.is_group {
-                // Try E2EE send first; if server rejects, fallback to plain send
-                if let Ok(result) = crate::chat::send_e2ee_message(s, s.account_key(), to, &message.text, id).await {
+            // Audit A01/A02 (SYS-02): the E2EE wire format is still unverified
+            // against the official client (E3 — see crypto/wire.rs, crypto/prekey.rs),
+            // so the stable text path must not attempt an E2EE send.  The previous
+            // probe-then-fallback sent plaintext whenever E2EE failed (including a
+            // timeout after the request reached the server, duplicating the message)
+            // and hid the 1-1 link-preview branch.  `send_e2ee_message` stays
+            // available for the SEC-01 protocol spike only.
+            // Parity: fork deviation — E2EE send is blocked until the wire format
+            // is verified (re-notes/36 §8); plain sends match Zalo PC behaviour.
+            match route_text(&message.text, job.is_group) {
+                TextRoute::Link(url) => {
+                    let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
+                        crate::chat::LinkMetadata {
+                            title: url.clone(),
+                            url,
+                            desc: String::new(),
+                            thumb: String::new(),
+                            src: "Liên kết".into(),
+                        },
+                    );
+                    let result = crate::chat::send_link_message_with_client_id(
+                        s,
+                        to,
+                        &message.text,
+                        &meta,
+                        job.is_group,
+                        id,
+                    )
+                    .await?;
+                    sent.link_url = Some(meta.url);
+                    sent.link_title = Some(meta.title);
+                    sent.link_desc = Some(meta.desc);
+                    sent.link_thumb = Some(meta.thumb);
+                    sent.link_src = Some(meta.src);
                     result
-                } else {
-                    // E2EE failed (no key, not supported) → fallback to regular send
+                }
+                TextRoute::Group => {
+                    crate::chat::send_group_message_with_client_id(s, to, &message.text, id).await?
+                }
+                TextRoute::Direct => {
                     crate::chat::send_message_with_client_id(s, to, &message.text, id).await?
                 }
-            } else if let Some(url) = crate::chat::extract_first_url(&message.text) {
-                let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
-                    crate::chat::LinkMetadata {
-                        title: url.clone(),
-                        url,
-                        desc: String::new(),
-                        thumb: String::new(),
-                        src: "Liên kết".into(),
-                    },
-                );
-                let result = crate::chat::send_link_message_with_client_id(
-                    s,
-                    to,
-                    &message.text,
-                    &meta,
-                    job.is_group,
-                    id,
-                )
-                .await?;
-                sent.link_url = Some(meta.url);
-                sent.link_title = Some(meta.title);
-                sent.link_desc = Some(meta.desc);
-                sent.link_thumb = Some(meta.thumb);
-                sent.link_src = Some(meta.src);
-                result
-            } else if job.is_group {
-                crate::chat::send_group_message_with_client_id(s, to, &message.text, id).await?
-            } else {
-                crate::chat::send_message_with_client_id(s, to, &message.text, id).await?
             }
         }
         Payload::Forward(original)
@@ -573,6 +596,22 @@ pub(crate) fn failure_message(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_routing_reaches_link_preview_for_direct_and_group() {
+        // Audit A02: the link branch was unreachable for 1-1 messages after the
+        // E2EE attempt was inserted ahead of it.
+        assert!(matches!(
+            route_text("xem thêm https://example.com/bai", false),
+            TextRoute::Link(_)
+        ));
+        assert!(matches!(
+            route_text("https://example.com", true),
+            TextRoute::Link(_)
+        ));
+        assert!(matches!(route_text("xin chào", false), TextRoute::Direct));
+        assert!(matches!(route_text("xin chào", true), TextRoute::Group));
+    }
 
     #[test]
     fn forwarded_media_does_not_inherit_source_conversation_state() {
