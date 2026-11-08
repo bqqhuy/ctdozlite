@@ -518,6 +518,8 @@ pub enum GuiEvent {
     ProfileSwitched {
         uid: String,
     },
+    AppUnlocked,
+    AppUnlockFailed,
 }
 
 #[derive(Debug, Clone)]
@@ -763,6 +765,7 @@ pub struct ZaloGuiApp {
 
     // App lock state (WP16-4)
     lock_guard: auth_guard::AppLockGuard,
+    auth_in_progress: bool,
 
     // Account switcher state (WP16-3)
     #[allow(dead_code)]
@@ -824,6 +827,8 @@ pub struct ZaloGuiApp {
     active_call: Option<ActiveCallOverlay>,
     call_terminals: crate::call_lifecycle::TerminalCalls,
     image_viewer: Option<ImageViewerModal>,
+    #[allow(dead_code)] // TODO(WP15-4): Wire "Preview" button in messages.rs
+    doc_viewer: Option<doc_viewer::DocViewerModal>,
 
     info_drawer_open: bool,
     profile_menu_open: bool,
@@ -1096,6 +1101,7 @@ impl ZaloGuiApp {
             active_call: None,
             call_terminals: Default::default(),
             image_viewer: None,
+            doc_viewer: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
@@ -1238,6 +1244,7 @@ impl ZaloGuiApp {
             quote_jump: None,
             quick_schedule: None,
             lock_guard: auth_guard::AppLockGuard::new(),
+            auth_in_progress: false,
             account_switcher: account_switcher::AccountSwitcher::default(),
         };
 
@@ -2669,6 +2676,21 @@ impl ZaloGuiApp {
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::RefreshThreads);
                     }
+                }
+                GuiEvent::AppUnlocked => {
+                    // WP16-4: Windows Hello authentication succeeded
+                    self.lock_guard.unlock();
+                    self.auth_in_progress = false;
+                    self.status_msg = "Đã mở khóa ứng dụng".into();
+                    // Refresh UI state after unlock
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::RefreshThreads);
+                    }
+                }
+                GuiEvent::AppUnlockFailed => {
+                    // WP16-4: Windows Hello authentication failed
+                    self.auth_in_progress = false;
+                    self.status_msg = "Xác thực thất bại. Vui lòng thử lại.".into();
                 }
                 GuiEvent::Tools { owner, result } => {
                     if owner != self.user_uin || !self.is_logged_in {
@@ -4829,6 +4851,11 @@ impl eframe::App for ZaloGuiApp {
                 });
         }
 
+        // Auto-lock check (WP16-4)
+        if self.is_logged_in && self.lock_guard.should_lock() {
+            self.lock_guard.lock();
+        }
+
         // Main Workspace
         if !self.is_logged_in {
             egui::CentralPanel::default()
@@ -4836,6 +4863,9 @@ impl eframe::App for ZaloGuiApp {
                 .show(ctx, |ui| {
                     self.render_login_screen(ui, &pal);
                 });
+        } else if self.lock_guard.is_locked() {
+            // Render lock overlay (WP16-4)
+            self.render_lock_overlay(ctx, &pal);
         } else {
             self.render_sync_status_bar(ctx, &pal);
             self.render_chat_workspace(ctx, &pal);
@@ -5076,6 +5106,76 @@ impl ZaloGuiApp {
                     });
                 });
         });
+    }
+
+    fn render_lock_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    let avail_h = ui.available_height();
+                    ui.add_space((avail_h * 0.35).max(100.0));
+
+                    // Lock icon
+                    ui.label(
+                        RichText::new("🔒")
+                            .size(64.0),
+                    );
+                    ui.add_space(16.0);
+
+                    ui.label(
+                        RichText::new("Ứng dụng đã bị khóa")
+                            .color(pal.text_primary)
+                            .size(24.0)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new("Xác thực bằng Windows Hello để tiếp tục")
+                            .color(pal.text_secondary)
+                            .size(14.0),
+                    );
+                    ui.add_space(24.0);
+
+                    let btn = egui::Button::new(
+                        RichText::new(if self.auth_in_progress {
+                            "Đang xác thực..."
+                        } else {
+                            "Mở khóa với Windows Hello"
+                        })
+                            .color(Color32::WHITE)
+                            .size(14.0)
+                            .strong(),
+                    )
+                    .fill(pal.primary)
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(240.0, 42.0));
+
+                    if ui
+                        .add_enabled(!self.auth_in_progress, btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        // Trigger authentication via worker task
+                        self.auth_in_progress = true;
+                        let ctx_clone = ctx.clone();
+                        let event_tx = self.event_tx.clone();
+
+                        tokio::spawn(async move {
+                            match auth_guard::request_windows_hello().await {
+                                Ok(true) => {
+                                    let _ = event_tx.send(GuiEvent::AppUnlocked);
+                                }
+                                _ => {
+                                    let _ = event_tx.send(GuiEvent::AppUnlockFailed);
+                                }
+                            }
+                            ctx_clone.request_repaint();
+                        });
+                    }
+                });
+            });
     }
 
     fn refresh_unread_title(&self, ctx: &egui::Context) {
@@ -5804,6 +5904,21 @@ mod v003_viewer_tests {
                             ..Default::default()
                         },
                         |ctx| app.render_image_viewer_modal(ctx, &pal),
+                    );
+                    last.clear();
+                    for shape in output.shapes {
+                        text_rects(&shape.shape, &mut last);
+                    }
+                }
+
+                // WP15-4: Document viewer modal (Task 4c)
+                if app.doc_viewer.is_some() {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| app.render_doc_viewer_modal(ctx, &pal),
                     );
                     last.clear();
                     for shape in output.shapes {

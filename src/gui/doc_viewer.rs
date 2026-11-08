@@ -71,19 +71,118 @@ impl DocViewerModal {
     }
 }
 
-#[allow(dead_code)]
 impl super::ZaloGuiApp {
+    /// Render document viewer modal for text/code/log files (WP15-4 Task 4c).
+    #[allow(dead_code)] // TODO(WP15-4): Wire "Preview" button in messages.rs
     pub(super) fn render_doc_viewer_modal(
         &mut self,
-        _ctx: &egui::Context,
-        _pal: &super::ThemePalette,
+        ctx: &egui::Context,
+        pal: &super::ThemePalette,
     ) {
-        // Placeholder: Document viewer not yet integrated.
-        // This stub allows the modal type to be available for future v0.016+ implementation.
-        // - Would render a full-screen modal with searchable text content
-        // - Line numbers in left gutter
-        // - Search bar at top
-        // - Scrollable content area with monospace font
-        // - Hotkeys: Ctrl+F for search, Ctrl+S to save to downloads folder
+        // Escape to close
+        let should_close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if should_close {
+            self.doc_viewer = None;
+            return;
+        }
+
+        let Some(ref mut viewer) = self.doc_viewer else {
+            return;
+        };
+
+        // Ctrl+F to focus search
+        let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        let focus_search = ctrl && ctx.input(|i| i.key_pressed(egui::Key::F));
+
+        let file_name = viewer.file_name.clone();
+        let mut close_clicked = false;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_app))
+            .show(ctx, |ui| {
+                ui.vertical(|ui| {
+                    // Top bar: filename + close button
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&file_name)
+                                .strong()
+                                .color(pal.text_primary),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✕ Đóng").clicked() {
+                                close_clicked = true;
+                            }
+                        });
+                    });
+
+                    ui.separator();
+
+                    // Search bar
+                    ui.horizontal(|ui| {
+                        ui.label("🔍");
+                        let search_response = ui.text_edit_singleline(&mut viewer.search_query);
+                        if focus_search {
+                            search_response.request_focus();
+                        }
+                        if search_response.changed() {
+                            viewer.update_search();
+                        }
+                        if !viewer.search_results.is_empty() {
+                            ui.label(format!(
+                                "{} / {}",
+                                viewer.search_index + 1,
+                                viewer.search_results.len()
+                            ));
+                            if ui.button("▲").clicked() {
+                                viewer.prev_search_result();
+                            }
+                            if ui.button("▼").clicked() {
+                                viewer.next_search_result();
+                            }
+                        }
+                    });
+
+                    ui.separator();
+
+                    // Scrollable content with line numbers
+                    egui::ScrollArea::vertical()
+                        .id_salt("doc_viewer_scroll")
+                        .show(ui, |ui| {
+                            let highlight_line = viewer.current_highlight_line();
+                            let font_id = egui::FontId::monospace(12.0);
+
+                            for (line_num, line) in viewer.content.lines().enumerate() {
+                                ui.horizontal(|ui| {
+                                    // Line number gutter
+                                    ui.label(
+                                        egui::RichText::new(format!("{:4} ", line_num + 1))
+                                            .font(font_id.clone())
+                                            .color(pal.text_secondary),
+                                    );
+
+                                    // Line content with highlight
+                                    let bg_highlight = if Some(line_num) == highlight_line {
+                                        pal.bg_selected
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+
+                                    let label = egui::Label::new(
+                                        egui::RichText::new(line)
+                                            .font(font_id.clone())
+                                            .color(pal.text_primary)
+                                            .background_color(bg_highlight),
+                                    )
+                                    .selectable(true);
+                                    ui.add(label);
+                                });
+                            }
+                        });
+                });
+            });
+
+        if close_clicked {
+            self.doc_viewer = None;
+        }
     }
 }

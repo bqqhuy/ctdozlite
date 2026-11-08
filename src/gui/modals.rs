@@ -2454,6 +2454,37 @@ impl ZaloGuiApp {
             return;
         }
 
+        // WP15-4: Keyboard shortcuts (Task 4b)
+        let ctrl_pressed = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+        if ctrl_pressed && ctx.input(|i| i.key_pressed(Key::S)) {
+            // Ctrl+S: Save media
+            if let Some(ref viewer) = self.image_viewer {
+                if !self.content_protected(&viewer.source.thread, viewer.source.group)
+                    && !viewer.original_url.is_empty() {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::DownloadMedia {
+                            url: viewer.original_url.clone(),
+                            name: viewer.title.clone(),
+                            play: false,
+                            open: false,
+                            context: Some(viewer.source.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        if ctrl_pressed && ctx.input(|i| i.key_pressed(Key::C)) && !viewer.is_video {
+            // Ctrl+C: Copy image
+            if !self.content_protected(&viewer.source.thread, viewer.source.group) {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::CopyViewerImage {
+                        owner: self.user_uin.clone(),
+                        context: viewer.source.clone(),
+                    });
+                }
+            }
+        }
+
         let screen_rect = ctx.screen_rect();
         // Windows owns the native caption outside the client area.
         let viewer_top = screen_rect.top();
@@ -2697,6 +2728,48 @@ impl ZaloGuiApp {
                             if viewer.navigation_pending {
                                 ui.spinner();
                             }
+
+                            // WP15-4: Album navigation counter (Task 4b) - placeholder for current/total
+                            // TODO: Wire MediaNeighbor response to track position in album
+                            // ui.label(RichText::new("3 / 12").size(11.0).color(pal.text_secondary));
+
+                            // WP15-4: Video player controls (Task 4a)
+                            if let Some(ref mut vstate) = viewer.video_state {
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    // Play/Pause button
+                                    let play_btn = if vstate.playing { "⏸" } else { "▶" };
+                                    if ui.small_button(play_btn).clicked() {
+                                        vstate.playing = !vstate.playing;
+                                    }
+
+                                    // Time display
+                                    let pos_min = (vstate.position_secs / 60.0) as u32;
+                                    let pos_sec = (vstate.position_secs % 60.0) as u32;
+                                    let dur_min = (vstate.duration_secs / 60.0) as u32;
+                                    let dur_sec = (vstate.duration_secs % 60.0) as u32;
+                                    ui.label(format!("{:02}:{:02} / {:02}:{:02}", pos_min, pos_sec, dur_min, dur_sec));
+
+                                    // Seek scrubber
+                                    if vstate.duration_secs > 0.0 {
+                                        let mut pos = vstate.position_secs;
+                                        if ui.add(egui::Slider::new(&mut pos, 0.0..=vstate.duration_secs)
+                                            .show_value(false)).changed() {
+                                            vstate.position_secs = pos;
+                                        }
+                                    }
+
+                                    // Volume control
+                                    ui.label("🔊");
+                                    let mut vol = vstate.volume;
+                                    if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0)
+                                        .show_value(false)
+                                        .fixed_decimals(2)).changed() {
+                                        vstate.volume = vol;
+                                    }
+                                });
+                            }
+
                             if viewer.is_video {
                                 if ui
                                     .add_enabled(

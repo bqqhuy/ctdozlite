@@ -36,14 +36,30 @@ impl AppLockGuard {
     }
 
     /// Check if Windows Hello is available on this system.
-    /// For now, we assume it's available on Windows 11; full integration
-    /// requires the windows crate with Security::Credentials::UI bindings.
     #[cfg(windows)]
     fn check_biometric_available() -> bool {
-        // Placeholder: assume available on Windows 11.
-        // TODO (WP16-4): Integrate windows::Security::Credentials::UI::UserConsentVerifier
-        // after adding the windows crate feature gates.
-        std::env::var("OS").ok().map(|os| os == "Windows_NT").unwrap_or(false)
+        use windows::Security::Credentials::UI::UserConsentVerifier;
+
+        // Check availability synchronously via blocking task
+        std::thread::spawn(|| {
+            match UserConsentVerifier::CheckAvailabilityAsync() {
+                Ok(async_op) => {
+                    // Poll the async operation synchronously
+                    match async_op.get() {
+                        Ok(availability) => {
+                            use windows::Security::Credentials::UI::UserConsentVerifierAvailability;
+                            matches!(
+                                availability,
+                                UserConsentVerifierAvailability::Available
+                            )
+                        }
+                        Err(_) => false,
+                    }
+                }
+                Err(_) => false,
+            }
+        }).join().unwrap_or(false)
+
     }
 
     #[cfg(not(windows))]
@@ -52,11 +68,15 @@ impl AppLockGuard {
     }
 
     /// Update last interaction timestamp (called on user input).
+    /// Does NOT unlock the app; unlock requires successful Windows Hello auth.
     pub fn touch(&mut self) {
         self.last_interaction = Instant::now();
-        if self.locked {
-            self.locked = false; // Interaction unlocks (for now; real unlock needs auth)
-        }
+    }
+
+    /// Mark the app as unlocked after successful authentication.
+    pub fn unlock(&mut self) {
+        self.locked = false;
+        self.last_interaction = Instant::now();
     }
 
     /// Check if the app should auto-lock due to idle timeout.
@@ -81,36 +101,11 @@ impl AppLockGuard {
             return Ok(false);
         }
 
-        let result = Self::request_biometric_auth().await?;
+        let result = request_windows_hello().await?;
         if result {
-            self.locked = false;
-            self.touch();
+            self.unlock();
         }
         Ok(result)
-    }
-
-    /// Perform the actual Windows Hello authentication request.
-    #[cfg(windows)]
-    async fn request_biometric_auth() -> Result<bool> {
-        // Windows Hello integration is deferred to a later implementation phase.
-        // For now, this returns a placeholder stub.
-        // TODO (WP16-4): Integrate windows::Security::Credentials::UI::UserConsentVerifier
-        // Full implementation requires:
-        // 1. Adding windows crate with Security::Credentials::UI feature
-        // 2. Wrapping async WinRT APIs for Tokio integration
-        // 3. Handling window context (HWND) from egui
-        let task = tokio::task::spawn_blocking(|| {
-            eprintln!("[AUTH_GUARD] Requesting Windows Hello authentication...");
-            true // Placeholder: assume success
-        });
-
-        task.await.context("Authentication task failed")
-    }
-
-    #[cfg(not(windows))]
-    async fn request_biometric_auth() -> Result<bool> {
-        // Non-Windows stub: always fail.
-        Ok(false)
     }
 
     /// Return the remaining idle time before auto-lock.
@@ -127,6 +122,53 @@ impl Default for AppLockGuard {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Perform the actual Windows Hello authentication request, independent of any
+/// lock-guard state. Returns `true` only when the user verified successfully.
+#[cfg(windows)]
+pub async fn request_windows_hello() -> Result<bool> {
+    use windows::Security::Credentials::UI::UserConsentVerifier;
+    use windows::core::HSTRING;
+
+    let task = tokio::task::spawn_blocking(move || -> Result<bool> {
+        eprintln!("[AUTH_GUARD] Requesting Windows Hello authentication...");
+
+        let message = HSTRING::from("ZaloLite");
+        match UserConsentVerifier::RequestVerificationAsync(&message) {
+            Ok(async_op) => {
+                // Block on the WinRT IAsyncOperation inside the blocking pool.
+                match async_op.get() {
+                    Ok(result) => {
+                        use windows::Security::Credentials::UI::UserConsentVerificationResult;
+                        let success =
+                            matches!(result, UserConsentVerificationResult::Verified);
+                        eprintln!(
+                            "[AUTH_GUARD] Authentication result: {}",
+                            if success { "verified" } else { "failed" }
+                        );
+                        Ok(success)
+                    }
+                    Err(e) => {
+                        eprintln!("[AUTH_GUARD] Authentication failed: {e:?}");
+                        Ok(false)
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[AUTH_GUARD] Failed to request authentication: {e:?}");
+                Ok(false)
+            }
+        }
+    });
+
+    task.await.context("Authentication task failed")?
+}
+
+/// Non-Windows stub: authentication is never available.
+#[cfg(not(windows))]
+pub async fn request_windows_hello() -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -164,6 +206,24 @@ mod tests {
         guard.lock();
         assert!(guard.is_locked());
         assert!(!guard.should_lock());
+    }
+
+    #[test]
+    fn touch_does_not_unlock_locked_app() {
+        let mut guard = AppLockGuard::new();
+        guard.lock();
+        guard.touch();
+        assert!(guard.is_locked(), "touch must not bypass Windows Hello auth");
+    }
+
+    #[test]
+    fn unlock_after_lock_resets_state() {
+        let mut guard = AppLockGuard::new();
+        guard.lock();
+        assert!(guard.is_locked());
+        guard.unlock();
+        assert!(!guard.is_locked());
+        assert!(!guard.should_lock(), "unlock must reset the idle timer");
     }
 
     #[test]
