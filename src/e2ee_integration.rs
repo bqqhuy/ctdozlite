@@ -91,6 +91,7 @@ pub const E2EE_PENDING_DATA: i64 = -30;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn e2ee_status_detection() {

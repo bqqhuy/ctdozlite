@@ -3039,20 +3039,25 @@ impl ZaloGuiApp {
                                 thread_name.clone()
                             };
                             egui::Frame::none()
-                                .fill(pal.bg_elevated)
-                                .inner_margin(Margin::symmetric(14.0, 6.0))
+                                .fill(if pal.is_dark { Color32::from_rgb(34, 38, 43) } else { Color32::from_rgb(241, 245, 249) })
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(Margin::symmetric(12.0, 6.0))
                                 .stroke(Stroke::new(1.0_f32, pal.border))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
+                                        let (bar_rect, _) = ui.allocate_exact_size(Vec2::new(3.0, 28.0), Sense::hover());
+                                        ui.painter().rect_filled(bar_rect, Rounding::same(1.5), pal.primary);
                                         ui.vertical(|ui| {
                                             ui.label(
-                                                RichText::new(format!("Đang trả lời {who}"))
+                                                RichText::new(format!("Trả lời {who}"))
                                                     .size(12.0)
                                                     .color(pal.primary)
                                                     .strong(),
                                             );
                                             let preview = if q.sticker_id.is_some() {
                                                 "[Nhãn dán]".to_string()
+                                            } else if q.text.is_empty() {
+                                                "[Hình ảnh/Tệp đính kèm]".to_string()
                                             } else {
                                                 truncate_chars(&q.text, 100).into_owned()
                                             };
@@ -3570,44 +3575,68 @@ impl ZaloGuiApp {
                                         if self.smoke.is_some() && !ui.clip_rect().expand(1.0).contains_rect(send_rect) {
                                             eprintln!("UI smoke failed: send button outside composer viewport: send={send_rect:?}, clip={:?}",ui.clip_rect());std::process::exit(3);
                                         }
-                                        let send_bg = if !can_send {
-                                            pal.primary.linear_multiply(0.42)
-                                        } else if send_resp.hovered() {
-                                            pal.primary_hover
+                                        if can_send {
+                                            let send_bg = if send_resp.hovered() {
+                                                pal.primary_hover
+                                            } else {
+                                                pal.primary
+                                            };
+                                            ui.painter().rect_filled(
+                                                send_rect,
+                                                Rounding::same(8.0),
+                                                send_bg,
+                                            );
+                                            if !composer_compact {
+                                                ui.painter().text(
+                                                    Pos2::new(
+                                                        send_rect.left() + 15.0,
+                                                        send_rect.center().y,
+                                                    ),
+                                                    egui::Align2::LEFT_CENTER,
+                                                    "Gửi",
+                                                    FontId::proportional(13.0),
+                                                    Color32::WHITE,
+                                                );
+                                                draw_icon_send(
+                                                    ui.painter(),
+                                                    Pos2::new(
+                                                        send_rect.right() - 17.0,
+                                                        send_rect.center().y,
+                                                    ),
+                                                    14.0,
+                                                    Color32::WHITE,
+                                                );
+                                            } else {
+                                                draw_icon_send(
+                                                    ui.painter(),
+                                                    send_rect.center(),
+                                                    16.0,
+                                                    Color32::WHITE,
+                                                );
+                                            }
                                         } else {
-                                            pal.primary
-                                        };
-                                        ui.painter().rect_filled(
-                                            send_rect,
-                                            Rounding::same(8.0),
-                                            send_bg,
-                                        );
-                                        if !composer_compact {
+                                            // Dynamic Thumbs-up / Like button when empty (Zalo PC & Olaz UX)
+                                            let like_bg = if send_resp.hovered() {
+                                                pal.bg_hover
+                                            } else {
+                                                pal.bg_input
+                                            };
+                                            ui.painter().rect_filled(
+                                                send_rect,
+                                                Rounding::same(8.0),
+                                                like_bg,
+                                            );
+                                            ui.painter().rect_stroke(
+                                                send_rect,
+                                                Rounding::same(8.0),
+                                                Stroke::new(1.0_f32, pal.border),
+                                            );
                                             ui.painter().text(
-                                                Pos2::new(
-                                                    send_rect.left() + 15.0,
-                                                    send_rect.center().y,
-                                                ),
-                                                egui::Align2::LEFT_CENTER,
-                                                "Gửi",
-                                                FontId::proportional(13.0),
-                                                Color32::WHITE,
-                                            );
-                                            draw_icon_send(
-                                                ui.painter(),
-                                                Pos2::new(
-                                                    send_rect.right() - 17.0,
-                                                    send_rect.center().y,
-                                                ),
-                                                14.0,
-                                                Color32::WHITE,
-                                            );
-                                        } else {
-                                            draw_icon_send(
-                                                ui.painter(),
                                                 send_rect.center(),
-                                                16.0,
-                                                Color32::WHITE,
+                                                egui::Align2::CENTER_CENTER,
+                                                "👍",
+                                                FontId::proportional(16.0),
+                                                pal.primary,
                                             );
                                         }
 
@@ -3639,12 +3668,13 @@ impl ZaloGuiApp {
                                             if ui.button(crate::i18n::tr("Hẹn giờ gửi…")).clicked(){self.open_quick_schedule();ui.close_menu();}
                                             if ui.button(crate::i18n::tr("Quản lý lịch gửi")).clicked(){self.tools.open=true;self.tools.tab=3;ui.close_menu();}
                                         });
+                                        let send_resp = if can_send {
+                                            send_resp.on_hover_text(crate::i18n::tr("Gửi tin nhắn (Enter)"))
+                                        } else {
+                                            send_resp.on_hover_text(crate::i18n::tr("Gửi nhanh biểu tượng thích (Like)"))
+                                        };
                                         let send_clicked = send_resp
-                                            .on_hover_cursor(if can_send {
-                                                CursorIcon::PointingHand
-                                            } else {
-                                                CursorIcon::Default
-                                            })
+                                            .on_hover_cursor(CursorIcon::PointingHand)
                                             .clicked();
 
                                         if (send_clicked || enter_pressed) && is_voice_active {
@@ -3730,6 +3760,18 @@ impl ZaloGuiApp {
                                                         is_group,
                                                     });
                                                 }
+                                            }
+                                        } else if send_clicked && !can_send {
+                                            // Send Zalo official Like sticker (cate 10130, id 18009)
+                                            response.request_focus();
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::SendSticker {
+                                                    to_id: thread_id.clone(),
+                                                    sticker_id: 18009,
+                                                    cate_id: 10130,
+                                                    sticker_type: 2,
+                                                    is_group,
+                                                });
                                             }
                                         } else if enter_pressed {
                                             response.request_focus();

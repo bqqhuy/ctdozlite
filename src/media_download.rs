@@ -119,7 +119,7 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                             let doh_client = doh_client_for(
                                 &host_str,
                                 &addrs,
-                                Duration::from_secs(ttl.clamp(60, 600)),
+                                Duration::from_secs(ttl.clamp(60, 600) as u64),
                             )?;
                             doh_client
                                 .get(url.clone())

@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.016-arm — Windows 11 ARM64 — 08/11/2026
+
+Thay đổi so với [v0.015.1-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.015.1-arm).
+Nhãn sản phẩm `v0.016-arm`, phiên bản số Windows `0.0.16`.
+
+Bản phát hành Nâng cấp Trải nghiệm Người dùng (Smart Composer & Zalo Native Theme Polish - Giai đoạn 1):
+
+### 🎨 Chuẩn Hóa Design Tokens & Bảng Màu Zalo Native
+- **Đồng bộ mã màu thương hiệu Zalo PC**: Cập nhật toàn diện `src/gui/theme.rs` với các tokens chính xác từ Zalo PC và Olaz:
+  - Zalo CTA Blue: `#0068FF` (nút chính, link, focus).
+  - Blue Pressed: `#005AE0`.
+  - Dark Mode Base: `#22262B` (nền cửa sổ chính) và `#2A2F35` (thanh bên và bong bóng tin nhắn).
+  - Primary Ink: `#081B3A` (mực chữ tương phản cao trên nền sáng, dễ đọc và êm mắt).
+  - Canvas: `#E8EEF4` (nền xám xanh đặc trưng của Zalo PC).
+
+### ✍️ Thanh Soạn Thảo Thông Minh (Smart Composer UX)
+- **Nút Send / Like (`👍`) Chuyển Đổi Động**: Khi ô nhập liệu trống, nút gửi tự động chuyển thành nút **Like / Thumbs-up (`👍`)** với màu xanh Zalo; nhấn vào gửi ngay Sticker Like chính thức của Zalo (`cate_id: 10130, sticker_id: 18009`). Khi bắt đầu gõ chữ, nút chuyển mượt mà thành nút "Gửi" (`✈`).
+- **Banner Trích Dẫn Trả Lời Trực Quan (Reply Preview Banner)**: Hiển thị thanh trích dẫn nổi bật phía trên composer với vạch nhấn dọc `|`, hiển thị tên người gửi được trả lời, nội dung tin rút gọn và nút `✕` hủy trả lời nhanh.
+
+### 🔒 Nền Tảng Mã Hóa E2EE & Giao Diện
+- Chuẩn bị nền tảng nhận dạng tin nhắn mã hóa đầu cuối với biểu tượng ổ khóa an toàn.
+
+---
+
 ## v0.015.1-arm — Windows 11 ARM64 — 07/11/2026
 
 Thay đổi so với [v0.015-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.015-arm).

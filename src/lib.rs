@@ -1,5 +1,5 @@
 /// User-visible fork release identifier, independent of the numeric Windows file version.
-pub const PRODUCT_VERSION: &str = "v0.015.1-arm";
+pub const PRODUCT_VERSION: &str = "v0.016-arm";
 
 pub mod call;
 pub mod chat;
