@@ -89,10 +89,27 @@ pub fn startup_error(message: &str) {
 }
 
 /// Open an already downloaded local file through the OS association.
+///
+/// A26 fix: Block executables, scripts, and shortcuts from auto-opening through
+/// shell association. User must explicitly save and run them outside the app.
 pub fn open_file(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
     }
+
+    // A26: Gate executable/script/shortcut extensions (audit A26)
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        let blocked = matches!(
+            ext_lower.as_str(),
+            "exe" | "com" | "bat" | "cmd" | "ps1" | "vbs" | "vbe" | "js" | "jse"
+                | "wsf" | "wsh" | "msi" | "scr" | "pif" | "lnk" | "url" | "inf" | "reg"
+        );
+        if blocked {
+            return false;
+        }
+    }
+
     #[cfg(windows)]
     {
         shell_open(path.as_os_str())
