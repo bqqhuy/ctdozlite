@@ -82,6 +82,9 @@ pub struct ChatMessage {
     pub contact_phone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_avatar: Option<String>,
+    /// WP16-3: E2EE status flag for message decryption indicator
+    #[serde(default)]
+    pub is_e2ee: bool,
 }
 
 impl ChatMessage {
@@ -5351,6 +5354,7 @@ pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
         contact_name,
         contact_phone,
         contact_avatar,
+        is_e2ee,
     } = message;
     serde_json::to_writer(
         &mut writer,
@@ -5399,6 +5403,7 @@ pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
                 contact_name,
                 contact_phone,
                 contact_avatar,
+                is_e2ee,
             ),
         ),
     )
@@ -5805,10 +5810,12 @@ pub(crate) fn parse_chat_message_with_profile(it: &Value, profile_id: Option<&st
         .unwrap_or_default();
 
     // WP16-3: E2EE receive path — decrypt incoming encrypted messages
+    let mut is_e2ee = false;
     if let Some(prof_id) = profile_id {
         if let Some(sender_id) = it.get("uidFrom").or_else(|| it.get("idFrom")).and_then(|v| v.as_str()) {
             if let Some((plaintext, _identity_changed)) = try_decrypt_e2ee_content(prof_id, sender_id, it) {
                 content = plaintext;
+                is_e2ee = true;
                 // TODO: Show identity_changed warning in UI (WP16-3 Mục 3)
             }
         }
@@ -6004,6 +6011,7 @@ pub(crate) fn parse_chat_message_with_profile(it: &Value, profile_id: Option<&st
         contact_name,
         contact_phone,
         contact_avatar,
+        is_e2ee,
         ..Default::default()
     };
     message.hydrate_media_metadata();
