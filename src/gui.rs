@@ -504,6 +504,14 @@ pub enum GuiEvent {
     DownloadFolderPicked(Option<Result<std::path::PathBuf, String>>),
     DownloadFolderFailed(String),
     CameraUnavailable(String),
+    UploadProgress {
+        upload_id: String,
+        completed: u64,
+        total: u64,
+    },
+    UploadResumeAvailable {
+        sessions: Vec<crate::upload::ResumableUploadState>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2545,6 +2553,22 @@ impl ZaloGuiApp {
                         }
                         Some(Err(error)) => self.show_toast(error),
                         None => {}
+                    }
+                }
+                GuiEvent::UploadProgress { upload_id: _, completed, total } => {
+                    self.status_msg = format!("Tải lên: {}/{} bytes", completed, total);
+                }
+                GuiEvent::UploadResumeAvailable { sessions } => {
+                    if !sessions.is_empty() {
+                        let summary = if sessions.len() == 1 {
+                            format!(
+                                "Có 1 tải lên chưa hoàn thành ({})…",
+                                sessions[0].file_name
+                            )
+                        } else {
+                            format!("Có {} tải lên chưa hoàn thành…", sessions.len())
+                        };
+                        self.show_toast(summary);
                     }
                 }
                 GuiEvent::LoggedOut => {

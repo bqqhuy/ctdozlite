@@ -432,6 +432,12 @@ pub enum WorkerCmd {
         owner: String,
         threads: Vec<Thread>,
     },
+    ResumeUpload {
+        upload_id: String,
+    },
+    CancelUpload {
+        upload_id: String,
+    },
     Logout,
 }
 
@@ -1585,6 +1591,59 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             if !matches!(result, Ok(Ok(()))) {
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể lưu lịch sử hội thoại".into()));
                             }
+                        }
+                        WorkerCmd::ResumeUpload { upload_id } => {
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                // Load upload state from store
+                                let result = tokio::task::spawn_blocking({
+                                    let s = s.clone();
+                                    move || -> anyhow::Result<Option<crate::upload::ResumableUploadState>> {
+                                        if !s.is_active() {
+                                            anyhow::bail!("Phiên đã hết hạn");
+                                        }
+                                        crate::store::MessageStore::open(s.history_path())?
+                                            .load_upload_state(&upload_id)
+                                    }
+                                })
+                                .await
+                                .map_err(|_| "Không thể đọc trạng thái tải lên".to_string())
+                                .and_then(|r| r.map_err(|_| "Không thể đọc trạng thái tải lên".to_string()));
+
+                                if let Ok(Some(_state)) = result {
+                                    let _ = tx.send(GuiEvent::StatusUpdate("Tiếp tục tải lên (v0.016)".into()));
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::CancelUpload { upload_id } => {
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                // Delete upload state from store
+                                let result = tokio::task::spawn_blocking({
+                                    let s = s.clone();
+                                    let id = upload_id.clone();
+                                    move || -> anyhow::Result<()> {
+                                        if !s.is_active() {
+                                            anyhow::bail!("Phiên đã hết hạn");
+                                        }
+                                        crate::store::MessageStore::open(s.history_path())?
+                                            .delete_upload_state(&id)
+                                    }
+                                })
+                                .await
+                                .map_err(|_| "Không thể hủy tải lên".to_string())
+                                .and_then(|r| r.map_err(|_| "Không thể hủy tải lên".to_string()));
+
+                                if result.is_ok() {
+                                    let _ = tx.send(GuiEvent::StatusUpdate("Đã hủy tải lên".into()));
+                                }
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::Logout => {
                             if let Some(task) = current_qr_task.take() { task.abort(); }
