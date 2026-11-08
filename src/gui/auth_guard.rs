@@ -81,7 +81,7 @@ impl AppLockGuard {
 
     /// Check if the app should auto-lock due to idle timeout.
     pub fn should_lock(&self) -> bool {
-        !self.locked && self.last_interaction.elapsed() >= self.idle_timeout
+        self.biometric_available && !self.locked && self.last_interaction.elapsed() >= self.idle_timeout
     }
 
     /// Mark the app as locked.
@@ -194,6 +194,7 @@ mod tests {
     #[test]
     fn should_lock_after_timeout() {
         let mut guard = AppLockGuard::new();
+        guard.biometric_available = true;
         guard.idle_timeout = Duration::from_millis(50);
         assert!(!guard.should_lock());
         thread::sleep(Duration::from_millis(100));

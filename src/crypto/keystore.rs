@@ -160,9 +160,9 @@ pub fn x3dh_sender(
     let ek_a = KeyPair::generate();
 
     // X3DH: DH1 || DH2 || DH3 [|| DH4]
-    let dh1 = ik_a.dh(&spk_b);
-    let dh2 = ek_a.dh(&ik_b);
-    let dh3 = ek_a.dh(&spk_b);
+    let dh1 = ik_a.dh(&spk_b)?;
+    let dh2 = ek_a.dh(&ik_b)?;
+    let dh3 = ek_a.dh(&spk_b)?;
     let mut km: Vec<u8> = Vec::with_capacity(128 + 32);
     // F = 0xFF * 32 (curve25519 "F" prefix per Signal spec §2.2)
     km.extend_from_slice(&[0xFF; 32]);
@@ -171,7 +171,7 @@ pub fn x3dh_sender(
     km.extend_from_slice(dh3.as_bytes());
     if let Some(otpk_b_bytes) = their_otpk_pub {
         let otpk_b = PublicKey::from(*otpk_b_bytes);
-        let dh4 = ek_a.dh(&otpk_b);
+        let dh4 = ek_a.dh(&otpk_b)?;
         km.extend_from_slice(dh4.as_bytes());
     }
 
@@ -198,9 +198,9 @@ pub fn x3dh_receiver(
     let ik_a = PublicKey::from(*their_identity_pub);
     let ek_a = PublicKey::from(*their_ek_pub);
 
-    let dh1 = spk_b.dh(&ik_a);
-    let dh2 = ik_b.dh(&ek_a);
-    let dh3 = spk_b.dh(&ek_a);
+    let dh1 = spk_b.dh(&ik_a)?;
+    let dh2 = ik_b.dh(&ek_a)?;
+    let dh3 = spk_b.dh(&ek_a)?;
     let mut km: Vec<u8> = Vec::with_capacity(128 + 32);
     km.extend_from_slice(&[0xFF; 32]);
     km.extend_from_slice(dh1.as_bytes());
@@ -208,7 +208,7 @@ pub fn x3dh_receiver(
     km.extend_from_slice(dh3.as_bytes());
     if let Some(otpk) = our_otpk {
         let otpk_b = KeyPair::from_private_bytes(otpk.key_pair.private);
-        let dh4 = otpk_b.dh(&ek_a);
+        let dh4 = otpk_b.dh(&ek_a)?;
         km.extend_from_slice(dh4.as_bytes());
     }
 

@@ -71,7 +71,7 @@ impl MessageStore {
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 11,
+            schema <= 12,
             "Database requires a newer application version"
         );
         conn.execute_batch(
@@ -2488,7 +2488,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                11
+                12
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -2660,7 +2660,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            11
+            12
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,

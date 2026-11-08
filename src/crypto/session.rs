@@ -115,22 +115,6 @@ impl E2eeManager {
         store::count_one_time_prekeys(&self.conn, &self.profile_id)
     }
 
-    /// Consume one one-time prekey (used when a peer starts a session).
-    fn take_one_time_prekey(&self) -> Result<Option<OneTimePreKey>> {
-        let row: Option<(u32,)> = self
-            .conn
-            .query_row(
-                "SELECT key_id FROM one_time_prekey WHERE profile_id=?1 ORDER BY key_id LIMIT 1",
-                rusqlite::params![self.profile_id],
-                |r| Ok((r.get(0)?,)),
-            )
-            .ok();
-        let Some((key_id,)) = row else {
-            return Ok(None);
-        };
-        store::consume_one_time_prekey(&self.conn, &self.profile_id, key_id)
-    }
-
     /// Next free one-time prekey id.
     fn next_prekey_id(&self) -> Result<u32> {
         let max: Option<u32> = self
@@ -246,7 +230,7 @@ impl E2eeManager {
         )?;
 
         let bob_spk = PublicKey::from(remote.signed_pre_key);
-        let mut session = RatchetSession::init_as_sender(&master, &bob_spk);
+        let mut session = RatchetSession::init_as_sender(&master, &bob_spk)?;
         let (header, ciphertext) = session.encrypt(plaintext)?;
         self.save_session(peer_id, &session)?;
         self.trust_identity(peer_id, &remote.identity_key)?;
@@ -254,6 +238,7 @@ impl E2eeManager {
         let bundle_wire = PreKeyBundleWire {
             registration_id: remote.registration_id,
             signed_pre_key_id: remote.signed_pre_key_id,
+            one_time_pre_key_id: remote.one_time_pre_key.map(|(_, id)| id),
             base_key: ek_pub,
             identity_key: identity.dh.public,
         };
@@ -283,7 +268,13 @@ impl E2eeManager {
             DecodedMessage::PreKey(prekey) => {
                 let identity = self.identity()?;
                 let spk = self.signed_prekey()?;
-                let otpk = self.take_one_time_prekey()?;
+                let otpk = match prekey.bundle.one_time_pre_key_id {
+                    Some(id) => Some(
+                        store::get_one_time_prekey(&self.conn, &self.profile_id, id)?
+                            .context("One-time prekey không tồn tại hoặc đã bị tiêu thụ")?,
+                    ),
+                    None => None,
+                };
 
                 let master = x3dh_receiver(
                     &identity,
@@ -297,8 +288,11 @@ impl E2eeManager {
                 // X3DH base key is only an input to the master secret.
                 let alice_key = PublicKey::from(prekey.header.dh_public);
                 let bob_spk = KeyPair::from_private_bytes(spk.key_pair.private);
-                let mut session = RatchetSession::init_as_receiver(&master, &alice_key, &bob_spk);
+                let mut session = RatchetSession::init_as_receiver(&master, &alice_key, &bob_spk)?;
                 let plaintext = session.decrypt(&prekey.header, &prekey.ciphertext)?;
+                if let Some(otpk_key) = otpk {
+                    store::delete_one_time_prekey(&self.conn, &self.profile_id, otpk_key.key_id)?;
+                }
                 self.save_session(peer_id, &session)?;
                 let changed = self.trust_identity(peer_id, &prekey.bundle.identity_key)?;
                 Ok(DecryptedMessage {

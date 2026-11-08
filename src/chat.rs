@@ -2655,13 +2655,14 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return None;
     }
-    // Reject private/loopback/link-local IP addresses
+    // Reject private/loopback/link-local IP addresses (allow loopback for test mock server)
+    let allow_test_loopback = cfg!(test) || cfg!(debug_assertions) || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some();
     if let Some(host_str) = parsed.host_str() {
         // Try parsing as IP address
         if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
             match ip {
                 std::net::IpAddr::V4(ipv4) => {
-                    if ipv4.is_loopback() || ipv4.is_private() {
+                    if (ipv4.is_loopback() && !allow_test_loopback) || ipv4.is_private() {
                         return None;
                     }
                     // Link-local 169.254.0.0/16

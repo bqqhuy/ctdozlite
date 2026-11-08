@@ -1835,11 +1835,6 @@ impl ZaloGuiApp {
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
-        // A21 fix: Gate event processing when locked
-        if self.lock_guard.is_locked() {
-            return;
-        }
-
         for index in 0..64 {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
@@ -1847,6 +1842,29 @@ impl ZaloGuiApp {
             if index == 63 {
                 ctx.request_repaint();
             }
+
+            // A21 fix: When locked, gate event processing but allow unlock lifecycle events
+            if self.lock_guard.is_locked() {
+                match event {
+                    GuiEvent::AppUnlocked => {
+                        self.lock_guard.unlock();
+                        self.auth_in_progress = false;
+                        self.status_msg = "Đã mở khóa ứng dụng".into();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                        }
+                        ctx.request_repaint();
+                    }
+                    GuiEvent::AppUnlockFailed => {
+                        self.auth_in_progress = false;
+                        self.status_msg = "Xác thực thất bại".into();
+                        ctx.request_repaint();
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
             let event = match event {
                 GuiEvent::LiveThreadsReady(updates) => {

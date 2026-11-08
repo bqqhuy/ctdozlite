@@ -204,7 +204,7 @@ pub fn save_one_time_prekeys(conn: &Connection, profile_id: &str, keys: &[OneTim
     Ok(())
 }
 
-pub fn consume_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> Result<Option<OneTimePreKey>> {
+pub fn get_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> Result<Option<OneTimePreKey>> {
     let row = conn.query_row(
         "SELECT public_key, private_bytes_enc FROM one_time_prekey
          WHERE profile_id=?1 AND key_id=?2",
@@ -213,11 +213,8 @@ pub fn consume_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32)
     );
     match row {
         Ok((pub_bytes, priv_enc)) => {
-            conn.execute(
-                "DELETE FROM one_time_prekey WHERE profile_id=?1 AND key_id=?2",
-                params![profile_id, key_id],
-            )?;
             let priv_dec = storage::unprotect(&priv_enc)?;
+            anyhow::ensure!(pub_bytes.len() >= 32 && priv_dec.len() >= 32, "One-time prekey in store is corrupt");
             let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes[..32]);
             let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec[..32]);
             Ok(Some(OneTimePreKey {
@@ -228,6 +225,22 @@ pub fn consume_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32)
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+pub fn delete_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> Result<()> {
+    conn.execute(
+        "DELETE FROM one_time_prekey WHERE profile_id=?1 AND key_id=?2",
+        params![profile_id, key_id],
+    )?;
+    Ok(())
+}
+
+pub fn consume_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> Result<Option<OneTimePreKey>> {
+    let key = get_one_time_prekey(conn, profile_id, key_id)?;
+    if key.is_some() {
+        delete_one_time_prekey(conn, profile_id, key_id)?;
+    }
+    Ok(key)
 }
 
 pub fn count_one_time_prekeys(conn: &Connection, profile_id: &str) -> Result<u32> {

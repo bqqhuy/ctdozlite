@@ -14,8 +14,9 @@
 //! -- PreKeyWhisperMessage only --
 //! bytes 42..46: registration id (u32 LE)
 //! bytes 46..50: signed prekey id (u32 LE)
-//! bytes 50..82: base key (X3DH ephemeral public key)
-//! bytes 82..114: identity key (sender's Curve25519 identity public key)
+//! bytes 50..54: one-time prekey id (u32 LE, 0 = None)
+//! bytes 54..86: base key (X3DH ephemeral public key)
+//! bytes 86..118: identity key (sender's Curve25519 identity public key)
 //! remainder    : ciphertext || 32-byte HMAC-SHA256
 //! ```
 //!
@@ -41,6 +42,8 @@ pub struct PreKeyBundleWire {
     pub registration_id: u32,
     /// Id of the sender's signed prekey.
     pub signed_pre_key_id: u32,
+    /// Optional id of the receiver's one-time prekey used in X3DH.
+    pub one_time_pre_key_id: Option<u32>,
     /// X3DH ephemeral (base) key.
     pub base_key: [u8; 32],
     /// Sender's identity public key.
@@ -105,7 +108,7 @@ pub fn serialize_prekey(
     header: &MessageHeader,
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(114 + ciphertext.len());
+    let mut out = Vec::with_capacity(118 + ciphertext.len());
     out.push(WIRE_VERSION);
     out.push(TYPE_PREKEY_WHISPER);
     out.extend_from_slice(&header.dh_public);
@@ -113,6 +116,7 @@ pub fn serialize_prekey(
     put_u32(&mut out, header.n);
     put_u32(&mut out, bundle.registration_id);
     put_u32(&mut out, bundle.signed_pre_key_id);
+    put_u32(&mut out, bundle.one_time_pre_key_id.unwrap_or(0));
     out.extend_from_slice(&bundle.base_key);
     out.extend_from_slice(&bundle.identity_key);
     out.extend_from_slice(ciphertext);
@@ -149,24 +153,27 @@ pub fn deserialize(payload: &[u8]) -> Result<DecodedMessage> {
         })),
         TYPE_PREKEY_WHISPER => {
             anyhow::ensure!(
-                payload.len() >= 114,
+                payload.len() >= 118,
                 "Gói tin E2EE PreKey bị cắt cụt"
             );
             let registration_id = read_u32(payload, 42)?;
             let signed_pre_key_id = read_u32(payload, 46)?;
+            let otpk_raw = read_u32(payload, 50)?;
+            let one_time_pre_key_id = if otpk_raw == 0 { None } else { Some(otpk_raw) };
             let mut base_key = [0u8; 32];
-            base_key.copy_from_slice(&payload[50..82]);
+            base_key.copy_from_slice(&payload[54..86]);
             let mut identity_key = [0u8; 32];
-            identity_key.copy_from_slice(&payload[82..114]);
+            identity_key.copy_from_slice(&payload[86..118]);
             Ok(DecodedMessage::PreKey(PreKeyMessage {
                 bundle: PreKeyBundleWire {
                     registration_id,
                     signed_pre_key_id,
+                    one_time_pre_key_id,
                     base_key,
                     identity_key,
                 },
                 header,
-                ciphertext: payload[114..].to_vec(),
+                ciphertext: payload[118..].to_vec(),
             }))
         }
         other => anyhow::bail!("Loại tin nhắn E2EE không hỗ trợ: {other}"),
@@ -205,6 +212,7 @@ mod tests {
         let bundle = PreKeyBundleWire {
             registration_id: 42,
             signed_pre_key_id: 1,
+            one_time_pre_key_id: Some(777),
             base_key: [3u8; 32],
             identity_key: [4u8; 32],
         };
@@ -214,9 +222,22 @@ mod tests {
         match deserialize(&payload).unwrap() {
             DecodedMessage::PreKey(m) => {
                 assert_eq!(m.bundle.registration_id, 42);
+                assert_eq!(m.bundle.signed_pre_key_id, 1);
+                assert_eq!(m.bundle.one_time_pre_key_id, Some(777));
                 assert_eq!(m.bundle.base_key, [3u8; 32]);
                 assert_eq!(m.bundle.identity_key, [4u8; 32]);
                 assert_eq!(m.ciphertext, vec![9, 9]);
+            }
+            _ => panic!("expected prekey"),
+        }
+
+        // Test with None one_time_pre_key_id
+        let mut bundle_none = bundle;
+        bundle_none.one_time_pre_key_id = None;
+        let payload_none = serialize_prekey(&bundle_none, &h, &[9, 9]);
+        match deserialize(&payload_none).unwrap() {
+            DecodedMessage::PreKey(m) => {
+                assert_eq!(m.bundle.one_time_pre_key_id, None);
             }
             _ => panic!("expected prekey"),
         }
