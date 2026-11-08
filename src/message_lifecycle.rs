@@ -106,6 +106,88 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// Schema v12: add ON UPDATE CASCADE to message_expiry and restored_assets FK constraints.
+///
+/// Audit A18 (P1/R): the v10 schema created FK constraints with ON DELETE CASCADE but
+/// without ON UPDATE CASCADE, so when store.rs promotes a message ID from local_* to
+/// the server-assigned ID (UPDATE messages SET msg_id=...), the FK in message_expiry
+/// and restored_assets fails with "FOREIGN KEY constraint failed". SQLite does not
+/// support altering FK constraints in place, so this migration recreates both tables
+/// with the fixed constraint, preserving all data.
+pub fn migrate_v12(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+
+    // Drop triggers that reference message_expiry before recreating the table
+    tx.execute_batch(
+        "DROP TRIGGER IF EXISTS expiry_message_insert;
+         DROP TRIGGER IF EXISTS expiry_message_update;
+         DROP TRIGGER IF EXISTS reject_expired_replay;
+         DROP TRIGGER IF EXISTS restored_asset_delete;
+
+         CREATE TABLE message_expiry_new(
+            thread_id TEXT NOT NULL,
+            msg_id TEXT NOT NULL,
+            expires_at INTEGER NOT NULL CHECK(expires_at>0),
+            PRIMARY KEY(thread_id,msg_id),
+            FOREIGN KEY(thread_id,msg_id) REFERENCES messages(thread_id,msg_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+        );
+        INSERT INTO message_expiry_new SELECT * FROM message_expiry;
+        DROP TABLE message_expiry;
+        ALTER TABLE message_expiry_new RENAME TO message_expiry;
+        CREATE INDEX message_expiry_due ON message_expiry(expires_at,thread_id,msg_id);
+
+        CREATE TABLE restored_assets_new(
+            thread_id TEXT NOT NULL,
+            msg_id TEXT NOT NULL,
+            quality TEXT NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY(thread_id,msg_id,quality),
+            FOREIGN KEY(thread_id,msg_id) REFERENCES messages(thread_id,msg_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+        );
+        INSERT INTO restored_assets_new SELECT * FROM restored_assets;
+        DROP TABLE restored_assets;
+        ALTER TABLE restored_assets_new RENAME TO restored_assets;
+        CREATE INDEX restored_assets_name ON restored_assets(name);
+
+        -- Recreate triggers with updated references
+        CREATE TRIGGER expiry_message_insert AFTER INSERT ON messages
+        WHEN ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0))>0
+        BEGIN
+            INSERT INTO message_expiry VALUES(NEW.thread_id,NEW.msg_id,ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0)))
+            ON CONFLICT(thread_id,msg_id) DO UPDATE SET expires_at=excluded.expires_at;
+        END;
+
+        CREATE TRIGGER expiry_message_update AFTER UPDATE OF raw_json,ts ON messages
+        WHEN ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0))>0
+        BEGIN
+            INSERT INTO message_expiry VALUES(NEW.thread_id,NEW.msg_id,ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0)))
+            ON CONFLICT(thread_id,msg_id) DO UPDATE SET expires_at=excluded.expires_at;
+        END;
+
+        CREATE TRIGGER reject_expired_replay BEFORE INSERT ON messages
+        WHEN ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0))>0
+        AND ctdo_expiry(COALESCE(NEW.raw_json,''),COALESCE(NEW.ts,0))<=CAST(strftime('%s','now') AS INTEGER)*1000
+        BEGIN
+            INSERT OR IGNORE INTO deleted_messages(thread_id,msg_id) VALUES(NEW.thread_id,NEW.msg_id);
+            SELECT RAISE(IGNORE);
+        END;
+
+        CREATE TRIGGER restored_asset_delete BEFORE DELETE ON restored_assets
+        BEGIN
+            INSERT OR IGNORE INTO restored_gc VALUES(OLD.name);
+        END;
+
+        PRAGMA user_version=12;"
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Backfill at most 500 existing rows. Returns true when this rebuild is complete.
 pub(crate) fn backfill(conn: &Connection) -> Result<bool> {
     let (last, done): (i64, bool) = conn.query_row(

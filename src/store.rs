@@ -216,6 +216,9 @@ impl MessageStore {
             )?;
             migration.commit()?;
         }
+        if schema < 12 {
+            crate::message_lifecycle::migrate_v12(&conn)?;
+        }
         Ok(Self { conn })
     }
 
