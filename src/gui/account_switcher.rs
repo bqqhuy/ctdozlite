@@ -7,6 +7,8 @@ use eframe::egui::{self, Align, Align2, Color32, FontId, Layout, RichText, Round
 use crate::profiles::Profile;
 
 /// Account switcher UI state.
+#[allow(dead_code)]
+#[derive(Default)]
 pub struct AccountSwitcher {
     /// Currently visible (expanded) or collapsed.
     pub expanded: bool,
@@ -14,15 +16,7 @@ pub struct AccountSwitcher {
     pub hover_profile: Option<String>,
 }
 
-impl Default for AccountSwitcher {
-    fn default() -> Self {
-        Self {
-            expanded: false,
-            hover_profile: None,
-        }
-    }
-}
-
+#[allow(dead_code)]
 impl AccountSwitcher {
     /// Render the account switcher in the sidebar header.
     /// Returns the UID of the profile selected, if any.
@@ -154,8 +148,10 @@ mod tests {
 
     #[test]
     fn switcher_toggles_expanded() {
-        let mut switcher = AccountSwitcher::default();
-        switcher.expanded = true;
+        let switcher = AccountSwitcher {
+            expanded: true,
+            ..Default::default()
+        };
         assert!(switcher.expanded);
     }
 }

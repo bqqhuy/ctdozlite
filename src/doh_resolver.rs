@@ -104,6 +104,12 @@ impl DohResolver {
         Err(anyhow!("DoH resolution failed for {}", host))
     }
 
+    /// Resolve hostname to IP addresses via DoH
+    pub async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let (addrs, _) = self.resolve_with_ttl(host).await?;
+        Ok(addrs)
+    }
+
     /// Query a single DoH endpoint, returning (IpAddrs, TTL)
     async fn query_endpoint_with_ttl(
         &self,
@@ -115,7 +121,7 @@ impl DohResolver {
         let dns_resp: DnsResponse = resp.json().await?;
 
         let addrs: Vec<IpAddr> = dns_resp
-            .Answer
+            .answer
             .iter()
             .filter_map(|a| a.data.parse::<IpAddr>().ok())
             .collect();
@@ -126,9 +132,9 @@ impl DohResolver {
 
         // Use maximum TTL from response (or default 300s)
         let ttl = dns_resp
-            .Answer
+            .answer
             .iter()
-            .map(|a| a.TTL)
+            .map(|a| a.ttl)
             .max()
             .unwrap_or(300);
 
@@ -148,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_doh_resolve() {
-        let resolver = DohResolver::new();
+        let resolver = DohResolver::new().unwrap();
         // Test with a known domain
         let result = resolver.resolve("dns.google").await;
         // May fail in test environment without network, so just check API
@@ -157,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_cache_invalidate() {
-        let resolver = DohResolver::new();
+        let resolver = DohResolver::new().unwrap();
         resolver
             .cache
             .lock()

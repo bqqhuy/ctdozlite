@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 /// Application lock guard — manages lock state and idle timeout.
+#[allow(dead_code)]
 pub struct AppLockGuard {
     /// Whether the app is currently locked.
     locked: bool,
@@ -22,6 +23,7 @@ pub struct AppLockGuard {
     biometric_available: bool,
 }
 
+#[allow(dead_code)]
 impl AppLockGuard {
     /// Create a new lock guard (app starts unlocked, no initial lock required).
     pub fn new() -> Self {
@@ -171,7 +173,7 @@ mod tests {
         thread::sleep(Duration::from_millis(30));
         guard.touch();
         assert!(!guard.should_lock());
-        thread::sleep(Duration::from_millis(30));
+        thread::sleep(Duration::from_millis(70));
         assert!(guard.should_lock());
     }
 }

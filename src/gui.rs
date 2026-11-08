@@ -536,6 +536,7 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct VideoPlayerState {
     playing: bool,
@@ -560,6 +561,7 @@ struct ImageViewerModal {
     time: String,
     zoom: f32,
     pan: Vec2,
+    #[allow(dead_code)]
     video_state: Option<VideoPlayerState>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -763,6 +765,7 @@ pub struct ZaloGuiApp {
     lock_guard: auth_guard::AppLockGuard,
 
     // Account switcher state (WP16-3)
+    #[allow(dead_code)]
     account_switcher: account_switcher::AccountSwitcher,
 
     // Login screen state
