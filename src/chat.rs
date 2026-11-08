@@ -5483,12 +5483,13 @@ pub(crate) async fn receive_new_messages(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    let profile_id = s.account_key();
     // 1. Poll live/offline message queues via `getChatFromPolling` (follow `more == 1` / `resetLastActionId` up to 3 batches)
     for _ in 0..3 {
         let Ok(lp_resp) = get_chat_from_polling(s, state).await else {
             break;
         };
-        merge_previews(threads, &lp_resp);
+        merge_previews_with_profile(threads, &lp_resp, Some(profile_id));
         let data_node = lp_resp.get("data").unwrap_or(&lp_resp);
         let more = data_node.get("more").and_then(Value::as_i64).unwrap_or(0);
         let has_reset = pick_str(data_node, &["resetLastActionId"])
@@ -5500,7 +5501,7 @@ pub(crate) async fn receive_new_messages(
     }
     // 2. Poll conversation previews via `get-last-msgs`
     if let Ok(preview_resp) = get_last_msgs(s, &[]).await {
-        merge_previews(threads, &preview_resp);
+        merge_previews_with_profile(threads, &preview_resp, Some(profile_id));
     }
     // Historical group/Cloud pages belong to explicit history sync. Re-reading every
     // group's latest 50 messages here makes startup O(groups), even with a warm database.
@@ -6109,6 +6110,11 @@ fn extract_message_thread_id_ext(
 
 /// Fold a `get-last-msgs` or `getChatFromPolling` response into thread previews and conversation messages.
 pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
+    merge_previews_with_profile(threads, resp, None)
+}
+
+/// Internal: merge previews with optional profile_id for E2EE decryption
+fn merge_previews_with_profile(threads: &mut Vec<Thread>, resp: &Value, profile_id: Option<&str>) {
     let mut entries: Vec<(&Value, bool)> = Vec::new();
     let parsed_str_data: Option<Value> = resp
         .get("data")
@@ -6236,7 +6242,7 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
         }
 
         for (m_val, is_grp) in raw_msgs {
-            let Some(parsed) = parse_chat_message(m_val) else {
+            let Some(parsed) = parse_chat_message_with_profile(m_val, profile_id) else {
                 continue;
             };
 
