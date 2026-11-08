@@ -152,6 +152,114 @@ impl ResumableUploadState {
         }
         (0..self.total_chunks).find(|i| !completed_set.contains(i))
     }
+
+    /// Returns the length of the contiguous prefix of completed chunks starting from 0.
+    /// Since `completed_chunks` is kept sorted, this is an O(N) single-pass scan.
+    pub fn contiguous_completed_prefix(&self) -> usize {
+        let mut expected = 0usize;
+        for &chunk in &self.completed_chunks {
+            if chunk == expected {
+                expected += 1;
+            } else {
+                break;
+            }
+        }
+        expected
+    }
+}
+
+/// RAII guard that automatically unregisters an active upload upon drop,
+/// preventing orphaned entries in `ACTIVE_UPLOADS` if an upload errors out.
+pub struct ActiveUploadRegistration {
+    upload_id: String,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ActiveUploadRegistration {
+    pub fn new(upload_id: &str) -> Self {
+        let flag = register_active_upload(upload_id);
+        Self {
+            upload_id: upload_id.to_string(),
+            flag,
+        }
+    }
+
+    pub fn flag(&self) -> &std::sync::Arc<std::sync::atomic::AtomicBool> {
+        &self.flag
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst) || is_upload_cancelled(&self.upload_id)
+    }
+}
+
+impl Drop for ActiveUploadRegistration {
+    fn drop(&mut self) {
+        unregister_active_upload(&self.upload_id);
+    }
+}
+
+static ACTIVE_UPLOADS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
+    std::sync::Mutex::new(None);
+static PROGRESS_CHANNEL: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<(String, u64, u64)>>> =
+    std::sync::Mutex::new(None);
+
+/// Register an active upload session so it can be monitored or cancelled.
+pub fn register_active_upload(upload_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let mut guard = ACTIVE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    map.insert(upload_id.to_string(), flag.clone());
+    flag
+}
+
+/// Cancel an in-flight upload session. Returns true if the upload was registered.
+pub fn cancel_active_upload(upload_id: &str) -> bool {
+    let guard = ACTIVE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_ref() {
+        if let Some(flag) = map.get(upload_id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            return true;
+        }
+    }
+    false
+}
+
+/// Unregister an upload when finished or aborted.
+pub fn unregister_active_upload(upload_id: &str) {
+    let mut guard = ACTIVE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.remove(upload_id);
+    }
+}
+
+/// Check if an upload session has been cancelled.
+pub fn is_upload_cancelled(upload_id: &str) -> bool {
+    let guard = ACTIVE_UPLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_ref() {
+        if let Some(flag) = map.get(upload_id) {
+            return flag.load(std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    false
+}
+
+/// Report upload progress (upload_id, bytes sent, total bytes).
+pub fn report_progress(upload_id: &str, completed: u64, total: u64) {
+    let guard = PROGRESS_CHANNEL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.send((upload_id.to_string(), completed, total));
+    }
+}
+
+/// Subscribe to upload progress events across all active uploads.
+pub fn subscribe_progress() -> tokio::sync::broadcast::Receiver<(String, u64, u64)> {
+    let mut guard = PROGRESS_CHANNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let tx = guard.get_or_insert_with(|| {
+        let (tx, _) = tokio::sync::broadcast::channel(256);
+        tx
+    });
+    tx.subscribe()
 }
 
 #[cfg(test)]
@@ -179,15 +287,7 @@ mod resumable_tests {
 
     /// The contiguous confirmed prefix is what a resume may trust.
     fn contiguous_prefix(state: &ResumableUploadState) -> usize {
-        let mut contiguous = 0usize;
-        for idx in 0..state.total_chunks {
-            if state.completed_chunks.contains(&idx) {
-                contiguous = idx + 1;
-            } else {
-                break;
-            }
-        }
-        contiguous
+        state.contiguous_completed_prefix()
     }
 
     #[test]
@@ -245,5 +345,29 @@ mod resumable_tests {
         assert!(source.next_chunk().await.unwrap().is_empty() || source.remaining == 0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn active_upload_registration_and_cancellation() {
+        let upload_id = "test-cancel-up";
+        let flag = register_active_upload(upload_id);
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!is_upload_cancelled(upload_id));
+
+        assert!(cancel_active_upload(upload_id));
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(is_upload_cancelled(upload_id));
+
+        unregister_active_upload(upload_id);
+        assert!(!is_upload_cancelled(upload_id));
+        assert!(!cancel_active_upload(upload_id));
+    }
+
+    #[tokio::test]
+    async fn progress_reporting_broadcasts_to_subscribers() {
+        let mut rx = subscribe_progress();
+        report_progress("test-prog-1", 1024, 4096);
+        let event = rx.recv().await.unwrap();
+        assert_eq!(event, ("test-prog-1".to_string(), 1024, 4096));
     }
 }

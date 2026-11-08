@@ -1973,7 +1973,41 @@ pub(crate) async fn send_attachment_with_client_id(
         };
 
         let mut last_up_dec = Value::Null;
-        for idx in 0..total_chunks {
+        let upload_id = format!("photo-{client_id}");
+        let mut resumable = crate::upload::ResumableUploadState::new(
+            upload_id.clone(),
+            file_name.clone(),
+            total_size,
+            chunk_size,
+        );
+        let resume_store = crate::store::MessageStore::open(s.history_path()).ok();
+        let upload_reg = crate::upload::ActiveUploadRegistration::new(&upload_id);
+        let mut resume_from = 0usize;
+        let total_chunks_usize = total_chunks as usize;
+        if let Some(ref st) = resume_store {
+            if let Some(saved) = st.load_upload_state(&upload_id).ok().flatten() {
+                if saved.total_size == total_size
+                    && saved.chunk_size == chunk_size
+                    && saved.file_name == file_name
+                    && saved.total_chunks == total_chunks_usize
+                {
+                    let contiguous = saved.contiguous_completed_prefix();
+                    if contiguous > 0 && contiguous < total_chunks_usize {
+                        resume_from = contiguous;
+                        resumable = saved;
+                        source.skip_chunks(resume_from, chunk_size).await?;
+                    } else if contiguous >= total_chunks_usize {
+                        let _ = st.delete_upload_state(&upload_id);
+                    }
+                } else {
+                    let _ = st.delete_upload_state(&upload_id);
+                }
+            }
+        }
+        for idx in resume_from..total_chunks_usize {
+            if upload_reg.is_cancelled() {
+                anyhow::bail!("Tải lên hình ảnh đã bị hủy");
+            }
             let chunk = source.next_chunk().await?;
             let chunk_id = idx + 1;
             let mut m = serde_json::Map::new();
@@ -1999,7 +2033,18 @@ pub(crate) async fn send_attachment_with_client_id(
                 .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
                 .await?;
             last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
+            resumable.mark_chunk_complete(idx);
+            if let Some(ref st) = resume_store {
+                let _ = st.save_upload_state(&resumable);
+            }
+            let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
+            crate::upload::report_progress(&upload_id, completed_bytes, total_size);
         }
+        if let Some(ref st) = resume_store {
+            let _ = st.delete_upload_state(&upload_id);
+        }
+        crate::upload::report_progress(&upload_id, total_size, total_size);
+        drop(upload_reg);
 
         source.verify().await?;
         let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
@@ -2188,6 +2233,7 @@ pub(crate) async fn send_attachment_with_client_id(
         total_size,
         chunk_size,
     );
+    let upload_reg = crate::upload::ActiveUploadRegistration::new(&upload_id);
     // Open store once; errors are non-fatal — upload still proceeds, just without
     // persistence (degraded mode).
     let resume_store = crate::store::MessageStore::open(s.history_path()).ok();
@@ -2204,14 +2250,7 @@ pub(crate) async fn send_attachment_with_client_id(
                 && saved.total_chunks == total_chunks_usize
             {
                 // Only trust the contiguous prefix the server confirmed.
-                let mut contiguous = 0usize;
-                for idx in 0..total_chunks_usize {
-                    if saved.completed_chunks.contains(&idx) {
-                        contiguous = idx + 1;
-                    } else {
-                        break;
-                    }
-                }
+                let contiguous = saved.contiguous_completed_prefix();
                 if contiguous > 0 && contiguous < total_chunks_usize {
                     resume_from = contiguous;
                     resumable = saved;
@@ -2227,6 +2266,9 @@ pub(crate) async fn send_attachment_with_client_id(
         }
     }
     for idx in resume_from..total_chunks_usize {
+        if upload_reg.is_cancelled() {
+            anyhow::bail!("Tải lên đã bị hủy");
+        }
         let chunk = source.next_chunk().await?;
         let chunk_id = idx + 1;
         let mut m = serde_json::Map::new();
@@ -2256,11 +2298,15 @@ pub(crate) async fn send_attachment_with_client_id(
         if let Some(ref st) = resume_store {
             let _ = st.save_upload_state(&resumable);
         }
+        let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
+        crate::upload::report_progress(&upload_id, completed_bytes, total_size);
     }
     // Upload complete: remove the checkpoint entry.
     if let Some(ref st) = resume_store {
         let _ = st.delete_upload_state(&upload_id);
     }
+    crate::upload::report_progress(&upload_id, total_size, total_size);
+    drop(upload_reg);
 
     source.verify().await?;
     let data_node = last_up_dec.get("data").unwrap_or(&last_up_dec);
@@ -5866,16 +5912,27 @@ pub(crate) fn parse_chat_message_with_profile(it: &Value, profile_id: Option<&st
         .and_then(extract_content_text)
         .unwrap_or_default();
 
-    // WP16-3: E2EE receive path — decrypt incoming encrypted messages
+    // WP16-3 & A10: E2EE receive path — decrypt incoming encrypted messages
     let mut is_e2ee = false;
     if let Some(prof_id) = profile_id {
-        if let Some(sender_id) = it.get("uidFrom").or_else(|| it.get("idFrom")).and_then(|v| v.as_str()) {
-            if let Some((plaintext, _identity_changed)) = try_decrypt_e2ee_content(prof_id, sender_id, it) {
+        let peer_candidate = pick_str(it, &["uidFrom", "fromUid", "fromId", "senderId", "idFrom", "sender"])
+            .unwrap_or_default();
+        let peer_id = if peer_candidate.is_empty() || peer_candidate == "0" || peer_candidate == prof_id {
+            pick_str(it, &["idTo", "toId", "userId"]).unwrap_or(peer_candidate)
+        } else {
+            peer_candidate
+        };
+        if !peer_id.is_empty() && peer_id != "0" {
+            if let Some((plaintext, _identity_changed)) = try_decrypt_e2ee_content(prof_id, &peer_id, it) {
                 content = plaintext;
                 is_e2ee = true;
                 // TODO: Show identity_changed warning in UI (WP16-3 Mục 3)
             }
         }
+    }
+    if !is_e2ee && crate::e2ee_integration::is_e2ee_message(it) {
+        is_e2ee = true;
+        content = "[Tin nhắn mã hoá]".to_string();
     }
 
     if msg_type == "chat.contact" || msg_type == "contact" || msg_type == "12" {
@@ -6178,8 +6235,8 @@ pub fn merge_previews(threads: &mut Vec<Thread>, resp: &Value) {
     merge_previews_with_profile(threads, resp, None)
 }
 
-/// Internal: merge previews with optional profile_id for E2EE decryption
-fn merge_previews_with_profile(threads: &mut Vec<Thread>, resp: &Value, profile_id: Option<&str>) {
+/// Merge previews with optional profile_id for E2EE decryption (A10)
+pub fn merge_previews_with_profile(threads: &mut Vec<Thread>, resp: &Value, profile_id: Option<&str>) {
     let mut entries: Vec<(&Value, bool)> = Vec::new();
     let parsed_str_data: Option<Value> = resp
         .get("data")
@@ -6426,6 +6483,11 @@ fn merge_previews_with_profile(threads: &mut Vec<Thread>, resp: &Value, profile_
 
 /// Merge group history response into a thread's messages, sorted by timestamp and deduplicated by msg_id.
 pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
+    merge_group_history_with_profile(thread, resp, None)
+}
+
+/// Merge group history with profile context for E2EE decryption (A10)
+pub fn merge_group_history_with_profile(thread: &mut Thread, resp: &Value, profile_id: Option<&str>) {
     let mut raw_msgs: Vec<&Value> = Vec::new();
     let parsed_str_data: Option<Value> = resp
         .get("data")
@@ -6475,7 +6537,7 @@ pub fn merge_group_history(thread: &mut Thread, resp: &Value) {
                 }
             }
         }
-        if let Some(m) = parse_chat_message(it) {
+        if let Some(m) = parse_chat_message_with_profile(it, profile_id) {
             if let Some(row) = identities.find(&thread.messages, &m) {
                 let existing = &mut thread.messages[row];
                 identities.remove(existing, row);
@@ -8378,28 +8440,32 @@ pub async fn send_e2ee_message(
     confirmed_send(resp)
 }
 
-// E2EE decrypt helper for parse_chat_message
+// E2EE decrypt helper for parse_chat_message (A10)
 pub fn try_decrypt_e2ee_content(
     profile_id: &str,
     peer_id: &str,
     raw: &Value,
 ) -> Option<(String, bool)> {
-    use base64::Engine;
-    
-    let e2ee_status = raw.get("e2eeStatus")
+    let is_e2ee_meta = raw.get("e2eeStatus")
         .and_then(|v| v.as_i64())
-        .filter(|&code| (3000..4000).contains(&code))?;
-    
-    let ciphertext_b64 = raw.get("content")
-        .or_else(|| raw.get("message"))
-        .and_then(|v| v.as_str())?;
-    
-    let ciphertext = base64::engine::general_purpose::STANDARD.decode(ciphertext_b64).ok()?;
-    
+        .map(|code| (3000..4000).contains(&code))
+        .unwrap_or(false)
+        || raw.get("isE2EE")
+            .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+            .map(|n| n > 0)
+            .unwrap_or(false);
+
+    let ciphertext = crate::e2ee_integration::extract_ciphertext_bytes(raw)?;
+    let is_wire = crate::e2ee_integration::is_e2ee_wire_payload(&ciphertext);
+
+    if !is_e2ee_meta && !is_wire {
+        return None;
+    }
+
     match crate::e2ee_integration::decrypt_message(profile_id, peer_id, &ciphertext) {
         Ok(decrypted) => Some((decrypted.text, decrypted.identity_changed)),
         Err(e) => {
-            eprintln!("E2EE decrypt failed (status {e2ee_status}): {e}");
+            eprintln!("E2EE decrypt failed for peer {peer_id}: {e}");
             Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false))
         }
     }
@@ -8483,5 +8549,80 @@ mod a36_ssrf_redirect_tests {
         // Must be None because the redirect hop to 192.168.1.1 is blocked!
         assert!(result.is_none());
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod a10_realtime_e2ee_tests {
+    use super::*;
+    use base64::Engine;
+    use serde_json::json;
+
+    #[test]
+    fn test_e2ee_realtime_decrypt_and_wire_detection() {
+        let profile_id = "test_profile_alice";
+        let peer_id = "test_peer_bob";
+
+        // Setup E2EE managers for alice and bob in isolated temp dirs
+        let dir_alice = std::env::temp_dir().join(format!("test-chat-alice-{}", std::process::id()));
+        let dir_bob = std::env::temp_dir().join(format!("test-chat-bob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir_alice);
+        let _ = std::fs::remove_dir_all(&dir_bob);
+        std::fs::create_dir_all(&dir_alice).unwrap();
+        std::fs::create_dir_all(&dir_bob).unwrap();
+
+        let alice_mgr = crate::crypto::session::E2eeManager::open_at(&dir_alice.join("e2ee.db"), profile_id).unwrap();
+        let bob_mgr = crate::crypto::session::E2eeManager::open_at(&dir_bob.join("e2ee.db"), peer_id).unwrap();
+
+        // Alice provides her prekey bundle to Bob (X3DH receiver is Alice)
+        let alice_id = alice_mgr.identity().unwrap();
+        let alice_spk = alice_mgr.signed_prekey().unwrap();
+        alice_mgr.refill_one_time_prekeys().unwrap();
+        let otpk = alice_mgr.list_one_time_prekeys().unwrap();
+        let alice_bundle = crate::crypto::prekey::RemoteBundle {
+            identity_key: alice_id.dh.public,
+            signing_identity_key: Some(alice_id.signing_public),
+            registration_id: alice_id.registration_id,
+            signed_pre_key_id: alice_spk.key_id,
+            signed_pre_key: alice_spk.key_pair.public,
+            signature: alice_spk.signature.clone().try_into().unwrap(),
+            one_time_pre_key: otpk.first().map(|k| (k.key_pair.public, k.key_id)),
+        };
+
+        // Bob sends first message to Alice (type 3) using Alice's prekey bundle
+        let ct_bytes = bob_mgr.start_session(profile_id, &alice_bundle, b"Bi mat thoi gian thuc").unwrap();
+        let ct_b64 = base64::engine::general_purpose::STANDARD.encode(&ct_bytes);
+
+        // 1. WebSocket push packet WITH metadata (isE2EE: 1, e2eeStatus: 3001)
+        let raw_push = json!({
+            "msgId": "ws_e2ee_1",
+            "uidFrom": peer_id,
+            "idTo": profile_id,
+            "isE2EE": 1,
+            "e2eeStatus": 3001,
+            "content": ct_b64
+        });
+
+        // Alice decrypts using her E2eeManager
+        let decrypted = alice_mgr.decrypt(peer_id, &ct_bytes).expect("Alice decrypts successfully");
+        assert_eq!(decrypted.text, "Bi mat thoi gian thuc");
+        assert!(!decrypted.identity_changed);
+
+        // Test wire payload detection
+        assert!(crate::e2ee_integration::is_e2ee_message(&raw_push));
+
+        // 2. WebSocket push packet WITHOUT metadata (only wire envelope version 1 type 1/3)
+        let raw_push_no_meta = json!({
+            "msgId": "ws_e2ee_2",
+            "uidFrom": peer_id,
+            "idTo": profile_id,
+            "content": ct_b64
+        });
+        assert!(crate::e2ee_integration::is_e2ee_message(&raw_push_no_meta), "Must detect E2EE via wire payload header without metadata");
+
+        // 3. Fallback when profile_id is None: sets is_e2ee flag and placeholder
+        let parsed_no_profile = parse_chat_message_with_profile(&raw_push_no_meta, None).unwrap();
+        assert!(parsed_no_profile.is_e2ee);
+        assert_eq!(parsed_no_profile.text, "[Tin nhắn mã hoá]");
     }
 }

@@ -230,6 +230,9 @@ pub struct RatchetSession {
     pub skipped: std::collections::HashMap<SkipKey, Vec<u8>>,
     /// Zalo addition: timestamp of last session reset for UI "new device" notice.
     pub session_ts: Option<i64>,
+    /// Base key (ephemeral public key) used to establish this session (A11 replay protection).
+    #[serde(default)]
+    pub base_key: Option<[u8; 32]>,
 }
 
 /// Portable key pair representation (private bytes zeroized on drop).
@@ -256,6 +259,12 @@ impl From<&KeyPairBytes> for KeyPair {
 }
 
 impl RatchetSession {
+    /// Whether the session has established ratchet state and has exchanged messages (A11).
+    pub fn is_active(&self) -> bool {
+        (self.chain_key_recv.is_some() || self.chain_key_send.is_some())
+            && (self.recv_count > 0 || self.send_count > 0)
+    }
+
     /// Initialise session as **Alice** (sender of first message, initiator of X3DH).
     ///
     /// Call after completing X3DH: pass the shared master secret and Bob's signed prekey.
@@ -279,6 +288,7 @@ impl RatchetSession {
             prev_send_count: 0,
             skipped: std::collections::HashMap::new(),
             session_ts: None,
+            base_key: None,
         })
     }
 
@@ -315,6 +325,7 @@ impl RatchetSession {
             prev_send_count: 0,
             skipped: std::collections::HashMap::new(),
             session_ts: Some(now_ms()),
+            base_key: None,
         })
     }
 

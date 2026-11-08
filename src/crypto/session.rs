@@ -246,9 +246,11 @@ impl E2eeManager {
 
         let bob_spk = PublicKey::from(remote.signed_pre_key);
         let mut session = RatchetSession::init_as_sender(&master, &bob_spk)?;
+        session.base_key = Some(ek_pub);
         let (header, ciphertext) = session.encrypt(plaintext)?;
         self.save_session(peer_id, &session)?;
         self.trust_identity(peer_id, &remote.identity_key)?;
+        store::record_base_key(&self.conn, &self.profile_id, peer_id, &ek_pub)?;
 
         let bundle_wire = PreKeyBundleWire {
             registration_id: remote.registration_id,
@@ -281,6 +283,40 @@ impl E2eeManager {
         let decoded = deserialize(payload)?;
         match decoded {
             DecodedMessage::PreKey(prekey) => {
+                let existing_opt = self.load_session(peer_id)?;
+                let trusted_opt = self.get_trusted_identity(peer_id)?;
+                let identity_changed = match trusted_opt {
+                    Some((ref trusted_key, _)) => trusted_key != &prekey.bundle.identity_key,
+                    None => false,
+                };
+
+                // Replay attack and session rollback protection (A11):
+                // Unconditionally reject duplicate base_keys across any identity key.
+                if store::has_base_key(&self.conn, &self.profile_id, peer_id, &prekey.bundle.base_key)? {
+                    anyhow::bail!("Phát hiện replay attack: PreKeyWhisperMessage đã được xử lý trước đó (base_key trùng lặp)");
+                }
+
+                // If identity hasn't changed, verify whether the session is active and healthy.
+                // Prevent replayed type-3 messages from rolling back the ratchet session.
+                if !identity_changed {
+                    if let Some(ref existing) = existing_opt {
+                        if existing.is_active() {
+                            if existing.base_key == Some(prekey.bundle.base_key) {
+                                anyhow::bail!("Phát hiện replay attack: gói tin PreKey trùng base_key với phiên đang hoạt động");
+                            }
+                            if existing.dh_remote == Some(prekey.header.dh_public)
+                                && prekey.header.n < existing.recv_count
+                            {
+                                anyhow::bail!(
+                                    "Phát hiện replay attack: counter của gói tin PreKey ({}) nhỏ hơn recv_count hiện tại ({})",
+                                    prekey.header.n,
+                                    existing.recv_count
+                                );
+                            }
+                        }
+                    }
+                }
+
                 let identity = self.identity()?;
                 let spk = self.signed_prekey()?;
                 let otpk = match prekey.bundle.one_time_pre_key_id {
@@ -304,10 +340,12 @@ impl E2eeManager {
                 let alice_key = PublicKey::from(prekey.header.dh_public);
                 let bob_spk = KeyPair::from_private_bytes(spk.key_pair.private);
                 let mut session = RatchetSession::init_as_receiver(&master, &alice_key, &bob_spk)?;
+                session.base_key = Some(prekey.bundle.base_key);
                 let plaintext = session.decrypt(&prekey.header, &prekey.ciphertext)?;
                 if let Some(otpk_key) = otpk {
                     store::delete_one_time_prekey(&self.conn, &self.profile_id, otpk_key.key_id)?;
                 }
+                store::record_base_key(&self.conn, &self.profile_id, peer_id, &prekey.bundle.base_key)?;
                 self.save_session(peer_id, &session)?;
                 let changed = self.trust_identity(peer_id, &prekey.bundle.identity_key)?;
                 Ok(DecryptedMessage {
@@ -491,4 +529,75 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.split(' ').count(), 12);
     }
+    #[test]
+    fn replay_type_3_does_not_rollback_active_session_a11() {
+        let alice = manager("alice_replay");
+        let bob = manager("bob_replay");
+
+        let bundle = peer_bundle(&bob);
+
+        // 1. Alice sends first message (type 3 PreKeyWhisperMessage)
+        let first = alice.start_session("bob", &bundle, b"hello first").expect("start session");
+        let out1 = bob.decrypt("alice", &first).expect("bob decrypts first");
+        assert_eq!(out1.text, "hello first");
+
+        // Verify initial session state on Bob
+        let s1 = bob.load_session("alice").unwrap().unwrap();
+        assert_eq!(s1.recv_count, 1);
+
+        // 2. Alice sends second message (type 1 WhisperMessage)
+        let second = alice.encrypt("bob", None, b"hello second").expect("encrypt second");
+        let out2 = bob.decrypt("alice", &second).expect("bob decrypts second");
+        assert_eq!(out2.text, "hello second");
+
+        let s2 = bob.load_session("alice").unwrap().unwrap();
+        assert_eq!(s2.recv_count, 2);
+
+        // 3. Replay attack: replay `first` (type 3 message) to Bob
+        let replay_res = bob.decrypt("alice", &first);
+        assert!(replay_res.is_err(), "Replaying type 3 message must be rejected");
+
+        // 4. Invariant: Bob's active session MUST NOT be rolled back to message 1
+        let s_after = bob.load_session("alice").unwrap().unwrap();
+        assert_eq!(s_after.recv_count, 2, "Session recv_count must remain 2, not rolled back to 1");
+
+        // 5. Subsequent legitimate message from Alice must continue to decrypt successfully
+        let third = alice.encrypt("bob", None, b"hello third").expect("encrypt third");
+        let out3 = bob.decrypt("alice", &third).expect("bob decrypts third after replay attempt");
+        assert_eq!(out3.text, "hello third");
+
+        let s3 = bob.load_session("alice").unwrap().unwrap();
+        assert_eq!(s3.recv_count, 3);
+    }
+
+    #[test]
+    fn peer_identity_change_resets_verified_and_signals_identity_changed_a11() {
+        let alice = manager("alice_id1");
+        let bob = manager("bob_id_test");
+
+        let bundle = peer_bundle(&bob);
+        let first = alice.start_session("bob", &bundle, b"msg from alice original").unwrap();
+        let out1 = bob.decrypt("alice", &first).unwrap();
+        assert_eq!(out1.text, "msg from alice original");
+        assert!(!out1.identity_changed, "TOFU is not identity changed");
+
+        // Bob marks Alice as verified
+        bob.verify_identity("alice").unwrap();
+        assert!(bob.is_identity_verified("alice").unwrap(), "Alice should be verified");
+
+        // Now Alice reinstalls the app (creates a new identity key pair)
+        let alice_new = manager("alice_id2_new");
+        // Alice new gets a fresh bundle from Bob
+        let bundle2 = peer_bundle(&bob);
+        let first_new = alice_new.start_session("bob", &bundle2, b"msg from alice new device").unwrap();
+
+        // Bob receives message from Alice's new device
+        let out2 = bob.decrypt("alice", &first_new).unwrap();
+        assert_eq!(out2.text, "msg from alice new device");
+        assert!(out2.identity_changed, "Must report identity_changed = true when identity key changes");
+
+        // Crucial A11 invariant: verified flag MUST be reset to false!
+        assert!(!bob.is_identity_verified("alice").unwrap(), "Verified flag must be reset to false upon identity change");
+    }
+
 }

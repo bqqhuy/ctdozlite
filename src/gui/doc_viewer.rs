@@ -2,24 +2,20 @@
 
 use eframe::egui;
 
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct DocViewerModal {
     pub content: String,
     pub file_name: String,
-    pub scroll: f32,
     pub search_query: String,
     pub search_results: Vec<usize>, // Line numbers where query is found
     pub search_index: usize,         // Current position in search_results
 }
 
-#[allow(dead_code)]
 impl DocViewerModal {
     pub fn new(content: String, file_name: String) -> Self {
         Self {
             content,
             file_name,
-            scroll: 0.0,
             search_query: String::new(),
             search_results: Vec::new(),
             search_index: 0,
@@ -73,7 +69,6 @@ impl DocViewerModal {
 
 impl super::ZaloGuiApp {
     /// Render document viewer modal for text/code/log files (WP15-4 Task 4c).
-    #[allow(dead_code)] // TODO(WP15-4): Wire "Preview" button in messages.rs
     pub(super) fn render_doc_viewer_modal(
         &mut self,
         ctx: &egui::Context,

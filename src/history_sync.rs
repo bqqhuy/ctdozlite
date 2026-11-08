@@ -298,7 +298,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                         "Máy chủ không trả trang cũ hơn; đã dừng để tránh lặp");
                 }
                 thread.messages.clear();
-                crate::chat::merge_group_history(&mut thread, &response);
+                crate::chat::merge_group_history_with_profile(&mut thread, &response, Some(session.account_key()));
                 inserted += crate::store::persist_threads(&mut store, std::slice::from_ref(&thread))?;
                 let updated = checkpoint.advance(&metadata, &thread.messages);
                 let next = updated.as_ref().and_then(|state| state.next.clone());

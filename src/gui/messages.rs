@@ -657,6 +657,24 @@ pub(super) fn render_message_body(
     if media.kind == crate::message_view::MediaKind::File {
         ui.add(egui::Label::new(RichText::new(&media.name).strong().color(text_col)).wrap());
         if let Some(url) = media.original {
+            let is_text_doc = {
+                let ext = media.name.rsplit('.').next().unwrap_or("").to_lowercase();
+                matches!(
+                    ext.as_str(),
+                    "txt" | "log" | "json" | "md" | "rs" | "py" | "c" | "cpp" | "csv" | "xml" | "toml" | "yaml" | "yml" | "ini" | "sh" | "bat"
+                )
+            };
+            if is_text_doc
+                && ui
+                    .small_button(crate::i18n::tr("Xem trước"))
+                    .on_hover_text(crate::i18n::tr("Xem nội dung văn bản trực tiếp"))
+                    .clicked()
+            {
+                return Some(BubbleAction::PreviewDocument {
+                    url,
+                    name: media.name,
+                });
+            }
             if ui
                 .button("Mở tệp")
                 .on_hover_text(crate::i18n::tr(
@@ -1338,6 +1356,10 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    PreviewDocument {
+        url: String,
+        name: String,
+    },
     OpenAttachment {
         url: String,
         name: String,

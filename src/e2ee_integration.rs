@@ -117,6 +117,60 @@ pub fn detect_e2ee_status(raw: &Value) -> Option<i32> {
         .filter(|&code| (3000..4000).contains(&code))
 }
 
+/// Check if a byte slice matches an E2EE wire envelope (version 1, type 1 or 3).
+pub fn is_e2ee_wire_payload(payload: &[u8]) -> bool {
+    crate::crypto::wire::deserialize(payload).is_ok()
+}
+
+/// Extract ciphertext bytes from raw message value if present (base64 encoded).
+pub fn extract_ciphertext_bytes(raw: &Value) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let b64_str = raw.get("content")
+        .or_else(|| raw.get("message"))
+        .or_else(|| raw.get("msg"))
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s)
+            } else if let Some(obj) = v.as_object() {
+                obj.get("ciphertext")
+                    .or_else(|| obj.get("content"))
+                    .or_else(|| obj.get("msg"))
+                    .or_else(|| obj.get("message"))
+                    .and_then(Value::as_str)
+            } else {
+                None
+            }
+        })?;
+    let trimmed = b64_str.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    base64::engine::general_purpose::STANDARD.decode(trimmed).ok()
+}
+
+/// Check if a raw message value represents an E2EE message based on
+/// metadata (e2eeStatus ∈ [3000, 4000), isE2EE == 1) or payload header (version 1, type 1 or 3).
+pub fn is_e2ee_message(raw: &Value) -> bool {
+    if let Some(status) = detect_e2ee_status(raw) {
+        if (3000..4000).contains(&status) {
+            return true;
+        }
+    }
+    if raw.get("isE2EE")
+        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+        .map(|n| n > 0)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(bytes) = extract_ciphertext_bytes(raw) {
+        if is_e2ee_wire_payload(&bytes) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Error code constants
 pub const E2EE_DECRYPT_FAILED: i64 = -29;
 pub const E2EE_PENDING_DATA: i64 = -30;
@@ -134,4 +188,38 @@ mod tests {
         let normal = json!({"status": 1});
         assert_eq!(detect_e2ee_status(&normal), None);
     }
+    #[test]
+    fn e2ee_detection_from_metadata_and_wire_header_a10() {
+        use base64::Engine;
+
+        // 1. Metadata: isE2EE == 1
+        let msg_flag = json!({"isE2EE": 1, "content": "not_base64"});
+        assert!(is_e2ee_message(&msg_flag));
+
+        // 2. Metadata: isE2EE == true
+        let msg_bool = json!({"isE2EE": true, "content": "xyz"});
+        assert!(is_e2ee_message(&msg_bool));
+
+        // 3. Metadata: e2eeStatus in 3000..4000
+        let msg_status = json!({"e2eeStatus": 3005, "content": "hello"});
+        assert!(is_e2ee_message(&msg_status));
+
+        // 4. Payload header (version 1, type 1) without metadata
+        let header = crate::crypto::ratchet::MessageHeader {
+            msg_type: crate::crypto::wire::TYPE_WHISPER,
+            dh_public: [5u8; 32],
+            pn: 0,
+            n: 1,
+        };
+        let wire = crate::crypto::wire::serialize_whisper(&header, &[99u8; 32]);
+        let wire_b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
+
+        let msg_wire = json!({"content": wire_b64});
+        assert!(is_e2ee_message(&msg_wire), "Must detect E2EE message via wire header");
+
+        // 5. Normal plaintext message
+        let msg_plain = json!({"content": "Xin chao buoi sang!"});
+        assert!(!is_e2ee_message(&msg_plain), "Plaintext must not be detected as E2EE");
+    }
+
 }

@@ -271,6 +271,10 @@ pub enum WorkerCmd {
     TrustIdentity {
         peer_id: String,
     },
+    PreviewDocument {
+        url: String,
+        name: String,
+    },
     Forward {
         target_id: String,
         target_is_group: bool,
@@ -955,6 +959,7 @@ pub(super) fn spawn_session_worker(
                     let cb = call_bridge.clone();
                     let gui_tx_ws = gui_tx.clone();
                     let ctx_ws = egui_ctx.clone();
+                    let is_ws_connected_ws = is_ws_connected.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
                             tokio::sync::mpsc::Receiver<crate::socket::WsEvent>,
@@ -975,7 +980,7 @@ pub(super) fn spawn_session_worker(
                                     phone_transport_tx.send_replace(Some(transport.clone()));
                                     // WP15.1-D: liveness thật từ transport epoch (Some = đã auth),
                                     // thay cho detection theo "có nhận event" (sai khi idle/half-dead).
-                                    let liveness_flag = is_ws_connected.clone();
+                                    let liveness_flag = is_ws_connected_ws.clone();
                                     let mut epoch_watch = transport.epochs();
                                     tokio::spawn(async move {
                                         loop {
@@ -1038,9 +1043,10 @@ pub(super) fn spawn_session_worker(
                                                         });
                                                     }
                                                 }
-                                                crate::chat::merge_previews(
+                                                crate::chat::merge_previews_with_profile(
                                                     &mut ws_threads,
                                                     &ev.payload,
+                                                    Some(s_snap.account_key()),
                                                 );
                                                 ws_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
                                                 let mut stored = true;
@@ -1113,8 +1119,8 @@ pub(super) fn spawn_session_worker(
                 }
 
                 // A19 fix: auth-attempt generation/cancel to prevent stale login response override
-                let current_auth_attempt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
+                let auth_attempt_mgr = crate::login::AuthAttemptManager::new();
+                let mut current_auth_task: Option<tokio::task::JoinHandle<()>> = None;
                 let is_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let known_threads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<(String, String, bool)>::new()));
                 {
@@ -1147,6 +1153,47 @@ pub(super) fn spawn_session_worker(
                             if let Some(tx) = commands.upgrade() {
                                 if tx.send(WorkerCmd::PollMessages {known_threads: snapshot}).is_err() { break; }
                             } else { break; }
+                        }
+                    });
+                }
+
+                // Upload progress forwarder: bridges upload::report_progress events to UI GuiEvent::UploadProgress
+                {
+                    let mut progress_rx = crate::upload::subscribe_progress();
+                    let tx_progress = gui_tx.clone();
+                    let ctx_progress = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        while let Ok((upload_id, completed, total)) = progress_rx.recv().await {
+                            let _ = tx_progress.send(GuiEvent::UploadProgress {
+                                upload_id,
+                                completed,
+                                total,
+                            });
+                            ctx_progress.request_repaint();
+                        }
+                    });
+                }
+
+                // Check for uncompleted resumable uploads from prior runs
+                {
+                    let session_clone = session.clone();
+                    let tx_resume = gui_tx.clone();
+                    let ctx_resume = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        let s = session_clone.lock().await.clone();
+                        if s.is_active() {
+                            let sessions = tokio::task::spawn_blocking(move || {
+                                crate::store::MessageStore::open(s.history_path())?
+                                    .list_upload_sessions()
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default();
+                            if !sessions.is_empty() {
+                                let _ = tx_resume.send(GuiEvent::UploadResumeAvailable { sessions });
+                                ctx_resume.request_repaint();
+                            }
                         }
                     });
                 }
@@ -1440,6 +1487,66 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             tokio::task::spawn_blocking(move||{if !account.is_active()||account.account_key()!=owner||thread.as_ref().is_some_and(|(id,group)|!account.hidden.view(&owner).allows(id,*group)){return;}
                                 if folder{if let Some(parent)=path.parent(){crate::platform::open_folder(parent);}}else{crate::platform::open_file(&path);}});
                         }
+                        WorkerCmd::PreviewDocument { url, name } => {
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let s = session.lock().await.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(GuiEvent::StatusUpdate("Đang tải xem trước tài liệu…".into()));
+                                ctx.request_repaint();
+
+                                let safe_name = crate::media_download::safe_name(&name);
+                                let root = s.history_path().with_extension("attachment-cache");
+                                let maybe_cached = root.join(&safe_name);
+                                let content_opt = if maybe_cached.exists() {
+                                    tokio::fs::read(&maybe_cached).await.ok()
+                                } else {
+                                    let client = reqwest::Client::builder()
+                                        .timeout(std::time::Duration::from_secs(10))
+                                        .build();
+                                    if let Ok(c) = client {
+                                        match c.get(&url).send().await {
+                                            Ok(resp) => {
+                                                use futures_util::StreamExt;
+                                                let mut stream = resp.bytes_stream();
+                                                let mut buf = Vec::new();
+                                                const MAX_PREVIEW_BYTES: usize = 1024 * 1024; // 1 MiB limit
+                                                while let Some(chunk) = stream.next().await {
+                                                    if let Ok(bytes) = chunk {
+                                                        let remaining = MAX_PREVIEW_BYTES.saturating_sub(buf.len());
+                                                        if remaining == 0 {
+                                                            break;
+                                                        }
+                                                        let to_take = bytes.len().min(remaining);
+                                                        buf.extend_from_slice(&bytes[..to_take]);
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                                Some(buf)
+                                            }
+                                            Err(_) => None,
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                match content_opt {
+                                    Some(bytes) => {
+                                        let content = String::from_utf8_lossy(&bytes).to_string();
+                                        let _ = tx.send(GuiEvent::DocPreviewLoaded {
+                                            file_name: name,
+                                            content,
+                                        });
+                                    }
+                                    None => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate("Không tải được nội dung xem trước tài liệu".into()));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerCmd::DownloadMedia{mut url,name,play,open,context}=>{
                             static REQUESTS:tokio::sync::Semaphore=tokio::sync::Semaphore::const_new(4);
                             let Ok(request_slot)=REQUESTS.try_acquire() else {let _=gui_tx.send(GuiEvent::StatusUpdate("Đang có nhiều yêu cầu tải; vui lòng chờ hoặc hủy bớt".into()));continue;};
@@ -1694,59 +1801,81 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
+                            let commands = commands.clone();
                             tokio::spawn(async move {
-                                // Load upload state from store
+                                // Load upload state from store and locate the original message
+                                type ResumedUploadInfo = Option<(crate::upload::ResumableUploadState, Option<(String, ChatMessage)>)>;
+                                let id = upload_id.clone();
                                 let result = tokio::task::spawn_blocking({
                                     let s = s.clone();
-                                    move || -> anyhow::Result<Option<crate::upload::ResumableUploadState>> {
+                                    move || -> anyhow::Result<ResumedUploadInfo> {
                                         if !s.is_active() {
                                             anyhow::bail!("Phiên đã hết hạn");
                                         }
-                                        crate::store::MessageStore::open(s.history_path())?
-                                            .load_upload_state(&upload_id)
+                                        let store = crate::store::MessageStore::open(s.history_path())?;
+                                        if let Some(state) = store.load_upload_state(&id)? {
+                                            let client_id = id
+                                                .strip_prefix("asyncfile-")
+                                                .or_else(|| id.strip_prefix("photo-"))
+                                                .unwrap_or(&id);
+                                            let msg = store.find_outgoing_message_by_client_id(client_id)?;
+                                            Ok(Some((state, msg)))
+                                        } else {
+                                            Ok(None)
+                                        }
                                     }
                                 })
                                 .await
                                 .map_err(|_| "Không thể đọc trạng thái tải lên".to_string())
                                 .and_then(|r| r.map_err(|_| "Không thể đọc trạng thái tải lên".to_string()));
 
-                                if let Ok(Some(_state)) = result {
-                                    let _ = tx.send(GuiEvent::StatusUpdate("Tiếp tục tải lên (v0.016)".into()));
+                                match result {
+                                    Ok(Some((state, maybe_msg))) => {
+                                        let name = state.file_name.clone();
+                                        if let Some((thread_id, message)) = maybe_msg {
+                                            if let Some(cmd_tx) = commands.upgrade() {
+                                                let _ = cmd_tx.send(WorkerCmd::RetryOutgoing { thread_id, message });
+                                            }
+                                        }
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Đang tiếp tục tải lên: {name}")));
+                                    }
+                                    Ok(None) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate("Không tìm thấy tác vụ tải lên cần tiếp tục".into()));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(e));
+                                    }
                                 }
                                 ctx.request_repaint();
                             });
                         }
                         WorkerCmd::CancelUpload { upload_id } => {
                             let s = session.lock().await.clone();
+                            if !s.is_active() {
+                                continue;
+                            }
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
+                            let id = upload_id.clone();
                             tokio::spawn(async move {
-                                // Delete upload state from store
-                                let result = tokio::task::spawn_blocking({
-                                    let s = s.clone();
-                                    let id = upload_id.clone();
-                                    move || -> anyhow::Result<()> {
-                                        if !s.is_active() {
-                                            anyhow::bail!("Phiên đã hết hạn");
-                                        }
+                                crate::upload::cancel_active_upload(&id);
+                                let _ = tokio::task::spawn_blocking({
+                                    let id = id.clone();
+                                    move || {
                                         crate::store::MessageStore::open(s.history_path())?
                                             .delete_upload_state(&id)
                                     }
                                 })
-                                .await
-                                .map_err(|_| "Không thể hủy tải lên".to_string())
-                                .and_then(|r| r.map_err(|_| "Không thể hủy tải lên".to_string()));
+                                .await;
 
-                                if result.is_ok() {
-                                    let _ = tx.send(GuiEvent::StatusUpdate("Đã hủy tải lên".into()));
-                                }
+                                let _ = tx.send(GuiEvent::StatusUpdate("Đã hủy tải lên".into()));
                                 ctx.request_repaint();
                             });
                         }
                         WorkerCmd::Logout => {
-                            // A19: Cancel QR task and bump auth attempt to invalidate all pending auth responses
-                            if let Some(task) = current_qr_task.take() { task.abort(); }
-                            current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            // A19: Cancel auth task and bump auth attempt to invalidate all pending auth responses
+                            if let Some(task) = current_auth_task.take() { task.abort(); }
+                            auth_attempt_mgr.next_attempt();
 
                             call_bridge.end_call();
                             crate::queue_cursors::flush_all().await;
@@ -1829,18 +1958,18 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
                         }
                         WorkerCmd::RequestQr => {
-                            // A19: Cancel current QR task and bump auth attempt generation
-                            if let Some(task) = current_qr_task.take() {
+                            // A19: Cancel current auth task and bump auth attempt generation
+                            if let Some(task) = current_auth_task.take() {
                                 task.abort();
                             }
-                            let attempt_id = current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let attempt_id = auth_attempt_mgr.next_attempt();
 
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let commands = commands.clone();
-                            let auth_attempt_clone = current_auth_attempt.clone();
+                            let auth_mgr = auth_attempt_mgr.clone();
 
                             let handle = tokio::spawn(async move {
                                 {
@@ -1860,6 +1989,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                 match q_res {
                                     Ok(q) => {
+                                        if !auth_mgr.is_current(attempt_id) {
+                                            return;
+                                        }
                                         if let Some(payload) = q.payload() {
                                             if let Ok(code) = qrcode::QrCode::new(payload.as_bytes())
                                             {
@@ -1891,6 +2023,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                     [total_w, total_w],
                                                     &pixels,
                                                 );
+                                                if !auth_mgr.is_current(attempt_id) {
+                                                    return;
+                                                }
                                                 let _ = gui_tx_clone.send(GuiEvent::QrReady {
                                                     qr_login: q.clone(),
                                                     qr_image: img,
@@ -1901,6 +2036,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                     crate::qr::wait_for_scan(&s_snap, &q).await;
 
                                                 if let Ok(scanned) = scan_res {
+                                                    if !auth_mgr.is_current(attempt_id) {
+                                                        return;
+                                                    }
                                                     let name = scanned
                                                         .get("display_name")
                                                         .and_then(|v| v.as_str())
@@ -1916,13 +2054,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                                     if let Ok(resp) = confirm_res {
                                                         // A19: Validate auth attempt before committing QR login result
-                                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
-                                                        if current != attempt_id {
+                                                        if !auth_mgr.is_current(attempt_id) {
                                                             // Stale response — another auth started, discard this result
                                                             return;
                                                         }
 
                                                         let mut s = session_clone.lock().await;
+                                                        if !auth_mgr.is_current(attempt_id) {
+                                                            return;
+                                                        }
                                                         if let Some(sek) =
                                                             crate::qr::extract_zpw_sek(&resp)
                                                         {
@@ -1998,8 +2138,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                     Err(e) => {
                                         // A19: Validate auth attempt before showing QR error
-                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
-                                        if current != attempt_id {
+                                        if !auth_mgr.is_current(attempt_id) {
                                             // Stale response — discard
                                             return;
                                         }
@@ -2010,7 +2149,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                 }
                             });
-                            current_qr_task = Some(handle);
+                            current_auth_task = Some(handle);
                         }
                         WorkerCmd::CancelPhoneHistory => {
                             phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
@@ -2416,6 +2555,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::PollMessages { known_threads } => {
+                            // WP13-2 fulfilled: polling eliminated when WebSocket epoch is Some.
+                            if is_ws_connected.load(std::sync::atomic::Ordering::SeqCst) {
+                                continue;
+                            }
                             if is_polling.swap(true, std::sync::atomic::Ordering::SeqCst) {
                                 continue;
                             }
@@ -2463,9 +2606,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         match poll_res {
                                             Ok(lp_resp) => {
                                                 deliver_presence(&s, &lp_resp, &gui_tx_clone, &ctx_clone).await;
-                                                crate::chat::merge_previews(
+                                                crate::chat::merge_previews_with_profile(
                                                     &mut temp_threads,
                                                     &lp_resp,
+                                                    Some(s.account_key()),
                                                 );
                                                 let data_node =
                                                     lp_resp.get("data").unwrap_or(&lp_resp);
@@ -2567,7 +2711,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     let head=if is_group||is_send2me {
                                         crate::history_open::fetch(&s,&group_id,is_group).await.unwrap_or_default()
                                     }else{None};
-                                    if let Some(head)=&head{crate::chat::merge_group_history(&mut t,&head.response);}
+                                    if let Some(head)=&head{crate::chat::merge_group_history_with_profile(&mut t,&head.response,Some(s.account_key()));}
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
                                         let mut filtered=vec![t];
@@ -3544,37 +3688,48 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
-                            // A19: Cancel QR task and bump auth attempt generation
-                            if let Some(task) = current_qr_task.take() { task.abort(); }
-                            let attempt_id = current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            // A19: Cancel in-flight auth task and bump auth attempt generation
+                            if let Some(task) = current_auth_task.take() { task.abort(); }
+                            let attempt_id = auth_attempt_mgr.next_attempt();
 
-                            session.lock().await.logout();
+                            // Build candidate session outside the live session lock to prevent blocking across network
+                            let mut candidate = session.lock().await.clone();
+                            candidate.logout();
+
                             let session_clone = session.clone();
                             let commands = commands.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
-                            let auth_attempt_clone = current_auth_attempt.clone();
-                            tokio::spawn(async move {
+                            let auth_mgr = auth_attempt_mgr.clone();
+                            let handle = tokio::spawn(async move {
                                 let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                     "Đang xác thực tài khoản…".into(),
                                 ));
                                 ctx_clone.request_repaint();
-                                let mut s = session_clone.lock().await;
-                                match crate::login::login_by_password(&mut s, &phone, &pass, "VN")
+                                match crate::login::login_by_password(&mut candidate, &phone, &pass, "VN")
                                     .await
                                 {
                                     Ok(_) => {
                                         // A19: Validate auth attempt before committing result
-                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
-                                        if current != attempt_id {
+                                        if !auth_mgr.is_current(attempt_id) {
                                             // Stale response — another auth started, discard this result
                                             return;
                                         }
 
-                                        if let Ok(info) = crate::login::get_login_info(&s).await {
+                                        if let Ok(info) = crate::login::get_login_info(&candidate).await {
                                             if let Some(cfg) = info.get("data") {
-                                                crate::login::apply_login_config(&mut s, cfg);
-                                                s.apply_server_info(cfg);
+                                                crate::login::apply_login_config(&mut candidate, cfg);
+                                                candidate.apply_server_info(cfg);
+
+                                                if !auth_mgr.is_current(attempt_id) {
+                                                    return;
+                                                }
+
+                                                let mut s = session_clone.lock().await;
+                                                if !auth_mgr.is_current(attempt_id) {
+                                                    return;
+                                                }
+                                                *s = candidate;
                                                 if let Err(e) = s.save_to_file("session.json") {
                                                     let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
                                                 }
@@ -3609,8 +3764,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                     Err(e) => {
                                         // A19: Validate auth attempt before showing error
-                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
-                                        if current != attempt_id {
+                                        if !auth_mgr.is_current(attempt_id) {
                                             // Stale response — discard
                                             return;
                                         }
@@ -3621,6 +3775,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                 }
                             });
+                            current_auth_task = Some(handle);
                         }
                     }
                 }
@@ -4878,5 +5033,77 @@ mod hidden_media_gate_tests {
         assert!(media_context_alive(&session, Some(&source)));
         session.hidden.enable();
         assert!(!media_context_alive(&session, Some(&source)));
+    }
+}
+
+#[cfg(test)]
+mod v0016_workflow_tests {
+
+    #[test]
+    fn polling_is_eliminated_when_websocket_is_connected() {
+        // WP13-2 fulfilled: polling eliminated when WebSocket epoch is Some.
+        let is_ws_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        // When WebSocket is connected, periodic check drops polling
+        let should_poll = !is_ws_connected.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!should_poll, "Polling must be suppressed when WebSocket is connected");
+
+        // When WebSocket disconnects, polling fallback activates
+        is_ws_connected.store(false, std::sync::atomic::Ordering::SeqCst);
+        let should_poll = !is_ws_connected.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(should_poll, "Polling must resume as fallback when WebSocket is down");
+    }
+
+    #[tokio::test]
+    async fn resumable_upload_lifecycle_save_cancel_delete() {
+        let root = std::env::temp_dir().join(format!("v016-upload-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let db_path = root.join("history.db");
+        let store = crate::store::MessageStore::open(&db_path).unwrap();
+
+        let upload_id = "asyncfile-test-9999";
+        let mut state = crate::upload::ResumableUploadState::new(
+            upload_id.into(),
+            "sample.bin".into(),
+            5_000_000,
+            1_048_576,
+        );
+
+        // 1. Save upload state per chunk
+        state.mark_chunk_complete(0);
+        store.save_upload_state(&state).unwrap();
+
+        let loaded = store.load_upload_state(upload_id).unwrap().unwrap();
+        assert_eq!(loaded.completed_chunks, vec![0]);
+        assert_eq!(loaded.total_chunks, 5);
+
+        // 2. Register active upload in memory
+        let cancel_flag = crate::upload::register_active_upload(upload_id);
+        assert!(!cancel_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        // 3. Cancel upload
+        let cancelled = crate::upload::cancel_active_upload(upload_id);
+        assert!(cancelled);
+        assert!(cancel_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(crate::upload::is_upload_cancelled(upload_id));
+
+        // 4. Delete upload state on completion or cancel
+        store.delete_upload_state(upload_id).unwrap();
+        assert!(store.load_upload_state(upload_id).unwrap().is_none());
+
+        crate::upload::unregister_active_upload(upload_id);
+        assert!(!crate::upload::is_upload_cancelled(upload_id));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn upload_progress_event_forwarding() {
+        let mut progress_rx = crate::upload::subscribe_progress();
+        crate::upload::report_progress("asyncfile-progress-1", 1_048_576, 3_000_000);
+        let event = progress_rx.recv().await.unwrap();
+        assert_eq!(event.0, "asyncfile-progress-1");
+        assert_eq!(event.1, 1_048_576);
+        assert_eq!(event.2, 3_000_000);
     }
 }

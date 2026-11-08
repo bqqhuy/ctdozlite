@@ -1614,6 +1614,59 @@ impl MessageStore {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
+/// Find an outgoing message by its client_message_id across all threads.
+    /// Used by ResumableUpload to locate and resume interrupted uploads.
+    /// # Errors
+    /// Returns SQLite query errors.
+    pub fn find_outgoing_message_by_client_id(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<(String, ChatMessage)>> {
+        use rusqlite::OptionalExtension;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT thread_id, msg_id, sender_name, sender_id, text, ts, raw_json FROM messages WHERE is_outgoing=1 AND (CASE WHEN json_valid(raw_json) THEN json_extract(raw_json,'$.message_state.client_message_id') END)=?1 LIMIT 1"
+        )?;
+        let row = stmt
+            .query_row([client_id], |r| {
+                let thread_id: String = r.get(0)?;
+                let msg_id: String = r.get(1)?;
+                let sender_name: String = r.get(2).unwrap_or_default();
+                let sender_id: String = r.get(3).unwrap_or_default();
+                let text: String = r.get(4).unwrap_or_default();
+                let ts: i64 = r.get(5).unwrap_or(0);
+                let raw_json: String = r.get(6)?;
+                Ok((thread_id, msg_id, sender_name, sender_id, text, ts, raw_json))
+            })
+            .optional()?;
+
+        if let Some((thread_id, msg_id, sender_name, sender_id, text, ts, raw_json)) = row {
+            let time = if ts > 0 {
+                crate::clock::message_time(ts)
+            } else {
+                crate::ui::clock()
+            };
+            let mut cm = ChatMessage {
+                id: msg_id,
+                sender: if !sender_name.is_empty() {
+                    sender_name
+                } else {
+                    sender_id
+                },
+                text,
+                time,
+                is_outgoing: true,
+                ts,
+                ..Default::default()
+            };
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw_json) {
+                if let Some(state) = val.get("message_state") {
+                    let _ = cm.restore_state(state);
+                }
+            }
+            return Ok(Some((thread_id, cm)));
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -1670,7 +1723,36 @@ mod upload_persistence_tests {
         assert!(sessions.iter().any(|s| s.upload_id == "up1"));
         assert!(sessions.iter().any(|s| s.upload_id == "up2"));
     }
+
+    #[test]
+    fn find_outgoing_message_by_client_id_finds_stored_outgoing_attachment() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let msg = ChatMessage {
+            id: "msg_out_1".into(),
+            client_message_id: "client_999".into(),
+            text: "Uploading file".into(),
+            is_outgoing: true,
+            ts: 1234567,
+            ..Default::default()
+        };
+        let mut stored = StoredMessage::from(&msg);
+        stored.thread_id = "thread_x".into();
+        store.upsert_message(&stored).unwrap();
+
+        let found = store.find_outgoing_message_by_client_id("client_999").unwrap();
+        assert!(found.is_some());
+        let (thread_id, restored) = found.unwrap();
+        assert_eq!(thread_id, "thread_x");
+        assert_eq!(restored.id, "msg_out_1");
+        assert_eq!(restored.client_message_id, "client_999");
+        assert!(restored.is_outgoing);
+
+        let not_found = store.find_outgoing_message_by_client_id("nonexistent").unwrap();
+        assert!(not_found.is_none());
+    }
 }
+
+
 
 #[cfg(test)]
 mod tests {

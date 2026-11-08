@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use crate::crypto;
 use crate::login;
+pub use crate::login::AuthAttemptManager;
 use crate::session::{urlencode, Session};
 
 /// Tag used by `getSignKey(tag, params)` for the QR request.
@@ -507,5 +508,23 @@ mod tests {
     fn missing_wait_url_is_rejected() {
         let v = json!({"qr_cnt": "http://x/"});
         assert!(QrLogin::from_data(&v).is_err());
+    }
+
+    #[test]
+    fn test_qr_attempt_generation_race_prevention() {
+        let manager = AuthAttemptManager::new();
+        let qr_attempt = manager.next_attempt();
+        assert_eq!(qr_attempt, 1);
+
+        // While QR waiting for scan, user enters password and submits
+        let pw_attempt = manager.next_attempt();
+        assert_eq!(pw_attempt, 2);
+
+        // Later, mobile confirms QR scan for attempt 1
+        assert!(
+            !manager.is_current(qr_attempt),
+            "Stale QR response must be discarded when newer auth attempt was started"
+        );
+        assert!(manager.is_current(pw_attempt));
     }
 }

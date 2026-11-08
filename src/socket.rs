@@ -73,6 +73,9 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 
 const PING_SECS: u64 = 15;
 
+/// First pong/heartbeat deadline before connection is considered hung and reconnected (A15).
+pub const FIRST_PONG_DEADLINE: Duration = Duration::from_secs(15);
+
 /// Maximum allowed payload size of a WebSocket frame (16MB) to guard against memory exhaustion (OOM/DoS) (A22).
 pub const MAX_FRAME_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
@@ -588,6 +591,7 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
                 break;
             }
             epoch += 1;
+            let had_success = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             match run_once(
                 &sess,
                 &tx,
@@ -596,6 +600,7 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
                 &ready_tx,
                 &controls,
                 epoch,
+                &had_success,
             )
             .await
             {
@@ -617,16 +622,23 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
                 break;
             }
             endpoint_idx = endpoint_idx.wrapping_add(1);
+            if had_success.load(std::sync::atomic::Ordering::SeqCst) {
+                // A17: Only reset retry backoff upon receiving actual successful traffic
+                backoff = 2;
+            }
             tokio::select! {
                 _=tx.closed()=>break,
                 _=tokio::time::sleep(Duration::from_secs(backoff))=>{}
             }
-            backoff = (backoff * 2).min(30);
+            if !had_success.load(std::sync::atomic::Ordering::SeqCst) {
+                backoff = (backoff * 2).min(30);
+            }
         }
     });
     (rx, transport)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_once(
     sess: &Session,
     tx: &mpsc::Sender<WsEvent>,
@@ -635,6 +647,7 @@ async fn run_once(
     ready: &tokio::sync::watch::Sender<Option<u64>>,
     controls: &tokio::sync::broadcast::Sender<WsEvent>,
     epoch: u64,
+    had_success: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {}", crate::session::redact_url(&url)));
@@ -733,26 +746,34 @@ async fn run_once(
     const LIVENESS_SECS: u64 = 3 * PING_SECS;
     let mut writes_open = true;
     let mut last_inbound = std::time::Instant::now();
-    // Only arm the deadline once the server has actually proven it answers
-    // keep-alives; a server that never pongs must not be killed while healthy.
+    // Only arm the extended deadline once the server has actually proven it answers
+    // keep-alives; before the first pong, bounded grace FIRST_PONG_DEADLINE applies (A15).
     let mut saw_pong = false;
-    // Absolute deadline, not a fresh `sleep` per loop iteration: the select loop
-    // wakes every 100 ms for the pull queue, so a relative sleep would be reset
-    // forever and the liveness branch would never fire.
-    let mut liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
+    let mut liveness_deadline = tokio::time::Instant::now() + FIRST_PONG_DEADLINE;
     loop {
         tokio::select! {
             _ = tx.closed() => {
                 crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::ReceiverClosed, None);
                 return Ok("receiver closed".into());
             }
-            _ = tokio::time::sleep_until(liveness_deadline), if authed => {
-                if saw_pong && last_inbound.elapsed() >= Duration::from_secs(LIVENESS_SECS) {
+            _ = tokio::time::sleep_until(liveness_deadline) => {
+                let grace = if saw_pong {
+                    Duration::from_secs(LIVENESS_SECS)
+                } else {
+                    FIRST_PONG_DEADLINE
+                };
+                if last_inbound.elapsed() >= grace {
                     crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::Error, None);
-                    return Err(anyhow!("socket silent for {LIVENESS_SECS}s (no pong/data)"));
+                    if !authed {
+                        return Err(anyhow!("socket silent before auth ({}s)", FIRST_PONG_DEADLINE.as_secs()));
+                    } else if !saw_pong {
+                        return Err(anyhow!("socket silent before first pong ({}s)", FIRST_PONG_DEADLINE.as_secs()));
+                    } else {
+                        return Err(anyhow!("socket silent for {LIVENESS_SECS}s (no pong/data)"));
+                    }
                 }
-                // Not armed yet (server never ponged) — re-arm and keep waiting.
-                liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
+                // Traffic arrived recently: re-arm deadline for the remaining grace
+                liveness_deadline = tokio::time::Instant::now() + grace.saturating_sub(last_inbound.elapsed());
             }
             _=pull_tick.tick(),if authed=>{
                 for pull in catchups.due(std::time::Instant::now()) {
@@ -825,12 +846,16 @@ async fn run_once(
                 let Some((version, cmd, sub_cmd, envelope)) = decode_frame(&buf) else {
                     trace(format!("<- undecodable {} bytes", buf.len()));
                     last_inbound = std::time::Instant::now();
-                    liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
+                    let grace = if saw_pong {
+                        Duration::from_secs(LIVENESS_SECS)
+                    } else {
+                        FIRST_PONG_DEADLINE
+                    };
+                    liveness_deadline = tokio::time::Instant::now() + grace;
                     continue;
                 };
                 // Any decodable frame proves the link is alive (pong or push alike).
                 last_inbound = std::time::Instant::now();
-                liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
 
                 let encrypt = envelope.get("encrypt").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let err = envelope.get("error_code").and_then(|v| v.as_i64());
@@ -844,7 +869,19 @@ async fn run_once(
                 // proof the server is alive and arms the liveness deadline.
                 if (cmd == CMD_PING || cmd == CMD_PING_ACTIVE) && envelope.get("eventId").is_some() {
                     saw_pong = true;
+                    had_success.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
+
+                if authed && err.unwrap_or(0) == 0 {
+                    had_success.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                let grace = if saw_pong {
+                    Duration::from_secs(LIVENESS_SECS)
+                } else {
+                    FIRST_PONG_DEADLINE
+                };
+                liveness_deadline = tokio::time::Instant::now() + grace;
 
                 if cmd == CMD_AUTHEN {
                     if let Some(key) = envelope.get("key").and_then(|v| v.as_str()) {
@@ -865,6 +902,13 @@ async fn run_once(
                         return Err(anyhow!("auth rejected"));
                     }
                     authed = true;
+                    liveness_deadline = tokio::time::Instant::now() + FIRST_PONG_DEADLINE;
+
+                    // Send immediate first ping right upon auth
+                    let body = json!({ "eventId": now_ms() });
+                    let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
+                    let _ = ws.send(Message::Binary(f)).await;
+                    trace("-> first ping (auth)");
                     ready.send_replace(Some(epoch));
                     forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload: auth.clone() }, epoch).await?;
 
@@ -1153,5 +1197,50 @@ mod a24_ws_host_guard_tests {
         assert!(validate_ws_host("10.0.0.1").is_err());
         assert!(validate_ws_host("172.16.0.1").is_err());
         assert!(validate_ws_host("169.254.169.254").is_err());
+    }
+}
+
+#[cfg(test)]
+mod a15_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn first_pong_deadline_constant_is_bounded_15_seconds() {
+        assert_eq!(FIRST_PONG_DEADLINE, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn grace_period_before_and_after_first_pong() {
+        let saw_pong = false;
+        let grace_before = if saw_pong {
+            Duration::from_secs(3 * PING_SECS)
+        } else {
+            FIRST_PONG_DEADLINE
+        };
+        assert_eq!(grace_before, Duration::from_secs(15));
+
+        let saw_pong = true;
+        let grace_after = if saw_pong {
+            Duration::from_secs(3 * PING_SECS)
+        } else {
+            FIRST_PONG_DEADLINE
+        };
+        assert_eq!(grace_after, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn pong_and_data_frames_proof_of_life() {
+        let ping_body = json!({"eventId": 12345678});
+        let frame = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&ping_body));
+        let (_, cmd, _, envelope) = decode_frame(&frame).unwrap();
+        assert_eq!(cmd, CMD_PING);
+        assert!(envelope.get("eventId").is_some());
+
+        // A data frame without eventId is not a pong, but still decodable
+        let data_body = json!({"data": {"msg": "hello"}});
+        let frame2 = encode_frame(CMD_PUSH_MSG_1_1, 0, 1, Some(&data_body));
+        let (_, cmd2, _, envelope2) = decode_frame(&frame2).unwrap();
+        assert_eq!(cmd2, CMD_PUSH_MSG_1_1);
+        assert!(envelope2.get("eventId").is_none());
     }
 }

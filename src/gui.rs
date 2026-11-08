@@ -82,6 +82,10 @@ pub enum GuiEvent {
         peer_id: String,
         is_trusted: bool,
     },
+    DocPreviewLoaded {
+        file_name: String,
+        content: String,
+    },
     ReactorProfiles {
         owner: String,
         ids: Vec<String>,
@@ -847,7 +851,6 @@ pub struct ZaloGuiApp {
     active_call: Option<ActiveCallOverlay>,
     call_terminals: crate::call_lifecycle::TerminalCalls,
     image_viewer: Option<ImageViewerModal>,
-    #[allow(dead_code)] // TODO(WP15-4): Wire "Preview" button in messages.rs
     doc_viewer: Option<doc_viewer::DocViewerModal>,
     safety_number_modal: Option<SafetyNumberModalState>,
     trusted_peers: HashSet<String>,
@@ -1945,6 +1948,10 @@ impl ZaloGuiApp {
                             m.loading = false;
                         }
                     }
+                    ctx.request_repaint();
+                }
+                GuiEvent::DocPreviewLoaded { file_name, content } => {
+                    self.doc_viewer = Some(doc_viewer::DocViewerModal::new(content, file_name));
                     ctx.request_repaint();
                 }
                 GuiEvent::DroppedFilePrepared {

@@ -96,6 +96,24 @@ fn migrate(conn: &Connection) -> Result<()> {
         }
         conn.execute_batch("PRAGMA user_version=2;")?;
     }
+    if version < 3 {
+        let has_table: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seen_base_key'")
+            .and_then(|mut s| s.exists([]))
+            .unwrap_or(false);
+        if !has_table {
+            conn.execute_batch("
+                CREATE TABLE IF NOT EXISTS seen_base_key (
+                    profile_id TEXT NOT NULL,
+                    peer_id TEXT NOT NULL,
+                    base_key BLOB NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, peer_id, base_key)
+                );
+            ")?;
+        }
+        conn.execute_batch("PRAGMA user_version=3;")?;
+    }
     Ok(())
 }
 
@@ -328,22 +346,35 @@ pub fn save_trusted_identity(
 ) -> Result<bool> {
     // Returns true if the key changed (device reset — show UI warning).
     // The very first sighting is not a change: trust-on-first-use.
-    let existing: Option<Vec<u8>> = conn
+    let existing: Option<(Vec<u8>, i32)> = conn
         .query_row(
-            "SELECT identity_key FROM trusted_identity WHERE profile_id=?1 AND peer_id=?2",
+            "SELECT identity_key, verified FROM trusted_identity WHERE profile_id=?1 AND peer_id=?2",
             params![profile_id, peer_id],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    let changed = match existing {
-        None => false,
-        Some(ref k) => k.as_slice() != identity_key.as_slice(),
-    };
-    conn.execute(
-        "INSERT OR REPLACE INTO trusted_identity (profile_id, peer_id, identity_key) VALUES (?1,?2,?3)",
-        params![profile_id, peer_id, &identity_key[..]],
-    )?;
-    Ok(changed)
+    match existing {
+        None => {
+            conn.execute(
+                "INSERT INTO trusted_identity (profile_id, peer_id, identity_key, verified) VALUES (?1,?2,?3,0)",
+                params![profile_id, peer_id, &identity_key[..]],
+            )?;
+            Ok(false)
+        }
+        Some((ref k, _verified)) => {
+            if k.as_slice() == identity_key.as_slice() {
+                // Key unchanged: preserve verified status
+                Ok(false)
+            } else {
+                // Key changed! Reset verified=0 and verified_at=NULL (A11 requirement)
+                conn.execute(
+                    "UPDATE trusted_identity SET identity_key=?1, verified=0, verified_at=NULL WHERE profile_id=?2 AND peer_id=?3",
+                    params![&identity_key[..], profile_id, peer_id],
+                )?;
+                Ok(true)
+            }
+        }
+    }
 }
 
 pub fn is_trusted_identity(
@@ -446,6 +477,40 @@ impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
     }
 }
 
+// --- Seen base keys (Replay attack & session rollback protection - A11) ---
+
+pub fn record_base_key(
+    conn: &Connection,
+    profile_id: &str,
+    peer_id: &str,
+    base_key: &[u8; 32],
+) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "INSERT OR IGNORE INTO seen_base_key (profile_id, peer_id, base_key, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![profile_id, peer_id, &base_key[..], now],
+    )?;
+    Ok(())
+}
+
+pub fn has_base_key(
+    conn: &Connection,
+    profile_id: &str,
+    peer_id: &str,
+    base_key: &[u8; 32],
+) -> Result<bool> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM seen_base_key WHERE profile_id=?1 AND peer_id=?2 AND base_key=?3",
+            params![profile_id, peer_id, &base_key[..]],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    Ok(exists)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,4 +542,58 @@ mod tests {
         assert_eq!(stored_key2, key);
         assert!(verified2);
     }
+    #[test]
+    fn identity_change_resets_verified_flag_a11() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_e2ee_a11.db");
+        let conn = open_crypto_db_at(&db_path).unwrap();
+
+        let profile_id = "user_a";
+        let peer_id = "user_b";
+        let initial_key = [11u8; 32];
+        let changed_key = [22u8; 32];
+
+        // 1. Initial save of peer identity (TOFU)
+        let changed = save_trusted_identity(&conn, profile_id, peer_id, &initial_key).unwrap();
+        assert!(!changed, "TOFU must not be reported as identity change");
+        assert!(!is_identity_verified(&conn, profile_id, peer_id).unwrap());
+
+        // 2. Mark identity verified
+        set_identity_verified(&conn, profile_id, peer_id, true).unwrap();
+        assert!(is_identity_verified(&conn, profile_id, peer_id).unwrap());
+
+        // 3. Saving the same identity preserves verified flag
+        let changed_same = save_trusted_identity(&conn, profile_id, peer_id, &initial_key).unwrap();
+        assert!(!changed_same, "Same key must return changed = false");
+        assert!(is_identity_verified(&conn, profile_id, peer_id).unwrap(), "Verified flag must stay true");
+
+        // 4. Changing identity MUST reset verified to 0 and report identity_changed = true (A11)
+        let changed_new = save_trusted_identity(&conn, profile_id, peer_id, &changed_key).unwrap();
+        assert!(changed_new, "Different key must return changed = true");
+        assert!(!is_identity_verified(&conn, profile_id, peer_id).unwrap(), "Verified flag must be reset to false");
+
+        let (stored_key, is_ver) = get_trusted_identity(&conn, profile_id, peer_id).unwrap().unwrap();
+        assert_eq!(stored_key, changed_key);
+        assert!(!is_ver);
+    }
+
+    #[test]
+    fn seen_base_key_prevents_replay_a11() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_e2ee_base_key.db");
+        let conn = open_crypto_db_at(&db_path).unwrap();
+
+        let profile_id = "user_a";
+        let peer_id = "user_b";
+        let base_key1 = [101u8; 32];
+        let base_key2 = [102u8; 32];
+
+        assert!(!has_base_key(&conn, profile_id, peer_id, &base_key1).unwrap());
+        record_base_key(&conn, profile_id, peer_id, &base_key1).unwrap();
+        assert!(has_base_key(&conn, profile_id, peer_id, &base_key1).unwrap());
+
+        // Different base key is not marked
+        assert!(!has_base_key(&conn, profile_id, peer_id, &base_key2).unwrap());
+    }
+
 }

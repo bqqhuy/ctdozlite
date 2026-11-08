@@ -35,6 +35,48 @@ pub(crate) struct PullQueues {
     queues: HashMap<Key, Queue>,
     epoch: u64,
 }
+/// Validate whether the server payload contains an error code, error status, or missing/null data (A17).
+pub(crate) fn is_queue_error_payload(payload: &Value) -> bool {
+    let check_code = |v: &Value| -> bool {
+        match v {
+            Value::Number(n) => n.as_i64().is_some_and(|c| c != 0),
+            Value::String(s) => s != "0" && !s.is_empty(),
+            Value::Bool(b) => *b,
+            _ => false,
+        }
+    };
+
+    if let Some(c) = payload.get("error_code") {
+        if check_code(c) {
+            return true;
+        }
+    }
+    if let Some(c) = payload.pointer("/data/error_code") {
+        if check_code(c) {
+            return true;
+        }
+    }
+    if let Some(err) = payload.get("error") {
+        if check_code(err) {
+            return true;
+        }
+    }
+    if let Some(err) = payload.pointer("/data/error") {
+        if check_code(err) {
+            return true;
+        }
+    }
+
+    // Missing or null data when no cursor fields exist at top level
+    let data_is_present = payload.get("data").is_some_and(|d| !d.is_null());
+    let has_top_cursor = payload.get("lastActionId").is_some() || payload.get("queueStatus").is_some();
+    if !data_is_present && !has_top_cursor {
+        return true;
+    }
+
+    false
+}
+
 impl PullQueues {
     /// Create an empty scheduler for one authenticated socket generation.
     pub fn new(epoch: u64) -> Self {
@@ -88,6 +130,17 @@ impl PullQueues {
             return None;
         }
         queue.in_flight = false;
+        if is_queue_error_payload(payload) {
+            // A17: Server error must NOT be marked completed. Retain existing cursor, keep backoff, and schedule retry if under limit.
+            if queue.retries < MAX_RETRIES {
+                queue.deadline = Some(queue.deadline.map_or(now + WAIT, |at| at.min(now + WAIT)));
+                diag::queue(self.epoch, key, diag::QueueDecision::Missing, queue.retries);
+            } else {
+                queue.deadline = None;
+                diag::queue(self.epoch, key, diag::QueueDecision::Exhausted, queue.retries);
+            }
+            return None;
+        }
         let more = payload.pointer("/data/more").and_then(Value::as_i64) == Some(1);
         let qkey = format!("{}_{}", key.0, key.1);
         let last = payload
@@ -153,10 +206,7 @@ impl PullQueues {
         if !more {
             return None;
         }
-        let failed = payload
-            .get("error_code")
-            .and_then(|v| v.as_i64())
-            .is_some_and(|code| code != 0);
+        let failed = is_queue_error_payload(payload);
         let qkey = format!("{}_{}", key.0, key.1);
         let last = payload
             .pointer("/data/lastActionId")
@@ -363,5 +413,45 @@ mod tests {
         assert!(first.page((511, 1), &page(9, true), now).is_some());
         let second = PullQueues::new(2);
         assert!(second.queues.is_empty());
+    }
+
+    #[test]
+    fn queue_error_not_marked_completed_and_backoff_preserved() {
+        let now = Instant::now();
+        let key = (603, 1);
+        let mut queues = PullQueues::new(1);
+        queues.register(key, "req1".into(), now, Some((json!(42), json!(["41"]))));
+
+        // 1. Numeric error code
+        let err_num = json!({"error_code": 500, "error_message": "Internal Server Error"});
+        assert!(queues.page(key, &err_num, now).is_none());
+        assert_eq!(queues.queues[&key].last, json!(42));
+        assert_eq!(queues.queues[&key].ids, json!(["41"]));
+        // Due after WAIT because it was NOT completed!
+        let due = queues.due(now + WAIT);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].last, json!(42));
+        assert_eq!(queues.queues[&key].retries, 1);
+        queues.sent(key, "retry1".into(), now + WAIT);
+
+        // 2. String error code
+        let err_str = json!({"error_code": "-1", "data": null});
+        assert!(queues.page(key, &err_str, now + WAIT).is_none());
+        assert_eq!(queues.queues[&key].retries, 1); // Not reset to 0!
+        let due2 = queues.due(now + WAIT * 2);
+        assert_eq!(due2.len(), 1);
+        assert_eq!(queues.queues[&key].retries, 2);
+        queues.sent(key, "retry2".into(), now + WAIT * 2);
+
+        // 3. Nested error under data
+        let err_nested = json!({"data": {"error_code": 1002, "more": 0}});
+        assert!(queues.page(key, &err_nested, now + WAIT * 2).is_none());
+        assert_eq!(queues.queues[&key].retries, 2); // Still preserved
+
+        // 4. Truly successful page resets retries to 0
+        let success = json!({"data": {"lastActionId": 43, "more": 1}});
+        let pull = queues.page(key, &success, now + WAIT * 3).unwrap();
+        assert_eq!(pull.last, json!(43));
+        assert_eq!(queues.queues[&key].retries, 0); // Reset to 0 only on true success!
     }
 }

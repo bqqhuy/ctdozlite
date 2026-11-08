@@ -195,9 +195,10 @@ mod tests {
     fn should_lock_after_timeout() {
         let mut guard = AppLockGuard::new();
         guard.biometric_available = true;
-        guard.idle_timeout = Duration::from_millis(50);
+        guard.idle_timeout = Duration::from_millis(100);
+        guard.touch();
         assert!(!guard.should_lock());
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(150));
         assert!(guard.should_lock());
     }
 

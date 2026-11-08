@@ -5,9 +5,41 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::param_cipher::ParamCipher;
 use crate::session::{obj, urlencode, Session, ZPW_TYPE, ZPW_VER};
+
+/// Thread-safe auth attempt generation tracker to prevent race conditions
+/// between concurrent or sequential login attempts (e.g. Password login vs QR login) (A19).
+#[derive(Debug, Clone, Default)]
+pub struct AuthAttemptManager {
+    generation: Arc<AtomicU64>,
+}
+
+impl AuthAttemptManager {
+    pub fn new() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Advance generation counter and return the new generation ID.
+    pub fn next_attempt(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Current generation ID.
+    pub fn current(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Check whether a response from a specific attempt generation is still valid/current.
+    pub fn is_current(&self, attempt_id: u64) -> bool {
+        self.current() == attempt_id
+    }
+}
 
 /// PasswordCipher (class N) — `re-notes/01_login.md` §2.2.
 ///
@@ -403,5 +435,28 @@ mod tests {
         assert_eq!(s.zpw_sek.as_deref(), Some("sek_nested_456"));
         let login = s.login.as_ref().unwrap();
         assert_eq!(login.zpw_sek, "sek_nested_456");
+    }
+
+    #[test]
+    fn test_login_attempt_generation_monotonic_and_race_prevention() {
+        let manager = AuthAttemptManager::new();
+        assert_eq!(manager.current(), 0);
+
+        let attempt_1 = manager.next_attempt();
+        assert_eq!(attempt_1, 1);
+        assert!(manager.is_current(attempt_1));
+
+        let attempt_2 = manager.next_attempt();
+        assert_eq!(attempt_2, 2);
+        assert!(manager.is_current(attempt_2));
+        // Stale attempt 1 must be rejected!
+        assert!(!manager.is_current(attempt_1));
+
+        // Attempt 3 started (e.g. user requested QR after password submit)
+        let attempt_3 = manager.next_attempt();
+        assert_eq!(attempt_3, 3);
+        assert!(!manager.is_current(attempt_1));
+        assert!(!manager.is_current(attempt_2));
+        assert!(manager.is_current(attempt_3));
     }
 }
