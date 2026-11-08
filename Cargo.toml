@@ -38,13 +38,21 @@ cpal = "0.15"
 opus = "0.3"
 wasmi = "0.40"
 zstd = "0.14.3"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"
+rand_core = "0.10"
 unicode-segmentation = "1.13"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
 jxl-oxide = { version = "0.12.6", default-features = false }
 lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
 aws-lc-rs = "1.19.0"
+
+# Signal Protocol — E2EE Double Ratchet (WP16-1/2)
+x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "3.0.0", features = ["zeroize"] }
+hkdf = "0.12"
+hmac = "0.12"
 
 # --- Windows ARM64 tuning -------------------------------------------------
 # Windows on ARM (Snapdragon) has no guaranteed native OpenGL driver: older
@@ -84,3 +92,5 @@ path = "src/main.rs"
 lru = { path = "vendor/lru-compat" }
 
 tray-icon = { path = "vendor/tray-icon" }
+
+# E2EE integration helper

@@ -641,12 +641,34 @@ async fn run_once(
     let mut catchups = queue_receiver::PullQueues::new(epoch);
     let mut pull_tick = tokio::time::interval(Duration::from_millis(100));
     pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // WP13-2 hardening: a half-dead TCP connection (router swap, suspended NIC)
+    // accepts outgoing pings but never answers, so `ws.next()` alone would hang
+    // forever while liveness still reports connected. The official client matches
+    // its ping eventId in `_onPong`; every inbound frame (pong included) refreshes
+    // this deadline, and 3 silent ping periods ends the epoch for a clean reconnect.
+    const LIVENESS_SECS: u64 = 3 * PING_SECS;
     let mut writes_open = true;
+    let mut last_inbound = std::time::Instant::now();
+    // Only arm the deadline once the server has actually proven it answers
+    // keep-alives; a server that never pongs must not be killed while healthy.
+    let mut saw_pong = false;
+    // Absolute deadline, not a fresh `sleep` per loop iteration: the select loop
+    // wakes every 100 ms for the pull queue, so a relative sleep would be reset
+    // forever and the liveness branch would never fire.
+    let mut liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
     loop {
         tokio::select! {
             _ = tx.closed() => {
                 crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::ReceiverClosed, None);
                 return Ok("receiver closed".into());
+            }
+            _ = tokio::time::sleep_until(liveness_deadline), if authed => {
+                if saw_pong && last_inbound.elapsed() >= Duration::from_secs(LIVENESS_SECS) {
+                    crate::transfer_diagnostics::socket_closed(epoch, crate::transfer_diagnostics::SocketEnd::Error, None);
+                    return Err(anyhow!("socket silent for {LIVENESS_SECS}s (no pong/data)"));
+                }
+                // Not armed yet (server never ponged) — re-arm and keep waiting.
+                liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
             }
             _=pull_tick.tick(),if authed=>{
                 for pull in catchups.due(std::time::Instant::now()) {
@@ -709,8 +731,13 @@ async fn run_once(
 
                 let Some((version, cmd, sub_cmd, envelope)) = decode_frame(&buf) else {
                     trace(format!("<- undecodable {} bytes", buf.len()));
+                    last_inbound = std::time::Instant::now();
+                    liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
                     continue;
                 };
+                // Any decodable frame proves the link is alive (pong or push alike).
+                last_inbound = std::time::Instant::now();
+                liveness_deadline = tokio::time::Instant::now() + Duration::from_secs(LIVENESS_SECS);
 
                 let encrypt = envelope.get("encrypt").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let err = envelope.get("error_code").and_then(|v| v.as_i64());
@@ -718,6 +745,13 @@ async fn run_once(
                     "<- v{version} cmd={cmd} sub={sub_cmd} enc={encrypt} err={err:?} {} bytes",
                     buf.len()
                 ));
+
+                // Detect pong: CMD_PING (2) or CMD_PING_ACTIVE (4) carrying eventId echo.
+                // Official client matches ping eventId in `_onPong`; either cmd code constitutes
+                // proof the server is alive and arms the liveness deadline.
+                if (cmd == CMD_PING || cmd == CMD_PING_ACTIVE) && envelope.get("eventId").is_some() {
+                    saw_pong = true;
+                }
 
                 if cmd == CMD_AUTHEN {
                     if let Some(key) = envelope.get("key").and_then(|v| v.as_str()) {

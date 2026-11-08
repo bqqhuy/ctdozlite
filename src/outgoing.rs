@@ -110,7 +110,17 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             }
         }
         Payload::Text => {
-            if let Some(url) = crate::chat::extract_first_url(&message.text) {
+            // E2EE path (WP16-3): check if conversation has E2EE enabled in session
+            // For now, defer to chat.rs helper which checks conversation metadata
+            if !job.is_group {
+                // Try E2EE send first; if server rejects, fallback to plain send
+                if let Ok(result) = crate::chat::send_e2ee_message(s, s.account_key(), to, &message.text, id).await {
+                    result
+                } else {
+                    // E2EE failed (no key, not supported) → fallback to regular send
+                    crate::chat::send_message_with_client_id(s, to, &message.text, id).await?
+                }
+            } else if let Some(url) = crate::chat::extract_first_url(&message.text) {
                 let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
                     crate::chat::LinkMetadata {
                         title: url.clone(),

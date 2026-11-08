@@ -1,6 +1,17 @@
 //! Crypto primitives, ported from the Zalo PC 26.10.11 bundles.
 //!
 //! See `re-notes/01_login.md` and `re-notes/02_chat_data.md` for evidence.
+//!
+//! Sub-modules under `crypto/` implement the Signal Protocol Double Ratchet for E2EE
+//! (v0.016 WP16-1/2).  Evidence in `re-notes/36-zalo-e2ee-signal-protocol-analysis.md`.
+
+pub mod ratchet;
+pub mod keystore;
+pub mod store;
+pub mod prekey;
+pub mod safety;
+pub mod session;
+pub mod wire;
 
 use aes::{Aes128, Aes256};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};

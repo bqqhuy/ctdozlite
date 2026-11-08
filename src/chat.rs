@@ -2176,7 +2176,54 @@ pub(crate) async fn send_attachment_with_client_id(
     };
 
     let mut last_up_dec = Value::Null;
-    for idx in 0..total_chunks {
+    // WP15-4: ResumableUpload persistence — checkpoint each completed chunk so that
+    // a retry after a network drop can resume from the last confirmed chunk boundary.
+    let upload_id = format!("asyncfile-{client_id}");
+    let mut resumable = crate::upload::ResumableUploadState::new(
+        upload_id.clone(),
+        file_name.clone(),
+        total_size,
+        chunk_size,
+    );
+    // Open store once; errors are non-fatal — upload still proceeds, just without
+    // persistence (degraded mode).
+    let resume_store = crate::store::MessageStore::open(s.history_path()).ok();
+    // Resume from the last checkpoint when it still describes *this* upload:
+    // same file, same size, same chunk layout.  A mismatched checkpoint is
+    // discarded rather than trusted — the server would reject the chunks.
+    let mut resume_from = 0usize;
+    let total_chunks_usize = total_chunks as usize;
+    if let Some(ref st) = resume_store {
+        if let Some(saved) = st.load_upload_state(&upload_id).ok().flatten() {
+            if saved.total_size == total_size
+                && saved.chunk_size == chunk_size
+                && saved.file_name == file_name
+                && saved.total_chunks == total_chunks_usize
+            {
+                // Only trust the contiguous prefix the server confirmed.
+                let mut contiguous = 0usize;
+                for idx in 0..total_chunks_usize {
+                    if saved.completed_chunks.contains(&idx) {
+                        contiguous = idx + 1;
+                    } else {
+                        break;
+                    }
+                }
+                if contiguous > 0 && contiguous < total_chunks_usize {
+                    resume_from = contiguous;
+                    resumable = saved;
+                    source.skip_chunks(resume_from, chunk_size).await?;
+                } else if contiguous >= total_chunks_usize {
+                    // Every chunk was confirmed but the final response never
+                    // reached us — the file id is unknown, so start over.
+                    let _ = st.delete_upload_state(&upload_id);
+                }
+            } else {
+                let _ = st.delete_upload_state(&upload_id);
+            }
+        }
+    }
+    for idx in resume_from..total_chunks_usize {
         let chunk = source.next_chunk().await?;
         let chunk_id = idx + 1;
         let mut m = serde_json::Map::new();
@@ -2201,6 +2248,15 @@ pub(crate) async fn send_attachment_with_client_id(
             .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
             .await?;
         last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
+        // Checkpoint: mark this chunk completed so a retry can skip re-uploading it.
+        resumable.mark_chunk_complete(idx);
+        if let Some(ref st) = resume_store {
+            let _ = st.save_upload_state(&resumable);
+        }
+    }
+    // Upload complete: remove the checkpoint entry.
+    if let Some(ref st) = resume_store {
+        let _ = st.delete_upload_state(&upload_id);
     }
 
     source.verify().await?;
@@ -5715,6 +5771,10 @@ fn extract_contact_info(v: &Value) -> ContactInfo {
 }
 
 pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
+    parse_chat_message_with_profile(it, None)
+}
+
+pub(crate) fn parse_chat_message_with_profile(it: &Value, profile_id: Option<&str>) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
     let raw_content_val = it
@@ -5742,6 +5802,17 @@ pub(crate) fn parse_chat_message(it: &Value) -> Option<ChatMessage> {
     let mut content = raw_content_val
         .and_then(extract_content_text)
         .unwrap_or_default();
+
+    // WP16-3: E2EE receive path — decrypt incoming encrypted messages
+    if let Some(prof_id) = profile_id {
+        if let Some(sender_id) = it.get("uidFrom").or_else(|| it.get("idFrom")).and_then(|v| v.as_str()) {
+            if let Some((plaintext, _identity_changed)) = try_decrypt_e2ee_content(prof_id, sender_id, it) {
+                content = plaintext;
+                // TODO: Show identity_changed warning in UI (WP16-3 Mục 3)
+            }
+        }
+    }
+
     if msg_type == "chat.contact" || msg_type == "contact" || msg_type == "12" {
         if let Some(ref name) = contact_name {
             content = format!("[Danh thiếp] {name}");
@@ -8197,5 +8268,68 @@ mod contact_and_batch_tests {
         assert_eq!(deserialized.contact_name.as_deref(), Some("Lê Văn C"));
         assert_eq!(deserialized.contact_phone.as_deref(), Some("0988776655"));
         assert_eq!(deserialized.contact_avatar.as_deref(), Some("https://img.zalo.me/ava.jpg"));
+    }
+}
+
+// E2EE helper: check if conversation has E2EE enabled
+pub fn is_conversation_e2ee(convo: &serde_json::Value) -> bool {
+    convo.get("isE2EE")
+        .and_then(|v| v.as_u64())
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+// E2EE send path wrapper (called from worker when E2EE enabled)
+pub async fn send_e2ee_message(
+    s: &Session,
+    profile_id: &str,
+    to_id: &str,
+    text: &str,
+    now: u64,
+) -> Result<Value> {
+    use base64::Engine;
+    
+    let ciphertext = crate::e2ee_integration::encrypt_message(s, profile_id, to_id, text).await?;
+    
+    let body = obj(&[
+        ("toid", json!(to_id)),
+        ("message", json!(base64::engine::general_purpose::STANDARD.encode(&ciphertext))),
+        ("clientId", json!(now)),
+        ("imei", json!(s.imei)),
+        ("isE2EE", json!(1)),
+    ]);
+    let params = s.encoded_params(&body)?;
+    let host = &s.domains.chat;
+    let url = format!("{host}/api/e2ee/pc/message/sms?{}", s.common_params());
+    let form = format!("params={params}");
+    let resp = s.post_form(&url, form).await?;
+    let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    confirmed_send(resp)
+}
+
+// E2EE decrypt helper for parse_chat_message
+pub fn try_decrypt_e2ee_content(
+    profile_id: &str,
+    peer_id: &str,
+    raw: &Value,
+) -> Option<(String, bool)> {
+    use base64::Engine;
+    
+    let e2ee_status = raw.get("e2eeStatus")
+        .and_then(|v| v.as_i64())
+        .filter(|&code| (3000..4000).contains(&code))?;
+    
+    let ciphertext_b64 = raw.get("content")
+        .or_else(|| raw.get("message"))
+        .and_then(|v| v.as_str())?;
+    
+    let ciphertext = base64::engine::general_purpose::STANDARD.decode(ciphertext_b64).ok()?;
+    
+    match crate::e2ee_integration::decrypt_message(profile_id, peer_id, &ciphertext) {
+        Ok(decrypted) => Some((decrypted.text, decrypted.identity_changed)),
+        Err(e) => {
+            eprintln!("E2EE decrypt failed (status {e2ee_status}): {e}");
+            Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false))
+        }
     }
 }

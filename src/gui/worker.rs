@@ -1106,7 +1106,6 @@ pub(super) fn spawn_session_worker(
                     tokio::spawn(async move {
                         let mut timer = tokio::time::interval(Duration::from_millis(1200));
                         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        let mut ws_skip_ticks: u32 = 0;
                         loop {
                             timer.tick().await;
                             if commands.strong_count() == 0 { break; }
@@ -1115,16 +1114,13 @@ pub(super) fn spawn_session_worker(
                             if s.login.is_none() || !s.is_active() { continue; }
                             drop(s);
 
-                            // WP13-2: Adaptive Realtime Polling Engine
-                            // When WebSocket is connected, back off HTTP polling to 24s keepalive interval
+                            // WP13-2 fulfilled: polling eliminated when WebSocket epoch is Some.
+                            // HTTP polling runs ONLY as fallback when the WebSocket is down.
+                            // The is_ws_connected flag is driven by transport.epochs() watch in
+                            // the liveness task above; it goes false the moment ready_tx sends None
+                            // (socket epoch ends or reconnect backoff). No polling skew allowed.
                             if is_ws_connected.load(std::sync::atomic::Ordering::SeqCst) {
-                                ws_skip_ticks = ws_skip_ticks.saturating_add(1);
-                                if ws_skip_ticks < 20 {
-                                    continue;
-                                }
-                                ws_skip_ticks = 0;
-                            } else {
-                                ws_skip_ticks = 0;
+                                continue;
                             }
 
                             let snapshot = known.lock().await.clone();
@@ -3739,10 +3735,10 @@ fn outgoing_command(cmd: &WorkerCmd) -> Option<(String, ChatMessage)> {
             to_id,
             text,
             is_group,
-        } => Some((
-            to_id.clone(),
-            pending(text.clone(), *is_group, Payload::Text),
-        )),
+        } => {
+            let msg = pending(text.clone(), *is_group, Payload::Text);
+            Some((to_id.clone(), msg))
+        }
         WorkerCmd::SendQuote {
             to_id,
             text,

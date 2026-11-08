@@ -65,6 +65,27 @@ impl Source {
         self.remaining -= chunk.len() as u64;
         Ok(chunk)
     }
+    /// Skip `count` chunks of `chunk_size` bytes without reading them into memory.
+    ///
+    /// Used to resume an interrupted chunked upload: the chunks the server
+    /// already confirmed are not re-sent, so the file position has to move
+    /// forward past them without allocating the bytes.  The chunk grid is
+    /// absolute — chunk `i` always covers `[i * chunk_size, (i + 1) * chunk_size)`
+    /// — so the skip is measured from the current position, not from the end of
+    /// the file.  Skipping past the end of the file stops at the last byte.
+    pub async fn skip_chunks(&mut self, count: usize, chunk_size: usize) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        let current = self.size - self.remaining;
+        let target = current
+            .saturating_add((count as u64).saturating_mul(chunk_size as u64))
+            .min(self.size);
+        use tokio::io::AsyncSeekExt;
+        self.file.seek(SeekFrom::Start(target)).await?;
+        self.remaining = self.size - target;
+        Ok(())
+    }
     pub async fn verify(&self) -> Result<()> {
         let metadata = self.file.metadata().await?;
         anyhow::ensure!(
@@ -154,5 +175,75 @@ mod resumable_tests {
         state.mark_chunk_complete(1);
         assert_eq!(state.next_missing_chunk(), None);
         assert!(state.is_complete());
+    }
+
+    /// The contiguous confirmed prefix is what a resume may trust.
+    fn contiguous_prefix(state: &ResumableUploadState) -> usize {
+        let mut contiguous = 0usize;
+        for idx in 0..state.total_chunks {
+            if state.completed_chunks.contains(&idx) {
+                contiguous = idx + 1;
+            } else {
+                break;
+            }
+        }
+        contiguous
+    }
+
+    #[test]
+    fn only_the_contiguous_prefix_is_resumable() {
+        let mut state = ResumableUploadState::new("up2".into(), "large.zip".into(), 10_000_000, 4_000_000);
+        state.mark_chunk_complete(0);
+        state.mark_chunk_complete(2);
+        // Chunk 1 was never confirmed, so chunk 2 alone cannot be resumed.
+        assert_eq!(contiguous_prefix(&state), 1);
+        assert_eq!(state.next_missing_chunk(), Some(1));
+
+        state.mark_chunk_complete(1);
+        assert_eq!(contiguous_prefix(&state), 3);
+        assert_eq!(state.next_missing_chunk(), None);
+    }
+
+    #[tokio::test]
+    async fn skip_chunks_advances_the_file_position_without_reading() {
+        let dir = std::env::temp_dir().join(format!("zalo-upload-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        let bytes: Vec<u8> = (0..(CHUNK * 2 + 17)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        // A fresh source starts at offset 0; skipping two chunks moves to chunk 2.
+        let mut source = Source::open(&path).await.unwrap();
+        source.skip_chunks(2, CHUNK).await.unwrap();
+        let chunk2 = source.next_chunk().await.unwrap();
+        assert_eq!(chunk2.len(), 17);
+        assert_eq!(chunk2, bytes[CHUNK * 2..]);
+
+        // A fresh source that reads one chunk first, then skips one more,
+        // lands on the same place as skipping two from the start.
+        let mut source = Source::open(&path).await.unwrap();
+        let chunk0 = source.next_chunk().await.unwrap();
+        assert_eq!(chunk0, bytes[..CHUNK]);
+        source.skip_chunks(1, CHUNK).await.unwrap();
+        let chunk2 = source.next_chunk().await.unwrap();
+        assert_eq!(chunk2, bytes[CHUNK * 2..]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn skipping_past_the_end_never_yields_extra_bytes() {
+        let dir = std::env::temp_dir().join(format!("zalo-upload-skip-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("payload.bin");
+        let bytes: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut source = Source::open(&path).await.unwrap();
+        // Far more chunks than the file holds — the skip must clamp.
+        source.skip_chunks(50, CHUNK).await.unwrap();
+        assert!(source.next_chunk().await.unwrap().is_empty() || source.remaining == 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

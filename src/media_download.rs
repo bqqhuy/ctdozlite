@@ -10,6 +10,59 @@ use std::{
 };
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 pub static DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Per-host DoH-resolved reqwest clients (keyed by hostname).  Built lazily when
+/// system DNS fails so the hot path (system DNS working) has zero overhead.
+static DOH: OnceLock<crate::doh_resolver::DohResolver> = OnceLock::new();
+
+/// DoH-pinned clients, one per hostname, reused across downloads.
+///
+/// The pinned addresses go stale when the CDN re-points a hostname, so each
+/// entry carries an expiry matching the DoH answer's TTL.
+static DOH_CLIENTS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>>,
+> = OnceLock::new();
+
+fn doh() -> &'static crate::doh_resolver::DohResolver {
+    DOH.get_or_init(|| {
+        crate::doh_resolver::DohResolver::new()
+            .expect("DohResolver construction must not fail — reqwest builder is always valid")
+    })
+}
+
+fn doh_clients(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>>
+{
+    DOH_CLIENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Build (or reuse) a client that pins `host` to the DoH-resolved addresses.
+///
+/// `ttl` bounds how long the pinned addresses may be reused.
+fn doh_client_for(host: &str, addrs: &[std::net::IpAddr], ttl: std::time::Duration) -> Result<reqwest::Client> {
+    let mut cache = doh_clients().lock().unwrap();
+    let now = std::time::Instant::now();
+    if let Some((expires, client)) = cache.get(host) {
+        if *expires > now {
+            return Ok(client.clone());
+        }
+    }
+    let addr_port: Vec<std::net::SocketAddr> = addrs
+        .iter()
+        .map(|ip| std::net::SocketAddr::new(*ip, 443))
+        .collect();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(8))
+        .user_agent("Mozilla/5.0")
+        .referer(true)
+        .resolve_to_addrs(host, &addr_port)
+        .no_proxy()
+        .build()
+        .context("Không tạo được DoH client")?;
+    cache.insert(host.to_owned(), (now + ttl, client.clone()));
+    Ok(client)
+}
 pub fn allowed(u: &reqwest::Url) -> bool {
     #[cfg(test)]
     if u.scheme() == "http" && u.host_str() == Some("127.0.0.1") {
@@ -53,13 +106,55 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
             .timeout(timeout)
             .send()
             .await;
-        let r = result.map_err(|e| {
-            if e.is_timeout() {
-                anyhow::Error::from(crate::media_recovery::Failure::Timeout)
-            } else {
-                anyhow::Error::from(crate::media_recovery::Failure::Network)
+        let r = match result {
+            Ok(r) => r,
+            Err(ref e) if is_dns_error(e) => {
+                // System DNS failed for a known CDN domain — attempt DoH fallback.
+                if let Some(host) = url.host_str() {
+                    let host_str = host.to_owned();
+                    match doh().resolve_with_ttl(&host_str).await {
+                        Ok((addrs, ttl)) => {
+                            // Reuse a pinned client for this hostname; the
+                            // resolver itself caches the addresses.
+                            let doh_client = doh_client_for(
+                                &host_str,
+                                &addrs,
+                                Duration::from_secs(ttl.clamp(60, 600)),
+                            )?;
+                            doh_client
+                                .get(url.clone())
+                                .header(reqwest::header::REFERER, crate::endpoints::WEB_ORIGIN)
+                                .timeout(timeout)
+                                .send()
+                                .await
+                                .map_err(|e| if e.is_timeout() {
+                                    anyhow::Error::from(crate::media_recovery::Failure::Timeout)
+                                } else {
+                                    // Invalidate DoH cache for this host on connection failure.
+                                    doh().invalidate(&host_str);
+                                    // The pinned client still holds the stale
+                                    // addresses — drop it so the next attempt
+                                    // re-resolves.
+                                    doh_clients().lock().unwrap().remove(&host_str);
+                                    anyhow::Error::from(crate::media_recovery::Failure::Network)
+                                })?
+                        }
+                        Err(_) => {
+                            return Err(crate::media_recovery::Failure::Network.into());
+                        }
+                    }
+                } else {
+                    return Err(crate::media_recovery::Failure::Network.into());
+                }
             }
-        })?;
+            Err(e) => {
+                return Err(if e.is_timeout() {
+                    crate::media_recovery::Failure::Timeout.into()
+                } else {
+                    crate::media_recovery::Failure::Network.into()
+                });
+            }
+        };
         if r.status().is_redirection() {
             let location = r
                 .headers()
@@ -77,6 +172,33 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
         return Ok(r);
     }
     anyhow::bail!("Nguồn media chuyển hướng quá nhiều lần")
+}
+
+/// Returns true when the reqwest error indicates a DNS resolution failure.
+///
+/// reqwest exposes no "is DNS" flag, so the error chain is inspected for the
+/// resolver-level markers.  Treating *every* connect error as a DNS failure
+/// would fire the DoH fallback for TLS and refused-connection errors, which
+/// DoH cannot fix.
+fn is_dns_error(e: &reqwest::Error) -> bool {
+    if !e.is_connect() || e.is_timeout() {
+        return false;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
+    while let Some(err) = source {
+        let text = err.to_string().to_ascii_lowercase();
+        if text.contains("dns error")
+            || text.contains("failed to lookup address")
+            || text.contains("name or service not known")
+            || text.contains("nodename nor servname")
+            || text.contains("temporary failure in name resolution")
+            || text.contains("no such host")
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 struct Partial(PathBuf);
 impl Drop for Partial {
@@ -297,6 +419,27 @@ mod tests {
     #[test]
     fn filenames_cannot_escape_picker_directory() {
         assert_eq!(safe_name("../a\\b:?.png"), "ab.png");
+    }
+
+    /// The DoH fallback must fire for resolver failures only.  A TLS or
+    /// refused-connection error is not fixable by resolving the name.
+    #[tokio::test]
+    async fn dns_failures_are_told_apart_from_other_connect_errors() {
+        // A connect error to a host that does not resolve carries a DNS marker.
+        let err = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get("https://this-host-does-not-exist-zalolite.invalid/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.is_connect());
+        assert!(
+            is_dns_error(&err),
+            "expected a DNS-classified error, got: {err}"
+        );
     }
     #[tokio::test]
     async fn streaming_save_preserves_existing_file_and_cleans_partial() {

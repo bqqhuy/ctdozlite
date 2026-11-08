@@ -19,6 +19,8 @@ pub mod session;
 pub mod socket;
 pub mod storage;
 pub mod store;
+pub mod profiles;
+pub mod e2ee_integration;
 pub mod tui;
 pub mod ui;
 pub mod video;
@@ -88,6 +90,8 @@ pub mod crash_report;
 pub mod proxy;
 
 pub mod media_download;
+
+pub mod doh_resolver;
 
 pub mod video_player;
 

@@ -411,11 +411,16 @@ fn release_client() -> Result<reqwest::Client, String> {
 }
 fn version(s: &str) -> Option<(u64, u64, u64)> {
     let s = s.strip_prefix('v').unwrap_or(s);
-    if let Some(serial) = s.strip_prefix("0.").and_then(|s| s.strip_suffix("-arm")) {
+    // The `-arm` suffix marks an ARM64 release and does not affect the serial.
+    let s = s.strip_suffix("-arm").unwrap_or(s);
+    // Legacy ARM64 serials used a single serial number: `v0.003-arm` == `v0.0.3`.
+    if let Some(serial) = s.strip_prefix("0.") {
         if serial.is_empty() || !serial.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+            // Not a legacy serial — fall through to the three-part parser below
+            // (e.g. `0.015.1` must not be mistaken for an invalid legacy tag).
+        } else {
+            return Some((0, 0, serial.parse().ok()?));
         }
-        return Some((0, 0, serial.parse().ok()?));
     }
     let mut p = s.split('.');
     let result = (
