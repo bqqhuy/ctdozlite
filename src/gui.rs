@@ -1835,6 +1835,11 @@ impl ZaloGuiApp {
     }
 
     fn check_events(&mut self, ctx: &egui::Context) {
+        // A21 fix: Gate event processing when locked
+        if self.lock_guard.is_locked() {
+            return;
+        }
+
         for index in 0..64 {
             let Ok(event) = self.event_rx.try_recv() else {
                 break;
@@ -4528,8 +4533,16 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Update lock guard on user interaction (WP16-4)
-        if ctx.input(|i| !i.raw.hovered_files.is_empty()
+        // A21 fix: Check and update lock state BEFORE processing input/events/render
+        // This ensures lock transition happens before any sensitive operation can execute.
+        if self.is_logged_in && self.lock_guard.should_lock() {
+            self.lock_guard.lock();
+        }
+
+        // Update lock guard on user interaction (WP16-4) — but only if not locked
+        // A21: Input after idle should not reset deadline if we're already locked
+        if !self.lock_guard.is_locked()
+            && ctx.input(|i| !i.raw.hovered_files.is_empty()
             || !i.raw.dropped_files.is_empty()
             || i.raw.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::PointerButton { .. }))) {
             self.lock_guard.touch();
@@ -4805,8 +4818,8 @@ impl eframe::App for ZaloGuiApp {
 
         let pal = self.palette();
 
-        // Dev Inspector Panel
-        if self.dev_mode && self.dev_panel_open {
+        // Dev Inspector Panel — A21: gate when locked
+        if self.dev_mode && self.dev_panel_open && !self.lock_guard.is_locked() {
             egui::TopBottomPanel::bottom("dev_inspector")
                 .resizable(true)
                 .default_height(250.0)
@@ -4849,11 +4862,6 @@ impl eframe::App for ZaloGuiApp {
                         DevTab::CryptoState => self.render_dev_crypto(ui),
                     }
                 });
-        }
-
-        // Auto-lock check (WP16-4)
-        if self.is_logged_in && self.lock_guard.should_lock() {
-            self.lock_guard.lock();
         }
 
         // Main Workspace
