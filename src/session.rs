@@ -297,6 +297,48 @@ fn next_runtime_generation() -> usize {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
+
+/// Scrub sensitive fields from response body for diagnostic dumps (A14 fix).
+///
+/// Preserves structure and error codes for debugging, removes credentials and PII.
+fn redact_body(body: &serde_json::Value) -> serde_json::Value {
+    use serde_json::{json, Value};
+
+    match body {
+        Value::Object(map) => {
+            let mut redacted = serde_json::Map::new();
+            for (key, value) in map {
+                let key_lower = key.to_lowercase();
+                // Preserve error codes and status for debugging
+                if key_lower.contains("error") || key_lower == "code" || key_lower == "status" {
+                    redacted.insert(key.clone(), value.clone());
+                }
+                // Redact known sensitive fields
+                else if key_lower.contains("token")
+                    || key_lower.contains("password")
+                    || key_lower.contains("secret")
+                    || key_lower.contains("key")
+                    || key_lower.contains("cookie")
+                    || key_lower.contains("session")
+                    || key_lower.contains("auth")
+                    || key_lower.contains("credential") {
+                    redacted.insert(key.clone(), json!("<REDACTED>"));
+                }
+                // Recursively scrub nested objects
+                else if value.is_object() || value.is_array() {
+                    redacted.insert(key.clone(), redact_body(value));
+                }
+                // Keep safe primitive values
+                else {
+                    redacted.insert(key.clone(), value.clone());
+                }
+            }
+            Value::Object(redacted)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(redact_body).collect()),
+        _ => body.clone(),
+    }
+}
 impl Session {
     pub fn new(verbose: bool, dump: bool, dump_raw: bool) -> Result<Self> {
         let jar = Arc::new(Jar::default());
@@ -668,7 +710,7 @@ impl Session {
             // offline. Only use it on a throwaway account.
             "url": if self.dump_raw { url.to_string() } else { redact_url(url) },
             "status": status,
-            "body": body_json,
+            "body": if self.dump_raw { body_json } else { redact_body(&body_json) },
         });
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&path, text) {
