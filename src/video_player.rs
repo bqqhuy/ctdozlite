@@ -40,7 +40,12 @@ impl CachedVideo {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Video cache unavailable"))?
                 .contains(&path);
-            if !in_use && metadata.is_file() && !entry.file_type()?.is_symlink() {
+            // A25 fix: Skip active partial files (.ctdoz-*.partial) from media_download
+            let is_active_partial = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".ctdoz-") && n.ends_with(".partial"));
+            if !in_use && !is_active_partial && metadata.is_file() && !entry.file_type()?.is_symlink() {
                 // Files in this directory are disposable playback copies, never user saves.
                 if std::fs::remove_file(path).is_err() {
                     crate::logger::log_error("video cache", "Cannot remove stale playback file");
