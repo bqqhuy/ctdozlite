@@ -211,6 +211,12 @@ impl ZaloGuiApp {
                         self.profile_menu_open = !self.profile_menu_open;
                     }
 
+                    // WP16-3: Account switcher dropdown (WIP integration)
+                    if self.profile_menu_open {
+                        // Placeholder for account switcher UI
+                        // The switcher.show() will be called here when integrated with ProfileRegistry
+                    }
+
                     ui.add_space(18.0);
 
                     // Navigation Icon 1: Tin nhắn (All / Active Chat)

@@ -22,6 +22,8 @@ use crate::qr::QrLogin;
 use crate::session::Session;
 
 mod account_state;
+mod account_switcher;
+mod auth_guard;
 mod avatar_panel;
 mod backup_panel;
 mod board_panel;
@@ -513,6 +515,9 @@ pub enum GuiEvent {
     UploadResumeAvailable {
         sessions: Vec<crate::upload::ResumableUploadState>,
     },
+    ProfileSwitched {
+        uid: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -753,6 +758,12 @@ pub struct ZaloGuiApp {
     user_name: String,
     user_uin: String,
     user_avatar: Option<String>,
+
+    // App lock state (WP16-4)
+    lock_guard: auth_guard::AppLockGuard,
+
+    // Account switcher state (WP16-3)
+    account_switcher: account_switcher::AccountSwitcher,
 
     // Login screen state
     login_tab: LoginTab,
@@ -1223,6 +1234,8 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             quote_jump: None,
             quick_schedule: None,
+            lock_guard: auth_guard::AppLockGuard::new(),
+            account_switcher: account_switcher::AccountSwitcher::default(),
         };
 
         if !bootstrap {
@@ -2643,6 +2656,15 @@ impl ZaloGuiApp {
                             }
                         }
                         Err(e) => self.show_toast(format!("Không thể tạo phiên mới: {e}")),
+                    }
+                }
+                GuiEvent::ProfileSwitched { uid: _ } => {
+                    // WP16-3: Profile switched; refresh UI state for new profile
+                    self.status_msg = "Đã chuyển tài khoản thành công".into();
+                    self.profile_menu_open = false;
+                    // Request refresh of threads and state for new profile
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::RefreshThreads);
                     }
                 }
                 GuiEvent::Tools { owner, result } => {
@@ -4481,6 +4503,13 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Update lock guard on user interaction (WP16-4)
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()
+            || !i.raw.dropped_files.is_empty()
+            || i.raw.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::PointerButton { .. }))) {
+            self.lock_guard.touch();
+        }
+
         crate::i18n::set_language(&self.settings.language);
         let notice_owner = if self.is_logged_in {
             self.user_uin.as_str()

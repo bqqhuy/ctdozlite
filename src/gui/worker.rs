@@ -438,6 +438,10 @@ pub enum WorkerCmd {
     CancelUpload {
         upload_id: String,
     },
+    SwitchProfile {
+        owner: String,
+        target_uid: String,
+    },
     Logout,
 }
 
@@ -1663,6 +1667,61 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             // Dropping this runtime cancels all old network tasks. A fresh UI channel
                             // prevents queued events from the previous account reaching the next one.
                             break;
+                        }
+                        WorkerCmd::SwitchProfile { owner, target_uid } => {
+                            // WP16-3: Profile switching integration
+                            let current_account = session.lock().await.account_key().to_owned();
+                            if current_account != owner {
+                                let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi".into()));
+                                continue;
+                            }
+
+                            let target_uid_clone = target_uid.clone();
+                            // Load the target profile from ProfileRegistry
+                            let profile_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                let registry = crate::profiles::ProfileRegistry::load()?;
+                                let profile = registry.profiles.values()
+                                    .find(|p| p.uid == target_uid)
+                                    .ok_or_else(|| anyhow::anyhow!("Profile not found"))?
+                                    .clone();
+                                Ok(profile)
+                            }).await;
+
+                            match profile_result {
+                                Ok(Ok(profile)) => {
+                                    // Logout current session
+                                    session.lock().await.logout();
+
+                                    // Load new session from profile
+                                    let load_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                                        let mut new_session = crate::session::Session::new(false, false, false)?;
+                                        let session_path = profile.session_file.to_string_lossy().to_string();
+                                        new_session.load_from_file(&session_path)?;
+                                        Ok(new_session)
+                                    }).await;
+
+                                    match load_result {
+                                        Ok(Ok(new_session)) => {
+                                            *session.lock().await = new_session;
+                                            let _ = gui_tx.send(GuiEvent::ProfileSwitched { uid: target_uid_clone });
+                                            egui_ctx.request_repaint();
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Đã chuyển tài khoản".into()));
+                                        }
+                                        Ok(Err(e)) => {
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể tải phiên: {e}")));
+                                        }
+                                        Err(_) => {
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Lỗi tải phiên".into()));
+                                        }
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không tìm thấy tài khoản: {e}")));
+                                }
+                                Err(_) => {
+                                    let _ = gui_tx.send(GuiEvent::StatusUpdate("Lỗi đọc danh sách tài khoản".into()));
+                                }
+                            }
                         }
                         WorkerCmd::PersistSession => {
                             let s = session.lock().await;

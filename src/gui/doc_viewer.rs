@@ -1,7 +1,8 @@
 //! Document preview modal for plain text, JSON, and log files.
 
-use eframe::egui::{self, Id, RichText};
+use eframe::egui;
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct DocViewerModal {
     pub content: String,
@@ -12,6 +13,7 @@ pub struct DocViewerModal {
     pub search_index: usize,         // Current position in search_results
 }
 
+#[allow(dead_code)]
 impl DocViewerModal {
     pub fn new(content: String, file_name: String) -> Self {
         Self {
@@ -69,11 +71,12 @@ impl DocViewerModal {
     }
 }
 
+#[allow(dead_code)]
 impl super::ZaloGuiApp {
     pub(super) fn render_doc_viewer_modal(
         &mut self,
-        ctx: &egui::Context,
-        pal: &super::ThemePalette,
+        _ctx: &egui::Context,
+        _pal: &super::ThemePalette,
     ) {
         // Placeholder: Document viewer not yet integrated.
         // This stub allows the modal type to be available for future v0.016+ implementation.

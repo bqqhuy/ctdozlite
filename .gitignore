@@ -51,3 +51,6 @@ data/
 # Account-scoped privacy metadata (never commit runtime account data)
 hidden_membership.json
 account_metadata_cache.json
+
+# Agent worktrees and ephemeral scratch directories
+.claude/worktrees/

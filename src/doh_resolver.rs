@@ -30,16 +30,16 @@ const DOH_ENDPOINTS: &[&str] = &[
 /// DNS response schema (simplified; only used fields)
 #[derive(serde::Deserialize)]
 struct DnsResponse {
-    #[serde(default)]
-    Answer: Vec<DnsAnswer>,
+    #[serde(default, rename = "Answer")]
+    answer: Vec<DnsAnswer>,
 }
 
 #[derive(serde::Deserialize)]
 struct DnsAnswer {
     #[serde(default)]
     data: String,
-    #[serde(default)]
-    TTL: u32,
+    #[serde(default, rename = "TTL")]
+    ttl: u32,
 }
 
 impl DohResolver {
