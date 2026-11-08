@@ -67,15 +67,17 @@ pub async fn encrypt_message(
     peer_id: &str,
     plaintext: &str,
 ) -> Result<Vec<u8>> {
-    let _lock = lock_e2ee();
     let mgr = get_manager(profile_id)?;
 
-    // Try existing session first
-    if mgr.load_session(peer_id)?.is_some() {
-        return mgr.encrypt(peer_id, None, plaintext.as_bytes());
+    // Try existing session first under lock
+    {
+        let _lock = lock_e2ee();
+        if mgr.load_session(peer_id)?.is_some() {
+            return mgr.encrypt(peer_id, None, plaintext.as_bytes());
+        }
     }
 
-    // No session → fetch peer's prekey bundle
+    // No session → fetch peer's prekey bundle (network I/O without holding lock)
     let bundle = fetch_bundle(session, peer_id).await?;
 
     // Upload our bundle if not yet done
@@ -84,7 +86,11 @@ pub async fn encrypt_message(
         eprintln!("Cảnh báo: không upload được prekey bundle: {e}");
     }
 
-    // Start session with first message
+    // Start session with first message under lock (re-check if another task established it)
+    let _lock = lock_e2ee();
+    if mgr.load_session(peer_id)?.is_some() {
+        return mgr.encrypt(peer_id, None, plaintext.as_bytes());
+    }
     mgr.start_session(peer_id, &bundle, plaintext.as_bytes())
         .map_err(|e| anyhow::anyhow!("Không khởi tạo được phiên E2EE: {e}"))
 }
