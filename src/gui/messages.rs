@@ -1330,6 +1330,10 @@ pub(super) fn render_chat_bubble(
                                 ui.label(
                                     RichText::new(ts_txt).size(11.0).color(pal.bubble_out_meta),
                                 );
+                                // WP16-3: E2EE lock badge
+                                if msg.is_e2ee {
+                                    ui.label(RichText::new("🔒").size(11.0));
+                                }
                             }
                         });
                     });
@@ -1474,6 +1478,10 @@ pub(super) fn render_chat_bubble(
                                         .color(pal.bubble_in_meta)
                                         .size(11.0),
                                 );
+                                // WP16-3: E2EE lock badge
+                                if msg.is_e2ee {
+                                    ui.label(RichText::new("🔒").size(11.0));
+                                }
                             }
                         });
                     });
