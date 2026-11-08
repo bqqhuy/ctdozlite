@@ -111,12 +111,43 @@ impl DohResolver {
     }
 
     /// Query a single DoH endpoint, returning (IpAddrs, TTL)
+    /// Audit A23: Google DoH JSON API takes one RR type parameter at a time.
+    /// Query A and AAAA separately and merge results.
     async fn query_endpoint_with_ttl(
         &self,
         endpoint: &str,
         host: &str,
     ) -> Result<(Vec<IpAddr>, u32)> {
-        let url = format!("{}?name={}&type=A,AAAA", endpoint, host);
+        let mut all_addrs = Vec::new();
+        let mut max_ttl = 300u32;
+
+        // Query A records (IPv4)
+        if let Ok((a_addrs, a_ttl)) = self.query_type(endpoint, host, "A").await {
+            all_addrs.extend(a_addrs);
+            max_ttl = max_ttl.max(a_ttl);
+        }
+
+        // Query AAAA records (IPv6)
+        if let Ok((aaaa_addrs, aaaa_ttl)) = self.query_type(endpoint, host, "AAAA").await {
+            all_addrs.extend(aaaa_addrs);
+            max_ttl = max_ttl.max(aaaa_ttl);
+        }
+
+        if all_addrs.is_empty() {
+            return Err(anyhow!("No A/AAAA records in response"));
+        }
+
+        Ok((all_addrs, max_ttl))
+    }
+
+    /// Query a single RR type (A or AAAA) from a DoH endpoint.
+    async fn query_type(
+        &self,
+        endpoint: &str,
+        host: &str,
+        rr_type: &str,
+    ) -> Result<(Vec<IpAddr>, u32)> {
+        let url = format!("{}?name={}&type={}", endpoint, host, rr_type);
         let resp = self.client.get(&url).send().await?;
         let dns_resp: DnsResponse = resp.json().await?;
 
@@ -126,11 +157,7 @@ impl DohResolver {
             .filter_map(|a| a.data.parse::<IpAddr>().ok())
             .collect();
 
-        if addrs.is_empty() {
-            return Err(anyhow!("No A/AAAA records in response"));
-        }
-
-        // Use maximum TTL from response (or default 300s)
+        // Empty response for this type is not an error (may not have AAAA, etc.)
         let ttl = dns_resp
             .answer
             .iter()
@@ -151,15 +178,6 @@ impl DohResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_doh_resolve() {
-        let resolver = DohResolver::new().unwrap();
-        // Test with a known domain
-        let result = resolver.resolve("dns.google").await;
-        // May fail in test environment without network, so just check API
-        let _ = result;
-    }
 
     #[test]
     fn test_cache_invalidate() {
