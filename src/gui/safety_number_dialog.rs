@@ -1,6 +1,6 @@
 //! Safety number verification dialog (WP16 Sprint 3-4).
 
-use egui::{Context, Id, Window};
+use eframe::egui::{Context, Id, Window};
 
 pub struct SafetyNumberDialog {
     pub peer_id: String,
@@ -10,6 +10,15 @@ pub struct SafetyNumberDialog {
 }
 
 impl SafetyNumberDialog {
+    pub fn new(peer_id: String, peer_name: String) -> Self {
+        Self {
+            peer_id,
+            peer_name,
+            safety_number: String::new(), // TODO: Load from crypto/safety.rs
+            identity_changed: false,
+        }
+    }
+
     pub fn render(&mut self, ctx: &Context, open: &mut bool) {
         Window::new(format!("🔒 Mã an toàn - {}", self.peer_name))
             .id(Id::new("safety_number_dialog"))
@@ -20,7 +29,7 @@ impl SafetyNumberDialog {
                 ui.vertical_centered(|ui| {
                     if self.identity_changed {
                         ui.colored_label(
-                            egui::Color32::from_rgb(239, 68, 68),
+                            eframe::egui::Color32::from_rgb(239, 68, 68),
                             "⚠️ Thiết bị của đối phương đã thay đổi"
                         );
                         ui.label("Mã an toàn trước đây không còn khớp.");
