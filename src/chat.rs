@@ -2646,6 +2646,47 @@ fn extract_meta_attr(tag: &str, attr_name: &str) -> Option<String> {
 
 /// Scrape OpenGraph / Twitter Card / HTML `<meta>` tags directly from a webpage URL.
 pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
+    // A27 fix: Validate URL scheme and reject private/loopback addresses
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    // Reject URLs with credentials (username:password@host)
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    // Reject private/loopback/link-local IP addresses
+    if let Some(host_str) = parsed.host_str() {
+        // Try parsing as IP address
+        if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
+            match ip {
+                std::net::IpAddr::V4(ipv4) => {
+                    if ipv4.is_loopback() || ipv4.is_private() {
+                        return None;
+                    }
+                    // Link-local 169.254.0.0/16
+                    let octets = ipv4.octets();
+                    if octets[0] == 169 && octets[1] == 254 {
+                        return None;
+                    }
+                }
+                std::net::IpAddr::V6(ipv6) => {
+                    if ipv6.is_loopback() || ipv6.is_unspecified() {
+                        return None;
+                    }
+                    // Link-local (fe80::/10) and ULA (fc00::/7)
+                    let octets = ipv6.octets();
+                    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                        return None;
+                    }
+                    if (octets[0] & 0xfe) == 0xfc {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
     // Link previews fetch third-party URLs; they must use the same proxy as Zalo traffic.
     let client = crate::proxy::apply(reqwest::Client::builder())
         .ok()?
