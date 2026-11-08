@@ -48,6 +48,9 @@ Thumbs.db
 session.dat
 data/
 
+# Claude AI worktrees (temporary parallel work isolation, never commit)
+.claude/worktrees/
+
 # Account-scoped privacy metadata (never commit runtime account data)
 hidden_membership.json
 account_metadata_cache.json
