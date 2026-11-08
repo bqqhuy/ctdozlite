@@ -334,10 +334,8 @@ pub fn verify_signed_prekey(remote: &super::prekey::RemoteBundle) -> bool {
     let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&identity) else {
         return false;
     };
-    let Ok(sig_bytes) = <[u8; 64]>::try_from(remote.signature.as_slice()) else {
-        return false;
-    };
-    let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    // The parser enforces the exact 64-byte signature length (audit A03).
+    let sig = ed25519_dalek::Signature::from_bytes(&remote.signature);
     vk.verify_strict(&remote.signed_pre_key, &sig).is_ok()
 }
 
@@ -364,7 +362,7 @@ mod tests {
             registration_id: identity.registration_id,
             signed_pre_key_id: spk.key_id,
             signed_pre_key: spk.key_pair.public,
-            signature: spk.signature,
+            signature: spk.signature.clone().try_into().expect("Ed25519 signature is 64 bytes"),
             one_time_pre_key: otpk.first().map(|k| (k.key_pair.public, k.key_id)),
         }
     }
@@ -440,6 +438,38 @@ mod tests {
         let last = ct.len() - 1;
         ct[last] ^= 0xFF;
         assert!(bob.decrypt("alice", &ct).is_err());
+    }
+
+    /// Audit A03 regression: a *validly signed* bundle fixture must survive the
+    /// production serialize → `parse_bundle` → `verify_signed_prekey` path.
+    ///
+    /// The Ed25519 signing key travels in `signingIdentityKey`, separate from
+    /// the Curve25519 DH identity key (audit A04) — without it the verifier
+    /// falls back to the DH key and fails even on a correctly signed bundle.
+    #[test]
+    fn parsed_bundle_signature_verifies_through_production_path() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+        let bob = manager("roundtrip");
+        let identity = bob.identity().unwrap();
+        let spk = bob.signed_prekey().unwrap();
+
+        let dec = serde_json::json!({
+            "error_code": 0,
+            "identityKey": B64.encode(identity.dh.public),
+            "signingIdentityKey": B64.encode(identity.signing_public),
+            "registrationId": identity.registration_id,
+            "signedPreKey": {
+                "keyId": spk.key_id,
+                "publicKey": B64.encode(spk.key_pair.public),
+                "signature": B64.encode(&spk.signature),
+            },
+        });
+        let parsed = super::super::prekey::parse_bundle(&dec).expect("parse production bundle");
+        assert!(
+            verify_signed_prekey(&parsed),
+            "a correctly signed bundle must verify after the parse round-trip"
+        );
     }
 
     #[test]
