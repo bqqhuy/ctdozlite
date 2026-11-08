@@ -200,6 +200,21 @@ impl E2eeManager {
         store::is_trusted_identity(&self.conn, &self.profile_id, peer_id, identity_key)
     }
 
+    /// Load trusted identity key and verified status for a peer.
+    pub fn get_trusted_identity(&self, peer_id: &str) -> Result<Option<([u8; 32], bool)>> {
+        store::get_trusted_identity(&self.conn, &self.profile_id, peer_id)
+    }
+
+    /// Explicitly mark a peer's identity as verified by the user.
+    pub fn verify_identity(&self, peer_id: &str) -> Result<()> {
+        store::set_identity_verified(&self.conn, &self.profile_id, peer_id, true)
+    }
+
+    /// Check if peer's identity has been verified by the user.
+    pub fn is_identity_verified(&self, peer_id: &str) -> Result<bool> {
+        store::is_identity_verified(&self.conn, &self.profile_id, peer_id)
+    }
+
     /// Safety number between our identity and the peer's identity.
     pub fn safety_number(&self, peer_identity: &[u8; 32]) -> Result<String> {
         let ours = self.identity()?;

@@ -2438,7 +2438,7 @@ impl ZaloGuiApp {
             video_state: if video { Some(super::VideoPlayerState {
                 playing: false,
                 position_secs: 0.0,
-                duration_secs: 0.0,
+                duration_secs: media.duration.map(|d| d as f32).unwrap_or(0.0),
                 volume: 1.0,
             }) } else { None },
         });
@@ -2737,10 +2737,27 @@ impl ZaloGuiApp {
                             if let Some(ref mut vstate) = viewer.video_state {
                                 ui.separator();
                                 ui.horizontal(|ui| {
-                                    // Play/Pause button
-                                    let play_btn = if vstate.playing { "⏸" } else { "▶" };
-                                    if ui.small_button(play_btn).clicked() {
-                                        vstate.playing = !vstate.playing;
+                                    let is_active = crate::video_player::is_video_window_active();
+                                    let is_playing = vstate.playing || is_active;
+                                    let play_icon = if is_playing { "⏸" } else { "▶" };
+                                    let play_tip = if is_playing { "Tạm dừng" } else { "Phát video" };
+
+                                    if ui.small_button(play_icon).on_hover_text(play_tip).clicked() {
+                                        if is_active {
+                                            crate::video_player::control_play_pause();
+                                            vstate.playing = !vstate.playing;
+                                        } else {
+                                            vstate.playing = true;
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::DownloadMedia {
+                                                    url: viewer.original_url.clone(),
+                                                    name: viewer.title.clone(),
+                                                    play: true,
+                                                    open: false,
+                                                    context: Some(viewer.source.clone()),
+                                                });
+                                            }
+                                        }
                                     }
 
                                     // Time display
@@ -2751,12 +2768,12 @@ impl ZaloGuiApp {
                                     ui.label(format!("{:02}:{:02} / {:02}:{:02}", pos_min, pos_sec, dur_min, dur_sec));
 
                                     // Seek scrubber
-                                    if vstate.duration_secs > 0.0 {
-                                        let mut pos = vstate.position_secs;
-                                        if ui.add(egui::Slider::new(&mut pos, 0.0..=vstate.duration_secs)
-                                            .show_value(false)).changed() {
-                                            vstate.position_secs = pos;
-                                        }
+                                    let max_dur = vstate.duration_secs.max(1.0);
+                                    let mut pos = vstate.position_secs;
+                                    if ui.add(egui::Slider::new(&mut pos, 0.0..=max_dur)
+                                        .show_value(false)).changed() {
+                                        vstate.position_secs = pos;
+                                        crate::video_player::control_seek(pos);
                                     }
 
                                     // Volume control
@@ -2766,6 +2783,7 @@ impl ZaloGuiApp {
                                         .show_value(false)
                                         .fixed_decimals(2)).changed() {
                                         vstate.volume = vol;
+                                        crate::video_player::control_set_volume(vol);
                                     }
                                 });
                             }
@@ -2777,8 +2795,9 @@ impl ZaloGuiApp {
                                             &viewer.source.thread,
                                             viewer.source.group,
                                         ) && !viewer.original_url.is_empty(),
-                                        egui::Button::new(crate::i18n::tr("▶ Phát video")),
+                                        egui::Button::new(crate::i18n::tr("▶ Cửa sổ video riêng")),
                                     )
+                                    .on_hover_text(crate::i18n::tr("Mở video trong cửa sổ native riêng biệt"))
                                     .clicked()
                                 {
                                     if let Some(tx) = WORKER_TX.get() {
@@ -2912,6 +2931,156 @@ impl ZaloGuiApp {
             } else {
                 self.image_viewer = Some(viewer);
             }
+        }
+    }
+
+    pub(super) fn open_safety_number_modal(&mut self, peer_id: String, peer_name: String) {
+        let is_verified = self.trusted_peers.contains(&peer_id);
+        self.safety_number_modal = Some(super::SafetyNumberModalState {
+            peer_id: peer_id.clone(),
+            peer_name: peer_name.clone(),
+            safety_number: String::new(),
+            is_verified,
+            identity_changed: false,
+            loading: true,
+        });
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::LoadSafetyNumber {
+                owner: self.user_uin.clone(),
+                peer_id,
+                peer_name,
+            });
+        }
+    }
+
+    pub(super) fn render_safety_number_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let Some(ref mut modal) = self.safety_number_modal else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.safety_number_modal = None;
+            return;
+        }
+
+        let mut is_open = true;
+        let mut close_clicked = false;
+        let mut trust_action = false;
+        let peer_id = modal.peer_id.clone();
+        let peer_name = modal.peer_name.clone();
+
+        egui::Window::new(format!("🔒 Mã an toàn E2EE — {peer_name}"))
+            .id(Id::new("safety_number_verification_modal"))
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(8.0);
+                    if modal.identity_changed {
+                        ui.colored_label(
+                            Color32::from_rgb(239, 68, 68),
+                            "⚠️ Thiết bị của đối phương đã thay đổi!",
+                        );
+                        ui.label(RichText::new("Mã an toàn trước đây không còn khớp. Hãy xác minh lại.").size(12.0).color(pal.warning));
+                        ui.add_space(8.0);
+                    }
+
+                    if modal.loading {
+                        ui.spinner();
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Đang tính toán mã an toàn E2EE…").color(pal.text_secondary));
+                    } else {
+                        ui.label(
+                            RichText::new("Mã an toàn (60 chữ số chia thành 12 nhóm, mỗi nhóm 5 chữ số):")
+                                .size(13.0)
+                                .color(pal.text_primary)
+                                .strong(),
+                        );
+                        ui.add_space(10.0);
+
+                        // Render safety number in 4 rows of 3 groups
+                        let groups: Vec<&str> = modal.safety_number.split_whitespace().collect();
+                        egui::Frame::none()
+                            .fill(pal.bg_elevated)
+                            .stroke(Stroke::new(1.0_f32, pal.border))
+                            .rounding(Rounding::same(8.0))
+                            .inner_margin(Margin::symmetric(16.0, 12.0))
+                            .show(ui, |ui| {
+                                for row in groups.chunks(3) {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing = Vec2::new(18.0, 6.0);
+                                        for group in row {
+                                            ui.monospace(
+                                                RichText::new(*group)
+                                                    .size(15.5)
+                                                    .strong()
+                                                    .color(pal.text_primary),
+                                            );
+                                        }
+                                    });
+                                    ui.add_space(4.0);
+                                }
+                            });
+
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "So sánh mã số này với {peer_name} qua điện thoại hoặc trực tiếp để xác nhận phiên trò chuyện an toàn."
+                            ))
+                            .size(11.5)
+                            .color(pal.text_secondary),
+                        );
+                        ui.add_space(14.0);
+
+                        if modal.is_verified {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new("✓ Đã xác minh an toàn")
+                                        .size(13.5)
+                                        .color(Color32::from_rgb(34, 197, 94))
+                                        .strong(),
+                                );
+                            });
+                        } else {
+                            let btn = egui::Button::new(
+                                RichText::new("✓ Xác minh danh tính")
+                                    .size(13.0)
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(pal.primary)
+                            .stroke(Stroke::new(1.0_f32, pal.primary_hover))
+                            .rounding(Rounding::same(8.0))
+                            .min_size(Vec2::new(190.0, 32.0));
+
+                            if ui.add(btn).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                trust_action = true;
+                            }
+                        }
+                    }
+
+                    ui.add_space(14.0);
+                    if ui.button(crate::i18n::tr("Đóng")).clicked() {
+                        close_clicked = true;
+                    }
+                    ui.add_space(4.0);
+                });
+            });
+
+        if trust_action {
+            if let Some(ref mut m) = self.safety_number_modal {
+                m.loading = true;
+            }
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::TrustIdentity { peer_id });
+            }
+        }
+
+        if !is_open || close_clicked {
+            self.safety_number_modal = None;
         }
     }
 
@@ -3220,5 +3389,56 @@ mod download_folder_tests {
         assert!(validate_download_folder(&file).is_err());
         assert!(validate_download_folder(&root.path().join("missing")).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+    }
+}
+
+#[cfg(test)]
+mod safety_number_modal_tests {
+
+    #[test]
+    fn safety_number_calculation_and_chunking() {
+        let our_key = [1u8; 32];
+        let peer_key = [2u8; 32];
+        let sn = crate::crypto::safety::safety_number(&our_key, &peer_key).unwrap();
+
+        // 60 digits divided into 12 groups of 5 characters, separated by space:
+        // Total chars: 60 digits + 11 spaces = 71 chars.
+        assert_eq!(sn.len(), 71);
+        let groups: Vec<&str> = sn.split_whitespace().collect();
+        assert_eq!(groups.len(), 12);
+        for g in &groups {
+            assert_eq!(g.len(), 5);
+            assert!(g.chars().all(|c| c.is_ascii_digit()));
+        }
+
+        // Verify Symmetry:
+        let sn_reverse = crate::crypto::safety::safety_number(&peer_key, &our_key).unwrap();
+        assert_eq!(sn, sn_reverse);
+    }
+
+    #[test]
+    fn safety_number_modal_state_lifecycle() {
+        let mut modal = super::super::SafetyNumberModalState {
+            peer_id: "user_bob_123".into(),
+            peer_name: "Bob".into(),
+            safety_number: String::new(),
+            is_verified: false,
+            identity_changed: false,
+            loading: true,
+        };
+
+        assert!(modal.loading);
+        assert!(!modal.is_verified);
+
+        // Simulate loaded event
+        let sn = crate::crypto::safety::safety_number(&[10u8; 32], &[20u8; 32]).unwrap();
+        modal.safety_number = sn;
+        modal.loading = false;
+        assert!(!modal.loading);
+        assert_eq!(modal.safety_number.split_whitespace().count(), 12);
+
+        // Simulate identity trusted
+        modal.is_verified = true;
+        assert!(modal.is_verified);
     }
 }

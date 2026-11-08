@@ -20,6 +20,11 @@ use windows::{
     },
 };
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+pub(crate) static ACTIVE_VIDEO_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+pub(crate) static REQUESTED_SEEK_100NS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+pub(crate) static REQUESTED_VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+const WM_APP_SEEK: u32 = 0x8000 + 1;
+const WM_APP_SET_VOL: u32 = 0x8000 + 2;
 thread_local! {
     static PLAYER:RefCell<Option<IMFPMediaPlayer>>=const{RefCell::new(None)};
     static ROOT:Cell<HWND>=const{Cell::new(HWND(0))};
@@ -471,13 +476,36 @@ unsafe extern "system" fn procedure(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_CLOSE => {
+            ACTIVE_VIDEO_WINDOW.store(0, Ordering::SeqCst);
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            ACTIVE_VIDEO_WINDOW.store(0, Ordering::SeqCst);
             if hwnd == ROOT.with(Cell::get) {
                 PostQuitMessage(0);
             }
+            LRESULT(0)
+        }
+        WM_APP_SEEK => {
+            let target = REQUESTED_SEEK_100NS.swap(-1, Ordering::SeqCst);
+            if target >= 0 {
+                if let Some(p) = player() {
+                    let _ = p.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from(target));
+                }
+            }
+            refresh_controls(ROOT.with(Cell::get));
+            LRESULT(0)
+        }
+        WM_APP_SET_VOL => {
+            let raw = REQUESTED_VOLUME.swap(u32::MAX, Ordering::SeqCst);
+            if raw <= 1000 {
+                let vol = raw as f32 / 1000.0;
+                if let Some(p) = player() {
+                    let _ = p.SetVolume(vol);
+                }
+            }
+            refresh_controls(ROOT.with(Cell::get));
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
@@ -551,6 +579,7 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
         anyhow::ensure!(root.0 != 0, "Không tạo được cửa sổ native");
         let _window = WindowGuard(root);
         ROOT.with(|s| s.set(root));
+        ACTIVE_VIDEO_WINDOW.store(root.0, Ordering::SeqCst);
         FULL.with(|s| s.set(false));
         let surface = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -710,8 +739,42 @@ pub(super) fn run(path: &Path, title: &str, active: impl Fn() -> bool) -> Result
         if IsWindow(root).as_bool() {
             let _ = DestroyWindow(root);
         }
+        ACTIVE_VIDEO_WINDOW.store(0, Ordering::SeqCst);
         ROOT.with(|s| s.set(HWND(0)));
         SURFACE.with(|s| s.set(HWND(0)));
         result
+    }
+}
+
+pub(super) fn is_video_window_active() -> bool {
+    ACTIVE_VIDEO_WINDOW.load(Ordering::SeqCst) != 0
+}
+
+pub(super) fn control_play_pause() {
+    let hwnd = ACTIVE_VIDEO_WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(HWND(hwnd), WM_COMMAND, WPARAM(1), LPARAM(0));
+        }
+    }
+}
+
+pub(super) fn control_seek(target_secs: f32) {
+    let hwnd = ACTIVE_VIDEO_WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 && target_secs >= 0.0 {
+        REQUESTED_SEEK_100NS.store((target_secs * 10_000_000.0) as i64, Ordering::SeqCst);
+        unsafe {
+            let _ = PostMessageW(HWND(hwnd), WM_APP_SEEK, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+pub(super) fn control_set_volume(volume: f32) {
+    let hwnd = ACTIVE_VIDEO_WINDOW.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        REQUESTED_VOLUME.store((volume.clamp(0.0, 1.0) * 1000.0) as u32, Ordering::SeqCst);
+        unsafe {
+            let _ = PostMessageW(HWND(hwnd), WM_APP_SET_VOL, WPARAM(0), LPARAM(0));
+        }
     }
 }

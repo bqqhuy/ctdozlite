@@ -73,6 +73,57 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
 
 const PING_SECS: u64 = 15;
 
+/// Maximum allowed payload size of a WebSocket frame (16MB) to guard against memory exhaustion (OOM/DoS) (A22).
+pub const MAX_FRAME_PAYLOAD_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+/// Validate target WebSocket host against endpoints allowlist and reject private/loopback addresses (A24).
+pub fn validate_ws_host(host: &str) -> Result<()> {
+    let host = host.trim();
+    if host.is_empty() {
+        bail!("WebSocket target host is empty");
+    }
+
+    let allow_test = cfg!(test) || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some();
+    if allow_test && (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+        return Ok(());
+    }
+
+    if !crate::endpoints::is_allowed_ws_host(host) {
+        bail!("WebSocket host '{host}' rejected: not in WS_HOSTS allowlist");
+    }
+
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if crate::endpoints::is_private_or_loopback_ip(ip) && !allow_test {
+            bail!("WebSocket host '{host}' rejected: private or loopback IP not allowed (DNS rebinding guard)");
+        }
+    }
+
+    Ok(())
+}
+
+/// Verify that DNS resolution of WebSocket host does not resolve to private or loopback IPs (DNS rebinding guard) (A24).
+pub async fn verify_ws_dns(host: &str, port: u16) -> Result<()> {
+    let allow_test = cfg!(test) || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some();
+    if allow_test && (host == "127.0.0.1" || host == "localhost" || host == "::1") {
+        return Ok(());
+    }
+
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
+        for addr in addrs {
+            let ip = addr.ip();
+            if crate::endpoints::is_private_or_loopback_ip(ip) && !allow_test {
+                bail!("WebSocket host '{host}' resolved to private/loopback IP {ip} (DNS rebinding guard)");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // -- wire level ----------------------------------------------------------------
 
 fn now_ms() -> u64 {
@@ -95,6 +146,13 @@ fn trace(msg: impl std::fmt::Display) {
 /// Encode one frame: `u8 version | u16 LE cmd | u8 subCmd | JSON body`.
 pub fn encode_frame(cmd: u16, sub_cmd: u8, version: u8, data: Option<&Value>) -> Vec<u8> {
     let body = data.map(|d| d.to_string()).unwrap_or_default();
+    if body.len() > MAX_FRAME_PAYLOAD_SIZE {
+        trace(format!(
+            "encode_frame: body length {} exceeds MAX_FRAME_PAYLOAD_SIZE",
+            body.len()
+        ));
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(version);
     out.extend_from_slice(&cmd.to_le_bytes());
@@ -112,6 +170,13 @@ pub fn decode_frame(buf: &[u8]) -> Option<(u8, u16, u8, Value)> {
     let cmd = u16::from_le_bytes([buf[1], buf[2]]);
     let sub_cmd = buf[3];
     let body = &buf[4..];
+    if body.len() > MAX_FRAME_PAYLOAD_SIZE {
+        trace(format!(
+            "decode_frame: payload length {} exceeds MAX_FRAME_PAYLOAD_SIZE",
+            body.len()
+        ));
+        return None;
+    }
     if body.is_empty() {
         return Some((version, cmd, sub_cmd, Value::Null));
     }
@@ -122,6 +187,9 @@ pub fn decode_frame(buf: &[u8]) -> Option<(u8, u16, u8, Value)> {
 /// `decodeURIComponent` for the AES branch, tolerating raw `+`/`/`/`=` base64.
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
+    if bytes.len() > MAX_FRAME_PAYLOAD_SIZE {
+        return String::new();
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -210,6 +278,13 @@ fn gcm_decrypt(key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
 
 /// Apply the envelope's `encrypt` scheme to its `data` field.
 pub fn decrypt_payload(cipher_key: Option<&[u8]>, encrypt: u8, data: &str) -> Result<Vec<u8>> {
+    if data.len() > MAX_FRAME_PAYLOAD_SIZE {
+        bail!(
+            "Payload exceeds maximum allowed frame size ({} > {})",
+            data.len(),
+            MAX_FRAME_PAYLOAD_SIZE
+        );
+    }
     match encrypt {
         0 => Ok(data.as_bytes().to_vec()),
         1 => inflate(&B64.decode(data)?),
@@ -565,6 +640,15 @@ async fn run_once(
     trace(format!("connect {}", crate::session::redact_url(&url)));
 
     let mut req = url.clone().into_client_request()?;
+    let uri = req.uri();
+    let host = uri.host().unwrap_or_default().to_string();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
+        80
+    } else {
+        443
+    });
+    validate_ws_host(&host)?;
+    verify_ws_dns(&host, port).await?;
     {
         let h = req.headers_mut();
         if let Some(sek) = sess.zpw_sek.as_deref().filter(|s| !s.is_empty()) {
@@ -579,8 +663,8 @@ async fn run_once(
     }
 
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        max_message_size: Some(crate::limits::INFLATED_BYTES as usize),
-        max_frame_size: Some(crate::limits::INFLATED_BYTES as usize),
+        max_message_size: Some(MAX_FRAME_PAYLOAD_SIZE),
+        max_frame_size: Some(MAX_FRAME_PAYLOAD_SIZE),
         ..Default::default()
     };
     let connection = tokio::time::timeout(Duration::from_secs(15), async {
@@ -709,7 +793,16 @@ async fn run_once(
                 };
                 let incoming = incoming?;
                 let buf = match incoming {
-                    Message::Binary(b) => b,
+                    Message::Binary(b) => {
+                        if b.len() > 4 + MAX_FRAME_PAYLOAD_SIZE {
+                            trace(format!(
+                                "<- frame size {} exceeds MAX_FRAME_PAYLOAD_SIZE",
+                                b.len()
+                            ));
+                            continue;
+                        }
+                        b
+                    }
                     Message::Text(t) => {
                         trace(format!("<- text {} bytes", t.len()));
                         continue;
@@ -1007,5 +1100,58 @@ mod forward_tests {
         let (forward, received) = mpsc::channel(1);
         drop(received);
         assert!(forward_event(&forward, event(1), 1).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod a22_payload_limit_tests {
+    use super::*;
+
+    #[test]
+    fn decode_frame_rejects_oversized_payload() {
+        let mut header = vec![1u8, 0x01, 0x02, 0x00];
+        header.extend_from_slice(b"{\"ok\":true}");
+        assert!(decode_frame(&header).is_some());
+        assert!(decode_frame(&header[..4]).is_some());
+        assert_eq!(MAX_FRAME_PAYLOAD_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn decrypt_payload_rejects_oversized_data() {
+        let huge_dummy = "A".repeat(100);
+        assert!(decrypt_payload(None, 0, &huge_dummy).is_ok());
+
+        let oversized = "A".repeat(MAX_FRAME_PAYLOAD_SIZE + 1);
+        let err = decrypt_payload(None, 0, &oversized).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum allowed frame size"));
+    }
+}
+
+#[cfg(test)]
+mod a24_ws_host_guard_tests {
+    use super::*;
+
+    #[test]
+    fn validate_ws_host_accepts_valid_endpoints() {
+        assert!(validate_ws_host("ws1-msg.chat.zalo.me").is_ok());
+        assert!(validate_ws_host("ws4-msg.chat.zalo.me").is_ok());
+        assert!(validate_ws_host("ws8-msg.chat.zalo.me").is_ok());
+        assert!(validate_ws_host("ws12-msg.chat.zalo.me").is_ok());
+    }
+
+    #[test]
+    fn validate_ws_host_rejects_untrusted_hosts() {
+        assert!(validate_ws_host("evil.com").is_err());
+        assert!(validate_ws_host("not-zalo.chat.zalo.me.evil.com").is_err());
+        assert!(validate_ws_host("").is_err());
+        assert!(validate_ws_host("   ").is_err());
+    }
+
+    #[test]
+    fn validate_ws_host_rejects_private_ips() {
+        assert!(validate_ws_host("192.168.1.1").is_err());
+        assert!(validate_ws_host("10.0.0.1").is_err());
+        assert!(validate_ws_host("172.16.0.1").is_err());
+        assert!(validate_ws_host("169.254.169.254").is_err());
     }
 }

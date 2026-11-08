@@ -1452,7 +1452,18 @@ impl ZaloGuiApp {
                                 ui.add_space(8.0);
                                 if d_is_group && ui.button("Ghi chú & bình chọn").clicked(){self.open_group_content(d_id.clone());}
                                 if ui.button("Tin tự xóa & chặn chia sẻ").clicked(){self.policy_panel.confirm=None;self.policy_panel.target=Some((d_id.clone(),d_is_group));self.policy_panel.ttl=self.policy_panel.snapshot.as_ref().map(|snapshot|snapshot.ttl(d_id,d_is_group)).unwrap_or(0);self.policy_command(crate::conversation_policy::Action::Read);}
-                                if !d_is_group && d_id!=&self.user_uin && !d_name.contains("Cloud của tôi") && ui.button("Liên hệ · Biệt danh · Chặn").clicked() { self.open_contact_panel(d_id.clone()); }
+                                if !d_is_group && d_id!=&self.user_uin && !d_name.contains("Cloud của tôi") {
+                                    if ui.button("Liên hệ · Biệt danh · Chặn").clicked() { self.open_contact_panel(d_id.clone()); }
+                                    let is_trusted = self.trusted_peers.contains(d_id);
+                                    let sn_btn_lbl = if is_trusted {
+                                        format!("{} Mã an toàn (Đã xác minh)", lucide::SHIELD_CHECK)
+                                    } else {
+                                        format!("{} Mã an toàn & Xác minh E2EE", lucide::LOCK)
+                                    };
+                                    if ui.button(sn_btn_lbl).clicked() {
+                                        self.open_safety_number_modal(d_id.clone(), d_name.to_string());
+                                    }
+                                }
                                 if ui.button(if d_is_group {"Quản lý nhóm"}else{"Nhóm chung"}).clicked(){
                                     self.open_group_panel(d_id.clone(),d_is_group,false);
                                     if d_is_group {if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::FetchGroupMembers{group_id:d_id.clone()});}}
@@ -3889,6 +3900,7 @@ impl ZaloGuiApp {
         self.render_forward_dialog(ctx, pal);
         self.render_call_overlay(ctx, pal);
         self.render_image_viewer_modal(ctx, pal);
+        self.render_safety_number_modal(ctx, pal);
         self.render_phone_lookup_modal(ctx, pal);
         self.render_settings_modal(ctx, pal);
         self.render_tools_panel(ctx);

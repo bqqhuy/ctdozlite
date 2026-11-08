@@ -2644,55 +2644,70 @@ fn extract_meta_attr(tag: &str, attr_name: &str) -> Option<String> {
     None
 }
 
+/// Validate URL safety for OpenGraph scraping and link previews (A27, A36).
+///
+/// Ensures HTTP/HTTPS schemes, rejects credentials in URLs, and blocks private/loopback/link-local IP addresses.
+pub fn is_safe_opengraph_url(parsed: &reqwest::Url, allow_test_loopback: bool) -> bool {
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    // Reject URLs with credentials (username:password@host)
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    if let Some(host_str) = parsed.host_str() {
+        let unbracketed = host_str.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+            let is_loopback = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_loopback(),
+                std::net::IpAddr::V6(v6) => v6.is_loopback(),
+            };
+            if is_loopback {
+                if !allow_test_loopback {
+                    return false;
+                }
+            } else if crate::endpoints::is_private_or_loopback_ip(ip) {
+                return false;
+            }
+        }
+        let host_lower = unbracketed.to_ascii_lowercase();
+        if !allow_test_loopback
+            && (host_lower == "localhost"
+                || host_lower.ends_with(".localhost")
+                || host_lower.ends_with(".local")
+                || host_lower.ends_with(".internal"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Scrape OpenGraph / Twitter Card / HTML `<meta>` tags directly from a webpage URL.
 pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
     // A27 fix: Validate URL scheme and reject private/loopback addresses
     let parsed = reqwest::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return None;
-    }
-    // Reject URLs with credentials (username:password@host)
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return None;
-    }
-    // Reject private/loopback/link-local IP addresses (allow loopback for test mock server)
     let allow_test_loopback = cfg!(test) || cfg!(debug_assertions) || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some();
-    if let Some(host_str) = parsed.host_str() {
-        // Try parsing as IP address
-        if let Ok(ip) = host_str.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(ipv4) => {
-                    if (ipv4.is_loopback() && !allow_test_loopback) || ipv4.is_private() {
-                        return None;
-                    }
-                    // Link-local 169.254.0.0/16
-                    let octets = ipv4.octets();
-                    if octets[0] == 169 && octets[1] == 254 {
-                        return None;
-                    }
-                }
-                std::net::IpAddr::V6(ipv6) => {
-                    if ipv6.is_loopback() || ipv6.is_unspecified() {
-                        return None;
-                    }
-                    // Link-local (fe80::/10) and ULA (fc00::/7)
-                    let octets = ipv6.octets();
-                    if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
-                        return None;
-                    }
-                    if (octets[0] & 0xfe) == 0xfc {
-                        return None;
-                    }
-                }
-            }
-        }
+    if !is_safe_opengraph_url(&parsed, allow_test_loopback) {
+        return None;
     }
 
+    // A36: Secure redirect policy validating every redirect hop against private/loopback/link-local IPs
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects (max 5)");
+        }
+        let next_url = attempt.url();
+        if !is_safe_opengraph_url(next_url, allow_test_loopback) {
+            return attempt.error("redirect to private/loopback/forbidden address blocked (A36 SSRF hardening)");
+        }
+        attempt.follow()
+    });
     // Link previews fetch third-party URLs; they must use the same proxy as Zalo traffic.
     let client = crate::proxy::apply(reqwest::Client::builder())
         .ok()?
         .timeout(std::time::Duration::from_millis(3800))
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(redirect_policy)
         .build()
         .ok()?;
     let resp = client
@@ -8387,5 +8402,86 @@ pub fn try_decrypt_e2ee_content(
             eprintln!("E2EE decrypt failed (status {e2ee_status}): {e}");
             Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false))
         }
+    }
+}
+
+
+#[cfg(test)]
+mod a36_ssrf_redirect_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_safe_opengraph_url() {
+        let safe_url = reqwest::Url::parse("https://example.com/article").unwrap();
+        assert!(is_safe_opengraph_url(&safe_url, false));
+
+        let http_url = reqwest::Url::parse("http://sub.domain.vn/news").unwrap();
+        assert!(is_safe_opengraph_url(&http_url, false));
+
+        // Reject non-http(s)
+        let file_url = reqwest::Url::parse("file:///etc/passwd").unwrap();
+        assert!(!is_safe_opengraph_url(&file_url, false));
+
+        // Reject credentials
+        let cred_url = reqwest::Url::parse("http://admin:secret@example.com").unwrap();
+        assert!(!is_safe_opengraph_url(&cred_url, false));
+
+        // Reject private IPv4
+        let p1 = reqwest::Url::parse("http://192.168.1.1/setup").unwrap();
+        assert!(!is_safe_opengraph_url(&p1, false));
+
+        let p2 = reqwest::Url::parse("http://10.0.0.5/api").unwrap();
+        assert!(!is_safe_opengraph_url(&p2, false));
+
+        let p3 = reqwest::Url::parse("http://172.16.50.1/").unwrap();
+        assert!(!is_safe_opengraph_url(&p3, false));
+
+        // Reject loopback
+        let loopback = reqwest::Url::parse("http://127.0.0.1:8080/admin").unwrap();
+        assert!(!is_safe_opengraph_url(&loopback, false));
+
+        // Reject link-local (cloud metadata)
+        let link_local = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        assert!(!is_safe_opengraph_url(&link_local, false));
+
+        // Reject IPv6 loopback, ULA, and mapped IPv4
+        let v6_loop = reqwest::Url::parse("http://[::1]/").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_loop, false));
+
+        let v6_ula = reqwest::Url::parse("http://[fc00::1]/").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_ula, false));
+
+        let v6_mapped = reqwest::Url::parse("http://[::ffff:127.0.0.1]/").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_mapped, false));
+
+        // Reject localhost names
+        let local_host = reqwest::Url::parse("http://localhost:3000").unwrap();
+        assert!(!is_safe_opengraph_url(&local_host, false));
+
+        let local_domain = reqwest::Url::parse("http://app.internal/status").unwrap();
+        assert!(!is_safe_opengraph_url(&local_domain, false));
+    }
+
+    #[tokio::test]
+    async fn test_redirect_to_private_ip_is_blocked() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn mock server that responds with 302 redirect to private IP 192.168.1.1
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await;
+            let resp = b"HTTP/1.1 302 Found\r\nLocation: http://192.168.1.1/admin\r\nConnection: close\r\n\r\n";
+            socket.write_all(resp).await.unwrap();
+        });
+
+        let url = format!("http://127.0.0.1:{port}/redirect-test");
+        let result = scrape_opengraph_metadata(&url).await;
+        // Must be None because the redirect hop to 192.168.1.1 is blocked!
+        assert!(result.is_none());
+        server.await.unwrap();
     }
 }

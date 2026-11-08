@@ -71,6 +71,17 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    SafetyNumberLoaded {
+        peer_id: String,
+        peer_name: String,
+        safety_number: String,
+        is_verified: bool,
+        identity_changed: bool,
+    },
+    IdentityTrusted {
+        peer_id: String,
+        is_trusted: bool,
+    },
     ReactorProfiles {
         owner: String,
         ids: Vec<String>,
@@ -538,13 +549,22 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct VideoPlayerState {
     playing: bool,
     position_secs: f32,
     duration_secs: f32,
     volume: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct SafetyNumberModalState {
+    pub peer_id: String,
+    pub peer_name: String,
+    pub safety_number: String,
+    pub is_verified: bool,
+    pub identity_changed: bool,
+    pub loading: bool,
 }
 
 #[derive(Clone)]
@@ -829,6 +849,8 @@ pub struct ZaloGuiApp {
     image_viewer: Option<ImageViewerModal>,
     #[allow(dead_code)] // TODO(WP15-4): Wire "Preview" button in messages.rs
     doc_viewer: Option<doc_viewer::DocViewerModal>,
+    safety_number_modal: Option<SafetyNumberModalState>,
+    trusted_peers: HashSet<String>,
 
     info_drawer_open: bool,
     profile_menu_open: bool,
@@ -1102,6 +1124,8 @@ impl ZaloGuiApp {
             call_terminals: Default::default(),
             image_viewer: None,
             doc_viewer: None,
+            safety_number_modal: None,
+            trusted_peers: HashSet::new(),
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
@@ -1885,6 +1909,44 @@ impl ZaloGuiApp {
                 event => event,
             };
             match event {
+                GuiEvent::SafetyNumberLoaded {
+                    peer_id,
+                    peer_name,
+                    safety_number,
+                    is_verified,
+                    identity_changed,
+                } => {
+                    if is_verified {
+                        self.trusted_peers.insert(peer_id.clone());
+                    }
+                    self.safety_number_modal = Some(SafetyNumberModalState {
+                        peer_id,
+                        peer_name,
+                        safety_number,
+                        is_verified,
+                        identity_changed,
+                        loading: false,
+                    });
+                    ctx.request_repaint();
+                }
+                GuiEvent::IdentityTrusted {
+                    peer_id,
+                    is_trusted,
+                } => {
+                    if is_trusted {
+                        self.trusted_peers.insert(peer_id.clone());
+                        self.status_msg = "Đã xác minh danh tính thiết bị an toàn".into();
+                    } else {
+                        self.trusted_peers.remove(&peer_id);
+                    }
+                    if let Some(ref mut m) = self.safety_number_modal {
+                        if m.peer_id == peer_id {
+                            m.is_verified = is_trusted;
+                            m.loading = false;
+                        }
+                    }
+                    ctx.request_repaint();
+                }
                 GuiEvent::DroppedFilePrepared {
                     owner,
                     thread,

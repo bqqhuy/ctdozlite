@@ -86,3 +86,140 @@ pub const ZNOISE: &str = "https://zwid.api.zalo.me";
 
 /// Public group invitation URLs recognized by the official join flow.
 pub const GROUP_INVITE_HOST: &str = "zalo.me";
+
+/// Allowed WebSocket hosts for real-time connection and push/pull messaging (A24).
+pub const WS_HOSTS: &[&str] = &[
+    "ws1-msg.chat.zalo.me",
+    "ws2-msg.chat.zalo.me",
+    "ws3-msg.chat.zalo.me",
+    "ws4-msg.chat.zalo.me",
+    "ws5-msg.chat.zalo.me",
+    "ws6-msg.chat.zalo.me",
+    "ws7-msg.chat.zalo.me",
+    "ws8-msg.chat.zalo.me",
+];
+
+/// Validate if the given WebSocket host is an allowed Zalo endpoint.
+///
+/// Rejects unauthorized third-party domains, private/loopback literals, and malformed hosts.
+pub fn is_allowed_ws_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if WS_HOSTS.iter().any(|&allowed| allowed == host) {
+        return true;
+    }
+    // Also accept valid numbered ws shards under chat.zalo.me (e.g. ws{N}-msg.chat.zalo.me)
+    if let Some(sub) = host.strip_suffix(".chat.zalo.me") {
+        if sub.starts_with("ws") && sub.ends_with("-msg") {
+            let num = &sub[2..sub.len() - 4];
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Check if an IP address is private, loopback, link-local, unspecified, or broadcast (A36, A24).
+pub fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            if ipv4.is_loopback() || ipv4.is_private() || ipv4.is_unspecified() || ipv4.is_broadcast() {
+                return true;
+            }
+            let octets = ipv4.octets();
+            // Link-local: 169.254.0.0/16
+            if octets[0] == 169 && octets[1] == 254 {
+                return true;
+            }
+            // Carrier-grade NAT: 100.64.0.0/10
+            if octets[0] == 100 && (octets[1] & 0xc0) == 64 {
+                return true;
+            }
+            // Documentation / test ranges (RFC 5737, RFC 2544)
+            if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
+                return true;
+            }
+            if octets[0] == 198 && ((octets[1] == 51 && octets[2] == 100) || (octets[1] & 0xfe) == 18) {
+                return true;
+            }
+            if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
+                return true;
+            }
+            false
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            if ipv6.is_loopback() || ipv6.is_unspecified() {
+                return true;
+            }
+            // IPv4-mapped IPv6 (::ffff:x.x.x.x)
+            let octets = ipv6.octets();
+            if octets[0..10] == [0; 10] && octets[10] == 0xff && octets[11] == 0xff {
+                let v4 = std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
+                return is_private_or_loopback_ip(std::net::IpAddr::V4(v4));
+            }
+            // Link-local: fe80::/10
+            if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            // Unique local address (ULA): fc00::/7
+            if (octets[0] & 0xfe) == 0xfc {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_allowed_ws_host() {
+        assert!(is_allowed_ws_host("ws1-msg.chat.zalo.me"));
+        assert!(is_allowed_ws_host("ws8-msg.chat.zalo.me"));
+        assert!(is_allowed_ws_host("ws99-msg.chat.zalo.me"));
+        assert!(is_allowed_ws_host("WS1-MSG.CHAT.ZALO.ME"));
+
+        // Reject untrusted hosts
+        assert!(!is_allowed_ws_host("evil.com"));
+        assert!(!is_allowed_ws_host("ws1-msg.chat.zalo.me.evil.com"));
+        assert!(!is_allowed_ws_host("127.0.0.1"));
+        assert!(!is_allowed_ws_host("localhost"));
+        assert!(!is_allowed_ws_host("attacker.chat.zalo.me"));
+    }
+
+    #[test]
+    fn test_is_private_or_loopback_ip() {
+        use std::net::IpAddr;
+
+        // Loopback
+        assert!(is_private_or_loopback_ip("127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("127.1.2.3".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("::1".parse::<IpAddr>().unwrap()));
+
+        // Private IPv4
+        assert!(is_private_or_loopback_ip("10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("172.16.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("172.31.255.255".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("192.168.1.1".parse::<IpAddr>().unwrap()));
+
+        // Link-local
+        assert!(is_private_or_loopback_ip("169.254.169.254".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("fe80::1".parse::<IpAddr>().unwrap()));
+
+        // ULA IPv6
+        assert!(is_private_or_loopback_ip("fc00::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("fd12:3456:789a::1".parse::<IpAddr>().unwrap()));
+
+        // IPv4-mapped IPv6
+        assert!(is_private_or_loopback_ip("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("::ffff:192.168.1.1".parse::<IpAddr>().unwrap()));
+
+        // Public IPs (should be allowed)
+        assert!(!is_private_or_loopback_ip("8.8.8.8".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_or_loopback_ip("1.1.1.1".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_or_loopback_ip("49.213.76.10".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_or_loopback_ip("2606:4700:4700::1111".parse::<IpAddr>().unwrap()));
+    }
+}

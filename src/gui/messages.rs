@@ -64,125 +64,7 @@ pub(super) fn render_sticker_widget(
     }
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct CallCardView {
-    pub(super) title: String,
-    pub(super) status_badge: String,
-    pub(super) reason: Option<String>,
-    pub(super) is_video: bool,
-    pub(super) is_missed_or_failed: bool,
-}
-
-/// Detect whether `msg` is a voice/video call log entry and parse its structured metadata.
-pub(super) fn extract_call_card_view(_msg: &ChatMessage) -> Option<CallCardView> {
-    // Call records are excluded from chat; active calls have their own overlay.
-    None
-}
-
-pub(super) fn render_call_card_widget(
-    ui: &mut egui::Ui,
-    card: &CallCardView,
-    pal: &ThemePalette,
-    card_width: f32,
-) -> Option<BubbleAction> {
-    let mut action = None;
-    let accent = if card.is_missed_or_failed {
-        Color32::from_rgb(239, 68, 68)
-    } else {
-        Color32::from_rgb(34, 197, 94)
-    };
-
-    ui.set_width(card_width);
-    let text_col_w = (card_width - 52.0).max(110.0);
-    ui.vertical(|ui| {
-        ui.set_width(card_width);
-        ui.horizontal(|ui| {
-            let (icon_rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
-            ui.painter().circle_filled(
-                icon_rect.center(),
-                20.0,
-                accent.linear_multiply(if pal.is_dark { 0.18 } else { 0.14 }),
-            );
-            ui.painter().circle_stroke(
-                icon_rect.center(),
-                20.0,
-                Stroke::new(1.2_f32, accent.linear_multiply(0.55)),
-            );
-            if card.is_video {
-                draw_icon_video(ui.painter(), icon_rect.center(), 18.0, accent);
-            } else {
-                draw_icon_phone(ui.painter(), icon_rect.center(), 18.0, accent);
-            }
-
-            ui.add_space(6.0);
-            ui.vertical(|ui| {
-                ui.set_width(text_col_w);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&card.title)
-                            .size(13.8)
-                            .color(pal.text_primary)
-                            .strong(),
-                    )
-                    .wrap(),
-                );
-                ui.add_space(2.0);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&card.status_badge)
-                            .size(11.8)
-                            .color(accent)
-                            .strong(),
-                    )
-                    .wrap(),
-                );
-                if let Some(reason) = &card.reason {
-                    ui.add_space(3.0);
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(reason).size(11.2).color(pal.text_secondary),
-                        )
-                        .wrap(),
-                    );
-                }
-            });
-        });
-        ui.add_space(8.0);
-        let (sep_rect, _) = ui.allocate_exact_size(Vec2::new(card_width, 1.0), Sense::hover());
-        ui.painter().line_segment(
-            [sep_rect.left_center(), sep_rect.right_center()],
-            Stroke::new(1.0_f32, pal.border),
-        );
-        ui.add_space(6.0);
-
-        let btn_label = if card.is_video {
-            format!("{}  Gọi video lại", lucide::VIDEO)
-        } else {
-            format!("{}  Gọi lại", lucide::PHONE)
-        };
-        let call_btn = egui::Button::new(
-            RichText::new(btn_label)
-                .size(12.5)
-                .color(Color32::WHITE)
-                .strong(),
-        )
-        .fill(pal.primary)
-        .stroke(Stroke::new(1.0_f32, pal.primary_hover))
-        .rounding(Rounding::same(7.0))
-        .min_size(Vec2::new(card_width, 30.0));
-
-        if ui
-            .add(call_btn)
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .clicked()
-        {
-            action = Some(BubbleAction::CallAgain {
-                is_video: card.is_video,
-            });
-        }
-    });
-    action
-}
+// Call records are excluded from chat; active calls have their own overlay.
 
 /// Open an `http://` or `https://` URL in the user's default system browser.
 pub(super) fn open_external_url(url: &str) {
@@ -1009,8 +891,6 @@ pub(super) fn render_chat_bubble(
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
     let max_text_width = (max_bubble_width - 24.0).max(90.0);
     let has_sticker = is_sticker_message(msg).is_some();
-    let call_card_opt = extract_call_card_view(msg);
-    let is_call_card = call_card_opt.is_some();
     let is_photo_card = matches!(
         crate::message_view::media(msg).kind,
         crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
@@ -1022,7 +902,7 @@ pub(super) fn render_chat_bubble(
         || msg.text.trim().starts_with("[Video]")
         || msg.text.trim().starts_with("[Tin nhắn thoại]");
     let has_link_card = extract_message_link_view(msg).is_some();
-    let has_interactive_card = is_call_card || has_link_card || is_photo_card || is_file_card;
+    let has_interactive_card = has_link_card || is_photo_card || is_file_card;
 
     let show_timestamp = !msg.display_time().is_empty()
         && (!next_same_sender
@@ -1044,11 +924,9 @@ pub(super) fn render_chat_bubble(
     let show_group_sender = !msg.is_outgoing && !prev_same_sender && is_group && sender_is_name;
 
     // Pre-measure exact content width for both outgoing and incoming bubbles so every bubble,
-    // photo, and call card hugs its content tightly without horizontal overflow or inner/outer frame mismatch.
+    // photo, and card hugs its content tightly without horizontal overflow or inner/outer frame mismatch.
     let content_width = if has_sticker {
         116.0_f32
-    } else if is_call_card {
-        max_text_width.min(256.0)
     } else if is_photo_card {
         let media = crate::message_view::media(msg);
         let photo_w = thumbnail_size(&media, max_text_width).x.ceil();
@@ -1215,28 +1093,11 @@ pub(super) fn render_chat_bubble(
 
                 let fill = if has_sticker || is_frameless_photo {
                     Color32::TRANSPARENT
-                } else if let Some(card) = &call_card_opt {
-                    if card.is_missed_or_failed {
-                        if pal.is_dark {
-                            Color32::from_rgb(38, 23, 30)
-                        } else {
-                            Color32::from_rgb(254, 242, 242)
-                        }
-                    } else {
-                        pal.bg_elevated
-                    }
                 } else {
                     pal.bubble_out_bg
                 };
                 let stroke = if has_sticker || is_frameless_photo {
                     Stroke::NONE
-                } else if let Some(card) = &call_card_opt {
-                    let border_col = if card.is_missed_or_failed {
-                        Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                    } else {
-                        Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                    };
-                    Stroke::new(1.2_f32, border_col)
                 } else if !pal.is_dark {
                     Stroke::new(1.0_f32, Color32::from_rgb(186, 214, 255))
                 } else {
@@ -1256,9 +1117,7 @@ pub(super) fn render_chat_bubble(
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             quote_action = render_quote_block(ui, msg, pal, true, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action = render_call_card_widget(ui, card, pal, content_width);
-                            } else if !render_sticker_widget(
+                            if !render_sticker_widget(
                                 ui,
                                 msg,
                                 sticker_textures,
@@ -1374,28 +1233,11 @@ pub(super) fn render_chat_bubble(
 
             let fill = if has_sticker || is_frameless_photo {
                 Color32::TRANSPARENT
-            } else if let Some(card) = &call_card_opt {
-                if card.is_missed_or_failed {
-                    if pal.is_dark {
-                        Color32::from_rgb(38, 23, 30)
-                    } else {
-                        Color32::from_rgb(254, 242, 242)
-                    }
-                } else {
-                    pal.bg_elevated
-                }
             } else {
                 pal.bubble_in_bg
             };
             let stroke = if has_sticker || is_frameless_photo {
                 Stroke::NONE
-            } else if let Some(card) = &call_card_opt {
-                let border_col = if card.is_missed_or_failed {
-                    Color32::from_rgb(239, 68, 68).linear_multiply(0.55)
-                } else {
-                    Color32::from_rgb(34, 197, 94).linear_multiply(0.55)
-                };
-                Stroke::new(1.2_f32, border_col)
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
@@ -1424,9 +1266,7 @@ pub(super) fn render_chat_bubble(
                                 ui.add_space(2.0);
                             }
                             quote_action = render_quote_block(ui, msg, pal, false, content_width);
-                            if let Some(card) = &call_card_opt {
-                                card_action = render_call_card_widget(ui, card, pal, content_width);
-                            } else if !render_sticker_widget(
+                            if !render_sticker_widget(
                                 ui,
                                 msg,
                                 sticker_textures,
@@ -1528,6 +1368,7 @@ pub(super) enum BubbleAction {
     ToggleStar,
     DeleteForMe,
     RecallForEveryone,
+    #[allow(dead_code)]
     CallAgain {
         is_video: bool,
     },

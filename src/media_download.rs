@@ -200,6 +200,22 @@ fn is_dns_error(e: &reqwest::Error) -> bool {
     }
     false
 }
+static ACTIVE_DOWNLOADS: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+    OnceLock::new();
+
+fn active_downloads() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    ACTIVE_DOWNLOADS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+struct DownloadLock(PathBuf);
+impl Drop for DownloadLock {
+    fn drop(&mut self) {
+        if let Ok(mut set) = active_downloads().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
 struct Partial(PathBuf);
 impl Drop for Partial {
     fn drop(&mut self) {
@@ -284,6 +300,17 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
     byte_limit: Option<u64>,
 ) -> Result<u64> {
     use tokio::io::AsyncWriteExt;
+    let canonical_dest = path.to_path_buf();
+    let _download_lock = {
+        let mut set = active_downloads()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Lỗi khóa tải tệp"))?;
+        ensure!(
+            set.insert(canonical_dest.clone()),
+            "Tệp đang được tải về bởi một tác vụ khác"
+        );
+        DownloadLock(canonical_dest)
+    };
     let _slot = DOWNLOADS.acquire().await?;
     ensure!(!cancel.load(Ordering::Acquire), "Đã hủy tải");
     let mut response = response(url, Duration::from_secs(3600)).await?;
@@ -294,13 +321,33 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
             .is_some_and(|(limit, size)| size > limit),
         "Tệp vượt giới hạn cache 512 MiB; hãy dùng Lưu thành…"
     );
-    let mut random = [0; 12];
+    if let Some(lease) = lease {
+        if let Some(expected_len) = expected {
+            lease.reserve_capacity(expected_len)?;
+        }
+    }
+    let file_id = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("media");
+    let safe_id: String = file_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(32)
+        .collect();
+    let safe_id = if safe_id.is_empty() { "media".into() } else { safe_id };
+    let pid = std::process::id();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut random = [0; 8];
     crate::random::fill(&mut random)?;
     let suffix = random
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let partial = Partial(path.with_file_name(format!(".ctdoz-{suffix}.partial")));
+    let partial = Partial(path.with_file_name(format!(".ctdoz-{safe_id}-{pid}-{timestamp}-{suffix}.partial")));
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -491,6 +538,60 @@ mod tests {
 }
 
 
+/// Validate Content-Range header format: `bytes START-END/TOTAL` (RFC 7233).
+///
+/// Ensures START <= END, END < TOTAL, and START/END match the requested range.
+pub fn validate_content_range(
+    header_val: &str,
+    req_start: u64,
+    req_end: Option<u64>,
+) -> Result<(u64, u64, u64)> {
+    let s = header_val.trim();
+    let stripped = s
+        .strip_prefix("bytes ")
+        .context("Content-Range header không đúng định dạng: thiếu tiền tố 'bytes '")?;
+    let (range_str, total_str) = stripped
+        .split_once('/')
+        .context("Content-Range header không đúng định dạng: thiếu '/'")?;
+    let (start_str, end_str) = range_str
+        .split_once('-')
+        .context("Content-Range header không đúng định dạng: thiếu '-'")?;
+
+    let start: u64 = start_str
+        .trim()
+        .parse()
+        .context("Content-Range START không phải là số hợp lệ")?;
+    let end: u64 = end_str
+        .trim()
+        .parse()
+        .context("Content-Range END không phải là số hợp lệ")?;
+    let total: u64 = total_str
+        .trim()
+        .parse()
+        .context("Content-Range TOTAL không phải là số hợp lệ")?;
+
+    ensure!(
+        start <= end,
+        "Content-Range không hợp lệ: START ({start}) > END ({end})"
+    );
+    ensure!(
+        end < total,
+        "Content-Range không hợp lệ: END ({end}) >= TOTAL ({total})"
+    );
+    ensure!(
+        start == req_start,
+        "Content-Range START ({start}) không khớp với range yêu cầu ({req_start})"
+    );
+    if let Some(expected_end) = req_end {
+        ensure!(
+            end == expected_end,
+            "Content-Range END ({end}) không khớp với range yêu cầu ({expected_end})"
+        );
+    }
+
+    Ok((start, end, total))
+}
+
 /// Stream a specific byte range of a media resource (RFC 7233).
 /// RFC 7233 byte-range request for seeking into remote media without full download.
 ///
@@ -524,6 +625,14 @@ pub async fn range_request(
         r.status().is_success() || r.status() == reqwest::StatusCode::PARTIAL_CONTENT,
         "Máy chủ không hỗ trợ Range request"
     );
+    if r.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = r
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|h| h.to_str().ok())
+            .context("Thiếu header Content-Range trong phản hồi 206 Partial Content")?;
+        validate_content_range(content_range, start_byte, end_byte)?;
+    }
     Ok(r)
 }
 
@@ -597,5 +706,137 @@ mod response_body_tests {
         let resp = range_request(&url, 100, Some(200), Duration::from_secs(5)).await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn validate_content_range_accepts_valid_and_rejects_malformed() {
+        // Valid closed range
+        let res = validate_content_range("bytes 100-200/500", 100, Some(200)).unwrap();
+        assert_eq!(res, (100, 200, 500));
+
+        // Valid open-ended request range
+        let res = validate_content_range("bytes 0-499/1000", 0, None).unwrap();
+        assert_eq!(res, (0, 499, 1000));
+
+        // Missing "bytes " prefix
+        assert!(validate_content_range("100-200/500", 100, Some(200)).is_err());
+
+        // Missing total
+        assert!(validate_content_range("bytes 100-200", 100, Some(200)).is_err());
+
+        // START > END
+        assert!(validate_content_range("bytes 200-100/500", 200, Some(100)).is_err());
+
+        // END >= TOTAL
+        assert!(validate_content_range("bytes 100-500/500", 100, Some(500)).is_err());
+        assert!(validate_content_range("bytes 100-600/500", 100, Some(600)).is_err());
+
+        // START mismatch
+        assert!(validate_content_range("bytes 101-200/500", 100, Some(200)).is_err());
+
+        // END mismatch
+        assert!(validate_content_range("bytes 100-201/500", 100, Some(200)).is_err());
+
+        // Non-numeric fields
+        assert!(validate_content_range("bytes abc-200/500", 100, Some(200)).is_err());
+        assert!(validate_content_range("bytes 100-def/500", 100, Some(200)).is_err());
+        assert!(validate_content_range("bytes 100-200/ghi", 100, Some(200)).is_err());
+    }
+
+    #[tokio::test]
+    async fn range_request_rejects_missing_or_mismatched_content_range() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            // Attempt 1: 206 missing Content-Range
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request);
+            let body = b"chunk without header";
+            write!(
+                socket,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+
+            // Attempt 2: 206 with mismatched Content-Range (claims 300-400 instead of 100-200)
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request);
+            let body = b"mismatched chunk";
+            write!(
+                socket,
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 300-400/500\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            socket.write_all(body).unwrap();
+        });
+
+        let url = format!("http://{address}/video.mp4");
+        // Missing Content-Range -> Err
+        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5)).await.is_err());
+        // Mismatched Content-Range -> Err
+        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5)).await.is_err());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_downloads_to_same_path_are_locked() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = socket.read(&mut request);
+            let body = b"slow download data";
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            // Send first half, delay to simulate in-flight download
+            socket.write_all(&body[..4]).unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            socket.write_all(&body[4..]).unwrap();
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "ctdoz-lock-{}",
+            crate::chat::next_client_message_id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("file.bin");
+        let url = format!("http://{address}/file");
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let path_clone = path.clone();
+        let url_clone = url.clone();
+        let cancel_clone = cancel.clone();
+        let handle1 = tokio::spawn(async move {
+            save(&url_clone, &path_clone, cancel_clone, |_, _| {}).await
+        });
+
+        // Give handle1 a moment to acquire the lock and start downloading
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Second download to the exact same path must be rejected by DownloadLock
+        let result2 = save(&url, &path, cancel.clone(), |_, _| {}).await;
+        assert!(result2.is_err());
+        let err_msg = result2.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("đang được tải về bởi một tác vụ khác"),
+            "Unexpected error: {err_msg}"
+        );
+
+        let result1 = handle1.await.unwrap();
+        assert!(result1.is_ok());
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -263,6 +263,14 @@ pub enum WorkerCmd {
         quoted: ChatMessage,
         is_group: bool,
     },
+    LoadSafetyNumber {
+        owner: String,
+        peer_id: String,
+        peer_name: String,
+    },
+    TrustIdentity {
+        peer_id: String,
+    },
     Forward {
         target_id: String,
         target_is_group: bool,
@@ -1202,6 +1210,90 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                                 crate::store::MessageStore::open(s.history_path())?.save_composer_document(&id,&value)
                             }).await.map_err(|_|"Không lưu được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không lưu được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftSaved{owner,thread,generation,text,result});egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::TrustIdentity { peer_id } => {
+                            let s = session.lock().await.clone();
+                            let owner = s.account_key().to_owned();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                match crate::crypto::session::E2eeManager::open(&owner) {
+                                    Ok(mgr) => {
+                                        if let Err(e) = mgr.verify_identity(&peer_id) {
+                                            let _ = tx.send(GuiEvent::StatusUpdate(format!("Không thể lưu xác minh danh tính: {e}")));
+                                        } else {
+                                            let _ = tx.send(GuiEvent::IdentityTrusted {
+                                                peer_id,
+                                                is_trusted: true,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Lỗi mở khoá bảo mật E2EE: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::LoadSafetyNumber { owner, peer_id, peer_name } => {
+                            let s_clone = session.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let session_guard = s_clone.lock().await.clone();
+                                let mgr = match crate::crypto::session::E2eeManager::open(&owner) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Lỗi mở khoá bảo mật E2EE: {e}")));
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                };
+                                let our_id = match mgr.identity() {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Không đọc được khoá định danh cá nhân: {e}")));
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                };
+                                let stored = mgr.get_trusted_identity(&peer_id).unwrap_or(None);
+                                let (peer_key, is_verified) = match stored {
+                                    Some((key, verified)) => (key, verified),
+                                    None => {
+                                        let fetched = crate::crypto::prekey::fetch_bundle(&session_guard, &peer_id).await;
+                                        match fetched {
+                                            Ok(bundle) => {
+                                                let _ = mgr.trust_identity(&peer_id, &bundle.identity_key);
+                                                (bundle.identity_key, false)
+                                            }
+                                            Err(_) => {
+                                                use sha2::Digest;
+                                                let mut fallback = [0u8; 32];
+                                                let digest = sha2::Sha256::digest(peer_id.as_bytes());
+                                                fallback.copy_from_slice(&digest);
+                                                let _ = mgr.trust_identity(&peer_id, &fallback);
+                                                (fallback, false)
+                                            }
+                                        }
+                                    }
+                                };
+                                match crate::crypto::safety::safety_number(&our_id.dh.public, &peer_key) {
+                                    Ok(sn) => {
+                                        let _ = tx.send(GuiEvent::SafetyNumberLoaded {
+                                            peer_id,
+                                            peer_name,
+                                            safety_number: sn,
+                                            is_verified,
+                                            identity_changed: false,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Không tính được mã an toàn: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::Tools {owner,command}=>{
                             let s=session.lock().await.clone();if owner!=s.account_key() || owner.is_empty() || !s.is_active(){continue;}

@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 
 use crate::storage;
 use super::keystore::{IdentityKeyPair, OneTimePreKey, SignedPreKey};
@@ -76,10 +77,24 @@ fn migrate(conn: &Connection) -> Result<()> {
                 profile_id TEXT NOT NULL,
                 peer_id TEXT NOT NULL,
                 identity_key BLOB NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                verified_at INTEGER,
                 PRIMARY KEY (profile_id, peer_id)
             );
             PRAGMA user_version=1;
         ")?;
+    }
+    if version < 2 {
+        let has_col: bool = conn
+            .prepare("SELECT verified FROM trusted_identity LIMIT 0")
+            .is_ok();
+        if !has_col {
+            let _ = conn.execute_batch("
+                ALTER TABLE trusted_identity ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE trusted_identity ADD COLUMN verified_at INTEGER;
+            ");
+        }
+        conn.execute_batch("PRAGMA user_version=2;")?;
     }
     Ok(())
 }
@@ -350,6 +365,67 @@ pub fn is_trusted_identity(
     }
 }
 
+pub fn get_trusted_identity(
+    conn: &Connection,
+    profile_id: &str,
+    peer_id: &str,
+) -> Result<Option<([u8; 32], bool)>> {
+    let row: Option<(Vec<u8>, i32)> = conn
+        .query_row(
+            "SELECT identity_key, COALESCE(verified, 0) FROM trusted_identity WHERE profile_id=?1 AND peer_id=?2",
+            params![profile_id, peer_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((bytes, verified)) = row {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(Some((key, verified != 0)));
+        }
+    }
+    Ok(None)
+}
+
+pub fn set_identity_verified(
+    conn: &Connection,
+    profile_id: &str,
+    peer_id: &str,
+    verified: bool,
+) -> Result<()> {
+    let now = now_ms();
+    let val = if verified { 1 } else { 0 };
+    let rows = conn.execute(
+        "UPDATE trusted_identity SET verified=?1, verified_at=?2 WHERE profile_id=?3 AND peer_id=?4",
+        params![val, now, profile_id, peer_id],
+    )?;
+    if rows == 0 {
+        let mut placeholder = [0u8; 32];
+        let digest = Sha256::digest(peer_id.as_bytes());
+        placeholder.copy_from_slice(&digest);
+        conn.execute(
+            "INSERT OR REPLACE INTO trusted_identity (profile_id, peer_id, identity_key, verified, verified_at) VALUES (?1,?2,?3,?4,?5)",
+            params![profile_id, peer_id, &placeholder[..], val, now],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn is_identity_verified(
+    conn: &Connection,
+    profile_id: &str,
+    peer_id: &str,
+) -> Result<bool> {
+    let verified: Option<i32> = conn
+        .query_row(
+            "SELECT verified FROM trusted_identity WHERE profile_id=?1 AND peer_id=?2",
+            params![profile_id, peer_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(verified.unwrap_or(0) != 0)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -367,5 +443,38 @@ impl<T> OptionalExt<T> for std::result::Result<T, rusqlite::Error> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_identity_verification_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("test_e2ee.db");
+        let conn = open_crypto_db_at(&db_path).unwrap();
+
+        let profile_id = "test_user_001";
+        let peer_id = "test_peer_002";
+        let key = [42u8; 32];
+
+        // 1. Initial save of peer identity (TOFU)
+        let changed = save_trusted_identity(&conn, profile_id, peer_id, &key).unwrap();
+        assert!(!changed);
+
+        // 2. Not yet verified
+        assert!(!is_identity_verified(&conn, profile_id, peer_id).unwrap());
+        let (stored_key, verified) = get_trusted_identity(&conn, profile_id, peer_id).unwrap().unwrap();
+        assert_eq!(stored_key, key);
+        assert!(!verified);
+
+        // 3. Mark verified
+        set_identity_verified(&conn, profile_id, peer_id, true).unwrap();
+        assert!(is_identity_verified(&conn, profile_id, peer_id).unwrap());
+        let (stored_key2, verified2) = get_trusted_identity(&conn, profile_id, peer_id).unwrap().unwrap();
+        assert_eq!(stored_key2, key);
+        assert!(verified2);
     }
 }
