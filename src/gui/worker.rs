@@ -1104,6 +1104,8 @@ pub(super) fn spawn_session_worker(
                     });
                 }
 
+                // A19 fix: auth-attempt generation/cancel to prevent stale login response override
+                let current_auth_attempt = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let mut current_qr_task: Option<tokio::task::JoinHandle<()>> = None;
                 let is_polling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let known_threads = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<(String, String, bool)>::new()));
@@ -1650,7 +1652,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::Logout => {
+                            // A19: Cancel QR task and bump auth attempt to invalidate all pending auth responses
                             if let Some(task) = current_qr_task.take() { task.abort(); }
+                            current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                             call_bridge.end_call();
                             crate::queue_cursors::flush_all().await;
                             let account = session.lock().await.account_key().to_owned();
@@ -1732,14 +1737,18 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
                         }
                         WorkerCmd::RequestQr => {
+                            // A19: Cancel current QR task and bump auth attempt generation
                             if let Some(task) = current_qr_task.take() {
                                 task.abort();
                             }
+                            let attempt_id = current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
                             let session_clone = session.clone();
                             let poll_clone = poll_state.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let commands = commands.clone();
+                            let auth_attempt_clone = current_auth_attempt.clone();
 
                             let handle = tokio::spawn(async move {
                                 {
@@ -1814,6 +1823,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                         crate::qr::confirm(&s_snap, &q).await;
 
                                                     if let Ok(resp) = confirm_res {
+                                                        // A19: Validate auth attempt before committing QR login result
+                                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
+                                                        if current != attempt_id {
+                                                            // Stale response — another auth started, discard this result
+                                                            return;
+                                                        }
+
                                                         let mut s = session_clone.lock().await;
                                                         if let Some(sek) =
                                                             crate::qr::extract_zpw_sek(&resp)
@@ -1889,6 +1905,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         }
                                     }
                                     Err(e) => {
+                                        // A19: Validate auth attempt before showing QR error
+                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
+                                        if current != attempt_id {
+                                            // Stale response — discard
+                                            return;
+                                        }
+
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::LoginFailed(e.to_string()));
                                         ctx_clone.request_repaint();
@@ -3429,12 +3452,16 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::LoginPassword { phone, pass } => {
+                            // A19: Cancel QR task and bump auth attempt generation
                             if let Some(task) = current_qr_task.take() { task.abort(); }
+                            let attempt_id = current_auth_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
                             session.lock().await.logout();
                             let session_clone = session.clone();
                             let commands = commands.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
+                            let auth_attempt_clone = current_auth_attempt.clone();
                             tokio::spawn(async move {
                                 let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                     "Đang xác thực tài khoản…".into(),
@@ -3445,6 +3472,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     .await
                                 {
                                     Ok(_) => {
+                                        // A19: Validate auth attempt before committing result
+                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
+                                        if current != attempt_id {
+                                            // Stale response — another auth started, discard this result
+                                            return;
+                                        }
+
                                         if let Ok(info) = crate::login::get_login_info(&s).await {
                                             if let Some(cfg) = info.get("data") {
                                                 crate::login::apply_login_config(&mut s, cfg);
@@ -3482,6 +3516,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         }
                                     }
                                     Err(e) => {
+                                        // A19: Validate auth attempt before showing error
+                                        let current = auth_attempt_clone.load(std::sync::atomic::Ordering::SeqCst);
+                                        if current != attempt_id {
+                                            // Stale response — discard
+                                            return;
+                                        }
+
                                         let _ = gui_tx_clone
                                             .send(GuiEvent::LoginFailed(e.to_string()));
                                         ctx_clone.request_repaint();
