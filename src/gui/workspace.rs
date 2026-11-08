@@ -1637,6 +1637,7 @@ impl ZaloGuiApp {
                                                     time: String::new(),
                                                     zoom: 1.0,
                                                     pan: Vec2::ZERO,
+                                                    video_state: None,
                                                 });
                                             }
                                         }
@@ -3004,6 +3005,7 @@ impl ZaloGuiApp {
                                         time,
                                         zoom: 1.0,
                                         pan: Vec2::ZERO,
+                                        video_state: None,
                                     });
                                 }
                             }

@@ -2435,6 +2435,12 @@ impl ZaloGuiApp {
             time: crate::clock::message_time(message.ts),
             zoom: 1.0,
             pan: Vec2::ZERO,
+            video_state: if video { Some(super::VideoPlayerState {
+                playing: false,
+                position_secs: 0.0,
+                duration_secs: 0.0,
+                volume: 1.0,
+            }) } else { None },
         });
     }
 

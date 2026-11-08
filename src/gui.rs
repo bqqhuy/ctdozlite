@@ -30,6 +30,7 @@ mod contact_panel;
 mod contacts;
 mod content_panel;
 mod download_panel;
+mod doc_viewer;
 mod file_drop;
 mod group_entry_panel;
 mod group_panel;
@@ -530,6 +531,14 @@ struct ActiveCallOverlay {
     error_reason: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+struct VideoPlayerState {
+    playing: bool,
+    position_secs: f32,
+    duration_secs: f32,
+    volume: f32,
+}
+
 #[derive(Clone)]
 struct ImageViewerModal {
     source: worker::ChatImage,
@@ -546,6 +555,7 @@ struct ImageViewerModal {
     time: String,
     zoom: f32,
     pan: Vec2,
+    video_state: Option<VideoPlayerState>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
