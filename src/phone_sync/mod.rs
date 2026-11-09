@@ -9,7 +9,7 @@ mod transfer;
 mod wire;
 pub(crate) use transfer::download;
 
-pub(crate) use transfer::{clean_after_connect, request_wake};
 pub use import::AtomicRestoreSession;
+pub(crate) use transfer::{clean_after_connect, request_wake};
 
 pub(crate) mod legacy;

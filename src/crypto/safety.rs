@@ -34,7 +34,10 @@ pub fn safety_number(pub_a: &[u8; 32], pub_b: &[u8; 32]) -> Result<String> {
 ///
 /// The two public keys are ordered lexicographically before hashing so that
 /// both peers derive the same digits regardless of who initiated the check.
-pub fn safety_number_digits(pub_a: &[u8; 32], pub_b: &[u8; 32]) -> Result<[u8; SAFETY_NUMBER_DIGITS]> {
+pub fn safety_number_digits(
+    pub_a: &[u8; 32],
+    pub_b: &[u8; 32],
+) -> Result<[u8; SAFETY_NUMBER_DIGITS]> {
     let (first, second) = if pub_a <= pub_b {
         (pub_a, pub_b)
     } else {
@@ -110,7 +113,10 @@ mod tests {
         let a = [5u8; 32];
         let b = [6u8; 32];
         let c = [7u8; 32];
-        assert_ne!(safety_number(&a, &b).unwrap(), safety_number(&a, &c).unwrap());
+        assert_ne!(
+            safety_number(&a, &b).unwrap(),
+            safety_number(&a, &c).unwrap()
+        );
     }
 
     #[test]

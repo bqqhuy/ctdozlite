@@ -3,10 +3,10 @@
 //! Provides data structures and API helpers for creating, voting, and inspecting
 //! group polls (`/api/group/poll/create`, `/api/group/poll/vote`, `/api/group/poll/detail`).
 
+use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::session::Session;
 
 /// An option in a poll.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -36,7 +36,12 @@ impl PollItem {
         if self.total_votes == 0 {
             return 0.0;
         }
-        let count = self.options.iter().find(|o| o.id == option_id).map(|o| o.vote_count).unwrap_or(0);
+        let count = self
+            .options
+            .iter()
+            .find(|o| o.id == option_id)
+            .map(|o| o.vote_count)
+            .unwrap_or(0);
         (count as f32 / self.total_votes as f32) * 100.0
     }
 }
@@ -44,21 +49,62 @@ impl PollItem {
 /// Parse a poll item from Zalo API response or message wire payload.
 pub fn parse_poll_item(val: &Value) -> Option<PollItem> {
     let root = val.get("data").unwrap_or(val);
-    let id = root.get("id").or_else(|| root.get("poll_id")).and_then(crate::api_response::integer)?;
-    let grid = root.get("grid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let question = root.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let creator_id = root.get("creator_id").or_else(|| root.get("owner_id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let multi_choice = root.get("multi_choice").or_else(|| root.get("is_multi_choice")).and_then(|v| v.as_bool()).unwrap_or(false);
-    let is_closed = root.get("is_closed").or_else(|| root.get("closed")).and_then(|v| v.as_bool()).unwrap_or(false);
+    let id = root
+        .get("id")
+        .or_else(|| root.get("poll_id"))
+        .and_then(crate::api_response::integer)?;
+    let grid = root
+        .get("grid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let question = root
+        .get("question")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let creator_id = root
+        .get("creator_id")
+        .or_else(|| root.get("owner_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let multi_choice = root
+        .get("multi_choice")
+        .or_else(|| root.get("is_multi_choice"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let is_closed = root
+        .get("is_closed")
+        .or_else(|| root.get("closed"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let mut total_votes = 0u32;
     let mut options = Vec::new();
     if let Some(arr) = root.get("options").and_then(|v| v.as_array()) {
         for (idx, opt) in arr.iter().enumerate() {
-            let opt_id = opt.get("id").or_else(|| opt.get("option_id")).and_then(crate::api_response::integer).unwrap_or(idx as i64 + 1);
-            let text = opt.get("content").or_else(|| opt.get("text")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let vote_count = opt.get("count").or_else(|| opt.get("vote_count")).and_then(crate::api_response::integer).unwrap_or(0) as u32;
-            let is_voted_by_me = opt.get("is_voted").or_else(|| opt.get("voted")).and_then(|v| v.as_bool()).unwrap_or(false);
+            let opt_id = opt
+                .get("id")
+                .or_else(|| opt.get("option_id"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(idx as i64 + 1);
+            let text = opt
+                .get("content")
+                .or_else(|| opt.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let vote_count = opt
+                .get("count")
+                .or_else(|| opt.get("vote_count"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0) as u32;
+            let is_voted_by_me = opt
+                .get("is_voted")
+                .or_else(|| opt.get("voted"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             total_votes += vote_count;
             options.push(PollOption {
                 id: opt_id,
@@ -112,38 +158,41 @@ pub async fn create_group_poll(
     hide_voters: bool,
 ) -> Result<Value> {
     let url = s.resolve_service_url("group", "/api/group/poll/create");
-    let payload = build_create_poll_params(grid, question, options, multi_choice, allow_add_opt, hide_voters);
-    let params = s.encoded_params(&payload)
+    let payload = build_create_poll_params(
+        grid,
+        question,
+        options,
+        multi_choice,
+        allow_add_opt,
+        hide_voters,
+    );
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số tạo bình chọn thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
 /// Call `/api/group/poll/vote`.
-pub async fn vote_group_poll(
-    s: &Session,
-    poll_id: i64,
-    option_ids: &[i64],
-) -> Result<Value> {
+pub async fn vote_group_poll(s: &Session, poll_id: i64, option_ids: &[i64]) -> Result<Value> {
     let url = s.resolve_service_url("group", "/api/group/poll/vote");
     let payload = json!({
         "poll_id": poll_id,
         "option_ids": option_ids,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số bỏ phiếu thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
 /// Call `/api/group/poll/detail`.
-pub async fn get_group_poll_detail(
-    s: &Session,
-    poll_id: i64,
-) -> Result<Option<PollItem>> {
+pub async fn get_group_poll_detail(s: &Session, poll_id: i64) -> Result<Option<PollItem>> {
     let url = s.resolve_service_url("group", "/api/group/poll/detail");
     let payload = json!({ "poll_id": poll_id });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số xem bình chọn thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;

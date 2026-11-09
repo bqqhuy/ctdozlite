@@ -45,7 +45,10 @@ fn test_a18_fk_promotion_with_expiry() -> Result<()> {
     );
 
     // Expected: FK constraint failure
-    assert!(result.is_err(), "UPDATE should fail without ON UPDATE CASCADE");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail without ON UPDATE CASCADE"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("FOREIGN KEY constraint failed"),

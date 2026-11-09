@@ -109,7 +109,11 @@ impl CachedVideo {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(".ctdoz-") && n.ends_with(".partial"));
-            if !in_use && !is_active_partial && metadata.is_file() && !entry.file_type()?.is_symlink() {
+            if !in_use
+                && !is_active_partial
+                && metadata.is_file()
+                && !entry.file_type()?.is_symlink()
+            {
                 // Files in this directory are disposable playback copies, never user saves.
                 if std::fs::remove_file(path).is_err() {
                     crate::logger::log_error("video cache", "Cannot remove stale playback file");
@@ -221,16 +225,10 @@ impl CachedVideo {
 impl Drop for CachedVideo {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        CACHE_BYTES.fetch_sub(
-            self.1.load(Ordering::Acquire),
-            Ordering::AcqRel,
-        );
+        CACHE_BYTES.fetch_sub(self.1.load(Ordering::Acquire), Ordering::AcqRel);
         let remaining_reserved = self.2.load(Ordering::Acquire);
         if remaining_reserved > 0 {
-            PENDING_RESERVATIONS.fetch_sub(
-                remaining_reserved,
-                Ordering::AcqRel,
-            );
+            PENDING_RESERVATIONS.fetch_sub(remaining_reserved, Ordering::AcqRel);
         }
         if let Ok(mut active) = ACTIVE_CACHE.lock() {
             active.retain(|p| p != &self.0);

@@ -316,7 +316,6 @@ mod media_archive_tests {
     }
 }
 
-
 /// An atomic snapshot session for database restoration.
 /// Preserves the original database and supports rollback on error or user cancellation.
 pub struct AtomicRestoreSession {
@@ -329,8 +328,7 @@ impl AtomicRestoreSession {
     pub fn begin(db_path: &std::path::Path) -> Result<Self> {
         let backup_path = db_path.with_extension("restore_snapshot.bak");
         if db_path.exists() {
-            std::fs::copy(db_path, &backup_path)
-                .context("Tạo bản sao lưu tạm thời thất bại")?;
+            std::fs::copy(db_path, &backup_path).context("Tạo bản sao lưu tạm thời thất bại")?;
         }
         Ok(Self {
             backup_path,
@@ -363,14 +361,19 @@ impl Drop for AtomicRestoreSession {
     }
 }
 
-
 #[cfg(test)]
 mod atomic_restore_tests {
     use super::*;
 
     #[test]
     fn test_atomic_backup_rollback() {
-        let dir = std::env::temp_dir().join(format!("ctdoz_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let dir = std::env::temp_dir().join(format!(
+            "ctdoz_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let db_file = dir.join("messages.db");
 

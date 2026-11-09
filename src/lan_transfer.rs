@@ -21,7 +21,10 @@ pub struct LanPeer {
 pub enum LanTransferState {
     Idle,
     Connecting,
-    Transferring { bytes_transferred: u64, total_bytes: u64 },
+    Transferring {
+        bytes_transferred: u64,
+        total_bytes: u64,
+    },
     Finished,
     Failed(String),
     Cancelled,
@@ -30,7 +33,10 @@ pub enum LanTransferState {
 impl LanTransferState {
     pub fn progress_ratio(&self) -> f32 {
         match self {
-            Self::Transferring { bytes_transferred, total_bytes } => {
+            Self::Transferring {
+                bytes_transferred,
+                total_bytes,
+            } => {
                 if *total_bytes > 0 {
                     (*bytes_transferred as f32 / *total_bytes as f32).clamp(0.0, 1.0)
                 } else {
@@ -86,14 +92,16 @@ mod tests {
     #[test]
     fn test_lan_peer_discovery() {
         let packet = "ZALO_LAN:v1:peer_win11_surface:Surface Pro ARM64:8998";
-        let peer = parse_lan_discovery_packet(packet, "192.168.1.105", 1795000000).expect("Must parse peer");
+        let peer = parse_lan_discovery_packet(packet, "192.168.1.105", 1795000000)
+            .expect("Must parse peer");
         assert_eq!(peer.peer_id, "peer_win11_surface");
         assert_eq!(peer.device_name, "Surface Pro ARM64");
         assert_eq!(peer.ip_address, "192.168.1.105");
         assert_eq!(peer.port, 8998);
         assert_eq!(peer.last_seen_ts, 1795000000);
 
-        let formatted = format_lan_discovery_packet("peer_win11_surface", "Surface Pro ARM64", 8998);
+        let formatted =
+            format_lan_discovery_packet("peer_win11_surface", "Surface Pro ARM64", 8998);
         assert_eq!(formatted, packet);
     }
 

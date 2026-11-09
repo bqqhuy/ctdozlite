@@ -451,7 +451,8 @@ impl AudioProcessor {
 
         // 1. Acoustic Echo Suppression (AES/AEC)
         if speaker_energy > 0.03 {
-            let suppression = (1.0 - (speaker_energy * 2.0).min(0.85)) * self.echo_suppression_factor;
+            let suppression =
+                (1.0 - (speaker_energy * 2.0).min(0.85)) * self.echo_suppression_factor;
             for s in samples.iter_mut() {
                 *s *= suppression;
             }
@@ -1341,8 +1342,7 @@ fn run_media_loop(
                             frame.fill(sample);
                         }
                         resampler.finish(&mut buffer);
-                        let rms =
-                            (energy_sq / played.max(1) as f64).sqrt() as f32;
+                        let rms = (energy_sq / played.max(1) as f64).sqrt() as f32;
                         // Exponential smoothing so the echo gate does not flicker
                         // on zero-crossings of the waveform.
                         let prev = f32::from_bits(seb.load(Ordering::Relaxed));
@@ -2764,22 +2764,34 @@ mod group_media_tests {
         let mut mic_echo = vec![0.5; FRAME_SAMPLES];
         let loud_speaker = 0.5;
         ap.process_capture(&mut mic_echo, loud_speaker);
-        let echo_rms: f32 = (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
-        assert!(echo_rms < 0.1, "Loud speaker must trigger echo suppression, got {echo_rms}");
+        let echo_rms: f32 =
+            (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(
+            echo_rms < 0.1,
+            "Loud speaker must trigger echo suppression, got {echo_rms}"
+        );
 
         // Test 2: Background noise below noise floor is gated
         let mut noise = vec![0.005; FRAME_SAMPLES];
         ap.process_capture(&mut noise, 0.0);
-        let noise_rms: f32 = (noise.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
-        assert!(noise_rms < 0.002, "Noise below threshold must be attenuated");
+        let noise_rms: f32 =
+            (noise.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(
+            noise_rms < 0.002,
+            "Noise below threshold must be attenuated"
+        );
 
         // Test 3: Normal voice signal is boosted/normalized by AGC
         let mut voice = vec![0.08; FRAME_SAMPLES];
         for _ in 0..10 {
             ap.process_capture(&mut voice, 0.0);
         }
-        let voice_rms: f32 = (voice.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
-        assert!(voice_rms > 0.1 && voice_rms <= 0.25, "AGC must normalize voice volume, got {voice_rms}");
+        let voice_rms: f32 =
+            (voice.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(
+            voice_rms > 0.1 && voice_rms <= 0.25,
+            "AGC must normalize voice volume, got {voice_rms}"
+        );
     }
 
     #[test]
@@ -2800,13 +2812,20 @@ mod group_media_tests {
             energy_bits.store(smoothed.to_bits(), std::sync::atomic::Ordering::Relaxed);
         }
         let speaker_energy = f32::from_bits(energy_bits.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(speaker_energy > 0.03, "RMS 0.4 must exceed the echo gate, got {speaker_energy}");
+        assert!(
+            speaker_energy > 0.03,
+            "RMS 0.4 must exceed the echo gate, got {speaker_energy}"
+        );
 
         // Echo of that loud speaker audio leaking into the mic capture.
         let mut mic_echo = vec![0.4f32; FRAME_SAMPLES];
         dsp.process_capture(&mut mic_echo, speaker_energy);
-        let echo_rms: f32 = (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
-        assert!(echo_rms < 0.02, "suppressed echo must stay far below original, got {echo_rms}");
+        let echo_rms: f32 =
+            (mic_echo.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        assert!(
+            echo_rms < 0.02,
+            "suppressed echo must stay far below original, got {echo_rms}"
+        );
 
         // WP15.1-A regression: AGC must NOT boost residual echo in steady state.
         // Repeatedly feeding the suppressed frames must not raise their RMS.
@@ -2814,7 +2833,8 @@ mod group_media_tests {
         for _ in 0..30 {
             dsp.process_capture(&mut steady, speaker_energy);
         }
-        let steady_rms: f32 = (steady.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
+        let steady_rms: f32 =
+            (steady.iter().map(|&s| s * s).sum::<f32>() / FRAME_SAMPLES as f32).sqrt();
         assert!(
             steady_rms < 0.02,
             "AGC must not resurrect suppressed echo, got {steady_rms}"
@@ -2828,18 +2848,30 @@ mod group_media_tests {
         // rather than treating raw integer values as float energy.
         let i16_max: i16 = i16::MAX;
         let i16_norm: f32 = i16_max.to_sample::<f32>();
-        assert!((i16_norm - 1.0).abs() < 0.001, "i16 max must normalize close to 1.0, got {i16_norm}");
+        assert!(
+            (i16_norm - 1.0).abs() < 0.001,
+            "i16 max must normalize close to 1.0, got {i16_norm}"
+        );
 
         let i16_min: i16 = i16::MIN;
         let i16_min_norm: f32 = i16_min.to_sample::<f32>();
-        assert!((i16_min_norm - (-1.0)).abs() < 0.001, "i16 min must normalize close to -1.0, got {i16_min_norm}");
+        assert!(
+            (i16_min_norm - (-1.0)).abs() < 0.001,
+            "i16 min must normalize close to -1.0, got {i16_min_norm}"
+        );
 
         let u16_silence: u16 = 32768;
         let u16_silence_norm: f32 = u16_silence.to_sample::<f32>();
-        assert!(u16_silence_norm.abs() < 0.001, "u16 mid/silence must normalize close to 0.0, got {u16_silence_norm}");
+        assert!(
+            u16_silence_norm.abs() < 0.001,
+            "u16 mid/silence must normalize close to 0.0, got {u16_silence_norm}"
+        );
 
         let f32_sample: f32 = 0.5f32;
         let f32_norm: f32 = f32_sample.to_sample::<f32>();
-        assert!((f32_norm - 0.5).abs() < f32::EPSILON, "f32 sample must be unchanged");
+        assert!(
+            (f32_norm - 0.5).abs() < f32::EPSILON,
+            "f32 sample must be unchanged"
+        );
     }
 }

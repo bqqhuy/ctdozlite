@@ -150,7 +150,9 @@ impl VoiceRecorder {
                     }
                     if let Ok(mut lock) = inner_clone.lock() {
                         for chunk in data.chunks_exact(channels) {
-                            let mono: f32 = chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / (channels as f32);
+                            let mono: f32 =
+                                chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>()
+                                    / (channels as f32);
                             lock.samples.push(mono);
                             lock.window_samples.push(mono);
                             if lock.window_samples.len() >= window_size {
@@ -175,7 +177,9 @@ impl VoiceRecorder {
                     }
                     if let Ok(mut lock) = inner_clone.lock() {
                         for chunk in data.chunks_exact(channels) {
-                            let mono: f32 = chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>() / (channels as f32);
+                            let mono: f32 =
+                                chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>()
+                                    / (channels as f32);
                             lock.samples.push(mono);
                             lock.window_samples.push(mono);
                             if lock.window_samples.len() >= window_size {
@@ -195,7 +199,9 @@ impl VoiceRecorder {
             other => anyhow::bail!("Định dạng mẫu micro không được hỗ trợ: {other:?}"),
         };
 
-        stream.play().context("Không thể khởi động luồng thu âm micro")?;
+        stream
+            .play()
+            .context("Không thể khởi động luồng thu âm micro")?;
 
         Ok(Self {
             _stream: Some(stream),

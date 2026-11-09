@@ -4,10 +4,10 @@
 //! stored on the Zalo server for groups and 1-1 conversations
 //! (`/api/mediastore/list` commands 11841..11843, `/api/media/oneone/list` commands 12220..12222).
 
+use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::session::Session;
 
 /// Category of media stored on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,12 +60,14 @@ pub fn parse_server_media_list(val: &Value, expected_kind: ServerMediaType) -> S
         .or_else(|| data.get("list"))
         .and_then(|v| v.as_array());
 
-    let has_more = data.get("has_more")
+    let has_more = data
+        .get("has_more")
         .or_else(|| data.get("hasMore"))
         .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
         .unwrap_or(false);
 
-    let next_cursor = data.get("next_cursor")
+    let next_cursor = data
+        .get("next_cursor")
         .or_else(|| data.get("nextCursor"))
         .or_else(|| data.get("cursor"))
         .and_then(|v| v.as_str())
@@ -79,16 +81,54 @@ pub fn parse_server_media_list(val: &Value, expected_kind: ServerMediaType) -> S
         };
     };
 
-    let items = arr.iter()
+    let items = arr
+        .iter()
         .filter_map(|it| {
-            let id = it.get("id").or_else(|| it.get("msg_id"))?.as_str()?.to_string();
-            let sender_id = it.get("sender_id").or_else(|| it.get("from_uid")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let created_ts = it.get("created_ts").or_else(|| it.get("time")).and_then(crate::api_response::integer).unwrap_or(0);
-            let url = it.get("url").or_else(|| it.get("normal_url")).or_else(|| it.get("href")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let thumbnail_url = it.get("thumb_url").or_else(|| it.get("thumbnail")).and_then(|v| v.as_str()).map(ToString::to_string);
-            let file_name = it.get("file_name").or_else(|| it.get("title")).or_else(|| it.get("name")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let file_size = it.get("file_size").or_else(|| it.get("size")).and_then(crate::api_response::integer).unwrap_or(0) as u64;
-            let is_expired = it.get("is_expired").or_else(|| it.get("expired")).and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0))).unwrap_or(false);
+            let id = it
+                .get("id")
+                .or_else(|| it.get("msg_id"))?
+                .as_str()?
+                .to_string();
+            let sender_id = it
+                .get("sender_id")
+                .or_else(|| it.get("from_uid"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let created_ts = it
+                .get("created_ts")
+                .or_else(|| it.get("time"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0);
+            let url = it
+                .get("url")
+                .or_else(|| it.get("normal_url"))
+                .or_else(|| it.get("href"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let thumbnail_url = it
+                .get("thumb_url")
+                .or_else(|| it.get("thumbnail"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let file_name = it
+                .get("file_name")
+                .or_else(|| it.get("title"))
+                .or_else(|| it.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let file_size = it
+                .get("file_size")
+                .or_else(|| it.get("size"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0) as u64;
+            let is_expired = it
+                .get("is_expired")
+                .or_else(|| it.get("expired"))
+                .and_then(|v| v.as_bool().or_else(|| v.as_i64().map(|n| n != 0)))
+                .unwrap_or(false);
 
             Some(ServerMediaItem {
                 id,
@@ -127,7 +167,8 @@ pub async fn fetch_group_media_store(
         "count": count,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy kho media nhóm thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -150,7 +191,8 @@ pub async fn fetch_direct_media_store(
         "count": count,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy kho media cá nhân thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;

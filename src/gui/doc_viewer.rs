@@ -8,7 +8,7 @@ pub struct DocViewerModal {
     pub file_name: String,
     pub search_query: String,
     pub search_results: Vec<usize>, // Line numbers where query is found
-    pub search_index: usize,         // Current position in search_results
+    pub search_index: usize,        // Current position in search_results
 }
 
 impl DocViewerModal {

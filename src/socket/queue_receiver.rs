@@ -70,7 +70,8 @@ pub(crate) fn is_queue_error_payload(payload: &Value) -> bool {
 
     // Missing or null data when no cursor fields exist at top level
     let data_is_present = payload.get("data").is_some_and(|d| !d.is_null());
-    let has_top_cursor = payload.get("lastActionId").is_some() || payload.get("queueStatus").is_some();
+    let has_top_cursor =
+        payload.get("lastActionId").is_some() || payload.get("queueStatus").is_some();
     if !data_is_present && !has_top_cursor {
         return true;
     }
@@ -146,7 +147,12 @@ impl PullQueues {
                 diag::queue(self.epoch, key, diag::QueueDecision::Missing, queue.retries);
             } else {
                 queue.deadline = None;
-                diag::queue(self.epoch, key, diag::QueueDecision::Exhausted, queue.retries);
+                diag::queue(
+                    self.epoch,
+                    key,
+                    diag::QueueDecision::Exhausted,
+                    queue.retries,
+                );
             }
             return None;
         }
@@ -521,7 +527,9 @@ mod tests {
         assert!(queues.is_throttled(key));
 
         // due_with_capacity while still without capacity should NOT emit pull
-        assert!(queues.due_with_capacity(now + Duration::from_millis(50), false).is_empty());
+        assert!(queues
+            .due_with_capacity(now + Duration::from_millis(50), false)
+            .is_empty());
         assert!(queues.is_throttled(key));
 
         // When capacity recovers, due_with_capacity emits the deferred pull and clears throttled

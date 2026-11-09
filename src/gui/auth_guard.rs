@@ -7,8 +7,8 @@
 //! - `windows::Security::Credentials::UI::UserConsentVerifier`
 //! - Tested on Windows 11 ARM64
 
-use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
 
 /// Application lock guard — manages lock state and idle timeout.
 #[allow(dead_code)]
@@ -48,18 +48,16 @@ impl AppLockGuard {
                     match async_op.get() {
                         Ok(availability) => {
                             use windows::Security::Credentials::UI::UserConsentVerifierAvailability;
-                            matches!(
-                                availability,
-                                UserConsentVerifierAvailability::Available
-                            )
+                            matches!(availability, UserConsentVerifierAvailability::Available)
                         }
                         Err(_) => false,
                     }
                 }
                 Err(_) => false,
             }
-        }).join().unwrap_or(false)
-
+        })
+        .join()
+        .unwrap_or(false)
     }
 
     #[cfg(not(windows))]
@@ -81,7 +79,9 @@ impl AppLockGuard {
 
     /// Check if the app should auto-lock due to idle timeout.
     pub fn should_lock(&self) -> bool {
-        self.biometric_available && !self.locked && self.last_interaction.elapsed() >= self.idle_timeout
+        self.biometric_available
+            && !self.locked
+            && self.last_interaction.elapsed() >= self.idle_timeout
     }
 
     /// Mark the app as locked.
@@ -113,7 +113,8 @@ impl AppLockGuard {
         if self.locked {
             Duration::ZERO
         } else {
-            self.idle_timeout.saturating_sub(self.last_interaction.elapsed())
+            self.idle_timeout
+                .saturating_sub(self.last_interaction.elapsed())
         }
     }
 }
@@ -128,8 +129,8 @@ impl Default for AppLockGuard {
 /// lock-guard state. Returns `true` only when the user verified successfully.
 #[cfg(windows)]
 pub async fn request_windows_hello() -> Result<bool> {
-    use windows::Security::Credentials::UI::UserConsentVerifier;
     use windows::core::HSTRING;
+    use windows::Security::Credentials::UI::UserConsentVerifier;
 
     let task = tokio::task::spawn_blocking(move || -> Result<bool> {
         eprintln!("[AUTH_GUARD] Requesting Windows Hello authentication...");
@@ -141,8 +142,7 @@ pub async fn request_windows_hello() -> Result<bool> {
                 match async_op.get() {
                     Ok(result) => {
                         use windows::Security::Credentials::UI::UserConsentVerificationResult;
-                        let success =
-                            matches!(result, UserConsentVerificationResult::Verified);
+                        let success = matches!(result, UserConsentVerificationResult::Verified);
                         eprintln!(
                             "[AUTH_GUARD] Authentication result: {}",
                             if success { "verified" } else { "failed" }
@@ -215,7 +215,10 @@ mod tests {
         let mut guard = AppLockGuard::new();
         guard.lock();
         guard.touch();
-        assert!(guard.is_locked(), "touch must not bypass Windows Hello auth");
+        assert!(
+            guard.is_locked(),
+            "touch must not bypass Windows Hello auth"
+        );
     }
 
     #[test]

@@ -147,20 +147,20 @@ impl ThemePalette {
             bg_selected: Color32::from_rgb(229, 241, 255),    // #E5F1FF Zalo active row
             bg_input: Color32::from_rgb(248, 250, 252),       // #F8FAFC
             border: Color32::from_rgb(226, 232, 240),         // #E2E8F0
-            text_primary: Color32::from_rgb(8, 27, 58),       // #081B3A Zalo Primary Ink (16.1:1 contrast)
-            text_secondary: Color32::from_rgb(71, 85, 105),   // #475569 (7.2:1 contrast)
-            text_muted: Color32::from_rgb(100, 116, 139),     // #64748B (4.6:1 contrast)
-            primary: Color32::from_rgb(0, 104, 255),          // #0068FF Zalo Blue
-            primary_hover: Color32::from_rgb(0, 90, 224),     // #005AE0 Zalo Blue Pressed
-            accent_online: Color32::from_rgb(5, 150, 105),    // #059669 Emerald
-            danger: Color32::from_rgb(220, 38, 38),           // #DC2626
-            warning: Color32::from_rgb(146, 64, 14),          // #92400E
+            text_primary: Color32::from_rgb(8, 27, 58), // #081B3A Zalo Primary Ink (16.1:1 contrast)
+            text_secondary: Color32::from_rgb(71, 85, 105), // #475569 (7.2:1 contrast)
+            text_muted: Color32::from_rgb(100, 116, 139), // #64748B (4.6:1 contrast)
+            primary: Color32::from_rgb(0, 104, 255),    // #0068FF Zalo Blue
+            primary_hover: Color32::from_rgb(0, 90, 224), // #005AE0 Zalo Blue Pressed
+            accent_online: Color32::from_rgb(5, 150, 105), // #059669 Emerald
+            danger: Color32::from_rgb(220, 38, 38),     // #DC2626
+            warning: Color32::from_rgb(146, 64, 14),    // #92400E
             bubble_out_bg: Color32::from_rgb(229, 239, 255), // #E5EFFF Zalo Desktop Light Outgoing
-            bubble_out_text: Color32::from_rgb(8, 27, 58),   // #081B3A Zalo Ink text on light blue
+            bubble_out_text: Color32::from_rgb(8, 27, 58), // #081B3A Zalo Ink text on light blue
             bubble_out_meta: Color32::from_rgb(71, 92, 122),
             bubble_in_bg: Color32::WHITE,
             bubble_in_border: Color32::from_rgb(216, 224, 236),
-            bubble_in_text: Color32::from_rgb(8, 27, 58),     // #081B3A Zalo Ink text
+            bubble_in_text: Color32::from_rgb(8, 27, 58), // #081B3A Zalo Ink text
             bubble_in_meta: Color32::from_rgb(100, 116, 139),
         }
     }

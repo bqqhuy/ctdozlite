@@ -4,10 +4,10 @@
 //! verify media presence on zCloud, and obtain signed download URLs
 //! (`/api/getCloudViewerKey`, `/cloudmedia/queue/pc/verify`, `/cloudmedia/downloadurls/pc/v1`).
 
+use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::session::Session;
 
 /// Status of a media file on zCloud.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,18 +60,21 @@ pub struct CloudMediaDownloadUrl {
 /// Parse `CloudViewerKey` from `/api/getCloudViewerKey` JSON response.
 pub fn parse_cloud_viewer_key(val: &Value) -> Result<CloudViewerKey> {
     let data = val.get("data").unwrap_or(val);
-    let file_id = data.get("file_id")
+    let file_id = data
+        .get("file_id")
         .or_else(|| data.get("fileId"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let viewer_key = data.get("viewer_key")
+    let viewer_key = data
+        .get("viewer_key")
         .or_else(|| data.get("key"))
         .or_else(|| data.get("viewerKey"))
         .and_then(|v| v.as_str())
         .context("Thiếu viewer_key trong phản hồi zCloud")?
         .to_string();
-    let expires_at = data.get("expires_at")
+    let expires_at = data
+        .get("expires_at")
         .or_else(|| data.get("expire_time"))
         .and_then(crate::api_response::integer)
         .unwrap_or(0);
@@ -97,10 +100,26 @@ pub fn parse_cloud_download_urls(val: &Value) -> Vec<CloudMediaDownloadUrl> {
 
     arr.iter()
         .filter_map(|it| {
-            let file_id = it.get("file_id").or_else(|| it.get("fileId"))?.as_str()?.to_string();
-            let url = it.get("url").or_else(|| it.get("download_url"))?.as_str()?.to_string();
-            let checksum = it.get("checksum").or_else(|| it.get("md5")).and_then(|v| v.as_str()).map(ToString::to_string);
-            let size_bytes = it.get("size").or_else(|| it.get("file_size")).and_then(crate::api_response::integer).unwrap_or(0) as u64;
+            let file_id = it
+                .get("file_id")
+                .or_else(|| it.get("fileId"))?
+                .as_str()?
+                .to_string();
+            let url = it
+                .get("url")
+                .or_else(|| it.get("download_url"))?
+                .as_str()?
+                .to_string();
+            let checksum = it
+                .get("checksum")
+                .or_else(|| it.get("md5"))
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string);
+            let size_bytes = it
+                .get("size")
+                .or_else(|| it.get("file_size"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0) as u64;
 
             Some(CloudMediaDownloadUrl {
                 file_id,
@@ -120,7 +139,8 @@ pub async fn get_cloud_viewer_key(s: &Session, file_id: &str) -> Result<CloudVie
         "file_id": file_id,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy viewer key zCloud thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -136,23 +156,32 @@ pub async fn verify_cloud_media(s: &Session, file_id: &str, checksum: &str) -> R
         "checksum": checksum,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số kiểm tra tệp zCloud thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    let ok = decrypted.get("error_code").and_then(crate::api_response::integer).unwrap_or(-1) == 0;
+    let ok = decrypted
+        .get("error_code")
+        .and_then(crate::api_response::integer)
+        .unwrap_or(-1)
+        == 0;
     Ok(ok)
 }
 
 /// Call `/cloudmedia/downloadurls/pc/v1` to obtain signed download links.
-pub async fn get_cloud_download_urls(s: &Session, file_ids: &[&str]) -> Result<Vec<CloudMediaDownloadUrl>> {
+pub async fn get_cloud_download_urls(
+    s: &Session,
+    file_ids: &[&str],
+) -> Result<Vec<CloudMediaDownloadUrl>> {
     let host = crate::endpoints::service("zcloud").context("Thiếu cấu hình endpoint zcloud")?;
     let url = format!("{host}/cloudmedia/downloadurls/pc/v1");
     let payload = json!({
         "file_ids": file_ids,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy download urls zCloud thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -216,6 +245,9 @@ mod tests {
         assert_eq!(urls[0].file_id, "f1");
         assert_eq!(urls[0].url, "https://zcld.chat.zalo.me/d/f1?sign=xyz");
         assert_eq!(urls[0].size_bytes, 102400);
-        assert_eq!(urls[0].checksum.as_deref(), Some("d41d8cd98f00b204e9800998ecf8427e"));
+        assert_eq!(
+            urls[0].checksum.as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
     }
 }

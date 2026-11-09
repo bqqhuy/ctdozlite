@@ -3,10 +3,10 @@
 //! Provides data structures and API helpers for creating, updating, and querying
 //! tasks/todos in groups (`/api/group/todo/create`, `/api/group/todo/update`, `/api/group/todo/list`).
 
+use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::session::Session;
 
 /// Status of a group to-do item.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -53,15 +53,52 @@ pub fn parse_todo_list(val: &Value) -> Vec<TodoItem> {
 
     arr.iter()
         .filter_map(|it| {
-            let id = it.get("id").or_else(|| it.get("todo_id"))?.as_str()?.to_string();
-            let grid = it.get("grid").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let content = it.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let creator_id = it.get("creator_id").or_else(|| it.get("owner_id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let assignee_id = it.get("assignee_id").or_else(|| it.get("assignee")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let deadline_ts = it.get("deadline").or_else(|| it.get("deadline_ts")).and_then(crate::api_response::integer).unwrap_or(0);
-            let status_num = it.get("status").and_then(crate::api_response::integer).unwrap_or(0);
-            let status = if status_num == 1 { TodoStatus::Done } else { TodoStatus::Pending };
-            let created_ts = it.get("created_ts").or_else(|| it.get("create_time")).and_then(crate::api_response::integer).unwrap_or(0);
+            let id = it
+                .get("id")
+                .or_else(|| it.get("todo_id"))?
+                .as_str()?
+                .to_string();
+            let grid = it
+                .get("grid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let content = it
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let creator_id = it
+                .get("creator_id")
+                .or_else(|| it.get("owner_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let assignee_id = it
+                .get("assignee_id")
+                .or_else(|| it.get("assignee"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let deadline_ts = it
+                .get("deadline")
+                .or_else(|| it.get("deadline_ts"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0);
+            let status_num = it
+                .get("status")
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0);
+            let status = if status_num == 1 {
+                TodoStatus::Done
+            } else {
+                TodoStatus::Pending
+            };
+            let created_ts = it
+                .get("created_ts")
+                .or_else(|| it.get("create_time"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0);
 
             Some(TodoItem {
                 id,
@@ -124,7 +161,8 @@ pub async fn create_group_todo(
 ) -> Result<Value> {
     let url = s.resolve_service_url("group", "/api/group/todo/create");
     let payload = build_create_todo_params(grid, content, assignee_id, deadline_ts);
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số tạo to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
@@ -141,20 +179,19 @@ pub async fn update_group_todo(
 ) -> Result<Value> {
     let url = s.resolve_service_url("group", "/api/group/todo/update");
     let payload = build_update_todo_params(todo_id, grid, status, assignee_id, deadline_ts);
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số cập nhật to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
 }
 
 /// Call `/api/group/todo/list`.
-pub async fn list_group_todos(
-    s: &Session,
-    grid: &str,
-) -> Result<Vec<TodoItem>> {
+pub async fn list_group_todos(s: &Session, grid: &str) -> Result<Vec<TodoItem>> {
     let url = s.resolve_service_url("group", "/api/group/todo/list");
     let payload = json!({ "grid": grid });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách to-do thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;

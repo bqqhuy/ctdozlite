@@ -20,9 +20,12 @@ use windows::{
     },
 };
 static GENERATION: AtomicU64 = AtomicU64::new(0);
-pub(crate) static ACTIVE_VIDEO_WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
-pub(crate) static REQUESTED_SEEK_100NS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
-pub(crate) static REQUESTED_VOLUME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+pub(crate) static ACTIVE_VIDEO_WINDOW: std::sync::atomic::AtomicIsize =
+    std::sync::atomic::AtomicIsize::new(0);
+pub(crate) static REQUESTED_SEEK_100NS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+pub(crate) static REQUESTED_VOLUME: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
 const WM_APP_SEEK: u32 = 0x8000 + 1;
 const WM_APP_SET_VOL: u32 = 0x8000 + 2;
 thread_local! {

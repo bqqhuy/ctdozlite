@@ -5,12 +5,12 @@
 //! Sub-modules under `crypto/` implement the Signal Protocol Double Ratchet for E2EE
 //! (v0.016 WP16-1/2).  Evidence in `re-notes/36-zalo-e2ee-signal-protocol-analysis.md`.
 
-pub mod ratchet;
 pub mod keystore;
-pub mod store;
 pub mod prekey;
+pub mod ratchet;
 pub mod safety;
 pub mod session;
+pub mod store;
 pub mod wire;
 
 use aes::{Aes128, Aes256};

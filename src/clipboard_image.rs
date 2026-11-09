@@ -572,4 +572,3 @@ mod tests {
         assert!(decode_dib(&b).is_err());
     }
 }
-

@@ -604,7 +604,6 @@ mod tests {
     }
 }
 
-
 /// Descriptor for BinNet sync frames, preserving unknown opcodes and raw payload without guessing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BinNetDescriptor {

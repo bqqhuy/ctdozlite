@@ -30,16 +30,20 @@ fn doh() -> &'static crate::doh_resolver::DohResolver {
     })
 }
 
-fn doh_clients(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>>
-{
+fn doh_clients() -> &'static std::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>,
+> {
     DOH_CLIENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// Build (or reuse) a client that pins `host` to the DoH-resolved addresses.
 ///
 /// `ttl` bounds how long the pinned addresses may be reused.
-fn doh_client_for(host: &str, addrs: &[std::net::IpAddr], ttl: std::time::Duration) -> Result<reqwest::Client> {
+fn doh_client_for(
+    host: &str,
+    addrs: &[std::net::IpAddr],
+    ttl: std::time::Duration,
+) -> Result<reqwest::Client> {
     let mut cache = doh_clients().lock().unwrap();
     let now = std::time::Instant::now();
     if let Some((expires, client)) = cache.get(host) {
@@ -127,16 +131,18 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                                 .timeout(timeout)
                                 .send()
                                 .await
-                                .map_err(|e| if e.is_timeout() {
-                                    anyhow::Error::from(crate::media_recovery::Failure::Timeout)
-                                } else {
-                                    // Invalidate DoH cache for this host on connection failure.
-                                    doh().invalidate(&host_str);
-                                    // The pinned client still holds the stale
-                                    // addresses — drop it so the next attempt
-                                    // re-resolves.
-                                    doh_clients().lock().unwrap().remove(&host_str);
-                                    anyhow::Error::from(crate::media_recovery::Failure::Network)
+                                .map_err(|e| {
+                                    if e.is_timeout() {
+                                        anyhow::Error::from(crate::media_recovery::Failure::Timeout)
+                                    } else {
+                                        // Invalidate DoH cache for this host on connection failure.
+                                        doh().invalidate(&host_str);
+                                        // The pinned client still holds the stale
+                                        // addresses — drop it so the next attempt
+                                        // re-resolves.
+                                        doh_clients().lock().unwrap().remove(&host_str);
+                                        anyhow::Error::from(crate::media_recovery::Failure::Network)
+                                    }
                                 })?
                         }
                         Err(_) => {
@@ -326,16 +332,17 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
             lease.reserve_capacity(expected_len)?;
         }
     }
-    let file_id = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("media");
+    let file_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("media");
     let safe_id: String = file_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
         .take(32)
         .collect();
-    let safe_id = if safe_id.is_empty() { "media".into() } else { safe_id };
+    let safe_id = if safe_id.is_empty() {
+        "media".into()
+    } else {
+        safe_id
+    };
     let pid = std::process::id();
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -347,7 +354,9 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let partial = Partial(path.with_file_name(format!(".ctdoz-{safe_id}-{pid}-{timestamp}-{suffix}.partial")));
+    let partial = Partial(path.with_file_name(format!(
+        ".ctdoz-{safe_id}-{pid}-{timestamp}-{suffix}.partial"
+    )));
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -537,7 +546,6 @@ mod tests {
     }
 }
 
-
 /// Validate Content-Range header format: `bytes START-END/TOTAL` (RFC 7233).
 ///
 /// Ensures START <= END, END < TOTAL, and START/END match the requested range.
@@ -607,7 +615,8 @@ pub async fn range_request(
     end_byte: Option<u64>,
     timeout: Duration,
 ) -> Result<reqwest::Response> {
-    let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("Đường dẫn media không hợp lệ"))?;
+    let url =
+        reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("Đường dẫn media không hợp lệ"))?;
     ensure!(allowed(&url), "Nguồn media không được hỗ trợ");
     let range_val = match end_byte {
         Some(end) => format!("bytes={start_byte}-{end}"),
@@ -703,7 +712,9 @@ mod response_body_tests {
             socket.write_all(body).unwrap();
         });
         let url = format!("http://{address}/video.mp4");
-        let resp = range_request(&url, 100, Some(200), Duration::from_secs(5)).await.unwrap();
+        let resp = range_request(&url, 100, Some(200), Duration::from_secs(5))
+            .await
+            .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::PARTIAL_CONTENT);
         server.join().unwrap();
     }
@@ -778,9 +789,13 @@ mod response_body_tests {
 
         let url = format!("http://{address}/video.mp4");
         // Missing Content-Range -> Err
-        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5)).await.is_err());
+        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5))
+            .await
+            .is_err());
         // Mismatched Content-Range -> Err
-        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5)).await.is_err());
+        assert!(range_request(&url, 100, Some(200), Duration::from_secs(5))
+            .await
+            .is_err());
         server.join().unwrap();
     }
 
@@ -818,9 +833,10 @@ mod response_body_tests {
         let path_clone = path.clone();
         let url_clone = url.clone();
         let cancel_clone = cancel.clone();
-        let handle1 = tokio::spawn(async move {
-            save(&url_clone, &path_clone, cancel_clone, |_, _| {}).await
-        });
+        let handle1 =
+            tokio::spawn(
+                async move { save(&url_clone, &path_clone, cancel_clone, |_, _| {}).await },
+            );
 
         // Give handle1 a moment to acquire the lock and start downloading
         tokio::time::sleep(Duration::from_millis(50)).await;

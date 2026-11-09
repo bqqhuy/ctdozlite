@@ -63,7 +63,10 @@ fn test_a18_migration_fixes_fk_constraint() -> Result<()> {
         "UPDATE messages SET msg_id=?1 WHERE thread_id=?2 AND msg_id=?3",
         params!["server_456", "thread1", "local_abc"],
     );
-    assert!(result.is_err(), "v10 schema should fail FK constraint on promotion");
+    assert!(
+        result.is_err(),
+        "v10 schema should fail FK constraint on promotion"
+    );
 
     // Run migration v12 — it preserves all data
     zalo_rust::message_lifecycle::migrate_v12(&conn)?;

@@ -102,8 +102,24 @@ pub fn open_file(path: &std::path::Path) -> bool {
         let ext_lower = ext.to_lowercase();
         let blocked = matches!(
             ext_lower.as_str(),
-            "exe" | "com" | "bat" | "cmd" | "ps1" | "vbs" | "vbe" | "js" | "jse"
-                | "wsf" | "wsh" | "msi" | "scr" | "pif" | "lnk" | "url" | "inf" | "reg"
+            "exe"
+                | "com"
+                | "bat"
+                | "cmd"
+                | "ps1"
+                | "vbs"
+                | "vbe"
+                | "js"
+                | "jse"
+                | "wsf"
+                | "wsh"
+                | "msi"
+                | "scr"
+                | "pif"
+                | "lnk"
+                | "url"
+                | "inf"
+                | "reg"
         );
         if blocked {
             return false;

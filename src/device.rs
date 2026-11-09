@@ -3,10 +3,10 @@
 //! Provides models and API helpers for listing logged-in device sessions and
 //! kicking unauthorized sessions remotely (`/api/login/getdevicelist`, `/api/login/kickdevice`).
 
+use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use crate::session::Session;
 
 /// An active logged-in device session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -33,14 +33,38 @@ pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Vec<DeviceS
 
     arr.iter()
         .filter_map(|it| {
-            let device_id = it.get("device_id").or_else(|| it.get("imei"))?.as_str()?.to_string();
-            let name = it.get("name").or_else(|| it.get("device_name")).and_then(|v| v.as_str()).unwrap_or("Thiết bị không tên").to_string();
-            let platform = it.get("platform").or_else(|| it.get("os")).and_then(|v| v.as_str()).unwrap_or("Desktop").to_string();
-            let last_active_ts = it.get("last_active").or_else(|| it.get("last_active_time")).and_then(crate::api_response::integer).unwrap_or(0);
-            let location = it.get("location").or_else(|| it.get("ip_location")).and_then(|v| v.as_str()).unwrap_or("Việt Nam").to_string();
-            let is_current = it.get("is_current").and_then(|v| v.as_bool()).unwrap_or_else(|| {
-                current_imei.is_some_and(|imei| imei == device_id)
-            });
+            let device_id = it
+                .get("device_id")
+                .or_else(|| it.get("imei"))?
+                .as_str()?
+                .to_string();
+            let name = it
+                .get("name")
+                .or_else(|| it.get("device_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Thiết bị không tên")
+                .to_string();
+            let platform = it
+                .get("platform")
+                .or_else(|| it.get("os"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Desktop")
+                .to_string();
+            let last_active_ts = it
+                .get("last_active")
+                .or_else(|| it.get("last_active_time"))
+                .and_then(crate::api_response::integer)
+                .unwrap_or(0);
+            let location = it
+                .get("location")
+                .or_else(|| it.get("ip_location"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Việt Nam")
+                .to_string();
+            let is_current = it
+                .get("is_current")
+                .and_then(|v| v.as_bool())
+                .unwrap_or_else(|| current_imei.is_some_and(|imei| imei == device_id));
 
             Some(DeviceSession {
                 device_id,
@@ -60,7 +84,8 @@ pub async fn get_logged_in_devices(s: &Session) -> Result<Vec<DeviceSession>> {
     let payload = json!({
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số lấy danh sách thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
@@ -74,7 +99,8 @@ pub async fn kick_remote_device(s: &Session, target_device_id: &str) -> Result<V
         "target_device_id": target_device_id,
         "imei": s.imei,
     });
-    let params = s.encoded_params(&payload)
+    let params = s
+        .encoded_params(&payload)
         .context("Mã hoá tham số đăng xuất thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)

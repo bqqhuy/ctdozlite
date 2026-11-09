@@ -384,7 +384,9 @@ pub fn execute(
     };
     let importing = expected.is_some();
     let restore_session = if importing {
-        Some(crate::phone_sync::AtomicRestoreSession::begin(&session.history_path())?)
+        Some(crate::phone_sync::AtomicRestoreSession::begin(
+            &session.history_path(),
+        )?)
     } else {
         None
     };

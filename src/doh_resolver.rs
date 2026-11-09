@@ -4,11 +4,11 @@
 //! CDN hostnames and retry with IP addresses directly. Supports multiple DoH endpoints
 //! with TTL-aware caching and negative cache.
 
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use anyhow::{anyhow, Result};
 
 pub const GOOGLE_DOH_ENDPOINT: &str = "https://dns.google/resolve";
 pub const CLOUDFLARE_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
@@ -100,10 +100,10 @@ impl DohResolver {
         }
 
         // All endpoints failed -> add to negative cache (10min)
-        self.negative.lock().unwrap().insert(
-            host.to_string(),
-            Instant::now() + Duration::from_secs(600),
-        );
+        self.negative
+            .lock()
+            .unwrap()
+            .insert(host.to_string(), Instant::now() + Duration::from_secs(600));
         Err(anyhow!("DoH resolution failed for {}", host))
     }
 
@@ -171,12 +171,7 @@ impl DohResolver {
             .collect();
 
         // Empty response for this type is not an error (may not have AAAA, etc.)
-        let ttl = dns_resp
-            .answer
-            .iter()
-            .map(|a| a.ttl)
-            .max()
-            .unwrap_or(300);
+        let ttl = dns_resp.answer.iter().map(|a| a.ttl).max().unwrap_or(300);
 
         Ok((addrs, ttl))
     }
@@ -191,9 +186,8 @@ impl DohResolver {
 /// Convenience async function to resolve a domain to IP addresses via the shared DoH resolver (v0.016 Task 3).
 pub async fn resolve_ip(host: &str) -> Result<Vec<IpAddr>> {
     static GLOBAL_DOH: std::sync::OnceLock<DohResolver> = std::sync::OnceLock::new();
-    let resolver = GLOBAL_DOH.get_or_init(|| {
-        DohResolver::new().expect("Failed to initialize DohResolver")
-    });
+    let resolver =
+        GLOBAL_DOH.get_or_init(|| DohResolver::new().expect("Failed to initialize DohResolver"));
     resolver.resolve(host).await
 }
 

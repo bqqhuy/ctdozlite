@@ -250,15 +250,30 @@ mod tests {
         init(true);
         clear_entries();
 
-        log_error("https://chat.zalo.me/api?zpw_sek=LEAK123", "Error with token=LEAK456 and password=PASS");
+        log_error(
+            "https://chat.zalo.me/api?zpw_sek=LEAK123",
+            "Error with token=LEAK456 and password=PASS",
+        );
         let entries = get_entries();
         assert!(!entries.is_empty());
-        let e = entries.iter().find(|e| e.url.contains("chat.zalo.me")).expect("found entry");
-        assert!(!e.url.contains("LEAK123"), "URL in LogEntry must not contain zpw_sek");
+        let e = entries
+            .iter()
+            .find(|e| e.url.contains("chat.zalo.me"))
+            .expect("found entry");
+        assert!(
+            !e.url.contains("LEAK123"),
+            "URL in LogEntry must not contain zpw_sek"
+        );
         assert!(e.url.contains("<redacted>"));
         let err_msg = e.error_msg.as_deref().unwrap();
-        assert!(!err_msg.contains("LEAK456"), "Error message must not contain token");
-        assert!(!err_msg.contains("PASS"), "Error message must not contain password");
+        assert!(
+            !err_msg.contains("LEAK456"),
+            "Error message must not contain token"
+        );
+        assert!(
+            !err_msg.contains("PASS"),
+            "Error message must not contain password"
+        );
         assert!(err_msg.contains("<redacted>"));
     }
 
