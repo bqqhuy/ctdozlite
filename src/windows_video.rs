@@ -211,6 +211,13 @@ impl Codec {
     unsafe fn encoder(w: u32, h: u32) -> Result<Self> {
         let transform: IMFTransform =
             CoCreateInstance(&CMSH264EncoderMFT, None, CLSCTX_INPROC_SERVER)?;
+        // Without low-latency mode the encoder can buffer the entire live GOP,
+        // which is lost whenever capture recreates it for a requested keyframe.
+        // Microsoft CODECAPI_AVLowLatencyMode requires VT_BOOL for the encoder.
+        transform.cast::<ICodecAPI>()?.SetValue(
+            &CODECAPI_AVLowLatencyMode,
+            &windows::core::VARIANT::from(true),
+        )?;
         let output = media_type(&MFVideoFormat_H264, Some((w, h)))?;
         output.SetUINT32(&MF_MT_AVG_BITRATE, 350_000)?;
         output.SetUINT32(&MF_MT_MPEG2_PROFILE, 66)?; // baseline, no B frames
@@ -226,6 +233,11 @@ impl Codec {
     unsafe fn decoder() -> Result<Self> {
         let transform: IMFTransform =
             CoCreateInstance(&CMSH264DecoderMFT, None, CLSCTX_INPROC_SERVER)?;
+        // The inbox H.264 decoder uses VT_UI4 for this property, unlike the encoder.
+        transform.cast::<ICodecAPI>()?.SetValue(
+            &CODECAPI_AVLowLatencyMode,
+            &windows::core::VARIANT::from(1u32),
+        )?;
         transform.SetInputType(0, &media_type(&MFVideoFormat_H264, None)?, 0)?;
         let codec = Self {
             transform,
