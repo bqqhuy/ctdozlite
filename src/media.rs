@@ -1142,6 +1142,17 @@ fn start_audio_stream(
     }
 }
 
+fn take_capture_frame(input: &Mutex<Vec<f32>>) -> anyhow::Result<Vec<f32>> {
+    let mut buffer = input.lock().map_err(|_| {
+        anyhow::anyhow!("Lỗi bộ đệm âm thanh; đã dừng truyền media. Hãy kết thúc và gọi lại.")
+    })?;
+    Ok(if buffer.len() >= FRAME_SAMPLES {
+        buffer.drain(..FRAME_SAMPLES).collect()
+    } else {
+        Vec::new()
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_media_loop(
     stop: Arc<AtomicBool>,
@@ -1459,12 +1470,11 @@ fn run_media_loop(
     let mut decoded_pcm = [0.0_f32; MAX_OPUS_SAMPLES];
     while !stop.load(Ordering::Relaxed) {
         // --- Capture: take 320 samples (or emit comfort-noise every 20ms so peer never sees 0kbps) ---
-        let mut frame: Vec<f32> = {
-            let mut b = input_buf.lock().unwrap();
-            if b.len() >= FRAME_SAMPLES {
-                b.drain(0..FRAME_SAMPLES).collect()
-            } else {
-                Vec::new()
+        let mut frame = match take_capture_frame(&input_buf) {
+            Ok(frame) => frame,
+            Err(error) => {
+                report_media_error(&gui_tx, &egui_ctx, &error.to_string());
+                break;
             }
         };
         if frame.is_empty() && last_rtp_tx.elapsed() >= Duration::from_millis(20) {
@@ -2203,6 +2213,19 @@ fn run_native_h264_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_buffer_poison_returns_error_without_reusing_samples() {
+        let buffer = Mutex::new(vec![0.25; FRAME_SAMPLES * 2]);
+        assert_eq!(take_capture_frame(&buffer).unwrap().len(), FRAME_SAMPLES);
+        assert_eq!(buffer.lock().unwrap().len(), FRAME_SAMPLES);
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = buffer.lock().unwrap();
+            panic!("synthetic audio callback failure");
+        });
+        assert!(take_capture_frame(&buffer).is_err());
+        assert!(buffer.is_poisoned());
+    }
 
     #[test]
     fn test_unwrap_zalo_relay_rtp_all_formats() {

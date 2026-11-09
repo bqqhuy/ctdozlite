@@ -7,8 +7,34 @@
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Discard disposable cache entries after a panic before allowing reuse.
+/// This must not be used for persistent, authentication or cryptographic state.
+pub(crate) fn lock_cache<T>(
+    cache: &Mutex<HashMap<String, T>>,
+) -> MutexGuard<'_, HashMap<String, T>> {
+    cache.lock().unwrap_or_else(|poisoned| {
+        let mut entries = poisoned.into_inner();
+        entries.clear();
+        cache.clear_poison();
+        entries
+    })
+}
+
+/// Lazily build the shared resolver without turning initialization failure into a panic.
+pub(crate) fn shared() -> Result<&'static DohResolver> {
+    static RESOLVER: OnceLock<DohResolver> = OnceLock::new();
+    if let Some(resolver) = RESOLVER.get() {
+        return Ok(resolver);
+    }
+    // Concurrent initialization is harmless; keep the first complete client.
+    let _ = RESOLVER.set(DohResolver::new()?);
+    RESOLVER
+        .get()
+        .ok_or_else(|| anyhow!("Không tạo được bộ phân giải DNS"))
+}
 
 pub const GOOGLE_DOH_ENDPOINT: &str = "https://dns.google/resolve";
 pub const CLOUDFLARE_DOH_ENDPOINT: &str = "https://cloudflare-dns.com/dns-query";
@@ -65,7 +91,7 @@ impl DohResolver {
     pub async fn resolve_with_ttl(&self, host: &str) -> Result<(Vec<IpAddr>, u32)> {
         // Check positive cache
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = lock_cache(&self.cache);
             if let Some((addrs, expiry)) = cache.get(host) {
                 if Instant::now() < *expiry {
                     let remaining_ttl = (*expiry - Instant::now()).as_secs() as u32;
@@ -76,7 +102,7 @@ impl DohResolver {
 
         // Check negative cache
         {
-            let negative = self.negative.lock().unwrap();
+            let negative = lock_cache(&self.negative);
             if let Some(expiry) = negative.get(host) {
                 if Instant::now() < *expiry {
                     return Err(anyhow!("Negative cache hit for {}", host));
@@ -90,19 +116,14 @@ impl DohResolver {
                 if !addrs.is_empty() {
                     let cache_ttl = ttl.clamp(60, 600);
                     let expiry = Instant::now() + Duration::from_secs(cache_ttl as u64);
-                    self.cache
-                        .lock()
-                        .unwrap()
-                        .insert(host.to_string(), (addrs.clone(), expiry));
+                    lock_cache(&self.cache).insert(host.to_string(), (addrs.clone(), expiry));
                     return Ok((addrs, cache_ttl));
                 }
             }
         }
 
         // All endpoints failed -> add to negative cache (10min)
-        self.negative
-            .lock()
-            .unwrap()
+        lock_cache(&self.negative)
             .insert(host.to_string(), Instant::now() + Duration::from_secs(600));
         Err(anyhow!("DoH resolution failed for {}", host))
     }
@@ -178,17 +199,14 @@ impl DohResolver {
 
     /// Invalidate cache entry for a host
     pub fn invalidate(&self, host: &str) {
-        self.cache.lock().unwrap().remove(host);
-        self.negative.lock().unwrap().remove(host);
+        lock_cache(&self.cache).remove(host);
+        lock_cache(&self.negative).remove(host);
     }
 }
 
 /// Convenience async function to resolve a domain to IP addresses via the shared DoH resolver (v0.016 Task 3).
 pub async fn resolve_ip(host: &str) -> Result<Vec<IpAddr>> {
-    static GLOBAL_DOH: std::sync::OnceLock<DohResolver> = std::sync::OnceLock::new();
-    let resolver =
-        GLOBAL_DOH.get_or_init(|| DohResolver::new().expect("Failed to initialize DohResolver"));
-    resolver.resolve(host).await
+    shared()?.resolve(host).await
 }
 
 /// Resolve a domain with system DNS first, falling back to DoH if system DNS fails (v0.016 Task 3).
@@ -205,6 +223,52 @@ pub async fn resolve_with_system_fallback(host: &str) -> Result<Vec<IpAddr>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn poisoned_dns_caches_are_discarded_and_reusable() {
+        let resolver = DohResolver::new().unwrap();
+        for positive in [true, false] {
+            std::thread::scope(|scope| {
+                assert!(scope
+                    .spawn(|| {
+                        if positive {
+                            let _guard = resolver.cache.lock().unwrap();
+                            panic!("synthetic cache writer failure");
+                        } else {
+                            let _guard = resolver.negative.lock().unwrap();
+                            panic!("synthetic negative cache writer failure");
+                        }
+                    })
+                    .join()
+                    .is_err());
+            });
+        }
+        resolver.invalidate("test.invalid");
+        assert!(!resolver.cache.is_poisoned());
+        assert!(!resolver.negative.is_poisoned());
+        lock_cache(&resolver.cache).insert(
+            "test.invalid".into(),
+            (
+                vec!["127.0.0.1".parse().unwrap()],
+                Instant::now() + Duration::from_secs(90),
+            ),
+        );
+        let (addresses, _) = resolver.resolve_with_ttl("test.invalid").await.unwrap();
+        assert_eq!(addresses, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+    }
+
+    #[test]
+    fn poisoned_cache_drops_all_stale_entries_before_reuse() {
+        let cache = Mutex::new(HashMap::from([("stale.invalid".to_owned(), 7)]));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("synthetic cache writer failure");
+        });
+        assert!(cache.is_poisoned());
+        assert!(lock_cache(&cache).is_empty());
+        lock_cache(&cache).insert("fresh.invalid".into(), 8);
+        assert_eq!(lock_cache(&cache).get("fresh.invalid"), Some(&8));
+    }
 
     #[test]
     fn test_cache_invalidate() {

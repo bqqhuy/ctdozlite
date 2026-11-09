@@ -2,6 +2,11 @@
 
 ## Chưa phát hành — khắc phục audit 09/11/2026
 
+- Đối chiếu audit Claude: sửa báo lỗi audio, phục hồi cache DNS/client sau poison,
+  bỏ panic khởi tạo resolver; sửa preview tài liệu theo cache đúng tin nhắn,
+  fallback CDN có kiểm tra và giới hạn 1 MiB. Giữ E2EE trial/log như trước.
+  Phân loại lỗi có bằng chứng và checklist tại docs/AUDIT_FIX_PLAN.md.
+
 - Khắc phục audit độc lập trên `164af11`: chặn bypass E2EE từ TUI/API thấp,
   ngăn envelope giả và tin nhóm thay policy DM, nhận trùng bền vững với crypto
   schema 8, bảo vệ plaintext đã lưu và xóa recovery copy khi xóa/thu hồi tin.

@@ -287,6 +287,7 @@ pub enum WorkerCmd {
     PreviewDocument {
         url: String,
         name: String,
+        context: ChatImage,
     },
     Forward {
         target_id: String,
@@ -1507,60 +1508,24 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             tokio::task::spawn_blocking(move||{if !account.is_active()||account.account_key()!=owner||thread.as_ref().is_some_and(|(id,group)|!account.hidden.view(&owner).allows(id,*group)){return;}
                                 if folder{if let Some(parent)=path.parent(){crate::platform::open_folder(parent);}}else{crate::platform::open_file(&path);}});
                         }
-                        WorkerCmd::PreviewDocument { url, name } => {
+                        WorkerCmd::PreviewDocument { url, name, context } => {
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
-                            let s = session.lock().await.clone();
+                            let account = session.lock().await.clone();
                             tokio::spawn(async move {
+                                if !media_context_alive(&account, Some(&context)) { return; }
                                 let _ = tx.send(GuiEvent::StatusUpdate("Đang tải xem trước tài liệu…".into()));
                                 ctx.request_repaint();
-
-                                let safe_name = crate::media_download::safe_name(&name);
-                                let root = s.history_path().with_extension("attachment-cache");
-                                let maybe_cached = root.join(&safe_name);
-                                let content_opt = if maybe_cached.exists() {
-                                    tokio::fs::read(&maybe_cached).await.ok()
-                                } else {
-                                    let client = reqwest::Client::builder()
-                                        .timeout(std::time::Duration::from_secs(10))
-                                        .build();
-                                    if let Ok(c) = client {
-                                        match c.get(&url).send().await {
-                                            Ok(resp) => {
-                                                use futures_util::StreamExt;
-                                                let mut stream = resp.bytes_stream();
-                                                let mut buf = Vec::new();
-                                                const MAX_PREVIEW_BYTES: usize = 1024 * 1024; // 1 MiB limit
-                                                while let Some(chunk) = stream.next().await {
-                                                    if let Ok(bytes) = chunk {
-                                                        let remaining = MAX_PREVIEW_BYTES.saturating_sub(buf.len());
-                                                        if remaining == 0 {
-                                                            break;
-                                                        }
-                                                        let to_take = bytes.len().min(remaining);
-                                                        buf.extend_from_slice(&bytes[..to_take]);
-                                                    } else {
-                                                        break;
-                                                    }
-                                                }
-                                                Some(buf)
-                                            }
-                                            Err(_) => None,
-                                        }
-                                    } else {
-                                        None
+                                let root = account.history_path().with_extension("attachment-cache");
+                                let cached = crate::attachment_cache::path_for(&root, &context.thread, &context.message.id, &name);
+                                let result = crate::media_download::document_preview(&cached, &url).await;
+                                if !media_context_alive(&account, Some(&context)) { return; }
+                                match result {
+                                    Ok(bytes) => {
+                                        let content = String::from_utf8_lossy(&bytes).into_owned();
+                                        let _ = tx.send(GuiEvent::DocPreviewLoaded { file_name: name, content });
                                     }
-                                };
-
-                                match content_opt {
-                                    Some(bytes) => {
-                                        let content = String::from_utf8_lossy(&bytes).to_string();
-                                        let _ = tx.send(GuiEvent::DocPreviewLoaded {
-                                            file_name: name,
-                                            content,
-                                        });
-                                    }
-                                    None => {
+                                    Err(_) => {
                                         let _ = tx.send(GuiEvent::StatusUpdate("Không tải được nội dung xem trước tài liệu".into()));
                                     }
                                 }

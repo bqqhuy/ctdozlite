@@ -2865,7 +2865,11 @@ impl ZaloGuiApp {
 
                                 BubbleAction::PreviewDocument { url, name } => {
                                     if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::PreviewDocument { url, name });
+                                        let _ = tx.send(WorkerCmd::PreviewDocument { url, name, context: super::worker::ChatImage {
+                                            thread: self.threads[self.selected_thread_index].id.clone(),
+                                            group: self.threads[self.selected_thread_index].is_group,
+                                            message: m.clone(), preview: false,
+                                        } });
                                     }
                                 }
                                 BubbleAction::OpenAttachment {url,name} => {

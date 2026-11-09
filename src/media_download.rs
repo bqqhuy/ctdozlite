@@ -11,10 +11,6 @@ use std::{
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 pub static DOWNLOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-/// Per-host DoH-resolved reqwest clients (keyed by hostname).  Built lazily when
-/// system DNS fails so the hot path (system DNS working) has zero overhead.
-static DOH: OnceLock<crate::doh_resolver::DohResolver> = OnceLock::new();
-
 /// DoH-pinned clients, one per hostname, reused across downloads.
 ///
 /// The pinned addresses go stale when the CDN re-points a hostname, so each
@@ -22,13 +18,6 @@ static DOH: OnceLock<crate::doh_resolver::DohResolver> = OnceLock::new();
 static DOH_CLIENTS: OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>>,
 > = OnceLock::new();
-
-fn doh() -> &'static crate::doh_resolver::DohResolver {
-    DOH.get_or_init(|| {
-        crate::doh_resolver::DohResolver::new()
-            .expect("DohResolver construction must not fail — reqwest builder is always valid")
-    })
-}
 
 fn doh_clients() -> &'static std::sync::Mutex<
     std::collections::HashMap<String, (std::time::Instant, reqwest::Client)>,
@@ -44,11 +33,13 @@ fn doh_client_for(
     addrs: &[std::net::IpAddr],
     ttl: std::time::Duration,
 ) -> Result<reqwest::Client> {
-    let mut cache = doh_clients().lock().unwrap();
     let now = std::time::Instant::now();
-    if let Some((expires, client)) = cache.get(host) {
-        if *expires > now {
-            return Ok(client.clone());
+    {
+        let cache = crate::doh_resolver::lock_cache(doh_clients());
+        if let Some((expires, client)) = cache.get(host) {
+            if *expires > now {
+                return Ok(client.clone());
+            }
         }
     }
     let addr_port: Vec<std::net::SocketAddr> = addrs
@@ -64,7 +55,8 @@ fn doh_client_for(
         .no_proxy()
         .build()
         .context("Không tạo được DoH client")?;
-    cache.insert(host.to_owned(), (now + ttl, client.clone()));
+    crate::doh_resolver::lock_cache(doh_clients())
+        .insert(host.to_owned(), (now + ttl, client.clone()));
     Ok(client)
 }
 pub fn allowed(u: &reqwest::Url) -> bool {
@@ -116,7 +108,10 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                 // System DNS failed for a known CDN domain — attempt DoH fallback.
                 if let Some(host) = url.host_str() {
                     let host_str = host.to_owned();
-                    match doh().resolve_with_ttl(&host_str).await {
+                    match crate::doh_resolver::shared()?
+                        .resolve_with_ttl(&host_str)
+                        .await
+                    {
                         Ok((addrs, ttl)) => {
                             // Reuse a pinned client for this hostname; the
                             // resolver itself caches the addresses.
@@ -136,11 +131,14 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                                         anyhow::Error::from(crate::media_recovery::Failure::Timeout)
                                     } else {
                                         // Invalidate DoH cache for this host on connection failure.
-                                        doh().invalidate(&host_str);
+                                        if let Ok(resolver) = crate::doh_resolver::shared() {
+                                            resolver.invalidate(&host_str);
+                                        }
                                         // The pinned client still holds the stale
                                         // addresses — drop it so the next attempt
                                         // re-resolves.
-                                        doh_clients().lock().unwrap().remove(&host_str);
+                                        crate::doh_resolver::lock_cache(doh_clients())
+                                            .remove(&host_str);
                                         anyhow::Error::from(crate::media_recovery::Failure::Network)
                                     }
                                 })?
@@ -178,6 +176,52 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
         return Ok(r);
     }
     anyhow::bail!("Nguồn media chuyển hướng quá nhiều lần")
+}
+
+const MAX_PREVIEW_BYTES: usize = 1024 * 1024;
+
+/// Read a bounded document prefix, falling back to validated CDN transport if cache reading fails.
+/// # Errors
+/// Returns safe transport/read errors; partial failed transfers are never successful previews.
+pub(crate) async fn document_preview(cached: &Path, url: &str) -> Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    async fn cached_prefix(file: tokio::fs::File) -> std::io::Result<Vec<u8>> {
+        if !file.metadata().await?.is_file() {
+            return Err(std::io::Error::other("Not a regular cached file"));
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_PREVIEW_BYTES as u64)
+            .read_to_end(&mut bytes)
+            .await?;
+        Ok(bytes)
+    }
+    // Cache eviction can race this read. An unreadable optional copy must not block refetching.
+    if let Ok(file) = tokio::fs::File::open(cached).await {
+        if let Ok(bytes) = cached_prefix(file).await {
+            if !bytes.is_empty() {
+                return Ok(bytes);
+            }
+        }
+    }
+    let read = async {
+        let mut response = response(url, Duration::from_secs(10)).await?;
+        let mut bytes = Vec::new();
+        while bytes.len() < MAX_PREVIEW_BYTES {
+            let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| anyhow::anyhow!("Không đọc được nội dung xem trước tài liệu"))?
+            else {
+                break;
+            };
+            let remaining = MAX_PREVIEW_BYTES - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        }
+        Ok(bytes)
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .map_err(|_| anyhow::anyhow!("Quá thời gian tải xem trước tài liệu"))?
 }
 
 /// Returns true when the reqwest error indicates a DNS resolution failure.
@@ -459,6 +503,132 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    async fn preview_server(reply: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut request = [0; 4096];
+            let received = stream.read(&mut request).await.unwrap();
+            assert!(
+                received > 0,
+                "preview must send a request before the fixture replies"
+            );
+            // A prefix reader may close after its byte limit.
+            let _ = stream.write_all(&reply).await;
+        });
+        (format!("http://{address}/document.txt"), server)
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled local preview cache benchmark"]
+    async fn measure_document_preview_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.txt");
+        tokio::fs::write(&path, vec![b'x'; 8 * MAX_PREVIEW_BYTES])
+            .await
+            .unwrap();
+        for bounded in [false, true] {
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                let bytes = if bounded {
+                    document_preview(&path, "invalid-url").await.unwrap()
+                } else {
+                    tokio::fs::read(&path).await.unwrap()
+                };
+                std::hint::black_box(bytes);
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "task": if bounded { "preview_bounded_after" } else { "preview_unbounded_before" },
+                    "iterations": 7, "dataset_bytes": 8 * MAX_PREVIEW_BYTES,
+                    "retained_bytes": if bounded { MAX_PREVIEW_BYTES } else { 8 * MAX_PREVIEW_BYTES },
+                    "arch": std::env::consts::ARCH, "os": std::env::consts::OS, "profile": "debug",
+                    "min_ms": samples[0], "avg_ms": samples.iter().sum::<f64>() / 7.0,
+                    "p50_ms": samples[3], "p95_ms": samples[6], "p99_ms": samples[6]
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn document_preview_uses_bounded_cache_without_network() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.txt");
+        tokio::fs::write(&path, vec![b'x'; MAX_PREVIEW_BYTES + 32])
+            .await
+            .unwrap();
+        let bytes = document_preview(&path, "invalid-url").await.unwrap();
+        assert_eq!(bytes, vec![b'x'; MAX_PREVIEW_BYTES]);
+    }
+
+    #[tokio::test]
+    async fn document_preview_refetches_missing_unreadable_and_empty_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let empty = root.path().join("empty.txt");
+        tokio::fs::write(&empty, []).await.unwrap();
+        for path in [
+            root.path().join("evicted.txt"),
+            root.path().to_owned(),
+            empty,
+        ] {
+            let (url, server) = preview_server(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".to_vec(),
+            )
+            .await;
+            assert_eq!(document_preview(&path, &url).await.unwrap(), b"hello");
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn document_preview_rejects_http_errors_and_incomplete_streams() {
+        let root = tempfile::tempdir().unwrap();
+        for reply in [
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nshort".to_vec(),
+        ] {
+            let (url, server) = preview_server(reply).await;
+            assert!(document_preview(&root.path().join("missing"), &url)
+                .await
+                .is_err());
+            server.await.unwrap();
+        }
+        assert!(
+            document_preview(&root.path().join("missing"), "file:///private.txt")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn document_preview_bounds_download_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let mut reply = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_PREVIEW_BYTES + 32
+        )
+        .into_bytes();
+        reply.extend(vec![b'x'; MAX_PREVIEW_BYTES + 32]);
+        let (url, server) = preview_server(reply).await;
+        assert_eq!(
+            document_preview(&root.path().join("missing"), &url)
+                .await
+                .unwrap()
+                .len(),
+            MAX_PREVIEW_BYTES
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn rejects_credentialed_or_lookalike_destinations() {
         for s in [

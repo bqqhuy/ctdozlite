@@ -27,6 +27,17 @@ impl Drop for Pruning {
     }
 }
 
+/// Derive the same account-local destination used by completed attachment downloads.
+pub(crate) fn path_for(root: &Path, thread: &str, message: &str, name: &str) -> PathBuf {
+    // Length-delimited fields cannot collide across conversation/message boundaries.
+    let key = format!("{}:{thread}{}:{message}", thread.len(), message.len());
+    let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
+    root.join(format!(
+        "{digest}-{}",
+        crate::media_download::safe_name(name)
+    ))
+}
+
 /// An exclusive download reservation; completed files remain reusable after release.
 pub(crate) struct Entry {
     path: PathBuf,
@@ -45,13 +56,7 @@ impl Entry {
             !std::fs::symlink_metadata(root)?.file_type().is_symlink(),
             "Thư mục cache không hợp lệ"
         );
-        // Length-delimited fields cannot collide across conversation/message boundaries.
-        let key = format!("{}:{thread}{}:{message}", thread.len(), message.len());
-        let digest = format!("{:x}", Sha256::digest(key.as_bytes()));
-        let path = root.join(format!(
-            "{digest}-{}",
-            crate::media_download::safe_name(name)
-        ));
+        let path = path_for(root, thread, message, name);
         {
             let mut registry = REGISTRY
                 .lock()
