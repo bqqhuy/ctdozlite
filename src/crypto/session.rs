@@ -19,7 +19,9 @@ use super::keystore::{
 };
 use super::ratchet::{KeyPair, KeyPairBytes, RatchetSession};
 use super::store;
-use super::wire::{deserialize, serialize_prekey, serialize_whisper, DecodedMessage, PreKeyBundleWire};
+use super::wire::{
+    deserialize, serialize_prekey, serialize_whisper, DecodedMessage, PreKeyBundleWire,
+};
 
 /// Signed prekey id used for initial prekey bundle.
 pub const SIGNED_PREKEY_ID: u32 = 1;
@@ -126,6 +128,13 @@ impl E2eeManager {
 
     /// Top up the one-time prekey pool when it runs low.
     pub fn refill_one_time_prekeys(&self) -> Result<Vec<OneTimePreKey>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let batch = self.refill_prekeys_in_transaction()?;
+        tx.commit()?;
+        Ok(batch)
+    }
+
+    fn refill_prekeys_in_transaction(&self) -> Result<Vec<OneTimePreKey>> {
         let remaining = store::count_one_time_prekeys(&self.conn, &self.profile_id)?;
         if remaining >= PREKEY_REFILL_THRESHOLD {
             return Ok(Vec::new());
@@ -143,19 +152,25 @@ impl E2eeManager {
 
     /// Next free one-time prekey id.
     fn next_prekey_id(&self) -> Result<u32> {
-        let max: Option<u32> = self
-            .conn
-            .query_row(
-                "SELECT MAX(key_id) FROM one_time_prekey WHERE profile_id=?1",
-                rusqlite::params![self.profile_id],
-                |r| r.get(0),
-            )
-            .unwrap_or(None);
-        Ok(max.map(|m| m + 1).unwrap_or(1))
+        let max: Option<u32> = self.conn.query_row(
+            "SELECT MAX(key_id) FROM one_time_prekey WHERE profile_id=?1",
+            rusqlite::params![self.profile_id],
+            |r| r.get(0),
+        )?;
+        let used = max.unwrap_or(0);
+        let reserved: u32 = self.conn.query_row(
+            "SELECT COALESCE((SELECT last_id FROM prekey_sequence WHERE profile_id=?1),0)",
+            [&self.profile_id],
+            |r| r.get(0),
+        )?;
+        used.max(reserved)
+            .checked_add(1)
+            .context("Đã hết định danh prekey")
     }
 
     /// Build the public bundle to upload to the server.
     pub fn local_bundle(&self) -> Result<super::keystore::PreKeyBundle> {
+        self.refill_one_time_prekeys()?;
         let identity = self.identity()?;
         let spk = self.signed_prekey()?;
         let one_time = self.list_one_time_prekeys()?;
@@ -204,6 +219,19 @@ impl E2eeManager {
         store::load_session(&self.conn, &self.profile_id, peer_id)
     }
 
+    /// Preserve encrypted-thread policy independently of ratchet availability.
+    /// # Errors
+    /// Returns unreadable or corrupt state instead of allowing a plaintext route.
+    pub fn requires_e2ee(&self, peer_id: &str) -> Result<bool> {
+        let session = self.load_session(peer_id)?;
+        let required: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM e2ee_required WHERE profile_id=?1 AND peer_id=?2)",
+            rusqlite::params![self.profile_id, peer_id],
+            |row| row.get(0),
+        )?;
+        Ok(session.is_some() || required)
+    }
+
     /// Persist a ratchet session for a peer.
     pub fn save_session(&self, peer_id: &str, session: &RatchetSession) -> Result<()> {
         store::save_session(&self.conn, &self.profile_id, peer_id, session)
@@ -234,6 +262,24 @@ impl E2eeManager {
     /// Explicitly mark a peer's identity as verified by the user.
     pub fn verify_identity(&self, peer_id: &str) -> Result<()> {
         store::set_identity_verified(&self.conn, &self.profile_id, peer_id, true)
+    }
+
+    /// Verify exactly the identity whose safety number was displayed to the user.
+    /// # Errors
+    /// Refuses missing identities or a key changed since the dialog was opened.
+    pub fn verify_identity_number(&self, peer_id: &str, expected: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (key, _) = self
+            .get_trusted_identity(peer_id)?
+            .context("Chưa có khóa danh tính đối phương")?;
+        let actual = self.safety_number(&key)?;
+        anyhow::ensure!(
+            actual == expected,
+            "Khóa đối phương đã thay đổi; hãy mở lại mã an toàn"
+        );
+        self.verify_identity(peer_id)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Check if peer's identity has been verified by the user.
@@ -274,17 +320,21 @@ impl E2eeManager {
         let mut session = RatchetSession::init_as_sender(&master, &bob_spk)?;
         session.base_key = Some(ek_pub);
         let (header, ciphertext) = session.encrypt(plaintext)?;
-        self.save_session(peer_id, &session)?;
-        self.trust_identity(peer_id, &remote.identity_key)?;
-        store::record_base_key(&self.conn, &self.profile_id, peer_id, &ek_pub)?;
 
         let bundle_wire = PreKeyBundleWire {
-            registration_id: remote.registration_id,
+            registration_id: identity.registration_id,
             signed_pre_key_id: remote.signed_pre_key_id,
             one_time_pre_key_id: remote.one_time_pre_key.map(|(_, id)| id),
             base_key: ek_pub,
             identity_key: identity.dh.public,
         };
+        // Repeat the prekey envelope until an authenticated reply proves session establishment.
+        session.pending_prekey_bundle = Some(bundle_wire.clone());
+        let tx = self.conn.unchecked_transaction()?;
+        self.save_session(peer_id, &session)?;
+        self.trust_identity(peer_id, &remote.identity_key)?;
+        store::record_base_key(&self.conn, &self.profile_id, peer_id, &ek_pub)?;
+        tx.commit()?;
         Ok(serialize_prekey(&bundle_wire, &header, &ciphertext))
     }
 
@@ -297,8 +347,17 @@ impl E2eeManager {
     ) -> Result<Vec<u8>> {
         if let Some(mut session) = self.load_session(peer_id)? {
             let (header, ciphertext) = session.encrypt(plaintext)?;
+            let wire = if session.recv_count == 0 {
+                if let Some(ref bundle_wire) = session.pending_prekey_bundle {
+                    serialize_prekey(bundle_wire, &header, &ciphertext)
+                } else {
+                    serialize_whisper(&header, &ciphertext)
+                }
+            } else {
+                serialize_whisper(&header, &ciphertext)
+            };
             self.save_session(peer_id, &session)?;
-            return Ok(serialize_whisper(&header, &ciphertext));
+            return Ok(wire);
         }
         let bundle = remote.context("Chưa có bundle khóa của đối phương")?;
         self.start_session(peer_id, bundle, plaintext)
@@ -309,6 +368,7 @@ impl E2eeManager {
         let decoded = deserialize(payload)?;
         match decoded {
             DecodedMessage::PreKey(prekey) => {
+                let tx = self.conn.unchecked_transaction()?;
                 let existing_opt = self.load_session(peer_id)?;
                 let trusted_opt = self.get_trusted_identity(peer_id)?;
                 let identity_changed = match trusted_opt {
@@ -316,9 +376,31 @@ impl E2eeManager {
                     None => false,
                 };
 
+                // Repeated envelopes continue the established ratchet; only a new base
+                // key may create a session. Authentication still rejects actual replays.
+                if !identity_changed {
+                    if let Some(mut existing) = existing_opt
+                        .clone()
+                        .filter(|s| s.base_key == Some(prekey.bundle.base_key))
+                    {
+                        let plaintext = existing.decrypt(&prekey.header, &prekey.ciphertext)?;
+                        self.save_session(peer_id, &existing)?;
+                        tx.commit()?;
+                        return Ok(DecryptedMessage {
+                            text: String::from_utf8_lossy(&plaintext).into_owned(),
+                            identity_changed: false,
+                        });
+                    }
+                }
+
                 // Replay attack and session rollback protection (A11):
                 // Unconditionally reject duplicate base_keys across any identity key.
-                if store::has_base_key(&self.conn, &self.profile_id, peer_id, &prekey.bundle.base_key)? {
+                if store::has_base_key(
+                    &self.conn,
+                    &self.profile_id,
+                    peer_id,
+                    &prekey.bundle.base_key,
+                )? {
                     anyhow::bail!("Phát hiện replay attack: PreKeyWhisperMessage đã được xử lý trước đó (base_key trùng lặp)");
                 }
 
@@ -352,7 +434,9 @@ impl E2eeManager {
                         if active.key_id == spk_id {
                             active
                         } else {
-                            anyhow::bail!("Signed prekey (id={spk_id}) không tồn tại hoặc đã hết hạn thu hồi");
+                            anyhow::bail!(
+                                "Signed prekey (id={spk_id}) không tồn tại hoặc đã hết hạn thu hồi"
+                            );
                         }
                     }
                 };
@@ -379,12 +463,20 @@ impl E2eeManager {
                 let mut session = RatchetSession::init_as_receiver(&master, &alice_key, &bob_spk)?;
                 session.base_key = Some(prekey.bundle.base_key);
                 let plaintext = session.decrypt(&prekey.header, &prekey.ciphertext)?;
+                // A failed write rolls back the consumed prekey and replay marker too.
                 if let Some(otpk_key) = otpk {
                     store::delete_one_time_prekey(&self.conn, &self.profile_id, otpk_key.key_id)?;
                 }
-                store::record_base_key(&self.conn, &self.profile_id, peer_id, &prekey.bundle.base_key)?;
+                store::record_base_key(
+                    &self.conn,
+                    &self.profile_id,
+                    peer_id,
+                    &prekey.bundle.base_key,
+                )?;
                 self.save_session(peer_id, &session)?;
                 let changed = self.trust_identity(peer_id, &prekey.bundle.identity_key)?;
+                self.refill_prekeys_in_transaction()?;
+                tx.commit()?;
                 Ok(DecryptedMessage {
                     text: String::from_utf8_lossy(&plaintext).into_owned(),
                     identity_changed: changed,
@@ -437,8 +529,12 @@ mod tests {
     /// A peer bundle built from real key material (Bob's perspective) using bound signing identity (audit A04).
     fn peer_bundle(bob: &E2eeManager) -> super::super::prekey::RemoteBundle {
         bob.refill_one_time_prekeys().unwrap();
-        let bundle = bob.local_bundle().expect("local bundle with bound signing key");
-        bundle.to_remote_bundle().expect("convert local bundle to remote bundle")
+        let bundle = bob
+            .local_bundle()
+            .expect("local bundle with bound signing key");
+        bundle
+            .to_remote_bundle()
+            .expect("convert local bundle to remote bundle")
     }
 
     /// Each manager gets a *fresh* database.  The directory name carries a
@@ -564,7 +660,9 @@ mod tests {
         let bundle = peer_bundle(&bob);
 
         // 1. Alice sends first message (type 3 PreKeyWhisperMessage)
-        let first = alice.start_session("bob", &bundle, b"hello first").expect("start session");
+        let first = alice
+            .start_session("bob", &bundle, b"hello first")
+            .expect("start session");
         let out1 = bob.decrypt("alice", &first).expect("bob decrypts first");
         assert_eq!(out1.text, "hello first");
 
@@ -573,7 +671,9 @@ mod tests {
         assert_eq!(s1.recv_count, 1);
 
         // 2. Alice sends second message (type 1 WhisperMessage)
-        let second = alice.encrypt("bob", None, b"hello second").expect("encrypt second");
+        let second = alice
+            .encrypt("bob", None, b"hello second")
+            .expect("encrypt second");
         let out2 = bob.decrypt("alice", &second).expect("bob decrypts second");
         assert_eq!(out2.text, "hello second");
 
@@ -582,15 +682,25 @@ mod tests {
 
         // 3. Replay attack: replay `first` (type 3 message) to Bob
         let replay_res = bob.decrypt("alice", &first);
-        assert!(replay_res.is_err(), "Replaying type 3 message must be rejected");
+        assert!(
+            replay_res.is_err(),
+            "Replaying type 3 message must be rejected"
+        );
 
         // 4. Invariant: Bob's active session MUST NOT be rolled back to message 1
         let s_after = bob.load_session("alice").unwrap().unwrap();
-        assert_eq!(s_after.recv_count, 2, "Session recv_count must remain 2, not rolled back to 1");
+        assert_eq!(
+            s_after.recv_count, 2,
+            "Session recv_count must remain 2, not rolled back to 1"
+        );
 
         // 5. Subsequent legitimate message from Alice must continue to decrypt successfully
-        let third = alice.encrypt("bob", None, b"hello third").expect("encrypt third");
-        let out3 = bob.decrypt("alice", &third).expect("bob decrypts third after replay attempt");
+        let third = alice
+            .encrypt("bob", None, b"hello third")
+            .expect("encrypt third");
+        let out3 = bob
+            .decrypt("alice", &third)
+            .expect("bob decrypts third after replay attempt");
         assert_eq!(out3.text, "hello third");
 
         let s3 = bob.load_session("alice").unwrap().unwrap();
@@ -603,28 +713,41 @@ mod tests {
         let bob = manager("bob_id_test");
 
         let bundle = peer_bundle(&bob);
-        let first = alice.start_session("bob", &bundle, b"msg from alice original").unwrap();
+        let first = alice
+            .start_session("bob", &bundle, b"msg from alice original")
+            .unwrap();
         let out1 = bob.decrypt("alice", &first).unwrap();
         assert_eq!(out1.text, "msg from alice original");
         assert!(!out1.identity_changed, "TOFU is not identity changed");
 
         // Bob marks Alice as verified
         bob.verify_identity("alice").unwrap();
-        assert!(bob.is_identity_verified("alice").unwrap(), "Alice should be verified");
+        assert!(
+            bob.is_identity_verified("alice").unwrap(),
+            "Alice should be verified"
+        );
 
         // Now Alice reinstalls the app (creates a new identity key pair)
         let alice_new = manager("alice_id2_new");
         // Alice new gets a fresh bundle from Bob
         let bundle2 = peer_bundle(&bob);
-        let first_new = alice_new.start_session("bob", &bundle2, b"msg from alice new device").unwrap();
+        let first_new = alice_new
+            .start_session("bob", &bundle2, b"msg from alice new device")
+            .unwrap();
 
         // Bob receives message from Alice's new device
         let out2 = bob.decrypt("alice", &first_new).unwrap();
         assert_eq!(out2.text, "msg from alice new device");
-        assert!(out2.identity_changed, "Must report identity_changed = true when identity key changes");
+        assert!(
+            out2.identity_changed,
+            "Must report identity_changed = true when identity key changes"
+        );
 
         // Crucial A11 invariant: verified flag MUST be reset to false!
-        assert!(!bob.is_identity_verified("alice").unwrap(), "Verified flag must be reset to false upon identity change");
+        assert!(
+            !bob.is_identity_verified("alice").unwrap(),
+            "Verified flag must be reset to false upon identity change"
+        );
     }
 
     #[test]
@@ -635,21 +758,29 @@ mod tests {
         // Corrupt identity in DB
         let short_blob = vec![0xEEu8; 10]; // bad length
         let enc_blob = crate::storage::protect(&short_blob).unwrap();
-        m.conn.execute(
-            "UPDATE identity_key SET public_key=?1, private_bytes=?2 WHERE profile_id=?3",
-            rusqlite::params![&short_blob, &enc_blob, m.profile_id()],
-        ).unwrap();
+        m.conn
+            .execute(
+                "UPDATE identity_key SET public_key=?1, private_bytes=?2 WHERE profile_id=?3",
+                rusqlite::params![&short_blob, &enc_blob, m.profile_id()],
+            )
+            .unwrap();
 
         // Loading identity must return Err and must NOT regenerate
         assert!(m.identity().is_err(), "Must return Err on corrupt identity");
 
         // Verify the database was not overwritten with a new identity key
-        let raw_pub: Vec<u8> = m.conn.query_row(
-            "SELECT public_key FROM identity_key WHERE profile_id=?1",
-            rusqlite::params![m.profile_id()],
-            |r| r.get(0),
-        ).unwrap();
-        assert_eq!(raw_pub, short_blob, "Identity row must remain untouched without regeneration");
+        let raw_pub: Vec<u8> = m
+            .conn
+            .query_row(
+                "SELECT public_key FROM identity_key WHERE profile_id=?1",
+                rusqlite::params![m.profile_id()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            raw_pub, short_blob,
+            "Identity row must remain untouched without regeneration"
+        );
     }
 
     #[test]
@@ -666,13 +797,18 @@ mod tests {
         assert_eq!(bob_bundle_v1.signed_pre_key_id, 1);
 
         // Alice prepares a message to Bob using SPK id = 1
-        let wire_msg1 = alice_mgr.start_session(bob_mgr.profile_id(), &bob_bundle_v1, b"hello with spk v1").unwrap();
+        let wire_msg1 = alice_mgr
+            .start_session(bob_mgr.profile_id(), &bob_bundle_v1, b"hello with spk v1")
+            .unwrap();
 
         // Simulate time advancing past 7 days for Bob
-        bob_mgr.conn.execute(
-            "UPDATE signed_prekey SET created_at = ?1 WHERE profile_id = ?2 AND key_id = 1",
-            rusqlite::params![now_ms() - (8 * 86_400_000), bob_mgr.profile_id()],
-        ).unwrap();
+        bob_mgr
+            .conn
+            .execute(
+                "UPDATE signed_prekey SET created_at = ?1 WHERE profile_id = ?2 AND key_id = 1",
+                rusqlite::params![now_ms() - (8 * 86_400_000), bob_mgr.profile_id()],
+            )
+            .unwrap();
 
         // Bob rotates SPK -> should now have key_id = 2
         let bob_spk_v2 = bob_mgr.active_signed_prekey().unwrap();
@@ -681,11 +817,160 @@ mod tests {
 
         // Verify old SPK v1 is still present in Bob's store (grace retention)
         let stored_v1 = store::load_signed_prekey(bob_mgr.conn(), bob_mgr.profile_id(), 1).unwrap();
-        assert!(stored_v1.is_some(), "Old signed prekey must be retained in store");
+        assert!(
+            stored_v1.is_some(),
+            "Old signed prekey must be retained in store"
+        );
 
         // Bob receives Alice's message which was encrypted with SPK v1!
         // Bob must be able to decrypt it using the retained SPK v1
         let decrypted = bob_mgr.decrypt(alice_mgr.profile_id(), &wire_msg1).unwrap();
         assert_eq!(decrypted.text, "hello with spk v1");
+    }
+    #[test]
+    fn prekey_delivery_survives_loss_reordering_and_rejects_replay() {
+        let alice = manager("delivery-alice");
+        let bob = manager("delivery-bob");
+        let remote = peer_bundle(&bob);
+        let first = alice
+            .start_session(bob.profile_id(), &remote, b"first")
+            .unwrap();
+        let second = alice.encrypt(bob.profile_id(), None, b"second").unwrap();
+        assert!(matches!(
+            deserialize(&second).unwrap(),
+            DecodedMessage::PreKey(_)
+        ));
+        assert_eq!(
+            bob.decrypt(alice.profile_id(), &second).unwrap().text,
+            "second"
+        );
+        assert_eq!(
+            bob.decrypt(alice.profile_id(), &first).unwrap().text,
+            "first"
+        );
+        assert!(bob.decrypt(alice.profile_id(), &first).is_err());
+        let reply = bob.encrypt(alice.profile_id(), None, b"reply").unwrap();
+        alice.decrypt(bob.profile_id(), &reply).unwrap();
+        let next = alice.encrypt(bob.profile_id(), None, b"third").unwrap();
+        assert!(matches!(
+            deserialize(&next).unwrap(),
+            DecodedMessage::Whisper(_)
+        ));
+        assert_eq!(
+            bob.decrypt(alice.profile_id(), &next).unwrap().text,
+            "third"
+        );
+    }
+
+    #[test]
+    fn session_write_failure_rolls_back_consumed_key_and_replay_marker() {
+        let alice = manager("atomic-alice");
+        let bob = manager("atomic-bob");
+        let remote = peer_bundle(&bob);
+        let wire = alice
+            .start_session(bob.profile_id(), &remote, b"recoverable")
+            .unwrap();
+        bob.conn.execute_batch("CREATE TRIGGER fail_session BEFORE INSERT ON signal_session BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+        assert!(bob.decrypt(alice.profile_id(), &wire).is_err());
+        assert!(bob.load_session(alice.profile_id()).unwrap().is_none());
+        assert!(store::get_one_time_prekey(
+            bob.conn(),
+            bob.profile_id(),
+            remote.one_time_pre_key.unwrap().1
+        )
+        .unwrap()
+        .is_some());
+        bob.conn.execute_batch("DROP TRIGGER fail_session").unwrap();
+        assert_eq!(
+            bob.decrypt(alice.profile_id(), &wire).unwrap().text,
+            "recoverable"
+        );
+    }
+
+    #[test]
+    fn verification_requires_the_displayed_real_identity() {
+        let manager = manager("verification");
+        assert!(manager.verify_identity("missing").is_err());
+        assert!(manager.get_trusted_identity("missing").unwrap().is_none());
+        manager.trust_identity("peer", &[7; 32]).unwrap();
+        let displayed = manager.safety_number(&[7; 32]).unwrap();
+        manager.trust_identity("peer", &[8; 32]).unwrap();
+        assert!(manager.verify_identity_number("peer", &displayed).is_err());
+        assert!(!manager.is_identity_verified("peer").unwrap());
+        manager
+            .verify_identity_number("peer", &manager.safety_number(&[8; 32]).unwrap())
+            .unwrap();
+        assert!(manager.is_identity_verified("peer").unwrap());
+    }
+
+    #[test]
+    fn refilled_pool_never_reuses_consumed_prekey_ids() {
+        let manager = manager("prekey-sequence");
+        let first = manager.refill_one_time_prekeys().unwrap();
+        let highest = first.iter().map(|key| key.key_id).max().unwrap();
+        manager
+            .conn
+            .execute(
+                "DELETE FROM one_time_prekey WHERE profile_id=?1",
+                [manager.profile_id()],
+            )
+            .unwrap();
+        let bundle = manager.local_bundle().unwrap();
+        assert!(bundle.pre_keys.iter().all(|key| key.key_id > highest));
+        manager
+            .conn
+            .execute(
+                "DELETE FROM one_time_prekey WHERE profile_id=?1",
+                [manager.profile_id()],
+            )
+            .unwrap();
+        manager
+            .conn
+            .execute(
+                "UPDATE prekey_sequence SET last_id=?1 WHERE profile_id=?2",
+                rusqlite::params![u32::MAX - 1, manager.profile_id()],
+            )
+            .unwrap();
+        assert!(manager.refill_one_time_prekeys().is_err());
+    }
+    #[test]
+    fn corrupt_ratchet_never_authorizes_plaintext_and_policy_survives_absence() {
+        let manager = manager("fail-closed-policy");
+        manager
+            .conn
+            .execute(
+                "INSERT INTO e2ee_required VALUES(?1,'peer')",
+                [manager.profile_id()],
+            )
+            .unwrap();
+        assert!(manager.requires_e2ee("peer").unwrap());
+        manager.conn.execute("INSERT INTO signal_session(profile_id,peer_id,device_id,session_record,updated_at) VALUES(?1,'peer',1,x'010203',0)",[manager.profile_id()]).unwrap();
+        assert!(manager.requires_e2ee("peer").is_err());
+    }
+    #[test]
+    fn consuming_last_prekey_refills_pool_in_the_same_transaction() {
+        let alice = manager("refill-alice");
+        let bob = manager("refill-bob");
+        let remote = peer_bundle(&bob);
+        let key_id = remote.one_time_pre_key.unwrap().1;
+        bob.conn
+            .execute(
+                "DELETE FROM one_time_prekey WHERE profile_id=?1 AND key_id<>?2",
+                rusqlite::params![bob.profile_id(), key_id],
+            )
+            .unwrap();
+        let packet = alice
+            .start_session(bob.profile_id(), &remote, b"refill")
+            .unwrap();
+        assert_eq!(
+            bob.decrypt(alice.profile_id(), &packet).unwrap().text,
+            "refill"
+        );
+        assert!(bob.one_time_prekey_count().unwrap() >= PREKEY_REFILL_THRESHOLD);
+        assert!(bob
+            .list_one_time_prekeys()
+            .unwrap()
+            .iter()
+            .all(|key| key.key_id > key_id));
     }
 }

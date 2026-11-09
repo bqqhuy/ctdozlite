@@ -1,5 +1,21 @@
 # Changelog
 
+## Chưa phát hành — khắc phục audit 09/11/2026
+
+- Chặn các đường E2EE chat và xác minh danh tính chưa có hợp đồng Zalo PC/Web
+  được kiểm chứng; không tự hạ xuống gửi plaintext. Không gửi envelope tự định
+  nghĩa lên máy chủ. Xem ADR-0035.
+- Sửa transaction ratchet/prekey, phục hồi khi mất gói đầu, dấu replay, khóa xác
+  minh giả và cache trạng thái xác minh cũ. Đây là kiểm chứng model local.
+- Cô lập worker/kênh sự kiện khi đổi profile; giữ kết quả tác vụ khi app khóa;
+  tiếp tục nhận progress sau broadcast lag.
+- Lưu tin nhắn nhanh theo tài khoản; chuyển lưu settings và đọc profile registry
+  ra khỏi UI; từ chối response lỗi hoặc thiếu dữ liệu bắt buộc.
+- Kiểm tra IP sau DNS cho link preview, giữ chính sách proxy; tối ưu checkpoint
+  upload, skipped keys và danh sách hội thoại; dọn helper/dialog/trace test dư.
+
+Chi tiết và giới hạn nghiệm thu: [bản ghi khắc phục](docs/audits/2026-11-09-remediation.md).
+
 ## v0.016-arm — Windows 11 ARM64 — 08/11/2026
 
 Thay đổi so với [v0.015.1-arm](https://github.com/bqqhuy/ctdozlite/releases/tag/v0.015.1-arm).

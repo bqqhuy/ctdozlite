@@ -1566,20 +1566,15 @@ impl ZaloGuiApp {
                     for item in items {
                         let key = format!("stk_{}_{}", item.cate_id, item.sticker_id);
                         let url = if item.cate_id == 0 && (1..=30).contains(&item.sticker_id) {
-                            format!(
-                                "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
-                                item.sticker_id
-                            )
+                            crate::endpoints::builtin_sticker_thumbnail(item.sticker_id)
                         } else {
-                            format!(
-                                "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
-                                item.sticker_id
-                            )
+                            crate::endpoints::legacy_sticker_image(item.sticker_id)
                         };
 
                         let (cell_rect, cell_resp) =
                             ui.allocate_exact_size(Vec2::new(68.0, 68.0), Sense::click());
-                        if ui.clip_rect().expand(100.0).intersects(cell_rect) && !self.sticker_textures.contains_key(&key)
+                        if ui.clip_rect().expand(100.0).intersects(cell_rect)
+                            && !self.sticker_textures.contains_key(&key)
                             && self.loading_stickers.insert(key.clone())
                         {
                             if let Some(tx) = WORKER_TX.get() {
@@ -1590,13 +1585,9 @@ impl ZaloGuiApp {
                             }
                         }
 
-
                         if cell_resp.hovered() {
-                            ui.painter().rect_filled(
-                                cell_rect,
-                                Rounding::same(8.0),
-                                pal.bg_hover,
-                            );
+                            ui.painter()
+                                .rect_filled(cell_rect, Rounding::same(8.0), pal.bg_hover);
                             ui.painter().rect_stroke(
                                 cell_rect,
                                 Rounding::same(8.0),
@@ -1859,15 +1850,9 @@ impl ZaloGuiApp {
                                             let url = if item.cate_id == 0
                                                 && (1..=30).contains(&item.sticker_id)
                                             {
-                                                format!(
-                                                    "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
-                                                    item.sticker_id
-                                                )
+                                                crate::endpoints::builtin_sticker_thumbnail(item.sticker_id)
                                             } else {
-                                                format!(
-                                                    "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
-                                                    item.sticker_id
-                                                )
+                                                crate::endpoints::legacy_sticker_image(item.sticker_id)
                                             };
 
                                             if !self.sticker_textures.contains_key(&key)

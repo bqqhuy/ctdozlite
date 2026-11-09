@@ -104,12 +104,17 @@ pub fn pending_e2ee(text: String, payload: Payload) -> ChatMessage {
     }
 }
 
-/// Check if a destination peer requires E2EE (audit A01).
-pub fn is_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> bool {
+/// Check whether a destination requires E2EE, preserving storage failures.
+/// Fail-closed: database read/open errors must NOT be silently swallowed as false.
+pub fn check_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> Result<bool> {
     if is_group {
-        return false;
+        return Ok(false);
     }
-    crate::e2ee_integration::is_thread_e2ee(account_key, to_id)
+    crate::e2ee_integration::check_thread_e2ee(account_key, to_id)
+}
+
+pub fn is_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> bool {
+    check_thread_e2ee(account_key, to_id, is_group).unwrap_or(true)
 }
 
 /// Where a plain-text payload goes (audit A01/A02).
@@ -158,6 +163,21 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             .ok_or_else(|| anyhow::anyhow!("Thiếu nguồn chuyển tiếp để xác minh quyền chia sẻ"))?;
         crate::conversation_policy::require_shareable(s, &source, group).await?;
     }
+    let is_e2ee = message.is_e2ee
+        || job.is_e2ee
+        || match check_thread_e2ee(s.account_key(), to, job.is_group) {
+            Ok(b) => b,
+            Err(e) => anyhow::bail!(
+                "Không thể xác minh trạng thái E2EE ({e}). Hủy gửi để bảo vệ an toàn tin nhắn."
+            ),
+        };
+
+    // Unverified non-text encrypted contracts must never route through ordinary upload endpoints.
+    // Encrypted contracts for non-text payloads (media/files/stickers/quotes) are not yet supported.
+    if is_e2ee && !matches!(job.payload, Payload::Text) {
+        anyhow::bail!("Hội thoại E2EE hiện chỉ hỗ trợ gửi tin nhắn văn bản đã mã hóa đầu cuối. Các loại nội dung khác (ảnh, tệp, nhãn dán, chuyển tiếp, trích dẫn) bị chặn để tránh rò rỉ dữ liệu không mã hóa.");
+    }
+
     let id = message.client_message_id.parse()?;
     let mut sent = message.clone();
     let response = match &job.payload {
@@ -175,25 +195,14 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             }
         }
         Payload::Text => {
-            // Audit A01/A02 (SYS-02): When E2EE is required (by message or thread policy),
-            // the text payload is routed to TextRoute::E2ee. URLs in E2EE messages are NOT
-            // extracted for link previews to prevent URL leakage over unencrypted HTTP.
-            // Furthermore, if E2EE encryption or sending fails, it fails closed and NEVER
-            // silently downgrades to plaintext send endpoints.
-            let is_e2ee = message.is_e2ee
-                || job.is_e2ee
-                || is_thread_e2ee(s.account_key(), to, job.is_group);
+            // Encrypted messages bypass link previews and ordinary send endpoints.
+            // Encryption failures remain failures rather than downgrading to plaintext.
             match route_text(&message.text, job.is_group, is_e2ee) {
                 TextRoute::E2ee => {
-                    let result = crate::chat::send_e2ee_message(
-                        s,
-                        s.account_key(),
-                        to,
-                        &message.text,
-                        id,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Gửi tin nhắn E2EE thất bại: {e}"))?;
+                    let result =
+                        crate::chat::send_e2ee_message(s, s.account_key(), to, &message.text, id)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("Gửi tin nhắn E2EE thất bại: {e}"))?;
                     sent.is_e2ee = true;
                     result
                 }
@@ -666,8 +675,14 @@ mod tests {
             route_text("https://example.com", true, false),
             TextRoute::Link(_)
         ));
-        assert!(matches!(route_text("xin chào", false, false), TextRoute::Direct));
-        assert!(matches!(route_text("xin chào", true, false), TextRoute::Group));
+        assert!(matches!(
+            route_text("xin chào", false, false),
+            TextRoute::Direct
+        ));
+        assert!(matches!(
+            route_text("xin chào", true, false),
+            TextRoute::Group
+        ));
     }
 
     #[test]
@@ -682,10 +697,7 @@ mod tests {
             route_text("https://secret.com", false, true),
             TextRoute::E2ee
         );
-        assert_eq!(
-            route_text("tin nhắn bí mật", false, true),
-            TextRoute::E2ee
-        );
+        assert_eq!(route_text("tin nhắn bí mật", false, true), TextRoute::E2ee);
     }
 
     #[test]
@@ -773,7 +785,7 @@ mod persistence_tests {
     async fn e2ee_send_fails_closed_without_plaintext_downgrade_a01() {
         let session = Session::new(false, false, false).unwrap();
         let message = pending_e2ee("tin nhắn tối mật".into(), Payload::Text);
-        
+
         // When sending to a peer without active session/network, E2EE send MUST fail-closed
         // and return an Err without falling back to plaintext.
         let result = send(&session, "non_existent_peer", &message).await;

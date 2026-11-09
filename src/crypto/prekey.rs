@@ -1,49 +1,12 @@
-//! Prekey server API client (WP16-1).
-//!
-//! Endpoints (evidence E2 — route index `re-notes/fixtures/v008-official-route-index.json`):
-//! - `POST /api/e2ee/pc/prekey/update` — upload our prekey bundle
-//! - `GET  /api/e2ee/pc/prekey/get` — fetch a peer's prekey bundle
-//!
-//! **Unverified (E3 inference):** the exact request/response schema of these
-//! routes was not captured live.  The shapes below follow the Signal Protocol
-//! bundle schema documented in
-//! `re-notes/36-zalo-e2ee-signal-protocol-analysis.md` §4 and are used defensively:
-//! every field is optional and a malformed response degrades to "no session"
-//! rather than sending undecryptable ciphertext.
+//! Parse synthetic prekey bundles for the local crypto model.
+//! Official server schemas remain unverified (re-notes/36 section 8); no network adapter is exposed.
 
 use anyhow::Result;
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use crate::session::Session;
-use super::keystore::PreKeyBundle;
-
-/// Upload our prekey bundle to the server.
-pub async fn update_prekeys(s: &Session, bundle: &PreKeyBundle) -> Result<()> {
-    // Export bundle including bound signing identity key (audit A04)
-    let mut payload = bundle.to_export_json();
-    // The server expects the same envelope as other Zalo APIs.
-    payload["clientId"] = json!(s.imei);
-
-    let url = format!(
-        "{}{}?{}",
-        s.resolve_service_url("chat", "/api/e2ee/pc/prekey/update"),
-        "",
-        s.common_params()
-    );
-    let params = s.encoded_params(&payload)?;
-    let full = format!("{url}&params={params}");
-    let raw = s.post_form(&full, format!("params={params}")).await?;
-    let dec = s.maybe_decrypt(raw, s.session_key_bytes()).await;
-    let code = dec.get("error_code").and_then(|v| v.as_i64()).unwrap_or(0);
-    anyhow::ensure!(code == 0, "Máy chủ từ chối đăng ký khóa E2EE (error_code={code})");
-    Ok(())
-}
-
-/// Fetch a peer's prekey bundle.
+/// A synthetic peer prekey bundle; not a verified server response schema.
 ///
-/// Built manually by [`parse_bundle`] from a decrypted JSON `Value` — never
-/// deserialized directly, so no `Deserialize` impl is needed (serde cannot
-/// derive arrays longer than 32 elements anyway, audit A03's 64-byte signature).
+/// Local fixtures are parsed explicitly so key and signature lengths are validated.
 #[derive(Debug)]
 pub struct RemoteBundle {
     pub identity_key: [u8; 32],
@@ -57,26 +20,22 @@ pub struct RemoteBundle {
     pub one_time_pre_key: Option<([u8; 32], u32)>,
 }
 
-pub async fn fetch_bundle(s: &Session, peer_id: &str) -> Result<RemoteBundle> {
-    let payload = json!({ "toid": peer_id, "clientId": s.imei });
-    let params = s.encoded_params(&payload)?;
-    let url = format!(
-        "{}{}?{}&params={params}",
-        s.resolve_service_url("chat", "/api/e2ee/pc/prekey/get"),
-        "",
-        s.common_params()
-    );
-    let raw = s.post_form(&url, format!("params={params}")).await?;
-    let dec = s.maybe_decrypt(raw, s.session_key_bytes()).await;
-    parse_bundle(&dec)
-}
-
 /// Parse a bundle from a server response.  Accepts both the nested `data` shape
 /// and a flat shape, and tolerates hex or base64 encoded keys.
 pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
+    if dec.get("error_code").is_some() {
+        let code = dec
+            .get("error_code")
+            .and_then(crate::api_response::integer)
+            .ok_or_else(|| anyhow::anyhow!("Mã lỗi bundle không hợp lệ"))?;
+        anyhow::ensure!(code == 0, "Máy chủ từ chối bundle E2EE ({code})");
+    }
     let node = dec.get("data").unwrap_or(dec);
     let error = node.get("error_code").and_then(|v| v.as_i64()).unwrap_or(0);
-    anyhow::ensure!(error == 0, "Máy chủ trả lỗi khi lấy bundle E2EE (error_code={error})");
+    anyhow::ensure!(
+        error == 0,
+        "Máy chủ trả lỗi khi lấy bundle E2EE (error_code={error})"
+    );
 
     let identity_key = decode_key32(
         pick(node, &["identityKey", "identity_key"])
@@ -202,15 +161,10 @@ pub fn decode_signature_64(value: &Value) -> Result<[u8; 64]> {
     Ok(out)
 }
 
-pub fn decode_key64(value: &Value) -> Result<[u8; 64]> {
-    decode_signature_64(value)
-}
-
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn bundle_parsing_accepts_flat_shape() {
@@ -298,10 +252,16 @@ mod tests {
 
         // Reject 32-byte key (old truncate bug)
         let val_32 = json!(B64.encode([1u8; 32]));
-        assert!(decode_signature_64(&val_32).is_err(), "Must reject 32-byte input");
+        assert!(
+            decode_signature_64(&val_32).is_err(),
+            "Must reject 32-byte input"
+        );
 
         // Reject 63-byte input
         let val_63 = json!(B64.encode([1u8; 63]));
-        assert!(decode_signature_64(&val_63).is_err(), "Must reject 63-byte input");
+        assert!(
+            decode_signature_64(&val_63).is_err(),
+            "Must reject 63-byte input"
+        );
     }
 }

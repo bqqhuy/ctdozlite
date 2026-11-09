@@ -31,8 +31,8 @@ mod composer_drafts;
 mod contact_panel;
 mod contacts;
 mod content_panel;
-mod download_panel;
 mod doc_viewer;
+mod download_panel;
 mod file_drop;
 mod group_entry_panel;
 mod group_panel;
@@ -71,7 +71,13 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    AppSettingsSaved(Result<(), String>),
+    ProfilesLoaded {
+        owner: String,
+        result: Result<Vec<crate::profiles::Profile>, String>,
+    },
     SafetyNumberLoaded {
+        owner: String,
         peer_id: String,
         peer_name: String,
         safety_number: String,
@@ -79,8 +85,14 @@ pub enum GuiEvent {
         identity_changed: bool,
     },
     IdentityTrusted {
+        owner: String,
         peer_id: String,
         is_trusted: bool,
+    },
+    SafetyNumberFailed {
+        owner: String,
+        peer_id: String,
+        message: String,
     },
     DocPreviewLoaded {
         file_name: String,
@@ -531,7 +543,7 @@ pub enum GuiEvent {
         sessions: Vec<crate::upload::ResumableUploadState>,
     },
     ProfileSwitched {
-        uid: String,
+        session: Box<Session>,
     },
     AppUnlocked,
     AppUnlockFailed,
@@ -710,10 +722,6 @@ impl AppSettings {
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
     }
-
-    fn save(&self) -> anyhow::Result<()> {
-        crate::storage::save_settings(self)
-    }
 }
 
 /// A loaded-message jump stays bound to its conversation and exact reference.
@@ -743,6 +751,9 @@ struct UiSmoke {
     /// Open the fixture group at this frame, then deliver older history two frames later.
     switch_at: u32,
 }
+
+type SidebarSortKey = (usize, bool, usize, i64, String);
+type SidebarOrderCache = (Vec<SidebarSortKey>, Vec<usize>);
 
 pub struct ZaloGuiApp {
     tools: tools_panel::ToolsPanel,
@@ -854,6 +865,9 @@ pub struct ZaloGuiApp {
     doc_viewer: Option<doc_viewer::DocViewerModal>,
     safety_number_modal: Option<SafetyNumberModalState>,
     trusted_peers: HashSet<String>,
+    profiles: Vec<crate::profiles::Profile>,
+    profiles_requested: bool,
+    sidebar_order: Option<SidebarOrderCache>,
 
     info_drawer_open: bool,
     profile_menu_open: bool,
@@ -1129,6 +1143,9 @@ impl ZaloGuiApp {
             doc_viewer: None,
             safety_number_modal: None,
             trusted_peers: HashSet::new(),
+            profiles: Vec::new(),
+            profiles_requested: false,
+            sidebar_order: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
@@ -1710,15 +1727,21 @@ impl ZaloGuiApp {
     }
 
     fn save_settings(&mut self) {
-        match self.settings.save() {
-            Ok(()) => {
-                if self.settings.remember_login {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::PersistSession);
+        match serde_json::to_value(&self.settings) {
+            Ok(settings) => {
+                if let Some(tx) = WORKER_TX.get() {
+                    if tx
+                        .send(WorkerCmd::SaveAppSettings {
+                            settings,
+                            persist_session: self.settings.remember_login,
+                        })
+                        .is_err()
+                    {
+                        self.show_toast("Không gửi được yêu cầu lưu cài đặt");
                     }
                 }
             }
-            Err(e) => self.show_toast(format!("Không thể lưu cài đặt: {e}")),
+            Err(_) => self.show_toast("Không mã hóa được cài đặt"),
         }
     }
 
@@ -1766,6 +1789,11 @@ impl ZaloGuiApp {
         self.reactor_profiles.clear();
         self.reactor_profile_pending.clear();
         self.unread_only = false;
+        self.sidebar_order = None;
+        self.profiles.clear();
+        self.profiles_requested = false;
+        self.trusted_peers.clear();
+        self.safety_number_modal = None;
         self.typing_map.clear();
         self.typing_sent.clear();
         self.group_members.clear();
@@ -1870,28 +1898,7 @@ impl ZaloGuiApp {
                 ctx.request_repaint();
             }
 
-            // A21 fix: When locked, gate event processing but allow unlock lifecycle events
-            if self.lock_guard.is_locked() {
-                match event {
-                    GuiEvent::AppUnlocked => {
-                        self.lock_guard.unlock();
-                        self.auth_in_progress = false;
-                        self.status_msg = "Đã mở khóa ứng dụng".into();
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::RefreshThreads);
-                        }
-                        ctx.request_repaint();
-                    }
-                    GuiEvent::AppUnlockFailed => {
-                        self.auth_in_progress = false;
-                        self.status_msg = "Xác thực thất bại".into();
-                        ctx.request_repaint();
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-
+            // Keep business state current while locked; rendering and input remain gated.
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
             let event = match event {
                 GuiEvent::LiveThreadsReady(updates) => {
@@ -1912,15 +1919,34 @@ impl ZaloGuiApp {
                 event => event,
             };
             match event {
+                GuiEvent::AppSettingsSaved(result) => {
+                    if let Err(error) = result {
+                        self.show_toast(error);
+                    }
+                }
+                GuiEvent::ProfilesLoaded { owner, result } => {
+                    if owner == self.user_uin {
+                        match result {
+                            Ok(profiles) => self.profiles = profiles,
+                            Err(error) => self.show_toast(error),
+                        }
+                    }
+                }
                 GuiEvent::SafetyNumberLoaded {
+                    owner,
                     peer_id,
                     peer_name,
                     safety_number,
                     is_verified,
                     identity_changed,
                 } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        continue;
+                    }
                     if is_verified {
                         self.trusted_peers.insert(peer_id.clone());
+                    } else {
+                        self.trusted_peers.remove(&peer_id);
                     }
                     self.safety_number_modal = Some(SafetyNumberModalState {
                         peer_id,
@@ -1933,9 +1959,13 @@ impl ZaloGuiApp {
                     ctx.request_repaint();
                 }
                 GuiEvent::IdentityTrusted {
+                    owner,
                     peer_id,
                     is_trusted,
                 } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        continue;
+                    }
                     if is_trusted {
                         self.trusted_peers.insert(peer_id.clone());
                         self.status_msg = "Đã xác minh danh tính thiết bị an toàn".into();
@@ -1949,6 +1979,23 @@ impl ZaloGuiApp {
                         }
                     }
                     ctx.request_repaint();
+                }
+                GuiEvent::SafetyNumberFailed {
+                    owner,
+                    peer_id,
+                    message,
+                } => {
+                    if owner == self.user_uin {
+                        self.trusted_peers.remove(&peer_id);
+                        if self
+                            .safety_number_modal
+                            .as_ref()
+                            .is_some_and(|m| m.peer_id == peer_id)
+                        {
+                            self.safety_number_modal = None;
+                        }
+                        self.show_toast(message);
+                    }
                 }
                 GuiEvent::DocPreviewLoaded { file_name, content } => {
                     self.doc_viewer = Some(doc_viewer::DocViewerModal::new(content, file_name));
@@ -2225,6 +2272,18 @@ impl ZaloGuiApp {
                     threads: mut updates,
                     source,
                 } => {
+                    for thread in &updates {
+                        if thread
+                            .messages
+                            .iter()
+                            .any(|message| message.e2ee_identity_changed)
+                        {
+                            self.trusted_peers.remove(&thread.id);
+                            self.safety_number_modal = None;
+                            self.status_msg = "Khóa danh tính đối phương đã thay đổi; cần xác minh lại mã an toàn".into();
+                        }
+                    }
+
                     if updates.iter().any(|t| {
                         t.messages.iter().any(|m| {
                             matches!(
@@ -2680,16 +2739,17 @@ impl ZaloGuiApp {
                         None => {}
                     }
                 }
-                GuiEvent::UploadProgress { upload_id: _, completed, total } => {
+                GuiEvent::UploadProgress {
+                    upload_id: _,
+                    completed,
+                    total,
+                } => {
                     self.status_msg = format!("Tải lên: {}/{} bytes", completed, total);
                 }
                 GuiEvent::UploadResumeAvailable { sessions } => {
                     if !sessions.is_empty() {
                         let summary = if sessions.len() == 1 {
-                            format!(
-                                "Có 1 tải lên chưa hoàn thành ({})…",
-                                sessions[0].file_name
-                            )
+                            format!("Có 1 tải lên chưa hoàn thành ({})…", sessions[0].file_name)
                         } else {
                             format!("Có {} tải lên chưa hoàn thành…", sessions.len())
                         };
@@ -2760,7 +2820,8 @@ impl ZaloGuiApp {
                         Err(e) => self.show_toast(format!("Không thể tạo phiên mới: {e}")),
                     }
                 }
-                GuiEvent::ProfileSwitched { uid } => {
+                GuiEvent::ProfileSwitched { session } => {
+                    let uid = session.account_key().to_owned();
                     // A20: Profile switched; thoroughly isolate and reset UI state for new profile
                     self.clear_presence_state();
                     self.deleted_message_ids.clear();
@@ -2808,7 +2869,11 @@ impl ZaloGuiApp {
                     self.link_metadata_cache.clear();
                     self.status_msg = "Đã chuyển tài khoản thành công".into();
                     self.profile_menu_open = false;
-                    // Request refresh of threads and state for new profile
+                    let (tx, rx) = channel();
+                    self.event_rx = rx;
+                    self.event_tx = tx.clone();
+                    spawn_session_worker(*session, tx, ctx.clone());
+                    // The new account receives a fresh worker, mailbox and event stream.
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::RefreshThreads);
                     }
@@ -4595,38 +4660,65 @@ impl ZaloGuiApp {
                 GuiEvent::StatusUpdate(msg) => {
                     self.status_msg = msg;
                 }
-                GuiEvent::ServerMediaLoaded { items, media_type: _ } => {
+                GuiEvent::ServerMediaLoaded {
+                    items,
+                    media_type: _,
+                } => {
                     self.tools.server_media_items = items;
-                    self.status_msg = format!("Đã tải {} mục từ kho media server", self.tools.server_media_items.len());
+                    self.status_msg = format!(
+                        "Đã tải {} mục từ kho media server",
+                        self.tools.server_media_items.len()
+                    );
                 }
                 GuiEvent::CloudViewerKeyLoaded(key) => {
-                    self.status_msg = format!("Đã nhận khoá giải mã zCloud cho tệp {}", key.file_id);
-                    self.tools.cloud_viewer_keys.insert(key.file_id.clone(), key);
+                    self.status_msg =
+                        format!("Đã nhận khoá giải mã zCloud cho tệp {}", key.file_id);
+                    self.tools
+                        .cloud_viewer_keys
+                        .insert(key.file_id.clone(), key);
                 }
                 GuiEvent::BusinessCatalogLoaded(items) => {
                     self.tools.catalog_items = items;
-                    self.status_msg = format!("Đã tải {} sản phẩm doanh nghiệp", self.tools.catalog_items.len());
+                    self.status_msg = format!(
+                        "Đã tải {} sản phẩm doanh nghiệp",
+                        self.tools.catalog_items.len()
+                    );
                 }
                 GuiEvent::DevicesLoaded(devices) => {
                     self.tools.devices = devices;
-                    self.status_msg = format!("Đã cập nhật {} thiết bị đăng nhập", self.tools.devices.len());
+                    self.status_msg = format!(
+                        "Đã cập nhật {} thiết bị đăng nhập",
+                        self.tools.devices.len()
+                    );
                 }
                 GuiEvent::TwoFactorStatusLoaded(status) => {
-                    let st_str = if status.is_enabled { "Đã kích hoạt" } else { "Chưa kích hoạt" };
-                    self.status_msg = format!("Xác thực 2FA: {} (SĐT: {})", st_str, status.phone_masked);
+                    let st_str = if status.is_enabled {
+                        "Đã kích hoạt"
+                    } else {
+                        "Chưa kích hoạt"
+                    };
+                    self.status_msg =
+                        format!("Xác thực 2FA: {} (SĐT: {})", st_str, status.phone_masked);
                     self.tools.two_factor_status = Some(status);
                 }
                 GuiEvent::GroupTodosLoaded(todos) => {
                     self.tools.group_todos = todos;
-                    self.status_msg = format!("Đã tải {} việc cần làm từ nhóm", self.tools.group_todos.len());
+                    self.status_msg = format!(
+                        "Đã tải {} việc cần làm từ nhóm",
+                        self.tools.group_todos.len()
+                    );
                 }
                 GuiEvent::GroupPollsLoaded(polls) => {
                     self.tools.group_polls = polls;
-                    self.status_msg = format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
+                    self.status_msg =
+                        format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
                 }
                 GuiEvent::LanPeersDiscovered(peers) => {
                     self.tools.lan_peers = peers;
-                    self.status_msg = format!("Đã phát hiện {} thiết bị Zalo trong mạng LAN", self.tools.lan_peers.len());
+                    self.status_msg = format!(
+                        "Đã phát hiện {} thiết bị Zalo trong mạng LAN",
+                        self.tools.lan_peers.len()
+                    );
                 }
                 GuiEvent::BatchRecallCompleted {
                     thread_id,
@@ -4644,7 +4736,10 @@ impl ZaloGuiApp {
                     self.selected_msg_ids.clear();
                     self.status_msg = format!("Đã thu hồi {count} tin nhắn cho mọi người");
                 }
-                GuiEvent::BatchForwardCompleted { target_id: _, count } => {
+                GuiEvent::BatchForwardCompleted {
+                    target_id: _,
+                    count,
+                } => {
                     self.batch_selection_mode = false;
                     self.selected_msg_ids.clear();
                     self.status_msg = format!("Đã chuyển tiếp {count} tin nhắn");
@@ -4673,9 +4768,17 @@ impl eframe::App for ZaloGuiApp {
         // Update lock guard on user interaction (WP16-4) — but only if not locked
         // A21: Input after idle should not reset deadline if we're already locked
         if !self.lock_guard.is_locked()
-            && ctx.input(|i| !i.raw.hovered_files.is_empty()
-            || !i.raw.dropped_files.is_empty()
-            || i.raw.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::PointerButton { .. }))) {
+            && ctx.input(|i| {
+                !i.raw.hovered_files.is_empty()
+                    || !i.raw.dropped_files.is_empty()
+                    || i.raw.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key { .. } | egui::Event::PointerButton { .. }
+                        )
+                    })
+            })
+        {
             self.lock_guard.touch();
         }
 
@@ -4924,6 +5027,15 @@ impl eframe::App for ZaloGuiApp {
         if !self.is_logged_in && !self.tools.loaded_for.is_empty() {
             self.tools = Default::default();
             self.theme_dirty = true;
+        }
+        if self.profile_menu_open && !self.profiles_requested {
+            if let Some(tx) = WORKER_TX.get() {
+                self.profiles_requested = tx
+                    .send(WorkerCmd::LoadProfiles {
+                        owner: self.user_uin.clone(),
+                    })
+                    .is_ok();
+            }
         }
         self.trim_resident_history();
         let now = std::time::Instant::now();
@@ -5256,10 +5368,7 @@ impl ZaloGuiApp {
                     ui.add_space((avail_h * 0.35).max(100.0));
 
                     // Lock icon
-                    ui.label(
-                        RichText::new("🔒")
-                            .size(64.0),
-                    );
+                    ui.label(RichText::new("🔒").size(64.0));
                     ui.add_space(16.0);
 
                     ui.label(
@@ -5283,9 +5392,9 @@ impl ZaloGuiApp {
                         } else {
                             "Mở khóa với Windows Hello"
                         })
-                            .color(Color32::WHITE)
-                            .size(14.0)
-                            .strong(),
+                        .color(Color32::WHITE)
+                        .size(14.0)
+                        .strong(),
                     )
                     .fill(pal.primary)
                     .rounding(Rounding::same(8.0))
@@ -6674,5 +6783,68 @@ mod v008_relock_regression_tests {
         app.server_aliases_ready = true;
         app.apply_server_aliases();
         assert_eq!(app.threads[0].name, "Tên gốc");
+    }
+}
+
+#[cfg(test)]
+mod audit_lock_tests {
+    use super::*;
+    #[test]
+    fn locked_app_updates_business_state_without_unlocking() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        app.lock_guard.lock();
+        tx.send(GuiEvent::UploadProgress {
+            upload_id: "upload".into(),
+            completed: 42,
+            total: 100,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.lock_guard.is_locked());
+        assert_eq!(app.status_msg, "Tải lên: 42/100 bytes");
+    }
+    #[test]
+    fn safety_result_clears_stale_verification_and_rejects_another_owner() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.user_uin = "owner-a".into();
+        app.is_logged_in = true;
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        app.trusted_peers.insert("peer".into());
+        tx.send(GuiEvent::SafetyNumberLoaded {
+            owner: "owner-a".into(),
+            peer_id: "peer".into(),
+            peer_name: "Peer".into(),
+            safety_number: "number".into(),
+            is_verified: false,
+            identity_changed: true,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.trusted_peers.contains("peer"));
+        tx.send(GuiEvent::IdentityTrusted {
+            owner: "owner-b".into(),
+            peer_id: "peer".into(),
+            is_trusted: true,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.trusted_peers.contains("peer"));
     }
 }

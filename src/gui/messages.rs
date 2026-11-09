@@ -39,9 +39,9 @@ pub(super) fn render_sticker_widget(
 
     let key = format!("stk_{cid}_{sid}");
     let url = if cid == 0 && (1..=30).contains(&sid) {
-        format!("https://stc-chat.zdn.vn/images/stickers/default/thumb/{sid}.png")
+        crate::endpoints::builtin_sticker_thumbnail(sid)
     } else {
-        format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={sid}&size=130")
+        crate::endpoints::legacy_sticker_image(sid)
     };
 
     if media_near_viewport(ui, 128.0)
@@ -661,7 +661,22 @@ pub(super) fn render_message_body(
                 let ext = media.name.rsplit('.').next().unwrap_or("").to_lowercase();
                 matches!(
                     ext.as_str(),
-                    "txt" | "log" | "json" | "md" | "rs" | "py" | "c" | "cpp" | "csv" | "xml" | "toml" | "yaml" | "yml" | "ini" | "sh" | "bat"
+                    "txt"
+                        | "log"
+                        | "json"
+                        | "md"
+                        | "rs"
+                        | "py"
+                        | "c"
+                        | "cpp"
+                        | "csv"
+                        | "xml"
+                        | "toml"
+                        | "yaml"
+                        | "yml"
+                        | "ini"
+                        | "sh"
+                        | "bat"
                 )
             };
             if is_text_doc
@@ -705,7 +720,9 @@ pub(super) fn render_message_body(
         return render_contact_card_widget(ui, msg, pal, outgoing, max_text_width);
     }
 
-    if msg.kind == crate::message_model::MessageKind::Voice || msg.text.starts_with("[Tin nhắn thoại]") {
+    if msg.kind == crate::message_model::MessageKind::Voice
+        || msg.text.starts_with("[Tin nhắn thoại]")
+    {
         return render_voice_message_widget(ui, msg, pal, outgoing, max_text_width);
     }
 
@@ -1135,12 +1152,7 @@ pub(super) fn render_chat_bubble(
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             quote_action = render_quote_block(ui, msg, pal, true, content_width);
-                            if !render_sticker_widget(
-                                ui,
-                                msg,
-                                sticker_textures,
-                                loading_stickers,
-                            ) {
+                            if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers) {
                                 card_action = render_message_body(
                                     ui,
                                     msg,
@@ -1284,12 +1296,7 @@ pub(super) fn render_chat_bubble(
                                 ui.add_space(2.0);
                             }
                             quote_action = render_quote_block(ui, msg, pal, false, content_width);
-                            if !render_sticker_widget(
-                                ui,
-                                msg,
-                                sticker_textures,
-                                loading_stickers,
-                            ) {
+                            if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers) {
                                 card_action = render_message_body(
                                     ui,
                                     msg,
@@ -1591,10 +1598,7 @@ pub(super) fn bubble_context_menu(
             ui.close_menu();
         }
         ui.separator();
-        if ui
-            .button(crate::i18n::tr("Chọn nhiều tin"))
-            .clicked()
-        {
+        if ui.button(crate::i18n::tr("Chọn nhiều tin")).clicked() {
             action = Some(BubbleAction::EnterSelectionMode);
             ui.close_menu();
         }
@@ -1640,12 +1644,15 @@ pub(super) fn render_voice_message_widget(
             let bar_w = (available_w / bar_count as f32).max(2.0);
             for i in 0..bar_count {
                 let h = 6.0 + ((i as f32 * 1.7 + (msg.ts % 10) as f32).sin().abs() * 16.0);
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(bar_w - 1.0, 24.0), Sense::hover());
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(bar_w - 1.0, 24.0), Sense::hover());
                 let bar_rect = Rect::from_center_size(rect.center(), Vec2::new(bar_w - 1.5, h));
-                ui.painter().rect_filled(bar_rect, Rounding::same(1.0), pal.primary);
+                ui.painter()
+                    .rect_filled(bar_rect, Rounding::same(1.0), pal.primary);
             }
 
-            let dur_label = if let Some(stripped) = msg.text.strip_prefix("[Tin nhắn thoại] (") {
+            let dur_label = if let Some(stripped) = msg.text.strip_prefix("[Tin nhắn thoại] (")
+            {
                 stripped.trim_end_matches(')').trim()
             } else {
                 "0:05"
@@ -1675,15 +1682,26 @@ pub(super) fn render_todo_widget(
         Layout::top_down(Align::Min),
         |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("📋 Giao việc").color(pal.primary).strong().size(13.0));
+                ui.label(
+                    RichText::new("📋 Giao việc")
+                        .color(pal.primary)
+                        .strong()
+                        .size(13.0),
+                );
             });
-            let task_text = msg.text.strip_prefix("[Giao việc]")
+            let task_text = msg
+                .text
+                .strip_prefix("[Giao việc]")
                 .or_else(|| msg.text.strip_prefix("[Nhắc việc]"))
                 .unwrap_or(&msg.text)
                 .trim();
             ui.label(RichText::new(task_text).color(text_col).size(13.5));
             ui.horizontal(|ui| {
-                ui.label(RichText::new("⏳ Trạng thái: Đang thực hiện").color(meta_col).size(11.5));
+                ui.label(
+                    RichText::new("⏳ Trạng thái: Đang thực hiện")
+                        .color(meta_col)
+                        .size(11.5),
+                );
             });
         },
     );
@@ -1709,15 +1727,26 @@ pub(super) fn render_poll_widget(
         Layout::top_down(Align::Min),
         |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("📊 Bình chọn nhóm").color(pal.primary).strong().size(13.0));
+                ui.label(
+                    RichText::new("📊 Bình chọn nhóm")
+                        .color(pal.primary)
+                        .strong()
+                        .size(13.0),
+                );
             });
-            let question = msg.text.strip_prefix("[Bình chọn]")
+            let question = msg
+                .text
+                .strip_prefix("[Bình chọn]")
                 .or_else(|| msg.text.strip_prefix("[Bình chọn mới]"))
                 .unwrap_or(&msg.text)
                 .trim();
             ui.label(RichText::new(question).color(text_col).strong().size(13.5));
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Bấm để xem và bình chọn").color(meta_col).size(11.5));
+                ui.label(
+                    RichText::new("Bấm để xem và bình chọn")
+                        .color(meta_col)
+                        .size(11.5),
+                );
             });
         },
     );
@@ -1743,52 +1772,56 @@ pub(super) fn render_contact_card_widget(
     let phone = msg.contact_phone.as_deref().unwrap_or("");
     let contact_id = msg.contact_id.as_deref().unwrap_or("");
 
-    ui.allocate_ui_with_layout(
-        Vec2::new(card_w, 0.0),
-        Layout::top_down(Align::Min),
-        |ui| {
-            ui.set_width(card_w);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("📇 Danh thiếp").size(12.0).color(meta_col));
-            });
-            ui.add_space(4.0);
+    ui.allocate_ui_with_layout(Vec2::new(card_w, 0.0), Layout::top_down(Align::Min), |ui| {
+        ui.set_width(card_w);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("📇 Danh thiếp").size(12.0).color(meta_col));
+        });
+        ui.add_space(4.0);
 
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
-                let initial = name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                ui.painter().circle_filled(rect.center(), 20.0, pal.primary_hover);
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    initial,
-                    FontId::proportional(18.0),
-                    Color32::WHITE,
-                );
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            let initial = name
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string();
+            ui.painter()
+                .circle_filled(rect.center(), 20.0, pal.primary_hover);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                initial,
+                FontId::proportional(18.0),
+                Color32::WHITE,
+            );
 
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(name).strong().size(14.5).color(text_col));
-                    if !phone.is_empty() {
-                        ui.label(RichText::new(phone).size(12.0).color(meta_col));
-                    }
-                });
-            });
-
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(4.0);
-
-            ui.horizontal(|ui| {
-                if !contact_id.is_empty() {
-                    if ui.button(crate::i18n::tr("Nhắn tin")).clicked() {
-                        action = Some(BubbleAction::OpenContactConversation(contact_id.to_string()));
-                    }
-                    if ui.button(crate::i18n::tr("Thông tin")).clicked() {
-                        action = Some(BubbleAction::ViewContact(contact_id.to_string()));
-                    }
+            ui.vertical(|ui| {
+                ui.label(RichText::new(name).strong().size(14.5).color(text_col));
+                if !phone.is_empty() {
+                    ui.label(RichText::new(phone).size(12.0).color(meta_col));
                 }
             });
-        },
-    );
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            if !contact_id.is_empty() {
+                if ui.button(crate::i18n::tr("Nhắn tin")).clicked() {
+                    action = Some(BubbleAction::OpenContactConversation(
+                        contact_id.to_string(),
+                    ));
+                }
+                if ui.button(crate::i18n::tr("Thông tin")).clicked() {
+                    action = Some(BubbleAction::ViewContact(contact_id.to_string()));
+                }
+            }
+        });
+    });
     action
 }
 

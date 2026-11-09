@@ -1,26 +1,44 @@
 use super::*;
 
 impl ZaloGuiApp {
-    fn sort_conversation_indices(&self, indices: &mut [usize]) {
-        // Compute each activity timestamp once: history may be evicted or delivered out of order.
-        // Cloud has no implicit pin; explicitly pinned threads retain the user's chosen priority.
-        indices.sort_by_cached_key(|&index| {
-            let thread = &self.threads[index];
-            (
-                std::cmp::Reverse(
-                    self.server_pins.rank(&thread.id, thread.is_group).is_some()
+    fn sort_conversation_indices(&mut self, indices: &mut [usize]) {
+        let keys: Vec<_> = indices
+            .iter()
+            .map(|&index| {
+                let thread = &self.threads[index];
+                let rank = self.server_pins.rank(&thread.id, thread.is_group);
+                (
+                    index,
+                    rank.is_some()
                         || self
                             .conversation_preferences
                             .get(&thread.id)
                             .is_some_and(|p| p.pinned),
-                ),
-                self.server_pins
-                    .rank(&thread.id, thread.is_group)
-                    .unwrap_or(usize::MAX),
-                std::cmp::Reverse(thread.sidebar_activity_ts()),
-                thread.id.as_str(),
+                    rank.unwrap_or(usize::MAX),
+                    thread.sidebar_activity_ts(),
+                    thread.id.clone(),
+                )
+            })
+            .collect();
+        if let Some((previous, order)) = &self.sidebar_order {
+            if previous == &keys {
+                indices.copy_from_slice(order);
+                return;
+            }
+        }
+        let mut order: Vec<_> = keys.iter().collect();
+        order.sort_by_key(|key| {
+            (
+                std::cmp::Reverse(key.1),
+                key.2,
+                std::cmp::Reverse(key.3),
+                key.4.as_str(),
             )
         });
+        for (slot, key) in indices.iter_mut().zip(order) {
+            *slot = key.0;
+        }
+        self.sidebar_order = Some((keys, indices.to_vec()));
     }
 
     pub(super) fn reset_sync_status(&mut self) {
@@ -212,21 +230,28 @@ impl ZaloGuiApp {
                     }
 
                     // A20: Account switcher dropdown (WP16-3 integration)
-                    if self.profile_menu_open {
-                        if let Ok(reg) = crate::profiles::ProfileRegistry::load() {
-                            let profiles_list: Vec<(&str, &crate::profiles::Profile)> = reg.profiles.iter().map(|(k, v)| (k.as_str(), v)).collect();
-                            let active = profiles_list.iter().find(|(_, p)| p.uid == self.user_uin).map(|(_, p)| *p);
-                            if let Some(target_uid) = self.account_switcher.show(ui, active, &profiles_list) {
-                                if target_uid != self.user_uin {
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::SwitchProfile {
-                                            owner: self.user_uin.clone(),
-                                            target_uid,
-                                        });
-                                    }
+                    if self.profile_menu_open && !self.profiles.is_empty() {
+                        let profiles_list: Vec<(&str, &crate::profiles::Profile)> = self
+                            .profiles
+                            .iter()
+                            .map(|profile| (profile.name.as_str(), profile))
+                            .collect();
+                        let active = profiles_list
+                            .iter()
+                            .find(|(_, p)| p.uid == self.user_uin)
+                            .map(|(_, p)| *p);
+                        if let Some(target_uid) =
+                            self.account_switcher.show(ui, active, &profiles_list)
+                        {
+                            if target_uid != self.user_uin {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::SwitchProfile {
+                                        owner: self.user_uin.clone(),
+                                        target_uid,
+                                    });
                                 }
-                                self.profile_menu_open = false;
                             }
+                            self.profile_menu_open = false;
                         }
                     }
 
@@ -898,12 +923,13 @@ impl ZaloGuiApp {
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut mention_target: Option<(String, String)> = None;
 
+                let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                 egui::ScrollArea::vertical()
                     .id_salt("threads_list_scroll")
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_space(4.0);
-                        for &i in &filtered_indices {
+                    .show_rows(ui, row_height, filtered_indices.len(), |ui, rows| {
+                        for row in rows {
+                            let i = filtered_indices[row];
                             let t = &self.threads[i];
                             let is_selected = i == self.selected_thread_index;
                             let is_user_pinned = self.server_pins.rank(&t.id,t.is_group).is_some() || self
@@ -911,7 +937,6 @@ impl ZaloGuiApp {
                                 .get(&t.id)
                                 .is_some_and(|p| p.pinned);
 
-                            let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                             let row_width = (ui.available_width() - 8.0).max(44.0);
                             let (row_rect, row_resp) = ui.allocate_exact_size(
                                 Vec2::new(row_width, row_height),
@@ -1471,7 +1496,7 @@ impl ZaloGuiApp {
                                     let sn_btn_lbl = if is_trusted {
                                         format!("{} Mã an toàn (Đã xác minh)", lucide::SHIELD_CHECK)
                                     } else {
-                                        format!("{} Mã an toàn & Xác minh E2EE", lucide::LOCK)
+                                        format!("{} E2EE (chưa khả dụng)", lucide::LOCK)
                                     };
                                     if ui.button(sn_btn_lbl).clicked() {
                                         self.open_safety_number_modal(d_id.clone(), d_name.to_string());
@@ -3767,7 +3792,7 @@ impl ZaloGuiApp {
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
                                             if self.input_message.starts_with('/') {
-                                                if let Some(expanded) = self.tools.quick_messages.expand(&self.input_message) {
+                                                if let Some(expanded) = self.tools.config.quick_messages.expand(&self.input_message) {
                                                     self.input_message = expanded.to_string();
                                                 }
                                             }
@@ -3960,32 +3985,46 @@ impl ZaloGuiApp {
                 });
                 ui.separator();
                 let query = self.send_contact_query.trim().to_lowercase();
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for t in &self.threads {
-                        if t.is_group || t.id.starts_with("group_") || t.id == self.user_uin {
-                            continue;
-                        }
-                        if !query.is_empty() && !t.name.to_lowercase().contains(&query) {
-                            continue;
-                        }
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-                            let initial = t.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                            ui.painter().circle_filled(rect.center(), 14.0, pal.primary_hover);
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                initial,
-                                FontId::proportional(13.0),
-                                Color32::WHITE,
-                            );
-                            if ui.button(&t.name).clicked() {
-                                chosen_contact = Some((t.id.clone(), t.name.clone(), t.avatar.clone().unwrap_or_default()));
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for t in &self.threads {
+                            if t.is_group || t.id.starts_with("group_") || t.id == self.user_uin {
+                                continue;
                             }
-                        });
-                        ui.add_space(2.0);
-                    }
-                });
+                            if !query.is_empty() && !t.name.to_lowercase().contains(&query) {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                                let initial = t
+                                    .name
+                                    .chars()
+                                    .next()
+                                    .unwrap_or('?')
+                                    .to_uppercase()
+                                    .to_string();
+                                ui.painter()
+                                    .circle_filled(rect.center(), 14.0, pal.primary_hover);
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    initial,
+                                    FontId::proportional(13.0),
+                                    Color32::WHITE,
+                                );
+                                if ui.button(&t.name).clicked() {
+                                    chosen_contact = Some((
+                                        t.id.clone(),
+                                        t.name.clone(),
+                                        t.avatar.clone().unwrap_or_default(),
+                                    ));
+                                }
+                            });
+                            ui.add_space(2.0);
+                        }
+                    });
                 ui.separator();
                 if ui.button("Đóng").clicked() {
                     close_modal = true;
@@ -4028,16 +4067,24 @@ impl ZaloGuiApp {
             .default_width(320.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(RichText::new(format!("Chuyển tiếp {} tin nhắn đã chọn đến:", self.selected_msg_ids.len())).color(pal.text_primary));
+                ui.label(
+                    RichText::new(format!(
+                        "Chuyển tiếp {} tin nhắn đã chọn đến:",
+                        self.selected_msg_ids.len()
+                    ))
+                    .color(pal.text_primary),
+                );
                 ui.separator();
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for t in &self.threads {
-                        if ui.button(&t.name).clicked() {
-                            chosen_target = Some((t.id.clone(), t.is_group));
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for t in &self.threads {
+                            if ui.button(&t.name).clicked() {
+                                chosen_target = Some((t.id.clone(), t.is_group));
+                            }
+                            ui.add_space(2.0);
                         }
-                        ui.add_space(2.0);
-                    }
-                });
+                    });
                 ui.separator();
                 if ui.button("Hủy").clicked() {
                     close_modal = true;
@@ -4050,7 +4097,9 @@ impl ZaloGuiApp {
         if let Some((target_id, is_group)) = chosen_target {
             self.batch_forward_modal_open = false;
             if let Some(t) = self.threads.get(self.selected_thread_index) {
-                let selected: Vec<ChatMessage> = t.messages.iter()
+                let selected: Vec<ChatMessage> = t
+                    .messages
+                    .iter()
                     .filter(|m| self.selected_msg_ids.contains(&m.id))
                     .cloned()
                     .collect();
@@ -5041,10 +5090,21 @@ impl ZaloGuiApp {
             Layout::left_to_right(Align::Center),
             |ui| {
                 if is_recording {
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
-                    ui.label(RichText::new("🔴 Ghi âm…").color(pal.danger).strong().size(12.5));
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(50));
+                    ui.label(
+                        RichText::new("🔴 Ghi âm…")
+                            .color(pal.danger)
+                            .strong()
+                            .size(12.5),
+                    );
                 } else {
-                    ui.label(RichText::new("⏹ Đã ghi âm").color(pal.primary).strong().size(12.5));
+                    ui.label(
+                        RichText::new("⏹ Đã ghi âm")
+                            .color(pal.primary)
+                            .strong()
+                            .size(12.5),
+                    );
                 }
 
                 let total_secs = dur.as_secs();
@@ -5066,14 +5126,22 @@ impl ZaloGuiApp {
                     ui.painter().rect_filled(
                         bar_rect,
                         Rounding::same(1.0),
-                        if is_recording { pal.danger } else { pal.primary },
+                        if is_recording {
+                            pal.danger
+                        } else {
+                            pal.primary
+                        },
                     );
                 }
 
                 ui.add_space(6.0);
 
                 if !is_recording {
-                    let lbl = if is_preview_playing { "⏸ Tạm dừng" } else { "▶ Nghe thử" };
+                    let lbl = if is_preview_playing {
+                        "⏸ Tạm dừng"
+                    } else {
+                        "▶ Nghe thử"
+                    };
                     if ui.small_button(lbl).clicked() {
                         if is_preview_playing {
                             action = VoiceBarAction::StopPreview;
@@ -5085,7 +5153,10 @@ impl ZaloGuiApp {
                     action = VoiceBarAction::StopRecording;
                 }
 
-                if ui.small_button(RichText::new(lucide::X).color(pal.danger)).clicked() {
+                if ui
+                    .small_button(RichText::new(lucide::X).color(pal.danger))
+                    .clicked()
+                {
                     action = VoiceBarAction::CancelRecording;
                 }
             },

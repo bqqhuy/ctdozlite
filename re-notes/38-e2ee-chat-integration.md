@@ -1,5 +1,10 @@
 # E2EE Chat Integration — WP16 Sprint 3-4
 
+> Historical implementation sketch. The independent audit on 2026-11-09 did not
+> find an official server-contract fixture here. Current production E2EE operations
+> are fail-closed under ADR-0035; the flows below do not certify interoperability.
+> See [the remediation boundary](39-independent-audit-boundaries.md).
+
 ## Overview
 
 Wire E2EE Signal Protocol (Double Ratchet) into ZaloLite's send/receive message flow.

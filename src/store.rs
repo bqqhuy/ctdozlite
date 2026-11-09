@@ -1539,15 +1539,18 @@ impl MessageStore {
     /// Load resumable upload state from persistence.
     /// # Errors
     /// Returns SQLite errors.
-    pub fn load_upload_state(&self, upload_id: &str) -> Result<Option<crate::upload::ResumableUploadState>> {
+    pub fn load_upload_state(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<crate::upload::ResumableUploadState>> {
         use rusqlite::OptionalExtension;
         let row = self.conn.query_row(
             "SELECT upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks FROM upload_sessions WHERE upload_id=?1",
             [upload_id],
             |r| {
                 let completed_str: String = r.get(5)?;
-                let completed_chunks: Vec<usize> = serde_json::from_str(&completed_str)
-                    .unwrap_or_default();
+                let completed_chunks = crate::upload::ResumableUploadState::decode_checkpoint(&completed_str, r.get(4)?)
+                    .map_err(|error| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, error.into()))?;
                 Ok(crate::upload::ResumableUploadState {
                     upload_id: r.get(0)?,
                     file_name: r.get(1)?,
@@ -1565,11 +1568,11 @@ impl MessageStore {
     /// # Errors
     /// Returns SQLite or JSON serialization errors.
     pub fn save_upload_state(&self, state: &crate::upload::ResumableUploadState) -> Result<()> {
-        let completed_json = serde_json::to_string(&state.completed_chunks)?;
+        let completed_json = state.checkpoint()?;
         self.conn.execute(
             "INSERT INTO upload_sessions(upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks, updated_at)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(upload_id) DO UPDATE SET completed_chunks=excluded.completed_chunks, updated_at=excluded.updated_at",
+             ON CONFLICT(upload_id) DO UPDATE SET file_name=excluded.file_name,total_size=excluded.total_size,chunk_size=excluded.chunk_size,total_chunks=excluded.total_chunks,completed_chunks=excluded.completed_chunks,updated_at=excluded.updated_at",
             params![
                 &state.upload_id,
                 &state.file_name,
@@ -1587,7 +1590,10 @@ impl MessageStore {
     /// # Errors
     /// Returns SQLite errors.
     pub fn delete_upload_state(&self, upload_id: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM upload_sessions WHERE upload_id=?1", [upload_id])?;
+        self.conn.execute(
+            "DELETE FROM upload_sessions WHERE upload_id=?1",
+            [upload_id],
+        )?;
         Ok(())
     }
 
@@ -1597,12 +1603,19 @@ impl MessageStore {
     pub fn list_upload_sessions(&self) -> Result<Vec<crate::upload::ResumableUploadState>> {
         let mut stmt = self.conn.prepare(
             "SELECT upload_id, file_name, total_size, chunk_size, total_chunks, completed_chunks
-             FROM upload_sessions ORDER BY updated_at DESC"
+             FROM upload_sessions ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             let completed_str: String = r.get(5)?;
-            let completed_chunks: Vec<usize> = serde_json::from_str(&completed_str)
-                .unwrap_or_default();
+            let completed_chunks =
+                crate::upload::ResumableUploadState::decode_checkpoint(&completed_str, r.get(4)?)
+                    .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        error.into(),
+                    )
+                })?;
             Ok(crate::upload::ResumableUploadState {
                 upload_id: r.get(0)?,
                 file_name: r.get(1)?,
@@ -1614,7 +1627,7 @@ impl MessageStore {
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
-/// Find an outgoing message by its client_message_id across all threads.
+    /// Find an outgoing message by its client_message_id across all threads.
     /// Used by ResumableUpload to locate and resume interrupted uploads.
     /// # Errors
     /// Returns SQLite query errors.
@@ -1635,7 +1648,15 @@ impl MessageStore {
                 let text: String = r.get(4).unwrap_or_default();
                 let ts: i64 = r.get(5).unwrap_or(0);
                 let raw_json: String = r.get(6)?;
-                Ok((thread_id, msg_id, sender_name, sender_id, text, ts, raw_json))
+                Ok((
+                    thread_id,
+                    msg_id,
+                    sender_name,
+                    sender_id,
+                    text,
+                    ts,
+                    raw_json,
+                ))
             })
             .optional()?;
 
@@ -1708,12 +1729,10 @@ mod upload_persistence_tests {
     fn list_upload_sessions_returns_all_active() {
         let store = MessageStore::open(":memory:").unwrap();
 
-        let state1 = crate::upload::ResumableUploadState::new(
-            "up1".into(), "file1.bin".into(), 1000, 500,
-        );
-        let state2 = crate::upload::ResumableUploadState::new(
-            "up2".into(), "file2.bin".into(), 2000, 500,
-        );
+        let state1 =
+            crate::upload::ResumableUploadState::new("up1".into(), "file1.bin".into(), 1000, 500);
+        let state2 =
+            crate::upload::ResumableUploadState::new("up2".into(), "file2.bin".into(), 2000, 500);
 
         store.save_upload_state(&state1).unwrap();
         store.save_upload_state(&state2).unwrap();
@@ -1739,7 +1758,9 @@ mod upload_persistence_tests {
         stored.thread_id = "thread_x".into();
         store.upsert_message(&stored).unwrap();
 
-        let found = store.find_outgoing_message_by_client_id("client_999").unwrap();
+        let found = store
+            .find_outgoing_message_by_client_id("client_999")
+            .unwrap();
         assert!(found.is_some());
         let (thread_id, restored) = found.unwrap();
         assert_eq!(thread_id, "thread_x");
@@ -1747,12 +1768,12 @@ mod upload_persistence_tests {
         assert_eq!(restored.client_message_id, "client_999");
         assert!(restored.is_outgoing);
 
-        let not_found = store.find_outgoing_message_by_client_id("nonexistent").unwrap();
+        let not_found = store
+            .find_outgoing_message_by_client_id("nonexistent")
+            .unwrap();
         assert!(not_found.is_none());
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {

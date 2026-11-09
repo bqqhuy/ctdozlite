@@ -58,6 +58,7 @@ async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<Str
     (address, task)
 }
 fn session(host: &str) -> Session {
+    static NEXT_ACCOUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut s = Session::new(false, false, false).unwrap();
     s.http = reqwest::Client::builder()
         .no_proxy()
@@ -65,7 +66,11 @@ fn session(host: &str) -> Session {
         .build()
         .unwrap();
     s.login = Some(LoginInfo {
-        uin: "123".into(),
+        uin: format!(
+            "fixture-{}-{}",
+            std::process::id(),
+            NEXT_ACCOUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
         ..Default::default()
     });
     s.secret_key = Some(vec![7; 32]);
@@ -396,8 +401,15 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let mut paths = Vec::new();
-        while let Ok(Ok((mut stream, _))) =
-            tokio::time::timeout(Duration::from_millis(300), listener.accept()).await
+        while let Ok(Ok((mut stream, _))) = tokio::time::timeout(
+            if paths.len() < 4 {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(300)
+            },
+            listener.accept(),
+        )
+        .await
         {
             let mut request = Vec::new();
             loop {
@@ -472,8 +484,8 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
 
 #[test]
 fn audit_a16_websocket_queue_backpressure_and_flow_control() {
-    use std::time::Instant;
     use serde_json::json;
+    use std::time::Instant;
 
     // Test that PullQueues handles flow control backpressure
     let mut queues = zalo_rust::socket::queue_receiver::PullQueues::new(10);
@@ -490,15 +502,25 @@ fn audit_a16_websocket_queue_backpressure_and_flow_control() {
 
     // 1. When forward queue is congested (has_capacity = false), page is throttled
     let throttled = queues.page_with_capacity(key, &page_payload, now, false);
-    assert!(throttled.is_none(), "Must throttle pull when downstream buffer has no capacity");
+    assert!(
+        throttled.is_none(),
+        "Must throttle pull when downstream buffer has no capacity"
+    );
     assert!(queues.is_throttled(key), "Queue must be marked throttled");
 
     // 2. due_with_capacity(false) will NOT resume throttled queues
-    assert!(queues.due_with_capacity(now, false).is_empty(), "Must not resume while capacity is unavailable");
+    assert!(
+        queues.due_with_capacity(now, false).is_empty(),
+        "Must not resume while capacity is unavailable"
+    );
 
     // 3. When capacity is restored (has_capacity = true), due_with_capacity resumes the throttled queue
     let resumed = queues.due_with_capacity(now, true);
-    assert_eq!(resumed.len(), 1, "Must resume throttled queue once capacity is restored");
+    assert_eq!(
+        resumed.len(),
+        1,
+        "Must resume throttled queue once capacity is restored"
+    );
     assert_eq!(resumed[0].last, json!(999));
     assert!(!queues.is_throttled(key));
 }
@@ -556,7 +578,9 @@ fn audit_a33_http2_header_injection_prevention() {
     assert!(has_header_injection("value\r"));
     assert!(has_header_injection("value\n"));
     assert!(has_header_injection("value\0null"));
-    assert!(!has_header_injection("Mozilla/5.0 (Windows NT 10.0; ARM64)"));
+    assert!(!has_header_injection(
+        "Mozilla/5.0 (Windows NT 10.0; ARM64)"
+    ));
 
     // Sanitization strips forbidden characters
     assert_eq!(
@@ -572,8 +596,8 @@ fn audit_a33_http2_header_injection_prevention() {
 #[test]
 fn audit_a35_ipv6_link_local_and_site_local_guards() {
     use std::net::IpAddr;
-    use zalo_rust::endpoints::is_private_or_loopback_ip;
     use zalo_rust::chat::is_safe_opengraph_url;
+    use zalo_rust::endpoints::is_private_or_loopback_ip;
 
     // IPv6 link-local (fe80::/10)
     let fe80_1 = "fe80::1".parse::<IpAddr>().unwrap();

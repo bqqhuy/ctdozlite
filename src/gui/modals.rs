@@ -58,41 +58,48 @@ impl ZaloGuiApp {
                         }
 
                         // A20: Profile switcher list in avatar popover
-                        if let Ok(reg) = crate::profiles::ProfileRegistry::load() {
-                            if reg.profiles.len() > 1 {
-                                ui.add_space(4.0);
-                                ui.separator();
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new("Chuyển tài khoản:")
-                                        .size(11.5)
-                                        .color(pal.text_secondary)
-                                        .strong(),
-                                );
-                                for profile in reg.profiles.values() {
-                                    let is_active = profile.uid == self.user_uin;
-                                    let display = if is_active {
-                                        format!("✓ {} (hiện tại)", profile.display_name)
-                                    } else {
-                                        format!("  {}", profile.display_name)
-                                    };
-                                    if is_active {
-                                        ui.label(RichText::new(display).size(12.0).color(pal.accent_online));
-                                    } else {
-                                        if ui.add_sized(
+                        if self.profiles.len() > 1 {
+                            ui.add_space(4.0);
+                            ui.separator();
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new("Chuyển tài khoản:")
+                                    .size(11.5)
+                                    .color(pal.text_secondary)
+                                    .strong(),
+                            );
+                            for profile in &self.profiles {
+                                let is_active = profile.uid == self.user_uin;
+                                let display = if is_active {
+                                    format!("✓ {} (hiện tại)", profile.display_name)
+                                } else {
+                                    format!("  {}", profile.display_name)
+                                };
+                                if is_active {
+                                    ui.label(
+                                        RichText::new(display).size(12.0).color(pal.accent_online),
+                                    );
+                                } else {
+                                    if ui
+                                        .add_sized(
                                             [200.0, 26.0],
                                             egui::Button::new(
-                                                RichText::new(display).size(12.0).color(pal.text_primary),
-                                            ).fill(Color32::TRANSPARENT),
-                                        ).on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::SwitchProfile {
-                                                    owner: self.user_uin.clone(),
-                                                    target_uid: profile.uid.clone(),
-                                                });
-                                            }
-                                            close_menu = true;
+                                                RichText::new(display)
+                                                    .size(12.0)
+                                                    .color(pal.text_primary),
+                                            )
+                                            .fill(Color32::TRANSPARENT),
+                                        )
+                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                        .clicked()
+                                    {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::SwitchProfile {
+                                                owner: self.user_uin.clone(),
+                                                target_uid: profile.uid.clone(),
+                                            });
                                         }
+                                        close_menu = true;
                                     }
                                 }
                             }
@@ -2476,12 +2483,16 @@ impl ZaloGuiApp {
             time: crate::clock::message_time(message.ts),
             zoom: 1.0,
             pan: Vec2::ZERO,
-            video_state: if video { Some(super::VideoPlayerState {
-                playing: false,
-                position_secs: 0.0,
-                duration_secs: media.duration.map(|d| d as f32).unwrap_or(0.0),
-                volume: 1.0,
-            }) } else { None },
+            video_state: if video {
+                Some(super::VideoPlayerState {
+                    playing: false,
+                    position_secs: 0.0,
+                    duration_secs: media.duration.map(|d| d as f32).unwrap_or(0.0),
+                    volume: 1.0,
+                })
+            } else {
+                None
+            },
         });
     }
 
@@ -2501,7 +2512,8 @@ impl ZaloGuiApp {
             // Ctrl+S: Save media
             if let Some(ref viewer) = self.image_viewer {
                 if !self.content_protected(&viewer.source.thread, viewer.source.group)
-                    && !viewer.original_url.is_empty() {
+                    && !viewer.original_url.is_empty()
+                {
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::DownloadMedia {
                             url: viewer.original_url.clone(),
@@ -2781,9 +2793,14 @@ impl ZaloGuiApp {
                                     let is_active = crate::video_player::is_video_window_active();
                                     let is_playing = vstate.playing || is_active;
                                     let play_icon = if is_playing { "⏸" } else { "▶" };
-                                    let play_tip = if is_playing { "Tạm dừng" } else { "Phát video" };
+                                    let play_tip = if is_playing {
+                                        "Tạm dừng"
+                                    } else {
+                                        "Phát video"
+                                    };
 
-                                    if ui.small_button(play_icon).on_hover_text(play_tip).clicked() {
+                                    if ui.small_button(play_icon).on_hover_text(play_tip).clicked()
+                                    {
                                         if is_active {
                                             crate::video_player::control_play_pause();
                                             vstate.playing = !vstate.playing;
@@ -2806,13 +2823,21 @@ impl ZaloGuiApp {
                                     let pos_sec = (vstate.position_secs % 60.0) as u32;
                                     let dur_min = (vstate.duration_secs / 60.0) as u32;
                                     let dur_sec = (vstate.duration_secs % 60.0) as u32;
-                                    ui.label(format!("{:02}:{:02} / {:02}:{:02}", pos_min, pos_sec, dur_min, dur_sec));
+                                    ui.label(format!(
+                                        "{:02}:{:02} / {:02}:{:02}",
+                                        pos_min, pos_sec, dur_min, dur_sec
+                                    ));
 
                                     // Seek scrubber
                                     let max_dur = vstate.duration_secs.max(1.0);
                                     let mut pos = vstate.position_secs;
-                                    if ui.add(egui::Slider::new(&mut pos, 0.0..=max_dur)
-                                        .show_value(false)).changed() {
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut pos, 0.0..=max_dur)
+                                                .show_value(false),
+                                        )
+                                        .changed()
+                                    {
                                         vstate.position_secs = pos;
                                         crate::video_player::control_seek(pos);
                                     }
@@ -2820,9 +2845,14 @@ impl ZaloGuiApp {
                                     // Volume control
                                     ui.label("🔊");
                                     let mut vol = vstate.volume;
-                                    if ui.add(egui::Slider::new(&mut vol, 0.0..=1.0)
-                                        .show_value(false)
-                                        .fixed_decimals(2)).changed() {
+                                    if ui
+                                        .add(
+                                            egui::Slider::new(&mut vol, 0.0..=1.0)
+                                                .show_value(false)
+                                                .fixed_decimals(2),
+                                        )
+                                        .changed()
+                                    {
                                         vstate.volume = vol;
                                         crate::video_player::control_set_volume(vol);
                                     }
@@ -2838,7 +2868,9 @@ impl ZaloGuiApp {
                                         ) && !viewer.original_url.is_empty(),
                                         egui::Button::new(crate::i18n::tr("▶ Cửa sổ video riêng")),
                                     )
-                                    .on_hover_text(crate::i18n::tr("Mở video trong cửa sổ native riêng biệt"))
+                                    .on_hover_text(crate::i18n::tr(
+                                        "Mở video trong cửa sổ native riêng biệt",
+                                    ))
                                     .clicked()
                                 {
                                     if let Some(tx) = WORKER_TX.get() {
@@ -3116,7 +3148,15 @@ impl ZaloGuiApp {
                 m.loading = true;
             }
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::TrustIdentity { peer_id });
+                let _ = tx.send(WorkerCmd::TrustIdentity {
+                    owner: self.user_uin.clone(),
+                    peer_id,
+                    safety_number: self
+                        .safety_number_modal
+                        .as_ref()
+                        .map(|m| m.safety_number.clone())
+                        .unwrap_or_default(),
+                });
             }
         }
 

@@ -83,3 +83,5 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0033 — V1 RSA backend after release audit](0033-v1-rsa-backend-release-audit.md)
 
 - [0034 — Hidden-chat PIN compatibility and local display gate](0034-hidden-chat-pin-compatibility.md)
+
+- [0035 — Fail closed at the unverified E2EE server boundary](0035-unverified-e2ee-boundary.md)

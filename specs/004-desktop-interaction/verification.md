@@ -34,3 +34,14 @@ Native CI 41987509192 phát hiện cảnh báo quyền nhóm đẩy nút Gửi v
 Test blocked_group_notice_keeps_send_inside_viewport tái hiện lỗi trước sửa và
 qua sau khi dành chiều cao đúng galley; ba cấu hình kích thước/DPI được kiểm tra.
 Chờ CI native mới; chưa đóng task nghiệm thu GUI/tài khoản thật.
+
+
+## Kiểm chứng bổ sung 09/11/2026
+
+Working tree trên `f842dfeb84fd94ff7ea79dc8d6b88dc9ad9d94bc`, theo yêu cầu sửa audit.
+U-03/U-04: event lifecycle và sidebar có thay đổi liên quan được mô tả trong
+[bản ghi khắc phục](../../docs/audits/2026-11-09-remediation.md).
+Suite đầy đủ: 803 passed, 11 ignored; Clippy và check ARM64 đạt. Ignored được
+chạy riêng; lỗi H.264 ban đầu đã có bản sửa và test native x64 chạy lại đạt.
+UI smoke có PNG ở hai kích thước/theme và đã kiểm tra trực quan.
+Không đóng task thiết bị hoặc chứng nhận Zalo interoperability từ các kết quả này.

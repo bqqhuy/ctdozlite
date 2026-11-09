@@ -79,7 +79,10 @@ impl KeyPair {
 
     pub fn dh(&self, their_public: &PublicKey) -> Result<SharedSecret> {
         let shared = self.private.diffie_hellman(their_public);
-        anyhow::ensure!(shared.was_contributory(), "Non-contributory DH secret rejected");
+        anyhow::ensure!(
+            shared.was_contributory(),
+            "Non-contributory DH secret rejected"
+        );
         Ok(shared)
     }
 }
@@ -183,7 +186,10 @@ mod skipped_keys_codec {
         created_at: Option<i64>,
     }
 
-    pub fn serialize<S>(map: &HashMap<SkipKey, SkippedKeyEntry>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    pub fn serialize<S>(
+        map: &HashMap<SkipKey, SkippedKeyEntry>,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -199,7 +205,9 @@ mod skipped_keys_codec {
         entries.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<HashMap<SkipKey, SkippedKeyEntry>, D::Error>
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<HashMap<SkipKey, SkippedKeyEntry>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -253,6 +261,9 @@ pub struct RatchetSession {
     /// Base key (ephemeral public key) used to establish this session (A11 replay protection).
     #[serde(default)]
     pub base_key: Option<[u8; 32]>,
+    /// Pending prekey envelope retained until an authenticated reply establishes the session.
+    #[serde(default)]
+    pub pending_prekey_bundle: Option<crate::crypto::wire::PreKeyBundleWire>,
 }
 
 /// Portable key pair representation (private bytes zeroized on drop).
@@ -291,12 +302,13 @@ impl RatchetSession {
     /// The signed prekey acts as Bob's *current* ratchet key, so Alice's first
     /// sending chain and Bob's first receiving chain derive from the same DH.
     pub fn init_as_sender(
-        shared_secret: &[u8],             // 32-byte X3DH shared secret
-        bob_signed_prekey: &PublicKey,     // Bob's SPK (Bob's current ratchet key)
+        shared_secret: &[u8],          // 32-byte X3DH shared secret
+        bob_signed_prekey: &PublicKey, // Bob's SPK (Bob's current ratchet key)
     ) -> Result<Self> {
         let our_ratchet = KeyPair::generate();
         let dh_out = our_ratchet.dh(bob_signed_prekey)?;
-        let (root_key, chain_key_send) = kdf_rk(&root_from_secret(shared_secret), dh_out.as_bytes());
+        let (root_key, chain_key_send) =
+            kdf_rk(&root_from_secret(shared_secret), dh_out.as_bytes());
         Ok(Self {
             dh_sending: Some(KeyPairBytes::from(&our_ratchet)),
             dh_remote: Some(*bob_signed_prekey.as_bytes()),
@@ -309,6 +321,7 @@ impl RatchetSession {
             skipped: std::collections::HashMap::new(),
             session_ts: None,
             base_key: None,
+            pending_prekey_bundle: None,
         })
     }
 
@@ -327,7 +340,8 @@ impl RatchetSession {
     ) -> Result<Self> {
         let alice_key = *alice_ratchet_key.as_bytes();
         let dh_recv = our_signed_prekey.dh(alice_ratchet_key)?;
-        let (root_key, chain_key_recv) = kdf_rk(&root_from_secret(shared_secret), dh_recv.as_bytes());
+        let (root_key, chain_key_recv) =
+            kdf_rk(&root_from_secret(shared_secret), dh_recv.as_bytes());
 
         // Bob's ratchet step: a new key pair yields the sending chain Alice expects.
         let bob_ratchet = KeyPair::generate();
@@ -346,6 +360,7 @@ impl RatchetSession {
             skipped: std::collections::HashMap::new(),
             session_ts: Some(now_ms()),
             base_key: None,
+            pending_prekey_bundle: None,
         })
     }
 
@@ -378,7 +393,11 @@ impl RatchetSession {
     }
 
     /// Decrypt a received `(header, ciphertext_with_mac)`.
-    pub fn decrypt(&mut self, header: &MessageHeader, ciphertext_with_mac: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext_with_mac: &[u8],
+    ) -> Result<Vec<u8>> {
         anyhow::ensure!(
             ciphertext_with_mac.len() >= 32,
             "Ciphertext too short (must include 32-byte MAC)"
@@ -398,6 +417,7 @@ impl RatchetSession {
                 anyhow::bail!("Khóa tin nhắn bị bỏ qua đã hết hạn (expired skipped key)");
             }
             let mk_bytes = entry.key;
+            anyhow::ensure!(mk_bytes.len() == 80, "Khóa tin nhắn lưu trữ bị hỏng");
             // Stored layout: cipher_key(32) || mac_key(32) || iv(16).
             let mk = MessageKey {
                 cipher_key: mk_bytes[..32].try_into().expect("cipher key slice"),
@@ -421,6 +441,10 @@ impl RatchetSession {
 
         // Advance the receiving chain, skipping over any gap.
         candidate.skip_over_recv_chain(header.n)?;
+        anyhow::ensure!(
+            header.n >= candidate.recv_count && header.n < u32::MAX,
+            "Counter tin nhắn không hợp lệ hoặc đã xử lý"
+        );
         let ck = candidate
             .chain_key_recv
             .as_mut()
@@ -432,6 +456,9 @@ impl RatchetSession {
         verify_mac(&mk.mac_key, &header.dh_public, header.n, header.pn, ct, mac)?;
         let pt = aes256_cbc_decrypt(ct, &mk.cipher_key, &mk.iv)?;
         *self = candidate;
+        if self.recv_count > 0 {
+            self.pending_prekey_bundle = None;
+        }
         Ok(pt)
     }
 
@@ -471,9 +498,13 @@ impl RatchetSession {
             .retain(|_, entry| now.saturating_sub(entry.created_at) < SKIPPED_KEY_EXPIRY_MS);
     }
 
-    /// Insert a skipped message key, enforcing max capacity and pruning expired keys (A12).
+    /// Insert one skipped key, pruning expired material before admission.
     pub fn insert_skipped_key(&mut self, key: SkipKey, mk_bytes: Vec<u8>, now: i64) {
         self.prune_expired_skipped_keys(now);
+        self.insert_pruned_skipped_key(key, mk_bytes, now);
+    }
+
+    fn insert_pruned_skipped_key(&mut self, key: SkipKey, mk_bytes: Vec<u8>, now: i64) {
         // Evict oldest if capacity exceeded
         if self.skipped.len() >= MAX_TOTAL_SKIPPED_KEYS {
             if let Some(oldest_key) = self
@@ -485,7 +516,13 @@ impl RatchetSession {
                 self.skipped.remove(&oldest_key);
             }
         }
-        self.skipped.insert(key, SkippedKeyEntry { key: mk_bytes, created_at: now });
+        self.skipped.insert(
+            key,
+            SkippedKeyEntry {
+                key: mk_bytes,
+                created_at: now,
+            },
+        );
     }
 
     /// Store the message keys of the messages skipped by an out-of-order delivery.
@@ -505,6 +542,24 @@ impl RatchetSession {
         let mut ck = ck;
         let remote = self.dh_remote.unwrap_or([0u8; 32]);
         let now = now_ms();
+        self.prune_expired_skipped_keys(now);
+        let required = (until - from) as usize;
+        let excess = self
+            .skipped
+            .len()
+            .saturating_add(required)
+            .saturating_sub(MAX_TOTAL_SKIPPED_KEYS);
+        if excess > 0 {
+            let mut oldest: Vec<_> = self
+                .skipped
+                .iter()
+                .map(|(key, entry)| (entry.created_at, key.clone()))
+                .collect();
+            oldest.sort_unstable_by_key(|(at, _)| *at);
+            for (_, key) in oldest.into_iter().take(excess) {
+                self.skipped.remove(&key);
+            }
+        }
         for n in from..until {
             let (new_ck, mk) = kdf_ck(&ck);
             ck = new_ck;
@@ -516,7 +571,7 @@ impl RatchetSession {
             mk_store[..32].copy_from_slice(&mk.cipher_key);
             mk_store[32..64].copy_from_slice(&mk.mac_key);
             mk_store[64..].copy_from_slice(&mk.iv);
-            self.insert_skipped_key(skip_key, mk_store, now);
+            self.insert_pruned_skipped_key(skip_key, mk_store, now);
         }
         self.chain_key_recv = Some(ck);
         self.recv_count = until;
@@ -636,9 +691,11 @@ mod tests {
         let bob_spk = KeyPair::generate();
         let alice_ek = KeyPair::generate();
         let ss = fake_x3dh(&alice_ek, &bob_spk);
-        let alice = RatchetSession::init_as_sender(&ss, &bob_spk.public).expect("init alice sender");
+        let alice =
+            RatchetSession::init_as_sender(&ss, &bob_spk.public).expect("init alice sender");
         let alice_key = PublicKey::from(alice.dh_sending.as_ref().unwrap().public);
-        let bob = RatchetSession::init_as_receiver(&ss, &alice_key, &bob_spk).expect("init bob receiver");
+        let bob =
+            RatchetSession::init_as_receiver(&ss, &alice_key, &bob_spk).expect("init bob receiver");
         (alice, bob)
     }
 
@@ -743,11 +800,16 @@ mod tests {
 
         // Deliver msg 3 to force msg 1 and 2 into bob's skipped map
         assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"three");
-        assert!(!bob.skipped.is_empty(), "Bob must have skipped keys buffered");
+        assert!(
+            !bob.skipped.is_empty(),
+            "Bob must have skipped keys buffered"
+        );
 
         // Serialize bob's session to JSON (would fail without skipped_keys_codec)
-        let json = serde_json::to_string(&bob).expect("Must serialize RatchetSession with skipped keys");
-        let mut bob_restored: RatchetSession = serde_json::from_str(&json).expect("Must deserialize RatchetSession");
+        let json =
+            serde_json::to_string(&bob).expect("Must serialize RatchetSession with skipped keys");
+        let mut bob_restored: RatchetSession =
+            serde_json::from_str(&json).expect("Must deserialize RatchetSession");
 
         // Ensure restored session can decrypt skipped message 1
         assert_eq!(bob_restored.decrypt(&h1, &c1).unwrap(), b"one");
@@ -760,7 +822,10 @@ mod tests {
         c1[0] ^= 0xFF; // Corrupt ciphertext / MAC
 
         let bob_state_before = bob.clone();
-        assert!(bob.decrypt(&h1, &c1).is_err(), "Corrupt decryption must fail");
+        assert!(
+            bob.decrypt(&h1, &c1).is_err(),
+            "Corrupt decryption must fail"
+        );
 
         // State must remain identical to before the failed decryption attempt
         assert_eq!(bob.recv_count, bob_state_before.recv_count);
@@ -777,7 +842,10 @@ mod tests {
         let (h3, c3) = alice.encrypt(b"msg-2").unwrap();
 
         assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"msg-2");
-        assert_eq!(bob.recv_count, 3, "Recv count must be advanced to header.n + 1");
+        assert_eq!(
+            bob.recv_count, 3,
+            "Recv count must be advanced to header.n + 1"
+        );
     }
 
     #[test]
@@ -831,7 +899,10 @@ mod tests {
         };
         bob.insert_skipped_key(extra_key.clone(), vec![0u8; 80], now + 100000);
         assert_eq!(bob.skipped.len(), MAX_TOTAL_SKIPPED_KEYS);
-        assert!(!bob.skipped.contains_key(&SkipKey { dh_public: [1u8; 32], counter: 0 }));
+        assert!(!bob.skipped.contains_key(&SkipKey {
+            dh_public: [1u8; 32],
+            counter: 0
+        }));
         assert!(bob.skipped.contains_key(&extra_key));
     }
 

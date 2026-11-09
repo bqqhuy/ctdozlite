@@ -1,6 +1,13 @@
 use super::*;
 
 pub enum WorkerCmd {
+    SaveAppSettings {
+        settings: serde_json::Value,
+        persist_session: bool,
+    },
+    LoadProfiles {
+        owner: String,
+    },
     Hidden {
         owner: String,
         generation: u64,
@@ -269,7 +276,9 @@ pub enum WorkerCmd {
         peer_name: String,
     },
     TrustIdentity {
+        owner: String,
         peer_id: String,
+        safety_number: String,
     },
     PreviewDocument {
         url: String,
@@ -512,6 +521,32 @@ impl WorkerMailbox {
 }
 pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox(std::sync::Mutex::new(None));
 
+async fn forward_upload_progress(
+    receiver: &mut tokio::sync::broadcast::Receiver<(String, u64, u64)>,
+    events: &Sender<GuiEvent>,
+    context: &egui::Context,
+) {
+    loop {
+        match receiver.recv().await {
+            Ok((upload_id, completed, total)) => {
+                if events
+                    .send(GuiEvent::UploadProgress {
+                        upload_id,
+                        completed,
+                        total,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                context.request_repaint();
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 struct PollGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
 impl Drop for PollGuard {
     fn drop(&mut self) {
@@ -593,15 +628,9 @@ fn preload_disk_sticker_inner(
             }
         }
         let url = if item.cate_id == 0 && (1..=30).contains(&item.sticker_id) {
-            format!(
-                "https://stc-chat.zdn.vn/images/stickers/default/thumb/{}.png",
-                item.sticker_id
-            )
+            crate::endpoints::builtin_sticker_thumbnail(item.sticker_id)
         } else {
-            format!(
-                "https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={}&size=130",
-                item.sticker_id
-            )
+            crate::endpoints::legacy_sticker_image(item.sticker_id)
         };
         missing.push((key, url, cache_path));
     }
@@ -1163,14 +1192,7 @@ pub(super) fn spawn_session_worker(
                     let tx_progress = gui_tx.clone();
                     let ctx_progress = egui_ctx.clone();
                     tokio::spawn(async move {
-                        while let Ok((upload_id, completed, total)) = progress_rx.recv().await {
-                            let _ = tx_progress.send(GuiEvent::UploadProgress {
-                                upload_id,
-                                completed,
-                                total,
-                            });
-                            ctx_progress.request_repaint();
-                        }
+                        forward_upload_progress(&mut progress_rx, &tx_progress, &ctx_progress).await;
                     });
                 }
 
@@ -1208,11 +1230,14 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                 while let Some(cmd) = cmd_rx.recv().await {
                     if let Some((thread_id, mut message)) = outgoing_command(&cmd) {
                         let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
-                        let tx = gui_tx.clone(); let ctx = egui_ctx.clone(); let shared = session.clone();
+                        let tx = gui_tx.clone();
+                        let ctx = egui_ctx.clone();
+                        // Capture the session before spawning so the intent remains bound to its account.
+                        let s = session.lock().await.clone();
+                        let owner = s.account_key().to_owned();
+                        let session_arc = session.clone();
                         tokio::spawn(async move {
                             let active = active;
-                            let s = shared.lock().await.clone();
-                            let owner = s.account_key().to_owned();
                             message.delivery = crate::message_model::DeliveryState::Pending;
                             if let Some(job) = message.outgoing_job.as_mut() { job.error.clear(); }
                             persist_outgoing(&s, &thread_id, &message).await;
@@ -1230,9 +1255,12 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                             persist_outgoing(&s, &thread_id, &message).await;
                             drop(active);
                             let _ = tx.send(GuiEvent::OutgoingState { owner, thread_id, message });
-                            if expired {
+                            if expired && s.is_active() {
+                                let mut current = session_arc.lock().await;
+                                if current.runtime_id() != s.runtime_id() { return; }
+                                current.logout();
+                                drop(current);
                                 let _ = tokio::task::spawn_blocking(crate::storage::remove_session).await;
-                                shared.lock().await.logout();
                                 let _ = tx.send(GuiEvent::SessionExpired("Không thể gửi vì phiên đăng nhập đã hết hạn".into()));
                             }
                             ctx.request_repaint();
@@ -1258,88 +1286,40 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                             }).await.map_err(|_|"Không lưu được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không lưu được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftSaved{owner,thread,generation,text,result});egui_ctx.request_repaint();
                         }
-                        WorkerCmd::TrustIdentity { peer_id } => {
-                            let s = session.lock().await.clone();
-                            let owner = s.account_key().to_owned();
-                            let tx = gui_tx.clone();
-                            let ctx = egui_ctx.clone();
+                        WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
+                            let account = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             tokio::task::spawn_blocking(move || {
-                                match crate::crypto::session::E2eeManager::open(&owner) {
-                                    Ok(mgr) => {
-                                        if let Err(e) = mgr.verify_identity(&peer_id) {
-                                            let _ = tx.send(GuiEvent::StatusUpdate(format!("Không thể lưu xác minh danh tính: {e}")));
-                                        } else {
-                                            let _ = tx.send(GuiEvent::IdentityTrusted {
-                                                peer_id,
-                                                is_trusted: true,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Lỗi mở khoá bảo mật E2EE: {e}")));
-                                    }
-                                }
-                                ctx.request_repaint();
+                                let result = (|| -> anyhow::Result<()> {
+                                    anyhow::ensure!(account.is_active() && account.account_key() == owner, "Tài khoản đã thay đổi");
+                                    crate::e2ee_integration::require_verified_contract()?;
+                                    let mgr = crate::crypto::session::E2eeManager::open(&owner)?;
+                                    mgr.verify_identity_number(&peer_id, &safety_number)
+                                })();
+                                let event = match result {
+                                    Ok(()) => GuiEvent::IdentityTrusted { owner, peer_id, is_trusted: true },
+                                    Err(error) => GuiEvent::SafetyNumberFailed { owner, peer_id, message: error.to_string() },
+                                };
+                                let _ = tx.send(event); ctx.request_repaint();
                             });
                         }
                         WorkerCmd::LoadSafetyNumber { owner, peer_id, peer_name } => {
-                            let s_clone = session.clone();
-                            let tx = gui_tx.clone();
-                            let ctx = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let session_guard = s_clone.lock().await.clone();
-                                let mgr = match crate::crypto::session::E2eeManager::open(&owner) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Lỗi mở khoá bảo mật E2EE: {e}")));
-                                        ctx.request_repaint();
-                                        return;
-                                    }
+                            let account = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let result = (|| -> anyhow::Result<_> {
+                                    anyhow::ensure!(account.is_active() && account.account_key() == owner, "Tài khoản đã thay đổi");
+                                    crate::e2ee_integration::require_verified_contract()?;
+                                    let mgr = crate::crypto::session::E2eeManager::open(&owner)?;
+                                    let (key, verified) = mgr.get_trusted_identity(&peer_id)?
+                                        .ok_or_else(|| anyhow::anyhow!("Chưa có khóa danh tính đã xác thực của đối phương; chưa thể tính mã an toàn"))?;
+                                    Ok((mgr.safety_number(&key)?, verified))
+                                })();
+                                let event = match result {
+                                    Ok((safety_number, is_verified)) => GuiEvent::SafetyNumberLoaded { owner, peer_id, peer_name, safety_number, is_verified, identity_changed: false },
+                                    Err(error) => GuiEvent::SafetyNumberFailed { owner, peer_id, message: error.to_string() },
                                 };
-                                let our_id = match mgr.identity() {
-                                    Ok(id) => id,
-                                    Err(e) => {
-                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Không đọc được khoá định danh cá nhân: {e}")));
-                                        ctx.request_repaint();
-                                        return;
-                                    }
-                                };
-                                let stored = mgr.get_trusted_identity(&peer_id).unwrap_or(None);
-                                let (peer_key, is_verified) = match stored {
-                                    Some((key, verified)) => (key, verified),
-                                    None => {
-                                        let fetched = crate::crypto::prekey::fetch_bundle(&session_guard, &peer_id).await;
-                                        match fetched {
-                                            Ok(bundle) => {
-                                                let _ = mgr.trust_identity(&peer_id, &bundle.identity_key);
-                                                (bundle.identity_key, false)
-                                            }
-                                            Err(_) => {
-                                                use sha2::Digest;
-                                                let mut fallback = [0u8; 32];
-                                                let digest = sha2::Sha256::digest(peer_id.as_bytes());
-                                                fallback.copy_from_slice(&digest);
-                                                let _ = mgr.trust_identity(&peer_id, &fallback);
-                                                (fallback, false)
-                                            }
-                                        }
-                                    }
-                                };
-                                match crate::crypto::safety::safety_number(&our_id.dh.public, &peer_key) {
-                                    Ok(sn) => {
-                                        let _ = tx.send(GuiEvent::SafetyNumberLoaded {
-                                            peer_id,
-                                            peer_name,
-                                            safety_number: sn,
-                                            is_verified,
-                                            identity_changed: false,
-                                        });
-                                    }
-                                    Err(e) => {
-                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Không tính được mã an toàn: {e}")));
-                                    }
-                                }
-                                ctx.request_repaint();
+                                let _ = tx.send(event); ctx.request_repaint();
                             });
                         }
                         WorkerCmd::Tools {owner,command}=>{
@@ -1435,6 +1415,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
                         }
                         WorkerCmd::RetryOutgoing { .. } => {},
+                        WorkerCmd::SaveAppSettings { settings, persist_session } => {
+                            let account = session.lock().await.clone();
+                            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                crate::storage::save_settings(&settings)?;
+                                if persist_session && account.is_active() && !account.account_key().is_empty() {
+                                    account.save_to_file("session.json")?;
+                                }
+                                Ok(())
+                            }).await.map_err(|_| "Không lưu được cài đặt".to_owned()).and_then(|r| r.map_err(|e| e.to_string()));
+                            let _ = gui_tx.send(GuiEvent::AppSettingsSaved(result));
+                            egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::LoadProfiles { owner } => {
+                            let result = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<crate::profiles::Profile>> {
+                                let registry = crate::profiles::ProfileRegistry::load()?;
+                                let mut profiles: Vec<_> = registry.profiles.into_values().collect();
+                                profiles.sort_by(|a,b| a.name.cmp(&b.name));
+                                Ok(profiles)
+                            }).await.map_err(|_| "Không đọc được danh sách tài khoản".to_owned()).and_then(|r| r.map_err(|e| e.to_string()));
+                            let _ = gui_tx.send(GuiEvent::ProfilesLoaded { owner, result }); egui_ctx.request_repaint();
+                        }
                         WorkerCmd::CheckUpdate=>{
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();tokio::spawn(async move{let result=crate::updater::discover().await;let _=tx.send(GuiEvent::UpdateChecked(result));ctx.request_repaint();});
                         }
@@ -1650,7 +1651,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let result=tokio::task::spawn_blocking(move||->anyhow::Result<()> {
                                 anyhow::ensure!(s.is_active(),"Tài khoản đã đăng xuất");
                                 let mut settings=AppSettings::load();settings.info_drawer_open=open;
-                                settings.save()
+                                crate::storage::save_settings(&settings)
                             }).await;
                             if !matches!(result,Ok(Ok(()))){let _=gui_tx.send(GuiEvent::StatusUpdate("Không lưu được trạng thái bảng thông tin hội thoại".into()));egui_ctx.request_repaint();}
                         }
@@ -1902,13 +1903,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 continue;
                             }
 
-                            let target_uid_clone = target_uid.clone();
+
                             // Load the target profile from ProfileRegistry
                             let profile_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                 let registry = crate::profiles::ProfileRegistry::load()?;
                                 let profile = registry.profiles.values()
                                     .find(|p| p.uid == target_uid)
-                                    .ok_or_else(|| anyhow::anyhow!("Profile not found"))?
+                                    .ok_or_else(|| anyhow::anyhow!("Không tìm thấy tài khoản"))?
                                     .clone();
                                 Ok(profile)
                             }).await;
@@ -1917,10 +1918,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 Ok(Ok(profile)) => {
                                     // A20: Prepare target session and validate BEFORE modifying current session (rollback preservation)
                                     let session_path = profile.session_file.clone();
+                                    let expected_uid = profile.uid.clone();
                                     let load_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                         let mut new_session = crate::session::Session::new(false, false, false)?;
                                         new_session.load_from_file(&session_path.to_string_lossy())?;
-                                        anyhow::ensure!(!new_session.account_key().is_empty(), "Target profile session has empty account key");
+                                        anyhow::ensure!(!new_session.account_key().is_empty() && new_session.account_key() == expected_uid, "Phiên không khớp tài khoản đã chọn");
                                         Ok(new_session)
                                     }).await;
 
@@ -1937,22 +1939,24 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&old_account)).await;
                                             }
 
-                                            // 2. Commit active profile in registry
                                             let profile_name = profile.name.clone();
-                                            let _ = tokio::task::spawn_blocking(move || {
-                                                if let Ok(mut reg) = crate::profiles::ProfileRegistry::load() {
-                                                    let _ = reg.set_active(&profile_name);
-                                                    let _ = reg.save();
-                                                }
+                                            let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                                let mut reg = crate::profiles::ProfileRegistry::load()?;
+                                                reg.set_active(&profile_name)?;
+                                                reg.save()
                                             }).await;
-
-                                            // 3. Atomically install new session
-                                            *session.lock().await = new_session;
-
-                                            // 4. Notify UI to isolate state and reload data for target UID
-                                            let _ = gui_tx.send(GuiEvent::ProfileSwitched { uid: target_uid_clone });
+                                            if !matches!(persisted, Ok(Ok(()))) {
+                                                let _ = gui_tx.send(GuiEvent::StatusUpdate("Không lưu được tài khoản đang chọn".into()));
+                                                egui_ctx.request_repaint();
+                                                continue;
+                                            }
+                                            history_sync_cancel.store(true, std::sync::atomic::Ordering::Release);
+                                            phone_sync_cancel.store(true, std::sync::atomic::Ordering::Release);
+                                            session.lock().await.logout();
+                                            let _ = gui_tx.send(GuiEvent::ProfileSwitched { session: Box::new(new_session) });
                                             egui_ctx.request_repaint();
-                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Đã chuyển tài khoản thành công".into()));
+                                            // Destroy the old runtime; the UI starts a fresh account-bound worker.
+                                            break;
                                         }
                                         Ok(Err(e)) => {
                                             let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể tải phiên tài khoản: {e}")));
@@ -5067,12 +5071,18 @@ mod v0016_workflow_tests {
 
         // When WebSocket is connected, periodic check drops polling
         let should_poll = !is_ws_connected.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(!should_poll, "Polling must be suppressed when WebSocket is connected");
+        assert!(
+            !should_poll,
+            "Polling must be suppressed when WebSocket is connected"
+        );
 
         // When WebSocket disconnects, polling fallback activates
         is_ws_connected.store(false, std::sync::atomic::Ordering::SeqCst);
         let should_poll = !is_ws_connected.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(should_poll, "Polling must resume as fallback when WebSocket is down");
+        assert!(
+            should_poll,
+            "Polling must resume as fallback when WebSocket is down"
+        );
     }
 
     #[tokio::test]
@@ -5126,5 +5136,26 @@ mod v0016_workflow_tests {
         assert_eq!(event.0, "asyncfile-progress-1");
         assert_eq!(event.1, 1_048_576);
         assert_eq!(event.2, 3_000_000);
+    }
+}
+
+#[cfg(test)]
+mod audit_progress_tests {
+    use super::*;
+    #[tokio::test]
+    async fn lagged_upload_progress_still_delivers_later_events() {
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(2);
+        for n in 0..10 {
+            sender.send(("upload".into(), n, 10)).unwrap();
+        }
+        drop(sender);
+        let (tx, rx) = std::sync::mpsc::channel();
+        forward_upload_progress(&mut receiver, &tx, &egui::Context::default()).await;
+        let events: Vec<_> = rx.try_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.last(),
+            Some(GuiEvent::UploadProgress { completed: 9, .. })
+        ));
     }
 }

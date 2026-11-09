@@ -101,32 +101,30 @@ pub struct Domains {
 }
 
 fn default_lp_chat() -> String {
-    "https://p4-msg-chat.zaloapp.com".into()
+    crate::endpoints::LP_CHAT_LEGACY.into()
 }
 
 fn default_lp_control() -> String {
-    "https://p4-ctl-chat.zaloapp.com".into()
+    crate::endpoints::LP_CONTROL_LEGACY.into()
 }
 
 fn default_cloud_msg() -> String {
-    "https://tt-group-cm.api.zaloapp.com".into()
+    crate::endpoints::CLOUD_MESSAGE_LEGACY.into()
 }
 
 fn default_voice_call() -> String {
-    "https://voicecall-wpa.chat.zalo.me".into()
+    crate::endpoints::VOICE_CALL.into()
 }
 
 fn default_sticker() -> String {
     crate::endpoints::service("sticker")
-        .unwrap_or("https://tt-sticker-wpa.chat.zalo.me")
+        .unwrap_or(crate::endpoints::STICKER)
         .into()
 }
 
 /// [O] `re-notes/02_chat_data.md`: `zpw_ws` = `wss://ws{1..8}-msg.chat.zalo.me`.
 fn default_ws() -> Vec<String> {
-    (1..=8)
-        .map(|n| format!("wss://ws{n}-msg.chat.zalo.me"))
-        .collect()
+    crate::endpoints::default_websockets()
 }
 
 impl Default for Domains {
@@ -140,11 +138,11 @@ impl Default for Domains {
             conversation: crate::endpoints::service("conversation").unwrap().into(),
             lp_chat: default_lp_chat(),
             lp_control: default_lp_control(),
-            friend: "https://tt-friend-wpa.chat.zalo.me".into(),
-            convers_api: "https://tt-convers-wpa.chat.zalo.me".into(),
-            profile: "https://tt-profile-wpa.chat.zalo.me".into(),
-            group: "https://tt-group-wpa.zaloapp.com".into(),
-            file: "https://tt-files-wpa.zaloapp.com".into(),
+            friend: crate::endpoints::FRIEND.into(),
+            convers_api: crate::endpoints::CONVERSATION.into(),
+            profile: crate::endpoints::PROFILE.into(),
+            group: crate::endpoints::GROUP_LEGACY.into(),
+            file: crate::endpoints::FILE_LEGACY.into(),
             reaction: default_reaction(),
             group_board: String::new(),
             group_poll: String::new(),
@@ -282,8 +280,14 @@ impl std::fmt::Debug for SavedSession {
         f.debug_struct("SavedSession")
             .field("imei", &crate::session::redact_secret(&self.imei))
             .field("computer_name", &self.computer_name)
-            .field("secret_key_b64", &self.secret_key_b64.as_ref().map(|_| "<redacted>"))
-            .field("session_key", &self.session_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "secret_key_b64",
+                &self.secret_key_b64.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "session_key",
+                &self.session_key.as_ref().map(|_| "<redacted>"),
+            )
             .field("zpw_sek", &self.zpw_sek.as_ref().map(|_| "<redacted>"))
             .field("login", &self.login)
             .field("domains", &self.domains)
@@ -293,7 +297,8 @@ impl std::fmt::Debug for SavedSession {
 
 #[derive(Clone)]
 pub struct Session {
-    pub service_resolver: std::sync::Arc<std::sync::RwLock<crate::service_resolver::ServiceResolver>>,
+    pub service_resolver:
+        std::sync::Arc<std::sync::RwLock<crate::service_resolver::ServiceResolver>>,
     runtime_generation: usize,
     /// Shared in-memory PIN gate, never serialized with login credentials.
     pub hidden: Arc<crate::hidden_chat::Vault>,
@@ -348,7 +353,8 @@ fn redact_body(body: &serde_json::Value) -> serde_json::Value {
                     || key_lower.contains("cookie")
                     || key_lower.contains("session")
                     || key_lower.contains("auth")
-                    || key_lower.contains("credential") {
+                    || key_lower.contains("credential")
+                {
                     redacted.insert(key.clone(), json!("<REDACTED>"));
                 }
                 // Recursively scrub nested objects
@@ -370,8 +376,11 @@ impl Session {
     pub fn new(verbose: bool, dump: bool, dump_raw: bool) -> Result<Self> {
         let jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
-        default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
+        default_headers.insert(
+            REFERER,
+            HeaderValue::from_static(crate::endpoints::WEB_ORIGIN),
+        );
+        default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         let http = crate::proxy::apply(Client::builder())?
             .cookie_provider(Arc::clone(&jar))
             .redirect(reqwest::redirect::Policy::none())
@@ -384,7 +393,9 @@ impl Session {
             )
             .build()?;
         Ok(Self {
-            service_resolver: std::sync::Arc::new(std::sync::RwLock::new(crate::service_resolver::ServiceResolver::new())),
+            service_resolver: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::service_resolver::ServiceResolver::new(),
+            )),
             runtime_generation: next_runtime_generation(),
             hidden: Arc::new(crate::hidden_chat::Vault::default()),
             inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
@@ -412,12 +423,12 @@ impl Session {
         }
         // Insert cookie for all required Zalo hosts
         let hosts = [
-            "https://chat.zalo.me",
-            "https://wpa.zaloapp.com",
-            "https://wpa.chat.zalo.me",
-            "https://tt-sticker-wpa.chat.zalo.me",
-            "https://tt-sticker-wpa.zaloapp.com",
-            "https://sticker-wpa.chat.zalo.me",
+            crate::endpoints::WEB_BASE,
+            crate::endpoints::AUTH,
+            crate::endpoints::WPA_CHAT,
+            crate::endpoints::STICKER,
+            crate::endpoints::STICKER_LEGACY,
+            crate::endpoints::STICKER_COMPAT,
             &self.domains.auth,
             &self.domains.chat,
             &self.domains.conversation,
@@ -448,11 +459,17 @@ impl Session {
     /// Check the server without treating a transient network failure as logout.
     /// Resolve service URL via dynamic ServiceResolver with domain rotation.
     pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
-        self.service_resolver.read().unwrap().resolve_url(service, path)
+        self.service_resolver
+            .read()
+            .unwrap()
+            .resolve_url(service, path)
     }
 
     pub fn record_service_failure(&self, service: &str) -> bool {
-        self.service_resolver.write().unwrap().record_failure(service)
+        self.service_resolver
+            .write()
+            .unwrap()
+            .record_failure(service)
     }
 
     pub async fn validate_session(&self) -> SessionStatus {
@@ -553,8 +570,11 @@ impl Session {
         self.session_key = None;
         self.jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
-        default_headers.insert(REFERER, HeaderValue::from_static("https://chat.zalo.me/"));
-        default_headers.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
+        default_headers.insert(
+            REFERER,
+            HeaderValue::from_static(crate::endpoints::WEB_ORIGIN),
+        );
+        default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         if let Ok(c) = crate::proxy::apply(Client::builder()).and_then(|builder| {
             Ok(builder
             .cookie_provider(Arc::clone(&self.jar))
@@ -659,7 +679,7 @@ impl Session {
                 self.domains.lp_chat = self.domains.chat.clone();
             }
             self.domains.chat = crate::endpoints::service("chat")
-                .unwrap_or("https://tt-chat3-wpa.api.zaloapp.com")
+                .unwrap_or(crate::endpoints::CHAT_LEGACY)
                 .into();
         }
         if self.domains.conversation.contains("-ctl-chat.") || self.domains.conversation.is_empty()
@@ -670,12 +690,12 @@ impl Session {
                 self.domains.lp_control = self.domains.conversation.clone();
             }
             self.domains.conversation = crate::endpoints::service("conversation")
-                .unwrap_or("https://tt-convers-wpa.chat.zalo.me")
+                .unwrap_or(crate::endpoints::CONVERSATION)
                 .into();
         }
         if self.domains.sticker.is_empty() {
             self.domains.sticker = crate::endpoints::service("sticker")
-                .unwrap_or("https://tt-sticker-wpa.chat.zalo.me")
+                .unwrap_or(crate::endpoints::STICKER)
                 .into();
         }
         self.session_key = saved.session_key;
@@ -1001,8 +1021,8 @@ impl Session {
                 rb = rb
                     .header("Cookie", format!("zpw_sek={sek}; _zlang=vi"))
                     .header("zpw_sek", sek)
-                    .header("Origin", "https://chat.zalo.me")
-                    .header("Referer", "https://chat.zalo.me/");
+                    .header("Origin", crate::endpoints::WEB_BASE)
+                    .header("Referer", crate::endpoints::WEB_ORIGIN);
             }
         }
         if let Some(length) = length {
@@ -1097,11 +1117,7 @@ impl Session {
         anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         if self.verbose {
-            eprintln!(
-                "→ {} {}",
-                m,
-                redact_url(url)
-            );
+            eprintln!("→ {} {}", m, redact_url(url));
             if let Some(b) = &body {
                 eprintln!("  body: {}", crate::diagnostics::preview(b));
             }
@@ -1114,8 +1130,8 @@ impl Session {
                 if is_zalo_host {
                     rb = rb.header("Cookie", format!("zpw_sek={sek}; _zlang=vi"));
                     rb = rb.header("zpw_sek", sek);
-                    rb = rb.header("Origin", "https://chat.zalo.me");
-                    rb = rb.header("Referer", "https://chat.zalo.me/");
+                    rb = rb.header("Origin", crate::endpoints::WEB_BASE);
+                    rb = rb.header("Referer", crate::endpoints::WEB_ORIGIN);
                 }
             }
         }
@@ -1272,7 +1288,8 @@ pub fn obj(pairs: &[(&str, Value)]) -> Value {
 /// Strip anything that could be a credential before a URL lands in a dump file.
 pub fn redact_url(url: &str) -> String {
     const SENSITIVE: &[&str] = &[
-        "password", "passw", "zpw_sek", "zpw_enk", "cookie", "token", "signkey", "params", "imei", "secret", "auth", "session", "key",
+        "password", "passw", "zpw_sek", "zpw_enk", "cookie", "token", "signkey", "params", "imei",
+        "secret", "auth", "session", "key",
     ];
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
@@ -1296,7 +1313,10 @@ pub fn redact_text(text: &str) -> String {
     if text.contains("http://") || text.contains("https://") {
         let mut result = String::with_capacity(text.len());
         let mut remaining = text;
-        while let Some(idx) = remaining.find("http://").or_else(|| remaining.find("https://")) {
+        while let Some(idx) = remaining
+            .find("http://")
+            .or_else(|| remaining.find("https://"))
+        {
             result.push_str(&remaining[..idx]);
             let url_part = &remaining[idx..];
             let end = url_part
@@ -1315,17 +1335,36 @@ pub fn redact_text(text: &str) -> String {
 fn scrub_sensitive_tokens(text: &str) -> String {
     let mut scrubbed = text.to_string();
     const PATTERNS: &[&str] = &[
-        "zpw_sek", "zpw_enk", "token", "password", "passw", "secret_key", "session_key", "signkey", "cookie",
+        "zpw_sek",
+        "zpw_enk",
+        "token",
+        "password",
+        "passw",
+        "secret_key",
+        "session_key",
+        "signkey",
+        "cookie",
     ];
     for &pat in PATTERNS {
         for delim in &["=", ": ", ":"] {
             let needle = format!("{pat}{delim}");
             let needle_lower = needle.to_ascii_lowercase();
             let mut search_idx = 0;
-            while let Some(pos) = scrubbed[search_idx..].to_ascii_lowercase().find(&needle_lower) {
+            while let Some(pos) = scrubbed[search_idx..]
+                .to_ascii_lowercase()
+                .find(&needle_lower)
+            {
                 let abs_pos = search_idx + pos + needle.len();
                 let val_end = scrubbed[abs_pos..]
-                    .find(|c: char| c.is_whitespace() || c == '&' || c == ';' || c == ',' || c == '}' || c == ']' || c == '"')
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == '&'
+                            || c == ';'
+                            || c == ','
+                            || c == '}'
+                            || c == ']'
+                            || c == '"'
+                    })
                     .unwrap_or(scrubbed.len() - abs_pos);
                 if val_end > 0 {
                     scrubbed.replace_range(abs_pos..abs_pos + val_end, "<redacted>");
@@ -1402,7 +1441,8 @@ mod tests {
 
     #[test]
     fn redact_text_scrubs_sensitive_tokens_a14() {
-        let err1 = "Request failed: https://chat.zalo.me/api/test?zpw_sek=SECRET123&token=TOK456 error";
+        let err1 =
+            "Request failed: https://chat.zalo.me/api/test?zpw_sek=SECRET123&token=TOK456 error";
         let scrubbed1 = redact_text(err1);
         assert!(!scrubbed1.contains("SECRET123"));
         assert!(!scrubbed1.contains("TOK456"));

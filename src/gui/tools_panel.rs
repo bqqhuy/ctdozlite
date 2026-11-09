@@ -18,7 +18,6 @@ pub(super) struct ToolsPanel {
     pub import_owned: bool,
     pub status: String,
     pub paused: bool,
-    pub quick_messages: crate::quick_message::QuickMessageStore,
     pub devices: Vec<crate::device::DeviceSession>,
     pub group_todos: Vec<crate::todo::TodoItem>,
     pub new_todo_content: String,
@@ -561,7 +560,11 @@ impl ZaloGuiApp {
     }
 
     fn render_tools_todo_poll(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("📋 Giao việc & Nhắc việc nhóm (Zalo Parity A18)").strong().size(14.0));
+        ui.label(
+            RichText::new("📋 Giao việc & Nhắc việc nhóm (Zalo Parity A18)")
+                .strong()
+                .size(14.0),
+        );
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Nội dung việc:");
@@ -572,7 +575,9 @@ impl ZaloGuiApp {
             ui.text_edit_singleline(&mut self.tools.new_todo_assignee);
         });
         ui.horizontal(|ui| {
-            if ui.button("➕ Tạo việc cần làm").clicked() && !self.tools.new_todo_content.trim().is_empty() {
+            if ui.button("➕ Tạo việc cần làm").clicked()
+                && !self.tools.new_todo_content.trim().is_empty()
+            {
                 let content = self.tools.new_todo_content.trim().to_string();
                 let assignee = self.tools.new_todo_assignee.trim().to_string();
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
@@ -602,15 +607,31 @@ impl ZaloGuiApp {
 
         if !self.tools.group_todos.is_empty() {
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("Danh sách việc ({}) :", self.tools.group_todos.len())).strong());
+            ui.label(
+                RichText::new(format!(
+                    "Danh sách việc ({}) :",
+                    self.tools.group_todos.len()
+                ))
+                .strong(),
+            );
             for todo in &self.tools.group_todos {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        let icon = if todo.status == crate::todo::TodoStatus::Done { "✅" } else { "⏳" };
+                        let icon = if todo.status == crate::todo::TodoStatus::Done {
+                            "✅"
+                        } else {
+                            "⏳"
+                        };
                         ui.label(icon);
                         ui.vertical(|ui| {
                             ui.label(RichText::new(&todo.content).strong());
-                            ui.label(RichText::new(format!("Người tạo: {} • Người nhận: {}", todo.creator_id, todo.assignee_id)).size(11.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "Người tạo: {} • Người nhận: {}",
+                                    todo.creator_id, todo.assignee_id
+                                ))
+                                .size(11.0),
+                            );
                         });
                     });
                 });
@@ -618,7 +639,11 @@ impl ZaloGuiApp {
         }
 
         ui.separator();
-        ui.label(RichText::new("📊 Bình chọn nhóm (Zalo Parity A19)").strong().size(14.0));
+        ui.label(
+            RichText::new("📊 Bình chọn nhóm (Zalo Parity A19)")
+                .strong()
+                .size(14.0),
+        );
         ui.label("Tạo và theo dõi kết quả các cuộc bình chọn trong nhóm trò chuyện.");
         ui.horizontal(|ui| {
             ui.label("Câu hỏi:");
@@ -633,7 +658,9 @@ impl ZaloGuiApp {
             ui.text_edit_singleline(&mut self.tools.new_poll_option_2);
         });
         ui.horizontal(|ui| {
-            if ui.button("➕ Tạo bình chọn").clicked() && !self.tools.new_poll_question.trim().is_empty() {
+            if ui.button("➕ Tạo bình chọn").clicked()
+                && !self.tools.new_poll_question.trim().is_empty()
+            {
                 let question = self.tools.new_poll_question.trim().to_string();
                 let mut options = Vec::new();
                 if !self.tools.new_poll_option_1.trim().is_empty() {
@@ -673,8 +700,15 @@ impl ZaloGuiApp {
             for poll in &self.tools.group_polls {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
-                        ui.label(RichText::new(&poll.question).strong().color(Color32::from_rgb(0, 120, 215)));
-                        ui.label(RichText::new(format!("Tổng số phiếu: {}", poll.total_votes)).size(11.0));
+                        ui.label(
+                            RichText::new(&poll.question)
+                                .strong()
+                                .color(Color32::from_rgb(0, 120, 215)),
+                        );
+                        ui.label(
+                            RichText::new(format!("Tổng số phiếu: {}", poll.total_votes))
+                                .size(11.0),
+                        );
                         for opt in &poll.options {
                             ui.horizontal(|ui| {
                                 ui.label(format!("• {} ({} phiếu)", opt.text, opt.vote_count));
@@ -687,15 +721,25 @@ impl ZaloGuiApp {
     }
 
     fn render_tools_quick_messages(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("⚡ Tin nhắn nhanh & Phím tắt gõ nhanh (Zalo Parity B07)").strong().size(14.0));
-        ui.label("Gõ phím tắt (bắt đầu bằng '/') trong khung chat để gợi ý và chèn nhanh nội dung.");
+        ui.label(
+            RichText::new("⚡ Tin nhắn nhanh & Phím tắt gõ nhanh (Zalo Parity B07)")
+                .strong()
+                .size(14.0),
+        );
+        ui.label(
+            "Gõ phím tắt (bắt đầu bằng '/') trong khung chat để gợi ý và chèn nhanh nội dung.",
+        );
         ui.add_space(6.0);
 
         let mut remove_shortcut = None;
-        for (idx, qm) in self.tools.quick_messages.items.iter().enumerate() {
+        for (idx, qm) in self.tools.config.quick_messages.items.iter().enumerate() {
             ui.group(|ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(&qm.shortcut).strong().color(Color32::from_rgb(0, 120, 215)));
+                    ui.label(
+                        RichText::new(&qm.shortcut)
+                            .strong()
+                            .color(Color32::from_rgb(0, 120, 215)),
+                    );
                     ui.label(format!("({})", qm.title));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Xoá").clicked() {
@@ -707,7 +751,8 @@ impl ZaloGuiApp {
             });
         }
         if let Some(idx) = remove_shortcut {
-            self.tools.quick_messages.items.remove(idx);
+            self.tools.config.quick_messages.items.remove(idx);
+            self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
         }
 
         ui.separator();
@@ -727,8 +772,16 @@ impl ZaloGuiApp {
             let title = self.tools.new_quick_title.trim();
             let text = self.tools.new_quick_text.trim();
             if !sc.is_empty() && !text.is_empty() {
-                let shortcut = if sc.starts_with('/') { sc.to_string() } else { format!("/{sc}") };
-                self.tools.quick_messages.upsert(shortcut, title.into(), text.into());
+                let shortcut = if sc.starts_with('/') {
+                    sc.to_string()
+                } else {
+                    format!("/{sc}")
+                };
+                self.tools
+                    .config
+                    .quick_messages
+                    .upsert(shortcut, title.into(), text.into());
+                self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
                 self.tools.new_quick_shortcut.clear();
                 self.tools.new_quick_title.clear();
                 self.tools.new_quick_text.clear();
@@ -737,7 +790,11 @@ impl ZaloGuiApp {
     }
 
     fn render_tools_business_lan(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("🏢 Doanh nghiệp & Truyền tệp LAN (Zalo Parity C01 / C03)").strong().size(14.0));
+        ui.label(
+            RichText::new("🏢 Doanh nghiệp & Truyền tệp LAN (Zalo Parity C01 / C03)")
+                .strong()
+                .size(14.0),
+        );
         ui.label("Quản lý danh mục sản phẩm OA/Doanh nghiệp và tính năng truyền tệp siêu tốc trong mạng nội bộ LAN.");
         ui.add_space(6.0);
 
@@ -756,14 +813,26 @@ impl ZaloGuiApp {
 
         if !self.tools.catalog_items.is_empty() {
             ui.separator();
-            ui.label(RichText::new(format!("📦 Danh mục sản phẩm ({}) :", self.tools.catalog_items.len())).strong());
+            ui.label(
+                RichText::new(format!(
+                    "📦 Danh mục sản phẩm ({}) :",
+                    self.tools.catalog_items.len()
+                ))
+                .strong(),
+            );
             for prod in &self.tools.catalog_items {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("🛍️");
                         ui.vertical(|ui| {
                             ui.label(RichText::new(&prod.name).strong());
-                            ui.label(RichText::new(format!("Giá: {} đ • {}", prod.price, prod.description)).size(12.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "Giá: {} đ • {}",
+                                    prod.price, prod.description
+                                ))
+                                .size(12.0),
+                            );
                         });
                     });
                 });
@@ -777,8 +846,13 @@ impl ZaloGuiApp {
                 ui.horizontal(|ui| {
                     ui.label("💻");
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet").strong());
-                        ui.label("Cổng mặc định: 8998 • Bấm quét để tìm kiếm thiết bị Zalo lân cận");
+                        ui.label(
+                            RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet")
+                                .strong(),
+                        );
+                        ui.label(
+                            "Cổng mặc định: 8998 • Bấm quét để tìm kiếm thiết bị Zalo lân cận",
+                        );
                     });
                 });
             });
@@ -789,7 +863,13 @@ impl ZaloGuiApp {
                         ui.label("💻");
                         ui.vertical(|ui| {
                             ui.label(RichText::new(&peer.device_name).strong());
-                            ui.label(RichText::new(format!("IP: {}:{} • ID: {}", peer.ip_address, peer.port, peer.peer_id)).size(12.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "IP: {}:{} • ID: {}",
+                                    peer.ip_address, peer.port, peer.peer_id
+                                ))
+                                .size(12.0),
+                            );
                         });
                     });
                 });
@@ -798,7 +878,11 @@ impl ZaloGuiApp {
     }
 
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("📦 Kho Lưu Trữ Media Server & zCloud (Zalo Parity A20 / B05)").strong().size(14.0));
+        ui.label(
+            RichText::new("📦 Kho Lưu Trữ Media Server & zCloud (Zalo Parity A20 / B05)")
+                .strong()
+                .size(14.0),
+        );
         ui.label("Truy xuất thư viện hình ảnh, video, tệp tin và liên kết từ máy chủ Zalo cùng dữ liệu lưu trữ đám mây zCloud.");
         ui.add_space(6.0);
 
@@ -844,7 +928,8 @@ impl ZaloGuiApp {
         ui.horizontal(|ui| {
             ui.label("File ID:");
             ui.text_edit_singleline(&mut self.tools.query);
-            if ui.button("🔑 Lấy khoá zCloud").clicked() && !self.tools.query.trim().is_empty() {
+            if ui.button("🔑 Lấy khoá zCloud").clicked() && !self.tools.query.trim().is_empty()
+            {
                 let fid = self.tools.query.trim().to_string();
                 if let Some(tx) = WORKER_TX.get() {
                     let _ = tx.send(WorkerCmd::GetCloudViewerKey { file_id: fid });
@@ -859,7 +944,13 @@ impl ZaloGuiApp {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(format!("Tệp: {fid}")).strong());
-                        ui.label(RichText::new(format!("Khoá giải mã: {} • Hết hạn: {}", k.viewer_key, k.expires_at)).size(11.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "Khoá giải mã: {} • Hết hạn: {}",
+                                k.viewer_key, k.expires_at
+                            ))
+                            .size(11.0),
+                        );
                     });
                 });
             }
@@ -867,7 +958,13 @@ impl ZaloGuiApp {
 
         if !self.tools.server_media_items.is_empty() {
             ui.separator();
-            ui.label(RichText::new(format!("Thư viện media từ máy chủ ({}) :", self.tools.server_media_items.len())).strong());
+            ui.label(
+                RichText::new(format!(
+                    "Thư viện media từ máy chủ ({}) :",
+                    self.tools.server_media_items.len()
+                ))
+                .strong(),
+            );
             for item in &self.tools.server_media_items {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -880,7 +977,13 @@ impl ZaloGuiApp {
                         ui.label(icon);
                         ui.vertical(|ui| {
                             ui.label(RichText::new(&item.file_name).strong());
-                            ui.label(RichText::new(format!("Kích thước: {} bytes • Người gửi: {}", item.file_size, item.sender_id)).size(11.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "Kích thước: {} bytes • Người gửi: {}",
+                                    item.file_size, item.sender_id
+                                ))
+                                .size(11.0),
+                            );
                         });
                     });
                 });
@@ -889,7 +992,11 @@ impl ZaloGuiApp {
     }
 
     fn render_tools_devices(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("🔒 Quản lý thiết bị đăng nhập & Bảo mật (Zalo Parity C02)").strong().size(14.0));
+        ui.label(
+            RichText::new("🔒 Quản lý thiết bị đăng nhập & Bảo mật (Zalo Parity C02)")
+                .strong()
+                .size(14.0),
+        );
         ui.label("Danh sách các phiên và thiết bị đang đăng nhập tài khoản Zalo cùng trạng thái bảo mật.");
         ui.add_space(6.0);
 
@@ -913,12 +1020,27 @@ impl ZaloGuiApp {
                     ui.label("🛡️");
                     ui.vertical(|ui| {
                         let st_badge = if status.is_enabled {
-                            RichText::new("Xác thực hai lớp (2FA): ĐÃ KÍCH HOẠT").color(Color32::from_rgb(0, 180, 80)).strong()
+                            RichText::new("Xác thực hai lớp (2FA): ĐÃ KÍCH HOẠT")
+                                .color(Color32::from_rgb(0, 180, 80))
+                                .strong()
                         } else {
-                            RichText::new("Xác thực hai lớp (2FA): CHƯA KÍCH HOẠT").color(Color32::from_rgb(220, 100, 0)).strong()
+                            RichText::new("Xác thực hai lớp (2FA): CHƯA KÍCH HOẠT")
+                                .color(Color32::from_rgb(220, 100, 0))
+                                .strong()
                         };
                         ui.label(st_badge);
-                        ui.label(RichText::new(format!("Số điện thoại bảo vệ: {} • Ứng dụng OTP: {}", status.phone_masked, if status.has_authenticator_app { "Có" } else { "Không" })).size(12.0));
+                        ui.label(
+                            RichText::new(format!(
+                                "Số điện thoại bảo vệ: {} • Ứng dụng OTP: {}",
+                                status.phone_masked,
+                                if status.has_authenticator_app {
+                                    "Có"
+                                } else {
+                                    "Không"
+                                }
+                            ))
+                            .size(12.0),
+                        );
                     });
                 });
             });
@@ -930,7 +1052,11 @@ impl ZaloGuiApp {
                     ui.label("💻");
                     ui.vertical(|ui| {
                         ui.label(RichText::new("Thiết bị hiện tại (Windows 11 ARM64)").strong());
-                        ui.label(RichText::new("Đang hoạt động • Phiên làm việc này").size(12.0).color(Color32::from_rgb(0, 180, 80)));
+                        ui.label(
+                            RichText::new("Đang hoạt động • Phiên làm việc này")
+                                .size(12.0)
+                                .color(Color32::from_rgb(0, 180, 80)),
+                        );
                     });
                 });
             });
@@ -938,17 +1064,35 @@ impl ZaloGuiApp {
             for dev in &self.tools.devices {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(if dev.platform.contains("Windows") { "💻" } else if dev.platform.contains("Web") { "🌐" } else { "📱" });
+                        ui.label(if dev.platform.contains("Windows") {
+                            "💻"
+                        } else if dev.platform.contains("Web") {
+                            "🌐"
+                        } else {
+                            "📱"
+                        });
                         ui.vertical(|ui| {
                             ui.label(RichText::new(&dev.name).strong());
-                            ui.label(RichText::new(format!("Hệ điều hành: {} • Vị trí: {}", dev.platform, dev.location)).size(12.0));
+                            ui.label(
+                                RichText::new(format!(
+                                    "Hệ điều hành: {} • Vị trí: {}",
+                                    dev.platform, dev.location
+                                ))
+                                .size(12.0),
+                            );
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if dev.is_current {
-                                ui.label(RichText::new("Thiết bị này").color(Color32::from_rgb(0, 180, 80)).strong());
+                                ui.label(
+                                    RichText::new("Thiết bị này")
+                                        .color(Color32::from_rgb(0, 180, 80))
+                                        .strong(),
+                                );
                             } else if ui.button("Đăng xuất từ xa").clicked() {
                                 if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::KickDevice { device_id: dev.device_id.clone() });
+                                    let _ = tx.send(WorkerCmd::KickDevice {
+                                        device_id: dev.device_id.clone(),
+                                    });
                                 }
                             }
                         });
@@ -969,7 +1113,6 @@ fn scheduled_time(text: &str, minutes: i64) -> Option<i64> {
     }
 }
 use chrono::{TimeZone, Timelike};
-
 
 #[cfg(test)]
 mod tests {

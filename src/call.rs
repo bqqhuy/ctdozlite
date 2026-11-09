@@ -197,7 +197,7 @@ pub fn ensure_call_target_allowed(
 
 fn voice_call_domain(s: &Session) -> &str {
     if s.domains.voice_call.is_empty() {
-        "https://voicecall-wpa.chat.zalo.me"
+        crate::endpoints::VOICE_CALL
     } else {
         &s.domains.voice_call
     }
@@ -919,7 +919,7 @@ pub async fn poll_control_events(
     }
     let is_initial_cursor = state.last_action_id == "1" || state.last_action_id == "0";
     let host = if s.domains.lp_control.is_empty() {
-        "https://p4-ctl-chat.zaloapp.com"
+        crate::endpoints::LP_CONTROL_LEGACY
     } else {
         &s.domains.lp_control
     };
@@ -3053,7 +3053,8 @@ impl CallBridge {
                                 );
                                 dispatch_send_signal(&s, 12044, &payload).await
                             } else {
-                                let payload = build_share_screen_request(&partner_id, call_id, status);
+                                let payload =
+                                    build_share_screen_request(&partner_id, call_id, status);
                                 dispatch_send_signal(&s, 12064, &payload).await
                             };
                             match res {
@@ -3842,7 +3843,10 @@ impl CallBridge {
                                 }
                             }
                             "sharescreen" | "group_sharescreen" | "requestsharescreen" => {
-                                let status = data.get("status").and_then(crate::api_response::integer).unwrap_or(0);
+                                let status = data
+                                    .get("status")
+                                    .and_then(crate::api_response::integer)
+                                    .unwrap_or(0);
                                 let is_sharing = status == 1;
                                 let msg = if is_sharing {
                                     "🖥️ Đối phương bắt đầu chia sẻ màn hình"
@@ -4282,7 +4286,13 @@ impl CallBridge {
     }
 
     /// Request start or stop screen sharing in active call (1-1 or group).
-    pub fn request_share_screen(&self, call_id: i64, partner_id: &str, enable: bool, is_group: bool) {
+    pub fn request_share_screen(
+        &self,
+        call_id: i64,
+        partner_id: &str,
+        enable: bool,
+        is_group: bool,
+    ) {
         let _ = self.cmd_tx.send(CallEngineCmd::RequestShareScreen {
             call_id,
             partner_id: partner_id.to_string(),
@@ -4333,7 +4343,8 @@ mod tests {
         assert_eq!(one_to_one["callId"], 998877);
         assert_eq!(one_to_one["status"], 1);
 
-        let group_sig = build_group_share_screen_request("my_uid", 554433, "host_99", 0, 1, 0, "token_xyz");
+        let group_sig =
+            build_group_share_screen_request("my_uid", 554433, "host_99", 0, 1, 0, "token_xyz");
         assert_eq!(group_sig["userId"], "my_uid");
         assert_eq!(group_sig["callId"], 554433);
         assert_eq!(group_sig["hostCall"], "host_99");
@@ -4587,174 +4598,6 @@ mod tests {
             u32::from_le_bytes(end_pkt[21..25].try_into().unwrap()) as usize,
             sess.len()
         );
-    }
-
-    #[tokio::test]
-    #[ignore]
-    async fn live_call_dtc_trace() {
-        let mut s = Session::new(true, false, false).unwrap();
-        s.load_from_file("session.json").expect("load session.json");
-        let partner_id = "1000000000000000005";
-        let mut ctrl_state = CtrlPollState::default();
-        let _ = poll_voip_controls(&s, &mut ctrl_state).await;
-        println!(
-            "[TRACE] Initial ctrl cursor synced: {}",
-            ctrl_state.last_action_id
-        );
-
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let call_id = (now_ms % 1_800_000_000) + 100_000_000;
-        let req_401 = json!({
-            "calleeId": partner_id,
-            "callId": call_id,
-            "codec": "[]\n",
-            "type": 1
-        });
-        let resp_401 = dispatch_send_signal(&s, 401, &req_401).await.expect("401");
-        println!(
-            "[TRACE] 401 id={}, fromId={}, toId={}, rtpIP={}",
-            resp_401["id"], resp_401["fromId"], resp_401["toId"], resp_401["rtpIP"]
-        );
-
-        let real_call_id = resp_401["id"].as_i64().unwrap_or(call_id);
-        let from_uid_u32 = resp_401["fromId"].as_u64().unwrap() as u32;
-        let partner_uid_u32 = resp_401["toId"].as_u64().unwrap() as u32;
-        let sess_id_raw = resp_401["sessId"].as_str().unwrap().to_string();
-
-        let rtp_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap());
-        let rtcp_sock = Arc::new(tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap());
-        let local_port = rtp_sock.local_addr().unwrap().port();
-        let servers = collect_relay_servers(&resp_401);
-        println!(
-            "[TRACE] Bound local UDP port={}, servers={:?}",
-            local_port, servers
-        );
-
-        let pkt_init_rtp = build_zrtp_init_packet(
-            false,
-            from_uid_u32,
-            partner_uid_u32,
-            real_call_id as u32,
-            1,
-            &sess_id_raw,
-        );
-        let pkt_init_rtcp = build_zrtp_init_packet(
-            true,
-            from_uid_u32,
-            partner_uid_u32,
-            real_call_id as u32,
-            1,
-            &sess_id_raw,
-        );
-        let pkt_ping = build_zrtp_ping_packet(from_uid_u32, real_call_id as u32, &sess_id_raw);
-        let pkt_echo = build_zrtp_echo_packet(0x4E1F, &crate::login::unix_now().to_string());
-
-        for (rtp_addr, rtcp_addr) in &servers {
-            let _ = rtp_sock.send_to(&pkt_init_rtp, rtp_addr.as_str()).await;
-            let _ = rtp_sock.send_to(&pkt_echo, rtp_addr.as_str()).await;
-            let _ = rtp_sock.send_to(&pkt_ping, rtp_addr.as_str()).await;
-            let _ = rtcp_sock.send_to(&pkt_init_rtcp, rtcp_addr.as_str()).await;
-            let _ = rtcp_sock.send_to(&pkt_ping, rtcp_addr.as_str()).await;
-        }
-
-        // Read UDP responses for 500ms before 416
-        let start_wait = std::time::Instant::now();
-        let mut buf = [0u8; 1500];
-        while start_wait.elapsed() < std::time::Duration::from_millis(500) {
-            if let Ok(Ok((n, peer))) = tokio::time::timeout(
-                std::time::Duration::from_millis(80),
-                rtp_sock.recv_from(&mut buf),
-            )
-            .await
-            {
-                println!(
-                    "[TRACE] Pre-416 RTP recv {} bytes from {}: {:02x?}",
-                    n,
-                    peer,
-                    &buf[..n.min(48)]
-                );
-            }
-            if let Ok(Ok((n, peer))) = tokio::time::timeout(
-                std::time::Duration::from_millis(40),
-                rtcp_sock.recv_from(&mut buf),
-            )
-            .await
-            {
-                println!(
-                    "[TRACE] Pre-416 RTCP recv {} bytes from {}: {:02x?}",
-                    n,
-                    peer,
-                    &buf[..n.min(48)]
-                );
-            }
-        }
-
-        let (rtp_ip, rtcp_ip, sess_id, codec_str, extend_str) =
-            build_pure_rust_invite_fields_with_port(&resp_401, false, Some(local_port));
-        let req_416 = json!({
-            "callId": real_call_id,
-            "calleeId": partner_id,
-            "codec": codec_str,
-            "extendData": extend_str,
-            "rtcpAddress": rtcp_ip,
-            "rtpAddress": rtp_ip,
-            "session": sess_id
-        });
-        let resp_416 = dispatch_send_signal(&s, 416, &req_416).await.expect("416");
-        println!("[TRACE] resp_416 = {}", resp_416);
-
-        // Spawn UDP reader + keepalive
-        let rtp_c = rtp_sock.clone();
-        let rtcp_c = rtcp_sock.clone();
-        let servers_c = servers.clone();
-        let sess_c = sess_id_raw.clone();
-        let udp_task = tokio::spawn(async move {
-            let mut b1 = [0u8; 1500];
-            let mut b2 = [0u8; 1500];
-            let mut iv = tokio::time::interval(std::time::Duration::from_millis(300));
-            let mut seq = 1u32;
-            loop {
-                tokio::select! {
-                    _ = iv.tick() => {
-                        let p_ir = build_zrtp_init_packet(false, from_uid_u32, partner_uid_u32, real_call_id as u32, 1, &sess_c);
-                        let p_ic = build_zrtp_init_packet(true, from_uid_u32, partner_uid_u32, real_call_id as u32, 1, &sess_c);
-                        let p_p = build_zrtp_ping_packet(from_uid_u32, real_call_id as u32, &sess_c);
-                        let p_e = build_zrtp_echo_packet(seq, &crate::login::unix_now().to_string());
-                        seq += 1;
-                        for (ra, ca) in &servers_c {
-                            let _ = rtp_c.send_to(&p_ir, ra.as_str()).await;
-                            let _ = rtp_c.send_to(&p_p, ra.as_str()).await;
-                            let _ = rtp_c.send_to(&p_e, ra.as_str()).await;
-                            let _ = rtcp_c.send_to(&p_ic, ca.as_str()).await;
-                            let _ = rtcp_c.send_to(&p_p, ca.as_str()).await;
-                        }
-                    }
-                    Ok((n, peer)) = rtp_c.recv_from(&mut b1) => {
-                        println!("[TRACE] Post-416 RTP recv {} bytes from {}: {:02x?}", n, peer, &b1[..n.min(64)]);
-                    }
-                    Ok((n, peer)) = rtcp_c.recv_from(&mut b2) => {
-                        println!("[TRACE] Post-416 RTCP recv {} bytes from {}: {:02x?}", n, peer, &b2[..n.min(64)]);
-                    }
-                }
-            }
-        });
-
-        let poll_start = std::time::Instant::now();
-        while poll_start.elapsed() < std::time::Duration::from_secs(18) {
-            if let Ok(evs) = poll_voip_controls(&s, &mut ctrl_state).await {
-                for ev in evs {
-                    println!(
-                        "[TRACE] VOIP CTRL EVENT @ {:?}: {}",
-                        poll_start.elapsed(),
-                        serde_json::to_string(&ev).unwrap()
-                    );
-                }
-            }
-        }
-        udp_task.abort();
     }
 
     #[test]

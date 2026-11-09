@@ -123,7 +123,11 @@ pub fn is_allowed_ws_host(host: &str) -> bool {
 pub fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ipv4) => {
-            if ipv4.is_loopback() || ipv4.is_private() || ipv4.is_unspecified() || ipv4.is_broadcast() {
+            if ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_unspecified()
+                || ipv4.is_broadcast()
+            {
                 return true;
             }
             let octets = ipv4.octets();
@@ -139,7 +143,9 @@ pub fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
             if octets[0] == 192 && octets[1] == 0 && octets[2] == 2 {
                 return true;
             }
-            if octets[0] == 198 && ((octets[1] == 51 && octets[2] == 100) || (octets[1] & 0xfe) == 18) {
+            if octets[0] == 198
+                && ((octets[1] == 51 && octets[2] == 100) || (octets[1] & 0xfe) == 18)
+            {
                 return true;
             }
             if octets[0] == 203 && octets[1] == 0 && octets[2] == 113 {
@@ -191,6 +197,78 @@ pub fn has_header_injection(val: &str) -> bool {
     val.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
 }
 
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const WEB_BASE: &str = "https://chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const LP_CHAT_LEGACY: &str = "https://p4-msg-chat.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const LP_CONTROL_LEGACY: &str = "https://p4-ctl-chat.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const CLOUD_MESSAGE_LEGACY: &str = "https://tt-group-cm.api.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const VOICE_CALL: &str = "https://voicecall-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const STICKER: &str = "https://tt-sticker-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const STICKER_LEGACY: &str = "https://tt-sticker-wpa.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const STICKER_COMPAT: &str = "https://sticker-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const CHAT: &str = "https://tt-chat-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const CHAT_LEGACY: &str = "https://tt-chat3-wpa.api.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const CONVERSATION: &str = "https://tt-convers-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const FRIEND: &str = "https://tt-friend-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const PROFILE: &str = "https://tt-profile-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const PROFILE_LEGACY: &str = "https://tt-profile-wpa.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const GROUP: &str = "https://tt-group-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const GROUP_LEGACY: &str = "https://tt-group-wpa.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const FILE: &str = "https://tt-files-wpa.chat.zalo.me";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const FILE_LEGACY: &str = "https://tt-files-wpa.zaloapp.com";
+
+/// Canonical compatibility endpoint; changing callers must preserve the selected service.
+pub const WS_PRIMARY: &str = "wss://ws1-msg.chat.zalo.me";
+
+/// Public thumbnail for a built-in sticker.
+pub fn builtin_sticker_thumbnail(id: impl std::fmt::Display) -> String {
+    format!("https://stc-chat.zdn.vn/images/stickers/default/thumb/{id}.png")
+}
+/// Public legacy image for a sticker id.
+pub fn legacy_sticker_image(id: impl std::fmt::Display) -> String {
+    format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={id}&size=130")
+}
+/// Default websocket shards from the saved PC service map.
+pub fn default_websockets() -> Vec<String> {
+    (1..=8)
+        .map(|n| format!("wss://ws{n}-msg.chat.zalo.me"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,44 +293,88 @@ mod tests {
         use std::net::IpAddr;
 
         // Loopback
-        assert!(is_private_or_loopback_ip("127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("127.1.2.3".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "127.1.2.3".parse::<IpAddr>().unwrap()
+        ));
         assert!(is_private_or_loopback_ip("::1".parse::<IpAddr>().unwrap()));
 
         // Private IPv4
-        assert!(is_private_or_loopback_ip("10.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("172.16.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("172.31.255.255".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("192.168.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "172.16.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "172.31.255.255".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "192.168.1.1".parse::<IpAddr>().unwrap()
+        ));
 
         // Link-local
-        assert!(is_private_or_loopback_ip("169.254.169.254".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("fe80::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "169.254.169.254".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "fe80::1".parse::<IpAddr>().unwrap()
+        ));
 
         // ULA IPv6
-        assert!(is_private_or_loopback_ip("fc00::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("fd12:3456:789a::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "fc00::1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "fd12:3456:789a::1".parse::<IpAddr>().unwrap()
+        ));
 
         // IPv4-mapped IPv6
-        assert!(is_private_or_loopback_ip("::ffff:127.0.0.1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("::ffff:192.168.1.1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "::ffff:192.168.1.1".parse::<IpAddr>().unwrap()
+        ));
 
         // Public IPs (should be allowed)
-        assert!(!is_private_or_loopback_ip("8.8.8.8".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_or_loopback_ip("1.1.1.1".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_or_loopback_ip("49.213.76.10".parse::<IpAddr>().unwrap()));
-        assert!(!is_private_or_loopback_ip("2606:4700:4700::1111".parse::<IpAddr>().unwrap()));
+        assert!(!is_private_or_loopback_ip(
+            "8.8.8.8".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_private_or_loopback_ip(
+            "1.1.1.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_private_or_loopback_ip(
+            "49.213.76.10".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_private_or_loopback_ip(
+            "2606:4700:4700::1111".parse::<IpAddr>().unwrap()
+        ));
 
         // A35: IPv6 site-local (fec0::/10) and multicast (ff00::/8) guards
-        assert!(is_private_or_loopback_ip("fec0::1".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("fec0::ffff".parse::<IpAddr>().unwrap()));
-        assert!(is_private_or_loopback_ip("ff02::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip(
+            "fec0::1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "fec0::ffff".parse::<IpAddr>().unwrap()
+        ));
+        assert!(is_private_or_loopback_ip(
+            "ff02::1".parse::<IpAddr>().unwrap()
+        ));
     }
 
     #[test]
     fn test_header_injection_sanitization_a33() {
-        assert_eq!(sanitize_header_value("normal_header_val"), "normal_header_val");
-        assert_eq!(sanitize_header_value("header\r\nInjected: evil"), "headerInjected: evil");
+        assert_eq!(
+            sanitize_header_value("normal_header_val"),
+            "normal_header_val"
+        );
+        assert_eq!(
+            sanitize_header_value("header\r\nInjected: evil"),
+            "headerInjected: evil"
+        );
         assert_eq!(sanitize_header_value("null\0byte"), "nullbyte");
         assert_eq!(sanitize_header_value("cr\r\nand\0null"), "crandnull");
 

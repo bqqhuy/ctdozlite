@@ -86,12 +86,25 @@ pub struct OneTimePreKey {
 impl OneTimePreKey {
     pub fn generate(key_id: u32) -> Result<Self> {
         let kp = KeyPair::generate();
-        Ok(Self { key_id, key_pair: (&kp).into() })
+        Ok(Self {
+            key_id,
+            key_pair: (&kp).into(),
+        })
     }
 
     /// Generate a batch of `n` prekeys starting from `start_id`.
     pub fn generate_batch(start_id: u32, n: usize) -> Result<Vec<Self>> {
-        (0..n).map(|i| Self::generate(start_id + i as u32)).collect()
+        if n > 0 {
+            let offset =
+                u32::try_from(n - 1).map_err(|_| anyhow::anyhow!("Số prekey vượt giới hạn"))?;
+            anyhow::ensure!(
+                start_id.checked_add(offset).is_some(),
+                "Đã hết định danh prekey"
+            );
+        }
+        (0..n)
+            .map(|i| Self::generate(start_id + i as u32))
+            .collect()
     }
 }
 
@@ -166,7 +179,11 @@ impl PreKeyBundle {
 
     /// Convert self into RemoteBundle for local verification (audit A04).
     pub fn to_remote_bundle(&self) -> Result<super::prekey::RemoteBundle> {
-        let sig: [u8; 64] = self.signed_pre_key.signature.clone().try_into()
+        let sig: [u8; 64] = self
+            .signed_pre_key
+            .signature
+            .clone()
+            .try_into()
             .map_err(|_| anyhow::anyhow!("Chữ ký signedPreKey không đủ 64 bytes"))?;
         Ok(super::prekey::RemoteBundle {
             identity_key: self.identity_key,
@@ -299,7 +316,11 @@ mod tests {
         let identity = IdentityKeyPair::generate().unwrap();
         let spk = SignedPreKey::generate(1, &identity).unwrap();
         let vk = ed25519_dalek::VerifyingKey::from_bytes(&identity.signing_public).unwrap();
-        let sig_bytes: [u8; 64] = spk.signature.clone().try_into().expect("Ed25519 signature is 64 bytes");
+        let sig_bytes: [u8; 64] = spk
+            .signature
+            .clone()
+            .try_into()
+            .expect("Ed25519 signature is 64 bytes");
         let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
         vk.verify_strict(&spk.key_pair.public, &sig).unwrap();
     }
@@ -316,7 +337,8 @@ mod tests {
             &bob_id.dh.public,
             &bob_spk.key_pair.public,
             Some(&bob_otpk.key_pair.public),
-        ).unwrap();
+        )
+        .unwrap();
 
         let bob_secret = x3dh_receiver(
             &bob_id,
@@ -324,7 +346,8 @@ mod tests {
             Some(&bob_otpk),
             &alice_id.dh.public,
             &alice_ek_pub,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(alice_secret, bob_secret);
     }
@@ -344,12 +367,16 @@ mod tests {
 
         // Convert to export json and verify signingIdentityKey presence
         let json_val = bundle.to_export_json();
-        let b64_signing = json_val.get("signingIdentityKey").and_then(|v| v.as_str()).unwrap();
+        let b64_signing = json_val
+            .get("signingIdentityKey")
+            .and_then(|v| v.as_str())
+            .unwrap();
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         assert_eq!(B64.decode(b64_signing).unwrap(), identity.signing_public);
 
         // Parse through production bundle parser and verify signature
-        let parsed = crate::crypto::prekey::parse_bundle(&json_val).expect("parse production bundle");
+        let parsed =
+            crate::crypto::prekey::parse_bundle(&json_val).expect("parse production bundle");
         assert_eq!(parsed.signing_identity_key, Some(identity.signing_public));
         assert!(crate::crypto::session::verify_signed_prekey(&parsed));
 
@@ -357,6 +384,8 @@ mod tests {
         let mut tampered_json = json_val.clone();
         tampered_json["signingIdentityKey"] = serde_json::json!(B64.encode([99u8; 32]));
         let tampered_parsed = crate::crypto::prekey::parse_bundle(&tampered_json).unwrap();
-        assert!(!crate::crypto::session::verify_signed_prekey(&tampered_parsed));
+        assert!(!crate::crypto::session::verify_signed_prekey(
+            &tampered_parsed
+        ));
     }
 }

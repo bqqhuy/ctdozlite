@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Preferences {
+    /// Account-local shortcuts persisted with the other tool preferences.
+    #[serde(default)]
+    pub quick_messages: crate::quick_message::QuickMessageStore,
     #[serde(default)]
     pub theme: serde_json::Value,
     #[serde(default)]
@@ -42,6 +45,22 @@ pub struct ReplyRule {
 impl Preferences {
     /// Validate user-controlled resource sizes and supported match modes before storing.
     pub fn validate(&mut self, now: i64) -> Result<()> {
+        ensure!(
+            self.quick_messages.items.len() <= 256,
+            "Tối đa 256 tin nhắn nhanh"
+        );
+        let mut shortcuts = std::collections::HashSet::new();
+        for item in &self.quick_messages.items {
+            ensure!(
+                item.shortcut.starts_with('/')
+                    && item.shortcut.len() <= 64
+                    && item.title.len() <= 256
+                    && !item.text.is_empty()
+                    && item.text.len() <= 16384
+                    && shortcuts.insert(item.shortcut.to_lowercase()),
+                "Tin nhắn nhanh không hợp lệ hoặc trùng phím tắt"
+            );
+        }
         ensure!(
             self.stickers.len() <= 64 && self.rules.len() <= 64,
             "Tối đa 64 bộ sticker / quy tắc"
@@ -1374,5 +1393,35 @@ mod media_gallery_bench {
                 serde_json::json!({"task":if indexed{"gallery_indexed_neighbor"}else{"full_thread_hydration_reference"},"rows":500,"iterations":count,"min_ms":times[0],"avg_ms":times.iter().sum::<f64>()/count as f64,"p50_ms":times[count/2],"p95_ms":times[(count*95/100).min(count-1)],"p99_ms":times[count-1]})
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod audit_quick_messages_tests {
+    use super::*;
+    #[test]
+    fn saved_shortcuts_survive_reload_and_stay_account_local() {
+        let a = MessageStore::open(":memory:").unwrap();
+        let b = MessageStore::open(":memory:").unwrap();
+        let mut config = Preferences::default();
+        config
+            .quick_messages
+            .upsert("/custom".into(), "Thử".into(), "Nội dung".into());
+        save_preferences(&a, config).unwrap();
+        assert_eq!(
+            preferences(&a).unwrap().quick_messages.expand("/custom"),
+            Some("Nội dung")
+        );
+        assert_eq!(
+            preferences(&b).unwrap().quick_messages.expand("/custom"),
+            None
+        );
+        let mut config = preferences(&a).unwrap();
+        config.quick_messages.remove("/custom");
+        save_preferences(&a, config).unwrap();
+        assert_eq!(
+            preferences(&a).unwrap().quick_messages.expand("/custom"),
+            None
+        );
     }
 }

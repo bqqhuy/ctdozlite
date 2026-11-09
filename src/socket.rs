@@ -373,7 +373,9 @@ async fn forward_event(forward: &mpsc::Sender<WsEvent>, event: WsEvent, epoch: u
                 }
                 Ok(Err(_)) => Err(anyhow!("event receiver closed")),
                 Err(_) => {
-                    bail!("event queue overflow: consumer stalled under backpressure (epoch {epoch})");
+                    bail!(
+                        "event queue overflow: consumer stalled under backpressure (epoch {epoch})"
+                    );
                 }
             }
         }
@@ -393,7 +395,7 @@ fn build_url(sess: &Session, endpoint_idx: usize) -> String {
                 Some(endpoints[endpoint_idx % endpoints.len()].clone())
             }
         })
-        .unwrap_or_else(|| "wss://ws1-msg.chat.zalo.me".to_string());
+        .unwrap_or_else(|| crate::endpoints::WS_PRIMARY.to_string());
     // The server's `zlpws` front end answers `501 Not Implemented` to a request line with an
     // empty path (`GET ?zpw_ver=...`), so always send an explicit `/`.
     let (host, query) = match base.split_once('?') {
@@ -681,7 +683,7 @@ async fn run_once(
             );
             h.insert("zpw_sek", HeaderValue::from_str(sek)?);
         }
-        h.insert(ORIGIN, HeaderValue::from_static("https://chat.zalo.me"));
+        h.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
     }
 
@@ -1177,7 +1179,6 @@ mod forward_tests {
         assert_eq!(BACKPRESSURE_WATERMARK, 128);
         const { assert!(BACKPRESSURE_WATERMARK < FORWARD_QUEUE) };
     }
-
 }
 
 #[cfg(test)]
@@ -1200,7 +1201,9 @@ mod a22_payload_limit_tests {
 
         let oversized = "A".repeat(MAX_FRAME_PAYLOAD_SIZE + 1);
         let err = decrypt_payload(None, 0, &oversized).unwrap_err();
-        assert!(err.to_string().contains("exceeds maximum allowed frame size"));
+        assert!(err
+            .to_string()
+            .contains("exceeds maximum allowed frame size"));
     }
 }
 

@@ -1,5 +1,6 @@
 //! Wire encoding for E2EE payloads (WP16-2).
 //!
+//! # Fork deviation (E3 - unverified against live Zalo PC capture)
 //! The exact ciphertext container used by Zalo's official client was **not**
 //! captured live (see `re-notes/36-zalo-e2ee-signal-protocol-analysis.md` §8,
 //! item 1), so this module defines a self-describing binary envelope that
@@ -36,7 +37,8 @@ pub const TYPE_WHISPER: u8 = 1;
 pub const TYPE_PREKEY_WHISPER: u8 = 3;
 
 /// Header information carried by a `PreKeyWhisperMessage`.
-#[derive(Debug, Clone)]
+/// Header information carried by a `PreKeyWhisperMessage`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PreKeyBundleWire {
     /// Sender's registration id.
     pub registration_id: u32,
@@ -84,9 +86,7 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 }
 
 fn read_u32(data: &[u8], at: usize) -> Result<u32> {
-    let slice = data
-        .get(at..at + 4)
-        .context("Gói tin E2EE bị cắt cụt")?;
+    let slice = data.get(at..at + 4).context("Gói tin E2EE bị cắt cụt")?;
     Ok(u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
 }
 
@@ -152,10 +152,7 @@ pub fn deserialize(payload: &[u8]) -> Result<DecodedMessage> {
             ciphertext: payload[42..].to_vec(),
         })),
         TYPE_PREKEY_WHISPER => {
-            anyhow::ensure!(
-                payload.len() >= 118,
-                "Gói tin E2EE PreKey bị cắt cụt"
-            );
+            anyhow::ensure!(payload.len() >= 118, "Gói tin E2EE PreKey bị cắt cụt");
             let registration_id = read_u32(payload, 42)?;
             let signed_pre_key_id = read_u32(payload, 46)?;
             let otpk_raw = read_u32(payload, 50)?;

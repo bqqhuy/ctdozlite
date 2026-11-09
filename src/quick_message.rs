@@ -13,34 +13,10 @@ pub struct QuickMessage {
     pub text: String,
 }
 
-/// Store of quick messages with standard defaults.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Account-local user-defined quick messages.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuickMessageStore {
     pub items: Vec<QuickMessage>,
-}
-
-impl Default for QuickMessageStore {
-    fn default() -> Self {
-        Self {
-            items: vec![
-                QuickMessage {
-                    shortcut: "/dc".into(),
-                    title: "Địa chỉ".into(),
-                    text: "Địa chỉ nhận hàng: Hà Nội, Việt Nam".into(),
-                },
-                QuickMessage {
-                    shortcut: "/stk".into(),
-                    title: "Số tài khoản".into(),
-                    text: "STK: 19036668889999 - Techcombank - NGUYEN VAN A".into(),
-                },
-                QuickMessage {
-                    shortcut: "/chao".into(),
-                    title: "Chào hỏi".into(),
-                    text: "Xin chào bạn! Mình có thể hỗ trợ gì cho bạn?".into(),
-                },
-            ],
-        }
-    }
 }
 
 impl QuickMessageStore {
@@ -49,7 +25,9 @@ impl QuickMessageStore {
         let q = query.to_lowercase();
         self.items
             .iter()
-            .filter(|it| it.shortcut.to_lowercase().contains(&q) || it.title.to_lowercase().contains(&q))
+            .filter(|it| {
+                it.shortcut.to_lowercase().contains(&q) || it.title.to_lowercase().contains(&q)
+            })
             .collect()
     }
 
@@ -64,16 +42,32 @@ impl QuickMessageStore {
 
     /// Add or update a quick message.
     pub fn upsert(&mut self, shortcut: String, title: String, text: String) {
-        if let Some(pos) = self.items.iter().position(|it| it.shortcut.eq_ignore_ascii_case(&shortcut)) {
-            self.items[pos] = QuickMessage { shortcut, title, text };
+        if let Some(pos) = self
+            .items
+            .iter()
+            .position(|it| it.shortcut.eq_ignore_ascii_case(&shortcut))
+        {
+            self.items[pos] = QuickMessage {
+                shortcut,
+                title,
+                text,
+            };
         } else {
-            self.items.push(QuickMessage { shortcut, title, text });
+            self.items.push(QuickMessage {
+                shortcut,
+                title,
+                text,
+            });
         }
     }
 
     /// Remove a quick message by shortcut.
     pub fn remove(&mut self, shortcut: &str) -> bool {
-        if let Some(pos) = self.items.iter().position(|it| it.shortcut.eq_ignore_ascii_case(shortcut)) {
+        if let Some(pos) = self
+            .items
+            .iter()
+            .position(|it| it.shortcut.eq_ignore_ascii_case(shortcut))
+        {
             self.items.remove(pos);
             true
         } else {
@@ -88,8 +82,24 @@ mod tests {
 
     #[test]
     fn test_quick_message_expansion() {
-        let store = QuickMessageStore::default();
-        assert_eq!(store.expand("/dc"), Some("Địa chỉ nhận hàng: Hà Nội, Việt Nam"));
+        let store = QuickMessageStore {
+            items: vec![
+                QuickMessage {
+                    shortcut: "/dc".into(),
+                    title: "Địa chỉ".into(),
+                    text: "Địa chỉ nhận hàng: Hà Nội, Việt Nam".into(),
+                },
+                QuickMessage {
+                    shortcut: "/chao".into(),
+                    title: "Chào hỏi".into(),
+                    text: "Xin chào".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            store.expand("/dc"),
+            Some("Địa chỉ nhận hàng: Hà Nội, Việt Nam")
+        );
         assert_eq!(store.expand("/none"), None);
 
         let matches = store.search("chao");
@@ -100,7 +110,11 @@ mod tests {
     #[test]
     fn test_quick_message_upsert_and_remove() {
         let mut store = QuickMessageStore::default();
-        store.upsert("/test".into(), "Thử nghiệm".into(), "Nội dung thử nghiệm".into());
+        store.upsert(
+            "/test".into(),
+            "Thử nghiệm".into(),
+            "Nội dung thử nghiệm".into(),
+        );
         assert_eq!(store.expand("/test"), Some("Nội dung thử nghiệm"));
 
         assert!(store.remove("/test"));

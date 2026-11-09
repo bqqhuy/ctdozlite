@@ -27,3 +27,14 @@ Bộ kiểm thử cục bộ chưa chứng minh đầy đủ cleanup cache thư�
 
 Chỉ thêm kết quả đã chạy; ghi test failed/ignored. Không điền bảng bằng dự đoán.
 Không ghi khóa, cookie, URL có chữ ký hay nội dung tin của người khác.
+
+
+## Kiểm chứng bổ sung 09/11/2026
+
+Working tree trên `f842dfeb84fd94ff7ea79dc8d6b88dc9ad9d94bc`, theo yêu cầu sửa audit.
+M-01/M-03: account, persistence và media có thay đổi liên quan được mô tả trong
+[bản ghi khắc phục](../../docs/audits/2026-11-09-remediation.md).
+Suite đầy đủ: 803 passed, 11 ignored; Clippy và check ARM64 đạt. Ignored được
+chạy riêng; lỗi H.264 ban đầu đã có bản sửa và test native x64 chạy lại đạt.
+UI smoke có PNG ở hai kích thước/theme và đã kiểm tra trực quan.
+Không đóng task thiết bị hoặc chứng nhận Zalo interoperability từ các kết quả này.

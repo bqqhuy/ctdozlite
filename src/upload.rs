@@ -131,9 +131,17 @@ impl ResumableUploadState {
     }
 
     pub fn mark_chunk_complete(&mut self, chunk_index: usize) {
-        if !self.completed_chunks.contains(&chunk_index) {
+        if chunk_index >= self.total_chunks {
+            return;
+        }
+        if self
+            .completed_chunks
+            .last()
+            .is_none_or(|last| chunk_index > *last)
+        {
             self.completed_chunks.push(chunk_index);
-            self.completed_chunks.sort_unstable();
+        } else if let Err(index) = self.completed_chunks.binary_search(&chunk_index) {
+            self.completed_chunks.insert(index, chunk_index);
         }
     }
 
@@ -141,30 +149,62 @@ impl ResumableUploadState {
         self.total_chunks > 0 && self.completed_chunks.len() == self.total_chunks
     }
 
-    /// WP15.1-C fix: O(n) scan instead of O(n²) contains per candidate.
+    /// Find the first gap without allocating a lookup table.
     pub fn next_missing_chunk(&self) -> Option<usize> {
-        if self.completed_chunks.is_empty() {
-            return if self.total_chunks > 0 { Some(0) } else { None };
-        }
-        let mut completed_set = std::collections::HashSet::with_capacity(self.completed_chunks.len());
-        for &idx in &self.completed_chunks {
-            completed_set.insert(idx);
-        }
-        (0..self.total_chunks).find(|i| !completed_set.contains(i))
+        let prefix = self.contiguous_completed_prefix();
+        (prefix < self.total_chunks).then_some(prefix)
     }
 
     /// Returns the length of the contiguous prefix of completed chunks starting from 0.
     /// Since `completed_chunks` is kept sorted, this is an O(N) single-pass scan.
     pub fn contiguous_completed_prefix(&self) -> usize {
-        let mut expected = 0usize;
-        for &chunk in &self.completed_chunks {
-            if chunk == expected {
-                expected += 1;
+        let (mut low, mut high) = (0, self.completed_chunks.len());
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.completed_chunks[mid] == mid {
+                low = mid + 1;
             } else {
-                break;
+                high = mid;
             }
         }
-        expected
+        low
+    }
+
+    /// Encode the sequential prefix compactly so per-chunk checkpoints stay constant-sized.
+    /// # Errors
+    /// Returns serialization errors.
+    pub fn checkpoint(&self) -> Result<String> {
+        let prefix = self.contiguous_completed_prefix();
+        Ok(serde_json::to_string(&(
+            prefix,
+            &self.completed_chunks[prefix..],
+        ))?)
+    }
+
+    /// Read compact checkpoints or legacy arrays and normalize sparse indexes.
+    /// # Errors
+    /// Rejects malformed, oversized or out-of-range checkpoints.
+    pub fn decode_checkpoint(text: &str, total: usize) -> Result<Vec<usize>> {
+        anyhow::ensure!(
+            total <= 1_000_000 && text.len() <= 16 * 1024 * 1024,
+            "Checkpoint tải lên quá lớn"
+        );
+        let mut chunks =
+            if let Ok((prefix, sparse)) = serde_json::from_str::<(usize, Vec<usize>)>(text) {
+                anyhow::ensure!(prefix <= total, "Checkpoint tải lên không hợp lệ");
+                let mut chunks: Vec<_> = (0..prefix).collect();
+                chunks.extend(sparse);
+                chunks
+            } else {
+                serde_json::from_str::<Vec<usize>>(text)?
+            };
+        anyhow::ensure!(
+            chunks.len() <= total && chunks.iter().all(|i| *i < total),
+            "Checkpoint tải lên không hợp lệ"
+        );
+        chunks.sort_unstable();
+        chunks.dedup();
+        Ok(chunks)
     }
 }
 
@@ -199,10 +239,12 @@ impl Drop for ActiveUploadRegistration {
     }
 }
 
-static ACTIVE_UPLOADS: std::sync::Mutex<Option<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>> =
-    std::sync::Mutex::new(None);
-static PROGRESS_CHANNEL: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<(String, u64, u64)>>> =
-    std::sync::Mutex::new(None);
+static ACTIVE_UPLOADS: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+> = std::sync::Mutex::new(None);
+static PROGRESS_CHANNEL: std::sync::Mutex<
+    Option<tokio::sync::broadcast::Sender<(String, u64, u64)>>,
+> = std::sync::Mutex::new(None);
 
 /// Register an active upload session so it can be monitored or cancelled.
 pub fn register_active_upload(upload_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -267,8 +309,27 @@ mod resumable_tests {
     use super::*;
 
     #[test]
+    fn checkpoints_are_compact_and_legacy_data_is_normalized() {
+        let mut state = ResumableUploadState::new("large".into(), "file".into(), 100000, 1);
+        for chunk in 0..100000 {
+            state.mark_chunk_complete(chunk);
+        }
+        assert!(state.checkpoint().unwrap().len() < 32);
+        assert_eq!(
+            ResumableUploadState::decode_checkpoint(&state.checkpoint().unwrap(), 100000).unwrap(),
+            state.completed_chunks
+        );
+        assert_eq!(
+            ResumableUploadState::decode_checkpoint("[2,0,1]", 3).unwrap(),
+            vec![0, 1, 2]
+        );
+        assert!(ResumableUploadState::decode_checkpoint("[3]", 3).is_err());
+        assert!(ResumableUploadState::decode_checkpoint("bad", 3).is_err());
+    }
+    #[test]
     fn resumable_upload_state_tracks_chunks_and_detects_completion() {
-        let mut state = ResumableUploadState::new("up1".into(), "large.zip".into(), 10_000_000, 4_000_000);
+        let mut state =
+            ResumableUploadState::new("up1".into(), "large.zip".into(), 10_000_000, 4_000_000);
         assert_eq!(state.total_chunks, 3);
         assert_eq!(state.next_missing_chunk(), Some(0));
         assert!(!state.is_complete());
@@ -292,7 +353,8 @@ mod resumable_tests {
 
     #[test]
     fn only_the_contiguous_prefix_is_resumable() {
-        let mut state = ResumableUploadState::new("up2".into(), "large.zip".into(), 10_000_000, 4_000_000);
+        let mut state =
+            ResumableUploadState::new("up2".into(), "large.zip".into(), 10_000_000, 4_000_000);
         state.mark_chunk_complete(0);
         state.mark_chunk_complete(2);
         // Chunk 1 was never confirmed, so chunk 2 alone cannot be resumed.

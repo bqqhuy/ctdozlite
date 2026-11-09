@@ -45,7 +45,7 @@ impl ProfileRegistry {
             std::fs::create_dir_all(parent)?;
         }
         let content = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, content)?;
+        crate::storage::atomic_write(&path, content.as_bytes())?;
         Ok(())
     }
 
@@ -62,13 +62,15 @@ impl ProfileRegistry {
     }
 
     pub fn set_active(&mut self, name: &str) -> Result<()> {
-        anyhow::ensure!(self.profiles.contains_key(name), "Profile not found");
+        anyhow::ensure!(self.profiles.contains_key(name), "Không tìm thấy tài khoản");
         self.active_profile = Some(name.to_string());
         Ok(())
     }
 
     pub fn active(&self) -> Option<&Profile> {
-        self.active_profile.as_ref().and_then(|name| self.profiles.get(name))
+        self.active_profile
+            .as_ref()
+            .and_then(|name| self.profiles.get(name))
     }
 }
 
@@ -105,10 +107,10 @@ mod tests {
             session_file: PathBuf::from("alice.json"),
         });
         reg.set_active("alice").unwrap();
-        
+
         let json = serde_json::to_string(&reg).unwrap();
         let parsed: ProfileRegistry = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(parsed.active_profile, Some("alice".to_string()));
         assert_eq!(parsed.profiles.len(), 1);
     }

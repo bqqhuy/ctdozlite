@@ -1,124 +1,88 @@
-//! E2EE integration layer: bridges crypto/session.rs into chat.rs send/receive flow (WP16-3).
-//!
-//! When isE2EE flag is present in conversation metadata:
-//! - Outgoing: encrypt plaintext → wire format → POST /api/e2ee/pc/message/sms
-//! - Incoming: detect e2eeStatus ∈ [3000,4000) → decrypt → display plaintext
-//! - Error codes: -29 (DECRYPT_FAILED), -30 (PENDING_DATA) → UI warning
-//!
-//! ## A08 fix (P1/S): atomic session operations
-//!
-//! Each (profile_id, peer_id) pair has a dedicated Mutex to serialize encrypt/decrypt operations.
-//! This prevents concurrent operations from loading the same session state, both advancing the
-//! chain key, then racing to save → last write wins but both used overlapping counters (nonce reuse).
+//! Fail-closed boundary for E2EE server operations whose official contracts are unverified.
+//! Local synthetic ratchet primitives remain available independently for tests.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::Mutex;
 
 use crate::crypto::session::E2eeManager;
-use crate::crypto::prekey::{fetch_bundle, update_prekeys};
-use crate::session::Session;
 
-/// Global lock serializing all E2EE operations (A08 fix).
-///
-/// Simplified approach: instead of per-session locks (complex lifetime),
-/// serialize ALL ratchet operations globally. This is acceptable because:
-/// - E2EE operations are infrequent (only encrypted messages)
-/// - Most messages are plaintext (groups, non-E2EE chats)
-/// - Single-writer per database connection already exists
-/// - Contention only occurs when user sends to multiple E2EE peers simultaneously
+// Session policy checks and encrypted-message markers share one short critical section.
 static E2EE_GLOBAL_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
-/// Acquire global E2EE serialization lock.
-///
-/// Returns a guard that serializes all encrypt/decrypt operations across all sessions,
-/// preventing concurrent chain key advancement (A08 fix).
-///
-/// This is a coarse-grained lock but sufficient for current usage patterns where
-/// E2EE messages are rare compared to total message volume.
-fn lock_e2ee() -> std::sync::MutexGuard<'static, ()> {
-    E2EE_GLOBAL_LOCK.lock().unwrap()
+fn lock_e2ee() -> Result<std::sync::MutexGuard<'static, ()>> {
+    E2EE_GLOBAL_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Không đọc được khóa trạng thái E2EE"))
+}
+
+/// Refuse server operations until official ciphertext and prekey contracts are verified.
+/// # Errors
+/// Always reports the missing contract; synthetic local crypto remains testable.
+pub fn require_verified_contract() -> Result<()> {
+    Err(unverified_contract_error())
+}
+
+/// Explain the unavailable production contract without exposing keys or message content.
+pub(crate) fn unverified_contract_error() -> anyhow::Error {
+    anyhow::anyhow!(
+        "E2EE chưa khả dụng: chưa xác minh định dạng gói tin và API khóa của Zalo PC/Web"
+    )
 }
 
 /// Get or create E2EE manager for a profile.
 ///
 /// NOTE: Each call opens a new SQLite connection. The manager itself is not cached;
-/// only SESSION_LOCKS provides serialization across concurrent operations.
+/// the global lock serializes local session checks.
 pub fn get_manager(profile_id: &str) -> Result<E2eeManager> {
     E2eeManager::open(profile_id)
 }
 
-/// Check if conversation has E2EE enabled.
-pub fn is_e2ee_enabled(convo: &Value) -> bool {
-    convo.get("isE2EE")
-        .and_then(|v| v.as_u64())
-        .map(|n| n > 0)
-        .unwrap_or(false)
-}
-
-/// Check if an active E2EE ratchet session exists for a peer (audit A01).
-pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
+/// Check for an existing encrypted session without treating storage failures as plaintext policy.
+/// Fail-closed: database read/open errors must NOT be silently swallowed as false.
+pub fn check_thread_e2ee(profile_id: &str, peer_id: &str) -> Result<bool> {
     if profile_id.is_empty() || peer_id.is_empty() {
-        return false;
+        return Ok(false);
     }
-    let _lock = lock_e2ee();
-    get_manager(profile_id)
-        .and_then(|mgr| mgr.load_session(peer_id))
-        .map(|opt| opt.is_some())
-        .unwrap_or(false)
+    let _lock = lock_e2ee()?;
+    let mgr =
+        get_manager(profile_id).context("Không thể khởi tạo E2eeManager để kiểm tra phiên E2EE")?;
+    mgr.requires_e2ee(peer_id)
+        .context("Lỗi đọc trạng thái E2EE từ cơ sở dữ liệu khóa")
 }
 
-/// Encrypt plaintext for E2EE conversation.
-///
-/// A08 fix: serializes all E2EE operations globally to prevent concurrent
-/// chain key advancement on any session.
-pub async fn encrypt_message(
-    session: &Session,
-    profile_id: &str,
-    peer_id: &str,
-    plaintext: &str,
-) -> Result<Vec<u8>> {
-    let mgr = get_manager(profile_id)?;
+/// Retain encrypted-message policy even when no local ratchet can decode the message.
+/// # Errors
+/// Returns storage failures; callers must not interpret them as plaintext permission.
+pub fn remember_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !profile_id.is_empty() && !peer_id.is_empty(),
+        "Thiếu tài khoản hoặc người nhận E2EE"
+    );
+    let _lock = lock_e2ee()?;
+    let manager = get_manager(profile_id)?;
+    manager.conn().execute(
+        "INSERT OR IGNORE INTO e2ee_required(profile_id,peer_id) VALUES(?1,?2)",
+        rusqlite::params![profile_id, peer_id],
+    )?;
+    Ok(())
+}
 
-    // Try existing session first under lock
-    {
-        let _lock = lock_e2ee();
-        if mgr.load_session(peer_id)?.is_some() {
-            return mgr.encrypt(peer_id, None, plaintext.as_bytes());
-        }
-    }
-
-    // No session → fetch peer's prekey bundle (network I/O without holding lock)
-    let bundle = fetch_bundle(session, peer_id).await?;
-
-    // Upload our bundle if not yet done
-    let our_bundle = mgr.local_bundle()?;
-    if let Err(e) = update_prekeys(session, &our_bundle).await {
-        eprintln!("Cảnh báo: không upload được prekey bundle: {e}");
-    }
-
-    // Start session with first message under lock (re-check if another task established it)
-    let _lock = lock_e2ee();
-    if mgr.load_session(peer_id)?.is_some() {
-        return mgr.encrypt(peer_id, None, plaintext.as_bytes());
-    }
-    mgr.start_session(peer_id, &bundle, plaintext.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Không khởi tạo được phiên E2EE: {e}"))
+/// Convenience wrapper for is_thread_e2ee that treats errors safely.
+pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
+    check_thread_e2ee(profile_id, peer_id).unwrap_or(true)
 }
 
 /// Decrypt incoming E2EE payload.
 ///
-/// A08 fix: serializes all E2EE operations globally.
+/// The custom local envelope is not an official Zalo container.
 pub fn decrypt_message(
-    profile_id: &str,
-    peer_id: &str,
-    payload: &[u8],
+    _profile_id: &str,
+    _peer_id: &str,
+    _payload: &[u8],
 ) -> Result<crate::crypto::session::DecryptedMessage> {
-    let _lock = lock_e2ee();
-    let mgr = get_manager(profile_id)?;
-    mgr.decrypt(peer_id, payload)
-        .context("Giải mã E2EE thất bại")
+    Err(unverified_contract_error())
 }
 
 /// Detect E2EE status codes.
@@ -137,7 +101,8 @@ pub fn is_e2ee_wire_payload(payload: &[u8]) -> bool {
 /// Extract ciphertext bytes from raw message value if present (base64 encoded).
 pub fn extract_ciphertext_bytes(raw: &Value) -> Option<Vec<u8>> {
     use base64::Engine;
-    let b64_str = raw.get("content")
+    let b64_str = raw
+        .get("content")
         .or_else(|| raw.get("message"))
         .or_else(|| raw.get("msg"))
         .and_then(|v| {
@@ -157,7 +122,9 @@ pub fn extract_ciphertext_bytes(raw: &Value) -> Option<Vec<u8>> {
     if trimmed.is_empty() {
         return None;
     }
-    base64::engine::general_purpose::STANDARD.decode(trimmed).ok()
+    base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .ok()
 }
 
 /// Check if a raw message value represents an E2EE message based on
@@ -168,8 +135,12 @@ pub fn is_e2ee_message(raw: &Value) -> bool {
             return true;
         }
     }
-    if raw.get("isE2EE")
-        .and_then(|v| v.as_i64().or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 })))
+    if raw
+        .get("isE2EE")
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
+        })
         .map(|n| n > 0)
         .unwrap_or(false)
     {
@@ -196,7 +167,7 @@ mod tests {
     fn e2ee_status_detection() {
         let msg = json!({"e2eeStatus": 3001});
         assert_eq!(detect_e2ee_status(&msg), Some(3001));
-        
+
         let normal = json!({"status": 1});
         assert_eq!(detect_e2ee_status(&normal), None);
     }
@@ -227,11 +198,26 @@ mod tests {
         let wire_b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
 
         let msg_wire = json!({"content": wire_b64});
-        assert!(is_e2ee_message(&msg_wire), "Must detect E2EE message via wire header");
+        assert!(
+            is_e2ee_message(&msg_wire),
+            "Must detect E2EE message via wire header"
+        );
 
         // 5. Normal plaintext message
         let msg_plain = json!({"content": "Xin chao buoi sang!"});
-        assert!(!is_e2ee_message(&msg_plain), "Plaintext must not be detected as E2EE");
+        assert!(
+            !is_e2ee_message(&msg_plain),
+            "Plaintext must not be detected as E2EE"
+        );
     }
-
+    #[tokio::test]
+    async fn production_send_refuses_unverified_contract_before_key_or_network_work() {
+        let session = crate::session::Session::new(false, false, false).unwrap();
+        let error =
+            crate::chat::send_e2ee_message(&session, "synthetic-owner", "peer", "private text", 1)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("chưa xác minh"));
+        assert!(!error.to_string().contains("private text"));
+    }
 }

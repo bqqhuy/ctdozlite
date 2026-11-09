@@ -143,7 +143,7 @@ pub async fn login_by_password_v1(s: &mut Session, phone: &str, password: &str) 
     o.insert("client_version".into(), json!(ZPW_VER));
     o.insert("computer_name".into(), json!(s.computer_name));
     o.insert("imei".into(), json!(s.imei));
-    o.insert("ref".into(), json!("https://chat.zalo.me"));
+    o.insert("ref".into(), json!(crate::endpoints::WEB_BASE));
 
     let sig = crate::crypto::sign_key("loginbypassw", &o);
     o.insert("signkey".into(), json!(sig));
@@ -216,7 +216,7 @@ pub async fn login_by_password(
     let url = format!(
         "{}/api/login/loginByPasswv2?{query}&ref={}",
         s.domains.auth,
-        urlencode("https://chat.zalo.me")
+        urlencode(crate::endpoints::WEB_BASE)
     );
 
     let resp = s.post_form(&url, String::new()).await?;

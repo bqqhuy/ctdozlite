@@ -1,41 +1,41 @@
 /// User-visible fork release identifier, independent of the numeric Windows file version.
 pub const PRODUCT_VERSION: &str = "v0.016-arm";
 
+pub mod account_recovery;
+pub mod business;
 pub mod call;
 pub mod chat;
 pub mod clock;
 pub mod crypto;
+pub mod device;
+pub mod e2ee_integration;
 pub mod endpoints;
 pub mod gui;
+pub mod lan_transfer;
 pub mod limits;
 pub mod logger;
 pub mod login;
 pub mod media;
 pub mod message_view;
 pub mod param_cipher;
+pub mod poll;
+pub mod profiles;
 pub mod qr;
+pub mod quick_message;
 pub mod random;
+pub mod server_media;
+pub mod service_resolver;
 pub mod session;
 pub mod socket;
 pub mod storage;
 pub mod store;
-pub mod profiles;
-pub mod e2ee_integration;
+pub mod todo;
 pub mod tui;
 pub mod ui;
 pub mod video;
-pub mod voip_log;
 pub mod voice;
-pub mod todo;
-pub mod poll;
-pub mod quick_message;
-pub mod device;
+pub mod voip_log;
 pub mod zcloud;
-pub mod server_media;
-pub mod business;
-pub mod account_recovery;
-pub mod lan_transfer;
-pub mod service_resolver;
 
 #[cfg(windows)]
 mod windows_video;
@@ -86,6 +86,7 @@ pub mod rich_text;
 
 pub mod clipboard_image;
 pub mod crash_report;
+mod preview_dns;
 /// Optional outbound proxy for Zalo HTTP and WebSocket traffic.
 pub mod proxy;
 
