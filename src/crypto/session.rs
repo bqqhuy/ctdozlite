@@ -363,12 +363,59 @@ impl E2eeManager {
         self.start_session(peer_id, bundle, plaintext)
     }
 
-    /// Decrypt an incoming E2EE payload.
+    /// Decrypt an incoming E2EE payload, rejecting raw crypto replays.
     pub fn decrypt(&self, peer_id: &str, payload: &[u8]) -> Result<DecryptedMessage> {
+        let tx = self.conn.unchecked_transaction()?;
+        let message = self.decrypt_core(peer_id, payload)?;
+        tx.commit()?;
+        Ok(message)
+    }
+
+    /// Recover an authenticated delivery after replay, restart or a failed history write.
+    /// The receipt and ratchet changes commit together; plaintext is protected at rest.
+    pub fn decrypt_received(
+        &self,
+        peer_id: &str,
+        message_id: &str,
+        payload: &[u8],
+    ) -> Result<DecryptedMessage> {
+        use rusqlite::{params, OptionalExtension};
+        use sha2::{Digest, Sha256};
+        anyhow::ensure!(
+            !message_id.is_empty() && message_id.len() <= 256,
+            "Thiếu định danh tin E2EE"
+        );
+        let hash = Sha256::digest(payload);
+        let tx = self.conn.unchecked_transaction()?;
+        let previous = tx.query_row("SELECT payload_hash,plaintext_enc,identity_changed FROM e2ee_received WHERE profile_id=?1 AND peer_id=?2 AND message_id=?3",
+            params![self.profile_id,peer_id,message_id], |row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,bool>(2)?))).optional()?;
+        if let Some((previous_hash, protected, changed)) = previous {
+            anyhow::ensure!(
+                previous_hash.as_slice() == hash.as_slice(),
+                "Định danh tin E2EE trùng với gói tin khác"
+            );
+            let text = String::from_utf8(crate::storage::unprotect(&protected)?)?;
+            return Ok(DecryptedMessage {
+                text,
+                identity_changed: changed,
+            });
+        }
+        let message = self.decrypt_core(peer_id, payload)?;
+        let protected = crate::storage::protect(message.text.as_bytes())?;
+        let path = crate::e2ee_integration::history_key(&crate::storage::account_file(
+            &self.profile_id,
+            "zalo_history.db",
+        ));
+        tx.execute("INSERT INTO e2ee_received(profile_id,peer_id,message_id,payload_hash,plaintext_enc,identity_changed,history_path) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![self.profile_id,peer_id,message_id,hash.as_slice(),protected,message.identity_changed,path])?;
+        tx.commit()?;
+        Ok(message)
+    }
+
+    fn decrypt_core(&self, peer_id: &str, payload: &[u8]) -> Result<DecryptedMessage> {
         let decoded = deserialize(payload)?;
         match decoded {
             DecodedMessage::PreKey(prekey) => {
-                let tx = self.conn.unchecked_transaction()?;
                 let existing_opt = self.load_session(peer_id)?;
                 let trusted_opt = self.get_trusted_identity(peer_id)?;
                 let identity_changed = match trusted_opt {
@@ -385,7 +432,6 @@ impl E2eeManager {
                     {
                         let plaintext = existing.decrypt(&prekey.header, &prekey.ciphertext)?;
                         self.save_session(peer_id, &existing)?;
-                        tx.commit()?;
                         return Ok(DecryptedMessage {
                             text: String::from_utf8_lossy(&plaintext).into_owned(),
                             identity_changed: false,
@@ -476,7 +522,6 @@ impl E2eeManager {
                 self.save_session(peer_id, &session)?;
                 let changed = self.trust_identity(peer_id, &prekey.bundle.identity_key)?;
                 self.refill_prekeys_in_transaction()?;
-                tx.commit()?;
                 Ok(DecryptedMessage {
                     text: String::from_utf8_lossy(&plaintext).into_owned(),
                     identity_changed: changed,

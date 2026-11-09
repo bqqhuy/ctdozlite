@@ -13,3 +13,10 @@
 - [ ] Kiểm tra trạng thái 2FA của tài khoản trong mục bảo mật.
 - [ ] Thử tính năng quét thiết bị cùng mạng LAN (LAN Discovery): hiển thị IP/port của máy tính khác.
 - [ ] Kiểm tra tính tương thích dịch vụ và không phát sinh crash Direct3D 12.
+
+## Corrected audit boundary 2026-11-09
+
+The previous fork-only LAN probe/model fixtures did not establish an official
+Zalo discovery or transfer contract. The scanner and UI action have been removed;
+C03 remains unverified. Business catalog and resolver behavior are retained.
+See ADR-0037 and re-notes/41; no native acceptance follows from a model test.

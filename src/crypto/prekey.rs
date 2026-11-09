@@ -41,15 +41,11 @@ pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
         pick(node, &["identityKey", "identity_key"])
             .ok_or_else(|| anyhow::anyhow!("Thiếu identityKey trong bundle E2EE"))?,
     )?;
-    let registration_id = node
-        .get("registrationId")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-
+    let registration_id = required_id(node, "registrationId")?;
     let spk = node
         .get("signedPreKey")
         .ok_or_else(|| anyhow::anyhow!("Thiếu signedPreKey trong bundle E2EE"))?;
-    let signed_pre_key_id = spk.get("keyId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let signed_pre_key_id = required_id(spk, "keyId")?;
     let signed_pre_key = decode_key32(
         spk.get("publicKey")
             .ok_or_else(|| anyhow::anyhow!("Thiếu publicKey của signedPreKey"))?,
@@ -59,29 +55,31 @@ pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
             .ok_or_else(|| anyhow::anyhow!("Thiếu signature của signedPreKey"))?,
     )?;
 
-    let mut one_time_pre_key = None;
-    if let Some(list) = node.get("preKeys").and_then(|v| v.as_array()) {
-        if let Some(first) = list.first() {
-            if let (Some(key), Some(id)) = (
-                first.get("publicKey"),
-                first.get("keyId").and_then(|v| v.as_u64()),
-            ) {
-                if let Ok(bytes) = decode_key32(key) {
-                    one_time_pre_key = Some((bytes, id as u32));
+    let one_time_pre_key = match node.get("preKeys") {
+        None => None,
+        Some(value) => {
+            let list = value
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Danh sách prekey không hợp lệ"))?;
+            let mut first = None;
+            for entry in list {
+                let id = required_id(entry, "keyId")?;
+                let key = decode_key32(
+                    entry
+                        .get("publicKey")
+                        .ok_or_else(|| anyhow::anyhow!("Thiếu publicKey của prekey"))?,
+                )?;
+                if first.is_none() {
+                    first = Some((key, id));
                 }
             }
+            first
         }
-    }
-
+    };
     let signing_identity_key = node
         .get("signingIdentityKey")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| decode_any_with_len(raw, 32).ok())
-        .map(|b| {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b[..32]);
-            arr
-        });
+        .map(decode_key32)
+        .transpose()?;
 
     Ok(RemoteBundle {
         identity_key,
@@ -92,6 +90,14 @@ pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
         signature,
         one_time_pre_key,
     })
+}
+
+fn required_id(value: &Value, key: &str) -> Result<u32> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| anyhow::anyhow!("Thiếu hoặc sai định danh khóa E2EE ({key})"))
 }
 
 fn pick<'a>(node: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -171,8 +177,8 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         let dec = json!({
             "error_code": 0,
-            "identityKey": B64.encode([1u8; 32]),
             "registrationId": 12345,
+            "identityKey": B64.encode([1u8; 32]),
             "signedPreKey": {
                 "keyId": 1,
                 "publicKey": B64.encode([2u8; 32]),
@@ -205,6 +211,7 @@ mod tests {
         let signature: Vec<u8> = (0..64u8).collect();
         let dec = json!({
             "error_code": 0,
+            "registrationId": 12345,
             "identityKey": B64.encode([1u8; 32]),
             "signedPreKey": {
                 "keyId": 1,
@@ -225,6 +232,7 @@ mod tests {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         let dec = json!({
             "error_code": 0,
+            "registrationId": 12345,
             "identityKey": B64.encode([1u8; 32]),
             "signedPreKey": {
                 "keyId": 1,

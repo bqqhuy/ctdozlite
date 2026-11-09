@@ -14,6 +14,7 @@ pub struct Snapshot {
     pub owner: String,
     pub count: usize,
     pub enabled: bool,
+    pub privacy_locked: bool,
     pub sound: bool,
     pub sequence: u64,
     pub notice: Option<Notice>,
@@ -22,6 +23,7 @@ static STATE: Mutex<Snapshot> = Mutex::new(Snapshot {
     owner: String::new(),
     count: 0,
     enabled: true,
+    privacy_locked: false,
     sound: false,
     sequence: 0,
     notice: None,
@@ -92,8 +94,28 @@ pub fn configure(enabled: bool, sound: bool) {
         }
     }
 }
+/// Apply app locking independently of user notification settings and withdraw visible previews.
+pub fn privacy_lock(owner: &str, locked: bool) {
+    let changed = if let Ok(mut state) = STATE.lock() {
+        if state.owner == owner && state.privacy_locked != locked {
+            state.privacy_locked = locked;
+            if locked {
+                state.notice = None;
+                state.sequence = state.sequence.wrapping_add(1);
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if changed && locked {
+        clear_previews(owner);
+    }
+}
+
 pub fn count(owner: &str, count: usize) {
-    account(owner);
     if let Ok(mut s) = STATE.lock() {
         if s.owner == owner {
             s.count = count;
@@ -101,9 +123,8 @@ pub fn count(owner: &str, count: usize) {
     }
 }
 pub fn publish(notice: Notice, count: usize) {
-    account(&notice.owner);
     if let Ok(mut s) = STATE.lock() {
-        if !s.enabled || s.owner != notice.owner {
+        if !s.enabled || s.privacy_locked || s.owner != notice.owner {
             return;
         }
         s.count = count;
@@ -135,7 +156,8 @@ pub fn snapshot() -> Snapshot {
     STATE.lock().map(|s| s.clone()).unwrap_or_default()
 }
 pub fn activate(notice: Notice) {
-    if snapshot().owner == notice.owner {
+    let state = snapshot();
+    if state.owner == notice.owner && !state.privacy_locked {
         if let Ok(mut slot) = ACTIVATION.lock() {
             *slot = Some(notice);
         }
@@ -164,6 +186,7 @@ pub struct Popup {
 impl Popup {
     pub fn update(&mut self, s: &Snapshot, now: std::time::Instant, background: bool) {
         if !s.enabled
+            || s.privacy_locked
             || s.owner.is_empty()
             || !background
             || self.current.as_ref().is_some_and(|n| n.owner != s.owner)
@@ -178,7 +201,7 @@ impl Popup {
             if s.notice.is_none() {
                 self.close();
             }
-            if s.enabled && background {
+            if s.enabled && !s.privacy_locked && background {
                 if let Some(n) = &s.notice {
                     if self.current.is_some() {
                         self.pending = Some(n.clone());

@@ -17,7 +17,7 @@ cargo build --release --locked --bin ctdozlite --target aarch64-pc-windows-msvc 
 Để tách dữ liệu thử khỏi dữ liệu đang dùng, đặt `CTDOZ_DATA_DIR` thành đường dẫn
 tuyệt đối mới trước khi chạy, rồi đăng nhập trong bản thử. Không sao chép session
 hay khóa vào log. Với dữ liệu cũ, đóng app và sao lưu toàn bộ thư mục dữ liệu
-trước khi chạy. Crypto DB sẽ nâng lên schema 7; bản chỉ hỗ trợ schema 6 không mở
+trước khi chạy. Crypto DB sẽ nâng lên schema 8; bản chỉ hỗ trợ schema 7 không mở
 được DB mới. Không sửa số phiên bản DB để hạ cấp.
 
 Build bình thường không có feature vẫn giữ chặn. Build có feature nhưng không
@@ -64,3 +64,12 @@ mã hóa/lưu trạng thái; `send` là gửi HTTP; `acknowledgement` là kiểm
 hợp lệ, `replay` là gói lặp, `database` là lỗi DB. `cancelled` có thể là tác vụ bị
 hủy; thiếu sự kiện cuối cũng có thể do app bị tắt đột ngột hoặc hàng đợi mất log.
 Log cố ý không chứa dữ liệu đủ để tái dựng khóa/nội dung hay toàn bộ schema server.
+
+Build GitHub: chạy workflow **Windows ARM64 (native build)** trên `main`, chọn
+`experimental_e2ee=true`. Artifact tên `ctdozlite-windows-arm64-trial`; có portable,
+installer, checksum, build-info với SHA nguồn và log/ảnh smoke test. Đây là build
+thử, không phải GitHub Release. Khi chạy vẫn cần `--e2ee-experimental`.
+
+Nếu thư mục log không ghi được, chế độ thử không bật. Nếu writer lỗi giữa chừng,
+app hiển thị lỗi và chặn lần gửi thử tiếp theo; khi thoát bình thường app đợi ghi
+log với thời hạn cố định. Log GitHub có `build_revision` để phân biệt các bản thử.

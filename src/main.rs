@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
         "E2EE thử nghiệm dùng log đã che dữ liệu; không kết hợp với --dev hoặc --dump"
     );
     zalo_rust::e2ee_trial::configure(e2ee_trial)?;
+    let _diagnostics = zalo_rust::e2ee_trial::LoggingGuard;
     if e2ee_trial {
         println!(
             "E2EE THỬ NGHIỆM: giao thức chưa xác minh. Log: {}",

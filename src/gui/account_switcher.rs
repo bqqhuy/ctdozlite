@@ -9,16 +9,12 @@ use eframe::egui::{
 };
 
 /// Account switcher UI state.
-#[allow(dead_code)]
 #[derive(Default)]
 pub struct AccountSwitcher {
     /// Currently visible (expanded) or collapsed.
     pub expanded: bool,
-    /// Profile being hovered.
-    pub hover_profile: Option<String>,
 }
 
-#[allow(dead_code)]
 impl AccountSwitcher {
     /// Render the account switcher in the sidebar header.
     /// Returns the UID of the profile selected, if any.
@@ -165,10 +161,7 @@ mod tests {
 
     #[test]
     fn switcher_toggles_expanded() {
-        let switcher = AccountSwitcher {
-            expanded: true,
-            ..Default::default()
-        };
+        let switcher = AccountSwitcher { expanded: true };
         assert!(switcher.expanded);
     }
 }

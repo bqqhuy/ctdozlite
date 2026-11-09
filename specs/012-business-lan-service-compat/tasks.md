@@ -12,14 +12,22 @@
 
 ## 3. Khối C03: Truyền tệp LAN (Local Transfer Protocol)
 - [x] [R15-T07] [C03] Mô hình dữ liệu `LanPeer`, `LanTransferState`, `LanTransferSession`.
-- [x] [R15-T08] [C03] Giao thức discovery mạng LAN và báo hiệu truyền tệp nội bộ.
-- [x] [R15-T09] [C03] Unit tests kiểm tra phát hiện peer và quản lý trạng thái phiên truyền tệp LAN.
+- [ ] [R15-T08] [C03] Giao thức discovery mạng LAN và báo hiệu truyền tệp nội bộ.
+- [ ] [R15-T09] [C03] Unit tests kiểm tra phát hiện peer và quản lý trạng thái phiên truyền tệp LAN.
 
 ## 4. Khối C04: Tương thích dịch vụ & Điều phối endpoint
 - [x] [R15-T10] [C04] Bộ phân giải URL tập trung `ServiceResolver` với fallback an toàn.
 - [x] [R15-T11] [C04] Unit tests cho `ServiceResolver`.
 
 ## 5. Tích hợp UI & Worker Command
-- [x] [R15-T12] Thêm các lệnh `WorkerCmd::GetBusinessCatalog` và `WorkerCmd::DiscoverLanPeers` vào `src/gui/worker.rs`.
+- [ ] [R15-T12] Thêm các lệnh `WorkerCmd::GetBusinessCatalog` và `WorkerCmd::DiscoverLanPeers` vào `src/gui/worker.rs`.
 - [x] [R15-T13] Thêm tab "Doanh nghiệp & Truyền LAN" vào `src/gui/tools_panel.rs`.
-- [x] [R15-T14] Đăng ký modules trong `src/lib.rs` và kiểm chứng toàn diện.
+- [ ] [R15-T14] Đăng ký modules trong `src/lib.rs` và kiểm chứng toàn diện.
+
+## Audit remediation 2026-11-09
+
+R15-T08/R15-T09 remain unverified: the fork-only UDP probe was not an official
+Zalo contract and had no corresponding peer responder. Its UI action, worker
+handler and unused transfer models were removed rather than claiming LAN parity.
+R15-T12 retains the business catalog path, but LAN discovery remains open.
+No native-device or Zalo interoperability acceptance is inferred from local tests.

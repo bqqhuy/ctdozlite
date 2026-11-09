@@ -525,7 +525,6 @@ pub enum GuiEvent {
     TwoFactorStatusLoaded(crate::account_recovery::TwoFactorStatus),
     GroupTodosLoaded(Vec<crate::todo::TodoItem>),
     GroupPollsLoaded(Vec<crate::poll::PollItem>),
-    LanPeersDiscovered(Vec<crate::lan_transfer::LanPeer>),
     BatchRecallCompleted {
         thread_id: String,
         recalled_ids: Vec<String>,
@@ -1928,6 +1927,8 @@ impl ZaloGuiApp {
             };
             match event {
                 GuiEvent::AppSettingsSaved(result) => {
+                    self.profiles_requested = false;
+                    self.profiles.clear();
                     if let Err(error) = result {
                         self.show_toast(error);
                     }
@@ -2223,6 +2224,8 @@ impl ZaloGuiApp {
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
                 GuiEvent::LoginSuccess { name, uin, avatar } => {
+                    self.profiles_requested = false;
+                    self.profiles.clear();
                     if self.user_uin != uin {
                         self.clear_presence_state();
                         self.deleted_message_ids.clear();
@@ -2904,6 +2907,7 @@ impl ZaloGuiApp {
                 GuiEvent::AppUnlocked => {
                     // WP16-4: Windows Hello authentication succeeded
                     self.lock_guard.unlock();
+                    crate::desktop_notice::privacy_lock(&self.user_uin, false);
                     self.auth_in_progress = false;
                     self.status_msg = "Đã mở khóa ứng dụng".into();
                     // Refresh UI state after unlock
@@ -4736,13 +4740,6 @@ impl ZaloGuiApp {
                     self.status_msg =
                         format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
                 }
-                GuiEvent::LanPeersDiscovered(peers) => {
-                    self.tools.lan_peers = peers;
-                    self.status_msg = format!(
-                        "Đã phát hiện {} thiết bị Zalo trong mạng LAN",
-                        self.tools.lan_peers.len()
-                    );
-                }
                 GuiEvent::BatchRecallCompleted {
                     thread_id,
                     recalled_ids,
@@ -4782,6 +4779,7 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.lock_guard.poll_availability();
         // A21 fix: Check and update lock state BEFORE processing input/events/render
         // This ensures lock transition happens before any sensitive operation can execute.
         if self.is_logged_in && self.lock_guard.should_lock() {
@@ -4813,6 +4811,7 @@ impl eframe::App for ZaloGuiApp {
         };
         let notice_account_changed = crate::desktop_notice::snapshot().owner != notice_owner;
         crate::desktop_notice::account(notice_owner);
+        crate::desktop_notice::privacy_lock(notice_owner, self.lock_guard.is_locked());
         if self.is_logged_in && notice_account_changed {
             crate::desktop_notice::count(&self.user_uin, self.unread_counts.values().sum());
         }

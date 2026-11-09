@@ -20,23 +20,26 @@ pub struct DeviceSession {
 }
 
 /// Parse device list from Zalo API response.
-pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Vec<DeviceSession> {
+pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Result<Vec<DeviceSession>> {
+    let envelope = crate::chat::confirmed_mutation(val.clone())?;
+    let val = &envelope;
     let items = val
         .get("data")
         .and_then(|d| d.get("items").or_else(|| d.get("devices")))
         .or_else(|| val.get("items"))
         .and_then(|v| v.as_array());
 
-    let Some(arr) = items else {
-        return Vec::new();
-    };
+    let arr = items.context("Thiếu danh sách thiết bị trong phản hồi")?;
+    anyhow::ensure!(arr.len() <= 1000, "Danh sách thiết bị quá lớn");
 
     arr.iter()
-        .filter_map(|it| {
+        .map(|it| {
             let device_id = it
                 .get("device_id")
-                .or_else(|| it.get("imei"))?
-                .as_str()?
+                .or_else(|| it.get("imei"))
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.len() <= 256)
+                .context("Thiết bị thiếu định danh hợp lệ")?
                 .to_string();
             let name = it
                 .get("name")
@@ -66,7 +69,7 @@ pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Vec<DeviceS
                 .and_then(|v| v.as_bool())
                 .unwrap_or_else(|| current_imei.is_some_and(|imei| imei == device_id));
 
-            Some(DeviceSession {
+            Ok(DeviceSession {
                 device_id,
                 name,
                 platform,
@@ -89,7 +92,7 @@ pub async fn get_logged_in_devices(s: &Session) -> Result<Vec<DeviceSession>> {
         .context("Mã hoá tham số lấy danh sách thiết bị thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(parse_device_list(&decrypted, Some(&s.imei)))
+    parse_device_list(&decrypted, Some(&s.imei))
 }
 
 /// Call `/api/login/kickdevice` to remotely log out a device.
@@ -136,7 +139,7 @@ mod tests {
             }
         });
 
-        let devices = parse_device_list(&val, Some("arm64-win11-surface"));
+        let devices = parse_device_list(&val, Some("arm64-win11-surface")).unwrap();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].name, "Surface Pro (Windows 11 ARM64)");
         assert!(devices[0].is_current);

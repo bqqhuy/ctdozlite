@@ -5,13 +5,12 @@
 //!
 //! Evidence: Windows Security Credentials UI (UserConsentVerifier API)
 //! - `windows::Security::Credentials::UI::UserConsentVerifier`
-//! - Tested on Windows 11 ARM64
+//! - Native-device acceptance is tracked separately from fixture tests.
 
 use anyhow::{Context, Result};
 use std::time::{Duration, Instant};
 
 /// Application lock guard — manages lock state and idle timeout.
-#[allow(dead_code)]
 pub struct AppLockGuard {
     /// Whether the app is currently locked.
     locked: bool,
@@ -21,9 +20,9 @@ pub struct AppLockGuard {
     idle_timeout: Duration,
     /// Whether biometric auth is available on this system.
     biometric_available: bool,
+    availability: Option<(std::sync::mpsc::Receiver<bool>, Instant)>,
 }
 
-#[allow(dead_code)]
 impl AppLockGuard {
     /// Create a new lock guard (app starts unlocked, no initial lock required).
     pub fn new() -> Self {
@@ -31,38 +30,57 @@ impl AppLockGuard {
             locked: false,
             last_interaction: Instant::now(),
             idle_timeout: Duration::from_secs(5 * 60), // 5 minutes
-            biometric_available: Self::check_biometric_available(),
+            biometric_available: false,
+            availability: Some((Self::start_availability_check(), Instant::now())),
         }
     }
 
-    /// Check if Windows Hello is available on this system.
-    #[cfg(windows)]
-    fn check_biometric_available() -> bool {
-        use windows::Security::Credentials::UI::UserConsentVerifier;
-
-        // Check availability synchronously via blocking task
-        std::thread::spawn(|| {
-            match UserConsentVerifier::CheckAvailabilityAsync() {
-                Ok(async_op) => {
-                    // Poll the async operation synchronously
-                    match async_op.get() {
-                        Ok(availability) => {
-                            use windows::Security::Credentials::UI::UserConsentVerifierAvailability;
-                            matches!(availability, UserConsentVerifierAvailability::Available)
-                        }
-                        Err(_) => false,
-                    }
-                }
-                Err(_) => false,
-            }
-        })
-        .join()
-        .unwrap_or(false)
+    #[cfg(not(test))]
+    fn start_availability_check() -> std::sync::mpsc::Receiver<bool> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let _ = std::thread::Builder::new()
+            .name("hello-availability".into())
+            .spawn(move || {
+                #[cfg(windows)]
+                let available = {
+                    use windows::Security::Credentials::UI::{
+                        UserConsentVerifier, UserConsentVerifierAvailability,
+                    };
+                    UserConsentVerifier::CheckAvailabilityAsync()
+                        .and_then(|operation| operation.get())
+                        .is_ok_and(|status| status == UserConsentVerifierAvailability::Available)
+                };
+                #[cfg(not(windows))]
+                let available = false;
+                let _ = sender.send(available);
+            });
+        receiver
     }
 
-    #[cfg(not(windows))]
-    fn check_biometric_available() -> bool {
-        false
+    #[cfg(test)]
+    fn start_availability_check() -> std::sync::mpsc::Receiver<bool> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender.send(false).unwrap();
+        receiver
+    }
+
+    /// Poll the background availability probe without blocking GUI creation or rendering.
+    pub fn poll_availability(&mut self) {
+        if let Some((receiver, start)) = &self.availability {
+            match receiver.try_recv() {
+                Ok(available) => {
+                    self.biometric_available = available;
+                    self.availability = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.availability = None,
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if start.elapsed() >= Duration::from_secs(5) =>
+                {
+                    self.availability = None
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     /// Update last interaction timestamp (called on user input).
@@ -92,30 +110,6 @@ impl AppLockGuard {
     /// Check if currently locked.
     pub fn is_locked(&self) -> bool {
         self.locked
-    }
-
-    /// Request biometric authentication and unlock if successful.
-    /// Returns `true` if unlock succeeded, `false` if authentication failed or was cancelled.
-    pub async fn authenticate(&mut self) -> Result<bool> {
-        if !self.biometric_available {
-            return Ok(false);
-        }
-
-        let result = request_windows_hello().await?;
-        if result {
-            self.unlock();
-        }
-        Ok(result)
-    }
-
-    /// Return the remaining idle time before auto-lock.
-    pub fn time_until_lock(&self) -> Duration {
-        if self.locked {
-            Duration::ZERO
-        } else {
-            self.idle_timeout
-                .saturating_sub(self.last_interaction.elapsed())
-        }
     }
 }
 
@@ -234,6 +228,7 @@ mod tests {
     #[test]
     fn touch_resets_idle_timer() {
         let mut guard = AppLockGuard::new();
+        guard.biometric_available = true;
         guard.idle_timeout = Duration::from_millis(50);
         thread::sleep(Duration::from_millis(30));
         guard.touch();

@@ -7,6 +7,34 @@ use std::sync::Mutex;
 
 use crate::crypto::session::E2eeManager;
 
+thread_local! {
+    // SQLite connections stay on their owning worker thread; only its last account is retained.
+    static MANAGER: std::cell::RefCell<Option<E2eeManager>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Serialize crypto operations without repeatedly opening the database for every message.
+pub(crate) fn with_manager<T>(
+    profile: &str,
+    operation: impl FnOnce(&E2eeManager) -> Result<T>,
+) -> Result<T> {
+    let _lock = lock_e2ee()?;
+    MANAGER.with(|slot| {
+        let mut slot = slot
+            .try_borrow_mut()
+            .map_err(|_| anyhow::anyhow!("Tác vụ E2EE đang được xử lý"))?;
+        if slot
+            .as_ref()
+            .is_none_or(|manager| manager.profile_id() != profile)
+        {
+            *slot = Some(get_manager(profile)?);
+        }
+        operation(
+            slot.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Không mở được E2EE"))?,
+        )
+    })
+}
+
 // Session policy checks and encrypted-message markers share one short critical section.
 static E2EE_GLOBAL_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
@@ -49,10 +77,7 @@ pub fn check_thread_e2ee(profile_id: &str, peer_id: &str) -> Result<bool> {
     if profile_id.is_empty() || peer_id.is_empty() {
         return Ok(false);
     }
-    let _lock = lock_e2ee()?;
-    let mgr =
-        get_manager(profile_id).context("Không thể khởi tạo E2eeManager để kiểm tra phiên E2EE")?;
-    mgr.requires_e2ee(peer_id)
+    with_manager(profile_id, |manager| manager.requires_e2ee(peer_id))
         .context("Lỗi đọc trạng thái E2EE từ cơ sở dữ liệu khóa")
 }
 
@@ -64,13 +89,13 @@ pub fn remember_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> 
         !profile_id.is_empty() && !peer_id.is_empty(),
         "Thiếu tài khoản hoặc người nhận E2EE"
     );
-    let _lock = lock_e2ee()?;
-    let manager = get_manager(profile_id)?;
-    manager.conn().execute(
-        "INSERT OR IGNORE INTO e2ee_required(profile_id,peer_id) VALUES(?1,?2)",
-        rusqlite::params![profile_id, peer_id],
-    )?;
-    Ok(())
+    with_manager(profile_id, |manager| {
+        manager.conn().execute(
+            "INSERT OR IGNORE INTO e2ee_required(profile_id,peer_id) VALUES(?1,?2)",
+            rusqlite::params![profile_id, peer_id],
+        )?;
+        Ok(())
+    })
 }
 
 /// Convenience wrapper for is_thread_e2ee that treats errors safely.
@@ -86,6 +111,16 @@ pub fn decrypt_message(
     peer_id: &str,
     payload: &[u8],
 ) -> Result<crate::crypto::session::DecryptedMessage> {
+    decrypt_received(profile_id, peer_id, None, payload)
+}
+
+/// Decrypt a stable network delivery while preserving crash-safe authenticated receipts.
+pub(crate) fn decrypt_received(
+    profile_id: &str,
+    peer_id: &str,
+    message_id: Option<&str>,
+    payload: &[u8],
+) -> Result<crate::crypto::session::DecryptedMessage> {
     use crate::e2ee_trial::{Stage, Trace};
     let mut trace = Trace::new(profile_id, peer_id, Stage::Contract, payload.len());
     let result = (|| {
@@ -94,21 +129,71 @@ pub fn decrypt_message(
         let decoded = crate::crypto::wire::deserialize(payload)?;
         trace.envelope(&decoded, payload.len());
         trace.stage(Stage::Load);
-        let _guard = lock_e2ee()?;
-        let manager = get_manager(profile_id)?;
         trace.stage(Stage::DecryptPersist);
-        manager.decrypt(peer_id, payload)
+        with_manager(profile_id, |manager| match message_id {
+            Some(id) => manager.decrypt_received(peer_id, id, payload),
+            None => manager.decrypt(peer_id, payload),
+        })
     })();
     trace.finish_result(&result);
     result
+}
+
+/// Normalize the account history path for private receive-receipt deletion.
+pub(crate) fn history_key(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        path.trim_start_matches("//?/").to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+/// Remove protected recovery copies when the owning history message is deleted or recalled.
+pub(crate) fn purge_received(
+    history: Option<&str>,
+    peer: &str,
+    message: Option<&str>,
+) -> Result<()> {
+    let Some(history) = history.filter(|path| *path != ":memory:") else {
+        return Ok(());
+    };
+    if !crate::storage::root().join("e2ee.db").exists() {
+        return Ok(());
+    }
+    let _guard = lock_e2ee()?;
+    let conn = crate::crypto::store::open_crypto_db()?;
+    let history = history_key(std::path::Path::new(history));
+    match message {
+        Some(id) => conn.execute(
+            "DELETE FROM e2ee_received WHERE history_path=?1 AND peer_id=?2 AND message_id=?3",
+            rusqlite::params![history, peer, id],
+        )?,
+        None => conn.execute(
+            "DELETE FROM e2ee_received WHERE history_path=?1 AND peer_id=?2",
+            rusqlite::params![history, peer],
+        )?,
+    };
+    Ok(())
 }
 
 /// Detect E2EE status codes.
 pub fn detect_e2ee_status(raw: &Value) -> Option<i32> {
     raw.get("e2eeStatus")
         .and_then(|v| v.as_i64())
-        .map(|n| n as i32)
+        .and_then(|n| i32::try_from(n).ok())
         .filter(|&code| (3000..4000).contains(&code))
+}
+
+/// Read explicit encrypted-message metadata; a base64-looking body alone is not policy.
+pub fn has_e2ee_metadata(raw: &Value) -> bool {
+    detect_e2ee_status(raw).is_some()
+        || raw
+            .get("isE2EE")
+            .is_some_and(|flag| flag.as_bool() == Some(true) || flag.as_i64() == Some(1))
 }
 
 /// Check if a byte slice matches an E2EE wire envelope (version 1, type 1 or 3).
@@ -175,6 +260,17 @@ pub fn is_e2ee_message(raw: &Value) -> bool {
 /// Error code constants
 pub const E2EE_DECRYPT_FAILED: i64 = -29;
 pub const E2EE_PENDING_DATA: i64 = -30;
+
+/// Generated encrypted-message labels carry no authenticated plaintext.
+pub(crate) fn is_placeholder(text: &str) -> bool {
+    matches!(
+        text,
+        "[Tin nhắn mã hoá]"
+            | "[Tin nhắn mã hoá - không giải mã được]"
+            | "[Tin nhắn mã hoá - thiếu dữ liệu]"
+            | "[Không đọc được trạng thái bảo mật E2EE]"
+    )
+}
 
 #[cfg(test)]
 mod tests {

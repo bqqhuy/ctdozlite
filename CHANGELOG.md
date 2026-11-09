@@ -2,6 +2,15 @@
 
 ## Chưa phát hành — khắc phục audit 09/11/2026
 
+- Khắc phục audit độc lập trên `164af11`: chặn bypass E2EE từ TUI/API thấp,
+  ngăn envelope giả và tin nhóm thay policy DM, nhận trùng bền vững với crypto
+  schema 8, bảo vệ plaintext đã lưu và xóa recovery copy khi xóa/thu hồi tin.
+- Hoàn thiện registry/khôi phục tài khoản, bảo vệ thông báo khi khóa, chuyển
+  kiểm tra Hello khỏi GUI, parser bundle/device nghiêm ngặt, tối ưu lookup merge
+  và connection crypto; bỏ scanner LAN chưa xác minh cùng model/helper dư.
+- Nâng SQLite đi kèm, thêm trạng thái/drain cho log; workflow GitHub tạo artifact
+  E2EE trial riêng và ngăn xuất bản trial thành release. Xem ADR-0037.
+
 - Chặn các đường E2EE chat và xác minh danh tính chưa có hợp đồng Zalo PC/Web
   được kiểm chứng; không tự hạ xuống gửi plaintext. Không gửi envelope tự định
   nghĩa lên máy chủ trong chế độ mặc định. Xem ADR-0035.

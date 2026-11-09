@@ -255,6 +255,14 @@ impl ZaloGuiApp {
                         }
                     }
 
+                    if self.profile_menu_open && ui.button("Thêm tài khoản").clicked() {
+                        if let Some(tx) = WORKER_TX.get() {
+                            if tx.send(WorkerCmd::AddAccount).is_err() {
+                                self.show_toast("Không kết nối được bộ xử lý tài khoản");
+                            }
+                        }
+                        self.profile_menu_open = false;
+                    }
                     ui.add_space(18.0);
 
                     // Navigation Icon 1: Tin nhắn (All / Active Chat)
@@ -1804,6 +1812,7 @@ impl ZaloGuiApp {
             .show(ctx, |ui| {
                 if crate::e2ee_trial::enabled() {
                     ui.colored_label(egui::Color32::YELLOW, "E2EE THỬ NGHIỆM — giao thức chưa xác minh; chỉ thử với tin nhắn kiểm tra.");
+                    if !crate::e2ee_trial::logging_healthy() { ui.colored_label(egui::Color32::RED, "Không ghi được log E2EE; tạm chặn gửi thử."); }
                 }
                 if let Some((thread_id, thread_name, thread_avatar, is_group, _msg_count)) =
                     thread_meta

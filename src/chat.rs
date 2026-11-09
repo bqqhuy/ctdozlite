@@ -1767,6 +1767,19 @@ pub(crate) fn next_client_message_id() -> u64 {
 /// Wait for the server to announce an uploaded file's processed URL.
 const ASYNC_FILE_URL_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Enforce encrypted-conversation policy at every low-level content send boundary.
+/// # Errors
+/// Rejects direct plaintext sends on encrypted threads, including unreadable policy stores.
+pub(crate) fn require_plaintext_send(s: &Session, peer: &str, group: bool) -> Result<()> {
+    if !group {
+        anyhow::ensure!(
+            !crate::e2ee_integration::check_thread_e2ee(s.account_key(), peer)?,
+            "Hội thoại yêu cầu E2EE; không được gửi nội dung qua endpoint thường"
+        );
+    }
+    Ok(())
+}
+
 /// Send a 1-1 text message: `POST {domains.chat}/api/message/sms?{common}`
 pub async fn send_message(s: &Session, to_id: &str, text: &str) -> Result<Value> {
     send_message_with_client_id(s, to_id, text, next_client_message_id()).await
@@ -1920,6 +1933,7 @@ pub(crate) async fn send_attachment_with_client_id(
     caption: &str,
     client_id: u64,
 ) -> Result<(Value, ChatMessage)> {
+    require_plaintext_send(s, to_id, is_group)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -2488,6 +2502,7 @@ pub async fn send_forward_message(
     info: &Value,
     client_id: u64,
 ) -> Result<Value> {
+    require_plaintext_send(s, to_id, is_group)?;
     anyhow::ensure!(s.login.is_some() && s.is_active(), "Chưa đăng nhập");
     let file_host = s.domains.file.trim_end_matches('/');
     anyhow::ensure!(!file_host.is_empty(), "Thiếu máy chủ tệp");
@@ -3124,6 +3139,7 @@ pub(crate) async fn send_sticker_with_client_id(
     is_group: bool,
     now: u64,
 ) -> Result<Value> {
+    require_plaintext_send(s, to_id, is_group)?;
     anyhow::ensure!(
         cate_id != crate::bundled_stickers::CATEGORY,
         "GIF cục bộ phải được gửi qua luồng attachment"
@@ -3887,6 +3903,7 @@ pub(crate) async fn send_quote_mentions(
     now: u64,
     mentions: &[crate::mentions::Mention],
 ) -> Result<Value> {
+    require_plaintext_send(s, to_id, is_group)?;
     crate::mentions::validate(text, mentions)?;
     anyhow::ensure!(
         is_group || mentions.is_empty(),
@@ -4506,6 +4523,7 @@ pub async fn send_contact_card(
     avatar: &str,
     client_id: u64,
 ) -> Result<Value> {
+    require_plaintext_send(s, to_id, is_group)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -5934,6 +5952,14 @@ pub(crate) fn parse_chat_message_with_profile(
     it: &Value,
     profile_id: Option<&str>,
 ) -> Option<ChatMessage> {
+    parse_chat_message_in_context(it, profile_id, is_group_flag(it))
+}
+
+fn parse_chat_message_in_context(
+    it: &Value,
+    profile_id: Option<&str>,
+    group: bool,
+) -> Option<ChatMessage> {
     let msg_type = normalize_msg_type(it);
 
     let raw_content_val = it
@@ -5965,7 +5991,7 @@ pub(crate) fn parse_chat_message_with_profile(
     // WP16-3 & A10: E2EE receive path — decrypt incoming encrypted messages
     let mut is_e2ee = false;
     let mut e2ee_identity_changed = false;
-    if let Some(prof_id) = profile_id {
+    if let Some(prof_id) = profile_id.filter(|_| !group) {
         let peer_candidate = pick_str(
             it,
             &[
@@ -5992,7 +6018,7 @@ pub(crate) fn parse_chat_message_with_profile(
             }
         }
     }
-    if !is_e2ee && crate::e2ee_integration::is_e2ee_message(it) {
+    if !is_e2ee && crate::e2ee_integration::has_e2ee_metadata(it) {
         is_e2ee = true;
         content = "[Tin nhắn mã hoá]".to_string();
     }
@@ -6399,6 +6425,11 @@ pub fn merge_previews_with_profile(
         })
         .collect();
 
+    let mut thread_positions = std::collections::HashMap::new();
+    for (row, thread) in threads.iter().enumerate() {
+        thread_positions.entry(thread.id.clone()).or_insert(row);
+    }
+
     for (entry, is_grp_bucket) in entries {
         let mut raw_msgs: Vec<(&Value, bool)> = Vec::new();
         if let Some(arr) = entry.get("messages").and_then(Value::as_array) {
@@ -6431,7 +6462,7 @@ pub fn merge_previews_with_profile(
         }
 
         for (m_val, is_grp) in raw_msgs {
-            let Some(parsed) = parse_chat_message_with_profile(m_val, profile_id) else {
+            let Some(parsed) = parse_chat_message_in_context(m_val, profile_id, is_grp) else {
                 continue;
             };
 
@@ -6441,7 +6472,7 @@ pub fn merge_previews_with_profile(
                 continue;
             };
 
-            if let Some(thread_index) = threads.iter().position(|thread| thread.id == tid) {
+            if let Some(thread_index) = thread_positions.get(&tid).copied() {
                 let t = &mut threads[thread_index];
                 t.presentation.inbox.apply(entry);
                 let identities = &mut message_indices[thread_index];
@@ -6508,6 +6539,7 @@ pub fn merge_previews_with_profile(
                 let mut identities = MessageIdentityIndex::default();
                 identities.insert(&parsed, 0);
                 message_indices.push(identities);
+                thread_positions.insert(tid.clone(), threads.len());
                 threads.push(Thread {
                     presentation: SidebarPresentation {
                         inbox: {
@@ -6608,7 +6640,7 @@ pub fn merge_group_history_with_profile(
                 }
             }
         }
-        if let Some(m) = parse_chat_message_with_profile(it, profile_id) {
+        if let Some(m) = parse_chat_message_in_context(it, profile_id, thread.is_group) {
             if let Some(row) = identities.find(&thread.messages, &m) {
                 let existing = &mut thread.messages[row];
                 identities.remove(existing, row);
@@ -6719,7 +6751,7 @@ pub async fn get_friend_request_status(s: &Session, fid: &str) -> Result<Value> 
     let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         &s.domains.friend
     };
@@ -6746,7 +6778,7 @@ pub async fn send_friend_request(s: &Session, to_id: &str, msg: &str) -> Result<
     ]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         &s.domains.friend
     };
@@ -6777,7 +6809,7 @@ pub async fn accept_friend_request(s: &Session, fid: &str) -> Result<Value> {
     let body = obj(&[("fid", json!(fid)), ("language", json!("vi"))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         &s.domains.friend
     };
@@ -6808,7 +6840,7 @@ pub async fn undo_friend_request(s: &Session, fid: &str) -> Result<Value> {
     let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         &s.domains.friend
     };
@@ -6829,7 +6861,7 @@ pub async fn reject_friend_request(s: &Session, fid: &str) -> Result<Value> {
     let body = obj(&[("fid", json!(fid)), ("imei", json!(s.imei))]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         &s.domains.friend
     };
@@ -6886,7 +6918,7 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
     ]);
     let enc = s.encoded_params(&body)?;
     let host = if s.domains.friend.is_empty() {
-        "https://tt-friend-wpa.chat.zalo.me"
+        crate::endpoints::FRIEND
     } else {
         s.domains.friend.trim_end_matches('/')
     };
@@ -8518,30 +8550,23 @@ pub fn try_decrypt_e2ee_content(
     peer_id: &str,
     raw: &Value,
 ) -> Option<(String, bool)> {
-    let is_e2ee_meta = raw
-        .get("e2eeStatus")
-        .and_then(|v| v.as_i64())
-        .map(|code| (3000..4000).contains(&code))
-        .unwrap_or(false)
-        || raw
-            .get("isE2EE")
-            .and_then(|v| {
-                v.as_i64()
-                    .or_else(|| v.as_bool().map(|b| if b { 1 } else { 0 }))
-            })
-            .map(|n| n > 0)
-            .unwrap_or(false);
-
+    let is_e2ee_meta = crate::e2ee_integration::has_e2ee_metadata(raw);
     let ciphertext = crate::e2ee_integration::extract_ciphertext_bytes(raw);
     let is_wire = ciphertext
         .as_deref()
         .is_some_and(crate::e2ee_integration::is_e2ee_wire_payload);
 
-    if !is_e2ee_meta && !is_wire {
+    if !is_e2ee_meta
+        && (!is_wire
+            || !crate::e2ee_trial::enabled()
+            || !crate::e2ee_integration::is_thread_e2ee(profile_id, peer_id))
+    {
         return None;
     }
 
-    if crate::e2ee_integration::remember_e2ee_requirement(profile_id, peer_id).is_err() {
+    if is_e2ee_meta
+        && crate::e2ee_integration::remember_e2ee_requirement(profile_id, peer_id).is_err()
+    {
         crate::e2ee_trial::Trace::new(profile_id, peer_id, crate::e2ee_trial::Stage::Policy, 0)
             .finish(false);
         return Some(("[Không đọc được trạng thái bảo mật E2EE]".into(), false));
@@ -8551,7 +8576,22 @@ pub fn try_decrypt_e2ee_content(
             .finish(false);
         return Some(("[Tin nhắn mã hoá - thiếu dữ liệu]".into(), false));
     };
-    match crate::e2ee_integration::decrypt_message(profile_id, peer_id, &ciphertext) {
+    let message_id = pick_str(raw, &["msgId", "globalId", "messageId", "id"])
+        .filter(|id| !id.is_empty() && id != "0")
+        .or_else(|| {
+            pick_str(raw, &["cliMsgId", "clientId"])
+                .filter(|id| !id.is_empty())
+                .map(|id| format!("client:{id}"))
+        });
+    let Some(message_id) = message_id else {
+        return Some(("[Tin nhắn mã hoá - thiếu dữ liệu]".into(), false));
+    };
+    match crate::e2ee_integration::decrypt_received(
+        profile_id,
+        peer_id,
+        Some(&message_id),
+        &ciphertext,
+    ) {
         Ok(decrypted) => Some((decrypted.text, decrypted.identity_changed)),
         Err(_) => Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false)),
     }
@@ -8725,10 +8765,10 @@ mod a10_realtime_e2ee_tests {
             "Must detect E2EE via wire payload header without metadata"
         );
 
-        // 3. Fallback when profile_id is None: sets is_e2ee flag and placeholder
+        // Structural envelope syntax is not authenticated policy evidence.
         let parsed_no_profile = parse_chat_message_with_profile(&raw_push_no_meta, None).unwrap();
-        assert!(parsed_no_profile.is_e2ee);
-        assert_eq!(parsed_no_profile.text, "[Tin nhắn mã hoá]");
+        assert!(!parsed_no_profile.is_e2ee);
+        assert_eq!(parsed_no_profile.text, ct_b64);
     }
 
     #[tokio::test]

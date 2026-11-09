@@ -393,6 +393,7 @@ impl Desktop {
             if new_notice
                 && snapshot.notice.is_some()
                 && snapshot.enabled
+                && !snapshot.privacy_locked
                 && snapshot.sound
                 && background
                 && self

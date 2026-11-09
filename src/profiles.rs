@@ -1,7 +1,7 @@
 //! Multi-profile account registry (WP16 Sprint 5-6).
 //!
 //! Each profile has isolated:
-//! - SQLite databases (messages.db, e2ee.db)
+//! - Account-keyed history and crypto records
 //! - Session credentials
 //! - Conversation state
 //!
@@ -78,16 +78,86 @@ pub fn registry_path() -> PathBuf {
     crate::storage::root().join("profiles.json")
 }
 
-pub fn profile_root(profile_name: &str) -> PathBuf {
-    crate::storage::root().join("profiles").join(profile_name)
+static REGISTRY_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Publish the target and revoke stale profile writers under the same registry lock.
+pub fn activate_for_switch(current: &crate::session::Session, name: &str) -> Result<()> {
+    let _guard = REGISTRY_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Không khóa được danh sách tài khoản"))?;
+    let mut registry = ProfileRegistry::load()?;
+    registry.set_active(name)?;
+    registry.save()?;
+    current.revoke_runtime();
+    Ok(())
 }
 
-pub fn profile_messages_db(profile_name: &str) -> PathBuf {
-    profile_root(profile_name).join("messages.db")
+/// Register a real remembered login and its DPAPI-protected account-local session.
+/// # Errors
+/// Returns credential/registry persistence failures without publishing a broken profile.
+pub fn remember_session(session: &crate::session::Session) -> Result<()> {
+    if !crate::storage::remember_login()? {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        session.is_active() && !session.account_key().is_empty(),
+        "Chưa có tài khoản để ghi nhớ"
+    );
+    let _guard = REGISTRY_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Không khóa được danh sách tài khoản"))?;
+    anyhow::ensure!(session.is_active(), "Tài khoản đã thay đổi");
+    let uid = session.account_key();
+    let path = crate::storage::account_file(uid, "session.dat");
+    session.save_to_file(path.to_str().context("Đường dẫn phiên không hợp lệ")?)?;
+    let mut registry = ProfileRegistry::load()?;
+    let name = registry
+        .profiles
+        .values()
+        .find(|profile| profile.uid == uid)
+        .map(|profile| profile.name.clone())
+        .unwrap_or_else(|| {
+            use sha2::{Digest, Sha256};
+            format!("account-{:x}", Sha256::digest(uid.as_bytes()))
+        });
+    let login = session
+        .login
+        .as_ref()
+        .context("Thiếu thông tin tài khoản")?;
+    registry.add_profile(Profile {
+        name: name.clone(),
+        uid: uid.into(),
+        phone: None,
+        display_name: login.display_name.clone(),
+        avatar_url: (!login.avatar.is_empty()).then(|| login.avatar.clone()),
+        last_active: crate::login::unix_now(),
+        session_file: path,
+    });
+    registry.set_active(&name)?;
+    registry.save()
 }
 
-pub fn profile_e2ee_db(profile_name: &str) -> PathBuf {
-    profile_root(profile_name).join("e2ee.db")
+/// Forget only the selected account's cached credential; history and other accounts remain.
+pub fn forget_session(owner: &str) -> Result<()> {
+    let _guard = REGISTRY_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Không khóa được danh sách tài khoản"))?;
+    let path = crate::storage::account_file(owner, "session.dat");
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut registry = ProfileRegistry::load()?;
+    registry.profiles.retain(|_, profile| profile.uid != owner);
+    if registry
+        .active_profile
+        .as_ref()
+        .is_some_and(|name| !registry.profiles.contains_key(name))
+    {
+        registry.active_profile = None;
+    }
+    registry.save()
 }
 
 #[cfg(test)]

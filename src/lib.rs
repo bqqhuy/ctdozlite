@@ -12,7 +12,6 @@ pub mod e2ee_integration;
 pub mod e2ee_trial;
 pub mod endpoints;
 pub mod gui;
-pub mod lan_transfer;
 pub mod limits;
 pub mod logger;
 pub mod login;

@@ -540,11 +540,33 @@ impl MessageStore {
                     new.as_object_mut().unwrap().remove(key);
                 }
             }
+            let keep_decrypted = old
+                .pointer("/message_state/is_e2ee")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && !crate::e2ee_integration::is_placeholder(&old_text)
+                && crate::e2ee_integration::is_placeholder(&msg.text);
             let text = if recalled {
                 "[Tin nhắn đã thu hồi]"
+            } else if keep_decrypted {
+                &old_text
             } else {
                 &msg.text
             };
+            if keep_decrypted {
+                new["message_state"]["is_e2ee"] = serde_json::json!(true);
+                new["message_state"]["e2ee_identity_changed"] = old
+                    .pointer("/message_state/e2ee_identity_changed")
+                    .cloned()
+                    .unwrap_or(serde_json::json!(false));
+            }
+            if recalled {
+                crate::e2ee_integration::purge_received(
+                    self.conn.path(),
+                    &msg.thread_id,
+                    Some(&msg.msg_id),
+                )?;
+            }
             self.conn.execute(
                 "UPDATE messages SET raw_json=?1,msg_type=?2,text=?3 WHERE thread_id=?4 AND msg_id=?5",
                 params![new.to_string(),msg.msg_type,text,msg.thread_id,msg.msg_id])?;
@@ -677,6 +699,14 @@ impl MessageStore {
             params![thread, key],
         )?;
         tx.commit()?;
+        crate::e2ee_integration::purge_received(self.conn.path(), thread, Some(&key))?;
+        if !message.client_message_id.is_empty() {
+            crate::e2ee_integration::purge_received(
+                self.conn.path(),
+                thread,
+                Some(&format!("client:{}", message.client_message_id)),
+            )?;
+        }
         Ok(())
     }
 
@@ -977,6 +1007,7 @@ impl MessageStore {
             [format!("draft_mentions:{id}")],
         )?;
         tx.commit()?;
+        crate::e2ee_integration::purge_received(self.conn.path(), id, None)?;
         Ok(())
     }
 
@@ -994,6 +1025,7 @@ impl MessageStore {
             params![id],
         )?;
         tx.commit()?;
+        crate::e2ee_integration::purge_received(self.conn.path(), id, None)?;
         Ok(())
     }
 

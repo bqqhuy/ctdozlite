@@ -466,11 +466,20 @@ impl Drop for PhoneRun {
 #[cfg(not(test))]
 static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(not(test))]
+static HEALTHY: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+enum WriteCommand {
+    Event(Event),
+    Flush(std::sync::mpsc::SyncSender<bool>),
+}
+#[cfg(not(test))]
+static CHANNEL: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<WriteCommand>>> =
+    std::sync::OnceLock::new();
+#[cfg(not(test))]
 fn record(event: Event) {
-    use std::sync::{mpsc, OnceLock};
-    static CHANNEL: OnceLock<Option<mpsc::SyncSender<Event>>> = OnceLock::new();
+    use std::sync::mpsc;
     if let Some(sender) = CHANNEL.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel(256);
+        let (tx, rx) = mpsc::sync_channel::<WriteCommand>(256);
         std::thread::Builder::new()
             .name("safe-diagnostics".into())
             .spawn(move || {
@@ -478,25 +487,61 @@ fn record(event: Event) {
                 if crate::storage::private_dir(&root).is_err() {
                     return;
                 }
-                while let Ok(event) = rx.recv() {
-                    let count = DROPPED.swap(0, Ordering::AcqRel);
-                    if count > 0 {
-                        let _ = append(&root, &Event::DiagnosticDropped { count });
+                while let Ok(command) = rx.recv() {
+                    let dropped = DROPPED.swap(0, Ordering::AcqRel);
+                    let counted = dropped == 0
+                        || append(&root, &Event::DiagnosticDropped { count: dropped }).is_ok();
+                    match command {
+                        WriteCommand::Event(event) => {
+                            HEALTHY
+                                .store(counted && append(&root, &event).is_ok(), Ordering::Release);
+                        }
+                        WriteCommand::Flush(reply) => {
+                            // Each append closes its file; this barrier acknowledges all preceding writes.
+                            let _ = reply.send(counted && HEALTHY.load(Ordering::Acquire));
+                        }
                     }
-                    // Diagnostics are best effort and may never fail a chat/transfer operation.
-                    let _ = append(&root, &event);
                 }
             })
             .ok()
             .map(|_| tx)
     }) {
-        if sender.try_send(event).is_err() {
+        if sender.try_send(WriteCommand::Event(event)).is_err() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 #[cfg(test)]
 fn record(_event: Event) {}
+
+/// Whether the most recent diagnostic append succeeded; never performs filesystem I/O.
+pub(crate) fn healthy() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        HEALTHY.load(Ordering::Acquire)
+    }
+}
+
+/// Drain queued diagnostics with a fixed deadline, for launch validation and normal shutdown.
+#[cfg(not(test))]
+pub(crate) fn flush(timeout: std::time::Duration) -> bool {
+    let Some(Some(sender)) = CHANNEL.get() else {
+        return true;
+    };
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    if sender.try_send(WriteCommand::Flush(tx)).is_err() {
+        return false;
+    }
+    rx.recv_timeout(timeout).unwrap_or(false)
+}
+#[cfg(test)]
+pub(crate) fn flush(_timeout: std::time::Duration) -> bool {
+    true
+}
 
 /// Rotate the diagnostic log at this size, keeping one previous file (2 × 4 MiB).
 const ROTATE_BYTES: u64 = 4 * 1024 * 1024;

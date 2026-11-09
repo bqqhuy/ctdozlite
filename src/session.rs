@@ -8,7 +8,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::cookie::Jar;
 use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER};
 use reqwest::{Client, Method};
@@ -601,6 +601,11 @@ impl Session {
         self.active.load(Ordering::SeqCst)
     }
 
+    /// Revoke clones before publishing an account switch; credential cleanup follows in logout.
+    pub(crate) fn revoke_runtime(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
     pub fn account_key(&self) -> &str {
         self.login
             .as_ref()
@@ -648,6 +653,10 @@ impl Session {
         let text = serde_json::to_string_pretty(&saved)?;
         let protected = crate::storage::protect(text.as_bytes())?;
         crate::storage::atomic_write(&crate::storage::session_path(path), &protected)?;
+        drop(_lock);
+        if path == "session.json" && !self.account_key().is_empty() {
+            crate::profiles::remember_session(self)?;
+        }
         Ok(())
     }
 
@@ -657,6 +666,26 @@ impl Session {
         if !crate::storage::remember_login()? {
             crate::storage::remove_session()?;
             anyhow::bail!("Remember login is disabled");
+        }
+        if path == "session.json" && crate::storage::session_path(path).exists() {
+            let registry = crate::profiles::ProfileRegistry::load()?;
+            if let Some(profile) = registry.active() {
+                anyhow::ensure!(
+                    profile.session_file.is_absolute(),
+                    "Đường dẫn phiên tài khoản không hợp lệ"
+                );
+                self.load_from_file(
+                    profile
+                        .session_file
+                        .to_str()
+                        .context("Đường dẫn phiên không hợp lệ")?,
+                )?;
+                anyhow::ensure!(
+                    self.account_key() == profile.uid,
+                    "Phiên đăng nhập không khớp tài khoản đã chọn"
+                );
+                return Ok(());
+            }
         }
         let bytes = std::fs::read(crate::storage::session_path(path))?;
         let text = crate::storage::unprotect(&bytes)?;

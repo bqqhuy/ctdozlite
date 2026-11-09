@@ -30,7 +30,6 @@ pub(super) struct ToolsPanel {
     pub catalog_items: Vec<crate::business::ProductCatalogItem>,
     pub two_factor_status: Option<crate::account_recovery::TwoFactorStatus>,
     pub group_polls: Vec<crate::poll::PollItem>,
-    pub lan_peers: Vec<crate::lan_transfer::LanPeer>,
     pub new_poll_question: String,
     pub new_poll_option_1: String,
     pub new_poll_option_2: String,
@@ -172,7 +171,7 @@ impl ZaloGuiApp {
                         "Tin nhắn nhanh",
                         "Thiết bị & Bảo mật",
                         "Kho Media Server & zCloud",
-                        "Doanh nghiệp & Truyền LAN",
+                        "Doanh nghiệp & LAN",
                     ]
                     .iter()
                     .enumerate()
@@ -791,22 +790,17 @@ impl ZaloGuiApp {
 
     fn render_tools_business_lan(&mut self, ui: &mut egui::Ui) {
         ui.label(
-            RichText::new("🏢 Doanh nghiệp & Truyền tệp LAN (Zalo Parity C01 / C03)")
+            RichText::new("🏢 Danh mục doanh nghiệp")
                 .strong()
                 .size(14.0),
         );
-        ui.label("Quản lý danh mục sản phẩm OA/Doanh nghiệp và tính năng truyền tệp siêu tốc trong mạng nội bộ LAN.");
+        ui.label("Danh mục sản phẩm OA/Doanh nghiệp.");
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
             if ui.button("📋 Tải Danh mục sản phẩm").clicked() {
                 if let Some(tx) = WORKER_TX.get() {
                     let _ = tx.send(WorkerCmd::GetBusinessCatalog);
-                }
-            }
-            if ui.button("🔍 Quét thiết bị cùng mạng LAN").clicked() {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::DiscoverLanPeers);
                 }
             }
         });
@@ -840,41 +834,7 @@ impl ZaloGuiApp {
         }
 
         ui.separator();
-        ui.label(RichText::new("📡 Thiết bị ngang hàng trong mạng LAN:").strong());
-        if self.tools.lan_peers.is_empty() {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.label("💻");
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new("Sẵn sàng truyền nhận tệp P2P qua Wi-Fi / Ethernet")
-                                .strong(),
-                        );
-                        ui.label(
-                            "Cổng mặc định: 8998 • Bấm quét để tìm kiếm thiết bị Zalo lân cận",
-                        );
-                    });
-                });
-            });
-        } else {
-            for peer in &self.tools.lan_peers {
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("💻");
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(&peer.device_name).strong());
-                            ui.label(
-                                RichText::new(format!(
-                                    "IP: {}:{} • ID: {}",
-                                    peer.ip_address, peer.port, peer.peer_id
-                                ))
-                                .size(12.0),
-                            );
-                        });
-                    });
-                });
-            }
-        }
+        ui.label("Truyền tệp LAN chưa khả dụng: chưa có giao thức Zalo được xác minh.");
     }
 
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
@@ -1128,7 +1088,6 @@ mod tests {
         assert!(tools.two_factor_status.is_none());
         assert!(tools.group_todos.is_empty());
         assert!(tools.group_polls.is_empty());
-        assert!(tools.lan_peers.is_empty());
         assert!(tools.new_poll_question.is_empty());
     }
 }

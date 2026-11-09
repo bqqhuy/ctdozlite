@@ -45,3 +45,16 @@ Suite đầy đủ: 803 passed, 11 ignored; Clippy và check ARM64 đạt. Ignor
 chạy riêng; lỗi H.264 ban đầu đã có bản sửa và test native x64 chạy lại đạt.
 UI smoke có PNG ở hai kích thước/theme và đã kiểm tra trực quan.
 Không đóng task thiết bị hoặc chứng nhận Zalo interoperability từ các kết quả này.
+
+## Khắc phục audit độc lập 09/11/2026 trên 164af11
+
+Receipt E2EE schema 8 bảo vệ nhận trùng/lỗi lưu lịch sử, có kiểm tra rollback và
+purge recovery copy khi xóa tin; parser phân biệt nhóm và DM. Guard API thấp giữ
+cùng chính sách cho GUI/TUI. Thông báo native tôn trọng khóa và owner hiện tại;
+Hello availability không chặn GUI. Registry được tạo từ login thật và lựa chọn
+account được khôi phục sau restart, stale writer bị thu hồi.
+
+Kiểm tra local: 812 test mặc định, 815 test có feature, không lỗi; 12 bài ignored
+được tách riêng theo yêu cầu fixture/device/benchmark. Nguồn và giới hạn xem
+[remediation](../../docs/audits/2026-11-09-independent-remediation.md), ADR-0037.
+Không đóng các task nghiệm thu Zalo/tài khoản thật hoặc thiết bị ARM64 từ check x64.

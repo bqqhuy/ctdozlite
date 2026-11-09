@@ -23,7 +23,7 @@ pub fn open_crypto_db() -> Result<Connection> {
 
 /// Open a crypto store at an explicit path (used by tests and tooling).
 /// Current schema version of the SQLite E2EE key store (A40).
-pub const CURRENT_SCHEMA_VERSION: i32 = 7;
+pub const CURRENT_SCHEMA_VERSION: i32 = 8;
 
 pub fn open_crypto_db_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -31,7 +31,14 @@ pub fn open_crypto_db_at(path: &std::path::Path) -> Result<Connection> {
     }
     let mut conn = Connection::open(path)
         .with_context(|| format!("Không mở được E2EE database: {}", path.display()))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+    }
+    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+    // Reserve the writer before reading state that this transaction will advance.
+    conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
     migrate(&mut conn)?;
     Ok(conn)
 }
@@ -49,6 +56,16 @@ fn migrate(conn: &mut Connection) -> Result<()> {
 
     // Atomic transaction guard for all migration steps (A40)
     let tx = conn.transaction()?;
+    // Another connection may have finished migration while this writer was waiting.
+    let version: i32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        version <= CURRENT_SCHEMA_VERSION,
+        "Cơ sở dữ liệu E2EE cần phiên bản ứng dụng mới hơn"
+    );
+    if version == CURRENT_SCHEMA_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
     if version < 1 {
         tx.execute_batch(
             "
@@ -171,6 +188,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version < 7 {
         // Trial sends are never automatically repeated after uncertain delivery, even after restart.
         tx.execute_batch("CREATE TABLE e2ee_trial_attempts(profile_id TEXT NOT NULL,peer_id TEXT NOT NULL,client_id TEXT NOT NULL,PRIMARY KEY(profile_id,peer_id,client_id));")?;
+    }
+    if version < 8 {
+        tx.execute_batch("CREATE TABLE e2ee_received(profile_id TEXT NOT NULL,peer_id TEXT NOT NULL,message_id TEXT NOT NULL,payload_hash BLOB NOT NULL,plaintext_enc BLOB NOT NULL,identity_changed INTEGER NOT NULL,history_path TEXT NOT NULL,PRIMARY KEY(profile_id,peer_id,message_id));
+            CREATE INDEX e2ee_received_history ON e2ee_received(history_path,peer_id,message_id);")?;
     }
     tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     tx.commit()?;
@@ -889,7 +910,7 @@ mod tests {
         .unwrap();
         save_trusted_identity(&conn, "owner", "real-peer", &[42; 32]).unwrap();
         conn.execute_batch(
-            "DROP TABLE prekey_sequence; DROP TABLE e2ee_required; DROP TABLE e2ee_trial_attempts; PRAGMA user_version=4;",
+            "DROP TABLE prekey_sequence; DROP TABLE e2ee_required; DROP TABLE e2ee_trial_attempts; DROP TABLE e2ee_received; PRAGMA user_version=4;",
         )
         .unwrap();
         drop(conn);

@@ -16,6 +16,10 @@ pub fn configure(requested: bool) -> Result<()> {
     ENABLED.store(requested, Ordering::Release);
     if requested {
         Trace::new("", "", Stage::Startup, 0).finish(true);
+        if !crate::transfer_diagnostics::flush(std::time::Duration::from_secs(2)) {
+            ENABLED.store(false, Ordering::Release);
+            anyhow::bail!("Không ghi được log E2EE; kiểm tra thư mục diagnostics trước khi thử");
+        }
     }
     Ok(())
 }
@@ -23,6 +27,20 @@ pub fn configure(requested: bool) -> Result<()> {
 /// Whether this process explicitly opted into the unverified protocol experiment.
 pub fn enabled() -> bool {
     cfg!(feature = "experimental-e2ee") && ENABLED.load(Ordering::Acquire)
+}
+
+/// Persist pending diagnostics after the GUI/CLI has stopped, with a bounded wait.
+pub struct LoggingGuard;
+impl Drop for LoggingGuard {
+    fn drop(&mut self) {
+        // Shutdown is bounded even when storage is unavailable.
+        let _ = crate::transfer_diagnostics::flush(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Inspect diagnostic writer health without blocking the UI.
+pub fn logging_healthy() -> bool {
+    crate::transfer_diagnostics::healthy()
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -124,6 +142,7 @@ pub(crate) struct Diagnostic {
     response_shape: u8,
     experimental: bool,
     version: &'static str,
+    build_revision: &'static str,
     arch: &'static str,
     failure: Option<Failure>,
 }
@@ -181,6 +200,7 @@ impl Trace {
                 response_shape: 0,
                 experimental: enabled(),
                 version: crate::PRODUCT_VERSION,
+                build_revision: option_env!("GITHUB_SHA").unwrap_or("local"),
                 arch: std::env::consts::ARCH,
                 failure: None,
             },
@@ -316,6 +336,10 @@ mod experiment {
         trace: &mut Trace,
     ) -> Result<Value> {
         anyhow::ensure!(enabled(), "Chưa bật chế độ E2EE thử nghiệm");
+        anyhow::ensure!(
+            logging_healthy(),
+            "Log E2EE đang lỗi; chưa gửi thử để tránh mất bằng chứng"
+        );
         anyhow::ensure!(
             profile == s.account_key() && !profile.is_empty() && !peer.is_empty(),
             "Sai tài khoản E2EE"
@@ -544,8 +568,10 @@ mod tests {
         let conn = crate::crypto::store::open_crypto_db_at(&path).unwrap();
         conn.execute("INSERT INTO e2ee_required VALUES('owner','peer')", [])
             .unwrap();
-        conn.execute_batch("DROP TABLE e2ee_trial_attempts; PRAGMA user_version=6;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE e2ee_trial_attempts; DROP TABLE e2ee_received; PRAGMA user_version=6;",
+        )
+        .unwrap();
         drop(conn);
         let conn = crate::crypto::store::open_crypto_db_at(&path).unwrap();
         assert_eq!(
