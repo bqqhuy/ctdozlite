@@ -1,9 +1,14 @@
-param([switch]$SkipTests)
+param([switch]$SkipTests, [switch]$ExperimentalE2ee)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Set-Location (Join-Path $PSScriptRoot '..')
 $target = 'aarch64-pc-windows-msvc'
 $env:CMAKE_POLICY_VERSION_MINIMUM = '3.5'
+$featureArgs = @()
+if ($ExperimentalE2ee) {
+    if ($env:GITHUB_REF -like 'refs/tags/*') { throw 'Experimental E2EE builds cannot publish a release tag' }
+    $featureArgs = @('--features','experimental-e2ee')
+}
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) {
@@ -39,7 +44,13 @@ $hostInfo = (& rustc -vV) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $hostInfo -notmatch 'host: aarch64-pc-windows-msvc') { throw 'Use native Rust ARM64 MSVC on Windows ARM64' }
 New-Item -ItemType Directory -Force dist | Out-Null
 if (-not $SkipTests) {
-    $testOutput = & cargo test --locked --all-targets --target $target 2>&1
+    $testPreviousData = $env:CTDOZ_DATA_DIR
+    $testPreviousLoopback = $env:CTDOZ_ALLOW_TEST_LOOPBACK
+    try {
+    $testRoot = Join-Path ([IO.Path]::GetTempPath()) ('ctdoz-ci-tests-' + [guid]::NewGuid())
+    $env:CTDOZ_DATA_DIR = $testRoot
+    $env:CTDOZ_ALLOW_TEST_LOOPBACK = '1'
+    $testOutput = & cargo test --locked --all-targets --target $target @featureArgs 2>&1
     $testOutput | Write-Host
     $testOutput | Set-Content dist/cargo-test.log -Encoding utf8
     if ($LASTEXITCODE -ne 0) {
@@ -85,13 +96,17 @@ if (-not $SkipTests) {
         $expected = [regex]::Match((Get-Content src/phone_sync/assets.rs -Raw), 'CODEC_SHA256: &str =\s*"([a-f0-9]{64})"').Groups[1].Value
         if (-not $expected -or (Get-FileHash -Algorithm SHA256 $codecPath).Hash.ToLowerInvariant() -ne $expected) { throw 'Official codec hash mismatch' }
         $env:CTDOZ_CODEC_TEST_PATH = $codecPath
-        Invoke-Checked cargo @('test', '--locked', '--lib', '--target', $target, 'phone_sync::codec', '--', '--ignored')
+        Invoke-Checked cargo (@('test', '--locked', '--lib', '--target', $target, 'phone_sync::codec') + $featureArgs + @('--', '--ignored'))
     } finally {
         $env:CTDOZ_CODEC_TEST_PATH = $previousCodec
         Remove-Item $codecPath -Force -ErrorAction SilentlyContinue
     }
+    } finally {
+        $env:CTDOZ_DATA_DIR = $testPreviousData
+        $env:CTDOZ_ALLOW_TEST_LOOPBACK = $testPreviousLoopback
+    }
 }
-Invoke-Checked cargo @('build', '--locked', '--release', '--bin', 'ctdozlite', '--target', $target)
+Invoke-Checked cargo (@('build', '--locked', '--release', '--bin', 'ctdozlite', '--target', $target) + $featureArgs)
 $binary = (Resolve-Path "target\$target\release\ctdozlite.exe").Path
 Assert-Arm64 $binary
 $dumpbin = Get-Dumpbin
@@ -175,7 +190,9 @@ try {
         @{ Size='1020x700'; Scale='1'; Tab='tools-2'; ToolsTab=2 },
         @{ Size='1020x700'; Scale='1'; Tab='tools-3'; ToolsTab=3 },
         @{ Size='1020x700'; Scale='1'; Tab='tools-4'; ToolsTab=4 }
+        @{ Size='1020x700'; Scale='1'; Tab='e2ee-trial'; E2eeTrial=$true }
     )) {
+        if ($case.ContainsKey('E2eeTrial') -and -not $ExperimentalE2ee) { continue }
         $fixture = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
         $env:CTDOZ_DATA_DIR = $fixture
         $png = Join-Path (Resolve-Path dist) "ui-$($case.Size)-$($case.Scale)-$($case.Tab).png"
@@ -184,10 +201,13 @@ try {
         $process = [Diagnostics.Process]::new()
         $process.StartInfo.FileName = $binary
         $process.StartInfo.UseShellExecute = $false
+        if ($case.ContainsKey('E2eeTrial')) { $process.StartInfo.ArgumentList.Add('--e2ee-experimental') }
         $process.StartInfo.CreateNoWindow = $true
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
-        foreach ($argument in @('--gui', '--dev', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
+        if ($case.ContainsKey('E2eeTrial')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-group-long') }
+        else { $process.StartInfo.ArgumentList.Add('--dev') }
+        foreach ($argument in @('--gui', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
             $process.StartInfo.ArgumentList.Add($argument)
         }
         if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
@@ -222,13 +242,20 @@ try {
                 throw "GUI renderer smoke failed: $($case.Size), exit=$($process.ExitCode)"
             }
         } finally { $process.Dispose() }
-        Remove-Item -Recurse -Force $fixture -ErrorAction SilentlyContinue
+        if ($case.ContainsKey('E2eeTrial')) {
+            Copy-Item -LiteralPath (Join-Path $fixture 'diagnostics\sync-media.jsonl') -Destination 'dist\e2ee-trial.log'
+        }
+        $resolvedFixture = [IO.Path]::GetFullPath($fixture)
+        $tempBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
+        if (-not $resolvedFixture.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe smoke fixture cleanup path' }
+        Remove-Item -LiteralPath $resolvedFixture -Recurse -Force -ErrorAction SilentlyContinue
     }
 } finally {
     $env:CTDOZ_DATA_DIR = $previousData
     $env:CTDOZ_RENDERER = $previousRenderer
 }
 $assetVersion = $productVersion.TrimStart('v')
+if ($ExperimentalE2ee) { $assetVersion += '-trial' }
 Copy-Item $binary "dist\ctdozlite-$assetVersion-portable-windows-arm64.exe" -Force
 $compiler = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $compiler) { throw 'Install Inno Setup 6.7.1 or newer before packaging' }
@@ -247,6 +274,8 @@ $sourceCommit = (& git rev-parse HEAD).Trim()
     minimum_windows_build = 22000
     crt = 'static'
     signed = $false
+    experimental_e2ee = [bool]$ExperimentalE2ee
+    runtime_opt_in_required = [bool]$ExperimentalE2ee
 } | ConvertTo-Json | Set-Content dist\build-info-windows-arm64.json -Encoding utf8
 Get-ChildItem dist\*.exe | Sort-Object Name | ForEach-Object {
     "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"

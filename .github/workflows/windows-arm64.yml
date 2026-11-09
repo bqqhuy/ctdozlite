@@ -2,6 +2,11 @@ name: Windows ARM64 (native build)
 
 on:
   workflow_dispatch:
+    inputs:
+      experimental_e2ee:
+        description: Build an opt-in E2EE trial artifact (never publish)
+        type: boolean
+        default: false
   push:
     branches: [main]
     tags: ['v*']
@@ -72,7 +77,9 @@ jobs:
           cache-on-failure: true
       - name: Tests, native PE smoke check and package
         shell: pwsh
-        run: ./scripts/build-windows-arm64.ps1
+        run: |
+          $trial = '${{ inputs.experimental_e2ee }}' -eq 'true'
+          ./scripts/build-windows-arm64.ps1 -ExperimentalE2ee:$trial
       - name: Print cargo test log on failure
         if: failure()
         shell: pwsh
@@ -91,13 +98,13 @@ jobs:
           if-no-files-found: ignore
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ctdozlite-windows-arm64
+          name: ctdozlite-windows-arm64${{ inputs.experimental_e2ee && '-trial' || '' }}
           path: dist/*
           if-no-files-found: error
   publish:
     name: Attach ARM64 binaries and checksums
     needs: windows-arm64
-    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request' && inputs.experimental_e2ee != true
     runs-on: windows-11-arm
     permissions:
       contents: write
