@@ -1,6 +1,10 @@
 use super::*;
 
 pub enum WorkerCmd {
+    PrepareE2eeTrial {
+        owner: String,
+        peer_id: String,
+    },
     SaveAppSettings {
         settings: serde_json::Value,
         persist_session: bool,
@@ -1285,6 +1289,21 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                                 crate::store::MessageStore::open(s.history_path())?.save_composer_document(&id,&value)
                             }).await.map_err(|_|"Không lưu được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không lưu được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftSaved{owner,thread,generation,text,result});egui_ctx.request_repaint();
+                        }
+                        WorkerCmd::PrepareE2eeTrial { owner, peer_id } => {
+                            let account = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let trace = crate::e2ee_trial::Trace::new(&owner, &peer_id, crate::e2ee_trial::Stage::Policy, 0);
+                                let result = (|| -> anyhow::Result<()> {
+                                    anyhow::ensure!(crate::e2ee_trial::enabled(), "Chưa bật E2EE thử nghiệm");
+                                    anyhow::ensure!(account.is_active() && !owner.is_empty() && account.account_key() == owner, "Tài khoản đã thay đổi");
+                                    crate::e2ee_integration::remember_e2ee_requirement(&owner, &peer_id)
+                                })();
+                                trace.finish_result(&result);
+                                let result = result.map_err(|_| "Không bật được E2EE thử nghiệm cho hội thoại".to_owned());
+                                let _ = tx.send(GuiEvent::E2eeTrialPrepared { owner, peer_id, result }); ctx.request_repaint();
+                            });
                         }
                         WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
                             let account = session.lock().await.clone();

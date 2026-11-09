@@ -14,6 +14,9 @@ establish Zalo PC/Web interoperability.
 
 ## Decision
 
+Amended by ADR-0036 for maintainer-authorized, double-opt-in experimental
+testing only; the default production decision below remains unchanged.
+
 Unknown — AMBIGUOUS: refuse production encrypted sends, prekey upload/fetch,
 decryption with the custom envelope, and safety-number verification without
 emitting a speculative server request or downgrading to plaintext. Retain the

@@ -4,7 +4,11 @@
 
 - Chặn các đường E2EE chat và xác minh danh tính chưa có hợp đồng Zalo PC/Web
   được kiểm chứng; không tự hạ xuống gửi plaintext. Không gửi envelope tự định
-  nghĩa lên máy chủ. Xem ADR-0035.
+  nghĩa lên máy chủ trong chế độ mặc định. Xem ADR-0035.
+- Bổ sung thử E2EE chưa xác minh khi build với `experimental-e2ee` và chạy với
+  `--e2ee-experimental`: bật riêng từng hội thoại, log đã che dữ liệu, chặn thử lại
+  cùng lần gửi qua cả khởi động lại (crypto schema 7). Chưa xác nhận tương thích
+  Zalo. Xem [hướng dẫn thử](docs/E2EE_TRIAL.md) và ADR-0036.
 - Sửa transaction ratchet/prekey, phục hồi khi mất gói đầu, dấu replay, khóa xác
   minh giả và cache trạng thái xác minh cũ. Đây là kiểm chứng model local.
 - Cô lập worker/kênh sự kiện khi đổi profile; giữ kết quả tác vụ khi app khóa;

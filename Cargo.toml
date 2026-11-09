@@ -9,6 +9,9 @@ repository = "https://github.com/bqqhuy/ctdozlite"
 license = "MIT OR Apache-2.0"
 default-run = "ctdozlite"
 
+[features]
+experimental-e2ee = []
+
 [dependencies]
 aes = "0.8"
 cbc = "0.1"

@@ -11,17 +11,21 @@ use crate::crypto::session::E2eeManager;
 static E2EE_GLOBAL_LOCK: std::sync::LazyLock<Mutex<()>> =
     std::sync::LazyLock::new(|| Mutex::new(()));
 
-fn lock_e2ee() -> Result<std::sync::MutexGuard<'static, ()>> {
+pub(crate) fn lock_e2ee() -> Result<std::sync::MutexGuard<'static, ()>> {
     E2EE_GLOBAL_LOCK
         .lock()
         .map_err(|_| anyhow::anyhow!("Không đọc được khóa trạng thái E2EE"))
 }
 
-/// Refuse server operations until official ciphertext and prekey contracts are verified.
+/// Enforce the default refusal, with an explicit exception for the opt-in experiment.
 /// # Errors
-/// Always reports the missing contract; synthetic local crypto remains testable.
+/// Reports the missing contract unless the explicit experimental launch is enabled.
 pub fn require_verified_contract() -> Result<()> {
-    Err(unverified_contract_error())
+    if crate::e2ee_trial::enabled() {
+        Ok(())
+    } else {
+        Err(unverified_contract_error())
+    }
 }
 
 /// Explain the unavailable production contract without exposing keys or message content.
@@ -78,11 +82,25 @@ pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
 ///
 /// The custom local envelope is not an official Zalo container.
 pub fn decrypt_message(
-    _profile_id: &str,
-    _peer_id: &str,
-    _payload: &[u8],
+    profile_id: &str,
+    peer_id: &str,
+    payload: &[u8],
 ) -> Result<crate::crypto::session::DecryptedMessage> {
-    Err(unverified_contract_error())
+    use crate::e2ee_trial::{Stage, Trace};
+    let mut trace = Trace::new(profile_id, peer_id, Stage::Contract, payload.len());
+    let result = (|| {
+        require_verified_contract()?;
+        trace.stage(Stage::Decode);
+        let decoded = crate::crypto::wire::deserialize(payload)?;
+        trace.envelope(&decoded, payload.len());
+        trace.stage(Stage::Load);
+        let _guard = lock_e2ee()?;
+        let manager = get_manager(profile_id)?;
+        trace.stage(Stage::DecryptPersist);
+        manager.decrypt(peer_id, payload)
+    })();
+    trace.finish_result(&result);
+    result
 }
 
 /// Detect E2EE status codes.

@@ -1692,7 +1692,7 @@ fn pick_str(v: &Value, keys: &[&str]) -> Option<String> {
 // HTTP 200 (including an empty long-poll-style response) is not a send receipt.
 // Keep the server error marker used by session expiry classification, without
 // copying arbitrary server text or decrypted payloads into diagnostics.
-fn confirmed_send(response: Value) -> Result<Value> {
+pub(crate) fn confirmed_send(response: Value) -> Result<Value> {
     let response = confirmed_upload(response)?;
     anyhow::ensure!(
         !sent_server_id(&response).is_empty(),
@@ -8481,17 +8481,35 @@ mod contact_and_batch_tests {
     }
 }
 
-/// Refuse encrypted sends until the official wire and server contracts are verified.
+/// Send only with explicit experimental opt-in while the official contract is unknown.
 /// # Errors
-/// Always returns an unsupported-contract error without network or ratchet side effects.
+/// Defaults to an unsupported-contract error; trial mode reports crypto, transport or ACK failure.
 pub async fn send_e2ee_message(
-    _s: &Session,
-    _profile_id: &str,
-    _to_id: &str,
-    _text: &str,
-    _now: u64,
+    s: &Session,
+    profile_id: &str,
+    to_id: &str,
+    text: &str,
+    now: u64,
 ) -> Result<Value> {
-    Err(crate::e2ee_integration::unverified_contract_error())
+    use crate::e2ee_trial::{Stage, Trace};
+    let trace = Trace::new(profile_id, to_id, Stage::Contract, text.len());
+    #[cfg(feature = "experimental-e2ee")]
+    {
+        if let Err(error) = crate::e2ee_integration::require_verified_contract() {
+            trace.finish(false);
+            return Err(error);
+        }
+        let mut trace = trace;
+        let result = crate::e2ee_trial::send(s, profile_id, to_id, text, now, &mut trace).await;
+        trace.finish_result(&result);
+        result.context("E2EE thử nghiệm thất bại; xem nhật ký chẩn đoán")
+    }
+    #[cfg(not(feature = "experimental-e2ee"))]
+    {
+        let _ = (s, now);
+        trace.finish(false);
+        Err(crate::e2ee_integration::unverified_contract_error())
+    }
 }
 
 // E2EE decrypt helper for parse_chat_message (A10)
@@ -8524,17 +8542,18 @@ pub fn try_decrypt_e2ee_content(
     }
 
     if crate::e2ee_integration::remember_e2ee_requirement(profile_id, peer_id).is_err() {
+        crate::e2ee_trial::Trace::new(profile_id, peer_id, crate::e2ee_trial::Stage::Policy, 0)
+            .finish(false);
         return Some(("[Không đọc được trạng thái bảo mật E2EE]".into(), false));
     }
     let Some(ciphertext) = ciphertext else {
+        crate::e2ee_trial::Trace::new(profile_id, peer_id, crate::e2ee_trial::Stage::Decode, 0)
+            .finish(false);
         return Some(("[Tin nhắn mã hoá - thiếu dữ liệu]".into(), false));
     };
     match crate::e2ee_integration::decrypt_message(profile_id, peer_id, &ciphertext) {
         Ok(decrypted) => Some((decrypted.text, decrypted.identity_changed)),
-        Err(e) => {
-            eprintln!("E2EE decrypt failed for peer {peer_id}: {e}");
-            Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false))
-        }
+        Err(_) => Some(("[Tin nhắn mã hoá - không giải mã được]".to_string(), false)),
     }
 }
 

@@ -151,6 +151,9 @@ pub(crate) enum RoundOutcome {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event {
+    E2ee {
+        diagnostic: crate::e2ee_trial::Diagnostic,
+    },
     SocketClosed {
         epoch: u64,
         end: SocketEnd,
@@ -240,6 +243,12 @@ pub(crate) fn tag(id: &str) -> u64 {
     let mut tag = [0; 8];
     tag.copy_from_slice(&digest[..8]);
     u64::from_le_bytes(tag)
+}
+/// Persist only the allowlisted E2EE trace schema, using the bounded writer.
+pub(crate) fn e2ee(diagnostic: &crate::e2ee_trial::Diagnostic) {
+    record(Event::E2ee {
+        diagnostic: diagnostic.clone(),
+    });
 }
 fn control_event(id: &str, control: PhoneControl) -> Event {
     Event::PhoneControl {

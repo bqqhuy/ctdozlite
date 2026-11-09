@@ -71,6 +71,11 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 pub enum GuiEvent {
+    E2eeTrialPrepared {
+        owner: String,
+        peer_id: String,
+        result: Result<(), String>,
+    },
     AppSettingsSaved(Result<(), String>),
     ProfilesLoaded {
         owner: String,
@@ -865,6 +870,7 @@ pub struct ZaloGuiApp {
     doc_viewer: Option<doc_viewer::DocViewerModal>,
     safety_number_modal: Option<SafetyNumberModalState>,
     trusted_peers: HashSet<String>,
+    trial_peers: HashSet<String>,
     profiles: Vec<crate::profiles::Profile>,
     profiles_requested: bool,
     sidebar_order: Option<SidebarOrderCache>,
@@ -1143,6 +1149,7 @@ impl ZaloGuiApp {
             doc_viewer: None,
             safety_number_modal: None,
             trusted_peers: HashSet::new(),
+            trial_peers: HashSet::new(),
             profiles: Vec::new(),
             profiles_requested: false,
             sidebar_order: None,
@@ -1793,6 +1800,7 @@ impl ZaloGuiApp {
         self.profiles.clear();
         self.profiles_requested = false;
         self.trusted_peers.clear();
+        self.trial_peers.clear();
         self.safety_number_modal = None;
         self.typing_map.clear();
         self.typing_sent.clear();
@@ -1979,6 +1987,21 @@ impl ZaloGuiApp {
                         }
                     }
                     ctx.request_repaint();
+                }
+                GuiEvent::E2eeTrialPrepared {
+                    owner,
+                    peer_id,
+                    result,
+                } => {
+                    if owner == self.user_uin {
+                        match result {
+                            Ok(()) => {
+                                self.trial_peers.insert(peer_id);
+                                self.show_toast("Đã bật thử E2EE. Tin văn bản tiếp theo sẽ thử gửi mã hóa; không tự quay về gửi thường.");
+                            }
+                            Err(message) => self.show_toast(message),
+                        }
+                    }
                 }
                 GuiEvent::SafetyNumberFailed {
                     owner,

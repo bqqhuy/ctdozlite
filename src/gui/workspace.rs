@@ -1496,10 +1496,22 @@ impl ZaloGuiApp {
                                     let sn_btn_lbl = if is_trusted {
                                         format!("{} Mã an toàn (Đã xác minh)", lucide::SHIELD_CHECK)
                                     } else {
-                                        format!("{} E2EE (chưa khả dụng)", lucide::LOCK)
+                                        format!("{} E2EE ({})", lucide::LOCK, if crate::e2ee_trial::enabled() { "thử nghiệm" } else { "chưa khả dụng" })
                                     };
                                     if ui.button(sn_btn_lbl).clicked() {
                                         self.open_safety_number_modal(d_id.clone(), d_name.to_string());
+                                    }
+                                    if crate::e2ee_trial::enabled() {
+                                        ui.small("Thử E2EE sẽ chặn gửi thường cho hội thoại này, kể cả khi tắt chế độ thử.");
+                                        if self.trial_peers.contains(d_id) {
+                                            ui.label("Đã bật thử E2EE cho hội thoại");
+                                        } else if ui.button("Bật thử E2EE cho hội thoại này").clicked() {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                if tx.send(WorkerCmd::PrepareE2eeTrial { owner: self.user_uin.clone(), peer_id: d_id.clone() }).is_err() {
+                                                    self.show_toast("Không kết nối được bộ xử lý nền");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 if ui.button(if d_is_group {"Quản lý nhóm"}else{"Nhóm chung"}).clicked(){
@@ -1790,6 +1802,9 @@ impl ZaloGuiApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
+                if crate::e2ee_trial::enabled() {
+                    ui.colored_label(egui::Color32::YELLOW, "E2EE THỬ NGHIỆM — giao thức chưa xác minh; chỉ thử với tin nhắn kiểm tra.");
+                }
                 if let Some((thread_id, thread_name, thread_avatar, is_group, _msg_count)) =
                     thread_meta
                 {

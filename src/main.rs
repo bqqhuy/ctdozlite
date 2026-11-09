@@ -35,6 +35,24 @@ async fn main() -> Result<()> {
     }
     let profile = storage::profile_from_args(&args)?;
     storage::init_profile(args.iter().any(|a| a == "--portable"), profile.as_deref())?;
+    let e2ee_trial = args.iter().any(|a| a == "--e2ee-experimental");
+    anyhow::ensure!(
+        !e2ee_trial
+            || !args.iter().any(|a| matches!(
+                a.as_str(),
+                "--dev" | "-v" | "--verbose" | "-d" | "--dump" | "--dump-raw"
+            )),
+        "E2EE thử nghiệm dùng log đã che dữ liệu; không kết hợp với --dev hoặc --dump"
+    );
+    zalo_rust::e2ee_trial::configure(e2ee_trial)?;
+    if e2ee_trial {
+        println!(
+            "E2EE THỬ NGHIỆM: giao thức chưa xác minh. Log: {}",
+            storage::root()
+                .join("diagnostics/sync-media.jsonl")
+                .display()
+        );
+    }
     let proxy = zalo_rust::proxy::from_args(&args, std::env::var("CTDOZ_PROXY").ok())?;
     if let Some(config) = &proxy {
         println!("Proxy: {}", config.redacted());

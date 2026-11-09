@@ -9,6 +9,7 @@ pub mod clock;
 pub mod crypto;
 pub mod device;
 pub mod e2ee_integration;
+pub mod e2ee_trial;
 pub mod endpoints;
 pub mod gui;
 pub mod lan_transfer;

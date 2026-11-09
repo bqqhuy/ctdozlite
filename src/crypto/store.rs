@@ -23,7 +23,7 @@ pub fn open_crypto_db() -> Result<Connection> {
 
 /// Open a crypto store at an explicit path (used by tests and tooling).
 /// Current schema version of the SQLite E2EE key store (A40).
-pub const CURRENT_SCHEMA_VERSION: i32 = 6;
+pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 pub fn open_crypto_db_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -167,6 +167,10 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version < 6 {
         tx.execute_batch("CREATE TABLE e2ee_required(profile_id TEXT NOT NULL,peer_id TEXT NOT NULL,PRIMARY KEY(profile_id,peer_id));
             INSERT INTO e2ee_required SELECT DISTINCT profile_id,peer_id FROM signal_session;")?;
+    }
+    if version < 7 {
+        // Trial sends are never automatically repeated after uncertain delivery, even after restart.
+        tx.execute_batch("CREATE TABLE e2ee_trial_attempts(profile_id TEXT NOT NULL,peer_id TEXT NOT NULL,client_id TEXT NOT NULL,PRIMARY KEY(profile_id,peer_id,client_id));")?;
     }
     tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     tx.commit()?;
@@ -885,7 +889,7 @@ mod tests {
         .unwrap();
         save_trusted_identity(&conn, "owner", "real-peer", &[42; 32]).unwrap();
         conn.execute_batch(
-            "DROP TABLE prekey_sequence; DROP TABLE e2ee_required; PRAGMA user_version=4;",
+            "DROP TABLE prekey_sequence; DROP TABLE e2ee_required; DROP TABLE e2ee_trial_attempts; PRAGMA user_version=4;",
         )
         .unwrap();
         drop(conn);

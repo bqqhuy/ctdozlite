@@ -151,6 +151,10 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
         .outgoing_job
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Thiếu dữ liệu gửi lại"))?;
+    anyhow::ensure!(
+        !(job.is_group && (message.is_e2ee || job.is_e2ee)),
+        "Chưa hỗ trợ E2EE thử nghiệm cho nhóm"
+    );
     if job.is_group {
         let snapshot = crate::group_state::snapshot(s, to, false).await?;
         anyhow::ensure!(
