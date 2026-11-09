@@ -12,6 +12,23 @@ pub struct Impact {
     pub groups: HashSet<String>,
     pub all_groups: bool,
 }
+
+impl Impact {
+    /// Invalidation impact when switching accounts (A20):
+    /// invalidates all cached profiles, privacy, relations, account, hidden chats and group states.
+    pub fn for_account_switch() -> Self {
+        Self {
+            activities: Vec::new(),
+            profiles: true,
+            privacy: true,
+            relations: true,
+            account: true,
+            hidden: true,
+            groups: HashSet::new(),
+            all_groups: true,
+        }
+    }
+}
 /// Only native control queues may invalidate account or group state. Chat text is never control.
 pub fn from_frame(event: &crate::socket::WsEvent) -> Impact {
     if event.is_voip_ish() {
@@ -155,6 +172,16 @@ mod tests {
         assert!(hint.hidden && hint.account);
         assert!(!parse(&json!({"act_type":"typing"})).account);
         assert!(parse(&json!({"act_type":"group","data":{}})).all_groups);
+    }
+    #[test]
+    fn account_switch_invalidates_all_account_state() {
+        let impact = Impact::for_account_switch();
+        assert!(impact.account);
+        assert!(impact.profiles);
+        assert!(impact.privacy);
+        assert!(impact.relations);
+        assert!(impact.hidden);
+        assert!(impact.all_groups);
     }
 }
 

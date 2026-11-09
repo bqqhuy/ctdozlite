@@ -1783,6 +1783,11 @@ pub(crate) async fn send_message_with_client_id(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
+    // Audit A01: fail-closed if E2EE is required for this direct peer.
+    // Never send to plaintext endpoint when thread requires E2EE.
+    if crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id) {
+        anyhow::bail!("Hội thoại yêu cầu mã hóa đầu cuối (E2EE); không được gửi qua endpoint thường");
+    }
     let body = obj(&[
         ("toid", json!(to_id)),
         ("message", json!(text)),
@@ -2703,7 +2708,8 @@ pub fn is_safe_opengraph_url(parsed: &reqwest::Url, allow_test_loopback: bool) -
     }
     if let Some(host_str) = parsed.host_str() {
         let unbracketed = host_str.trim_start_matches('[').trim_end_matches(']');
-        if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        let ip_str = unbracketed.split('%').next().unwrap_or(unbracketed);
+        if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
             let is_loopback = match ip {
                 std::net::IpAddr::V4(v4) => v4.is_loopback(),
                 std::net::IpAddr::V6(v6) => v6.is_loopback(),
@@ -2716,9 +2722,14 @@ pub fn is_safe_opengraph_url(parsed: &reqwest::Url, allow_test_loopback: bool) -
                 return false;
             }
         }
-        let host_lower = unbracketed.to_ascii_lowercase();
+        let host_lower = ip_str.to_ascii_lowercase();
+        // A35: Explicit string guard against IPv6 link-local (fe80::/10), site-local (fec0::/10) and internal names
         if !allow_test_loopback
-            && (host_lower == "localhost"
+            && (host_lower.starts_with("fe80:")
+                || host_lower.starts_with("fec0:")
+                || host_lower.starts_with("fc00:")
+                || host_lower.starts_with("fd")
+                || host_lower == "localhost"
                 || host_lower.ends_with(".localhost")
                 || host_lower.ends_with(".local")
                 || host_lower.ends_with(".internal"))
@@ -2756,13 +2767,12 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
         .redirect(redirect_policy)
         .build()
         .ok()?;
+    let user_agent = crate::endpoints::sanitize_header_value("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)");
+    let accept_lang = crate::endpoints::sanitize_header_value("vi-VN,vi;q=0.9,en-US;q=0.8");
     let resp = client
         .get(url)
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
-        )
-        .header("Accept-Language", "vi-VN,vi;q=0.9,en-US;q=0.8")
+        .header("User-Agent", user_agent)
+        .header("Accept-Language", accept_lang)
         .send()
         .await
         .ok()?;
@@ -2960,6 +2970,10 @@ pub(crate) async fn send_link_message_with_client_id(
 ) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
+    }
+    // Audit A01: fail-closed if E2EE is required for this direct peer.
+    if !is_group && crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id) {
+        anyhow::bail!("Hội thoại yêu cầu mã hóa đầu cuối (E2EE); không được gửi liên kết qua endpoint thường");
     }
     let msg_str = if text.trim().is_empty() {
         meta.url.as_str()
@@ -8412,7 +8426,8 @@ pub fn is_conversation_e2ee(convo: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-// E2EE send path wrapper (called from worker when E2EE enabled)
+// E2EE send path wrapper (called from worker/outbox when E2EE enabled)
+// Audit A01: fail-closed on encryption or network error; never downgrade to plaintext.
 pub async fn send_e2ee_message(
     s: &Session,
     profile_id: &str,
@@ -8422,7 +8437,9 @@ pub async fn send_e2ee_message(
 ) -> Result<Value> {
     use base64::Engine;
     
-    let ciphertext = crate::e2ee_integration::encrypt_message(s, profile_id, to_id, text).await?;
+    let ciphertext = crate::e2ee_integration::encrypt_message(s, profile_id, to_id, text)
+        .await
+        .map_err(|e| anyhow::anyhow!("Không thể mã hóa E2EE cho người nhận {to_id}: {e}"))?;
     
     let body = obj(&[
         ("toid", json!(to_id)),
@@ -8519,6 +8536,14 @@ mod a36_ssrf_redirect_tests {
 
         let v6_mapped = reqwest::Url::parse("http://[::ffff:127.0.0.1]/").unwrap();
         assert!(!is_safe_opengraph_url(&v6_mapped, false));
+
+        // A35: Reject IPv6 link-local (fe80::/10) and site-local (fec0::/10)
+        let v6_link_local = reqwest::Url::parse("http://[fe80::1]/").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_link_local, false));
+        let v6_site_local = reqwest::Url::parse("http://[fec0::1]/").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_site_local, false));
+        let v6_site_local_high = reqwest::Url::parse("http://[fec0::ffff]/secret").unwrap();
+        assert!(!is_safe_opengraph_url(&v6_site_local_high, false));
 
         // Reject localhost names
         let local_host = reqwest::Url::parse("http://localhost:3000").unwrap();
@@ -8624,5 +8649,62 @@ mod a10_realtime_e2ee_tests {
         let parsed_no_profile = parse_chat_message_with_profile(&raw_push_no_meta, None).unwrap();
         assert!(parsed_no_profile.is_e2ee);
         assert_eq!(parsed_no_profile.text, "[Tin nhắn mã hoá]");
+    }
+
+    #[tokio::test]
+    async fn test_plain_send_refuses_when_peer_requires_e2ee_a01() {
+        // Direct plain message sending to an E2EE peer must be rejected
+        // fail-closed to prevent automatic downgrade attacks.
+        let unique = format!(
+            "test_acc_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: unique.clone(),
+            ..Default::default()
+        });
+        
+        let to_peer_str = format!("peer_{unique}");
+        let to_peer = to_peer_str.as_str();
+        
+        // 1. Without E2EE session, normal validation happens (not e2ee blocked)
+        assert!(!crate::e2ee_integration::is_thread_e2ee(session.account_key(), to_peer));
+
+        // 2. Setup E2EE session for this peer in sender's manager
+        let sender_mgr = crate::crypto::session::E2eeManager::open(session.account_key()).unwrap();
+        let bob_id = crate::crypto::keystore::IdentityKeyPair::generate().unwrap();
+        let bob_spk = crate::crypto::keystore::SignedPreKey::generate(1, &bob_id).unwrap();
+        let bob_otpk = crate::crypto::keystore::OneTimePreKey::generate(10).unwrap();
+        let bob_bundle = crate::crypto::keystore::PreKeyBundle::from_local_keys(&bob_id, &bob_spk, &[bob_otpk])
+            .to_remote_bundle()
+            .unwrap();
+        let _ = sender_mgr.start_session(to_peer, &bob_bundle, b"init e2ee").unwrap();
+
+        // 3. Now is_thread_e2ee must be true
+        assert!(crate::e2ee_integration::is_thread_e2ee(session.account_key(), to_peer));
+
+        // 4. send_message_with_client_id MUST fail-closed with clear E2EE error
+        let res_plain = send_message_with_client_id(&session, to_peer, "plain downgrade text", 12345).await;
+        assert!(res_plain.is_err(), "Must reject sending plain message to E2EE peer");
+        let err_text = res_plain.err().unwrap().to_string();
+        assert!(err_text.contains("E2EE") || err_text.contains("mã hóa"), "Error must indicate E2EE refusal: {err_text}");
+
+        // 5. send_link_message_with_client_id MUST ALSO fail-closed with clear E2EE error
+        let meta = LinkMetadata {
+            url: "https://example.com".into(),
+            title: "Test".into(),
+            desc: "Test".into(),
+            thumb: "".into(),
+            src: "".into(),
+        };
+        let res_link = send_link_message_with_client_id(&session, to_peer, "link text", &meta, false, 12346).await;
+        assert!(res_link.is_err(), "Must reject sending plain link to E2EE peer");
+        let err_link = res_link.err().unwrap().to_string();
+        assert!(err_link.contains("E2EE") || err_link.contains("mã hóa"), "Error must indicate E2EE refusal: {err_link}");
     }
 }

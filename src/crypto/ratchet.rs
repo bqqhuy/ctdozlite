@@ -42,6 +42,12 @@ const KDF_KEYS_INFO: &[u8] = b"WhisperMessageKeysV2";
 /// Maximum number of skipped message keys retained per ratchet step.
 const MAX_SKIP: usize = 1000;
 
+/// Maximum total skipped keys retained in a session to prevent memory/storage exhaustion (A12).
+pub const MAX_TOTAL_SKIPPED_KEYS: usize = 2000;
+
+/// Skipped key expiry duration: 14 days in milliseconds (A12).
+pub const SKIPPED_KEY_EXPIRY_MS: i64 = 14 * 86_400_000;
+
 /// A Curve25519 key pair (static, long-lived or ephemeral ratchet step).
 #[derive(Clone)]
 pub struct KeyPair {
@@ -150,10 +156,17 @@ impl MessageKey {
 // --- Double Ratchet session state ---
 
 /// Index key for a skipped message (ratchet public key + message counter).
-#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug)]
 pub struct SkipKey {
     pub dh_public: [u8; 32],
     pub counter: u32,
+}
+
+/// Skipped key payload with expiration metadata (A12).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SkippedKeyEntry {
+    pub key: Vec<u8>,
+    pub created_at: i64,
 }
 
 mod skipped_keys_codec {
@@ -166,9 +179,11 @@ mod skipped_keys_codec {
         dh_public: [u8; 32],
         counter: u32,
         key: Vec<u8>,
+        #[serde(default)]
+        created_at: Option<i64>,
     }
 
-    pub fn serialize<S>(map: &HashMap<SkipKey, Vec<u8>>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    pub fn serialize<S>(map: &HashMap<SkipKey, SkippedKeyEntry>, serializer: S) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -177,25 +192,30 @@ mod skipped_keys_codec {
             .map(|(k, v)| Entry {
                 dh_public: k.dh_public,
                 counter: k.counter,
-                key: v.clone(),
+                key: v.key.clone(),
+                created_at: Some(v.created_at),
             })
             .collect();
         entries.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<HashMap<SkipKey, Vec<u8>>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<HashMap<SkipKey, SkippedKeyEntry>, D::Error>
     where
         D: Deserializer<'de>,
     {
         let entries = Vec::<Entry>::deserialize(deserializer)?;
         let mut map = HashMap::with_capacity(entries.len());
+        let now = now_ms();
         for e in entries {
             map.insert(
                 SkipKey {
                     dh_public: e.dh_public,
                     counter: e.counter,
                 },
-                e.key,
+                SkippedKeyEntry {
+                    key: e.key,
+                    created_at: e.created_at.unwrap_or(now),
+                },
             );
         }
         Ok(map)
@@ -225,9 +245,9 @@ pub struct RatchetSession {
     /// Number of messages sent in the previous sending chain (for header).
     pub prev_send_count: u32,
     /// Skipped message keys buffered for out-of-order delivery.
-    /// Stored as 80 raw bytes: cipher_key(32) || mac_key(32) || iv(16).
+    /// Stored with creation timestamp for expiration management (A12).
     #[serde(with = "skipped_keys_codec", default)]
-    pub skipped: std::collections::HashMap<SkipKey, Vec<u8>>,
+    pub skipped: std::collections::HashMap<SkipKey, SkippedKeyEntry>,
     /// Zalo addition: timestamp of last session reset for UI "new device" notice.
     pub session_ts: Option<i64>,
     /// Base key (ephemeral public key) used to establish this session (A11 replay protection).
@@ -372,7 +392,12 @@ impl RatchetSession {
             dh_public: header.dh_public,
             counter: header.n,
         };
-        if let Some(mk_bytes) = candidate.skipped.remove(&skip_key) {
+        if let Some(entry) = candidate.skipped.remove(&skip_key) {
+            let now = now_ms();
+            if now.saturating_sub(entry.created_at) >= SKIPPED_KEY_EXPIRY_MS {
+                anyhow::bail!("Khóa tin nhắn bị bỏ qua đã hết hạn (expired skipped key)");
+            }
+            let mk_bytes = entry.key;
             // Stored layout: cipher_key(32) || mac_key(32) || iv(16).
             let mk = MessageKey {
                 cipher_key: mk_bytes[..32].try_into().expect("cipher key slice"),
@@ -387,6 +412,10 @@ impl RatchetSession {
 
         // Perform a DH ratchet step when the remote key changed.
         if candidate.dh_remote.as_ref() != Some(&header.dh_public) {
+            // A12: Retain old chain keys up to header.pn before resetting receiving chain
+            if candidate.chain_key_recv.is_some() {
+                candidate.skip_over_recv_chain(header.pn)?;
+            }
             candidate.ratchet_step(&header.dh_public)?;
         }
 
@@ -436,12 +465,38 @@ impl RatchetSession {
         Ok(())
     }
 
+    /// Prune expired skipped keys older than `SKIPPED_KEY_EXPIRY_MS` (A12).
+    pub fn prune_expired_skipped_keys(&mut self, now: i64) {
+        self.skipped
+            .retain(|_, entry| now.saturating_sub(entry.created_at) < SKIPPED_KEY_EXPIRY_MS);
+    }
+
+    /// Insert a skipped message key, enforcing max capacity and pruning expired keys (A12).
+    pub fn insert_skipped_key(&mut self, key: SkipKey, mk_bytes: Vec<u8>, now: i64) {
+        self.prune_expired_skipped_keys(now);
+        // Evict oldest if capacity exceeded
+        if self.skipped.len() >= MAX_TOTAL_SKIPPED_KEYS {
+            if let Some(oldest_key) = self
+                .skipped
+                .iter()
+                .min_by_key(|(_, entry)| entry.created_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.skipped.remove(&oldest_key);
+            }
+        }
+        self.skipped.insert(key, SkippedKeyEntry { key: mk_bytes, created_at: now });
+    }
+
     /// Store the message keys of the messages skipped by an out-of-order delivery.
     fn skip_over_recv_chain(&mut self, until: u32) -> Result<()> {
         let Some(ck) = self.chain_key_recv else {
             return Ok(());
         };
         let from = self.recv_count;
+        if until <= from {
+            return Ok(());
+        }
         anyhow::ensure!(
             (until as usize).saturating_sub(from as usize) <= MAX_SKIP,
             "Message skipped too many times ({} > {MAX_SKIP})",
@@ -449,6 +504,7 @@ impl RatchetSession {
         );
         let mut ck = ck;
         let remote = self.dh_remote.unwrap_or([0u8; 32]);
+        let now = now_ms();
         for n in from..until {
             let (new_ck, mk) = kdf_ck(&ck);
             ck = new_ck;
@@ -460,7 +516,7 @@ impl RatchetSession {
             mk_store[..32].copy_from_slice(&mk.cipher_key);
             mk_store[32..64].copy_from_slice(&mk.mac_key);
             mk_store[64..].copy_from_slice(&mk.iv);
-            self.skipped.insert(skip_key, mk_store);
+            self.insert_skipped_key(skip_key, mk_store, now);
         }
         self.chain_key_recv = Some(ck);
         self.recv_count = until;
@@ -722,5 +778,83 @@ mod tests {
 
         assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"msg-2");
         assert_eq!(bob.recv_count, 3, "Recv count must be advanced to header.n + 1");
+    }
+
+    #[test]
+    fn dh_transition_retains_old_chain_keys_up_to_header_pn_a12() {
+        let (mut alice, mut bob) = pair();
+
+        // Alice sends msg 0 and msg 1 under initial ratchet key
+        let (h0, c0) = alice.encrypt(b"msg-0-chain-A").unwrap();
+        let (h1, c1) = alice.encrypt(b"msg-1-chain-A").unwrap();
+
+        // Bob receives msg 0 only, msg 1 is delayed in network transit
+        assert_eq!(bob.decrypt(&h0, &c0).unwrap(), b"msg-0-chain-A");
+        assert_eq!(bob.recv_count, 1);
+
+        // Bob replies to Alice (Bob ratchets)
+        let (h_bob, c_bob) = bob.encrypt(b"reply-bob").unwrap();
+        assert_eq!(alice.decrypt(&h_bob, &c_bob).unwrap(), b"reply-bob");
+
+        // Alice ratchets and sends msg 2 under new DH key (with pn = 2)
+        let (h2, c2) = alice.encrypt(b"msg-2-chain-B").unwrap();
+        assert_eq!(h2.pn, 2);
+        assert_ne!(h2.dh_public, h0.dh_public);
+
+        // Bob receives msg 2 with new DH key. This triggers DH transition on Bob.
+        // During DH transition, Bob must buffer msg 1 into skipped keys.
+        assert_eq!(bob.decrypt(&h2, &c2).unwrap(), b"msg-2-chain-B");
+
+        // Now the delayed msg 1 from the old chain is decrypted by Bob successfully!
+        assert_eq!(bob.decrypt(&h1, &c1).unwrap(), b"msg-1-chain-A");
+    }
+
+    #[test]
+    fn skipped_keys_max_capacity_evicts_oldest_a12() {
+        let (_alice, mut bob) = pair();
+
+        // Manually insert MAX_TOTAL_SKIPPED_KEYS keys into bob
+        let now = now_ms();
+        for i in 0..MAX_TOTAL_SKIPPED_KEYS as u32 {
+            let key = SkipKey {
+                dh_public: [1u8; 32],
+                counter: i,
+            };
+            bob.insert_skipped_key(key, vec![0u8; 80], now + i as i64);
+        }
+        assert_eq!(bob.skipped.len(), MAX_TOTAL_SKIPPED_KEYS);
+
+        // Inserting one more must evict the oldest (counter 0)
+        let extra_key = SkipKey {
+            dh_public: [2u8; 32],
+            counter: 9999,
+        };
+        bob.insert_skipped_key(extra_key.clone(), vec![0u8; 80], now + 100000);
+        assert_eq!(bob.skipped.len(), MAX_TOTAL_SKIPPED_KEYS);
+        assert!(!bob.skipped.contains_key(&SkipKey { dh_public: [1u8; 32], counter: 0 }));
+        assert!(bob.skipped.contains_key(&extra_key));
+    }
+
+    #[test]
+    fn expired_skipped_key_is_rejected_a12() {
+        let (mut alice, mut bob) = pair();
+        let (h1, c1) = alice.encrypt(b"one").unwrap();
+        let (_h2, _c2) = alice.encrypt(b"two").unwrap();
+        let (h3, c3) = alice.encrypt(b"three").unwrap();
+
+        // Bob receives msg 3, skipping msg 1 and 2
+        assert_eq!(bob.decrypt(&h3, &c3).unwrap(), b"three");
+
+        // Set the skipped key's created_at to 15 days ago
+        let skip_key = SkipKey {
+            dh_public: h1.dh_public,
+            counter: h1.n,
+        };
+        if let Some(entry) = bob.skipped.get_mut(&skip_key) {
+            entry.created_at = now_ms() - (SKIPPED_KEY_EXPIRY_MS + 1000);
+        }
+
+        // Attempting to decrypt the expired skipped message must fail
+        assert!(bob.decrypt(&h1, &c1).is_err());
     }
 }

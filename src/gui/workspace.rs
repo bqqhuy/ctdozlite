@@ -211,10 +211,23 @@ impl ZaloGuiApp {
                         self.profile_menu_open = !self.profile_menu_open;
                     }
 
-                    // WP16-3: Account switcher dropdown (WIP integration)
+                    // A20: Account switcher dropdown (WP16-3 integration)
                     if self.profile_menu_open {
-                        // Placeholder for account switcher UI
-                        // The switcher.show() will be called here when integrated with ProfileRegistry
+                        if let Ok(reg) = crate::profiles::ProfileRegistry::load() {
+                            let profiles_list: Vec<(&str, &crate::profiles::Profile)> = reg.profiles.iter().map(|(k, v)| (k.as_str(), v)).collect();
+                            let active = profiles_list.iter().find(|(_, p)| p.uid == self.user_uin).map(|(_, p)| *p);
+                            if let Some(target_uid) = self.account_switcher.show(ui, active, &profiles_list) {
+                                if target_uid != self.user_uin {
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        let _ = tx.send(WorkerCmd::SwitchProfile {
+                                            owner: self.user_uin.clone(),
+                                            target_uid,
+                                        });
+                                    }
+                                }
+                                self.profile_menu_open = false;
+                            }
+                        }
                     }
 
                     ui.add_space(18.0);

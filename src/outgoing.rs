@@ -53,6 +53,8 @@ impl FileStamp {
 pub struct Job {
     pub payload: Payload,
     pub is_group: bool,
+    #[serde(default)]
+    pub is_e2ee: bool,
     pub attempt: u32,
     pub error: String,
 }
@@ -66,28 +68,71 @@ pub fn pending(text: String, is_group: bool, payload: Payload) -> ChatMessage {
         time: crate::ui::clock(),
         ts: crate::login::unix_now() * 1000,
         is_outgoing: true,
+        is_e2ee: false,
         delivery: DeliveryState::Pending,
         outgoing_job: Some(Box::new(Job {
             payload,
             is_group,
+            is_e2ee: false,
             attempt: 1,
             error: String::new(),
         })),
         ..Default::default()
     }
 }
-/// Where a plain-text payload goes (audit A01/A02).  The E2EE send is not part
-/// of the stable dispatcher until the wire format is verified against the
-/// official client (SEC-01); keeping it out of this enum makes the exclusion
-/// compile-level instead of a runtime fallback.
-enum TextRoute {
+
+pub fn pending_e2ee(text: String, payload: Payload) -> ChatMessage {
+    let id = crate::chat::next_client_message_id();
+    ChatMessage {
+        id: format!("out_{id}"),
+        client_message_id: id.to_string(),
+        text,
+        sender: "Tôi".into(),
+        time: crate::ui::clock(),
+        ts: crate::login::unix_now() * 1000,
+        is_outgoing: true,
+        is_e2ee: true,
+        delivery: DeliveryState::Pending,
+        outgoing_job: Some(Box::new(Job {
+            payload,
+            is_group: false,
+            is_e2ee: true,
+            attempt: 1,
+            error: String::new(),
+        })),
+        ..Default::default()
+    }
+}
+
+/// Check if a destination peer requires E2EE (audit A01).
+pub fn is_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> bool {
+    if is_group {
+        return false;
+    }
+    crate::e2ee_integration::is_thread_e2ee(account_key, to_id)
+}
+
+/// Where a plain-text payload goes (audit A01/A02).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TextRoute {
+    /// End-to-end encrypted message (audit A01/A02): never leaks URL to preview,
+    /// and fails closed if encryption/send fails without falling back to plaintext.
+    E2ee,
+    /// Plaintext message with URL: triggers OpenGraph link preview.
     Link(String),
+    /// Plaintext group message.
     Group,
+    /// Plaintext direct 1-1 message.
     Direct,
 }
 
-fn route_text(text: &str, is_group: bool) -> TextRoute {
-    if let Some(url) = crate::chat::extract_first_url(text) {
+pub fn route_text(text: &str, is_group: bool, is_e2ee: bool) -> TextRoute {
+    if is_e2ee {
+        // Audit A01/A02: E2EE messages must never leak URL via plaintext link previews
+        // and must go directly to E2EE encryption path.
+        TextRoute::E2ee
+    } else if let Some(url) = crate::chat::extract_first_url(text) {
+        // Plaintext direct (1-1) and group messages with URLs go to link preview
         TextRoute::Link(url)
     } else if is_group {
         TextRoute::Group
@@ -130,16 +175,28 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             }
         }
         Payload::Text => {
-            // Audit A01/A02 (SYS-02): the E2EE wire format is still unverified
-            // against the official client (E3 — see crypto/wire.rs, crypto/prekey.rs),
-            // so the stable text path must not attempt an E2EE send.  The previous
-            // probe-then-fallback sent plaintext whenever E2EE failed (including a
-            // timeout after the request reached the server, duplicating the message)
-            // and hid the 1-1 link-preview branch.  `send_e2ee_message` stays
-            // available for the SEC-01 protocol spike only.
-            // Parity: fork deviation — E2EE send is blocked until the wire format
-            // is verified (re-notes/36 §8); plain sends match Zalo PC behaviour.
-            match route_text(&message.text, job.is_group) {
+            // Audit A01/A02 (SYS-02): When E2EE is required (by message or thread policy),
+            // the text payload is routed to TextRoute::E2ee. URLs in E2EE messages are NOT
+            // extracted for link previews to prevent URL leakage over unencrypted HTTP.
+            // Furthermore, if E2EE encryption or sending fails, it fails closed and NEVER
+            // silently downgrades to plaintext send endpoints.
+            let is_e2ee = message.is_e2ee
+                || job.is_e2ee
+                || is_thread_e2ee(s.account_key(), to, job.is_group);
+            match route_text(&message.text, job.is_group, is_e2ee) {
+                TextRoute::E2ee => {
+                    let result = crate::chat::send_e2ee_message(
+                        s,
+                        s.account_key(),
+                        to,
+                        &message.text,
+                        id,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Gửi tin nhắn E2EE thất bại: {e}"))?;
+                    sent.is_e2ee = true;
+                    result
+                }
                 TextRoute::Link(url) => {
                     let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
                         crate::chat::LinkMetadata {
@@ -602,15 +659,33 @@ mod tests {
         // Audit A02: the link branch was unreachable for 1-1 messages after the
         // E2EE attempt was inserted ahead of it.
         assert!(matches!(
-            route_text("xem thêm https://example.com/bai", false),
+            route_text("xem thêm https://example.com/bai", false, false),
             TextRoute::Link(_)
         ));
         assert!(matches!(
-            route_text("https://example.com", true),
+            route_text("https://example.com", true, false),
             TextRoute::Link(_)
         ));
-        assert!(matches!(route_text("xin chào", false), TextRoute::Direct));
-        assert!(matches!(route_text("xin chào", true), TextRoute::Group));
+        assert!(matches!(route_text("xin chào", false, false), TextRoute::Direct));
+        assert!(matches!(route_text("xin chào", true, false), TextRoute::Group));
+    }
+
+    #[test]
+    fn text_routing_routes_e2ee_without_leaking_url_preview_a02() {
+        // Audit A01/A02: E2EE messages must never leak URL via plaintext link previews
+        // and must route to E2ee regardless of URLs in text.
+        assert_eq!(
+            route_text("xem https://secret.com/token", false, true),
+            TextRoute::E2ee
+        );
+        assert_eq!(
+            route_text("https://secret.com", false, true),
+            TextRoute::E2ee
+        );
+        assert_eq!(
+            route_text("tin nhắn bí mật", false, true),
+            TextRoute::E2ee
+        );
     }
 
     #[test]
@@ -692,5 +767,21 @@ mod persistence_tests {
         assert_eq!(message.id, "42");
         assert_eq!(message.delivery, DeliveryState::ServerAccepted);
         assert!(message.outgoing_job.is_none());
+    }
+
+    #[tokio::test]
+    async fn e2ee_send_fails_closed_without_plaintext_downgrade_a01() {
+        let session = Session::new(false, false, false).unwrap();
+        let message = pending_e2ee("tin nhắn tối mật".into(), Payload::Text);
+        
+        // When sending to a peer without active session/network, E2EE send MUST fail-closed
+        // and return an Err without falling back to plaintext.
+        let result = send(&session, "non_existent_peer", &message).await;
+        assert!(result.is_err(), "E2EE failure must fail-closed");
+        let err_msg = result.err().unwrap().to_string();
+        assert!(
+            err_msg.contains("E2EE") || err_msg.contains("mã hóa"),
+            "Error must clearly indicate E2EE failure: {err_msg}"
+        );
     }
 }

@@ -157,17 +157,38 @@ pub fn is_private_or_loopback_ip(ip: std::net::IpAddr) -> bool {
                 let v4 = std::net::Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]);
                 return is_private_or_loopback_ip(std::net::IpAddr::V4(v4));
             }
-            // Link-local: fe80::/10
+            // Link-local: fe80::/10 (A35)
             if octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80 {
+                return true;
+            }
+            // Site-local (RFC 3879 deprecated, but reserved/scoped): fec0::/10 (A35)
+            if octets[0] == 0xfe && (octets[1] & 0xc0) == 0xc0 {
                 return true;
             }
             // Unique local address (ULA): fc00::/7
             if (octets[0] & 0xfe) == 0xfc {
                 return true;
             }
+            // Multicast: ff00::/8
+            if octets[0] == 0xff {
+                return true;
+            }
             false
         }
     }
+}
+
+/// Validate and sanitize an HTTP header value against CRLF and null byte injection (A33).
+/// Removes carriage return (\r), line feed (\n), and null byte (\0) to prevent HTTP/2 and HTTP/1.1 header splitting/smuggling.
+pub fn sanitize_header_value(val: &str) -> String {
+    val.chars()
+        .filter(|&c| c != '\r' && c != '\n' && c != '\0')
+        .collect()
+}
+
+/// Check if a header value contains prohibited injection characters (\r, \n, \0) (A33).
+pub fn has_header_injection(val: &str) -> bool {
+    val.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
 }
 
 #[cfg(test)]
@@ -221,5 +242,23 @@ mod tests {
         assert!(!is_private_or_loopback_ip("1.1.1.1".parse::<IpAddr>().unwrap()));
         assert!(!is_private_or_loopback_ip("49.213.76.10".parse::<IpAddr>().unwrap()));
         assert!(!is_private_or_loopback_ip("2606:4700:4700::1111".parse::<IpAddr>().unwrap()));
+
+        // A35: IPv6 site-local (fec0::/10) and multicast (ff00::/8) guards
+        assert!(is_private_or_loopback_ip("fec0::1".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("fec0::ffff".parse::<IpAddr>().unwrap()));
+        assert!(is_private_or_loopback_ip("ff02::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_header_injection_sanitization_a33() {
+        assert_eq!(sanitize_header_value("normal_header_val"), "normal_header_val");
+        assert_eq!(sanitize_header_value("header\r\nInjected: evil"), "headerInjected: evil");
+        assert_eq!(sanitize_header_value("null\0byte"), "nullbyte");
+        assert_eq!(sanitize_header_value("cr\r\nand\0null"), "crandnull");
+
+        assert!(!has_header_injection("safe_value_123"));
+        assert!(has_header_injection("has\rcarriage_return"));
+        assert!(has_header_injection("has\nline_feed"));
+        assert!(has_header_injection("has\0null_byte"));
     }
 }

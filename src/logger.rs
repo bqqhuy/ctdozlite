@@ -102,7 +102,7 @@ pub fn log_request(
             payload_preview,
             decrypted_preview,
             is_error,
-            error_msg: error_msg.map(str::to_string),
+            error_msg: error_msg.map(crate::session::redact_text),
         };
 
         state.entries.push(entry);
@@ -130,13 +130,13 @@ pub fn log_error(context: &str, err: &str) {
             id: state.counter,
             timestamp: time_str,
             method: "ERR".to_string(),
-            url: context.to_string(),
+            url: crate::session::redact_url(context),
             status: None,
             latency_ms: 0,
             payload_preview: String::new(),
             decrypted_preview: None,
             is_error: true,
-            error_msg: Some(err.to_string()),
+            error_msg: Some(crate::session::redact_text(err)),
         };
 
         state.entries.push(entry);
@@ -244,6 +244,23 @@ pub fn scan_logs() -> Vec<ScanFinding> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_error_and_request_scrub_sensitive_information_a14() {
+        init(true);
+        clear_entries();
+
+        log_error("https://chat.zalo.me/api?zpw_sek=LEAK123", "Error with token=LEAK456 and password=PASS");
+        let entries = get_entries();
+        assert!(!entries.is_empty());
+        let e = entries.iter().find(|e| e.url.contains("chat.zalo.me")).expect("found entry");
+        assert!(!e.url.contains("LEAK123"), "URL in LogEntry must not contain zpw_sek");
+        assert!(e.url.contains("<redacted>"));
+        let err_msg = e.error_msg.as_deref().unwrap();
+        assert!(!err_msg.contains("LEAK456"), "Error message must not contain token");
+        assert!(!err_msg.contains("PASS"), "Error message must not contain password");
+        assert!(err_msg.contains("<redacted>"));
+    }
 
     #[test]
     fn test_log_error_records_entry() {

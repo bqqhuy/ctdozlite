@@ -469,3 +469,135 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
     assert!(paths[2].starts_with("POST /api/message/renewlink"));
     assert!(paths[3].starts_with("POST /api/message/forward"));
 }
+
+#[test]
+fn audit_a16_websocket_queue_backpressure_and_flow_control() {
+    use std::time::Instant;
+    use serde_json::json;
+
+    // Test that PullQueues handles flow control backpressure
+    let mut queues = zalo_rust::socket::queue_receiver::PullQueues::new(10);
+    let key = (510, 0);
+    let now = Instant::now();
+    queues.register(key, "req-1".into(), now, None);
+
+    let page_payload = json!({
+        "data": {
+            "lastActionId": 999,
+            "more": 1
+        }
+    });
+
+    // 1. When forward queue is congested (has_capacity = false), page is throttled
+    let throttled = queues.page_with_capacity(key, &page_payload, now, false);
+    assert!(throttled.is_none(), "Must throttle pull when downstream buffer has no capacity");
+    assert!(queues.is_throttled(key), "Queue must be marked throttled");
+
+    // 2. due_with_capacity(false) will NOT resume throttled queues
+    assert!(queues.due_with_capacity(now, false).is_empty(), "Must not resume while capacity is unavailable");
+
+    // 3. When capacity is restored (has_capacity = true), due_with_capacity resumes the throttled queue
+    let resumed = queues.due_with_capacity(now, true);
+    assert_eq!(resumed.len(), 1, "Must resume throttled queue once capacity is restored");
+    assert_eq!(resumed[0].last, json!(999));
+    assert!(!queues.is_throttled(key));
+}
+
+#[test]
+fn audit_a20_multi_account_profile_isolation_and_rollback_preservation() {
+    use zalo_rust::account_controls::Impact;
+
+    // 1. Account switch impact must invalidate all per-account state
+    let impact = Impact::for_account_switch();
+    assert!(impact.account, "Must invalidate account boundary");
+    assert!(impact.profiles, "Must invalidate cached profiles");
+    assert!(impact.privacy, "Must invalidate privacy settings");
+    assert!(impact.relations, "Must invalidate friends/relations");
+    assert!(impact.hidden, "Must invalidate hidden conversations");
+    assert!(impact.all_groups, "Must invalidate all group memberships");
+
+    // 2. Profile registry isolation
+    let mut reg = zalo_rust::profiles::ProfileRegistry::default();
+    reg.add_profile(zalo_rust::profiles::Profile {
+        name: "account_a".into(),
+        uid: "111".into(),
+        phone: Some("0901234567".into()),
+        display_name: "Account A".into(),
+        avatar_url: None,
+        last_active: 100,
+        session_file: std::path::PathBuf::from("a.json"),
+    });
+    reg.add_profile(zalo_rust::profiles::Profile {
+        name: "account_b".into(),
+        uid: "222".into(),
+        phone: Some("0907654321".into()),
+        display_name: "Account B".into(),
+        avatar_url: None,
+        last_active: 200,
+        session_file: std::path::PathBuf::from("b.json"),
+    });
+    reg.set_active("account_a").unwrap();
+    assert_eq!(reg.active().unwrap().uid, "111");
+
+    reg.set_active("account_b").unwrap();
+    assert_eq!(reg.active().unwrap().uid, "222");
+
+    // Non-existent profile fails without corrupting active profile
+    assert!(reg.set_active("non_existent").is_err());
+    assert_eq!(reg.active().unwrap().uid, "222");
+}
+
+#[test]
+fn audit_a33_http2_header_injection_prevention() {
+    use zalo_rust::endpoints::{has_header_injection, sanitize_header_value};
+
+    // CRLF and null byte detection
+    assert!(has_header_injection("value\r\nEvil-Header: 1"));
+    assert!(has_header_injection("value\r"));
+    assert!(has_header_injection("value\n"));
+    assert!(has_header_injection("value\0null"));
+    assert!(!has_header_injection("Mozilla/5.0 (Windows NT 10.0; ARM64)"));
+
+    // Sanitization strips forbidden characters
+    assert_eq!(
+        sanitize_header_value("evil\r\nCustom: injected\0value"),
+        "evilCustom: injectedvalue"
+    );
+    assert_eq!(
+        sanitize_header_value("clean_header_value_123"),
+        "clean_header_value_123"
+    );
+}
+
+#[test]
+fn audit_a35_ipv6_link_local_and_site_local_guards() {
+    use std::net::IpAddr;
+    use zalo_rust::endpoints::is_private_or_loopback_ip;
+    use zalo_rust::chat::is_safe_opengraph_url;
+
+    // IPv6 link-local (fe80::/10)
+    let fe80_1 = "fe80::1".parse::<IpAddr>().unwrap();
+    let fe80_high = "fe80:0:0:0:ffff:ffff:ffff:ffff".parse::<IpAddr>().unwrap();
+    assert!(is_private_or_loopback_ip(fe80_1));
+    assert!(is_private_or_loopback_ip(fe80_high));
+
+    // IPv6 site-local (fec0::/10, RFC 3879)
+    let fec0_1 = "fec0::1".parse::<IpAddr>().unwrap();
+    let fec0_high = "fec0:0:0:0:ffff:ffff:ffff:ffff".parse::<IpAddr>().unwrap();
+    assert!(is_private_or_loopback_ip(fec0_1));
+    assert!(is_private_or_loopback_ip(fec0_high));
+
+    // IPv6 multicast (ff00::/8)
+    let ff02_1 = "ff02::1".parse::<IpAddr>().unwrap();
+    assert!(is_private_or_loopback_ip(ff02_1));
+
+    // Verify OpenGraph URL security validator rejects them
+    let url_fe80 = reqwest::Url::parse("http://[fe80::1]/").unwrap();
+    assert!(!is_safe_opengraph_url(&url_fe80, false));
+
+    let url_fec0 = reqwest::Url::parse("http://[fec0::1]/private").unwrap();
+    assert!(!is_safe_opengraph_url(&url_fec0, false));
+
+    let url_fec0_high = reqwest::Url::parse("http://[fec0::ffff]/metadata").unwrap();
+    assert!(!is_safe_opengraph_url(&url_fec0_high, false));
+}

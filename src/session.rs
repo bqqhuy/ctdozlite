@@ -240,7 +240,7 @@ pub(crate) fn http_failure_status(error: &anyhow::Error) -> Option<u16> {
     error.downcast_ref::<HttpFailure>().map(|failure| failure.0)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct LoginInfo {
     pub uin: String,
     /// `zpw_enk` — base64 AES-256 key for legacy param encryption.
@@ -253,7 +253,20 @@ pub struct LoginInfo {
     pub avatar: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for LoginInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginInfo")
+            .field("uin", &self.uin)
+            .field("zpw_enk", &"<redacted>")
+            .field("zpw_sek", &"<redacted>")
+            .field("display_name", &self.display_name)
+            .field("send2me_id", &self.send2me_id)
+            .field("avatar", &self.avatar)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SavedSession {
     pub imei: String,
     pub computer_name: String,
@@ -262,6 +275,20 @@ pub struct SavedSession {
     pub zpw_sek: Option<String>,
     pub login: Option<LoginInfo>,
     pub domains: Domains,
+}
+
+impl std::fmt::Debug for SavedSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SavedSession")
+            .field("imei", &crate::session::redact_secret(&self.imei))
+            .field("computer_name", &self.computer_name)
+            .field("secret_key_b64", &self.secret_key_b64.as_ref().map(|_| "<redacted>"))
+            .field("session_key", &self.session_key.as_ref().map(|_| "<redacted>"))
+            .field("zpw_sek", &self.zpw_sek.as_ref().map(|_| "<redacted>"))
+            .field("login", &self.login)
+            .field("domains", &self.domains)
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -706,11 +733,10 @@ impl Session {
 
         let doc = serde_json::json!({
             "method": method,
-            // `dump_raw` keeps the full URL so a signature mismatch can be reproduced
-            // offline. Only use it on a throwaway account.
-            "url": if self.dump_raw { url.to_string() } else { redact_url(url) },
+            // A14: Always scrub sensitive fields in diagnostic dumps, even in dev mode / dump_raw
+            "url": redact_url(url),
             "status": status,
-            "body": if self.dump_raw { body_json } else { redact_body(&body_json) },
+            "body": redact_body(&body_json),
         });
         let text = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&path, text) {
@@ -1074,11 +1100,7 @@ impl Session {
             eprintln!(
                 "→ {} {}",
                 m,
-                if self.dump_raw {
-                    url.to_string()
-                } else {
-                    redact_url(url)
-                }
+                redact_url(url)
             );
             if let Some(b) = &body {
                 eprintln!("  body: {}", crate::diagnostics::preview(b));
@@ -1250,7 +1272,7 @@ pub fn obj(pairs: &[(&str, Value)]) -> Value {
 /// Strip anything that could be a credential before a URL lands in a dump file.
 pub fn redact_url(url: &str) -> String {
     const SENSITIVE: &[&str] = &[
-        "password", "passw", "zpw_sek", "zpw_enk", "cookie", "token", "signkey", "params", "imei",
+        "password", "passw", "zpw_sek", "zpw_enk", "cookie", "token", "signkey", "params", "imei", "secret", "auth", "session", "key",
     ];
     let Some((base, query)) = url.split_once('?') else {
         return url.to_string();
@@ -1267,6 +1289,55 @@ pub fn redact_url(url: &str) -> String {
         })
         .collect();
     format!("{base}?{}", cleaned.join("&"))
+}
+
+/// Scrub sensitive tokens, secrets, cookies, passwords, and URLs from freeform text / error messages (A14).
+pub fn redact_text(text: &str) -> String {
+    if text.contains("http://") || text.contains("https://") {
+        let mut result = String::with_capacity(text.len());
+        let mut remaining = text;
+        while let Some(idx) = remaining.find("http://").or_else(|| remaining.find("https://")) {
+            result.push_str(&remaining[..idx]);
+            let url_part = &remaining[idx..];
+            let end = url_part
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ')' || c == ']')
+                .unwrap_or(url_part.len());
+            let raw_url = &url_part[..end];
+            result.push_str(&redact_url(raw_url));
+            remaining = &url_part[end..];
+        }
+        result.push_str(remaining);
+        return scrub_sensitive_tokens(&result);
+    }
+    scrub_sensitive_tokens(text)
+}
+
+fn scrub_sensitive_tokens(text: &str) -> String {
+    let mut scrubbed = text.to_string();
+    const PATTERNS: &[&str] = &[
+        "zpw_sek", "zpw_enk", "token", "password", "passw", "secret_key", "session_key", "signkey", "cookie",
+    ];
+    for &pat in PATTERNS {
+        for delim in &["=", ": ", ":"] {
+            let needle = format!("{pat}{delim}");
+            let needle_lower = needle.to_ascii_lowercase();
+            let mut search_idx = 0;
+            while let Some(pos) = scrubbed[search_idx..].to_ascii_lowercase().find(&needle_lower) {
+                let abs_pos = search_idx + pos + needle.len();
+                let val_end = scrubbed[abs_pos..]
+                    .find(|c: char| c.is_whitespace() || c == '&' || c == ';' || c == ',' || c == '}' || c == ']' || c == '"')
+                    .unwrap_or(scrubbed.len() - abs_pos);
+                if val_end > 0 {
+                    scrubbed.replace_range(abs_pos..abs_pos + val_end, "<redacted>");
+                }
+                search_idx = abs_pos + "<redacted>".len();
+                if search_idx >= scrubbed.len() {
+                    break;
+                }
+            }
+        }
+    }
+    scrubbed
 }
 
 /// Redact a sensitive secret string, showing at most the first 8 characters followed by `…<redacted>`.
@@ -1327,6 +1398,52 @@ mod tests {
         assert_eq!(redact_secret("1234567890abcdef"), "12345678…<redacted>");
         assert_eq!(redact_secret("short"), "short…<redacted>");
         assert_eq!(redact_secret(""), "…<redacted>");
+    }
+
+    #[test]
+    fn redact_text_scrubs_sensitive_tokens_a14() {
+        let err1 = "Request failed: https://chat.zalo.me/api/test?zpw_sek=SECRET123&token=TOK456 error";
+        let scrubbed1 = redact_text(err1);
+        assert!(!scrubbed1.contains("SECRET123"));
+        assert!(!scrubbed1.contains("TOK456"));
+        assert!(scrubbed1.contains("<redacted>"));
+
+        let err2 = "Auth failed with zpw_sek=SECRET789 and password=MYPASS";
+        let scrubbed2 = redact_text(err2);
+        assert!(!scrubbed2.contains("SECRET789"));
+        assert!(!scrubbed2.contains("MYPASS"));
+        assert!(scrubbed2.contains("<redacted>"));
+    }
+
+    #[test]
+    fn debug_impl_scrubs_sensitive_fields_a14() {
+        let login = LoginInfo {
+            uin: "12345".into(),
+            zpw_enk: "ENK_SECRET".into(),
+            zpw_sek: "SEK_SECRET".into(),
+            display_name: "Test User".into(),
+            send2me_id: "s2m".into(),
+            avatar: "avatar.png".into(),
+        };
+        let dbg_login = format!("{login:?}");
+        assert!(!dbg_login.contains("ENK_SECRET"));
+        assert!(!dbg_login.contains("SEK_SECRET"));
+        assert!(dbg_login.contains("<redacted>"));
+
+        let saved = SavedSession {
+            imei: "01234567890123456789".into(),
+            computer_name: "PC".into(),
+            secret_key_b64: Some("B64_KEY".into()),
+            session_key: Some("SESS_KEY".into()),
+            zpw_sek: Some("SEK_SAVED".into()),
+            login: Some(login),
+            domains: Domains::default(),
+        };
+        let dbg_saved = format!("{saved:?}");
+        assert!(!dbg_saved.contains("B64_KEY"));
+        assert!(!dbg_saved.contains("SESS_KEY"));
+        assert!(!dbg_saved.contains("SEK_SAVED"));
+        assert!(dbg_saved.contains("<redacted>"));
     }
 }
 

@@ -25,21 +25,35 @@ pub fn open_crypto_db() -> Result<Connection> {
 }
 
 /// Open a crypto store at an explicit path (used by tests and tooling).
+/// Current schema version of the SQLite E2EE key store (A40).
+pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+
 pub fn open_crypto_db_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         storage::private_dir(parent)?;
     }
-    let conn = Connection::open(path)
+    let mut conn = Connection::open(path)
         .with_context(|| format!("Không mở được E2EE database: {}", path.display()))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    migrate(&conn)?;
+    migrate(&mut conn)?;
     Ok(conn)
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
+fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        anyhow::bail!(
+            "Phiên bản cơ sở dữ liệu E2EE ({version}) mới hơn phiên bản ứng dụng hỗ trợ ({CURRENT_SCHEMA_VERSION}). Vui lòng nâng cấp ứng dụng."
+        );
+    }
+    if version == CURRENT_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Atomic transaction guard for all migration steps (A40)
+    let tx = conn.transaction()?;
     if version < 1 {
-        conn.execute_batch("
+        tx.execute_batch("
             CREATE TABLE IF NOT EXISTS identity_key (
                 profile_id TEXT NOT NULL PRIMARY KEY,
                 public_key BLOB NOT NULL,
@@ -81,28 +95,26 @@ fn migrate(conn: &Connection) -> Result<()> {
                 verified_at INTEGER,
                 PRIMARY KEY (profile_id, peer_id)
             );
-            PRAGMA user_version=1;
         ")?;
     }
     if version < 2 {
-        let has_col: bool = conn
+        let has_col: bool = tx
             .prepare("SELECT verified FROM trusted_identity LIMIT 0")
             .is_ok();
         if !has_col {
-            let _ = conn.execute_batch("
+            let _ = tx.execute_batch("
                 ALTER TABLE trusted_identity ADD COLUMN verified INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE trusted_identity ADD COLUMN verified_at INTEGER;
             ");
         }
-        conn.execute_batch("PRAGMA user_version=2;")?;
     }
     if version < 3 {
-        let has_table: bool = conn
+        let has_table: bool = tx
             .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='seen_base_key'")
             .and_then(|mut s| s.exists([]))
             .unwrap_or(false);
         if !has_table {
-            conn.execute_batch("
+            tx.execute_batch("
                 CREATE TABLE IF NOT EXISTS seen_base_key (
                     profile_id TEXT NOT NULL,
                     peer_id TEXT NOT NULL,
@@ -112,8 +124,15 @@ fn migrate(conn: &Connection) -> Result<()> {
                 );
             ")?;
         }
-        conn.execute_batch("PRAGMA user_version=3;")?;
     }
+    if version < 4 {
+        tx.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_signed_prekey_created
+            ON signed_prekey (profile_id, created_at);
+        ")?;
+    }
+    tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -155,16 +174,21 @@ pub fn load_identity(conn: &Connection, profile_id: &str) -> Result<Option<Ident
     );
     match row {
         Ok((pub_bytes, priv_enc, reg_id, sign_pub, sign_priv_enc)) => {
-            let priv_dec = storage::unprotect(&priv_enc)?;
-            let sign_priv_dec = storage::unprotect(&sign_priv_enc)?;
+            let priv_dec = storage::unprotect(&priv_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu khóa riêng bị hỏng: {e}"))?;
+            let sign_priv_dec = storage::unprotect(&sign_priv_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu khóa ký riêng bị hỏng: {e}"))?;
+            if pub_bytes.len() != 32 || priv_dec.len() != 32 || sign_pub.len() != 32 || sign_priv_dec.len() != 32 {
+                anyhow::bail!("Dữ liệu khóa danh tính E2EE bị hỏng (corrupted): độ dài không hợp lệ");
+            }
             let mut pub_arr = [0u8; 32];
             let mut priv_arr = [0u8; 32];
             let mut sign_pub_arr = [0u8; 32];
             let mut sign_priv_arr = [0u8; 32];
-            pub_arr.copy_from_slice(&pub_bytes[..32]);
-            priv_arr.copy_from_slice(&priv_dec[..32]);
-            sign_pub_arr.copy_from_slice(&sign_pub[..32]);
-            sign_priv_arr.copy_from_slice(&sign_priv_dec[..32]);
+            pub_arr.copy_from_slice(&pub_bytes);
+            priv_arr.copy_from_slice(&priv_dec);
+            sign_pub_arr.copy_from_slice(&sign_pub);
+            sign_priv_arr.copy_from_slice(&sign_priv_dec);
             Ok(Some(IdentityKeyPair {
                 dh: KeyPairBytes { public: pub_arr, private: priv_arr },
                 signing_public: sign_pub_arr,
@@ -206,10 +230,14 @@ pub fn load_signed_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> R
     );
     match row {
         Ok((pub_bytes, priv_enc, sig_bytes, created_at)) => {
-            let priv_dec = storage::unprotect(&priv_enc)?;
-            let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes[..32]);
-            let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec[..32]);
-            let mut sig_arr = [0u8; 64]; sig_arr.copy_from_slice(&sig_bytes[..64]);
+            let priv_dec = storage::unprotect(&priv_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu khóa riêng của signed prekey bị hỏng: {e}"))?;
+            if pub_bytes.len() != 32 || priv_dec.len() != 32 || sig_bytes.len() != 64 {
+                anyhow::bail!("Dữ liệu signed prekey bị hỏng (corrupted): độ dài không hợp lệ");
+            }
+            let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes);
+            let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec);
+            let mut sig_arr = [0u8; 64]; sig_arr.copy_from_slice(&sig_bytes);
             Ok(Some(SignedPreKey {
                 key_id,
                 key_pair: KeyPairBytes { public: pub_arr, private: priv_arr },
@@ -220,6 +248,59 @@ pub fn load_signed_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> R
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Load the most recently created signed prekey (active signed prekey) for a profile (A12).
+pub fn load_latest_signed_prekey(conn: &Connection, profile_id: &str) -> Result<Option<SignedPreKey>> {
+    let row = conn.query_row(
+        "SELECT key_id, public_key, private_bytes_enc, signature, created_at
+         FROM signed_prekey WHERE profile_id=?1 ORDER BY key_id DESC LIMIT 1",
+        params![profile_id],
+        |r| {
+            Ok((
+                r.get::<_, u32>(0)?,
+                r.get::<_, Vec<u8>>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+                r.get::<_, Vec<u8>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        },
+    );
+    match row {
+        Ok((key_id, pub_bytes, priv_enc, sig_bytes, created_at)) => {
+            let priv_dec = storage::unprotect(&priv_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu khóa riêng của signed prekey bị hỏng: {e}"))?;
+            if pub_bytes.len() != 32 || priv_dec.len() != 32 || sig_bytes.len() != 64 {
+                anyhow::bail!("Dữ liệu signed prekey bị hỏng (corrupted): độ dài không hợp lệ");
+            }
+            let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes);
+            let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec);
+            let mut sig_arr = [0u8; 64]; sig_arr.copy_from_slice(&sig_bytes);
+            Ok(Some(SignedPreKey {
+                key_id,
+                key_pair: KeyPairBytes { public: pub_arr, private: priv_arr },
+                signature: sig_arr.to_vec(),
+                created_at,
+            }))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Prune signed prekeys older than `retention_ms` while retaining the active key (A12 grace retention).
+pub fn prune_old_signed_prekeys(conn: &Connection, profile_id: &str, retention_ms: i64) -> Result<usize> {
+    let cutoff = now_ms().saturating_sub(retention_ms);
+    let deleted = conn.execute(
+        "DELETE FROM signed_prekey
+         WHERE profile_id=?1
+           AND created_at < ?2
+           AND key_id NOT IN (
+               SELECT key_id FROM signed_prekey WHERE profile_id=?1 ORDER BY key_id DESC LIMIT 1
+           )",
+        params![profile_id, cutoff],
+    )?;
+    Ok(deleted)
 }
 
 // --- One-time prekeys ---
@@ -246,10 +327,13 @@ pub fn get_one_time_prekey(conn: &Connection, profile_id: &str, key_id: u32) -> 
     );
     match row {
         Ok((pub_bytes, priv_enc)) => {
-            let priv_dec = storage::unprotect(&priv_enc)?;
-            anyhow::ensure!(pub_bytes.len() >= 32 && priv_dec.len() >= 32, "One-time prekey in store is corrupt");
-            let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes[..32]);
-            let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec[..32]);
+            let priv_dec = storage::unprotect(&priv_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu khóa riêng one-time prekey bị hỏng: {e}"))?;
+            if pub_bytes.len() != 32 || priv_dec.len() != 32 {
+                anyhow::bail!("One-time prekey trong cơ sở dữ liệu bị hỏng (corrupted): độ dài không hợp lệ");
+            }
+            let mut pub_arr = [0u8; 32]; pub_arr.copy_from_slice(&pub_bytes);
+            let mut priv_arr = [0u8; 32]; priv_arr.copy_from_slice(&priv_dec);
             Ok(Some(OneTimePreKey {
                 key_id,
                 key_pair: KeyPairBytes { public: pub_arr, private: priv_arr },
@@ -319,8 +403,10 @@ pub fn load_session(
     );
     match row {
         Ok(record_enc) => {
-            let record = storage::unprotect(&record_enc)?;
-            let session: RatchetSession = serde_json::from_slice(&record)?;
+            let record = storage::unprotect(&record_enc)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu phiên ratchet bị hỏng: {e}"))?;
+            let session: RatchetSession = serde_json::from_slice(&record)
+                .map_err(|e| anyhow::anyhow!("Dữ liệu phiên ratchet không giải mã được JSON: {e}"))?;
             Ok(Some(session))
         }
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -596,4 +682,84 @@ mod tests {
         assert!(!has_base_key(&conn, profile_id, peer_id, &base_key2).unwrap());
     }
 
+    #[test]
+    fn schema_version_guard_rejects_future_version_a40() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("future_e2ee.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA user_version = 99;").unwrap();
+        }
+        let err = open_crypto_db_at(&db_path).err().unwrap();
+        let msg = err.to_string();
+        assert!(msg.contains("99") && msg.contains("mới hơn"), "Error message must report future version: {msg}");
+    }
+
+    #[test]
+    fn store_corruption_fails_safely_without_panic_a14() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("corrupt_e2ee.db");
+        let conn = open_crypto_db_at(&db_path).unwrap();
+        let profile_id = "victim_user";
+
+        // Insert corrupt / short blob into identity_key
+        let short_blob = vec![1u8, 2, 3]; // length < 32!
+        let enc_blob = storage::protect(&short_blob).unwrap();
+        conn.execute(
+            "INSERT INTO identity_key (profile_id, public_key, private_bytes, registration_id, signing_public, signing_private_enc)
+             VALUES (?1, ?2, ?3, 100, ?4, ?5)",
+            params![profile_id, &short_blob, &enc_blob, &short_blob, &enc_blob],
+        ).unwrap();
+
+        // Must return Err instead of panicking on slice bounds
+        let load_res = load_identity(&conn, profile_id);
+        assert!(load_res.is_err(), "Must return Err on corrupt identity blob");
+
+        // Insert corrupt short blob into signed_prekey
+        conn.execute(
+            "INSERT INTO signed_prekey (profile_id, key_id, public_key, private_bytes_enc, signature, created_at)
+             VALUES (?1, 1, ?2, ?3, ?4, 1000)",
+            params![profile_id, &short_blob, &enc_blob, &short_blob],
+        ).unwrap();
+        assert!(load_signed_prekey(&conn, profile_id, 1).is_err());
+        assert!(load_latest_signed_prekey(&conn, profile_id).is_err());
+    }
+
+    #[test]
+    fn signed_prekey_pruning_retains_latest_spk_a12() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("prune_spk.db");
+        let conn = open_crypto_db_at(&db_path).unwrap();
+        let profile_id = "prune_user";
+
+        let now = now_ms();
+        // Insert SPK 1 (very old: 60 days ago)
+        let dummy_spk1 = SignedPreKey {
+            key_id: 1,
+            key_pair: KeyPairBytes { public: [1u8; 32], private: [2u8; 32] },
+            signature: vec![3u8; 64],
+            created_at: now - (60 * 86_400_000),
+        };
+        save_signed_prekey(&conn, profile_id, &dummy_spk1).unwrap();
+
+        // Insert SPK 2 (active, recent)
+        let dummy_spk2 = SignedPreKey {
+            key_id: 2,
+            key_pair: KeyPairBytes { public: [4u8; 32], private: [5u8; 32] },
+            signature: vec![6u8; 64],
+            created_at: now,
+        };
+        save_signed_prekey(&conn, profile_id, &dummy_spk2).unwrap();
+
+        // Pruning older than 30 days should delete SPK 1 but preserve SPK 2
+        let deleted = prune_old_signed_prekeys(&conn, profile_id, 30 * 86_400_000).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(load_signed_prekey(&conn, profile_id, 1).unwrap().is_none());
+        assert!(load_signed_prekey(&conn, profile_id, 2).unwrap().is_some());
+
+        // Pruning again when only SPK 2 exists (even if we pretend retention is 0) must retain SPK 2
+        let deleted2 = prune_old_signed_prekeys(&conn, profile_id, 0).unwrap();
+        assert_eq!(deleted2, 0, "Active SPK must never be pruned");
+        assert!(load_latest_signed_prekey(&conn, profile_id).unwrap().is_some());
+    }
 }

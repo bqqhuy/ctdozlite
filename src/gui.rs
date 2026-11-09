@@ -2760,8 +2760,52 @@ impl ZaloGuiApp {
                         Err(e) => self.show_toast(format!("Không thể tạo phiên mới: {e}")),
                     }
                 }
-                GuiEvent::ProfileSwitched { uid: _ } => {
-                    // WP16-3: Profile switched; refresh UI state for new profile
+                GuiEvent::ProfileSwitched { uid } => {
+                    // A20: Profile switched; thoroughly isolate and reset UI state for new profile
+                    self.clear_presence_state();
+                    self.deleted_message_ids.clear();
+                    self.quick_schedule = None;
+                    self.reset_sync_status();
+                    self.live_mailbox = None;
+                    crate::desktop_notice::account(&uid);
+                    self.clear_downloads();
+                    self.user_uin = uid.clone();
+                    self.user_name.clear();
+                    self.threads.clear();
+                    self.selected_thread_index = 0;
+                    self.active_call = None;
+                    self.image_viewer = None;
+                    self.user_avatar = None;
+                    self.input_message.clear();
+                    self.replying_to = None;
+                    self.forward_msg = None;
+                    self.forward_filter.clear();
+                    self.clipboard_read_pending = false;
+                    self.pending_clipboard_image = None;
+                    self.search_query.clear();
+                    self.phone_lookup_result = None;
+                    self.phone_modal_input.clear();
+                    self.friend_status_map.clear();
+                    self.checking_friend_status.clear();
+                    self.loading_link_previews.clear();
+                    self.dismissed_link_preview_for.clear();
+                    self.dismissed_sticker_suggest_for.clear();
+                    self.last_composer_text.clear();
+                    self.unread_counts.clear();
+                    #[cfg(windows)]
+                    crate::tray::set_unread(false);
+                    self.conversation_preferences.clear();
+                    self.show_hidden_conversations = false;
+                    self.clear_history_confirmation = None;
+                    self.sticker_textures.clear();
+                    self.texture_budget = crate::media_resources::ResourceLru::new(
+                        crate::media_resources::TEXTURE_BUDGET,
+                    );
+                    self.loading_stickers.clear();
+                    self.image_retry_at.clear();
+                    self.image_failures.clear();
+                    self.composer_sticker_cache.clear();
+                    self.link_metadata_cache.clear();
                     self.status_msg = "Đã chuyển tài khoản thành công".into();
                     self.profile_menu_open = false;
                     // Request refresh of threads and state for new profile

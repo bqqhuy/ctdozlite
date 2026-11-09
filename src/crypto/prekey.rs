@@ -19,19 +19,8 @@ use super::keystore::PreKeyBundle;
 
 /// Upload our prekey bundle to the server.
 pub async fn update_prekeys(s: &Session, bundle: &PreKeyBundle) -> Result<()> {
-    let mut payload = json!({
-        "identityKey": base64_encode(&bundle.identity_key),
-        "registrationId": bundle.registration_id,
-        "signedPreKey": {
-            "keyId": bundle.signed_pre_key.key_id,
-            "publicKey": base64_encode(&bundle.signed_pre_key.public_key),
-            "signature": base64_encode(&bundle.signed_pre_key.signature),
-        },
-        "preKeys": bundle.pre_keys.iter().map(|k| json!({
-            "keyId": k.key_id,
-            "publicKey": base64_encode(&k.public_key),
-        })).collect::<Vec<_>>(),
-    });
+    // Export bundle including bound signing identity key (audit A04)
+    let mut payload = bundle.to_export_json();
     // The server expects the same envelope as other Zalo APIs.
     payload["clientId"] = json!(s.imei);
 
@@ -106,7 +95,7 @@ pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
         spk.get("publicKey")
             .ok_or_else(|| anyhow::anyhow!("Thiếu publicKey của signedPreKey"))?,
     )?;
-    let signature = decode_key64(
+    let signature = decode_signature_64(
         spk.get("signature")
             .ok_or_else(|| anyhow::anyhow!("Thiếu signature của signedPreKey"))?,
     )?;
@@ -128,8 +117,7 @@ pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
     let signing_identity_key = node
         .get("signingIdentityKey")
         .and_then(|v| v.as_str())
-        .and_then(|raw| decode_any(raw).ok())
-        .filter(|b| b.len() == 32)
+        .and_then(|raw| decode_any_with_len(raw, 32).ok())
         .map(|b| {
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&b[..32]);
@@ -164,56 +152,61 @@ fn pick<'a>(node: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 /// production-parsed bundle then failed signature verification even when
 /// correctly signed.  Length is now part of the return type, not a runtime
 /// hint.
+pub fn decode_any_with_len(raw: &str, len: usize) -> Result<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let trimmed = raw.trim();
+    // 1. If length matches hex representation (len * 2) and all chars are hex digits, decode as hex
+    if trimmed.len() == len * 2 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(v) = hex::decode(trimmed) {
+            if v.len() == len {
+                return Ok(v);
+            }
+        }
+    }
+    // 2. Try Base64 decode
+    if let Ok(v) = B64.decode(trimmed) {
+        if v.len() == len {
+            return Ok(v);
+        }
+    }
+    // 3. Fallback hex decode
+    if trimmed.len().is_multiple_of(2) && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        if let Ok(v) = hex::decode(trimmed) {
+            if v.len() == len {
+                return Ok(v);
+            }
+        }
+    }
+    anyhow::bail!("Không giải mã được khóa E2EE (độ dài kỳ vọng: {len})")
+}
+
 fn decode_key_bytes(value: &Value, len: usize) -> Result<Vec<u8>> {
     let raw = value
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Khóa E2EE không phải chuỗi"))?;
-    let bytes = decode_any(raw)?;
-    anyhow::ensure!(
-        bytes.len() == len,
-        "Khóa E2EE sai độ dài ({} != {len})",
-        bytes.len()
-    );
-    Ok(bytes)
+    decode_any_with_len(raw, len)
 }
 
-fn decode_key32(value: &Value) -> Result<[u8; 32]> {
+pub fn decode_key32(value: &Value) -> Result<[u8; 32]> {
     let bytes = decode_key_bytes(value, 32)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
     Ok(out)
 }
 
-fn decode_key64(value: &Value) -> Result<[u8; 64]> {
+/// Decode a 64-byte Ed25519 signature from base64 or hex JSON value (audit A03).
+pub fn decode_signature_64(value: &Value) -> Result<[u8; 64]> {
     let bytes = decode_key_bytes(value, 64)?;
     let mut out = [0u8; 64];
     out.copy_from_slice(&bytes);
     Ok(out)
 }
 
-fn decode_any(raw: &str) -> Result<Vec<u8>> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    let trimmed = raw.trim();
-    if let Ok(v) = B64.decode(trimmed) {
-        return Ok(v);
-    }
-    // Hex fallback
-    if trimmed.len().is_multiple_of(2) && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        let mut out = Vec::with_capacity(trimmed.len() / 2);
-        let bytes = trimmed.as_bytes();
-        for pair in bytes.chunks(2) {
-            let s = std::str::from_utf8(pair)?;
-            out.push(u8::from_str_radix(s, 16)?);
-        }
-        return Ok(out);
-    }
-    anyhow::bail!("Không giải mã được khóa E2EE")
+pub fn decode_key64(value: &Value) -> Result<[u8; 64]> {
+    decode_signature_64(value)
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    B64.encode(bytes)
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -286,5 +279,29 @@ mod tests {
             },
         });
         assert!(parse_bundle(&dec).is_err());
+    }
+
+    /// Audit A03: test decode_signature_64 directly with 64-byte base64 and hex,
+    /// and ensure it rejects 32-byte or truncated inputs.
+    #[test]
+    fn test_decode_signature_64_exact_length_a03() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let raw64 = [42u8; 64];
+        let val_b64 = json!(B64.encode(raw64));
+        let decoded = decode_signature_64(&val_b64).expect("valid 64-byte base64");
+        assert_eq!(decoded, raw64);
+
+        let hex_str = hex::encode(raw64);
+        let val_hex = json!(hex_str);
+        let decoded_hex = decode_signature_64(&val_hex).expect("valid 64-byte hex");
+        assert_eq!(decoded_hex, raw64);
+
+        // Reject 32-byte key (old truncate bug)
+        let val_32 = json!(B64.encode([1u8; 32]));
+        assert!(decode_signature_64(&val_32).is_err(), "Must reject 32-byte input");
+
+        // Reject 63-byte input
+        let val_63 = json!(B64.encode([1u8; 63]));
+        assert!(decode_signature_64(&val_63).is_err(), "Must reject 63-byte input");
     }
 }

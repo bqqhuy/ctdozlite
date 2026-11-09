@@ -56,6 +56,47 @@ impl ZaloGuiApp {
                             self.open_own_profile();
                             close_menu = true;
                         }
+
+                        // A20: Profile switcher list in avatar popover
+                        if let Ok(reg) = crate::profiles::ProfileRegistry::load() {
+                            if reg.profiles.len() > 1 {
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new("Chuyển tài khoản:")
+                                        .size(11.5)
+                                        .color(pal.text_secondary)
+                                        .strong(),
+                                );
+                                for profile in reg.profiles.values() {
+                                    let is_active = profile.uid == self.user_uin;
+                                    let display = if is_active {
+                                        format!("✓ {} (hiện tại)", profile.display_name)
+                                    } else {
+                                        format!("  {}", profile.display_name)
+                                    };
+                                    if is_active {
+                                        ui.label(RichText::new(display).size(12.0).color(pal.accent_online));
+                                    } else {
+                                        if ui.add_sized(
+                                            [200.0, 26.0],
+                                            egui::Button::new(
+                                                RichText::new(display).size(12.0).color(pal.text_primary),
+                                            ).fill(Color32::TRANSPARENT),
+                                        ).on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::SwitchProfile {
+                                                    owner: self.user_uin.clone(),
+                                                    target_uid: profile.uid.clone(),
+                                                });
+                                            }
+                                            close_menu = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         ui.add_space(6.0);
                         ui.separator();
                         ui.add_space(4.0);

@@ -96,22 +96,25 @@ impl OneTimePreKey {
 }
 
 /// PreKey bundle: sent to the server for peers to initiate X3DH sessions with us.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct PreKeyBundle {
     pub identity_key: [u8; 32],
+    /// Ed25519 signing public key bound to this bundle (audit A04).
+    /// Used by peers to verify the signed_pre_key signature.
+    pub signing_identity_key: [u8; 32],
     pub registration_id: u32,
     pub signed_pre_key: BundleSignedPreKey,
     pub pre_keys: Vec<BundleOneTimePreKey>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct BundleSignedPreKey {
     pub key_id: u32,
     pub public_key: [u8; 32],
     pub signature: Vec<u8>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct BundleOneTimePreKey {
     pub key_id: u32,
     pub public_key: [u8; 32],
@@ -125,6 +128,7 @@ impl PreKeyBundle {
     ) -> Self {
         Self {
             identity_key: identity.dh.public,
+            signing_identity_key: identity.signing_public,
             registration_id: identity.registration_id,
             signed_pre_key: BundleSignedPreKey {
                 key_id: spk.key_id,
@@ -139,6 +143,40 @@ impl PreKeyBundle {
                 })
                 .collect(),
         }
+    }
+
+    /// Convert to JSON Value for export/upload with bound signing identity (audit A04).
+    pub fn to_export_json(&self) -> serde_json::Value {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        serde_json::json!({
+            "identityKey": B64.encode(self.identity_key),
+            "signingIdentityKey": B64.encode(self.signing_identity_key),
+            "registrationId": self.registration_id,
+            "signedPreKey": {
+                "keyId": self.signed_pre_key.key_id,
+                "publicKey": B64.encode(self.signed_pre_key.public_key),
+                "signature": B64.encode(&self.signed_pre_key.signature),
+            },
+            "preKeys": self.pre_keys.iter().map(|k| serde_json::json!({
+                "keyId": k.key_id,
+                "publicKey": B64.encode(k.public_key),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    /// Convert self into RemoteBundle for local verification (audit A04).
+    pub fn to_remote_bundle(&self) -> Result<super::prekey::RemoteBundle> {
+        let sig: [u8; 64] = self.signed_pre_key.signature.clone().try_into()
+            .map_err(|_| anyhow::anyhow!("Chữ ký signedPreKey không đủ 64 bytes"))?;
+        Ok(super::prekey::RemoteBundle {
+            identity_key: self.identity_key,
+            signing_identity_key: Some(self.signing_identity_key),
+            registration_id: self.registration_id,
+            signed_pre_key_id: self.signed_pre_key.key_id,
+            signed_pre_key: self.signed_pre_key.public_key,
+            signature: sig,
+            one_time_pre_key: self.pre_keys.first().map(|k| (k.public_key, k.key_id)),
+        })
     }
 }
 
@@ -289,5 +327,36 @@ mod tests {
         ).unwrap();
 
         assert_eq!(alice_secret, bob_secret);
+    }
+
+    /// Audit A04: PreKeyBundle must bind Ed25519 signing identity key upon generation and export,
+    /// and verifier must succeed using the bound signing key.
+    #[test]
+    fn test_prekey_bundle_binds_signing_identity_and_verifies_a04() {
+        let identity = IdentityKeyPair::generate().unwrap();
+        let spk = SignedPreKey::generate(1, &identity).unwrap();
+        let otpk = OneTimePreKey::generate_batch(100, 3).unwrap();
+
+        let bundle = PreKeyBundle::from_local_keys(&identity, &spk, &otpk);
+        // Ensure signing_identity_key is bound to the bundle
+        assert_eq!(bundle.signing_identity_key, identity.signing_public);
+        assert_eq!(bundle.identity_key, identity.dh.public);
+
+        // Convert to export json and verify signingIdentityKey presence
+        let json_val = bundle.to_export_json();
+        let b64_signing = json_val.get("signingIdentityKey").and_then(|v| v.as_str()).unwrap();
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        assert_eq!(B64.decode(b64_signing).unwrap(), identity.signing_public);
+
+        // Parse through production bundle parser and verify signature
+        let parsed = crate::crypto::prekey::parse_bundle(&json_val).expect("parse production bundle");
+        assert_eq!(parsed.signing_identity_key, Some(identity.signing_public));
+        assert!(crate::crypto::session::verify_signed_prekey(&parsed));
+
+        // Tamper with signingIdentityKey: verify must fail
+        let mut tampered_json = json_val.clone();
+        tampered_json["signingIdentityKey"] = serde_json::json!(B64.encode([99u8; 32]));
+        let tampered_parsed = crate::crypto::prekey::parse_bundle(&tampered_json).unwrap();
+        assert!(!crate::crypto::session::verify_signed_prekey(&tampered_parsed));
     }
 }

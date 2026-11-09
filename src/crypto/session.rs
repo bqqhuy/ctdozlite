@@ -21,11 +21,17 @@ use super::ratchet::{KeyPair, KeyPairBytes, RatchetSession};
 use super::store;
 use super::wire::{deserialize, serialize_prekey, serialize_whisper, DecodedMessage, PreKeyBundleWire};
 
-/// Signed prekey id used by this implementation (Zalo PC uses a fixed id).
+/// Signed prekey id used for initial prekey bundle.
 pub const SIGNED_PREKEY_ID: u32 = 1;
 
 /// Low-water mark: refill one-time prekeys when fewer than this remain.
 pub const PREKEY_REFILL_THRESHOLD: u32 = 2;
+
+/// Signed prekey rotation period (7 days in milliseconds) (A12).
+pub const SIGNED_PREKEY_ROTATION_MS: i64 = 7 * 86_400_000;
+
+/// Grace retention period for superseded signed prekeys (30 days in milliseconds) (A12).
+pub const SIGNED_PREKEY_GRACE_RETENTION_MS: i64 = 30 * 86_400_000;
 
 /// Outcome of decrypting an incoming E2EE payload.
 #[derive(Debug, Clone)]
@@ -71,31 +77,51 @@ impl E2eeManager {
         &self.conn
     }
 
-    /// Load the identity key, generating and persisting one on first use.
+    /// Load the identity key, generating and persisting one on first use (fail-safe: never regenerates on corruption, A14).
     pub fn identity(&self) -> Result<IdentityKeyPair> {
-        if let Some(id) = store::load_identity(&self.conn, &self.profile_id)? {
-            return Ok(id);
+        match store::load_identity(&self.conn, &self.profile_id) {
+            Ok(Some(id)) => Ok(id),
+            Ok(None) => {
+                let identity = IdentityKeyPair::generate()?;
+                store::save_identity(&self.conn, &self.profile_id, &identity)?;
+                Ok(identity)
+            }
+            Err(e) => {
+                Err(e.context("Không thể nạp khóa danh tính E2EE do dữ liệu bị hỏng. Hủy bỏ để bảo vệ an toàn danh tính, không tự ý tạo khóa mới."))
+            }
         }
-        let identity = IdentityKeyPair::generate()?;
-        store::save_identity(&self.conn, &self.profile_id, &identity)?;
-        Ok(identity)
     }
 
-    /// Ensure a signed prekey exists, generating one when missing.
+    /// Ensure an active signed prekey exists, rotating when older than 7 days (A12).
     ///
-    /// The signed prekey is rotated when it is older than seven days, matching
-    /// the Signal recommendation (evidence §4.3).
-    pub fn signed_prekey(&self) -> Result<SignedPreKey> {
-        if let Some(spk) = store::load_signed_prekey(&self.conn, &self.profile_id, SIGNED_PREKEY_ID)? {
-            let age_days = (now_ms() - spk.created_at).max(0) / 86_400_000;
-            if age_days < 7 {
+    /// Preserves old prekey IDs in the store to support late-arriving messages (grace retention).
+    pub fn active_signed_prekey(&self) -> Result<SignedPreKey> {
+        if let Some(spk) = store::load_latest_signed_prekey(&self.conn, &self.profile_id)? {
+            let age_ms = (now_ms() - spk.created_at).max(0);
+            if age_ms < SIGNED_PREKEY_ROTATION_MS {
                 return Ok(spk);
             }
+            // Older than 7 days: rotate to incremented key_id without overwriting old ones
+            let next_key_id = spk.key_id.wrapping_add(1).max(1);
+            let identity = self.identity()?;
+            let new_spk = SignedPreKey::generate(next_key_id, &identity)?;
+            store::save_signed_prekey(&self.conn, &self.profile_id, &new_spk)?;
+            let _ = store::prune_old_signed_prekeys(
+                &self.conn,
+                &self.profile_id,
+                SIGNED_PREKEY_GRACE_RETENTION_MS,
+            );
+            return Ok(new_spk);
         }
         let identity = self.identity()?;
         let spk = SignedPreKey::generate(SIGNED_PREKEY_ID, &identity)?;
         store::save_signed_prekey(&self.conn, &self.profile_id, &spk)?;
         Ok(spk)
+    }
+
+    /// Backwards-compatible alias for the active signed prekey.
+    pub fn signed_prekey(&self) -> Result<SignedPreKey> {
+        self.active_signed_prekey()
     }
 
     /// Top up the one-time prekey pool when it runs low.
@@ -318,7 +344,18 @@ impl E2eeManager {
                 }
 
                 let identity = self.identity()?;
-                let spk = self.signed_prekey()?;
+                let spk_id = prekey.bundle.signed_pre_key_id;
+                let spk = match store::load_signed_prekey(&self.conn, &self.profile_id, spk_id)? {
+                    Some(s) => s,
+                    None => {
+                        let active = self.active_signed_prekey()?;
+                        if active.key_id == spk_id {
+                            active
+                        } else {
+                            anyhow::bail!("Signed prekey (id={spk_id}) không tồn tại hoặc đã hết hạn thu hồi");
+                        }
+                    }
+                };
                 let otpk = match prekey.bundle.one_time_pre_key_id {
                     Some(id) => Some(
                         store::get_one_time_prekey(&self.conn, &self.profile_id, id)?
@@ -397,21 +434,11 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    /// A peer bundle built from real key material (Bob's perspective).
+    /// A peer bundle built from real key material (Bob's perspective) using bound signing identity (audit A04).
     fn peer_bundle(bob: &E2eeManager) -> super::super::prekey::RemoteBundle {
-        let identity = bob.identity().unwrap();
-        let spk = bob.signed_prekey().unwrap();
         bob.refill_one_time_prekeys().unwrap();
-        let otpk = bob.list_one_time_prekeys().unwrap();
-        super::super::prekey::RemoteBundle {
-            identity_key: identity.dh.public,
-            signing_identity_key: Some(identity.signing_public),
-            registration_id: identity.registration_id,
-            signed_pre_key_id: spk.key_id,
-            signed_pre_key: spk.key_pair.public,
-            signature: spk.signature.clone().try_into().expect("Ed25519 signature is 64 bytes"),
-            one_time_pre_key: otpk.first().map(|k| (k.key_pair.public, k.key_id)),
-        }
+        let bundle = bob.local_bundle().expect("local bundle with bound signing key");
+        bundle.to_remote_bundle().expect("convert local bundle to remote bundle")
     }
 
     /// Each manager gets a *fresh* database.  The directory name carries a
@@ -600,4 +627,65 @@ mod tests {
         assert!(!bob.is_identity_verified("alice").unwrap(), "Verified flag must be reset to false upon identity change");
     }
 
+    #[test]
+    fn corrupt_identity_does_not_regenerate_key_a14() {
+        let m = manager("corrupt_guard");
+        let _orig_id = m.identity().unwrap();
+
+        // Corrupt identity in DB
+        let short_blob = vec![0xEEu8; 10]; // bad length
+        let enc_blob = crate::storage::protect(&short_blob).unwrap();
+        m.conn.execute(
+            "UPDATE identity_key SET public_key=?1, private_bytes=?2 WHERE profile_id=?3",
+            rusqlite::params![&short_blob, &enc_blob, m.profile_id()],
+        ).unwrap();
+
+        // Loading identity must return Err and must NOT regenerate
+        assert!(m.identity().is_err(), "Must return Err on corrupt identity");
+
+        // Verify the database was not overwritten with a new identity key
+        let raw_pub: Vec<u8> = m.conn.query_row(
+            "SELECT public_key FROM identity_key WHERE profile_id=?1",
+            rusqlite::params![m.profile_id()],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(raw_pub, short_blob, "Identity row must remain untouched without regeneration");
+    }
+
+    #[test]
+    fn signed_prekey_rotation_preserves_old_keys_and_decrypts_late_messages_a12() {
+        let bob_mgr = manager("bob_spk_rot");
+        let alice_mgr = manager("alice_spk_rot");
+
+        // Initial SPK for Bob (id = 1)
+        let bob_spk_v1 = bob_mgr.signed_prekey().unwrap();
+        assert_eq!(bob_spk_v1.key_id, 1);
+
+        // Alice fetches Bob's initial bundle (with SPK id = 1)
+        let bob_bundle_v1 = peer_bundle(&bob_mgr);
+        assert_eq!(bob_bundle_v1.signed_pre_key_id, 1);
+
+        // Alice prepares a message to Bob using SPK id = 1
+        let wire_msg1 = alice_mgr.start_session(bob_mgr.profile_id(), &bob_bundle_v1, b"hello with spk v1").unwrap();
+
+        // Simulate time advancing past 7 days for Bob
+        bob_mgr.conn.execute(
+            "UPDATE signed_prekey SET created_at = ?1 WHERE profile_id = ?2 AND key_id = 1",
+            rusqlite::params![now_ms() - (8 * 86_400_000), bob_mgr.profile_id()],
+        ).unwrap();
+
+        // Bob rotates SPK -> should now have key_id = 2
+        let bob_spk_v2 = bob_mgr.active_signed_prekey().unwrap();
+        assert_eq!(bob_spk_v2.key_id, 2);
+        assert_ne!(bob_spk_v2.key_pair.public, bob_spk_v1.key_pair.public);
+
+        // Verify old SPK v1 is still present in Bob's store (grace retention)
+        let stored_v1 = store::load_signed_prekey(bob_mgr.conn(), bob_mgr.profile_id(), 1).unwrap();
+        assert!(stored_v1.is_some(), "Old signed prekey must be retained in store");
+
+        // Bob receives Alice's message which was encrypted with SPK v1!
+        // Bob must be able to decrypt it using the retained SPK v1
+        let decrypted = bob_mgr.decrypt(alice_mgr.profile_id(), &wire_msg1).unwrap();
+        assert_eq!(decrypted.text, "hello with spk v1");
+    }
 }

@@ -57,6 +57,18 @@ pub fn is_e2ee_enabled(convo: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Check if an active E2EE ratchet session exists for a peer (audit A01).
+pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
+    if profile_id.is_empty() || peer_id.is_empty() {
+        return false;
+    }
+    let _lock = lock_e2ee();
+    get_manager(profile_id)
+        .and_then(|mgr| mgr.load_session(peer_id))
+        .map(|opt| opt.is_some())
+        .unwrap_or(false)
+}
+
 /// Encrypt plaintext for E2EE conversation.
 ///
 /// A08 fix: serializes all E2EE operations globally to prevent concurrent

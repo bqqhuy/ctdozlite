@@ -15,7 +15,7 @@ const KNOWN_PULL_COMMANDS: [u16; 9] = [510, 511, 513, 514, 515, 517, 518, 603, 6
 /// Same bound as the auth-advertised queue list.
 const MAX_QUEUES: usize = 256;
 
-pub(crate) struct Pull {
+pub struct Pull {
     pub key: Key,
     pub last: Value,
     pub ids: Value,
@@ -28,10 +28,11 @@ struct Queue {
     in_flight: bool,
     deadline: Option<Instant>,
     retries: u8,
+    throttled: bool,
 }
 /// One instance per socket epoch; dropping the connection drops every scheduled retry.
 #[derive(Default)]
-pub(crate) struct PullQueues {
+pub struct PullQueues {
     queues: HashMap<Key, Queue>,
     epoch: u64,
 }
@@ -109,12 +110,20 @@ impl PullQueues {
                 in_flight: true,
                 deadline: Some(now + WAIT),
                 retries: 0,
+                throttled: false,
             },
         );
         diag::queue(self.epoch, key, diag::QueueDecision::Initial, 0);
     }
-    /// Process only replies for an advertised queue, retaining the exact server cursor.
-    pub fn page(&mut self, key: Key, payload: &Value, now: Instant) -> Option<Pull> {
+    /// Process replies for an advertised queue, retaining the exact server cursor.
+    /// When `has_capacity` is false, flow control suspends pulling further pages (A16).
+    pub fn page_with_capacity(
+        &mut self,
+        key: Key,
+        payload: &Value,
+        now: Instant,
+        has_capacity: bool,
+    ) -> Option<Pull> {
         if !self.queues.contains_key(&key) {
             self.discover(key, payload)?;
         }
@@ -160,19 +169,28 @@ impl PullQueues {
             }
             queue.retries = 0;
             queue.deadline = None;
-            diag::queue(self.epoch, key, diag::QueueDecision::Continue, 0);
-            Some(Pull {
-                key,
-                last: queue.last.clone(),
-                ids: queue.ids.clone(),
-            })
+            if has_capacity {
+                queue.throttled = false;
+                diag::queue(self.epoch, key, diag::QueueDecision::Continue, 0);
+                Some(Pull {
+                    key,
+                    last: queue.last.clone(),
+                    ids: queue.ids.clone(),
+                })
+            } else {
+                // A16: Consumer buffer congested - throttle pull and defer until capacity frees
+                queue.throttled = true;
+                None
+            }
         } else if !more {
             queue.deadline = None;
             queue.retries = 0;
+            queue.throttled = false;
             diag::queue(self.epoch, key, diag::QueueDecision::Complete, 0);
             None
         } else {
             // Missing/invalid cursors never replace the last valid request cursor.
+            queue.throttled = false;
             if queue.retries < MAX_RETRIES {
                 queue.deadline = Some(queue.deadline.map_or(now + WAIT, |at| at.min(now + WAIT)));
                 diag::queue(
@@ -196,6 +214,12 @@ impl PullQueues {
             }
             None
         }
+    }
+
+    /// Process only replies for an advertised queue, retaining the exact server cursor.
+    #[allow(dead_code)]
+    pub fn page(&mut self, key: Key, payload: &Value, now: Instant) -> Option<Pull> {
+        self.page_with_capacity(key, payload, now, true)
     }
     /// Register a known pull queue the auth reply did not list, from a valid page.
     ///
@@ -234,6 +258,7 @@ impl PullQueues {
                 in_flight: false,
                 deadline: None,
                 retries: 0,
+                throttled: false,
             },
         );
         diag::queue(self.epoch, key, diag::QueueDecision::DiscoveredFromPage, 0);
@@ -248,11 +273,27 @@ impl PullQueues {
         }
     }
     /// Resume idempotent reads even if no push arrives; work per scheduler tick is bounded.
-    pub fn due(&mut self, now: Instant) -> Vec<Pull> {
+    /// Resumes throttled queues when `has_capacity` is true (A16).
+    pub fn due_with_capacity(&mut self, now: Instant, has_capacity: bool) -> Vec<Pull> {
         let mut out = Vec::new();
         for (&key, queue) in &mut self.queues {
             if out.len() >= 8 {
                 break;
+            }
+            // Resume queues deferred by flow control when capacity is available
+            if queue.throttled {
+                if has_capacity {
+                    queue.throttled = false;
+                    queue.in_flight = false;
+                    queue.deadline = None;
+                    diag::queue(self.epoch, key, diag::QueueDecision::Resume, queue.retries);
+                    out.push(Pull {
+                        key,
+                        last: queue.last.clone(),
+                        ids: queue.ids.clone(),
+                    });
+                }
+                continue;
             }
             if queue.deadline.is_none_or(|at| at > now) {
                 continue;
@@ -279,6 +320,18 @@ impl PullQueues {
             });
         }
         out
+    }
+
+    /// Resume idempotent reads even if no push arrives.
+    #[allow(dead_code)]
+    pub fn due(&mut self, now: Instant) -> Vec<Pull> {
+        self.due_with_capacity(now, true)
+    }
+
+    /// Query if a queue is currently throttled by flow control backpressure (A16).
+    #[allow(dead_code)]
+    pub fn is_throttled(&self, key: Key) -> bool {
+        self.queues.get(&key).map(|q| q.throttled).unwrap_or(false)
     }
 }
 
@@ -453,5 +506,28 @@ mod tests {
         let pull = queues.page(key, &success, now + WAIT * 3).unwrap();
         assert_eq!(pull.last, json!(43));
         assert_eq!(queues.queues[&key].retries, 0); // Reset to 0 only on true success!
+    }
+
+    #[test]
+    fn flow_control_throttles_pull_when_capacity_exhausted_and_resumes() {
+        let now = Instant::now();
+        let mut queues = PullQueues::new(1);
+        let key = (510, 0);
+        queues.register(key, "r1".into(), now, None);
+
+        // When capacity is exhausted (has_capacity = false), page throttles and returns None
+        let throttled_pull = queues.page_with_capacity(key, &page(10, true), now, false);
+        assert!(throttled_pull.is_none());
+        assert!(queues.is_throttled(key));
+
+        // due_with_capacity while still without capacity should NOT emit pull
+        assert!(queues.due_with_capacity(now + Duration::from_millis(50), false).is_empty());
+        assert!(queues.is_throttled(key));
+
+        // When capacity recovers, due_with_capacity emits the deferred pull and clears throttled
+        let resumed = queues.due_with_capacity(now + Duration::from_millis(100), true);
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].last, json!(10));
+        assert!(!queues.is_throttled(key));
     }
 }

@@ -1895,7 +1895,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             break;
                         }
                         WorkerCmd::SwitchProfile { owner, target_uid } => {
-                            // WP16-3: Profile switching integration
+                            // A20: Multi-account runtime profile switching with thorough isolation
                             let current_account = session.lock().await.account_key().to_owned();
                             if current_account != owner {
                                 let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi".into()));
@@ -1915,29 +1915,50 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                             match profile_result {
                                 Ok(Ok(profile)) => {
-                                    // Logout current session
-                                    session.lock().await.logout();
-
-                                    // Load new session from profile
+                                    // A20: Prepare target session and validate BEFORE modifying current session (rollback preservation)
+                                    let session_path = profile.session_file.clone();
                                     let load_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                         let mut new_session = crate::session::Session::new(false, false, false)?;
-                                        let session_path = profile.session_file.to_string_lossy().to_string();
-                                        new_session.load_from_file(&session_path)?;
+                                        new_session.load_from_file(&session_path.to_string_lossy())?;
+                                        anyhow::ensure!(!new_session.account_key().is_empty(), "Target profile session has empty account key");
                                         Ok(new_session)
                                     }).await;
 
                                     match load_result {
                                         Ok(Ok(new_session)) => {
+                                            // 1. Tear down old account tasks and worker resources
+                                            if let Some(task) = current_auth_task.take() { task.abort(); }
+                                            auth_attempt_mgr.next_attempt();
+                                            call_bridge.end_call();
+                                            crate::queue_cursors::flush_all().await;
+
+                                            let old_account = session.lock().await.account_key().to_owned();
+                                            if !old_account.is_empty() {
+                                                let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&old_account)).await;
+                                            }
+
+                                            // 2. Commit active profile in registry
+                                            let profile_name = profile.name.clone();
+                                            let _ = tokio::task::spawn_blocking(move || {
+                                                if let Ok(mut reg) = crate::profiles::ProfileRegistry::load() {
+                                                    let _ = reg.set_active(&profile_name);
+                                                    let _ = reg.save();
+                                                }
+                                            }).await;
+
+                                            // 3. Atomically install new session
                                             *session.lock().await = new_session;
+
+                                            // 4. Notify UI to isolate state and reload data for target UID
                                             let _ = gui_tx.send(GuiEvent::ProfileSwitched { uid: target_uid_clone });
                                             egui_ctx.request_repaint();
-                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Đã chuyển tài khoản".into()));
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Đã chuyển tài khoản thành công".into()));
                                         }
                                         Ok(Err(e)) => {
-                                            let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể tải phiên: {e}")));
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể tải phiên tài khoản: {e}")));
                                         }
                                         Err(_) => {
-                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Lỗi tải phiên".into()));
+                                            let _ = gui_tx.send(GuiEvent::StatusUpdate("Lỗi tải phiên tài khoản".into()));
                                         }
                                     }
                                 }

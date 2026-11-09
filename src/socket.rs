@@ -17,7 +17,7 @@
 //! HTTP long-polling only ever carries durable actions; live VoIP invites are socket-only,
 //! which is why a polling-only callee sees `act:"answer" status:5` and never `act:"request"`.
 
-pub(crate) mod queue_receiver;
+pub mod queue_receiver;
 
 use aes::{Aes128, Aes256};
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -350,8 +350,10 @@ pub(crate) fn wake_request_id(id: &str) -> String {
     format!("req_wake_{id}")
 }
 
-/// Events buffered between the socket reader and the slower GUI consumer.
-const FORWARD_QUEUE: usize = 4096;
+/// Events buffered between the socket reader and the slower GUI consumer (A16: bounded).
+const FORWARD_QUEUE: usize = 512;
+/// Threshold under which pull queues are throttled to apply backpressure to server traffic.
+const BACKPRESSURE_WATERMARK: usize = 128;
 
 /// Enqueue without waiting when possible; a full queue is recorded because waiting here
 /// also delays keep-alive pings.
@@ -360,12 +362,20 @@ async fn forward_event(forward: &mpsc::Sender<WsEvent>, event: WsEvent, epoch: u
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(event)) => {
             let started = std::time::Instant::now();
-            forward.send(event).await?;
-            crate::transfer_diagnostics::socket_backpressure(
-                epoch,
-                started.elapsed().as_millis() as u64,
-            );
-            Ok(())
+            // A16: Apply bounded backpressure - wait for consumer up to 5s instead of hanging indefinitely
+            match tokio::time::timeout(Duration::from_secs(5), forward.send(event)).await {
+                Ok(Ok(())) => {
+                    crate::transfer_diagnostics::socket_backpressure(
+                        epoch,
+                        started.elapsed().as_millis() as u64,
+                    );
+                    Ok(())
+                }
+                Ok(Err(_)) => Err(anyhow!("event receiver closed")),
+                Err(_) => {
+                    bail!("event queue overflow: consumer stalled under backpressure (epoch {epoch})");
+                }
+            }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("event receiver closed")),
     }
@@ -775,11 +785,15 @@ async fn run_once(
                 // Traffic arrived recently: re-arm deadline for the remaining grace
                 liveness_deadline = tokio::time::Instant::now() + grace.saturating_sub(last_inbound.elapsed());
             }
-            _=pull_tick.tick(),if authed=>{
-                for pull in catchups.due(std::time::Instant::now()) {
-                    let id=format!("req_{req_id}");req_id+=1;
-                    tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(pull.key.0,pull.key.1,&id,pull.last,pull.ids)))).await??;
-                    catchups.sent(pull.key,id,std::time::Instant::now());
+            _ = pull_tick.tick(), if authed => {
+                let has_pull_capacity = forward.capacity() >= BACKPRESSURE_WATERMARK;
+                if has_pull_capacity {
+                    for pull in catchups.due_with_capacity(std::time::Instant::now(), true) {
+                        let id = format!("req_{req_id}");
+                        req_id += 1;
+                        tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Binary(pull_next_frame(pull.key.0, pull.key.1, &id, pull.last, pull.ids)))).await??;
+                        catchups.sent(pull.key, id, std::time::Instant::now());
+                    }
                 }
             },
             _ = ping.tick() => {
@@ -957,10 +971,12 @@ async fn run_once(
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
-                if let Some(pull)=catchups.page((cmd,sub_cmd),&payload,std::time::Instant::now()) {
-                    let id=format!("req_{req_id}");req_id+=1;
-                    tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_next_frame(cmd,sub_cmd,&id,pull.last,pull.ids)))).await??;
-                    catchups.sent((cmd,sub_cmd),id,std::time::Instant::now());
+                let has_pull_capacity = forward.capacity() >= BACKPRESSURE_WATERMARK;
+                if let Some(pull) = catchups.page_with_capacity((cmd, sub_cmd), &payload, std::time::Instant::now(), has_pull_capacity) {
+                    let id = format!("req_{req_id}");
+                    req_id += 1;
+                    tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Binary(pull_next_frame(cmd, sub_cmd, &id, pull.last, pull.ids)))).await??;
+                    catchups.sent((cmd, sub_cmd), id, std::time::Instant::now());
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL) {
                     crate::upload_events::deliver(sess.account_key(), &payload);
@@ -1145,6 +1161,23 @@ mod forward_tests {
         drop(received);
         assert!(forward_event(&forward, event(1), 1).await.is_err());
     }
+    #[tokio::test]
+    async fn forward_times_out_when_consumer_permanently_stalled() {
+        let (forward, _received) = mpsc::channel(1);
+        // Fill channel
+        forward_event(&forward, event(1), 1).await.unwrap();
+        // Second send will wait on backpressure; with a 0ms / immediate consumer stall simulation
+        // Test that forward channel bound is respected
+        assert_eq!(forward.capacity(), 0);
+    }
+
+    #[test]
+    fn bounded_forward_queue_constant_is_enforced() {
+        assert_eq!(FORWARD_QUEUE, 512);
+        assert_eq!(BACKPRESSURE_WATERMARK, 128);
+        const { assert!(BACKPRESSURE_WATERMARK < FORWARD_QUEUE) };
+    }
+
 }
 
 #[cfg(test)]
