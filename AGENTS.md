@@ -134,3 +134,20 @@ precedence; this section does not authorize additional work or external actions.
 These rules apply regardless of assistant vendor. Agent entry points and optional
 skills delegate here rather than maintaining separate policies or task status.
 See [multi-assistant setup](docs/AI_ASSISTANTS.md).
+
+## Advisor checkpoints
+
+When a second-opinion model is available (in Claude Code, the advisor configured in
+`.claude/settings.json`), consult it at these three points:
+
+1. **Before finalizing a plan**: before presenting a plan for approval or starting
+   a multi-file change.
+2. **When the same error occurs twice**: the same build, test or runtime failure
+   after one attempted fix. Consult before a third attempt instead of retrying
+   variations.
+3. **Before reporting completion**: before saying a task is done, fixed or verified.
+
+Treat advice like any other evidence: if it conflicts with code, tests or captures,
+report the conflict. If no advisor is available at a checkpoint, say so in the plan
+or report instead of skipping it silently. Read-only answers with no plan or change
+need no consultation.

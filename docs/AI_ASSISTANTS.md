@@ -19,7 +19,7 @@ Không yêu cầu test mới cho mỗi sửa tài liệu hay thay đổi nhỏ d
 | Công cụ | Điểm vào trong repo | Cách dùng |
 | :--- | :--- | :--- |
 | Codex | `AGENTS.md`; `.agents/skills/karpathy-guidelines/SKILL.md` | AGENTS là hướng dẫn dự án; có thể gọi `$karpathy-guidelines` khi skill đã được công cụ nhận diện |
-| Claude Code | `CLAUDE.md`; `.claude/skills/karpathy-guidelines/SKILL.md` | CLAUDE yêu cầu đọc AGENTS; skill có thể gọi bằng `/karpathy-guidelines` |
+| Claude Code | `CLAUDE.md`; `.claude/settings.json`; `.claude/agents/`; `.claude/skills/karpathy-guidelines/SKILL.md` | CLAUDE yêu cầu đọc AGENTS; phiên chính Sonnet 5.5, advisor Fable 5.2 (dự phòng Opus 5.5 bằng `/advisor`); 3 sub agent Haiku 4.5 chỉ đọc (`search`, `grep`, `docs`); skill gọi bằng `/karpathy-guidelines` |
 | Gemini CLI | `GEMINI.md` | Import `@./AGENTS.md`; dùng `/memory show` để kiểm tra ngữ cảnh, `/memory refresh` để tải lại khi cần |
 | Cursor | `.cursor/rules/karpathy-guidelines.mdc` | Rule `alwaysApply: true` yêu cầu đọc AGENTS; mở repo và kiểm tra Project Rules |
 | GitHub Copilot | `.github/copilot-instructions.md` | Hướng dẫn workspace yêu cầu đọc AGENTS; hỗ trợ cụ thể tùy sản phẩm/chế độ |
