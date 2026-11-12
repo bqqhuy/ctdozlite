@@ -74,3 +74,5 @@ thử, không phải GitHub Release. Khi chạy vẫn cần `--e2ee-experimental
 Nếu thư mục log không ghi được, chế độ thử không bật. Nếu writer lỗi giữa chừng,
 app hiển thị lỗi và chặn lần gửi thử tiếp theo; khi thoát bình thường app đợi ghi
 log với thời hạn cố định. Log GitHub có `build_revision` để phân biệt các bản thử.
+
+Hướng dẫn cho các AI Agent tiếp quản dự án sau bước thử nghiệm này: xem [E2EE_HANDOVER_AI_GUIDE.md](E2EE_HANDOVER_AI_GUIDE.md).

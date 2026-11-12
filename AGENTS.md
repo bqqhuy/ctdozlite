@@ -134,3 +134,11 @@ precedence; this section does not authorize additional work or external actions.
 These rules apply regardless of assistant vendor. Agent entry points and optional
 skills delegate here rather than maintaining separate policies or task status.
 See [multi-assistant setup](docs/AI_ASSISTANTS.md).
+
+## E2EE Handover & Next Steps (post-trial)
+
+For AI agents continuing work after the E2EE trial build and user testing, consult
+[docs/E2EE_HANDOVER_AI_GUIDE.md](docs/E2EE_HANDOVER_AI_GUIDE.md). It details:
+- Current baseline (`main` branch with Signal Protobuf wire, truncated 8-byte MAC, WebSocket command IDs).
+- Concrete actions if user testing passes: empirical parity elevation (E1), real-time inbound WebSocket push decryption (`CMD_SIGNAL_RECEIVE_1_1` = 551), group sender keys, and media encryption.
+- Concrete debugging steps if user testing reports an error via `diagnostics/sync-media.jsonl`.
