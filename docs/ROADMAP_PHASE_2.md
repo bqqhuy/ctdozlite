@@ -23,7 +23,7 @@
 
 | Phiên bản | Tên định danh | Trọng tâm kỹ thuật cốt lõi | Bằng chứng giao thức & Điểm neo mã nguồn |
 | :--- | :--- | :--- | :--- |
-| **`v0.013-arm`** | **Realtime Push Engine & Zero-Delay Sync** | Thay thế HTTP Polling bằng WebSocket Full-Duplex; Instant Typing & Read Receipts; Battery Keepalive trên ARM64 | `src/socket.rs`, `src/gui/worker.rs`, Push CMD `501, 502, 521, 200`, `re-notes/04_websocket_push.md` |
+| **`v0.013-arm`** | **Realtime Push Engine & Zero-Delay Sync** | Thay thế HTTP Polling bằng WebSocket Full-Duplex; Instant Typing & Read Receipts; Battery Keepalive trên ARM64 | `src/socket.rs`, `src/gui/worker.rs`, Push CMD `501, 502, 521, 601, 2`, `re-notes/04_websocket_push.md` |
 | **`v0.014-arm`** | **WebRTC Audio DSP & VoIP Hardening** | Tích hợp WebRTC APM (AEC3, Noise Suppression, AGC); Software H.264 Fallback; Mượt hóa Screen-Sharing 30fps | `src/call.rs`, `src/media.rs`, `src/windows_video.rs`, WebRTC Audio Processing Module |
 | **`v0.015-arm`** | **In-App Rich Media & Large File Transfers** | Multi-window Photo Gallery; Range-request Video Streaming; In-app Document Preview (PDF/Doc); Chunked Resume Upload | `src/media.rs`, `src/gui/`, HTTP Range RFC 7233, `re-notes/22_media_pipeline.md` |
 | **`v0.016-arm`** | **Full E2EE Double Ratchet & Multi-Account** | Bắt tay trao đổi PreKey Signal Protocol thật; Lưu trữ an toàn khóa thiết bị; Đa tài khoản Zalo không cần relogin | `src/crypto.rs`, `src/session.rs`, `re-notes/13_e2ee.md`, SQLite multi-profile |
@@ -61,12 +61,12 @@ Hiện tại, ứng dụng vẫn dựa một phần vào HTTP Polling định k�
    - Endpoint: `wss://ws-push.chat.zalo.me/ws/chat` (hoặc domain do `ServiceResolver` cung cấp).
    - Packet Framing: Khung nhị phân Zalo Socket Header 4 bytes (`u8 version | u16 LE cmd | u8 subCmd`) theo Zalo PC 26.10.11 (`src/socket.rs`).
 2. **Push Command IDs cần xử lý full-duplex**:
-   - `CMD 501`: Tin nhắn văn bản / media 1-1 mới đến từ server.
-   - `CMD 502`: Tin nhắn nhóm mới.
-   - `CMD 521`: Sự kiện thu hồi tin nhắn (`undo/recall`) thời gian thực.
-   - `CMD 601`: Cập nhật trạng thái đã nhận (`delivered`) và đã xem (`seen`).
-   - `CMD 610`: Sự kiện đang soạn tin nhắn (`typing indicator` - start/stop).
-   - `CMD 200`: Heartbeat ping-pong giữ kết nối.
+   - `CMD 2` (`CMD_PING`): Heartbeat ping-pong giữ kết nối (`PING = 2`, `PING_ACTIVE = 4`).
+   - `CMD 501` (`CMD_PUSH_MSG_1_1`): Tin nhắn văn bản / media 1-1 mới đến từ server.
+   - `CMD 502` (`PUSH_STATUS_1_1`): Cập nhật trạng thái tin nhắn 1-1 (delivered/seen) từ server.
+   - `CMD 521` (`CMD_PUSH_MSG_GROUP`): Tin nhắn nhóm mới đến từ server.
+   - `CMD 601` (`CMD_CTRL_PUSH_CTRL`): Gói tin điều khiển đồng bộ và cập nhật trạng thái thời gian thực.
+   - *Lưu ý về hàng đợi shard*: `CMD 610` thuộc nhóm hàng đợi điều khiển phản ứng (reaction control family), không phải lệnh typing độc lập. Typing indicator thời gian thực được trao đổi qua HTTP / control events đã phân giải.
 
 #### C. Luồng dữ liệu (Data Loop Invariant)
 ```
@@ -78,7 +78,7 @@ App UI State (threads & active chat) -> egui Reactive Render
 #### D. Các gói công việc cụ thể (Work Packages)
 - **WP13-1: WebSocket Reconnect & Auto-Recovery**: Triển khai cơ chế Exponential Backoff Reconnect (1s, 2s, 4s, tối đa 30s) khi mất kết nối mạng.
 - **WP13-2: Instant Push Dispatcher**: Thay thế hoàn toàn vòng lặp polling HTTP ở `worker.rs` bằng `tokio::select!` lắng nghe trực tiếp kênh WebSocket stream.
-- **WP13-3: Typing Indicator & Read Receipt Sync**: Gửi gói tin `CMD 610` khi người dùng nhập tin nhắn vào text box, hiển thị avatar động "đang soạn tin..." trong danh sách chat.
+- **WP13-3: Typing Indicator & Read Receipt Sync**: Đồng bộ trạng thái đã nhận / đã đọc (`CMD 601`) và sự kiện đang soạn tin nhắn (`typing indicator`), hiển thị avatar động "đang soạn tin..." trong danh sách chat.
 - **WP13-4: ARM64 Battery Keepalive Optimizer**: Tự động giảm tần suất ping heartbeat khi ứng dụng chạy nền hoặc khi màn hình khóa (Modern Standby).
 
 #### E. Tiêu chí nghiệm thu (Verification Criteria)

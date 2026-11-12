@@ -1,8 +1,15 @@
 # Lộ trình hoàn thiện fork theo Zalo PC/Web
 
-Ngày cập nhật: 07/11/2026 (Asia/Saigon).
-Trạng thái tổng thể:
-- **Giai đoạn 1 (v0.008-arm → v0.011-arm)**: Đã hoàn tất 100% bao phủ bề mặt API và tính năng (R0 → R15).
+Ngày cập nhật: 10/11/2026 (Asia/Saigon).
+Trạng thái tổng thể & Phân định mức độ hoàn thiện (Capability Status Standards):
+- **Quy ước nhãn trạng thái**:
+  - `Implemented`: Đã tích hợp luồng logic mã nguồn và kết nối UI/Worker.
+  - `Fixture-tested`: Đã kiểm thử qua test fixture nội bộ / synthetic runner.
+  - `Live-verified`: Đã xác thực thành công trên tài khoản và thiết bị thật qua capture Zalo PC/Web (`E1`).
+  - `Experimental`: Thử nghiệm sơ khởi, đang nghiên cứu PoC hoặc cần khóa/môi trường đặc thù (E2EE Double Ratchet, zCloud file decrypt, LAN transfer).
+  - `Unsupported`: Chưa hỗ trợ hoặc phía server Zalo đã ngừng cung cấp route/giao thức.
+  - `Unknown`: Chưa đủ bằng chứng hoặc trạng thái chưa xác định.
+- **Giai đoạn 1 (v0.008-arm → v0.011-arm)**: Đã hoàn tất bao phủ bề mặt API và tính năng (R0 → R15: `Implemented` & `Fixture-tested`; các nhánh nhạy cảm như E2EE/zCloud/LAN ở mức `Experimental` theo capability).
 - **Cột mốc kiểm toán v0.012-arm**: Đã hoàn tất rà soát toàn diện, dọn 100% dead code, 0 lỗi Clippy, chuẩn hóa luồng dữ liệu 2 chiều. Xem [báo cáo v0.012](releases/v0.012-arm-release.md).
 - **Giai đoạn 2 (từ v0.013-arm trở đi)**: Đang triển khai lộ trình Production Hardening, Realtime Engine & Experience Parity. Xem [Lộ trình Giai đoạn 2](ROADMAP_PHASE_2.md).
 
@@ -13,14 +20,14 @@ Bao phủ 20 nhóm A, 12 nhóm B và các nhánh nghiên cứu C trong
 không được tính như tính năng độc lập. 421 route tĩnh là chỉ mục bằng chứng, không
 phải danh sách cần gọi hết.
 
-### Giai đoạn 1: Bốn phiên bản bao phủ tính năng (Đã hoàn tất)
+### Giai đoạn 1: Bốn phiên bản bao phủ tính năng (Đã hoàn tất diện mạo & Fixture)
 
-| Phiên bản | Khối công việc giữ lại | Mục tiêu bàn giao | Trạng thái |
+| Phiên bản | Khối công việc giữ lại | Mục tiêu bàn giao | Trạng thái kỹ thuật |
 | :--- | :--- | :--- | :--- |
-| **[v0.008-arm](releases/v0.008-arm-plan.md)** | R0, R8, R9, R10 | Sửa cuộc gọi nhận ở điện thoại; UI PR #105; người lạ/privacy; tổ chức hội thoại/danh bạ/hồ sơ; quản trị nhóm/cộng đồng | **ĐÃ HOÀN TẤT** |
-| **[v0.009-arm](releases/v0.009-arm-plan.md)** | R11, R12, R13 | Voice/card/batch, sticker/GIF/viewer/screen-share; to-do/nhắc hẹn/automation server; bảo mật tài khoản và chat E2EE | **ĐÃ HOÀN TẤT** |
-| **[v0.010-arm](releases/v0.010-arm-plan.md)** | R14 | Lịch sử, server media library và zCloud; hoàn thiện V1/BinNet/import/khôi phục | **ĐÃ HOÀN TẤT** |
-| **[v0.011-arm](releases/v0.011-arm-plan.md)** | R15 | Business/OA/enterprise/catalog, phần tài khoản đặc thù, LAN/transfer theo capability xác minh | **ĐÃ HOÀN TẤT** |
+| **[v0.008-arm](releases/v0.008-arm-plan.md)** | R0, R8, R9, R10 | Sửa cuộc gọi nhận ở điện thoại; UI PR #105; người lạ/privacy; tổ chức hội thoại/danh bạ/hồ sơ; quản trị nhóm/cộng đồng | **Implemented / Live-verified** (Call lifecycle, UI, Group basics) |
+| **[v0.009-arm](releases/v0.009-arm-plan.md)** | R11, R12, R13 | Voice/card/batch, sticker/GIF/viewer/screen-share; to-do/nhắc hẹn/automation server; bảo mật tài khoản và chat E2EE | **Implemented / Fixture-tested** (E2EE: **Experimental**) |
+| **[v0.010-arm](releases/v0.010-arm-plan.md)** | R14 | Lịch sử, server media library và zCloud; hoàn thiện V1/BinNet/import/khôi phục | **Implemented / Fixture-tested** (zCloud: **Experimental**) |
+| **[v0.011-arm](releases/v0.011-arm-plan.md)** | R15 | Business/OA/enterprise/catalog, phần tài khoản đặc thù, LAN/transfer theo capability xác minh | **Implemented / Fixture-tested** (LAN: **Experimental**) |
 
 ### Cột mốc Kiểm toán & Hợp nhất chất lượng
 
