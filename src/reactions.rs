@@ -598,6 +598,55 @@ mod tests {
             assert!(parse_reaction_events(&v).is_empty());
         }
     }
+
+    #[test]
+    fn test_duplicate_and_out_of_order_reaction_handling() {
+        let mut summaries: Vec<ReactionSummary> = Vec::new();
+        let mut version = ReactionVersion::default();
+
+        let ev1 = ReactionEvent {
+            message_id: "m1".into(),
+            sender_id: "u1".into(),
+            event_id: "ev1".into(),
+            r_type: 3, // 👍
+            emoji: "👍".into(),
+            ts: 1000,
+            ..Default::default()
+        };
+
+        // First application
+        assert!(version.record(&mut summaries, &ev1, false));
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].emoji, "👍");
+        assert_eq!(summaries[0].count, 1);
+        assert_eq!(summaries[0].reactor_counts.get("u1"), Some(&1));
+
+        // Duplicate replay of same event: must return false (no-op)
+        assert!(!version.record(&mut summaries, &ev1, false));
+        assert_eq!(summaries[0].count, 1);
+
+        // Out-of-order arrival: older event from another user
+        let ev0 = ReactionEvent {
+            message_id: "m1".into(),
+            sender_id: "u2".into(),
+            event_id: "ev0".into(),
+            r_type: 5, // ❤️
+            emoji: "❤️".into(),
+            ts: 500,
+            ..Default::default()
+        };
+        let mut v_u2 = ReactionVersion::default();
+        assert!(v_u2.record(&mut summaries, &ev0, false));
+        assert_eq!(summaries.len(), 2);
+        // Both reactions preserved with per-user breakdown
+        let heart = summaries.iter().find(|s| s.emoji == "❤️").unwrap();
+        assert_eq!(heart.count, 1);
+        assert_eq!(heart.reactor_counts.get("u2"), Some(&1));
+
+        let thumbs = summaries.iter().find(|s| s.emoji == "👍").unwrap();
+        assert_eq!(thumbs.count, 1);
+        assert_eq!(thumbs.reactor_counts.get("u1"), Some(&1));
+    }
 }
 
 /// Persist source and capture watermark independently of the transient network-fresh bit.

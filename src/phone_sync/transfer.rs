@@ -162,6 +162,14 @@ type TraceKey = (usize, Option<u64>, Option<u64>, usize, bool, bool);
 /// Unchanged round summaries are repeated at most this often.
 const TRACE_EVERY: Duration = Duration::from_secs(10);
 impl Round {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn new(number: usize) -> Self {
+        Self {
+            number,
+            ..Default::default()
+        }
+    }
+
     fn progress(&self, wait: u64) -> String {
         let base = self.progress_counts(wait);
         if self.idle {
@@ -254,9 +262,20 @@ impl Round {
             },
         );
     }
-    fn complete(&self, _wanted: &[String]) -> bool {
-        self.last_index
-            .is_some_and(|last| (0..=last).all(|idx| self.seen.contains_key(&idx)))
+    fn complete(&self, wanted: &[String]) -> bool {
+        self.last_index.is_some_and(|last| {
+            if self.seen.is_empty() || !(0..=last).all(|idx| self.seen.contains_key(&idx)) {
+                return false;
+            }
+            // For the initial conversation metadata round (round 0, wanted empty),
+            // ensure at least one metadata batch (batchType=2) was received.
+            // Message rounds (number > 0 or non-empty wanted) receive batchType=1 (is_meta=false).
+            if self.number == 0 && wanted.is_empty() {
+                self.seen.values().any(|(is_meta, _, _)| *is_meta)
+            } else {
+                true
+            }
+        })
     }
     fn apply(&mut self, event: &WsEvent, id: &str) -> Result<bool> {
         if event.cmd == crate::socket::CMD_SYNC_REQUEST
@@ -2259,5 +2278,33 @@ mod resilience_tests {
             request_queries(&wanted, 99, UNLIMITED)[0]["limit"],
             json!(2_147_483_647)
         );
+    }
+
+    #[test]
+    fn test_round_complete_metadata_and_message_rounds() {
+        // Round 0 (metadata round, wanted is empty)
+        let mut r0 = Round::new(0);
+        r0.last_index = Some(1);
+        // Chunks without is_meta=true should NOT complete r0
+        r0.seen.insert(0, (false, "url0".to_string(), 10));
+        r0.seen.insert(1, (false, "url1".to_string(), 10));
+        assert!(!r0.complete(&[]));
+
+        // When a metadata chunk is received, r0 completes
+        r0.seen.insert(0, (true, "url0".to_string(), 10));
+        assert!(r0.complete(&[]));
+
+        // Round 1 (message round, wanted is not empty)
+        let mut r1 = Round::new(1);
+        r1.last_index = Some(1);
+        r1.seen.insert(0, (false, "url0".to_string(), 20));
+        r1.seen.insert(1, (false, "url1".to_string(), 20));
+        let wanted = vec!["oneone/user1".to_string()];
+        // Should complete successfully even though all chunks have is_meta == false
+        assert!(r1.complete(&wanted));
+
+        // If a chunk is missing in r1, it must not complete
+        r1.seen.remove(&1);
+        assert!(!r1.complete(&wanted));
     }
 }

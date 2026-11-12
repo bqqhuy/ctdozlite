@@ -97,9 +97,14 @@ pub fn parse_product_catalog(val: &Value) -> Result<Vec<ProductCatalogItem>> {
         .collect()
 }
 
-/// Call `/api/prodcatalog/list` to fetch the account's product catalog.
+/// Strict parser for product catalog items from Zalo API response.
+pub fn try_parse_product_catalog(val: &Value) -> Result<Vec<ProductCatalogItem>> {
+    parse_product_catalog(val)
+}
+
+/// Call `/api/prodcatalog/product/list` (cmd 12039) to fetch the account's product catalog.
 pub async fn fetch_product_catalog(s: &Session) -> Result<Vec<ProductCatalogItem>> {
-    let url = format!("{}/api/prodcatalog/list", s.domains.profile);
+    let url = s.resolve_service_url("profile", "/api/prodcatalog/product/list");
     let payload = json!({
         "page": 1,
         "count": 50,
@@ -111,6 +116,22 @@ pub async fn fetch_product_catalog(s: &Session) -> Result<Vec<ProductCatalogItem
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
     parse_product_catalog(&decrypted)
+}
+
+/// Call `/api/prodcatalog/catalog/list` (cmd 12038) to fetch the account's catalog categories.
+pub async fn fetch_catalog_list(s: &Session) -> Result<Value> {
+    let url = s.resolve_service_url("profile", "/api/prodcatalog/catalog/list");
+    let payload = json!({
+        "page": 1,
+        "count": 50,
+        "imei": s.imei,
+    });
+    let params = s
+        .encoded_params(&payload)
+        .context("Mã hoá tham số lấy danh sách catalog thất bại")?;
+    let resp = s.post_form(&url, format!("params={params}")).await?;
+    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
+    crate::api_response::checked_data(decrypted)
 }
 
 #[cfg(test)]
@@ -162,11 +183,20 @@ mod tests {
         assert!(parse_product_catalog(&json!({"error_code":600,"data":{"items":[]}})).is_err());
         assert!(parse_product_catalog(&json!({"error_code":0,"data":{}})).is_err());
         assert!(parse_product_catalog(
+            &json!({"error_code":114,"error_message":"Permission denied","data":null})
+        )
+        .is_err());
+        assert!(parse_product_catalog(
             &json!({"error_code":0,"data":{"items":[{"id":"x","price":-1}]}})
         )
         .is_err());
         assert!(
             parse_product_catalog(&json!({"error_code":0,"data":{"items":[]}}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            try_parse_product_catalog(&json!({"error_code":0,"data":{"items":[]}}))
                 .unwrap()
                 .is_empty()
         );

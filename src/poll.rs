@@ -46,6 +46,62 @@ impl PollItem {
     }
 }
 
+impl From<crate::group_content::Poll> for PollItem {
+    fn from(p: crate::group_content::Poll) -> Self {
+        let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
+        Self {
+            id: p.id.parse::<i64>().unwrap_or(0),
+            grid: String::new(),
+            question: p.question,
+            creator_id: p.creator,
+            options: p
+                .options
+                .into_iter()
+                .map(|o| PollOption {
+                    id: o.id,
+                    text: o.text,
+                    vote_count: o.votes.unwrap_or(0) as u32,
+                    is_voted_by_me: o.selected,
+                })
+                .collect(),
+            multi_choice: p.multi,
+            is_closed: p.closed,
+            total_votes: total,
+        }
+    }
+}
+
+impl From<&crate::group_content::Poll> for PollItem {
+    fn from(p: &crate::group_content::Poll) -> Self {
+        let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
+        Self {
+            id: p.id.parse::<i64>().unwrap_or(0),
+            grid: String::new(),
+            question: p.question.clone(),
+            creator_id: p.creator.clone(),
+            options: p
+                .options
+                .iter()
+                .map(|o| PollOption {
+                    id: o.id,
+                    text: o.text.clone(),
+                    vote_count: o.votes.unwrap_or(0) as u32,
+                    is_voted_by_me: o.selected,
+                })
+                .collect(),
+            multi_choice: p.multi,
+            is_closed: p.closed,
+            total_votes: total,
+        }
+    }
+}
+
+/// Strict parser for a poll item from Zalo API response; returns `Err` on business errors.
+pub fn try_parse_poll_item(val: &Value) -> Result<PollItem> {
+    let data = crate::api_response::checked_data(val.clone())?;
+    parse_poll_item(&data).context("Thiếu thông tin hoặc cấu trúc bình chọn không hợp lệ")
+}
+
 /// Parse a poll item from Zalo API response or message wire payload.
 pub fn parse_poll_item(val: &Value) -> Option<PollItem> {
     let root = val.get("data").unwrap_or(val);
@@ -228,5 +284,52 @@ mod tests {
         assert_eq!(poll.total_votes, 10);
         assert_eq!(poll.option_percentage(1), 80.0);
         assert_eq!(poll.option_percentage(2), 20.0);
+    }
+
+    #[test]
+    fn test_try_parse_poll_item_errors_and_from_conversion() {
+        // Business refusal
+        assert!(try_parse_poll_item(
+            &json!({"error_code": 114, "error_message": "Access denied", "data": null})
+        )
+        .is_err());
+        // Malformed missing poll id
+        assert!(
+            try_parse_poll_item(&json!({"error_code": 0, "data": {"question": "No id"}})).is_err()
+        );
+
+        // Conversion from crate::group_content::Poll
+        let gc_poll = crate::group_content::Poll {
+            id: "12345".into(),
+            question: "Vote test?".into(),
+            creator: "user1".into(),
+            closed: false,
+            multi: true,
+            anonymous: false,
+            add_options: true,
+            options: vec![
+                crate::group_content::OptionItem {
+                    id: 1,
+                    text: "Opt 1".into(),
+                    votes: Some(5),
+                    selected: true,
+                },
+                crate::group_content::OptionItem {
+                    id: 2,
+                    text: "Opt 2".into(),
+                    votes: Some(15),
+                    selected: false,
+                },
+            ],
+            raw: json!({}),
+        };
+
+        let poll_item: PollItem = gc_poll.into();
+        assert_eq!(poll_item.id, 12345);
+        assert_eq!(poll_item.total_votes, 20);
+        assert_eq!(poll_item.options[0].text, "Opt 1");
+        assert!(poll_item.options[0].is_voted_by_me);
+        assert_eq!(poll_item.option_percentage(1), 25.0);
+        assert_eq!(poll_item.option_percentage(2), 75.0);
     }
 }

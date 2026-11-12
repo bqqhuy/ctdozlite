@@ -790,6 +790,7 @@ pub fn import_history(
                     name,
                     is_group: group,
                     last_ts: ts,
+                    last_read_msg_id: String::new(),
                 })?;
                 inserted += import_message(store, &thread_id, m)?;
             }
@@ -812,6 +813,7 @@ pub fn import_history(
                     name: thread.name.clone(),
                     is_group: thread.is_group,
                     last_ts: thread.messages.iter().map(|m| m.ts).max().unwrap_or(0),
+                    last_read_msg_id: thread.unread.last_seen_id.clone().unwrap_or_default(),
                 })?;
                 for message in thread.messages {
                     inserted += import_message(store, &thread.id, message)?;
@@ -1119,15 +1121,15 @@ pub fn export_history(
     }
     let _cleanup = Cleanup(stage.clone());
     let mut target = rusqlite::Connection::open(&stage)?;
-    target.execute_batch("CREATE TABLE threads(thread_id TEXT PRIMARY KEY,name TEXT,is_group INTEGER,last_ts INTEGER);CREATE TABLE messages(msg_id TEXT,thread_id TEXT,sender_id TEXT,sender_name TEXT,text TEXT,msg_type TEXT,ts INTEGER,is_outgoing INTEGER,raw_json TEXT,PRIMARY KEY(thread_id,msg_id));CREATE TABLE history_export(owner TEXT NOT NULL,version INTEGER NOT NULL);")?;
+    target.execute_batch("CREATE TABLE threads(thread_id TEXT PRIMARY KEY,name TEXT,is_group INTEGER,last_ts INTEGER,last_read_msg_id TEXT NOT NULL DEFAULT '');CREATE TABLE messages(msg_id TEXT,thread_id TEXT,sender_id TEXT,sender_name TEXT,text TEXT,msg_type TEXT,ts INTEGER,is_outgoing INTEGER,raw_json TEXT,PRIMARY KEY(thread_id,msg_id));CREATE TABLE history_export(owner TEXT NOT NULL,version INTEGER NOT NULL);")?;
     let tx = target.transaction()?;
     tx.execute("INSERT INTO history_export VALUES(?1,1)", [owner])?;
     let snapshot = store.conn.unchecked_transaction()?;
     for table in ["threads", "messages"] {
         let (select, insert) = if table == "threads" {
             (
-                "SELECT thread_id,name,is_group,last_ts FROM threads",
-                "INSERT INTO threads VALUES(?1,?2,?3,?4)",
+                "SELECT thread_id,name,is_group,last_ts,last_read_msg_id FROM threads",
+                "INSERT INTO threads (thread_id,name,is_group,last_ts,last_read_msg_id) VALUES(?1,?2,?3,?4,?5)",
             )
         } else {
             ("SELECT msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json FROM messages m WHERE NOT EXISTS(SELECT 1 FROM conversation_policies p WHERE p.thread_id=m.thread_id AND p.is_group=COALESCE((SELECT is_group FROM threads WHERE thread_id=m.thread_id),0) AND p.is_protected=1)","INSERT INTO messages VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")
@@ -1188,7 +1190,7 @@ mod export_tests {
     #[test]
     fn exported_history_round_trips_without_automation_and_checks_owner() {
         let source = MessageStore::open(":memory:").unwrap();
-        source.conn.execute_batch("INSERT INTO threads VALUES('t','Thread',0,100);INSERT INTO messages(thread_id,msg_id,text,ts,is_outgoing,raw_json) VALUES('t','m','hello',100,0,'{}');INSERT INTO tool_config VALUES('private-config','must-not-export');").unwrap();
+        source.conn.execute_batch("INSERT INTO threads (thread_id, name, is_group, last_ts) VALUES('t','Thread',0,100);INSERT INTO messages(thread_id,msg_id,text,ts,is_outgoing,raw_json) VALUES('t','m','hello',100,0,'{}');INSERT INTO tool_config VALUES('private-config','must-not-export');").unwrap();
         let path = std::env::temp_dir().join(format!(
             "history-export-{}.db",
             crate::chat::next_client_message_id()

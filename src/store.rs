@@ -27,6 +27,8 @@ pub struct StoredThread {
     pub name: String,
     pub is_group: bool,
     pub last_ts: i64,
+    #[serde(default)]
+    pub last_read_msg_id: String,
 }
 
 /// Local-only conversation presentation controls, isolated by account database.
@@ -52,6 +54,11 @@ pub struct MessageStore {
     pub conn: Connection,
 }
 
+/// Path to the account-isolated SQLite history database (`zalo_history.db`).
+pub fn db_path_for_account(uin: &str) -> std::path::PathBuf {
+    crate::storage::account_file(uin, "zalo_history.db")
+}
+
 impl MessageStore {
     /// Initial history window; deeper reads occur when opening a thread.
     pub const PRELOAD_MSGS: usize = 20;
@@ -71,7 +78,7 @@ impl MessageStore {
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(
-            schema <= 12,
+            schema <= 13,
             "Database requires a newer application version"
         );
         conn.execute_batch(
@@ -97,7 +104,8 @@ impl MessageStore {
                 thread_id TEXT PRIMARY KEY,
                 name TEXT,
                 is_group INTEGER,
-                last_ts INTEGER
+                last_ts INTEGER,
+                last_read_msg_id TEXT NOT NULL DEFAULT ''
             );",
         )?;
 
@@ -218,6 +226,24 @@ impl MessageStore {
         }
         if schema < 12 {
             crate::message_lifecycle::migrate_v12(&conn)?;
+        }
+        if schema < 13 {
+            let has_col: bool = conn
+                .prepare("PRAGMA table_info(threads)")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map([], |r| r.get::<_, String>(1))
+                        .ok()
+                        .map(|rows| rows.flatten().any(|c| c == "last_read_msg_id"))
+                })
+                .unwrap_or(false);
+            if !has_col {
+                let _ = conn.execute(
+                    "ALTER TABLE threads ADD COLUMN last_read_msg_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                );
+            }
+            let _ = conn.execute("PRAGMA user_version = 13", []);
         }
         Ok(Self { conn })
     }
@@ -1032,21 +1058,40 @@ impl MessageStore {
     /// Insert or update thread metadata.
     pub fn upsert_thread(&self, t: &StoredThread) -> Result<()> {
         self.conn.prepare_cached(
-            "INSERT INTO threads (thread_id, name, is_group, last_ts)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO threads (thread_id, name, is_group, last_ts, last_read_msg_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(thread_id) DO UPDATE SET
                  name = CASE WHEN excluded.name = '' OR excluded.name = 'Nhóm ' || excluded.thread_id
                     OR excluded.name = 'Người dùng ' || excluded.thread_id
                     THEN threads.name ELSE excluded.name END,
                  is_group = excluded.is_group,
-                 last_ts = MAX(threads.last_ts, excluded.last_ts)")?.execute(
+                 last_ts = MAX(threads.last_ts, excluded.last_ts),
+                 last_read_msg_id = CASE
+                     WHEN excluded.last_read_msg_id IS NOT NULL AND excluded.last_read_msg_id != ''
+                     THEN excluded.last_read_msg_id
+                     ELSE threads.last_read_msg_id
+                 END")?.execute(
             params![
                 t.thread_id,
                 t.name,
                 if t.is_group { 1 } else { 0 },
                 t.last_ts,
+                t.last_read_msg_id,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Persist the read-point (last read message ID) of a thread.
+    /// Upserts safely even if the thread does not have a row yet.
+    pub fn set_thread_read(&self, thread_id: &str, last_msg_id: &str) -> Result<()> {
+        self.conn
+            .prepare_cached(
+                "INSERT INTO threads (thread_id, last_read_msg_id)
+             VALUES (?1, ?2)
+             ON CONFLICT(thread_id) DO UPDATE SET last_read_msg_id = excluded.last_read_msg_id",
+            )?
+            .execute(params![thread_id, last_msg_id])?;
         Ok(())
     }
 
@@ -1091,11 +1136,28 @@ impl MessageStore {
 
     /// Retrieve all persisted thread metadata ordered by `last_ts` descending.
     pub fn all_threads(&self) -> Result<Vec<StoredThread>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT thread_id, name, is_group, last_ts
+        let has_read_col = self
+            .conn
+            .prepare("PRAGMA table_info(threads)")
+            .ok()
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(1))
+                    .ok()
+                    .map(|rows| rows.flatten().any(|c| c == "last_read_msg_id"))
+            })
+            .unwrap_or(false);
+
+        let sql = if has_read_col {
+            "SELECT thread_id, name, is_group, last_ts, last_read_msg_id
              FROM threads
-             ORDER BY last_ts DESC",
-        )?;
+             ORDER BY last_ts DESC"
+        } else {
+            "SELECT thread_id, name, is_group, last_ts, ''
+             FROM threads
+             ORDER BY last_ts DESC"
+        };
+
+        let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map([], |row| {
             let is_group_num: i64 = row.get(2).unwrap_or(0);
             Ok(StoredThread {
@@ -1103,6 +1165,7 @@ impl MessageStore {
                 name: row.get(1).unwrap_or_default(),
                 is_group: is_group_num != 0,
                 last_ts: row.get(3).unwrap_or(0),
+                last_read_msg_id: row.get(4).unwrap_or_default(),
             })
         })?;
         let mut out = Vec::new();
@@ -1166,10 +1229,17 @@ impl MessageStore {
                     existing.name = st.name;
                 }
                 existing.is_group = existing.is_group || st.is_group;
+                if !st.last_read_msg_id.is_empty() {
+                    existing.unread.last_seen_id = Some(st.last_read_msg_id.clone());
+                }
             } else if include_unlisted {
+                let mut unread = crate::unread::UnreadState::default();
+                if !st.last_read_msg_id.is_empty() {
+                    unread.last_seen_id = Some(st.last_read_msg_id.clone());
+                }
                 threads.push(Thread {
                     presentation: Default::default(),
-                    unread: Default::default(),
+                    unread,
                     id: st.thread_id.clone(),
                     name: if st.name.is_empty() {
                         format!("Người dùng {}", st.thread_id)
@@ -1517,6 +1587,7 @@ fn persist_snapshot(
             name: t.name.clone(),
             is_group: t.is_group,
             last_ts,
+            last_read_msg_id: t.unread.last_seen_id.clone().unwrap_or_default(),
         };
         store.upsert_thread(&st)?;
 
@@ -1974,6 +2045,7 @@ mod tests {
                     name: format!("Name {id}"),
                     is_group: true,
                     last_ts: 1,
+                    last_read_msg_id: String::new(),
                 })
                 .unwrap();
         }
@@ -2339,6 +2411,7 @@ mod identity_tests {
             name: "Nhóm có tên".into(),
             is_group: true,
             last_ts: 99,
+            last_read_msg_id: String::new(),
         };
         store.upsert_thread(&thread).unwrap();
         thread.name = "Nhóm 123".into();
@@ -2623,7 +2696,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                12
+                13
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -2795,7 +2868,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            12
+            13
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,
@@ -3196,5 +3269,30 @@ mod mention_draft_tests {
         draft.insert(0, 0, "42", "An");
         assert!(store.save_composer_document("group_1", &draft).is_err());
         assert_eq!(store.composer_draft("group_1").unwrap(), "old");
+    }
+
+    #[test]
+    fn thread_read_point_roundtrips_and_survives_reupsert() {
+        let store = MessageStore::open(":memory:").unwrap();
+        store.set_thread_read("t1", "msg-100").unwrap();
+        let got = store.all_threads().unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].last_read_msg_id, "msg-100");
+
+        // Re-upserting without read-point preserves existing read-point (#119).
+        store
+            .upsert_thread(&StoredThread {
+                thread_id: "t1".into(),
+                name: "A".into(),
+                is_group: false,
+                last_ts: 1,
+                last_read_msg_id: String::new(),
+            })
+            .unwrap();
+        assert_eq!(store.all_threads().unwrap()[0].last_read_msg_id, "msg-100");
+
+        // Explicit new read-point updates.
+        store.set_thread_read("t1", "msg-200").unwrap();
+        assert_eq!(store.all_threads().unwrap()[0].last_read_msg_id, "msg-200");
     }
 }
