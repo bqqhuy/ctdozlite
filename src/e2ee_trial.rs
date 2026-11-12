@@ -407,7 +407,29 @@ mod experiment {
             ciphertext.len(),
         );
         use base64::Engine;
-        let body = json!({"toid":peer,"message":base64::engine::general_purpose::STANDARD.encode(ciphertext),"clientId":id,"imei":s.imei,"isE2EE":1});
+        let b64_wire = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+        let list_params = json!([
+            {
+                "toId": peer,
+                "platform": 1,
+                "message": b64_wire,
+                "e2ee": {
+                    "ver": 1,
+                    "iid": 1,
+                    "sender_iid": 1,
+                }
+            }
+        ]);
+        let body = json!({
+            "toid": peer,
+            "threadId": peer,
+            "destType": 3,
+            "message": b64_wire,
+            "listParams": list_params,
+            "clientId": id,
+            "imei": s.imei,
+            "isE2EE": 1,
+        });
         trace.stage(Stage::Send);
         let response = request(s, "/api/e2ee/pc/message/sms", &body).await?;
         trace.stage(Stage::Acknowledgement);

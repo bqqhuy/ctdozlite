@@ -153,6 +153,17 @@ fn decode_key_bytes(value: &Value, len: usize) -> Result<Vec<u8>> {
 }
 
 pub fn decode_key32(value: &Value) -> Result<[u8; 32]> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("Khóa E2EE không phải chuỗi"))?;
+    // Try 33-byte DJB format (prefixed with 0x05) first, then standard 32-byte format.
+    if let Ok(bytes) = decode_any_with_len(raw, 33) {
+        if bytes.len() == 33 && bytes[0] == crate::crypto::keystore::DJB_TYPE {
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&bytes[1..33]);
+            return Ok(out);
+        }
+    }
     let bytes = decode_key_bytes(value, 32)?;
     let mut out = [0u8; 32];
     out.copy_from_slice(&bytes);
@@ -165,6 +176,71 @@ pub fn decode_signature_64(value: &Value) -> Result<[u8; 64]> {
     let mut out = [0u8; 64];
     out.copy_from_slice(&bytes);
     Ok(out)
+}
+/// Build JSON payload for submitting/updating PreKey bundle (`CMD_SIGNAL_SUBMIT_BUNDLE = 540`).
+pub fn build_submit_bundle_payload(bundle: &crate::crypto::keystore::PreKeyBundle) -> Value {
+    bundle.to_export_json()
+}
+
+/// Build JSON payload for requesting a peer's PreKey bundle (`CMD_SIGNAL_GET_BUNDLE = 541`).
+pub fn build_get_bundle_payload(peer_id: &str) -> Value {
+    serde_json::json!({
+        "userId": peer_id,
+        "deviceId": crate::crypto::keystore::DEVICE_ID,
+    })
+}
+
+/// Build JSON payload for submitting a refill batch of one-time prekeys (`CMD_SIGNAL_SUBMIT_PREKEYS = 542`).
+pub fn build_submit_prekeys_payload(prekeys: &[crate::crypto::keystore::OneTimePreKey]) -> Value {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    serde_json::json!({
+        "preKeys": prekeys.iter().map(|k| serde_json::json!({
+            "keyId": k.key_id,
+            "publicKey": B64.encode(k.key_pair.public),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Multi-device recipient parameters for `/api/e2ee/pc/message/sms`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DeviceParam {
+    pub toid: String,
+    pub message: String,
+    #[serde(rename = "clientId")]
+    pub client_id: u64,
+    pub imei: String,
+    #[serde(rename = "isE2EE")]
+    pub is_e2ee: u8,
+}
+
+/// Build the `listParams` array for multi-device fan-out payload when sending E2EE messages via `/api/e2ee/pc/message/sms`.
+pub fn build_multi_device_fanout_payload(
+    to_id: &str,
+    client_id: u64,
+    device_ciphertexts: &[(&str, &str)], // (device_id_or_imei, base64_ciphertext)
+    default_imei: &str,
+) -> Value {
+    let list_params: Vec<Value> = device_ciphertexts
+        .iter()
+        .map(|(dev_imei, b64_ct)| {
+            let imei = if dev_imei.is_empty() {
+                default_imei
+            } else {
+                dev_imei
+            };
+            serde_json::json!({
+                "toid": to_id,
+                "message": b64_ct,
+                "clientId": client_id,
+                "imei": imei,
+                "isE2EE": 1,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "listParams": list_params,
+    })
 }
 
 #[cfg(test)]
@@ -271,5 +347,41 @@ mod tests {
             decode_signature_64(&val_63).is_err(),
             "Must reject 63-byte input"
         );
+    }
+
+    #[test]
+    fn test_decode_key32_accepts_33_byte_djb_format() {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine};
+        let raw32 = [88u8; 32];
+        let djb33 = crate::crypto::keystore::to_djb_bytes(&raw32);
+        let val_djb = json!(B64.encode(djb33));
+
+        let decoded = decode_key32(&val_djb).expect("decode 33-byte DJB format");
+        assert_eq!(decoded, raw32);
+
+        // Also accepts standard 32-byte key
+        let val_32 = json!(B64.encode(raw32));
+        let decoded_32 = decode_key32(&val_32).expect("decode 32-byte format");
+        assert_eq!(decoded_32, raw32);
+    }
+
+    #[test]
+    fn test_multi_device_fanout_payload_structure() {
+        let payload = build_multi_device_fanout_payload(
+            "user_456",
+            12345678,
+            &[("imei_phone", "b64_msg_phone"), ("imei_pc", "b64_msg_pc")],
+            "default_imei_fallback",
+        );
+        let list = payload.get("listParams").and_then(Value::as_array).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["toid"], "user_456");
+        assert_eq!(list[0]["clientId"], 12345678);
+        assert_eq!(list[0]["imei"], "imei_phone");
+        assert_eq!(list[0]["message"], "b64_msg_phone");
+        assert_eq!(list[0]["isE2EE"], 1);
+
+        assert_eq!(list[1]["imei"], "imei_pc");
+        assert_eq!(list[1]["message"], "b64_msg_pc");
     }
 }

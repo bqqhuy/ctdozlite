@@ -407,9 +407,17 @@ pub enum WorkerCmd {
         thread_id: String,
         is_group: bool,
         media_type: u8,
+        page: u32,
+        count: u32,
+        cursor: Option<String>,
+        generation: u64,
     },
     GetCloudViewerKey {
         file_id: String,
+    },
+    MarkThreadRead {
+        thread_id: String,
+        last_read_msg_id: String,
     },
     GetBusinessCatalog,
     CreateTodo {
@@ -469,6 +477,20 @@ pub enum WorkerCmd {
     },
     Logout,
     AddAccount,
+    TranslateMessage {
+        thread_id: String,
+        msg_id: String,
+        text: String,
+        target_lang: String,
+        text_hash: u64,
+        generation: u64,
+    },
+    TranscribeVoiceMessage {
+        thread_id: String,
+        msg_id: String,
+        voice_url: String,
+        generation: u64,
+    },
 }
 
 // Replaceable mailbox: each logout tears down the old worker runtime and event channel.
@@ -984,6 +1006,12 @@ pub(super) fn spawn_session_worker(
                 let is_ws_connected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let is_ws_connected_poll = is_ws_connected.clone();
 
+                // Correlation map for voice-to-text tickets: req_id -> (thread_id, msg_id, generation, Instant)
+                type PendingV2tStore = HashMap<String, (String, String, u64, std::time::Instant)>;
+                let pending_v2t_tickets: std::sync::Arc<tokio::sync::Mutex<PendingV2tStore>> =
+                    std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let pending_v2t_ws = pending_v2t_tickets.clone();
+
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
                     let live_updates = live_updates.clone();
@@ -1053,6 +1081,28 @@ pub(super) fn spawn_session_worker(
                                                     _=>{crate::logger::log_error("reaction","Cannot persist incoming reaction page");false}
                                                 }
                                             };
+
+                                            if let Some(v2t) = crate::socket::parse_voice_to_text_push(&ev.payload) {
+                                                let mut map = pending_v2t_ws.lock().await;
+                                                if let Some((thread_id, msg_id, generation, _)) = map.remove(&v2t.req_id) {
+                                                    if v2t.error_code == 0 && v2t.text.is_some() {
+                                                        let _ = gui_tx_ws.send(GuiEvent::VoiceTranscriptLoaded {
+                                                            thread_id,
+                                                            msg_id,
+                                                            transcript: v2t.text.unwrap_or_default(),
+                                                            generation,
+                                                        });
+                                                    } else {
+                                                        let _ = gui_tx_ws.send(GuiEvent::VoiceTranscriptFailed {
+                                                            thread_id,
+                                                            msg_id,
+                                                            error: format!("Mã lỗi: {}", v2t.error_code),
+                                                            generation,
+                                                        });
+                                                    }
+                                                    ctx_ws.request_repaint();
+                                                }
+                                            }
 
                                             if ev.is_voip_ish() {
                                                 let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
@@ -1433,6 +1483,116 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     drop(active);let _=tx.send(GuiEvent::OutgoingState{owner:task.owner,thread_id:task.thread_id,message});ctx.request_repaint();
                                 });
                             }
+                        }
+                        WorkerCmd::TranslateMessage {
+                            thread_id,
+                            msg_id,
+                            text,
+                            target_lang,
+                            text_hash,
+                            generation,
+                        } => {
+                            let s_arc = session.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_arc.lock().await.clone();
+                                match crate::chat::translate_message_manual(&s, &text, &target_lang, &msg_id).await {
+                                    Ok(res) => {
+                                        let _ = tx.send(GuiEvent::MessageTranslated {
+                                            thread_id,
+                                            msg_id,
+                                            translated_text: res.translated_text,
+                                            source_lang: res.source_lang,
+                                            text_hash,
+                                            generation,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::MessageTranslateFailed {
+                                            thread_id,
+                                            msg_id,
+                                            error: e.to_string(),
+                                            generation,
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::TranscribeVoiceMessage {
+                            thread_id,
+                            msg_id,
+                            voice_url,
+                            generation,
+                        } => {
+                            let s_arc = session.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let tickets = pending_v2t_tickets.clone();
+                            tokio::spawn(async move {
+                                let s = s_arc.lock().await.clone();
+                                match crate::chat::submit_voice_to_text(&s, &voice_url, &msg_id, &thread_id).await {
+                                    Ok(ticket) => {
+                                        if let Some(transcript) = ticket.transcript {
+                                            let _ = tx.send(GuiEvent::VoiceTranscriptLoaded {
+                                                thread_id,
+                                                msg_id,
+                                                transcript,
+                                                generation,
+                                            });
+                                            ctx.request_repaint();
+                                        } else {
+                                            // Register ticket in correlation map
+                                            let req_id = ticket.req_id.clone();
+                                            {
+                                                const MAX_PENDING_V2T: usize = 128;
+                                                let mut map = tickets.lock().await;
+                                                if map.len() >= MAX_PENDING_V2T {
+                                                    // Evict oldest entry based on timestamp
+                                                    if let Some(oldest_key) = map
+                                                        .iter()
+                                                        .min_by_key(|(_, (_, _, _, instant))| *instant)
+                                                        .map(|(k, _)| k.clone())
+                                                    {
+                                                        map.remove(&oldest_key);
+                                                    }
+                                                }
+                                                map.insert(
+                                                    req_id.clone(),
+                                                    (thread_id.clone(), msg_id.clone(), generation, std::time::Instant::now()),
+                                                );
+                                            }
+                                            // Spawn 30-second timeout watcher for ticket
+                                            let tickets_timeout = tickets.clone();
+                                            let tx_timeout = tx.clone();
+                                            let ctx_timeout = ctx.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(Duration::from_secs(30)).await;
+                                                let mut map = tickets_timeout.lock().await;
+                                                if let Some((th, mid, gen, _)) = map.remove(&req_id) {
+                                                    let _ = tx_timeout.send(GuiEvent::VoiceTranscriptFailed {
+                                                        thread_id: th,
+                                                        msg_id: mid,
+                                                        error: "Hết thời gian chờ phản hồi chuyển giọng nói (timeout 30s)".into(),
+                                                        generation: gen,
+                                                    });
+                                                    ctx_timeout.request_repaint();
+                                                }
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(GuiEvent::VoiceTranscriptFailed {
+                                            thread_id,
+                                            msg_id,
+                                            error: e.to_string(),
+                                            generation,
+                                        });
+                                        ctx.request_repaint();
+                                    }
+                                }
+                            });
                         }
                         WorkerCmd::RetryOutgoing { .. } => {},
                         WorkerCmd::SaveAppSettings { settings, persist_session } => {
@@ -1874,6 +2034,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             auth_attempt_mgr.next_attempt();
 
                             call_bridge.end_call();
+                            pending_v2t_tickets.lock().await.clear();
                             crate::queue_cursors::flush_all().await;
                             let account = session.lock().await.account_key().to_owned();
                             if !account.is_empty() {
@@ -1927,6 +2088,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             if let Some(task) = current_auth_task.take() { task.abort(); }
                                             auth_attempt_mgr.next_attempt();
                                             call_bridge.end_call();
+                                            pending_v2t_tickets.lock().await.clear();
                                             crate::queue_cursors::flush_all().await;
 
                                             let old_account = session.lock().await.account_key().to_owned();
@@ -3190,6 +3352,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi lưu tệp âm thanh: {e}")));
                                     return;
                                 }
+                                // Outgoing voice recorded audio is sent as a standard WAV audio attachment (Payload::Attachment)
+                                // pending reverse-engineering and live verification of native Zalo voice codec / metadata.
                                 let stamp = crate::outgoing::FileStamp::read(&temp_file).await.ok();
                                 let caption = format!("[Tin nhắn thoại] ({duration_secs}s)");
                                 let mut message = crate::outgoing::pending(
@@ -3313,7 +3477,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::FetchServerMedia { thread_id, is_group, media_type } => {
+                        WorkerCmd::FetchServerMedia {
+                            thread_id,
+                            is_group,
+                            media_type,
+                            page,
+                            count,
+                            cursor,
+                            generation,
+                        } => {
                             let s_clone = session.clone();
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
@@ -3326,16 +3498,45 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     _ => crate::server_media::ServerMediaType::Link,
                                 };
                                 let res = if is_group {
-                                    crate::server_media::fetch_group_media_store(&s, &thread_id, kind, 1, 30).await
+                                    crate::server_media::fetch_group_media_store_paged(
+                                        &s,
+                                        &thread_id,
+                                        kind,
+                                        page,
+                                        count,
+                                        cursor.as_deref(),
+                                    )
+                                    .await
                                 } else {
-                                    crate::server_media::fetch_direct_media_store(&s, &thread_id, kind, 1, 30).await
+                                    crate::server_media::fetch_direct_media_store_paged(
+                                        &s,
+                                        &thread_id,
+                                        kind,
+                                        page,
+                                        count,
+                                        cursor.as_deref(),
+                                    )
+                                    .await
                                 };
                                 match res {
-                                    Ok(page) => {
-                                        let _ = events.send(GuiEvent::ServerMediaLoaded { items: page.items, media_type });
+                                    Ok(media_page) => {
+                                        let _ = events.send(GuiEvent::ServerMediaLoaded {
+                                            thread_id,
+                                            media_type,
+                                            page_num: page,
+                                            page: media_page,
+                                            generation,
+                                        });
                                     }
                                     Err(e) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải kho media server: {e}")));
+                                        let err_msg = e.to_string();
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải kho media server: {err_msg}")));
+                                        let _ = events.send(GuiEvent::ServerMediaLoadFailed {
+                                            thread_id,
+                                            media_type,
+                                            generation,
+                                            error: err_msg,
+                                        });
                                     }
                                 }
                                 ctx.request_repaint();
@@ -3356,6 +3557,18 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                 }
                                 ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::MarkThreadRead { thread_id, last_read_msg_id } => {
+                            let s_clone = session.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                if !s.is_active() { return; }
+                                let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                    let store = crate::store::MessageStore::open(s.history_path())?;
+                                    store.set_thread_read(&thread_id, &last_read_msg_id)?;
+                                    Ok(())
+                                }).await;
                             });
                         }
                         WorkerCmd::GetBusinessCatalog => {
@@ -3422,24 +3635,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Ok(_) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo cuộc bình chọn: {question}")));
                                         if let Ok(reply) = crate::group_content::execute(&s, &thread_id, &crate::group_content::Action::ListPolls { page: 1, last: String::new(), last_type: 0 }).await {
-                                            let poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(|p| {
-                                                let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
-                                                crate::poll::PollItem {
-                                                    id: p.id.parse::<i64>().unwrap_or(0),
-                                                    grid: thread_id.clone(),
-                                                    question: p.question,
-                                                    creator_id: p.creator,
-                                                    options: p.options.into_iter().map(|o| crate::poll::PollOption {
-                                                        id: o.id,
-                                                        text: o.text,
-                                                        vote_count: o.votes.unwrap_or(0) as u32,
-                                                        is_voted_by_me: o.selected,
-                                                    }).collect(),
-                                                    multi_choice: p.multi,
-                                                    is_closed: p.closed,
-                                                    total_votes: total,
-                                                }
-                                            }).collect();
+                                            let mut poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(Into::into).collect();
+                                            for p in &mut poll_items {
+                                                p.grid = thread_id.clone();
+                                            }
                                             let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
                                         }
                                     }
@@ -3458,24 +3657,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let s = s_clone.lock().await.clone();
                                 match crate::group_content::execute(&s, &thread_id, &crate::group_content::Action::ListPolls { page: 1, last: String::new(), last_type: 0 }).await {
                                     Ok(reply) => {
-                                        let poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(|p| {
-                                            let total: u32 = p.options.iter().map(|o| o.votes.unwrap_or(0) as u32).sum();
-                                            crate::poll::PollItem {
-                                                id: p.id.parse::<i64>().unwrap_or(0),
-                                                grid: thread_id.clone(),
-                                                question: p.question,
-                                                creator_id: p.creator,
-                                                options: p.options.into_iter().map(|o| crate::poll::PollOption {
-                                                    id: o.id,
-                                                    text: o.text,
-                                                    vote_count: o.votes.unwrap_or(0) as u32,
-                                                    is_voted_by_me: o.selected,
-                                                }).collect(),
-                                                multi_choice: p.multi,
-                                                is_closed: p.closed,
-                                                total_votes: total,
-                                            }
-                                        }).collect();
+                                        let mut poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(Into::into).collect();
+                                        for p in &mut poll_items {
+                                            p.grid = thread_id.clone();
+                                        }
                                         let count = poll_items.len();
                                         let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {count} cuộc bình chọn")));

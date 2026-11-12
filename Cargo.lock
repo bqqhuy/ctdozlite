@@ -960,6 +960,7 @@ dependencies = [
  "cipher",
  "cpal",
  "crossterm",
+ "curve25519-dalek",
  "ed25519-dalek",
  "eframe",
  "flate2",

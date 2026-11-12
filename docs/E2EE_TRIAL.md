@@ -49,7 +49,8 @@ thư mục dữ liệu của lần chạy đó:
 - `diagnostics/sync-media.jsonl`
 - `diagnostics/sync-media.previous.jsonl` nếu có
 
-Đường dẫn gốc được in khi khởi chạy; có thể xem bằng `--doctor` cùng các tùy chọn
+Có thể mở trực tiếp thư mục này từ giao diện: mở **Tiện ích hội thoại** → tab **Thiết bị & Bảo mật** → bấm **Mở thư mục nhật ký** hoặc **Sao chép đường dẫn**.
+Đường dẫn gốc cũng được in khi khởi chạy; có thể xem bằng `--doctor` cùng các tùy chọn
 profile/portable và `CTDOZ_DATA_DIR` đã dùng. File chứa cả chẩn đoán sync/media;
 sự kiện E2EE có `event: "e2ee"`. Gửi kèm giờ thử, bước thao tác, kiến trúc máy,
 commit build và việc bên nhận có nhận/đọc được hay không. Không gửi `session.json`,

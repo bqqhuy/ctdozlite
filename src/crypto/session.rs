@@ -20,7 +20,8 @@ use super::keystore::{
 use super::ratchet::{KeyPair, KeyPairBytes, RatchetSession};
 use super::store;
 use super::wire::{
-    deserialize, serialize_prekey, serialize_whisper, DecodedMessage, PreKeyBundleWire,
+    deserialize, serialize_prekey_signal, serialize_whisper_signal, DecodedMessage,
+    PreKeyBundleWire,
 };
 
 /// Signed prekey id used for initial prekey bundle.
@@ -319,7 +320,7 @@ impl E2eeManager {
         let bob_spk = PublicKey::from(remote.signed_pre_key);
         let mut session = RatchetSession::init_as_sender(&master, &bob_spk)?;
         session.base_key = Some(ek_pub);
-        let (header, ciphertext) = session.encrypt(plaintext)?;
+        let (header, ct, mac_key) = session.encrypt_raw(plaintext)?;
 
         let bundle_wire = PreKeyBundleWire {
             registration_id: identity.registration_id,
@@ -335,7 +336,12 @@ impl E2eeManager {
         self.trust_identity(peer_id, &remote.identity_key)?;
         store::record_base_key(&self.conn, &self.profile_id, peer_id, &ek_pub)?;
         tx.commit()?;
-        Ok(serialize_prekey(&bundle_wire, &header, &ciphertext))
+        Ok(serialize_prekey_signal(
+            &bundle_wire,
+            &header,
+            &ct,
+            &mac_key,
+        ))
     }
 
     /// Encrypt with the existing session, or start a new one when needed.
@@ -346,15 +352,15 @@ impl E2eeManager {
         plaintext: &[u8],
     ) -> Result<Vec<u8>> {
         if let Some(mut session) = self.load_session(peer_id)? {
-            let (header, ciphertext) = session.encrypt(plaintext)?;
+            let (header, ct, mac_key) = session.encrypt_raw(plaintext)?;
             let wire = if session.recv_count == 0 {
                 if let Some(ref bundle_wire) = session.pending_prekey_bundle {
-                    serialize_prekey(bundle_wire, &header, &ciphertext)
+                    serialize_prekey_signal(bundle_wire, &header, &ct, &mac_key)
                 } else {
-                    serialize_whisper(&header, &ciphertext)
+                    serialize_whisper_signal(&header, &ct, &mac_key)
                 }
             } else {
-                serialize_whisper(&header, &ciphertext)
+                serialize_whisper_signal(&header, &ct, &mac_key)
             };
             self.save_session(peer_id, &session)?;
             return Ok(wire);
@@ -549,15 +555,26 @@ impl E2eeManager {
 /// Ed25519 form and otherwise reports "not verifiable" instead of failing the
 /// session outright.
 pub fn verify_signed_prekey(remote: &super::prekey::RemoteBundle) -> bool {
-    // The signing key may be published separately; fall back to the bundle's
-    // identity key when the server sends a single key.
     let identity = remote.signing_identity_key.unwrap_or(remote.identity_key);
+    let djb_bytes = super::keystore::to_djb_bytes(&remote.signed_pre_key);
+
+    // 1. Try XEdDSA verification against Curve25519 identity key (Signal Protocol / Zalo PC parity)
+    if super::keystore::xeddsa_verify(&identity, &djb_bytes, &remote.signature) {
+        return true;
+    }
+    if super::keystore::xeddsa_verify(&identity, &remote.signed_pre_key, &remote.signature) {
+        return true;
+    }
+
+    // 2. Fall back to Ed25519 verifying key for legacy fixtures
     let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&identity) else {
         return false;
     };
-    // The parser enforces the exact 64-byte signature length (audit A03).
     let sig = ed25519_dalek::Signature::from_bytes(&remote.signature);
-    vk.verify_strict(&remote.signed_pre_key, &sig).is_ok()
+    if vk.verify_strict(&remote.signed_pre_key, &sig).is_ok() {
+        return true;
+    }
+    vk.verify_strict(&djb_bytes, &sig).is_ok()
 }
 
 fn now_ms() -> i64 {
@@ -672,7 +689,7 @@ mod tests {
         let dec = serde_json::json!({
             "error_code": 0,
             "identityKey": B64.encode(identity.dh.public),
-            "signingIdentityKey": B64.encode(identity.signing_public),
+            "signingIdentityKey": B64.encode(identity.dh.public),
             "registrationId": identity.registration_id,
             "signedPreKey": {
                 "keyId": spk.key_id,
@@ -1017,5 +1034,50 @@ mod tests {
             .unwrap()
             .iter()
             .all(|key| key.key_id > key_id));
+    }
+
+    #[test]
+    fn signal_protobuf_wire_roundtrip_multi_messages() {
+        use super::super::wire::SIGNAL_PROTO_VERSION;
+        let alice = manager("alice_sig_proto");
+        let bob = manager("bob_sig_proto");
+        let remote_bob = peer_bundle(&bob);
+
+        // 1. Alice initiates with PreKeyWhisperMessage (Signal Protobuf wire format)
+        let msg1 = alice
+            .encrypt(
+                bob.profile_id(),
+                Some(&remote_bob),
+                b"Xin chao Bob tu Alice",
+            )
+            .expect("Alice encrypts message 1");
+        assert_eq!(msg1[0], SIGNAL_PROTO_VERSION);
+
+        let dec1 = bob
+            .decrypt(alice.profile_id(), &msg1)
+            .expect("Bob decrypts message 1");
+        assert_eq!(dec1.text, "Xin chao Bob tu Alice");
+
+        // 2. Alice sends follow-up WhisperMessage (Signal Protobuf wire format)
+        let msg2 = alice
+            .encrypt(bob.profile_id(), None, b"Tin nhan thu 2")
+            .expect("Alice encrypts message 2");
+        assert_eq!(msg2[0], SIGNAL_PROTO_VERSION);
+
+        let dec2 = bob
+            .decrypt(alice.profile_id(), &msg2)
+            .expect("Bob decrypts message 2");
+        assert_eq!(dec2.text, "Tin nhan thu 2");
+
+        // 3. Bob ratchets and replies back to Alice
+        let msg3 = bob
+            .encrypt(alice.profile_id(), None, b"Chao Alice, Bob nhan duoc roi!")
+            .expect("Bob encrypts reply message 3");
+        assert_eq!(msg3[0], SIGNAL_PROTO_VERSION);
+
+        let dec3 = alice
+            .decrypt(bob.profile_id(), &msg3)
+            .expect("Alice decrypts reply message 3");
+        assert_eq!(dec3.text, "Chao Alice, Bob nhan duoc roi!");
     }
 }

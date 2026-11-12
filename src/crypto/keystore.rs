@@ -51,12 +51,167 @@ impl IdentityKeyPair {
     }
 }
 
-/// Signed prekey: rotated every ~7 days.  Signature = Ed25519(identity_signing_key, spk_pub).
+/// Signal Protocol Curve25519 DJB key type byte (0x05).
+pub const DJB_TYPE: u8 = 0x05;
+
+/// Convert a 32-byte Curve25519 public key to 33-byte DJB format (prefixed with 0x05).
+pub fn to_djb_bytes(key: &[u8; 32]) -> [u8; 33] {
+    let mut out = [0u8; 33];
+    out[0] = DJB_TYPE;
+    out[1..].copy_from_slice(key);
+    out
+}
+
+/// Parse a 32-byte Curve25519 public key from either 33-byte DJB format (0x05 prefix) or raw 32-byte format.
+pub fn from_djb_bytes(slice: &[u8]) -> Result<[u8; 32]> {
+    if slice.len() == 33 && slice[0] == DJB_TYPE {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&slice[1..33]);
+        Ok(out)
+    } else if slice.len() == 32 {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(slice);
+        Ok(out)
+    } else {
+        anyhow::bail!(
+            "Độ dài khóa Curve25519 không hợp lệ: {} byte (kỳ vọng 32 bytes hoặc 33 bytes có tiền tố 0x05)",
+            slice.len()
+        );
+    }
+}
+
+/// Mask off the high bit for Curve25519 Montgomery public keys (RFC 7748 / XEdDSA).
+pub fn clamp_curve25519_scalar(k: &[u8; 32]) -> [u8; 32] {
+    let mut s = *k;
+    s[0] &= 248;
+    s[31] &= 127;
+    s[31] |= 64;
+    s
+}
+
+/// Sign a message using the Curve25519 identity private key with XEdDSA (XEd25519).
+///
+/// Implements XEd25519 signing per Signal Protocol specification (https://signal.org/docs/specifications/xeddsa/).
+/// `k`: 32-byte Curve25519 private key.
+/// `msg`: message bytes to sign (typically the 33-byte DJB-encoded signedPreKey public key).
+pub fn xeddsa_sign(k_bytes: &[u8; 32], msg: &[u8]) -> [u8; 64] {
+    use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
+
+    // 1. Clamping the Montgomery private key k
+    let k_clamped = clamp_curve25519_scalar(k_bytes);
+    let k_scalar = Scalar::from_bytes_mod_order(k_clamped);
+
+    // 2. Compute E = k * B on Edwards curve
+    let e_point = ED25519_BASEPOINT_POINT * k_scalar;
+    let enc_e = e_point.compress();
+
+    // In XEdDSA: If sign bit of E is 1, a = -k mod q, else a = k mod q
+    let sign_bit = (enc_e.as_bytes()[31] >> 7) & 1;
+    let a_scalar = if sign_bit == 1 { -k_scalar } else { k_scalar };
+
+    // Compute A = a * B (which has sign bit 0)
+    let a_point = ED25519_BASEPOINT_POINT * a_scalar;
+    let enc_a = a_point.compress();
+
+    // 3. Generate nonce r = hash1(a || M || Z) mod q
+    // Z: 64 random bytes for side-channel / glitch resistance
+    let mut z = [0u8; 64];
+    use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+    let _ = SystemRandom::new().fill(&mut z);
+
+    let mut h1 = Sha512::new();
+    // hash1 prefix: 32 bytes of 0xFF with first byte 0xFE
+    let mut prefix = [0xFFu8; 32];
+    prefix[0] = 0xFE;
+    h1.update(prefix);
+    h1.update(a_scalar.to_bytes());
+    h1.update(msg);
+    h1.update(z);
+    let r_hash: [u8; 64] = h1.finalize().into();
+    let r_scalar = Scalar::from_bytes_mod_order_wide(&r_hash);
+
+    // 4. R = r * B
+    let r_point = ED25519_BASEPOINT_POINT * r_scalar;
+    let enc_r = r_point.compress();
+
+    // 5. h = hash(R || A || M) mod q
+    let mut h_standard = Sha512::new();
+    h_standard.update(enc_r.as_bytes());
+    h_standard.update(enc_a.as_bytes());
+    h_standard.update(msg);
+    let h_hash: [u8; 64] = h_standard.finalize().into();
+    let h_scalar = Scalar::from_bytes_mod_order_wide(&h_hash);
+
+    // 6. s = r + h * a mod q
+    let s_scalar = r_scalar + h_scalar * a_scalar;
+
+    let mut sig = [0u8; 64];
+    sig[..32].copy_from_slice(enc_r.as_bytes());
+    sig[32..].copy_from_slice(&s_scalar.to_bytes());
+    sig
+}
+
+/// Verify an XEdDSA (XEd25519) signature over Curve25519 public key u.
+///
+/// Implements XEd25519 verification per Signal Protocol specification.
+/// `u_bytes`: 32-byte Curve25519 public key (or 33-byte DJB public key).
+/// `msg`: message bytes to verify.
+/// `sig`: 64-byte signature (R || s).
+pub fn xeddsa_verify(u_bytes: &[u8], msg: &[u8], sig: &[u8; 64]) -> bool {
+    use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+    use curve25519_dalek::edwards::CompressedEdwardsY;
+    use curve25519_dalek::montgomery::MontgomeryPoint;
+    use curve25519_dalek::scalar::Scalar;
+    use sha2::{Digest, Sha512};
+
+    let raw_u = match from_djb_bytes(u_bytes) {
+        Ok(raw) => raw,
+        Err(_) => return false,
+    };
+
+    // Parse R point and s scalar
+    let mut enc_r = [0u8; 32];
+    enc_r.copy_from_slice(&sig[..32]);
+    let mut s_bytes = [0u8; 32];
+    s_bytes.copy_from_slice(&sig[32..]);
+
+    let Some(r_point) = CompressedEdwardsY(enc_r).decompress() else {
+        return false;
+    };
+    let Some(s_scalar) = Option::<Scalar>::from(Scalar::from_canonical_bytes(s_bytes)) else {
+        return false;
+    };
+
+    // Convert Montgomery u to Edwards A with sign bit 0 (convert_mont)
+    let mont = MontgomeryPoint(raw_u);
+    let Some(a_point) = mont.to_edwards(0) else {
+        return false;
+    };
+    let enc_a = a_point.compress();
+
+    // Compute h = hash(R || A || M) mod q
+    let mut h_standard = Sha512::new();
+    h_standard.update(enc_r);
+    h_standard.update(enc_a.as_bytes());
+    h_standard.update(msg);
+    let h_hash: [u8; 64] = h_standard.finalize().into();
+    let h_scalar = Scalar::from_bytes_mod_order_wide(&h_hash);
+
+    // Check s * B == R + h * A
+    let s_b = ED25519_BASEPOINT_POINT * s_scalar;
+    let r_plus_h_a = r_point + (a_point * h_scalar);
+
+    s_b == r_plus_h_a
+}
+
+/// Signed prekey: rotated every ~7 days.  Signature = XEdDSA(identity_dh_key, spk_pub).
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct SignedPreKey {
     pub key_id: u32,
     pub key_pair: super::ratchet::KeyPairBytes,
-    /// Ed25519 signature over the Curve25519 public key bytes (64 raw bytes).
+    /// XEdDSA signature over the Curve25519 public key bytes (64 raw bytes).
     pub signature: Vec<u8>,
     /// Unix timestamp (ms) when this prekey was generated.
     pub created_at: i64,
@@ -65,7 +220,8 @@ pub struct SignedPreKey {
 impl SignedPreKey {
     pub fn generate(key_id: u32, identity: &IdentityKeyPair) -> Result<Self> {
         let kp = KeyPair::generate();
-        let signature = identity.sign(kp.public.as_bytes());
+        let djb_pub = to_djb_bytes(kp.public.as_bytes());
+        let signature = xeddsa_sign(&identity.dh.private, &djb_pub).to_vec();
         let created_at = now_ms();
         Ok(Self {
             key_id,
@@ -73,6 +229,11 @@ impl SignedPreKey {
             signature,
             created_at,
         })
+    }
+
+    /// Generate a signed prekey signing over 33-byte DJB format (standard Signal wire parity).
+    pub fn generate_djb(key_id: u32, identity: &IdentityKeyPair) -> Result<Self> {
+        Self::generate(key_id, identity)
     }
 }
 
@@ -141,7 +302,7 @@ impl PreKeyBundle {
     ) -> Self {
         Self {
             identity_key: identity.dh.public,
-            signing_identity_key: identity.signing_public,
+            signing_identity_key: identity.dh.public,
             registration_id: identity.registration_id,
             signed_pre_key: BundleSignedPreKey {
                 key_id: spk.key_id,
@@ -315,14 +476,13 @@ mod tests {
     fn signed_prekey_signature_verifies() {
         let identity = IdentityKeyPair::generate().unwrap();
         let spk = SignedPreKey::generate(1, &identity).unwrap();
-        let vk = ed25519_dalek::VerifyingKey::from_bytes(&identity.signing_public).unwrap();
         let sig_bytes: [u8; 64] = spk
             .signature
             .clone()
             .try_into()
-            .expect("Ed25519 signature is 64 bytes");
-        let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        vk.verify_strict(&spk.key_pair.public, &sig).unwrap();
+            .expect("Signature is 64 bytes");
+        let djb_bytes = to_djb_bytes(&spk.key_pair.public);
+        assert!(xeddsa_verify(&identity.dh.public, &djb_bytes, &sig_bytes));
     }
 
     #[test]
@@ -352,7 +512,7 @@ mod tests {
         assert_eq!(alice_secret, bob_secret);
     }
 
-    /// Audit A04: PreKeyBundle must bind Ed25519 signing identity key upon generation and export,
+    /// Audit A04: PreKeyBundle must bind signing identity key upon generation and export,
     /// and verifier must succeed using the bound signing key.
     #[test]
     fn test_prekey_bundle_binds_signing_identity_and_verifies_a04() {
@@ -362,7 +522,7 @@ mod tests {
 
         let bundle = PreKeyBundle::from_local_keys(&identity, &spk, &otpk);
         // Ensure signing_identity_key is bound to the bundle
-        assert_eq!(bundle.signing_identity_key, identity.signing_public);
+        assert_eq!(bundle.signing_identity_key, identity.dh.public);
         assert_eq!(bundle.identity_key, identity.dh.public);
 
         // Convert to export json and verify signingIdentityKey presence
@@ -372,12 +532,12 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
-        assert_eq!(B64.decode(b64_signing).unwrap(), identity.signing_public);
+        assert_eq!(B64.decode(b64_signing).unwrap(), identity.dh.public);
 
         // Parse through production bundle parser and verify signature
         let parsed =
             crate::crypto::prekey::parse_bundle(&json_val).expect("parse production bundle");
-        assert_eq!(parsed.signing_identity_key, Some(identity.signing_public));
+        assert_eq!(parsed.signing_identity_key, Some(identity.dh.public));
         assert!(crate::crypto::session::verify_signed_prekey(&parsed));
 
         // Tamper with signingIdentityKey: verify must fail
@@ -387,5 +547,18 @@ mod tests {
         assert!(!crate::crypto::session::verify_signed_prekey(
             &tampered_parsed
         ));
+    }
+
+    #[test]
+    fn test_signed_prekey_djb_verifies() {
+        let identity = IdentityKeyPair::generate().unwrap();
+        let spk_djb = SignedPreKey::generate_djb(1, &identity).unwrap();
+        let djb_bytes = to_djb_bytes(&spk_djb.key_pair.public);
+        let sig_bytes: [u8; 64] = spk_djb
+            .signature
+            .clone()
+            .try_into()
+            .expect("Signature is 64 bytes");
+        assert!(xeddsa_verify(&identity.dh.public, &djb_bytes, &sig_bytes));
     }
 }

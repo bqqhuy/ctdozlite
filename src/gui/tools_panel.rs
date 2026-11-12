@@ -26,6 +26,13 @@ pub(super) struct ToolsPanel {
     pub new_quick_title: String,
     pub new_quick_text: String,
     pub server_media_items: Vec<crate::server_media::ServerMediaItem>,
+    pub server_media_thread_id: String,
+    pub server_media_type: u8,
+    pub server_media_page: u32,
+    pub server_media_has_more: bool,
+    pub server_media_next_cursor: Option<String>,
+    pub server_media_generation: u64,
+    pub server_media_loading: bool,
     pub cloud_viewer_keys: std::collections::HashMap<String, crate::zcloud::CloudViewerKey>,
     pub catalog_items: Vec<crate::business::ProductCatalogItem>,
     pub two_factor_status: Option<crate::account_recovery::TwoFactorStatus>,
@@ -795,6 +802,11 @@ impl ZaloGuiApp {
                 .size(14.0),
         );
         ui.label("Danh mục sản phẩm OA/Doanh nghiệp.");
+        ui.label(
+            RichText::new("ℹ️ Tính năng Danh mục sản phẩm yêu cầu tài khoản Official Account (OA) hoặc gói Business đã đăng ký với Zalo.")
+                .size(11.5)
+                .color(Color32::from_rgb(180, 180, 190)),
+        );
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
@@ -835,9 +847,40 @@ impl ZaloGuiApp {
 
         ui.separator();
         ui.label("Truyền tệp LAN chưa khả dụng: chưa có giao thức Zalo được xác minh.");
+
+        ui.separator();
+        ui.label(RichText::new("🔍 Trích xuất văn bản từ hình ảnh (Local OCR)").strong());
+        let ocr_status = crate::ocr_windows::get_ocr_capability_status();
+        let status_desc = match ocr_status {
+            crate::ocr_windows::OcrCapabilityStatus::Ready => "Sẵn sàng (WinRT Media OCR)",
+            crate::ocr_windows::OcrCapabilityStatus::ExperimentalPreprocessOnly => {
+                "Tiền xử lý hình ảnh cục bộ (Giới hạn 1280px, chuẩn hóa tương phản)"
+            }
+        };
+        ui.label(format!("Trạng thái OCR: {status_desc}"));
     }
 
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
+        // Finding 4: Stale Server Media State Across Thread Switches
+        // When active thread differs from self.tools.server_media_thread_id while non-empty,
+        // automatically reset the server media view state for the new thread.
+        let current_thread_id = self
+            .threads
+            .get(self.selected_thread_index)
+            .map(|t| t.id.as_str())
+            .unwrap_or("");
+        if !self.tools.server_media_thread_id.is_empty()
+            && self.tools.server_media_thread_id != current_thread_id
+        {
+            self.tools.server_media_thread_id = current_thread_id.to_string();
+            self.tools.server_media_items.clear();
+            self.tools.server_media_page = 1;
+            self.tools.server_media_has_more = false;
+            self.tools.server_media_next_cursor = None;
+            self.tools.server_media_loading = false;
+            self.tools.server_media_generation = self.tools.server_media_generation.wrapping_add(1);
+        }
+
         ui.label(
             RichText::new("📦 Kho Lưu Trữ Media Server & zCloud (Zalo Parity A20 / B05)")
                 .strong()
@@ -846,45 +889,104 @@ impl ZaloGuiApp {
         ui.label("Truy xuất thư viện hình ảnh, video, tệp tin và liên kết từ máy chủ Zalo cùng dữ liệu lưu trữ đám mây zCloud.");
         ui.add_space(6.0);
 
+        let is_loading = self.tools.server_media_loading;
+
         ui.horizontal(|ui| {
-            if ui.button("🖼️ Tải Ảnh & Video").clicked() {
+            if ui
+                .add_enabled(!is_loading, egui::Button::new("🖼️ Tải Ảnh & Video"))
+                .clicked()
+            {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    self.tools.server_media_generation =
+                        self.tools.server_media_generation.wrapping_add(1);
+                    self.tools.server_media_thread_id = thread.id.clone();
+                    self.tools.server_media_type = 1;
+                    self.tools.server_media_page = 1;
+                    self.tools.server_media_has_more = false;
+                    self.tools.server_media_next_cursor = None;
+                    self.tools.server_media_loading = true;
+                    self.tools.server_media_items.clear();
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::FetchServerMedia {
                             thread_id: thread.id.clone(),
                             is_group: thread.is_group,
                             media_type: 1,
+                            page: 1,
+                            count: 30,
+                            cursor: None,
+                            generation: self.tools.server_media_generation,
                         });
                     }
                 }
             }
-            if ui.button("📁 Tải Tệp tin").clicked() {
+            if ui
+                .add_enabled(!is_loading, egui::Button::new("📁 Tải Tệp tin"))
+                .clicked()
+            {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    self.tools.server_media_generation =
+                        self.tools.server_media_generation.wrapping_add(1);
+                    self.tools.server_media_thread_id = thread.id.clone();
+                    self.tools.server_media_type = 3;
+                    self.tools.server_media_page = 1;
+                    self.tools.server_media_has_more = false;
+                    self.tools.server_media_next_cursor = None;
+                    self.tools.server_media_loading = true;
+                    self.tools.server_media_items.clear();
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::FetchServerMedia {
                             thread_id: thread.id.clone(),
                             is_group: thread.is_group,
                             media_type: 3,
+                            page: 1,
+                            count: 30,
+                            cursor: None,
+                            generation: self.tools.server_media_generation,
                         });
                     }
                 }
             }
-            if ui.button("🔗 Tải Liên kết").clicked() {
+            if ui
+                .add_enabled(!is_loading, egui::Button::new("🔗 Tải Liên kết"))
+                .clicked()
+            {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                    self.tools.server_media_generation =
+                        self.tools.server_media_generation.wrapping_add(1);
+                    self.tools.server_media_thread_id = thread.id.clone();
+                    self.tools.server_media_type = 4;
+                    self.tools.server_media_page = 1;
+                    self.tools.server_media_has_more = false;
+                    self.tools.server_media_next_cursor = None;
+                    self.tools.server_media_loading = true;
+                    self.tools.server_media_items.clear();
                     if let Some(tx) = WORKER_TX.get() {
                         let _ = tx.send(WorkerCmd::FetchServerMedia {
                             thread_id: thread.id.clone(),
                             is_group: thread.is_group,
                             media_type: 4,
+                            page: 1,
+                            count: 30,
+                            cursor: None,
+                            generation: self.tools.server_media_generation,
                         });
                     }
                 }
+            }
+            if is_loading {
+                ui.spinner();
+                ui.label(RichText::new("Đang tải dữ liệu…").size(12.0));
             }
         });
 
         ui.separator();
         ui.label(RichText::new("☁️ Khôi phục & Mở tệp zCloud (A20):").strong());
-        ui.label("Nhập mã file_id để kiểm tra trạng thái và nhận khoá giải mã xem trước.");
+        ui.label(
+            RichText::new("⚠️ Thử nghiệm (Experimental): Xác thực quyền/metadata từ server; chưa giải mã trực tiếp dữ liệu đám mây.")
+                .size(11.0)
+                .color(Color32::from_rgb(200, 150, 50)),
+        );
+        ui.label("Nhập mã file_id để kiểm tra trạng thái quyền xem trước:");
         ui.horizontal(|ui| {
             ui.label("File ID:");
             ui.text_edit_singleline(&mut self.tools.query);
@@ -899,17 +1001,26 @@ impl ZaloGuiApp {
 
         if !self.tools.cloud_viewer_keys.is_empty() {
             ui.add_space(4.0);
-            ui.label(RichText::new("Khoá giải mã zCloud đã lưu:").strong());
+            ui.label(RichText::new("Trạng thái quyền xem tệp zCloud đã xác thực:").strong());
             for (fid, k) in &self.tools.cloud_viewer_keys {
                 ui.group(|ui| {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(format!("Tệp: {fid}")).strong());
+                        let exp_str = if k.expires_at > 0 {
+                            crate::clock::local_datetime(k.expires_at)
+                                .map(|dt| dt.format("%d/%m/%Y %H:%M").to_string())
+                                .unwrap_or_else(|| k.expires_at.to_string())
+                        } else {
+                            "Không thời hạn".to_string()
+                        };
+                        let auth_status = if !k.viewer_key.is_empty() {
+                            "Đã xác thực trên máy chủ (Khóa an toàn trong bộ nhớ worker)"
+                        } else {
+                            "Chưa có quyền"
+                        };
                         ui.label(
-                            RichText::new(format!(
-                                "Khoá giải mã: {} • Hết hạn: {}",
-                                k.viewer_key, k.expires_at
-                            ))
-                            .size(11.0),
+                            RichText::new(format!("Quyền xem: {auth_status} • Hết hạn: {exp_str}"))
+                                .size(11.0),
                         );
                     });
                 });
@@ -918,13 +1029,16 @@ impl ZaloGuiApp {
 
         if !self.tools.server_media_items.is_empty() {
             ui.separator();
-            ui.label(
-                RichText::new(format!(
-                    "Thư viện media từ máy chủ ({}) :",
-                    self.tools.server_media_items.len()
-                ))
-                .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Thư viện media từ máy chủ (Trang {}, {} mục):",
+                        self.tools.server_media_page,
+                        self.tools.server_media_items.len()
+                    ))
+                    .strong(),
+                );
+            });
             for item in &self.tools.server_media_items {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
@@ -944,8 +1058,49 @@ impl ZaloGuiApp {
                                 ))
                                 .size(11.0),
                             );
+                            if !item.url.is_empty() {
+                                ui.horizontal(|ui| {
+                                    if ui.button("🌐 Mở liên kết").clicked() {
+                                        crate::platform::open_url(&item.url);
+                                    }
+                                    if ui.button("📋 Sao chép URL").clicked() {
+                                        ui.output_mut(|output| {
+                                            output.copied_text = item.url.clone()
+                                        });
+                                    }
+                                });
+                            }
                         });
                     });
+                });
+            }
+
+            if self.tools.server_media_has_more {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!is_loading, egui::Button::new("⬇️ Tải thêm"))
+                        .clicked()
+                    {
+                        if let Some(thread) = self.threads.get(self.selected_thread_index) {
+                            let next_page = self.tools.server_media_page + 1;
+                            self.tools.server_media_loading = true;
+                            if let Some(tx) = WORKER_TX.get() {
+                                let _ = tx.send(WorkerCmd::FetchServerMedia {
+                                    thread_id: thread.id.clone(),
+                                    is_group: thread.is_group,
+                                    media_type: self.tools.server_media_type,
+                                    page: next_page,
+                                    count: 30,
+                                    cursor: self.tools.server_media_next_cursor.clone(),
+                                    generation: self.tools.server_media_generation,
+                                });
+                            }
+                        }
+                    }
+                    if is_loading {
+                        ui.spinner();
+                    }
                 });
             }
         }
@@ -1060,6 +1215,21 @@ impl ZaloGuiApp {
                 });
             }
         }
+
+        ui.separator();
+        ui.label(RichText::new("🔐 Nhật ký & Chẩn đoán E2EE (Thử nghiệm)").strong());
+        ui.label("Xem hoặc xuất nhật ký chẩn đoán giao thức mã hóa đầu cuối (E2EE) đã che thông tin nhạy cảm.");
+        let diag_dir = crate::storage::root().join("diagnostics");
+        ui.horizontal(|ui| {
+            if ui.button("📁 Mở thư mục nhật ký").clicked() {
+                let _ = std::fs::create_dir_all(&diag_dir);
+                crate::platform::open_folder(&diag_dir);
+            }
+            if ui.button("📋 Sao chép đường dẫn").clicked() {
+                ui.output_mut(|o| o.copied_text = diag_dir.display().to_string());
+                self.status_msg = "Đã sao chép đường dẫn thư mục chẩn đoán".into();
+            }
+        });
     }
 }
 fn scheduled_time(text: &str, minutes: i64) -> Option<i64> {

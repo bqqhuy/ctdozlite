@@ -68,6 +68,47 @@ pub const CMD_PULL_MSG_518: u16 = 518;
 pub const CMD_HAS_MSG: u16 = 533;
 pub const CMD_PUSH_MISS_MSG: u16 = 534;
 pub const CMD_GET_MSG: u16 = 570;
+
+// -- Signal Protocol / E2EE command range (540..=582) -----------------------
+/// Minimum command code in the Signal Protocol family.
+pub const CMD_SIGNAL_MIN: u16 = 540;
+/// Maximum command code in the Signal Protocol family.
+pub const CMD_SIGNAL_MAX: u16 = 582;
+/// Register or update complete PreKey bundle on Zalo server.
+pub const CMD_SIGNAL_SUBMIT_BUNDLE: u16 = 540;
+/// Fetch peer's PreKey bundle to initiate X3DH session.
+pub const CMD_SIGNAL_GET_BUNDLE: u16 = 541;
+/// Refill batch of one-time prekeys when depleted.
+pub const CMD_SIGNAL_SUBMIT_PREKEYS: u16 = 542;
+/// Server requests client to refill one-time prekeys.
+pub const CMD_SIGNAL_REQUEST_PREKEYS: u16 = 549;
+/// Sub-device does not support E2EE.
+pub const CMD_SIGNAL_SUBDEVICE_UNSUPPORT: u16 = 550;
+/// Incoming 1-to-1 E2EE encrypted message push.
+pub const CMD_SIGNAL_RECEIVE_1_1: u16 = 551;
+/// Incoming group E2EE encrypted message push.
+pub const CMD_SIGNAL_RECEIVE_GROUP: u16 = 552;
+/// E2EE delivery confirmation acknowledgment.
+pub const CMD_SIGNAL_DELIVER_ACK: u16 = 553;
+/// E2EE seen confirmation acknowledgment.
+pub const CMD_SIGNAL_SEEN_ACK: u16 = 554;
+/// Query user device key ID.
+pub const CMD_SIGNAL_GET_KEY_ID: u16 = 564;
+
+/// Encode a Signal Protocol request frame (540..=582).
+/// Official Zalo PC envelope: `{"cmd": cmd, "subCmd": 0, "data": {"reqId": req_id, "data": payload}}`.
+pub fn signal_request_frame(cmd: u16, req_id: &str, payload: &Value) -> Vec<u8> {
+    let body = json!({
+        "cmd": cmd,
+        "subCmd": 0,
+        "data": {
+            "reqId": req_id,
+            "data": payload,
+        }
+    });
+    encode_frame(cmd, 0, 1, Some(&body))
+}
+
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                   (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36";
 
@@ -341,7 +382,14 @@ impl WsEvent {
                 | CMD_PULL_MSG_518
                 | CMD_PUSH_MISS_MSG
                 | CMD_GET_MSG
+                | CMD_SIGNAL_RECEIVE_1_1
+                | CMD_SIGNAL_RECEIVE_GROUP
         )
+    }
+
+    /// `true` for Signal Protocol frames (540..=582).
+    pub fn is_signal_ish(&self) -> bool {
+        (CMD_SIGNAL_MIN..=CMD_SIGNAL_MAX).contains(&self.cmd)
     }
 }
 
@@ -996,9 +1044,92 @@ async fn run_once(
     }
 }
 
+/// Parse incoming `CTRL_PUSH_CTRL = 601` push event or control frame for `voice2text/convert_finish`.
+pub fn parse_voice_to_text_push(val: &Value) -> Option<crate::chat::VoiceToTextPushResult> {
+    let act_type = val
+        .get("act_type")
+        .or_else(|| val.get("act"))
+        .or_else(|| val.get("action"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    if act_type != "voice2text/convert_finish" && !act_type.contains("voice2text") {
+        return None;
+    }
+
+    let data = val.get("data").unwrap_or(val);
+    let req_id = data
+        .get("req_id")
+        .or_else(|| data.get("reqId"))
+        .or_else(|| data.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+
+    let error_code = data
+        .get("error_code")
+        .or_else(|| val.get("error_code"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as i32;
+
+    let text = data
+        .get("text")
+        .or_else(|| data.get("transcript"))
+        .or_else(|| data.get("result"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Some(crate::chat::VoiceToTextPushResult {
+        req_id,
+        text,
+        error_code,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_voice_to_text_push_outcomes() {
+        // 1. Successful async push
+        let push_success = json!({
+            "act_type": "voice2text/convert_finish",
+            "data": {
+                "req_id": "v2t_9999",
+                "text": "Chào bạn nhé",
+                "error_code": 0
+            }
+        });
+        let parsed = parse_voice_to_text_push(&push_success).unwrap();
+        assert_eq!(parsed.req_id, "v2t_9999");
+        assert_eq!(parsed.text.as_deref(), Some("Chào bạn nhé"));
+        assert_eq!(parsed.error_code, 0);
+
+        // 2. Error result push
+        let push_error = json!({
+            "act": "voice2text/convert_finish",
+            "data": {
+                "reqId": "v2t_fail_1",
+                "error_code": 13399
+            }
+        });
+        let parsed_err = parse_voice_to_text_push(&push_error).unwrap();
+        assert_eq!(parsed_err.req_id, "v2t_fail_1");
+        assert_eq!(parsed_err.text, None);
+        assert_eq!(parsed_err.error_code, 13399);
+
+        // 3. Irrelevant push event returns None
+        let other_push = json!({
+            "act_type": "typing",
+            "data": { "uid": "123" }
+        });
+        assert!(parse_voice_to_text_push(&other_push).is_none());
+    }
+
     #[test]
     fn first_pull_resumes_from_a_saved_cursor() {
         let fresh = decode_frame(&pull_frame(510, 0, "req_1", None)).unwrap().3;

@@ -392,6 +392,31 @@ impl RatchetSession {
         Ok((header, ciphertext_with_mac))
     }
 
+    /// Encrypt plaintext returning `(header, aes_ciphertext, mac_key)` for wire serialization.
+    pub fn encrypt_raw(&mut self, plaintext: &[u8]) -> Result<(MessageHeader, Vec<u8>, [u8; 32])> {
+        let ck = self
+            .chain_key_send
+            .as_mut()
+            .context("Chain key send not initialised — call init_as_sender first")?;
+        let (new_ck, mk) = kdf_ck(ck);
+        *ck = new_ck;
+        let n = self.send_count;
+        self.send_count += 1;
+        let dh_pub = self
+            .dh_sending
+            .as_ref()
+            .context("DH sending key not set")?
+            .public;
+        let ct = aes256_cbc_encrypt(plaintext, &mk.cipher_key, &mk.iv)?;
+        let header = MessageHeader {
+            msg_type: MessageType::Whisper as u8,
+            dh_public: dh_pub,
+            pn: self.prev_send_count,
+            n,
+        };
+        Ok((header, ct, mk.mac_key))
+    }
+
     /// Decrypt a received `(header, ciphertext_with_mac)`.
     pub fn decrypt(
         &mut self,
@@ -399,10 +424,9 @@ impl RatchetSession {
         ciphertext_with_mac: &[u8],
     ) -> Result<Vec<u8>> {
         anyhow::ensure!(
-            ciphertext_with_mac.len() >= 32,
-            "Ciphertext too short (must include 32-byte MAC)"
+            ciphertext_with_mac.len() >= 8,
+            "Ciphertext too short (must include at least 8-byte MAC)"
         );
-        let (ct, mac) = ciphertext_with_mac.split_at(ciphertext_with_mac.len() - 32);
 
         let mut candidate = self.clone();
 
@@ -424,8 +448,7 @@ impl RatchetSession {
                 mac_key: mk_bytes[32..64].try_into().expect("mac key slice"),
                 iv: mk_bytes[64..80].try_into().expect("iv slice"),
             };
-            verify_mac(&mk.mac_key, &header.dh_public, header.n, header.pn, ct, mac)?;
-            let pt = aes256_cbc_decrypt(ct, &mk.cipher_key, &mk.iv)?;
+            let pt = split_and_decrypt(&mk, header, ciphertext_with_mac)?;
             *self = candidate;
             return Ok(pt);
         }
@@ -453,8 +476,7 @@ impl RatchetSession {
         *ck = new_ck;
         candidate.recv_count = header.n + 1;
 
-        verify_mac(&mk.mac_key, &header.dh_public, header.n, header.pn, ct, mac)?;
-        let pt = aes256_cbc_decrypt(ct, &mk.cipher_key, &mk.iv)?;
+        let pt = split_and_decrypt(&mk, header, ciphertext_with_mac)?;
         *self = candidate;
         if self.recv_count > 0 {
             self.pending_prekey_bundle = None;
@@ -672,8 +694,64 @@ fn verify_mac(
     mac.update(&n.to_be_bytes());
     mac.update(&pn.to_be_bytes());
     mac.update(ciphertext);
-    mac.verify_slice(expected)
-        .map_err(|_| anyhow::anyhow!("E2EE MAC verification failed — message may be tampered"))
+    let full = mac.finalize().into_bytes();
+    if (expected.len() == 8 && constant_time_eq(&full[..8], expected))
+        || (expected.len() == 32 && constant_time_eq(full.as_slice(), expected))
+    {
+        return Ok(());
+    }
+    anyhow::bail!("E2EE MAC verification failed — message may be tampered")
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn split_and_decrypt(
+    mk: &MessageKey,
+    header: &MessageHeader,
+    ciphertext_with_mac: &[u8],
+) -> Result<Vec<u8>> {
+    // 1. If length >= 32, try 32-byte legacy MAC first
+    if ciphertext_with_mac.len() >= 32 {
+        let (ct32, mac32) = ciphertext_with_mac.split_at(ciphertext_with_mac.len() - 32);
+        if verify_mac(
+            &mk.mac_key,
+            &header.dh_public,
+            header.n,
+            header.pn,
+            ct32,
+            mac32,
+        )
+        .is_ok()
+        {
+            return aes256_cbc_decrypt(ct32, &mk.cipher_key, &mk.iv);
+        }
+    }
+    // 2. Try 8-byte Signal Protocol truncated MAC
+    if ciphertext_with_mac.len() >= 8 {
+        let (ct8, mac8) = ciphertext_with_mac.split_at(ciphertext_with_mac.len() - 8);
+        if verify_mac(
+            &mk.mac_key,
+            &header.dh_public,
+            header.n,
+            header.pn,
+            ct8,
+            mac8,
+        )
+        .is_ok()
+        {
+            return aes256_cbc_decrypt(ct8, &mk.cipher_key, &mk.iv);
+        }
+    }
+    anyhow::bail!("E2EE MAC verification failed — message may be tampered")
 }
 
 #[cfg(test)]
