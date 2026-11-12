@@ -251,6 +251,9 @@ pub const FILE: &str = "https://tt-files-wpa.chat.zalo.me";
 /// Canonical compatibility endpoint; changing callers must preserve the selected service.
 pub const FILE_LEGACY: &str = "https://tt-files-wpa.zaloapp.com";
 
+/// Canonical compatibility endpoint for AI features (translation, voice2text) mapped to Chat service.
+pub const AI_FEATURES: &str = "https://tt-chat-wpa.chat.zalo.me";
+
 /// Canonical compatibility endpoint; changing callers must preserve the selected service.
 pub const WS_PRIMARY: &str = "wss://ws1-msg.chat.zalo.me";
 
@@ -382,5 +385,10 @@ mod tests {
         assert!(has_header_injection("has\rcarriage_return"));
         assert!(has_header_injection("has\nline_feed"));
         assert!(has_header_injection("has\0null_byte"));
+    }
+
+    #[test]
+    fn test_ai_features_endpoint() {
+        assert_eq!(AI_FEATURES, CHAT);
     }
 }

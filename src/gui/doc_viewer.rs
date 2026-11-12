@@ -1,4 +1,7 @@
 //! Document preview modal for plain text, JSON, and log files.
+//!
+//! Provides a bounded 1 MiB text preview (`Xem trước văn bản (tối đa 1 MiB)`).
+//! Note: this is a bounded plain-text viewer, not a binary PDF or Microsoft Office layout engine.
 
 use eframe::egui;
 
@@ -99,9 +102,11 @@ impl super::ZaloGuiApp {
                     // Top bar: filename + close button
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(&file_name)
-                                .strong()
-                                .color(pal.text_primary),
+                            egui::RichText::new(format!(
+                                "📄 Xem trước văn bản (tối đa 1 MiB): {file_name}"
+                            ))
+                            .strong()
+                            .color(pal.text_primary),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("✕ Đóng").clicked() {

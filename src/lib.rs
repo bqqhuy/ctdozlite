@@ -17,6 +17,7 @@ pub mod logger;
 pub mod login;
 pub mod media;
 pub mod message_view;
+pub mod ocr_windows;
 pub mod param_cipher;
 pub mod poll;
 pub mod profiles;

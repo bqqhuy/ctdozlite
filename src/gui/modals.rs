@@ -1415,6 +1415,20 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.enable_sticker_keyword_search, pal);
                                                         });
                                                     });
+                                                    ui.add_space(10.0);
+                                                    // Row 4: Dịch tin nhắn AI (Thử nghiệm)
+                                                    ui.horizontal(|ui| {
+                                                        let (b_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                                                        ui.painter().circle_filled(b_rect.center(), 15.0, Color32::from_rgb(46, 139, 87));
+                                                        ui.painter().text(b_rect.center(), egui::Align2::CENTER_CENTER, "AI", FontId::proportional(11.0), Color32::WHITE);
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new(crate::i18n::tr("Đồng ý dịch tin nhắn bằng AI")).color(pal.text_primary).size(13.2).strong());
+                                                            ui.label(RichText::new(crate::i18n::tr("Cho phép gửi văn bản cần dịch lên máy chủ AI Zalo (không áp dụng cho tin E2EE)")).color(pal.text_secondary).size(11.8));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.ai_translation_consent, pal);
+                                                        });
+                                                    });
                                                 });
                                         }
                                     }

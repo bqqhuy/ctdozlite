@@ -1412,6 +1412,14 @@ pub(super) enum BubbleAction {
     OpenContactConversation(String),
     ViewContact(String),
     ToggleSelect(String),
+    TranslateMessage {
+        msg_id: String,
+        text: String,
+    },
+    TranscribeVoice {
+        msg_id: String,
+        voice_url: String,
+    },
 }
 
 /// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.
@@ -1540,6 +1548,39 @@ pub(super) fn bubble_context_menu(
             .clicked()
         {
             action = Some(BubbleAction::Reminder);
+            ui.close_menu();
+        }
+        if !protected
+            && !msg.is_e2ee
+            && msg.kind != crate::message_model::MessageKind::Recall
+            && !msg.text.trim().is_empty()
+            && !msg.text.trim().starts_with('[')
+            && ui
+                .button(crate::i18n::tr("🌐 Dịch tin nhắn (Thử nghiệm)"))
+                .clicked()
+        {
+            action = Some(BubbleAction::TranslateMessage {
+                msg_id: msg.id.clone(),
+                text: msg.text.clone(),
+            });
+            ui.close_menu();
+        }
+        let voice_url = msg.link_url.as_deref().unwrap_or_default();
+        let is_voice_msg = msg.kind == crate::message_model::MessageKind::Voice
+            || msg.text.starts_with("[Tin nhắn thoại]");
+        if !protected
+            && !msg.is_e2ee
+            && msg.kind != crate::message_model::MessageKind::Recall
+            && is_voice_msg
+            && !voice_url.is_empty()
+            && ui
+                .button(crate::i18n::tr("🎙 Chuyển giọng nói thành văn bản"))
+                .clicked()
+        {
+            action = Some(BubbleAction::TranscribeVoice {
+                msg_id: msg.id.clone(),
+                voice_url: voice_url.to_string(),
+            });
             ui.close_menu();
         }
         if ui

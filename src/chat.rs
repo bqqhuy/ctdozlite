@@ -6975,9 +6975,261 @@ pub async fn find_user_by_phone(s: &Session, raw_phone: &str) -> Result<PhoneLoo
     })
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TranslationResult {
+    pub translated_text: String,
+    pub source_lang: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VoiceToTextTicket {
+    pub req_id: String,
+    pub transcript: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VoiceToTextPushResult {
+    pub req_id: String,
+    pub text: Option<String>,
+    pub error_code: i32,
+}
+
+/// Strict parser for manual translation responses (`/api/aifeatures/translate/v1/manual`, cmd `13397`).
+/// Never swallows errors or yields an empty translated text.
+pub fn try_parse_translation_result(val: &Value) -> Result<TranslationResult> {
+    if let Some(code) = val.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = val
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("Dịch tin nhắn thất bại (mã {code}): {msg}");
+        }
+    }
+    let data = val.get("data").unwrap_or(val);
+    let translated = data
+        .get("translated_text")
+        .or_else(|| data.get("text"))
+        .or_else(|| data.get("msg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Phản hồi dịch không chứa nội dung văn bản hợp lệ"))?;
+
+    let source_lang = data
+        .get("source_lang")
+        .or_else(|| data.get("src_lang"))
+        .or_else(|| data.get("from_lang"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Ok(TranslationResult {
+        translated_text: translated.to_string(),
+        source_lang,
+    })
+}
+
+/// Strict envelope parser for `/api/aifeatures/voice2text` (cmd `13394`).
+pub fn try_parse_voice_to_text_ticket(val: &Value) -> Result<VoiceToTextTicket> {
+    if let Some(code) = val.get("error_code").and_then(Value::as_i64) {
+        if code != 0 {
+            let msg = val
+                .get("error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            anyhow::bail!("Yêu cầu chuyển giọng nói thất bại (mã {code}): {msg}");
+        }
+    }
+    let data = val.get("data").unwrap_or(val);
+    let req_id = data
+        .get("req_id")
+        .or_else(|| data.get("reqId"))
+        .or_else(|| data.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Thiếu mã yêu cầu (req_id) trong phản hồi voice-to-text"))?
+        .to_string();
+
+    let transcript = data
+        .get("text")
+        .or_else(|| data.get("transcript"))
+        .or_else(|| data.get("result"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    Ok(VoiceToTextTicket { req_id, transcript })
+}
+
+/// Request AI manual translation for a message (`/api/aifeatures/translate/v1/manual`, cmd `13397`).
+/// Uses standard ParamCipher v2 + signkey.
+pub async fn translate_message_manual(
+    s: &Session,
+    text: &str,
+    target_lang: &str,
+    msg_id: &str,
+) -> Result<TranslationResult> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let text_trimmed = text.trim();
+    anyhow::ensure!(!text_trimmed.is_empty(), "Nội dung tin nhắn trống");
+
+    let client_time = crate::login::unix_now();
+    let payload = json!({
+        "msg_id": msg_id,
+        "text": text_trimmed,
+        "target_lang": target_lang,
+        "imei": s.imei,
+        "ts": client_time,
+    });
+
+    let cipher =
+        crate::param_cipher::ParamCipher::new(crate::session::ZPW_TYPE, &s.imei, client_time)?;
+    let body = cipher.build_body(
+        crate::session::ZPW_TYPE,
+        crate::session::ZPW_VER,
+        &payload,
+        "manual",
+    )?;
+
+    let form = body
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Không thể tạo form tham số"))?
+        .iter()
+        .map(|(k, v)| {
+            let s_val = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            format!("{k}={}", crate::session::urlencode(&s_val))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let base_url = s.resolve_service_url("chat", "/api/aifeatures/translate/v1/manual");
+    let url = format!("{base_url}?{}", s.common_params());
+
+    let resp = s.post_form(&url, form).await?;
+    let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+    try_parse_translation_result(&decrypted)
+}
+
+/// Submit voice message for transcription (`/api/aifeatures/voice2text`, cmd `13394`).
+pub async fn submit_voice_to_text(
+    s: &Session,
+    voice_url: &str,
+    msg_id: &str,
+    thread_id: &str,
+) -> Result<VoiceToTextTicket> {
+    if s.login.is_none() {
+        anyhow::bail!("chưa đăng nhập");
+    }
+    let client_time = crate::login::unix_now();
+    let payload = json!({
+        "msg_id": msg_id,
+        "thread_id": thread_id,
+        "voice_url": voice_url,
+        "imei": s.imei,
+        "ts": client_time,
+    });
+
+    let cipher =
+        crate::param_cipher::ParamCipher::new(crate::session::ZPW_TYPE, &s.imei, client_time)?;
+    let body = cipher.build_body(
+        crate::session::ZPW_TYPE,
+        crate::session::ZPW_VER,
+        &payload,
+        "voice2text",
+    )?;
+
+    let form = body
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Không thể tạo form tham số"))?
+        .iter()
+        .map(|(k, v)| {
+            let s_val = v
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| v.to_string());
+            format!("{k}={}", crate::session::urlencode(&s_val))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    let base_url = s.resolve_service_url("chat", "/api/aifeatures/voice2text");
+    let url = format!("{base_url}?{}", s.common_params());
+
+    let resp = s.post_form(&url, form).await?;
+    let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+    try_parse_voice_to_text_ticket(&decrypted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_try_parse_translation_result_success_and_error() {
+        let ok_json = json!({
+            "error_code": 0,
+            "error_message": "Successful",
+            "data": {
+                "translated_text": "Xin chào thế giới",
+                "source_lang": "en"
+            }
+        });
+        let res = try_parse_translation_result(&ok_json).unwrap();
+        assert_eq!(res.translated_text, "Xin chào thế giới");
+        assert_eq!(res.source_lang.as_deref(), Some("en"));
+
+        let err_json = json!({
+            "error_code": 13301,
+            "error_message": "Rate limit exceeded"
+        });
+        assert!(try_parse_translation_result(&err_json).is_err());
+
+        let empty_json = json!({
+            "error_code": 0,
+            "data": {
+                "translated_text": "   "
+            }
+        });
+        assert!(try_parse_translation_result(&empty_json).is_err());
+    }
+
+    #[test]
+    fn test_try_parse_voice_to_text_ticket_success_and_error() {
+        let ticket_async = json!({
+            "error_code": 0,
+            "data": {
+                "req_id": "v2t_req_12345"
+            }
+        });
+        let res1 = try_parse_voice_to_text_ticket(&ticket_async).unwrap();
+        assert_eq!(res1.req_id, "v2t_req_12345");
+        assert_eq!(res1.transcript, None);
+
+        let ticket_sync = json!({
+            "error_code": 0,
+            "data": {
+                "req_id": "v2t_req_67890",
+                "text": "Tôi đang trên đường tới"
+            }
+        });
+        let res2 = try_parse_voice_to_text_ticket(&ticket_sync).unwrap();
+        assert_eq!(res2.req_id, "v2t_req_67890");
+        assert_eq!(res2.transcript.as_deref(), Some("Tôi đang trên đường tới"));
+
+        let err_json = json!({
+            "error_code": 500,
+            "error_message": "Internal error"
+        });
+        assert!(try_parse_voice_to_text_ticket(&err_json).is_err());
+    }
 
     #[tokio::test]
     async fn unauthenticated_calls_fail_cleanly() {
@@ -8719,7 +8971,7 @@ mod a10_realtime_e2ee_tests {
         let otpk = alice_mgr.list_one_time_prekeys().unwrap();
         let alice_bundle = crate::crypto::prekey::RemoteBundle {
             identity_key: alice_id.dh.public,
-            signing_identity_key: Some(alice_id.signing_public),
+            signing_identity_key: Some(alice_id.dh.public),
             registration_id: alice_id.registration_id,
             signed_pre_key_id: alice_spk.key_id,
             signed_pre_key: alice_spk.key_pair.public,

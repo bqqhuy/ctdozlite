@@ -7,7 +7,9 @@
 //! - `windows::Security::Credentials::UI::UserConsentVerifier`
 //! - Native-device acceptance is tracked separately from fixture tests.
 
-use anyhow::{Context, Result};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::Result;
 use std::time::{Duration, Instant};
 
 /// Application lock guard — manages lock state and idle timeout.

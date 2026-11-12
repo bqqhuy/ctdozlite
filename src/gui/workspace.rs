@@ -2669,6 +2669,30 @@ impl ZaloGuiApp {
                                                     ui.add_space(6.0);
                                                 }
 
+                                                let width_bucket = ((ui.available_width() / 20.0).round() as u32) * 20;
+                                                let cache_key = (thread_id.clone(), msg.id.clone(), width_bucket);
+                                                let clip = ui.clip_rect();
+                                                let current_y = ui.cursor().top();
+                                                let is_far_offscreen = (current_y < clip.top() - 600.0) || (current_y > clip.bottom() + 600.0);
+
+                                                if is_far_offscreen
+                                                    && jump_index.is_none()
+                                                    && !newest_requested
+                                                    && !msg.id.is_empty()
+                                                    && !is_system_notice_message(msg)
+                                                {
+                                                    if let Some(&cached_height) = self.measured_msg_heights.get(&cache_key) {
+                                                        let (_, rect) = ui.allocate_space(egui::vec2(ui.available_width(), cached_height));
+                                                        capture_anchor(ui, rect, &msg.id, previous_anchor.as_ref(), &mut next_anchor, &mut anchor_delta);
+                                                        ui.add_space(if next_msg.map(|nm| same_message_cluster(msg, nm)).unwrap_or(false) {
+                                                            2.5
+                                                        } else {
+                                                            9.0
+                                                        });
+                                                        continue;
+                                                    }
+                                                }
+
                                                 let row = ui.scope(|ui| {
                                                     if is_system_notice_message(msg) {
                                                         render_system_notice_pill(ui, msg, pal);
@@ -2723,12 +2747,93 @@ impl ZaloGuiApp {
                                                     ) {
                                                         pending_action = Some((idx, action));
                                                     }
+
+                                                    // Render AI manual translation box below message bubble if present
+                                                    let trans_key = (thread_id.clone(), msg.id.clone());
+                                                    let is_translating = self.translating_messages.contains(&trans_key);
+                                                    let cached_trans = self.translations.get(&trans_key);
+                                                    if is_translating {
+                                                        ui.horizontal(|ui| {
+                                                            if msg.is_outgoing { ui.add_space((ui.available_width() - 240.0).max(0.0)); }
+                                                            ui.spinner();
+                                                            ui.label(RichText::new("🌐 Đang dịch tin nhắn…").size(12.0).color(pal.text_muted));
+                                                        });
+                                                    } else if let Some((translated_text, src_lang, text_hash)) = cached_trans {
+                                                        use std::hash::{Hash, Hasher};
+                                                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                                                        msg.text.hash(&mut h);
+                                                        let cur_hash = h.finish();
+                                                        if *text_hash == cur_hash && !msg.is_e2ee && msg.kind != crate::message_model::MessageKind::Recall {
+                                                            let trans_w = (ui.available_width() * 0.72).clamp(160.0, 480.0);
+                                                            ui.horizontal(|ui| {
+                                                                if msg.is_outgoing { ui.add_space((ui.available_width() - trans_w - 6.0).max(0.0)); }
+                                                                egui::Frame::none()
+                                                                    .fill(if pal.is_dark { Color32::from_rgb(32, 40, 52) } else { Color32::from_rgb(238, 244, 255) })
+                                                                    .stroke(Stroke::new(1.0_f32, pal.primary.linear_multiply(0.4)))
+                                                                    .rounding(Rounding::same(8.0))
+                                                                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                                                                    .show(ui, |ui| {
+                                                                        ui.set_width(trans_w);
+                                                                        ui.horizontal(|ui| {
+                                                                            let lang_hint = src_lang.as_deref().map(|l| format!(" ({l})")).unwrap_or_default();
+                                                                            ui.label(RichText::new(format!("🌐 Bản dịch{lang_hint}:")).strong().size(12.0).color(pal.primary));
+                                                                            if ui.small_button("📋 Sao chép").on_hover_text("Sao chép bản dịch").clicked() {
+                                                                                ui.ctx().copy_text(translated_text.clone());
+                                                                            }
+                                                                        });
+                                                                        ui.add_space(2.0);
+                                                                        ui.label(RichText::new(translated_text).size(13.0).color(if pal.is_dark { Color32::from_rgb(220, 230, 245) } else { Color32::from_rgb(30, 40, 55) }));
+                                                                    });
+                                                            });
+                                                        }
+                                                    }
+
+                                                    // Render Voice-to-text transcript box below voice message if present
+                                                    let is_transcribing = self.transcribing_voices.contains(&trans_key);
+                                                    let cached_transcript = self.voice_transcripts.get(&trans_key);
+                                                    if is_transcribing {
+                                                        ui.horizontal(|ui| {
+                                                            if msg.is_outgoing { ui.add_space((ui.available_width() - 240.0).max(0.0)); }
+                                                            ui.spinner();
+                                                            ui.label(RichText::new("🎙 Đang chuyển giọng nói thành văn bản…").size(12.0).color(pal.text_muted));
+                                                        });
+                                                    } else if let Some(transcript) = cached_transcript {
+                                                        let trans_w = (ui.available_width() * 0.72).clamp(160.0, 480.0);
+                                                        ui.horizontal(|ui| {
+                                                            if msg.is_outgoing { ui.add_space((ui.available_width() - trans_w - 6.0).max(0.0)); }
+                                                            egui::Frame::none()
+                                                                .fill(if pal.is_dark { Color32::from_rgb(35, 45, 40) } else { Color32::from_rgb(238, 255, 244) })
+                                                                .stroke(Stroke::new(1.0_f32, Color32::from_rgb(40, 160, 80)))
+                                                                .rounding(Rounding::same(8.0))
+                                                                .inner_margin(Margin::symmetric(10.0, 6.0))
+                                                                .show(ui, |ui| {
+                                                                    ui.set_width(trans_w);
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.label(RichText::new("🎙 Văn bản từ giọng nói:").strong().size(12.0).color(Color32::from_rgb(30, 150, 70)));
+                                                                        if ui.small_button("📋 Sao chép").on_hover_text("Sao chép văn bản").clicked() {
+                                                                            ui.ctx().copy_text(transcript.clone());
+                                                                        }
+                                                                    });
+                                                                    ui.add_space(2.0);
+                                                                    ui.label(RichText::new(transcript).size(13.0).color(if pal.is_dark { Color32::from_rgb(220, 245, 230) } else { Color32::from_rgb(25, 45, 30) }));
+                                                                });
+                                                        });
+                                                    }
+
                                                     ui.add_space(if next_same_sender {
                                                         2.5
                                                     } else {
                                                         9.0
                                                     });
                                                 });
+                                                let measured_h = row.response.rect.height();
+                                                if measured_h > 1.0 && !msg.id.is_empty() {
+                                                    const MAX_MEASURED_HEIGHTS: usize = 3000;
+                                                    if self.measured_msg_heights.len() >= MAX_MEASURED_HEIGHTS {
+                                                        self.measured_msg_heights.clear();
+                                                    }
+                                                    self.measured_msg_heights.insert(cache_key, measured_h);
+                                                }
                                                 capture_anchor(ui,row.response.rect,&msg.id,previous_anchor.as_ref(),&mut next_anchor,&mut anchor_delta);
                                                 if !is_system_notice_message(msg) {
                                                     let mut hit = row.response.clone();
@@ -3095,6 +3200,52 @@ impl ZaloGuiApp {
                                         pan: Vec2::ZERO,
                                         video_state: None,
                                     });
+                                }
+                                BubbleAction::TranslateMessage { msg_id, text } => {
+                                    if !self.settings.ai_translation_consent {
+                                        self.show_toast("Vui lòng kích hoạt 'Đồng ý dịch tin nhắn bằng AI' trong Cài đặt");
+                                    } else if m.is_e2ee || m.kind == crate::message_model::MessageKind::Recall {
+                                        self.show_toast("Không thể dịch tin nhắn mã hóa đầu cuối hoặc tin đã thu hồi");
+                                    } else {
+                                        let key = (thread_id.clone(), msg_id.clone());
+                                        let text_hash = {
+                                            use std::hash::{Hash, Hasher};
+                                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                                            text.hash(&mut h);
+                                            h.finish()
+                                        };
+                                        if self.translating_messages.insert(key) {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::TranslateMessage {
+                                                    thread_id: thread_id.clone(),
+                                                    msg_id: msg_id.clone(),
+                                                    text,
+                                                    target_lang: "vi".into(),
+                                                    text_hash,
+                                                    generation: 0,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                                BubbleAction::TranscribeVoice { msg_id, voice_url } => {
+                                    if !self.settings.ai_translation_consent {
+                                        self.show_toast("Vui lòng kích hoạt 'Đồng ý dịch tin nhắn bằng AI' trong Cài đặt");
+                                    } else if m.is_e2ee || m.kind == crate::message_model::MessageKind::Recall {
+                                        self.show_toast("Không thể chuyển giọng nói cho tin nhắn mã hóa đầu cuối hoặc tin đã thu hồi");
+                                    } else {
+                                        let key = (thread_id.clone(), msg_id.clone());
+                                        if self.transcribing_voices.insert(key) {
+                                            if let Some(tx) = WORKER_TX.get() {
+                                                let _ = tx.send(WorkerCmd::TranscribeVoiceMessage {
+                                                    thread_id: thread_id.clone(),
+                                                    msg_id: msg_id.clone(),
+                                                    voice_url,
+                                                    generation: 0,
+                                                });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3938,6 +4089,16 @@ impl ZaloGuiApp {
         self.sync_composer_draft(ctx);
         if let Some(thread) = self.threads.get_mut(idx) {
             thread.unread.read_foreground(&thread.messages);
+            if let Some(last) = thread.messages.last() {
+                let mid = last.id.clone();
+                thread.unread.last_seen_id = Some(mid.clone());
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(crate::gui::WorkerCmd::MarkThreadRead {
+                        thread_id: tid.clone(),
+                        last_read_msg_id: mid,
+                    });
+                }
+            }
         }
         self.persist_threads_async();
         if self.unread_counts.remove(&tid).is_some() {
@@ -5199,4 +5360,35 @@ enum VoiceBarAction {
     CancelRecording,
     TogglePreview(Vec<f32>, u32),
     StopPreview,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_measured_height_cache_insertion_and_separation() {
+        let mut heights: HashMap<(String, String, u32), f32> = HashMap::new();
+        let thread_id = "th_100".to_string();
+        let msg_id = "msg_001".to_string();
+
+        let bucket_narrow = 320u32;
+        let bucket_wide = 640u32;
+
+        heights.insert((thread_id.clone(), msg_id.clone(), bucket_narrow), 85.5);
+        heights.insert((thread_id.clone(), msg_id.clone(), bucket_wide), 42.0);
+
+        assert_eq!(
+            heights.get(&(thread_id.clone(), msg_id.clone(), bucket_narrow)),
+            Some(&85.5)
+        );
+        assert_eq!(
+            heights.get(&(thread_id.clone(), msg_id.clone(), bucket_wide)),
+            Some(&42.0)
+        );
+
+        // Invalidation: simulating message mutation or recall
+        heights.retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
+        assert!(heights.is_empty());
+    }
 }

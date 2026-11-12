@@ -408,8 +408,10 @@ fn clear_rtcp_inbox() {
     }
 }
 
-/// Real-time audio digital signal processor providing Acoustic Echo Cancellation (AEC),
-/// Noise Suppression (NS), and Automatic Gain Control (AGC) for VoIP audio calls.
+/// Real-time basic audio digital signal processor providing speaker-energy ducking/suppression,
+/// noise gate, and AGC (`Bộ xử lý âm thanh cơ bản: Ducking / Noise Gate / AGC`).
+///
+/// Note: this is an energy-based suppressor/ducker, not a full adaptive WebRTC AEC3 filter.
 #[derive(Clone, Debug)]
 pub struct AudioProcessor {
     /// Target RMS amplitude for AGC (0.15 = ~-16 dBFS).
@@ -438,8 +440,8 @@ impl AudioProcessor {
         Self::default()
     }
 
-    /// Process a frame of captured microphone samples with acoustic echo cancellation
-    /// using reference speaker energy, plus noise gating and AGC.
+    /// Process a frame of captured microphone samples with acoustic echo suppression
+    /// using reference speaker energy ducking, plus noise gating and AGC.
     ///
     /// WP15.1-A fix: echo-suppressed frames return early. Running AGC after suppression
     /// (v0.014 behavior) boosted the residual echo back up in steady state, defeating

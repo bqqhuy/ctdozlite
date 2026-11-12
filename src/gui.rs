@@ -516,8 +516,17 @@ pub enum GuiEvent {
     },
     StatusUpdate(String),
     ServerMediaLoaded {
-        items: Vec<crate::server_media::ServerMediaItem>,
+        thread_id: String,
         media_type: u8,
+        page_num: u32,
+        page: crate::server_media::ServerMediaPage,
+        generation: u64,
+    },
+    ServerMediaLoadFailed {
+        thread_id: String,
+        media_type: u8,
+        generation: u64,
+        error: String,
     },
     CloudViewerKeyLoaded(crate::zcloud::CloudViewerKey),
     BusinessCatalogLoaded(Vec<crate::business::ProductCatalogItem>),
@@ -551,6 +560,32 @@ pub enum GuiEvent {
     },
     AppUnlocked,
     AppUnlockFailed,
+    MessageTranslated {
+        thread_id: String,
+        msg_id: String,
+        translated_text: String,
+        source_lang: Option<String>,
+        text_hash: u64,
+        generation: u64,
+    },
+    MessageTranslateFailed {
+        thread_id: String,
+        msg_id: String,
+        error: String,
+        generation: u64,
+    },
+    VoiceTranscriptLoaded {
+        thread_id: String,
+        msg_id: String,
+        transcript: String,
+        generation: u64,
+    },
+    VoiceTranscriptFailed {
+        thread_id: String,
+        msg_id: String,
+        error: String,
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -666,6 +701,8 @@ struct AppSettings {
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
+    // 8. Tính năng AI & Quyền riêng tư
+    ai_translation_consent: bool,
 }
 
 impl Default for AppSettings {
@@ -715,6 +752,7 @@ impl Default for AppSettings {
             enable_sticker_keyword_search: true,
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
+            ai_translation_consent: false,
         }
     }
 }
@@ -959,6 +997,15 @@ pub struct ZaloGuiApp {
     recorded_voice_samples: Option<(Vec<f32>, u32, std::time::Duration)>,
     settings_tab: SettingsTab,
     settings: AppSettings,
+
+    // AI manual translations: (thread_id, msg_id) -> (translated_text, source_lang, text_hash)
+    translations: HashMap<(String, String), (String, Option<String>, u64)>,
+    translating_messages: HashSet<(String, String)>,
+    // Voice-to-text transcripts: (thread_id, msg_id) -> transcript
+    voice_transcripts: HashMap<(String, String), String>,
+    transcribing_voices: HashSet<(String, String)>,
+    // Measured height cache for virtualization: (thread_id, msg_id, width_bucket) -> height
+    measured_msg_heights: HashMap<(String, String, u32), f32>,
 
     // Dev Inspector state
     dev_mode: bool,
@@ -1284,6 +1331,11 @@ impl ZaloGuiApp {
             reactor_profile_pending: Default::default(),
             backup_panel: Default::default(),
             settings: loaded_settings,
+            translations: HashMap::new(),
+            translating_messages: HashSet::new(),
+            voice_transcripts: HashMap::new(),
+            transcribing_voices: HashSet::new(),
+            measured_msg_heights: HashMap::new(),
             dev_mode,
             dev_panel_open: false,
             dev_tab: DevTab::Logs,
@@ -1926,6 +1978,62 @@ impl ZaloGuiApp {
                 event => event,
             };
             match event {
+                GuiEvent::MessageTranslated {
+                    thread_id,
+                    msg_id,
+                    translated_text,
+                    source_lang,
+                    text_hash,
+                    generation: _,
+                } => {
+                    self.measured_msg_heights
+                        .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
+                    self.translating_messages
+                        .remove(&(thread_id.clone(), msg_id.clone()));
+                    self.translations.insert(
+                        (thread_id, msg_id),
+                        (translated_text, source_lang, text_hash),
+                    );
+                    ctx.request_repaint();
+                }
+                GuiEvent::MessageTranslateFailed {
+                    thread_id,
+                    msg_id,
+                    error,
+                    generation: _,
+                } => {
+                    self.measured_msg_heights
+                        .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
+                    self.translating_messages.remove(&(thread_id, msg_id));
+                    self.show_toast(format!("Dịch tin nhắn thất bại: {error}"));
+                    ctx.request_repaint();
+                }
+                GuiEvent::VoiceTranscriptLoaded {
+                    thread_id,
+                    msg_id,
+                    transcript,
+                    generation: _,
+                } => {
+                    self.measured_msg_heights
+                        .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
+                    self.transcribing_voices
+                        .remove(&(thread_id.clone(), msg_id.clone()));
+                    self.voice_transcripts
+                        .insert((thread_id, msg_id), transcript);
+                    ctx.request_repaint();
+                }
+                GuiEvent::VoiceTranscriptFailed {
+                    thread_id,
+                    msg_id,
+                    error,
+                    generation: _,
+                } => {
+                    self.measured_msg_heights
+                        .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
+                    self.transcribing_voices.remove(&(thread_id, msg_id));
+                    self.show_toast(format!("Chuyển giọng nói thất bại: {error}"));
+                    ctx.request_repaint();
+                }
                 GuiEvent::AppSettingsSaved(result) => {
                     self.profiles_requested = false;
                     self.profiles.clear();
@@ -2833,6 +2941,11 @@ impl ZaloGuiApp {
                     self.image_failures.clear();
                     self.composer_sticker_cache.clear();
                     self.link_metadata_cache.clear();
+                    self.translations.clear();
+                    self.translating_messages.clear();
+                    self.voice_transcripts.clear();
+                    self.transcribing_voices.clear();
+                    self.measured_msg_heights.clear();
                     let (tx, rx) = channel();
                     self.event_rx = rx;
                     self.event_tx = tx.clone();
@@ -2893,6 +3006,11 @@ impl ZaloGuiApp {
                     self.image_failures.clear();
                     self.composer_sticker_cache.clear();
                     self.link_metadata_cache.clear();
+                    self.translations.clear();
+                    self.translating_messages.clear();
+                    self.voice_transcripts.clear();
+                    self.transcribing_voices.clear();
+                    self.measured_msg_heights.clear();
                     self.status_msg = "Đã chuyển tài khoản thành công".into();
                     self.profile_menu_open = false;
                     let (tx, rx) = channel();
@@ -4688,14 +4806,56 @@ impl ZaloGuiApp {
                     self.status_msg = msg;
                 }
                 GuiEvent::ServerMediaLoaded {
-                    items,
-                    media_type: _,
+                    thread_id,
+                    media_type,
+                    page_num,
+                    page,
+                    generation,
                 } => {
-                    self.tools.server_media_items = items;
-                    self.status_msg = format!(
-                        "Đã tải {} mục từ kho media server",
-                        self.tools.server_media_items.len()
-                    );
+                    // Only update if generation matches and thread/media_type match current tools state
+                    if generation == self.tools.server_media_generation
+                        && thread_id == self.tools.server_media_thread_id
+                        && media_type == self.tools.server_media_type
+                    {
+                        self.tools.server_media_loading = false;
+                        self.tools.server_media_page = page_num;
+                        self.tools.server_media_has_more = page.has_more;
+                        self.tools.server_media_next_cursor = page.next_cursor;
+                        if page_num <= 1 {
+                            self.tools.server_media_items = page.items;
+                        } else {
+                            // Deduplicate items by ID (or URL if ID is empty)
+                            for new_item in page.items {
+                                let exists = self.tools.server_media_items.iter().any(|existing| {
+                                    if !new_item.id.is_empty() && !existing.id.is_empty() {
+                                        existing.id == new_item.id
+                                    } else {
+                                        existing.url == new_item.url
+                                    }
+                                });
+                                if !exists {
+                                    self.tools.server_media_items.push(new_item);
+                                }
+                            }
+                        }
+                        self.status_msg = format!(
+                            "Đã tải {} mục từ kho media server",
+                            self.tools.server_media_items.len()
+                        );
+                    }
+                }
+                GuiEvent::ServerMediaLoadFailed {
+                    thread_id,
+                    media_type,
+                    generation,
+                    error: _,
+                } => {
+                    if generation == self.tools.server_media_generation
+                        && thread_id == self.tools.server_media_thread_id
+                        && media_type == self.tools.server_media_type
+                    {
+                        self.tools.server_media_loading = false;
+                    }
                 }
                 GuiEvent::CloudViewerKeyLoaded(key) => {
                     self.status_msg =

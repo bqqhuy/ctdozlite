@@ -508,7 +508,7 @@ mod tests {
     use super::*;
     fn store() -> MessageStore {
         let s = MessageStore::open(":memory:").unwrap();
-        s.conn.execute_batch("INSERT INTO threads VALUES('t','Nhóm thử',1,100); INSERT INTO threads VALUES('hidden','Private',0,90);INSERT INTO thread_preferences(thread_id,is_hidden) VALUES('hidden',1);").unwrap();
+        s.conn.execute_batch("INSERT INTO threads (thread_id, name, is_group, last_ts) VALUES('t','Nhóm thử',1,100); INSERT INTO threads (thread_id, name, is_group, last_ts) VALUES('hidden','Private',0,90);INSERT INTO thread_preferences(thread_id,is_hidden) VALUES('hidden',1);").unwrap();
         s
     }
     fn insert(s: &MessageStore, id: &str, ts: i64, text: &str, kind: &str, raw: &str) {
@@ -678,7 +678,7 @@ mod benchmarks {
         let mut store = MessageStore::open(":memory:").unwrap();
         let begin = std::time::Instant::now();
         let tx = store.conn.transaction().unwrap();
-        tx.execute("INSERT INTO threads VALUES('t','Synthetic',1,632000)", [])
+        tx.execute("INSERT INTO threads (thread_id, name, is_group, last_ts) VALUES('t','Synthetic',1,632000)", [])
             .unwrap();
         {
             let mut st=tx.prepare("INSERT INTO messages(thread_id,msg_id,ts,text,msg_type,raw_json,sender_id,sender_name) VALUES('t',?1,?2,?3,'webchat','{}','user-1','Synthetic')").unwrap();
