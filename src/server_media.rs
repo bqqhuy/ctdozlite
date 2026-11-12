@@ -51,14 +51,53 @@ pub struct ServerMediaPage {
     pub next_cursor: Option<String>,
 }
 
-/// Parse server media response from `/api/mediastore/list` or `/api/media/oneone/list`.
-pub fn parse_server_media_list(val: &Value, expected_kind: ServerMediaType) -> ServerMediaPage {
+/// Strict parser for server media response from `/api/mediastore/list` or `/api/media/oneone/list`.
+///
+/// Returns `Err` when the response contains a server error code or when the payload schema
+/// is malformed or missing the items list. Returns `Ok(ServerMediaPage)` on valid responses,
+/// including valid empty lists (`items: []`).
+pub fn try_parse_server_media_list(
+    val: &Value,
+    expected_kind: ServerMediaType,
+) -> Result<ServerMediaPage> {
+    if let Some(code) = val.get("error_code").and_then(crate::api_response::integer) {
+        if code != 0 {
+            let msg = val
+                .get("error_message")
+                .or_else(|| val.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Máy chủ trả về mã lỗi");
+            anyhow::bail!("Máy chủ từ chối lấy kho media (mã {code}): {msg}");
+        }
+    }
+
     let data = val.get("data").unwrap_or(val);
-    let items_array = data
+    if data.is_null() {
+        anyhow::bail!("Phản hồi kho media rỗng hoặc lỗi (data null)");
+    }
+
+    if let Some(inner_code) = data
+        .get("error_code")
+        .and_then(crate::api_response::integer)
+    {
+        if inner_code != 0 {
+            let msg = data
+                .get("error_message")
+                .or_else(|| data.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Máy chủ trả về mã lỗi nội bộ");
+            anyhow::bail!("Máy chủ từ chối lấy kho media (mã {inner_code}): {msg}");
+        }
+    }
+
+    let items_val = data
         .get("items")
         .or_else(|| data.get("medias"))
-        .or_else(|| data.get("list"))
-        .and_then(|v| v.as_array());
+        .or_else(|| data.get("list"));
+
+    let Some(arr) = items_val.and_then(|v| v.as_array()) else {
+        anyhow::bail!("Thiếu mảng dữ liệu media hợp lệ trong phản hồi (items/medias/list)");
+    };
 
     let has_more = data
         .get("has_more")
@@ -72,14 +111,6 @@ pub fn parse_server_media_list(val: &Value, expected_kind: ServerMediaType) -> S
         .or_else(|| data.get("cursor"))
         .and_then(|v| v.as_str())
         .map(ToString::to_string);
-
-    let Some(arr) = items_array else {
-        return ServerMediaPage {
-            items: Vec::new(),
-            has_more,
-            next_cursor,
-        };
-    };
 
     let items = arr
         .iter()
@@ -144,11 +175,19 @@ pub fn parse_server_media_list(val: &Value, expected_kind: ServerMediaType) -> S
         })
         .collect();
 
-    ServerMediaPage {
+    Ok(ServerMediaPage {
         items,
         has_more,
         next_cursor,
-    }
+    })
+}
+
+/// Parse server media response from `/api/mediastore/list` or `/api/media/oneone/list`.
+pub fn parse_server_media_list(
+    val: &Value,
+    expected_kind: ServerMediaType,
+) -> Result<ServerMediaPage> {
+    try_parse_server_media_list(val, expected_kind)
 }
 
 /// Call `/api/mediastore/list` to retrieve group media items.
@@ -159,20 +198,37 @@ pub async fn fetch_group_media_store(
     page: u32,
     count: u32,
 ) -> Result<ServerMediaPage> {
+    fetch_group_media_store_paged(s, grid, media_type, page, count, None).await
+}
+
+/// Call `/api/mediastore/list` with pagination and optional cursor.
+pub async fn fetch_group_media_store_paged(
+    s: &Session,
+    grid: &str,
+    media_type: ServerMediaType,
+    page: u32,
+    count: u32,
+    cursor: Option<&str>,
+) -> Result<ServerMediaPage> {
     let url = format!("{}/api/mediastore/list", s.domains.group);
-    let payload = json!({
+    let mut payload = json!({
         "grid": grid,
         "type": media_type as u8,
         "page": page,
         "count": count,
         "imei": s.imei,
     });
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            payload["cursor"] = json!(c);
+        }
+    }
     let params = s
         .encoded_params(&payload)
         .context("Mã hoá tham số lấy kho media nhóm thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(parse_server_media_list(&decrypted, media_type))
+    try_parse_server_media_list(&decrypted, media_type)
 }
 
 /// Call `/api/media/oneone/list` to retrieve direct 1-1 media items.
@@ -183,20 +239,37 @@ pub async fn fetch_direct_media_store(
     page: u32,
     count: u32,
 ) -> Result<ServerMediaPage> {
+    fetch_direct_media_store_paged(s, fid, media_type, page, count, None).await
+}
+
+/// Call `/api/media/oneone/list` with pagination and optional cursor.
+pub async fn fetch_direct_media_store_paged(
+    s: &Session,
+    fid: &str,
+    media_type: ServerMediaType,
+    page: u32,
+    count: u32,
+    cursor: Option<&str>,
+) -> Result<ServerMediaPage> {
     let url = format!("{}/api/media/oneone/list", s.domains.chat);
-    let payload = json!({
+    let mut payload = json!({
         "fid": fid,
         "type": media_type as u8,
         "page": page,
         "count": count,
         "imei": s.imei,
     });
+    if let Some(c) = cursor {
+        if !c.is_empty() {
+            payload["cursor"] = json!(c);
+        }
+    }
     let params = s
         .encoded_params(&payload)
         .context("Mã hoá tham số lấy kho media cá nhân thất bại")?;
     let resp = s.post_form(&url, format!("params={params}")).await?;
     let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(parse_server_media_list(&decrypted, media_type))
+    try_parse_server_media_list(&decrypted, media_type)
 }
 
 #[cfg(test)]
@@ -225,7 +298,7 @@ mod tests {
             }
         });
 
-        let page = parse_server_media_list(&val, ServerMediaType::Photo);
+        let page = parse_server_media_list(&val, ServerMediaType::Photo).unwrap();
         assert!(page.has_more);
         assert_eq!(page.next_cursor.as_deref(), Some("cur_photo_100"));
         assert_eq!(page.items.len(), 1);
@@ -255,7 +328,7 @@ mod tests {
             }
         });
 
-        let page = parse_server_media_list(&val, ServerMediaType::File);
+        let page = parse_server_media_list(&val, ServerMediaType::File).unwrap();
         assert!(!page.has_more);
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].file_name, "Bao_Cao_v0010.pdf");
@@ -281,9 +354,70 @@ mod tests {
             }
         });
 
-        let page = parse_server_media_list(&val, ServerMediaType::Link);
+        let page = parse_server_media_list(&val, ServerMediaType::Link).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].url, "https://github.com/bqqhuy/ctdozlite");
         assert_eq!(page.items[0].file_name, "ctdozlite GitHub Repository");
+    }
+
+    #[test]
+    fn test_parse_server_media_list_business_error() {
+        // (a) Outer/inner business error
+        let outer_err = json!({
+            "error_code": 114,
+            "error_message": "Session expired or permission denied",
+            "data": null
+        });
+        assert!(try_parse_server_media_list(&outer_err, ServerMediaType::Photo).is_err());
+
+        let inner_err = json!({
+            "error_code": 0,
+            "data": {
+                "error_code": 5001,
+                "error_message": "Thread media access restricted",
+                "items": null
+            }
+        });
+        assert!(try_parse_server_media_list(&inner_err, ServerMediaType::Photo).is_err());
+    }
+
+    #[test]
+    fn test_parse_server_media_list_malformed_schema() {
+        // (b) Malformed schema (missing list array)
+        let missing_list = json!({
+            "error_code": 0,
+            "data": {
+                "has_more": false,
+                "cursor": "abc"
+            }
+        });
+        assert!(try_parse_server_media_list(&missing_list, ServerMediaType::File).is_err());
+
+        let invalid_items_type = json!({
+            "error_code": 0,
+            "data": {
+                "items": "not-an-array"
+            }
+        });
+        assert!(try_parse_server_media_list(&invalid_items_type, ServerMediaType::File).is_err());
+    }
+
+    #[test]
+    fn test_parse_server_media_list_valid_empty_list() {
+        // (c) Valid empty list
+        let empty_val = json!({
+            "error_code": 0,
+            "data": {
+                "items": [],
+                "has_more": false,
+                "next_cursor": null
+            }
+        });
+        let res = try_parse_server_media_list(&empty_val, ServerMediaType::Photo);
+        assert!(res.is_ok());
+        let page = res.unwrap();
+        assert!(page.items.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, None);
     }
 }

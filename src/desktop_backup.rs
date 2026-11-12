@@ -350,6 +350,7 @@ pub fn execute(
                         .into(),
                     is_group: group,
                     last_ts: 0,
+                    last_read_msg_id: String::new(),
                 };
                 ensure!(
                     threads.len() < 100000 && threads.insert(id, thread).is_none(),

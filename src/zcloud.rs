@@ -41,11 +41,21 @@ impl CloudFileStatus {
 }
 
 /// Authentication key for viewing a cloud media asset.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CloudViewerKey {
     pub file_id: String,
     pub viewer_key: String,
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for CloudViewerKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CloudViewerKey")
+            .field("file_id", &self.file_id)
+            .field("viewer_key", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// Signed download URL and integrity checksum for a zCloud asset.
