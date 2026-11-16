@@ -31,6 +31,20 @@ Hai bên thống nhất: F07, F11–F17, F19 đóng ở mức code; F03–F06, F
 | 13 | A2 | minor | Lỗi ghi first ping / GET_MSG bị `let _ =` | Propagate bằng `?` |
 | 14 | A2 | minor | Màn khóa không có đường đăng xuất khi WinRT treo; xác thực >30 s bị coi là lỗi | **Chưa sửa** — rủi ro còn lại, cần native ARM64 để thiết kế; xem bàn giao |
 
-## Re-review
+## Re-review R1 (`99674a0..a41b49c`)
 
-PENDING
+| | Auditor 1 | Auditor 2 |
+|---|---|---|
+| Kết luận | **APPROVE** | **APPROVE** |
+| Kiểm chứng | Đọc code; 12/12 mục fixed | Đọc code; test tập trung 51 passed, 0 failed |
+| Lỗi mới | 2 minor | 2 minor |
+
+Lỗi mới và xử lý:
+
+| Nguồn | Lỗi | Xử lý |
+|---|---|---|
+| A1, A2 | Tracker link tới `ANTIGRAVITY_HANDOVER.md` chưa được commit | File được commit cùng vòng R2 |
+| A1 | `merge_hydrated` không áp bộ lọc `deleted_messages` trong bộ nhớ (chỉ an toàn nhờ thứ tự hàng đợi) | R2: áp `filter_deleted_replays` sau merge |
+| A2 | Khóa reaction pending chỉ được nhả nhờ worker trả lời hoặc logout | Rủi ro còn lại (không có đường lỗi hiện tại); ghi vào bàn giao |
+
+Hai auditor thống nhất: không còn blocker/major. F21 (đường đăng xuất trên màn khóa khi WinRT treo) giữ là rủi ro còn lại, phải nằm trong kế hoạch nghiệm thu native ARM64.

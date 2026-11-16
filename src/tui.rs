@@ -2406,6 +2406,12 @@ impl<'a> TuiApp<'a> {
                     // Hydration is async: merge so sends, polls and history that
                     // arrived meanwhile are kept, then persist the startup batch.
                     merge_hydrated(&mut self.threads, threads);
+                    // Independent of writer ordering: never resurrect a local delete.
+                    for thread in &mut self.threads {
+                        if let Some(ids) = self.deleted_messages.get(&thread.id) {
+                            Self::filter_deleted_replays(thread, ids);
+                        }
+                    }
                     self.rebuild_filter();
                     self.ensure_msg_selection();
                     self.persist_async();

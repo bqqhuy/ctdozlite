@@ -1,6 +1,6 @@
 # Tracker triển khai — Các phát hiện F01–F21
 
-**Trạng thái:** đã triển khai đủ P1, P2 và P3 ở mức code/fixture. Hai Pro auditor đã review độc lập; vòng sửa R1 đã thực hiện, re-review: xem bảng cổng bên dưới. Chưa merge `main`, chưa push.
+**Trạng thái:** đã triển khai đủ P1, P2 và P3 ở mức code/fixture. Hai Pro auditor review độc lập; sau vòng sửa R1 và R2 cả hai **APPROVE**. Merge `main`: xem bảng cổng bên dưới.
 **Mốc audit lịch sử:** `main` tại `f0d3206e875d083c7f8a0a2e5c3ae6d14c2e45b9` (2026-11-16).
 **Nhánh:** `codex/audit-21-remediation`.
 **Hướng dẫn:** [ANTIGRAVITY_IMPLEMENTATION_GUIDE.md](ANTIGRAVITY_IMPLEMENTATION_GUIDE.md) · **Bàn giao:** [ANTIGRAVITY_HANDOVER.md](ANTIGRAVITY_HANDOVER.md)
@@ -41,12 +41,12 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 | Pro auditor 1 | CHANGES REQUIRED (3 major, 9 minor) | [AUDITOR_REVIEWS.md](AUDITOR_REVIEWS.md) |
 | Pro auditor 2 | APPROVE (5 minor) | [AUDITOR_REVIEWS.md](AUDITOR_REVIEWS.md) |
 | Vòng sửa R1 | Xong | xem AUDITOR_REVIEWS.md |
-| Re-review của cả hai | PENDING | |
-| Merge local/GitHub `main` | PENDING | |
+| Re-review của cả hai | Cả hai APPROVE; vòng R2 xử lý 2 minor | [AUDITOR_REVIEWS.md](AUDITOR_REVIEWS.md) |
+| Merge local/GitHub `main` | Chờ xác nhận của maintainer | |
 
 ## Gate đã chạy (Windows x64, rustc 1.99.1, `CTDOZ_DATA_DIR` tạm, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
 
-| Lệnh | Sau `99674a0` | Sau R1 |
+| Lệnh | Sau `99674a0` | Sau R1 và R2 (giống nhau) |
 |---|---|---|
 | `cargo fmt --all -- --check` | exit 0 | exit 0 |
 | `cargo check --locked --all-targets` | exit 0 | exit 0 |
