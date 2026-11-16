@@ -1363,50 +1363,135 @@ pub fn redact_text(text: &str) -> String {
 }
 
 fn scrub_sensitive_tokens(text: &str) -> String {
-    let mut scrubbed = text.to_string();
-    const PATTERNS: &[&str] = &[
+    // Keys sorted by length descending so longer keys match before shorter prefixes.
+    const KEYS: &[&str] = &[
+        "session_key",
+        "secret_key",
+        "password",
         "zpw_sek",
         "zpw_enk",
-        "token",
-        "password",
-        "passw",
-        "secret_key",
-        "session_key",
         "signkey",
         "cookie",
+        "token",
+        "passw",
     ];
-    for &pat in PATTERNS {
-        for delim in &["=", ": ", ":"] {
-            let needle = format!("{pat}{delim}");
-            let needle_lower = needle.to_ascii_lowercase();
-            let mut search_idx = 0;
-            while let Some(pos) = scrubbed[search_idx..]
-                .to_ascii_lowercase()
-                .find(&needle_lower)
-            {
-                let abs_pos = search_idx + pos + needle.len();
-                let val_end = scrubbed[abs_pos..]
-                    .find(|c: char| {
-                        c.is_whitespace()
-                            || c == '&'
-                            || c == ';'
-                            || c == ','
-                            || c == '}'
-                            || c == ']'
-                            || c == '"'
-                    })
-                    .unwrap_or(scrubbed.len() - abs_pos);
-                if val_end > 0 {
-                    scrubbed.replace_range(abs_pos..abs_pos + val_end, "<redacted>");
-                }
-                search_idx = abs_pos + "<redacted>".len();
-                if search_idx >= scrubbed.len() {
-                    break;
+
+    let lower = text.to_ascii_lowercase();
+    let text_bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        // Preceding character boundary check: must not be in the middle of a word
+        let is_start_boundary = if cursor == 0 {
+            true
+        } else {
+            let prev = text_bytes[cursor - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        };
+
+        let mut matched_key_end = None;
+        if is_start_boundary {
+            let remaining_lower = &lower[cursor..];
+            for &key in KEYS {
+                if remaining_lower.starts_with(key) {
+                    let key_end = cursor + key.len();
+                    // Followed by non-word char or delimiter
+                    if key_end == text.len()
+                        || (!text_bytes[key_end].is_ascii_alphanumeric() && text_bytes[key_end] != b'_')
+                    {
+                        matched_key_end = Some(key_end);
+                        break;
+                    }
+                } else if (remaining_lower.starts_with('"') && remaining_lower[1..].starts_with(key))
+                    || (remaining_lower.starts_with('\'') && remaining_lower[1..].starts_with(key))
+                {
+                    let quote = text_bytes[cursor];
+                    let after_key = cursor + 1 + key.len();
+                    if after_key < text.len() && text_bytes[after_key] == quote {
+                        matched_key_end = Some(after_key + 1);
+                        break;
+                    }
                 }
             }
         }
+
+        if let Some(after_key) = matched_key_end {
+            // Check if followed by optional whitespace and delimiter (= or :)
+            let mut idx = after_key;
+            while idx < text.len() && (text_bytes[idx] == b' ' || text_bytes[idx] == b'\t') {
+                idx += 1;
+            }
+            if idx < text.len() && (text_bytes[idx] == b'=' || text_bytes[idx] == b':') {
+                idx += 1; // consume delimiter
+                while idx < text.len() && (text_bytes[idx] == b' ' || text_bytes[idx] == b'\t') {
+                    idx += 1; // consume whitespace after delimiter
+                }
+
+                // Append up to delimiter and spacing
+                result.push_str(&text[cursor..idx]);
+
+                // Now extract and redact value
+                if idx < text.len() {
+                    let val_quote = text_bytes[idx];
+                    if val_quote == b'"' || val_quote == b'\'' {
+                        // Quoted value
+                        idx += 1; // skip opening quote
+                        while idx < text.len() {
+                            if text_bytes[idx] == val_quote
+                                && text_bytes[idx.saturating_sub(1)] != b'\\'
+                            {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        result.push(val_quote as char);
+                        result.push_str("<redacted>");
+                        if idx < text.len() && text_bytes[idx] == val_quote {
+                            result.push(val_quote as char);
+                            idx += 1;
+                        }
+                        cursor = idx;
+                        continue;
+                    } else {
+                        // Unquoted value: ends at whitespace, &, ;, ,, }, ]
+                        let val_start = idx;
+                        while idx < text.len() {
+                            let b = text_bytes[idx];
+                            if b.is_ascii_whitespace()
+                                || b == b'&'
+                                || b == b';'
+                                || b == b','
+                                || b == b'}'
+                                || b == b']'
+                            {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        if idx > val_start {
+                            result.push_str("<redacted>");
+                        }
+                        cursor = idx;
+                        continue;
+                    }
+                } else {
+                    cursor = idx;
+                    continue;
+                }
+            }
+        }
+
+        // Advance by one UTF-8 character safely
+        if let Some(ch) = text[cursor..].chars().next() {
+            result.push(ch);
+            cursor += ch.len_utf8();
+        } else {
+            break;
+        }
     }
-    scrubbed
+
+    result
 }
 
 /// Redact a sensitive secret string, showing at most the first 8 characters followed by `…<redacted>`.
@@ -1514,6 +1599,60 @@ mod tests {
         assert!(!dbg_saved.contains("SESS_KEY"));
         assert!(!dbg_saved.contains("SEK_SAVED"));
         assert!(dbg_saved.contains("<redacted>"));
+    }
+
+    #[test]
+    fn l02_json_formats_are_redacted() {
+        let json_input = r#"{"zpw_enk":"ENK_SECRET_VAL","zpw_sek": "SEK_SECRET_VAL", "token": "TOKEN_VAL", "password":"PASSWORD_VAL"}"#;
+        let scrubbed = redact_text(json_input);
+        assert!(!scrubbed.contains("ENK_SECRET_VAL"));
+        assert!(!scrubbed.contains("SEK_SECRET_VAL"));
+        assert!(!scrubbed.contains("TOKEN_VAL"));
+        assert!(!scrubbed.contains("PASSWORD_VAL"));
+        assert!(scrubbed.contains(r#""zpw_enk":"<redacted>""#));
+        assert!(scrubbed.contains(r#""zpw_sek": "<redacted>""#));
+        assert!(scrubbed.contains(r#""token": "<redacted>""#));
+    }
+
+    #[test]
+    fn l02_multibyte_utf8_after_cookie_does_not_panic() {
+        // PoC test from audit: cookie:" followed by Vietnamese multibyte UTF-8 chars
+        let input = "cookie:\"ĐĐĐĐĐĐ";
+        let scrubbed = redact_text(input);
+        assert!(!scrubbed.is_empty());
+        assert!(!scrubbed.contains("ĐĐĐĐĐĐ"));
+        assert!(scrubbed.contains("<redacted>"));
+
+        let input_closed = "cookie:\"Đà Nẵng Việt Nam\" and other info";
+        let scrubbed_closed = redact_text(input_closed);
+        assert!(!scrubbed_closed.contains("Đà Nẵng"));
+        assert!(scrubbed_closed.contains("<redacted>"));
+    }
+
+    #[test]
+    fn l02_fuzz_random_utf8_strings_never_panic() {
+        let mut prng: u64 = 0xDEADBEEFCAFE1234;
+        let next_rand = |state: &mut u64| -> u64 {
+            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *state
+        };
+
+        let sample_chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_:= \"'\n\r\t&;,}]Đàáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵ".chars().collect();
+        for _ in 0..5_000 {
+            let len = (next_rand(&mut prng) % 64) as usize;
+            let mut s = String::with_capacity(len * 4);
+            // Occasionally inject key words
+            if next_rand(&mut prng) % 3 == 0 {
+                s.push_str("cookie:\"");
+            } else if next_rand(&mut prng) % 3 == 1 {
+                s.push_str("\"zpw_enk\":\"");
+            }
+            for _ in 0..len {
+                let idx = (next_rand(&mut prng) as usize) % sample_chars.len();
+                s.push(sample_chars[idx]);
+            }
+            let _ = redact_text(&s);
+        }
     }
 }
 
