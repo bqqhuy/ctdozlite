@@ -7230,6 +7230,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c01_plaintext_malicious_base64_parses_as_plain_text() {
+        // PoC A-01 text: "MyL///////////8B" (decodes to [0x33, 0x22, 0xff*9, 0x01])
+        let raw_msg = serde_json::json!({
+            "msgId": "12345678",
+            "uidFrom": "peer_100",
+            "idTo": "user_200",
+            "message": "MyL///////////8B",
+            "msgType": "chat.text",
+            "ts": 1700000000
+        });
+
+        // 1. try_decrypt_e2ee_content must return None for normal non-E2EE message
+        let decrypt_res = try_decrypt_e2ee_content("user_200", "peer_100", &raw_msg);
+        assert!(
+            decrypt_res.is_none(),
+            "Normal message without E2EE metadata must skip wire decrypt"
+        );
+
+        // 2. parse_chat_message_in_context must parse it cleanly as plain text without panic
+        let parsed = parse_chat_message_in_context(&raw_msg, Some("user_200"), false);
+        assert!(parsed.is_some());
+        let msg = parsed.unwrap();
+        assert_eq!(msg.text, "MyL///////////8B");
+        assert!(!msg.is_e2ee);
+    }
+
+    #[test]
     fn test_try_parse_translation_result_success_and_error() {
         let ok_json = json!({
             "error_code": 0,
@@ -8956,16 +8983,21 @@ pub fn try_decrypt_e2ee_content(
     raw: &Value,
 ) -> Option<(String, bool)> {
     let is_e2ee_meta = crate::e2ee_integration::has_e2ee_metadata(raw);
+    let is_trial_thread = crate::e2ee_trial::enabled()
+        && crate::e2ee_integration::is_thread_e2ee(profile_id, peer_id);
+
+    // C-01 early gate: Plaintext messages without E2EE metadata in non-E2EE threads
+    // must NEVER be forwarded to wire::deserialize or ciphertext extraction.
+    if !is_e2ee_meta && !is_trial_thread {
+        return None;
+    }
+
     let ciphertext = crate::e2ee_integration::extract_ciphertext_bytes(raw);
     let is_wire = ciphertext
         .as_deref()
         .is_some_and(crate::e2ee_integration::is_e2ee_wire_payload);
 
-    if !is_e2ee_meta
-        && (!is_wire
-            || !crate::e2ee_trial::enabled()
-            || !crate::e2ee_integration::is_thread_e2ee(profile_id, peer_id))
-    {
+    if !is_e2ee_meta && !is_wire {
         return None;
     }
 

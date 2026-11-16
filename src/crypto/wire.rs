@@ -114,14 +114,42 @@ fn decode_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
     while *offset < data.len() {
         let b = data[*offset];
         *offset += 1;
-        result |= ((b & 0x7f) as u64) << shift;
+        let val = (b & 0x7f) as u64;
+        if shift >= 64 || (shift == 63 && val > 1) {
+            anyhow::bail!("Varint overflow");
+        }
+        result = result
+            .checked_add(val << shift)
+            .ok_or_else(|| anyhow::anyhow!("Varint overflow"))?;
         if (b & 0x80) == 0 {
             return Ok(result);
         }
         shift += 7;
-        anyhow::ensure!(shift <= 64, "Varint overflow");
     }
     anyhow::bail!("Cắt cụt khi đọc varint protobuf");
+}
+
+fn decode_varint_u32(data: &[u8], offset: &mut usize) -> Result<u32> {
+    let val = decode_varint(data, offset)?;
+    u32::try_from(val).map_err(|_| anyhow::anyhow!("Protobuf varint vượt quá giới hạn u32 ({val})"))
+}
+
+fn decode_length_delimited<'a>(data: &'a [u8], offset: &mut usize) -> Result<&'a [u8]> {
+    let len_u64 = decode_varint(data, offset)?;
+    let len = usize::try_from(len_u64)
+        .map_err(|_| anyhow::anyhow!("Độ dài trường protobuf quá lớn ({len_u64})"))?;
+    let start = *offset;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("Tràn số độ dài trường protobuf"))?;
+    anyhow::ensure!(
+        end <= data.len(),
+        "Trường protobuf bị cắt cụt (yêu cầu {end} byte, có {} byte)",
+        data.len()
+    );
+    *offset = end;
+    data.get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("Trường protobuf không hợp lệ"))
 }
 
 fn encode_bytes_field(out: &mut Vec<u8>, field_num: u32, data: &[u8]) {
@@ -367,13 +395,17 @@ fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
             let field_num = (tag >> 3) as u32;
             let wire_type = (tag & 0x7) as u8;
             if (field_num == 2 || field_num == 3 || field_num == 4) && wire_type == 2 {
-                if let Ok(len) = decode_varint(body, &mut test_offset) {
-                    if test_offset + (len as usize) <= body.len() {
-                        test_offset += len as usize;
-                        if field_num == 4 {
-                            is_prekey = true;
+                if let Ok(len_u64) = decode_varint(body, &mut test_offset) {
+                    if let Ok(len) = usize::try_from(len_u64) {
+                        if let Some(next_offset) = test_offset.checked_add(len) {
+                            if next_offset <= body.len() {
+                                test_offset = next_offset;
+                                if field_num == 4 {
+                                    is_prekey = true;
+                                }
+                                continue;
+                            }
                         }
-                        continue;
                     }
                 }
             } else if (field_num == 1 || field_num == 5 || field_num == 6)
@@ -395,19 +427,16 @@ fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
             let wire_type = (tag & 0x7) as u8;
             match wire_type {
                 0 => {
-                    let val = decode_varint(body, &mut offset)?;
+                    let val = decode_varint_u32(body, &mut offset)?;
                     match field_num {
-                        1 => prekey_id = Some(val as u32),
-                        5 => reg_id = val as u32,
-                        6 => signed_prekey_id = val as u32,
+                        1 => prekey_id = Some(val),
+                        5 => reg_id = val,
+                        6 => signed_prekey_id = val,
                         _ => {}
                     }
                 }
                 2 => {
-                    let len = decode_varint(body, &mut offset)? as usize;
-                    anyhow::ensure!(offset + len <= body.len(), "Trường protobuf bị cắt cụt");
-                    let field_slice = &body[offset..offset + len];
-                    offset += len;
+                    let field_slice = decode_length_delimited(body, &mut offset)?;
                     match field_num {
                         2 => base_key = Some(field_slice),
                         3 => identity_key = Some(field_slice),
@@ -464,21 +493,15 @@ fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
         let wire_type = (tag & 0x7) as u8;
         match wire_type {
             0 => {
-                let val = decode_varint(proto_bytes, &mut offset)?;
+                let val = decode_varint_u32(proto_bytes, &mut offset)?;
                 match field_num {
-                    2 => whisper_counter = val as u32,
-                    3 => whisper_prev_counter = val as u32,
+                    2 => whisper_counter = val,
+                    3 => whisper_prev_counter = val,
                     _ => {}
                 }
             }
             2 => {
-                let len = decode_varint(proto_bytes, &mut offset)? as usize;
-                anyhow::ensure!(
-                    offset + len <= proto_bytes.len(),
-                    "Trường protobuf bị cắt cụt"
-                );
-                let field_slice = &proto_bytes[offset..offset + len];
-                offset += len;
+                let field_slice = decode_length_delimited(proto_bytes, &mut offset)?;
                 match field_num {
                     1 => whisper_dh_public = Some(field_slice),
                     4 => whisper_ciphertext = Some(field_slice),
@@ -649,5 +672,41 @@ mod tests {
         let (msg_type, decoded_bytes) = decode_wire_b64(&b64).expect("decode wire b64");
         assert_eq!(msg_type, TYPE_WHISPER);
         assert_eq!(decoded_bytes, wire);
+    }
+
+    #[test]
+    fn c01_poc_malicious_varint_overflow_returns_err_no_panic() {
+        // PoC A-01: 33 22 ff ff ff ff ff ff ff ff ff 01 (base64: "MyL///////////8B")
+        let malformed = [
+            0x33, 0x22, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01,
+        ];
+        let result = deserialize(&malformed);
+        assert!(
+            result.is_err(),
+            "Must reject malformed varint payload safely with Err, never panic"
+        );
+    }
+
+    #[test]
+    fn c01_fuzz_random_bytes_never_panic() {
+        use std::num::Wrapping;
+        // Simple deterministic PRNG for fuzzing without external rand dependency
+        let mut state = Wrapping(0x1234_5678_9abc_def0u64);
+        let mut rng = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.0.wrapping_mul(0x2545_f491_4f6c_dd1du64)
+        };
+
+        for _ in 0..10_000 {
+            let len = (rng() % 128) as usize;
+            let mut buf = Vec::with_capacity(len);
+            for _ in 0..len {
+                buf.push((rng() & 0xff) as u8);
+            }
+            // Must never panic
+            let _ = deserialize(&buf);
+        }
     }
 }
