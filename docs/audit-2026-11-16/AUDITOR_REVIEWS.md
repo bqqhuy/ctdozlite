@@ -124,4 +124,37 @@ Hai Pro auditor (`Phase 2 Pro Auditor 1` và `Phase 2 Pro Auditor 2`) đã tiế
 - Thêm hàm `remove_e2ee_requirement` và nút "Gỡ yêu cầu E2EE" trong giao diện drawer của hội thoại.
 - Lỗi DB trong `check_thread_e2ee` được trả về dưới dạng lỗi gửi tin thông thường, không khóa vĩnh viễn thread liên hệ.
 
+---
+
+# Kết quả Review Độc lập — Audit `bd44cc1` Phase 3 (Error Display & Performance)
+
+Phạm vi review: Commit `accecd0..5b7268e` trên nhánh `antigravity/phase-3-error-and-perf`.
+Hai Pro auditor (`Phase 3 Pro Auditor 1` và `Phase 3 Pro Auditor 2`) đã tiến hành kiểm toán độc lập, chạy test và rà soát diff.
+
+## Đánh giá tổng hợp Phase 3
+
+| Chỉ số | Pro Auditor 1 | Pro Auditor 2 |
+|---|---|---|
+| **Kết luận** | **APPROVE** | **APPROVE** |
+| **Blocker** | 0 | 0 |
+| **Major** | 0 | 0 |
+| **Minor** | 1 (Quan sát) | 0 |
+| **Suggestions** | 2 | 2 |
+
+### Xác nhận M-04:
+- Tự động phân loại các thông điệp lỗi trong `GuiEvent::StatusUpdate` (bắt đầu bằng "Không ", "Lỗi ", "Thất bại", v.v.) hiển thị qua banner toast `self.show_toast(msg)`.
+- Giữ nguyên hiển thị status trên thanh trạng thái, không làm phiền người dùng với các thông báo tiến độ thông thường.
+
+### Xác nhận M-06:
+- Quá trình ghi đĩa và mã hóa DPAPI trong `WorkerCmd::PersistSession` và Password login success đã nhả `session.lock().await` trước khi offload sang `tokio::task::spawn_blocking`.
+- Giải phóng luồng async của Tokio worker khỏi tình trạng nghẽn I/O đĩa.
+
+### Xác nhận L-01:
+- Ticker `RunAutomation`/`PruneExpired` cấu hình `MissedTickBehavior::Skip`, tránh dồn tích tick gây spike tải định kỳ.
+
+### Xác nhận Hiệu năng phụ:
+- Logger chuyển `Vec` sang `VecDeque`, đổi `remove(0)` O(N) sang `pop_front()` O(1), giữ nguyên interface `get_entries() -> Vec<LogEntry>`.
+- Voice buffer cấp phát trước 30 giây mẫu PCM mono và waveform levels, triệt tiêu allocation trong audio callback thread.
+
+
 
