@@ -85,3 +85,9 @@ Related domain language lives in [`/GLOSSARY.md`](../../GLOSSARY.md).
 - [0034 — Hidden-chat PIN compatibility and local display gate](0034-hidden-chat-pin-compatibility.md)
 
 - [0035 — Fail closed at the unverified E2EE server boundary](0035-unverified-e2ee-boundary.md)
+
+- [0036 — Explicit E2EE experiment with bounded diagnostics](0036-opt-in-e2ee-trial.md)
+
+- [0037 — Authenticated receive and account boundaries](0037-authenticated-receive-and-account-boundaries.md)
+
+- [0038 — Identity-bound verification in the local E2EE trial](0038-identity-bound-trial-verification.md)

@@ -2,7 +2,7 @@
 //!
 //! Evidence: `re-notes/36-zalo-e2ee-signal-protocol-analysis.md` §4
 //! - Identity key: Curve25519, one per profile, long-lived
-//! - Signed prekey: Curve25519, signed with Ed25519 identity key, rotated ~7 days
+//! - Local signed prekey: Curve25519, signed with its DH identity using XEdDSA
 //! - One-time prekeys: Curve25519, consumed per session, batch of 5
 
 use anyhow::Result;
@@ -21,7 +21,8 @@ pub const DEVICE_ID: u32 = 1;
 pub struct IdentityKeyPair {
     /// Curve25519 key pair for DH operations.
     pub dh: super::ratchet::KeyPairBytes,
-    /// Ed25519 signing key for signing our own prekeys.
+    /// Legacy Ed25519 signing material retained for stored-key compatibility.
+    /// Local prekeys are authenticated by the DH identity using XEdDSA instead.
     pub signing_private: [u8; 32],
     pub signing_public: [u8; 32],
     /// Random registration ID (u32).  Must match Zalo server registration.
@@ -273,8 +274,7 @@ impl OneTimePreKey {
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct PreKeyBundle {
     pub identity_key: [u8; 32],
-    /// Ed25519 signing public key bound to this bundle (audit A04).
-    /// Used by peers to verify the signed_pre_key signature.
+    /// Synthetic signing-key hint, equal to the DH identity for XEdDSA bundles.
     pub signing_identity_key: [u8; 32],
     pub registration_id: u32,
     pub signed_pre_key: BundleSignedPreKey,

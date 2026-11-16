@@ -150,21 +150,13 @@ pub async fn request_qr(s: &Session, language: &str) -> Result<QrLogin> {
 
     let (status, text, _) = get_raw(s, &url).await?;
     if status != 200 {
-        bail!(
-            "reqqr: HTTP {status}: {}",
-            crate::session::truncate(&text, 200)
-        );
+        bail!("reqqr: HTTP {status}");
     }
-    let v: Value = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "reqqr: không phải JSON ({e}): {}",
-            crate::session::truncate(&text, 200)
-        )
-    })?;
+    let v: Value =
+        serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("reqqr: không phải JSON ({e})"))?;
     let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
     if code != 0 {
-        let msg = v.get("error_message").and_then(Value::as_str).unwrap_or("");
-        bail!("reqqr: server error {code}: {msg}");
+        bail!("reqqr: server error {code}");
     }
     QrLogin::from_data(
         v.get("data")
@@ -236,16 +228,12 @@ pub async fn wait_for_scan(s: &Session, q: &QrLogin) -> Result<Value> {
                 } else {
                     attempts += 1;
                     if attempts > q.qr_retry.max(1) {
-                        let msg = v.get("error_message").and_then(Value::as_str).unwrap_or("");
-                        bail!("waiting scan: server error {code}: {msg}");
+                        bail!("waiting scan: server error {code}");
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(800)).await;
             }
-            other => bail!(
-                "waiting scan: HTTP {other}: {}",
-                crate::session::truncate(&text, 200)
-            ),
+            other => bail!("waiting scan: HTTP {other}"),
         }
     }
 }
@@ -270,18 +258,11 @@ pub async fn confirm(s: &Session, q: &QrLogin) -> Result<Value> {
             continue;
         }
         if status != 200 {
-            bail!(
-                "pc-status: HTTP {status}: {}",
-                crate::session::truncate(&text, 200)
-            );
+            bail!("pc-status: HTTP {status}");
         }
 
-        let mut v: Value = serde_json::from_str(&text).map_err(|e| {
-            anyhow::anyhow!(
-                "pc-status: không phải JSON ({e}): {}",
-                crate::session::truncate(&text, 200)
-            )
-        })?;
+        let mut v: Value = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("pc-status: không phải JSON ({e})"))?;
         let code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
         if code == 0 {
             if let Some(sek) = cookie_sek {
@@ -295,8 +276,7 @@ pub async fn confirm(s: &Session, q: &QrLogin) -> Result<Value> {
             tokio::time::sleep(Duration::from_millis(800)).await;
             continue;
         } else {
-            let msg = v.get("error_message").and_then(Value::as_str).unwrap_or("");
-            bail!("pc-status: server error {code}: {msg}");
+            bail!("pc-status: server error {code}");
         }
     }
 }
@@ -403,20 +383,39 @@ async fn get_raw(s: &Session, url: &str) -> Result<(u16, String, Option<String>)
     let text = String::from_utf8_lossy(&bytes).into_owned();
     if s.verbose {
         eprintln!("→ GET {}", crate::session::redact_url(url));
-        eprintln!("← {status} {}", crate::session::truncate(&text, 200));
-        if let Some(ref k) = sek {
-            eprintln!(
-                "  Captured zpw_sek cookie: {}",
-                crate::session::redact_secret(k)
-            );
-        }
+        eprintln!("{}", response_metadata(status, &text, sek.is_some()));
     }
     Ok((status, text, sek))
+}
+
+fn response_metadata(status: u16, body: &str, cookie_present: bool) -> String {
+    let error_code = serde_json::from_str::<Value>(body).ok().and_then(|value| {
+        value
+            .get("error_code")
+            .and_then(|code| code.as_i64().or_else(|| code.as_str()?.parse().ok()))
+    });
+    format!(
+        "← {status} body_bytes={} error_code={error_code:?} zpw_sek_present={cookie_present}",
+        body.len()
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbose_response_metadata_never_contains_body_or_cookie_values() {
+        let body = r#"{"error_code":73,"token":"SYNTHETIC_TOKEN_SENTINEL","nested":{"zpw_sek":"SYNTHETIC_SEK_SENTINEL"}}"#;
+        let cookie = "SYNTHETIC_COOKIE_PREFIX_SENTINEL";
+        let line = response_metadata(200, body, !cookie.is_empty());
+        assert!(line.contains("200"));
+        assert!(line.contains("error_code=Some(73)"));
+        assert!(line.contains("zpw_sek_present=true"));
+        assert!(!line.contains("SYNTHETIC_TOKEN_SENTINEL"));
+        assert!(!line.contains("SYNTHETIC_SEK_SENTINEL"));
+        assert!(!line.contains(cookie));
+    }
 
     /// Live capture, 2026-10-20, `self_g = 1`.
     const LIVE_RESP: &str = r#"{

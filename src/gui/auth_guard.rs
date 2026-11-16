@@ -7,9 +7,11 @@
 //! - `windows::Security::Credentials::UI::UserConsentVerifier`
 //! - Native-device acceptance is tracked separately from fixture tests.
 
-#[cfg(windows)]
-use anyhow::Context;
-use anyhow::Result;
+#[cfg(any(windows, test))]
+use anyhow::{anyhow, Context};
+use anyhow::{bail, Result};
+#[cfg(any(windows, test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Application lock guard — manages lock state and idle timeout.
@@ -121,50 +123,152 @@ impl Default for AppLockGuard {
     }
 }
 
-/// Perform the actual Windows Hello authentication request, independent of any
-/// lock-guard state. Returns `true` only when the user verified successfully.
 #[cfg(windows)]
-pub async fn request_windows_hello() -> Result<bool> {
-    use windows::core::HSTRING;
-    use windows::Security::Credentials::UI::UserConsentVerifier;
+const HELLO_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(windows)]
+static HELLO_ADMISSION: HelloAdmission = HelloAdmission::new();
 
-    let task = tokio::task::spawn_blocking(move || -> Result<bool> {
-        eprintln!("[AUTH_GUARD] Requesting Windows Hello authentication...");
+#[cfg(any(windows, test))]
+struct HelloAdmission(AtomicBool);
 
-        let message = HSTRING::from("ZaloLite");
-        match UserConsentVerifier::RequestVerificationAsync(&message) {
-            Ok(async_op) => {
-                // Block on the WinRT IAsyncOperation inside the blocking pool.
-                match async_op.get() {
-                    Ok(result) => {
-                        use windows::Security::Credentials::UI::UserConsentVerificationResult;
-                        let success = matches!(result, UserConsentVerificationResult::Verified);
-                        eprintln!(
-                            "[AUTH_GUARD] Authentication result: {}",
-                            if success { "verified" } else { "failed" }
-                        );
-                        Ok(success)
-                    }
-                    Err(e) => {
-                        eprintln!("[AUTH_GUARD] Authentication failed: {e:?}");
-                        Ok(false)
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[AUTH_GUARD] Failed to request authentication: {e:?}");
-                Ok(false)
-            }
-        }
-    });
+#[cfg(any(windows, test))]
+impl HelloAdmission {
+    const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
 
-    task.await.context("Authentication task failed")?
+    fn acquire(&self) -> Result<HelloLease<'_>> {
+        self.0
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| anyhow!("Đang có yêu cầu Windows Hello khác xử lý."))?;
+        Ok(HelloLease(self))
+    }
 }
 
-/// Non-Windows stub: authentication is never available.
-#[cfg(not(windows))]
-pub async fn request_windows_hello() -> Result<bool> {
-    Ok(false)
+#[cfg(any(windows, test))]
+struct HelloLease<'a>(&'a HelloAdmission);
+
+#[cfg(any(windows, test))]
+impl Drop for HelloLease<'_> {
+    fn drop(&mut self) {
+        self.0 .0.store(false, Ordering::Release);
+    }
+}
+
+/// Perform a desktop-owned Windows Hello request and return whether verification succeeded.
+///
+/// # Errors
+/// Returns an error for an invalid window handle, a concurrent request, a timed-out request,
+/// or a failed native operation. A timeout does not cancel WinRT; admission stays held until
+/// the native operation actually completes.
+pub async fn request_windows_hello(hwnd: isize) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+
+        let native_hwnd = HWND(hwnd);
+        validate_hwnd(hwnd, is_valid_window)?;
+        request_with_backend(&HELLO_ADMISSION, HELLO_REQUEST_TIMEOUT, move || {
+            run_desktop_hello(native_hwnd)
+        })
+        .await
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        bail!("Windows Hello chỉ khả dụng trên Windows.");
+    }
+}
+
+#[cfg(windows)]
+fn is_valid_window(hwnd: isize) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow};
+
+    let native_hwnd = windows::Win32::Foundation::HWND(hwnd);
+    let mut process_id = 0;
+    // SAFETY: These calls inspect the HWND and return its owning process; they do not retain it.
+    unsafe {
+        IsWindow(native_hwnd).as_bool()
+            && GetWindowThreadProcessId(native_hwnd, Some(&mut process_id as *mut u32)) != 0
+            && process_id == std::process::id()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn validate_hwnd(isize_hwnd: isize, is_window: impl FnOnce(isize) -> bool) -> Result<()> {
+    if isize_hwnd == 0 || !is_window(isize_hwnd) {
+        bail!("Không thể xác thực Windows Hello vì cửa sổ ứng dụng không hợp lệ.");
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+async fn request_with_backend<F>(
+    admission: &'static HelloAdmission,
+    timeout: Duration,
+    operation: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<bool> + Send + 'static,
+{
+    let lease = admission.acquire()?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("windows-hello-request".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation))
+                .unwrap_or_else(|_| Err(anyhow!("Windows Hello gặp lỗi nội bộ.")));
+            drop(lease);
+            let _ = sender.send(result);
+        })
+        .context("Không thể khởi chạy yêu cầu Windows Hello.")?;
+
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => bail!("Yêu cầu Windows Hello đã kết thúc bất thường."),
+        Err(_) => bail!("Yêu cầu Windows Hello quá thời hạn 30 giây; hãy thử lại sau."),
+    }
+}
+
+#[cfg(windows)]
+fn run_desktop_hello(hwnd: windows::Win32::Foundation::HWND) -> Result<bool> {
+    use windows::core::HSTRING;
+    use windows::Security::Credentials::UI::UserConsentVerificationResult;
+    use windows::Win32::System::WinRT::IUserConsentVerifierInterop;
+    use windows::Win32::System::WinRT::{
+        RoGetActivationFactory, RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED,
+    };
+
+    // SAFETY: This dedicated native thread has no prior WinRT apartment initialization.
+    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }
+        .context("Không thể khởi tạo WinRT apartment cho Windows Hello.")?;
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) {
+            // SAFETY: This guard is created only after successful RoInitialize on this thread.
+            unsafe { RoUninitialize() };
+        }
+    }
+    let _apartment = Apartment;
+
+    let class_name = HSTRING::from("Windows.Security.Credentials.UI.UserConsentVerifier");
+    // SAFETY: WinRT is initialized on this thread and the requested runtime class is the
+    // documented desktop verifier interop class.
+    let interop: IUserConsentVerifierInterop = unsafe { RoGetActivationFactory(&class_name) }
+        .context("Không thể khởi tạo giao diện Windows Hello trên desktop.")?;
+    let message = HSTRING::from("Xác minh danh tính để mở khóa ZaloLite");
+    validate_hwnd(hwnd.0, is_valid_window)?;
+    // SAFETY: HWND was revalidated on this native thread. WinRT manages the consent UI after
+    // invocation, and this call retains no Rust borrow or pointer into the GUI owner. The GUI
+    // generation layer must ignore any completion that arrives after the window closes.
+    let operation: windows::Foundation::IAsyncOperation<UserConsentVerificationResult> =
+        unsafe { interop.RequestVerificationForWindowAsync(hwnd, &message) }
+            .context("Không thể hiển thị yêu cầu Windows Hello.")?;
+    let result = operation
+        .get()
+        .context("Yêu cầu Windows Hello không hoàn tất thành công.")?;
+    Ok(matches!(result, UserConsentVerificationResult::Verified))
 }
 
 #[cfg(test)]
@@ -237,5 +341,48 @@ mod tests {
         assert!(!guard.should_lock());
         thread::sleep(Duration::from_millis(70));
         assert!(guard.should_lock());
+    }
+
+    #[test]
+    fn admission_rejects_overlapping_native_operations() {
+        let admission = HelloAdmission::new();
+        let lease = admission.acquire().unwrap();
+        assert!(admission.acquire().is_err());
+        drop(lease);
+        assert!(admission.acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn timeout_keeps_admission_until_native_operation_finishes() {
+        let admission = Box::leak(Box::new(HelloAdmission::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let timed_out = request_with_backend(admission, Duration::from_millis(10), move || {
+            started_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            Ok(true)
+        })
+        .await;
+        assert!(timed_out.is_err());
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(admission.acquire().is_err());
+        finish_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while admission.0.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!admission.0.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn invalid_window_handles_fail_closed_without_native_calls() {
+        let mut native_calls = 0;
+        assert!(validate_hwnd(0, |_| {
+            native_calls += 1;
+            true
+        })
+        .is_err());
+        assert_eq!(native_calls, 0);
+        assert!(validate_hwnd(123, |_| false).is_err());
     }
 }

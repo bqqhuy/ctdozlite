@@ -24,7 +24,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::AesGcm;
 use anyhow::{anyhow, bail, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use generic_array::typenum::U16;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -68,6 +68,40 @@ pub const CMD_PULL_MSG_518: u16 = 518;
 pub const CMD_HAS_MSG: u16 = 533;
 pub const CMD_PUSH_MISS_MSG: u16 = 534;
 pub const CMD_GET_MSG: u16 = 570;
+
+const WS_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+
+async fn send_ws_bounded<S>(
+    sink: &mut S,
+    message: Message,
+    receiver: &mpsc::Sender<WsEvent>,
+) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    send_ws_with_deadline(sink, message, receiver, WS_WRITE_DEADLINE).await
+}
+
+async fn send_ws_with_deadline<S>(
+    sink: &mut S,
+    message: Message,
+    receiver: &mpsc::Sender<WsEvent>,
+    deadline: Duration,
+) -> Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    tokio::select! {
+        _ = receiver.closed() => bail!("WebSocket receiver closed during write"),
+        result = tokio::time::timeout(deadline, sink.send(message)) => {
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => bail!("WebSocket write timed out after {}s", deadline.as_secs()),
+            }
+        }
+    }
+}
 
 // -- Signal Protocol / E2EE command range (540..=582) -----------------------
 /// Minimum command code in the Signal Protocol family.
@@ -841,7 +875,7 @@ async fn run_once(
                     for pull in catchups.due_with_capacity(std::time::Instant::now(), true) {
                         let id = format!("req_{req_id}");
                         req_id += 1;
-                        tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Binary(pull_next_frame(pull.key.0, pull.key.1, &id, pull.last, pull.ids)))).await??;
+                        send_ws_bounded(&mut ws, Message::Binary(pull_next_frame(pull.key.0, pull.key.1, &id, pull.last, pull.ids)), tx).await?;
                         catchups.sent(pull.key, id, std::time::Instant::now());
                     }
                 }
@@ -854,7 +888,7 @@ async fn run_once(
                 if authed {
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    ws.send(Message::Binary(f)).await?;
+                    send_ws_bounded(&mut ws, Message::Binary(f), tx).await?;
                     trace("-> ping");
                 }
             }
@@ -865,8 +899,7 @@ async fn run_once(
                         continue;
                     }
                     let frame=encode_frame(outgoing.command,0,1,Some(&outgoing.body));
-                    let sent=tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(frame))).await;
-                    let success=matches!(sent,Ok(Ok(())));
+                    let success = send_ws_bounded(&mut ws, Message::Binary(frame), tx).await.is_ok();
                     let _=outgoing.ack.send(success);
                     anyhow::ensure!(success,"Phone sync socket write failed");
                 } else { writes_open=false; }
@@ -893,7 +926,7 @@ async fn run_once(
                         continue;
                     }
                     Message::Ping(p) => {
-                        ws.send(Message::Pong(p)).await?;
+                        send_ws_bounded(&mut ws, Message::Pong(p), tx).await?;
                         continue;
                     }
                     Message::Close(c) => {
@@ -971,7 +1004,7 @@ async fn run_once(
                     // Send immediate first ping right upon auth
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    let _ = ws.send(Message::Binary(f)).await;
+                    let _ = send_ws_bounded(&mut ws, Message::Binary(f), tx).await;
                     trace("-> first ping (auth)");
                     ready.send_replace(Some(epoch));
                     forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload: auth.clone() }, epoch).await?;
@@ -982,7 +1015,7 @@ async fn run_once(
                         let id = format!("req_{req_id}");
                         req_id += 1;
                         let start = crate::queue_cursors::socket_start(sess, qcmd, qsub).await;
-                        tokio::time::timeout(Duration::from_secs(5),ws.send(Message::Binary(pull_frame(qcmd, qsub, &id, start.as_ref())))).await??;
+                        send_ws_bounded(&mut ws, Message::Binary(pull_frame(qcmd, qsub, &id, start.as_ref())), tx).await?;
                         catchups.register((qcmd,qsub),id.clone(),std::time::Instant::now(),start);
                         trace(format!("-> pull {qcmd}_{qsub} {id}"));
                     }
@@ -1013,11 +1046,12 @@ async fn run_once(
                             "lastId": "1",
                             "reqId": id,
                         });
-                        let _ = ws
-                            .send(Message::Binary(
-                                encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req)),
-                            ))
-                            .await;
+                        let _ = send_ws_bounded(
+                            &mut ws,
+                            Message::Binary(encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req))),
+                            tx,
+                        )
+                        .await;
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
@@ -1025,7 +1059,7 @@ async fn run_once(
                 if let Some(pull) = catchups.page_with_capacity((cmd, sub_cmd), &payload, std::time::Instant::now(), has_pull_capacity) {
                     let id = format!("req_{req_id}");
                     req_id += 1;
-                    tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Binary(pull_next_frame(cmd, sub_cmd, &id, pull.last, pull.ids)))).await??;
+                    send_ws_bounded(&mut ws, Message::Binary(pull_next_frame(cmd, sub_cmd, &id, pull.last, pull.ids)), tx).await?;
                     catchups.sent((cmd, sub_cmd), id, std::time::Instant::now());
                 }
                 if matches!(cmd,CMD_CTRL_PUSH_CTRL|CMD_CTRL_PULL_CTRL) {
@@ -1252,6 +1286,148 @@ mod phone_forwarding_tests {
             &json!({"data":{"controls":[control,{"content":{"act_type":"voip"}}]}})
         ));
         assert!(!phone_only_controls(&json!({"data":{"controls":[]}})));
+    }
+}
+
+#[cfg(test)]
+mod bounded_write_tests {
+    use super::*;
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    struct PendingSink;
+
+    impl Sink<Message> for PendingSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    struct ImmediateSink {
+        fail: bool,
+    }
+
+    impl Sink<Message> for ImmediateSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: Pin<&mut Self>,
+            _item: Message,
+        ) -> std::result::Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            if self.fail {
+                Poll::Ready(Err(tokio_tungstenite::tungstenite::Error::ConnectionClosed))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_write_completes() {
+        let (receiver, _events) = mpsc::channel(1);
+        assert!(send_ws_with_deadline(
+            &mut ImmediateSink { fail: false },
+            Message::Ping(Vec::new()),
+            &receiver,
+            Duration::from_secs(1),
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn sink_error_is_returned() {
+        let (receiver, _events) = mpsc::channel(1);
+        let error = send_ws_with_deadline(
+            &mut ImmediateSink { fail: true },
+            Message::Ping(Vec::new()),
+            &receiver,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<tokio_tungstenite::tungstenite::Error>(),
+            Some(tokio_tungstenite::tungstenite::Error::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pending_write_times_out() {
+        let (receiver, _events) = mpsc::channel(1);
+        let error = send_ws_with_deadline(
+            &mut PendingSink,
+            Message::Ping(Vec::new()),
+            &receiver,
+            Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("WebSocket write timed out"));
+    }
+
+    #[tokio::test]
+    async fn pending_write_is_cancelled_when_receiver_closes() {
+        let (receiver, events) = mpsc::channel(1);
+        drop(events);
+        let error = send_ws_with_deadline(
+            &mut PendingSink,
+            Message::Ping(Vec::new()),
+            &receiver,
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("receiver closed"));
     }
 }
 

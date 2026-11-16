@@ -70,52 +70,45 @@ impl ZaloGuiApp {
                             close_menu = true;
                         }
 
-                        // A20: Profile switcher list in avatar popover
+                        // Keep account selection in this single foreground menu surface.
                         if self.profiles.len() > 1 {
-                            ui.add_space(4.0);
-                            ui.separator();
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new("Chuyển tài khoản:")
-                                    .size(11.5)
-                                    .color(pal.text_secondary)
-                                    .strong(),
-                            );
-                            for profile in &self.profiles {
-                                let is_active = profile.uid == self.user_uin;
-                                let display = if is_active {
-                                    format!("✓ {} (hiện tại)", profile.display_name)
-                                } else {
-                                    format!("  {}", profile.display_name)
-                                };
-                                if is_active {
-                                    ui.label(
-                                        RichText::new(display).size(12.0).color(pal.accent_online),
-                                    );
-                                } else {
-                                    if ui
-                                        .add_sized(
-                                            [200.0, 26.0],
-                                            egui::Button::new(
-                                                RichText::new(display)
-                                                    .size(12.0)
-                                                    .color(pal.text_primary),
-                                            )
-                                            .fill(Color32::TRANSPARENT),
-                                        )
-                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                        .clicked()
-                                    {
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::SwitchProfile {
+                            let profiles_list: Vec<(&str, &crate::profiles::Profile)> = self
+                                .profiles
+                                .iter()
+                                .map(|profile| (profile.display_name.as_str(), profile))
+                                .collect();
+                            let active = profiles_list
+                                .iter()
+                                .find(|(_, profile)| profile.uid == self.user_uin)
+                                .map(|(_, profile)| *profile);
+                            if let Some(target_uid) =
+                                self.account_switcher.show(ui, active, &profiles_list)
+                            {
+                                if target_uid != self.user_uin {
+                                    if let Some(tx) = WORKER_TX.get() {
+                                        if tx
+                                            .send(WorkerCmd::SwitchProfile {
                                                 owner: self.user_uin.clone(),
-                                                target_uid: profile.uid.clone(),
-                                            });
+                                                target_uid,
+                                            })
+                                            .is_err()
+                                        {
+                                            self.show_toast(
+                                                "Không kết nối được bộ xử lý tài khoản",
+                                            );
                                         }
-                                        close_menu = true;
                                     }
                                 }
+                                close_menu = true;
                             }
+                        }
+                        if ui.button("Thêm tài khoản").clicked() {
+                            if let Some(tx) = WORKER_TX.get() {
+                                if tx.send(WorkerCmd::AddAccount).is_err() {
+                                    self.show_toast("Không kết nối được bộ xử lý tài khoản");
+                                }
+                            }
+                            close_menu = true;
                         }
                         ui.add_space(6.0);
                         ui.separator();

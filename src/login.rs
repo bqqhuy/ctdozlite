@@ -68,23 +68,30 @@ pub fn encrypt_password(phone: &str, imei: &str, password: &str, salt: &str) -> 
     crate::crypto::encode_aes(enk.as_bytes(), &plain)
 }
 
-/// Salt generator for encrypt_password: 8 random alphanumerics.
-pub fn random_salt() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    const ALPHA: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(1)
-        ^ ((std::process::id() as u64) << 17);
-    let mut out = String::with_capacity(8);
-    for _ in 0..8 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        out.push(ALPHA[(seed >> 33) as usize % ALPHA.len()] as char);
+const SALT_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const SALT_LEN: usize = 8;
+
+/// Salt generator for encrypt_password: 8 alphanumerics from the OS CSPRNG.
+/// Length and alphabet are unchanged; an RNG failure aborts login instead of
+/// falling back to a predictable seed.
+pub fn random_salt() -> Result<String> {
+    salt_from(crate::random::fill)
+}
+
+/// Rejection sampling keeps every alphabet symbol equally likely (252 = 7 * 36).
+fn salt_from(mut fill: impl FnMut(&mut [u8]) -> Result<()>) -> Result<String> {
+    const LIMIT: u8 = (u8::MAX as usize / SALT_ALPHABET.len() * SALT_ALPHABET.len()) as u8;
+    let mut out = String::with_capacity(SALT_LEN);
+    let mut buf = [0u8; 16];
+    while out.len() < SALT_LEN {
+        fill(&mut buf)?;
+        for byte in buf {
+            if byte < LIMIT && out.len() < SALT_LEN {
+                out.push(SALT_ALPHABET[usize::from(byte) % SALT_ALPHABET.len()] as char);
+            }
+        }
     }
-    out
+    Ok(out)
 }
 
 /// `GET {auth}/api/login/getServerInfo` — unauthenticated, gates param encryption.
@@ -185,7 +192,7 @@ pub async fn login_by_password(
     password: &str,
     iso: &str,
 ) -> Result<Value> {
-    let salt = random_salt();
+    let salt = random_salt()?;
     let pwd = encrypt_password(phone, &s.imei, password, &salt)?;
     let client_time = unix_now();
 
@@ -403,6 +410,49 @@ pub fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn salt_uses_injected_rng_with_exact_length_and_alphabet() {
+        // Bytes >= 252 are rejected; 0, 35 and 251 map to 'a', '9' and '9'.
+        let script = [255u8, 252, 0, 35, 251, 36, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut calls = 0;
+        let salt = salt_from(|buf| {
+            calls += 1;
+            buf.copy_from_slice(&script);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(salt, "a99abcde");
+        assert_eq!(salt.len(), SALT_LEN);
+        assert!(salt.bytes().all(|b| SALT_ALPHABET.contains(&b)));
+    }
+
+    #[test]
+    fn salt_requests_more_entropy_when_bytes_are_rejected() {
+        let mut calls = 0;
+        let salt = salt_from(|buf| {
+            calls += 1;
+            buf.fill(if calls == 1 { 254 } else { 1 });
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(salt, "bbbbbbbb");
+    }
+
+    #[test]
+    fn salt_propagates_rng_failure_without_fallback() {
+        let error = salt_from(|_| anyhow::bail!("rng down")).unwrap_err();
+        assert!(error.to_string().contains("rng down"));
+    }
+
+    #[test]
+    fn production_salt_comes_from_os_rng() {
+        let salt = random_salt().unwrap();
+        assert_eq!(salt.len(), SALT_LEN);
+        assert!(salt.bytes().all(|b| SALT_ALPHABET.contains(&b)));
+    }
 
     #[test]
     fn apply_login_config_captures_zpw_sek() {

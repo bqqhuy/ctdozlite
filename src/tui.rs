@@ -11,7 +11,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -37,6 +40,7 @@ use crate::logger::{self, FindingLevel};
 use crate::session::Session;
 
 const POLL_SECS: u64 = 4;
+const WRITER_SHUTDOWN_BUDGET: Duration = Duration::from_secs(5);
 
 /// Quick-reaction palette for keys `1`..`6`, same order as the GUI picker.
 const QUICK_REACTIONS: [&str; 6] = [
@@ -103,6 +107,7 @@ struct PromptState {
 enum ConfirmKind {
     Logout,
     DeleteMessage,
+    RetryMessage,
 }
 
 struct ConfirmAction {
@@ -127,6 +132,7 @@ struct StickerState {
 // These infrequent terminal events retain the existing TUI ownership boundary.
 #[allow(clippy::large_enum_variant)]
 enum BgEvent {
+    Hydrated(Vec<Thread>),
     PollDone {
         threads: Vec<Thread>,
         state: chat::PollState,
@@ -136,16 +142,10 @@ enum BgEvent {
     HistoryLoaded {
         thread: Thread,
     },
-    MessageSent {
+    SendOutcome {
         thread_id: String,
-        text: String,
-    },
-    AttachmentSent {
-        thread_id: String,
-        msg: ChatMessage,
-    },
-    StickerSent {
-        thread_id: String,
+        client_message_id: String,
+        outcome: SendDisposition,
     },
     ReactionDone {
         thread_id: String,
@@ -157,11 +157,558 @@ enum BgEvent {
         deleted: DeletedIdentity,
         result: std::result::Result<(), String>,
     },
+    DeleteFailed(String),
     HiddenStateChanged(std::result::Result<(), String>),
     StickerPacks(Vec<StickerPackInfo>),
     StickerItems(Vec<StickerItem>),
-    SendFailed(String),
     ActionFailed(String),
+    StoreFailed(String),
+    StoreSaved,
+}
+
+enum SendDisposition {
+    Accepted(Box<ChatMessage>),
+    Rejected(String),
+    Unknown(String),
+    NotSent(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimeStamp {
+    owner: String,
+    runtime_id: usize,
+}
+
+impl RuntimeStamp {
+    fn for_session(session: &Session) -> Self {
+        Self {
+            owner: session.account_key().to_owned(),
+            runtime_id: session.runtime_id(),
+        }
+    }
+
+    fn matches(&self, session: &Session) -> bool {
+        session.is_active()
+            && self.owner == session.account_key()
+            && self.runtime_id == session.runtime_id()
+    }
+}
+
+struct BgEnvelope {
+    stamp: RuntimeStamp,
+    event: BgEvent,
+}
+
+#[derive(Clone)]
+struct BgSender {
+    tx: Sender<BgEnvelope>,
+    stamp: RuntimeStamp,
+}
+
+impl BgSender {
+    /// `Err` means the UI receiver is gone; the undelivered event is dropped.
+    fn send(&self, event: BgEvent) -> std::result::Result<(), ()> {
+        self.tx
+            .send(BgEnvelope {
+                stamp: self.stamp.clone(),
+                event,
+            })
+            .map_err(|_| ())
+    }
+}
+
+enum StoreCommand {
+    Hydrate {
+        session: Session,
+        stamp: RuntimeStamp,
+        threads: Vec<Thread>,
+        completion: BgSender,
+    },
+    Snapshot {
+        session: Session,
+        stamp: RuntimeStamp,
+        threads: Vec<Thread>,
+        completion: BgSender,
+    },
+    Delete {
+        session: Session,
+        stamp: RuntimeStamp,
+        thread_id: String,
+        message: Box<ChatMessage>,
+        threads: Vec<Thread>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    Outgoing {
+        session: Session,
+        stamp: RuntimeStamp,
+        thread: Box<Thread>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    Shutdown {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    PanicForTest,
+}
+
+#[derive(Clone)]
+struct StoreWriter {
+    inner: Arc<StoreWriterInner>,
+}
+
+struct StoreWriterInner {
+    tx: SyncSender<StoreEnvelope>,
+    slots: Arc<tokio::sync::Semaphore>,
+    accepting: AtomicBool,
+    available: AtomicBool,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    done: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+struct StoreEnvelope {
+    command: StoreCommand,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreAdmissionError {
+    Full,
+    Disconnected,
+}
+
+struct CriticalTask(Arc<AtomicUsize>);
+
+impl CriticalTask {
+    fn start(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for CriticalTask {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl StoreWriter {
+    const CAPACITY: usize = 16;
+
+    fn new() -> Self {
+        let (writer, rx) = Self::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        *writer
+            .inner
+            .done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(done_rx);
+        let spawned = std::thread::Builder::new()
+            .name("tui-history-writer".into())
+            .spawn(move || store_writer_loop(rx, done_tx));
+        match spawned {
+            Ok(worker) => {
+                *writer
+                    .inner
+                    .worker
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(worker)
+            }
+            Err(_) => writer.inner.available.store(false, Ordering::Release),
+        }
+        writer
+    }
+
+    fn channel() -> (Self, Receiver<StoreEnvelope>) {
+        let (tx, rx) = sync_channel(Self::CAPACITY);
+        (
+            Self {
+                inner: Arc::new(StoreWriterInner {
+                    tx,
+                    slots: Arc::new(tokio::sync::Semaphore::new(Self::CAPACITY)),
+                    accepting: AtomicBool::new(true),
+                    available: AtomicBool::new(true),
+                    worker: Mutex::new(None),
+                    done: Mutex::new(None),
+                }),
+            },
+            rx,
+        )
+    }
+
+    /// Holds one admission slot while the remote delete is in flight.
+    fn try_reserve_delete(
+        &self,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, StoreAdmissionError> {
+        if !self.inner.available.load(Ordering::Acquire)
+            || !self.inner.accepting.load(Ordering::Acquire)
+        {
+            return Err(StoreAdmissionError::Disconnected);
+        }
+        self.inner
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| StoreAdmissionError::Full)
+    }
+
+    fn try_send(&self, command: StoreCommand) -> std::result::Result<(), StoreAdmissionError> {
+        let permit = self.try_reserve_delete()?;
+        self.enqueue_reserved(command, permit)
+    }
+
+    fn enqueue_reserved(
+        &self,
+        command: StoreCommand,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> std::result::Result<(), StoreAdmissionError> {
+        if !self.inner.available.load(Ordering::Acquire)
+            || (!self.inner.accepting.load(Ordering::Acquire)
+                && !matches!(&command, StoreCommand::Shutdown { .. }))
+        {
+            return Err(StoreAdmissionError::Disconnected);
+        }
+        match self.inner.tx.try_send(StoreEnvelope {
+            command,
+            _permit: permit,
+        }) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(StoreAdmissionError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(StoreAdmissionError::Disconnected),
+        }
+    }
+
+    async fn shutdown_until(&self, deadline: tokio::time::Instant) -> bool {
+        self.inner.accepting.store(false, Ordering::Release);
+        if !self.inner.available.load(Ordering::Acquire) {
+            return false;
+        }
+        let response;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            match self.inner.slots.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    let (reply, wait) = tokio::sync::oneshot::channel();
+                    match self.inner.tx.try_send(StoreEnvelope {
+                        command: StoreCommand::Shutdown { reply },
+                        _permit: permit,
+                    }) {
+                        Ok(()) => {
+                            response = wait;
+                            break;
+                        }
+                        Err(TrySendError::Full(envelope)) => drop(envelope),
+                        Err(TrySendError::Disconnected(_)) => {
+                            self.join_if_finished();
+                            return false;
+                        }
+                    }
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        if !matches!(
+            tokio::time::timeout_at(deadline, response).await,
+            Ok(Ok(()))
+        ) {
+            self.join_if_finished();
+            return false;
+        }
+        let done = self
+            .inner
+            .done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(done) = done else {
+            self.join_if_finished();
+            return false;
+        };
+        if !matches!(tokio::time::timeout_at(deadline, done).await, Ok(Ok(()))) {
+            self.join_if_finished();
+            return false;
+        }
+        while !self.worker_finished() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.join_if_finished()
+    }
+
+    fn worker_finished(&self) -> bool {
+        self.inner
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+    }
+
+    fn join_if_finished(&self) -> bool {
+        let mut worker = self
+            .inner
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(handle) = worker.as_ref() else {
+            return true;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        worker
+            .take()
+            .expect("worker handle checked above")
+            .join()
+            .is_ok()
+    }
+}
+
+struct WriterDone(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for WriterDone {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.send(());
+        }
+    }
+}
+
+fn store_writer_loop(rx: Receiver<StoreEnvelope>, done: tokio::sync::oneshot::Sender<()>) {
+    let _done = WriterDone(Some(done));
+    let mut path: Option<PathBuf> = None;
+    let mut store: Option<crate::store::MessageStore> = None;
+    while let Ok(envelope) = rx.recv() {
+        let StoreEnvelope { command, _permit } = envelope;
+        let command = match command {
+            StoreCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
+            }
+            command => command,
+        };
+        #[cfg(test)]
+        if matches!(&command, StoreCommand::PanicForTest) {
+            panic!("injected writer panic");
+        }
+        let (session, stamp) = match &command {
+            StoreCommand::Hydrate { session, stamp, .. }
+            | StoreCommand::Snapshot { session, stamp, .. }
+            | StoreCommand::Delete { session, stamp, .. }
+            | StoreCommand::Outgoing { session, stamp, .. } => (session, stamp),
+            StoreCommand::Shutdown { .. } => unreachable!("shutdown is handled above"),
+            #[cfg(test)]
+            StoreCommand::PanicForTest => unreachable!(),
+        };
+        if !stamp.matches(session) {
+            reply_store_error(command, "Phiên đăng nhập đã hết hiệu lực".into());
+            continue;
+        }
+        if !session.is_active() || session.account_key().is_empty() {
+            reply_store_error(command, "Phiên đăng nhập đã hết hiệu lực".into());
+            continue;
+        }
+        let current_path = session.history_path();
+        if path.as_ref() != Some(&current_path) || store.is_none() {
+            store = crate::store::MessageStore::open(&current_path).ok();
+            path = Some(current_path);
+        }
+        if let Some(store) = store.as_mut() {
+            if let Err(error) = execute_store_command(store, command) {
+                logger::log_error("tui::history_writer", &error);
+            }
+        } else {
+            let error = "Không thể mở lịch sử cục bộ".to_owned();
+            reply_store_error(command, error.clone());
+            logger::log_error("tui::history_writer", &error);
+        }
+    }
+}
+
+fn reply_store_error(command: StoreCommand, error: String) {
+    match command {
+        StoreCommand::Hydrate { completion, .. } => {
+            let _ = completion.send(BgEvent::ActionFailed(error));
+        }
+        StoreCommand::Delete { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        StoreCommand::Outgoing { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        StoreCommand::Snapshot { completion, .. } => {
+            let _ = completion.send(BgEvent::StoreFailed(error));
+        }
+        StoreCommand::Shutdown { .. } => {}
+        #[cfg(test)]
+        StoreCommand::PanicForTest => {}
+    }
+}
+
+fn execute_store_command(
+    store: &mut crate::store::MessageStore,
+    command: StoreCommand,
+) -> std::result::Result<(), String> {
+    match command {
+        StoreCommand::Hydrate {
+            mut threads,
+            completion,
+            ..
+        } => {
+            let result = store
+                .hydrate_threads(&mut threads, 200)
+                .and_then(|_| store.filter_deleted(&mut threads));
+            match result {
+                Ok(_) => {
+                    let _ = completion.send(BgEvent::Hydrated(threads));
+                }
+                Err(error) => {
+                    let _ = completion.send(BgEvent::ActionFailed(error.to_string()));
+                }
+            }
+        }
+        StoreCommand::Snapshot {
+            session,
+            mut threads,
+            completion,
+            ..
+        } => {
+            let result = store
+                .filter_deleted(&mut threads)
+                .and_then(|_| crate::store::persist_local_threads(store, &threads).map(|_| ()))
+                .map_err(|error| error.to_string())
+                .and_then(|_| write_threads_cache(&session, &threads));
+            match result {
+                Ok(()) => {
+                    let _ = completion.send(BgEvent::StoreSaved);
+                }
+                Err(error) => {
+                    let _ = completion.send(BgEvent::StoreFailed(error));
+                }
+            }
+        }
+        StoreCommand::Delete {
+            session,
+            thread_id,
+            message,
+            mut threads,
+            reply,
+            ..
+        } => {
+            let result = (|| -> Result<()> {
+                persist_acknowledged_delete(store, &thread_id, &message)?;
+                store.filter_deleted(&mut threads)?;
+                crate::store::persist_local_threads(store, &threads)?;
+                write_threads_cache(&session, &threads).map_err(anyhow::Error::msg)?;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = reply.send(Err(message.clone()));
+                    return Err(message);
+                }
+            }
+        }
+        StoreCommand::Outgoing {
+            mut thread, reply, ..
+        } => {
+            let result = store
+                .filter_deleted(std::slice::from_mut(&mut *thread))
+                .and_then(|_| {
+                    crate::store::persist_threads(store, std::slice::from_ref(&*thread)).map(|_| ())
+                })
+                .map_err(|error| error.to_string());
+            match result {
+                Ok(()) => {
+                    let _ = reply.send(Ok(()));
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error.clone()));
+                    return Err(error);
+                }
+            }
+        }
+        StoreCommand::Shutdown { .. } => unreachable!("shutdown is handled by the actor loop"),
+        #[cfg(test)]
+        StoreCommand::PanicForTest => unreachable!("test panic is handled by the actor loop"),
+    }
+    Ok(())
+}
+
+fn write_threads_cache(session: &Session, threads: &[Thread]) -> std::result::Result<(), String> {
+    let mut slim = threads.to_vec();
+    for thread in &mut slim {
+        let skip = thread
+            .messages
+            .len()
+            .saturating_sub(crate::store::MessageStore::PRELOAD_MSGS);
+        thread.messages.drain(..skip);
+    }
+    let bytes = serde_json::to_vec(&slim).map_err(|e| e.to_string())?;
+    crate::storage::atomic_write(&session.cache_path(), &bytes).map_err(|e| e.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn deliver_outgoing(
+    session: Session,
+    thread_id: String,
+    thread: Thread,
+    message: ChatMessage,
+    writer: StoreWriter,
+    tx: BgSender,
+    _active: crate::outgoing::Active,
+    _critical: CriticalTask,
+) {
+    let client_message_id = message.client_message_id.clone();
+    let (reply_tx, persisted) = tokio::sync::oneshot::channel();
+    let command = StoreCommand::Outgoing {
+        session: session.clone(),
+        stamp: RuntimeStamp::for_session(&session),
+        thread: Box::new(thread),
+        reply: reply_tx,
+    };
+    let admitted = writer.try_send(command).map_err(|error| match error {
+        StoreAdmissionError::Full => "Hàng đợi lưu lịch sử đang đầy; tin chưa được gửi".to_owned(),
+        StoreAdmissionError::Disconnected => "Bộ lưu lịch sử đã dừng; tin chưa được gửi".to_owned(),
+    });
+    let persisted = match admitted {
+        Ok(()) => persisted
+            .await
+            .unwrap_or_else(|_| Err("Bộ lưu lịch sử đã dừng".into())),
+        Err(error) => Err(error),
+    };
+    let outcome = if let Err(error) = persisted {
+        SendDisposition::NotSent(error)
+    } else if !session.is_active() {
+        SendDisposition::NotSent("Phiên đăng nhập đã hết hiệu lực".into())
+    } else {
+        match crate::outgoing::send(&session, &thread_id, &message).await {
+            Ok(sent) if sent.delivery == crate::message_model::DeliveryState::ServerAccepted => {
+                SendDisposition::Accepted(Box::new(sent))
+            }
+            Ok(_) => SendDisposition::Unknown(
+                "Máy chủ chưa trả mã xác nhận; hãy kiểm tra hội thoại trước khi gửi lại".into(),
+            ),
+            Err(error) => {
+                let text = crate::outgoing::failure_message(&error);
+                match crate::outgoing::send_failure_kind(&error) {
+                    crate::outgoing::SendFailureKind::ExplicitlyRejected => {
+                        SendDisposition::Rejected(text)
+                    }
+                    crate::outgoing::SendFailureKind::Unknown => SendDisposition::Unknown(text),
+                }
+            }
+        }
+    };
+    let _ = tx.send(BgEvent::SendOutcome {
+        thread_id,
+        client_message_id,
+        outcome,
+    });
 }
 
 #[derive(Clone)]
@@ -227,7 +774,6 @@ pub struct TuiApp<'a> {
     pub focus: Focus,
     pub status: String,
     pub should_quit: bool,
-    pub store: Option<crate::store::MessageStore>,
     pub poll_state: chat::PollState,
     filtered: Vec<usize>,
     filter: FilterTab,
@@ -248,19 +794,33 @@ pub struct TuiApp<'a> {
     prompt: Option<PromptState>,
     confirm: Option<ConfirmAction>,
     poll_inflight: bool,
-    bg_rx: Receiver<BgEvent>,
-    bg_tx: Sender<BgEvent>,
+    delete_inflight: bool,
+    critical_inflight: Arc<AtomicUsize>,
+    bg_rx: Receiver<BgEnvelope>,
+    bg_tx: Sender<BgEnvelope>,
+    writer: StoreWriter,
+    /// Latest complete snapshot retained for retry when the bounded writer queue is full.
+    pending_snapshot: Option<(Session, RuntimeStamp, Vec<Thread>)>,
 }
 
 impl<'a> TuiApp<'a> {
-    pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
+    pub fn new(session: &'a mut Session, threads: Vec<Thread>) -> Self {
         session.hidden.enable();
-        let store = crate::store::MessageStore::open(session.history_path()).ok();
-        if let Some(ref st) = store {
-            let _ = st.hydrate_threads(&mut threads, 200);
-        }
-
         let (tx, rx) = channel();
+        let writer = StoreWriter::new();
+        let hydrate_session = (*session).clone();
+        let hydrate_queued = hydrate_session.account_key().is_empty()
+            || writer
+                .try_send(StoreCommand::Hydrate {
+                    session: hydrate_session.clone(),
+                    stamp: RuntimeStamp::for_session(&hydrate_session),
+                    threads: threads.clone(),
+                    completion: BgSender {
+                        tx: tx.clone(),
+                        stamp: RuntimeStamp::for_session(&hydrate_session),
+                    },
+                })
+                .is_ok();
 
         let mut app = Self {
             session,
@@ -269,9 +829,12 @@ impl<'a> TuiApp<'a> {
             selected_thread: 0,
             input_text: String::new(),
             focus: Focus::Threads,
-            status: "San sang".into(),
+            status: if hydrate_queued {
+                "San sang".into()
+            } else {
+                "Không thể khởi tạo lưu trữ lịch sử".into()
+            },
             should_quit: false,
-            store,
             poll_state: chat::PollState::default(),
             filtered: Vec::new(),
             filter: FilterTab::All,
@@ -292,8 +855,12 @@ impl<'a> TuiApp<'a> {
             prompt: None,
             confirm: None,
             poll_inflight: false,
+            delete_inflight: false,
+            critical_inflight: Arc::new(AtomicUsize::new(0)),
             bg_rx: rx,
             bg_tx: tx,
+            writer,
+            pending_snapshot: None,
         };
         app.rebuild_filter();
         app.ensure_msg_selection();
@@ -302,6 +869,40 @@ impl<'a> TuiApp<'a> {
 
     fn session_clone(&self) -> Session {
         (*self.session).clone()
+    }
+
+    fn bg_sender(&self) -> BgSender {
+        BgSender {
+            tx: self.bg_tx.clone(),
+            stamp: RuntimeStamp::for_session(self.session),
+        }
+    }
+
+    fn critical_task(&self) -> CriticalTask {
+        CriticalTask::start(&self.critical_inflight)
+    }
+
+    async fn shutdown_writer(&mut self) -> bool {
+        let deadline = tokio::time::Instant::now() + WRITER_SHUTDOWN_BUDGET;
+        while self.critical_inflight.load(Ordering::Acquire) > 0
+            && tokio::time::Instant::now() < deadline
+        {
+            self.check_background_events();
+            self.flush_pending_snapshot();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        self.check_background_events();
+        while self.pending_snapshot.is_some() && tokio::time::Instant::now() < deadline {
+            self.flush_pending_snapshot();
+            if self.pending_snapshot.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let snapshots_admitted = self.pending_snapshot.is_none();
+        let writer_stopped = self.writer.shutdown_until(deadline).await;
+        let critical_finished = self.critical_inflight.load(Ordering::Acquire) == 0;
+        self.session.revoke_runtime();
+        snapshots_admitted && writer_stopped && critical_finished
     }
 
     fn current_thread(&self) -> Option<&Thread> {
@@ -611,44 +1212,57 @@ impl<'a> TuiApp<'a> {
     }
 
     fn persist_snapshot(&mut self, threads: &[Thread]) {
-        if let Some(ref mut st) = self.store {
-            let _ = crate::store::persist_threads(st, threads);
-        } else if let Ok(mut st) = crate::store::MessageStore::open(self.session.history_path()) {
-            let _ = crate::store::persist_threads(&mut st, threads);
-            self.store = Some(st);
+        let session = self.session_clone();
+        let stamp = RuntimeStamp::for_session(&session);
+        let snapshot = threads.to_vec();
+        let command = StoreCommand::Snapshot {
+            session: session.clone(),
+            stamp: stamp.clone(),
+            threads: snapshot.clone(),
+            completion: BgSender {
+                tx: self.bg_tx.clone(),
+                stamp: stamp.clone(),
+            },
+        };
+        match self.writer.try_send(command) {
+            Ok(()) => {}
+            Err(StoreAdmissionError::Full) => {
+                self.pending_snapshot = Some((session, stamp, snapshot));
+                self.status = "Đang chờ lưu lịch sử cục bộ".into();
+            }
+            Err(StoreAdmissionError::Disconnected) => {
+                self.status = "Không thể lưu lịch sử cục bộ".into();
+            }
         }
     }
 
-    fn persist_current_snapshot(&mut self) {
-        let Some(t) = self.threads.get(self.selected_thread) else {
-            return;
-        };
-        let snapshot = vec![t.clone()];
-        self.persist_snapshot(&snapshot);
-    }
-
-    fn persist_thread_by_id(&mut self, thread_id: &str) {
-        let Some(t) = self.threads.iter().find(|t| t.id == thread_id) else {
-            return;
-        };
-        let snapshot = vec![t.clone()];
-        self.persist_snapshot(&snapshot);
-    }
-
-    fn persist_async(&self) {
+    fn persist_async(&mut self) {
         let snapshot = self.threads.clone();
-        let account = self.session.clone();
-        tokio::spawn(async move {
-            let _ = tokio::task::spawn_blocking(move || {
-                if !account.is_active() {
-                    return;
-                }
-                if let Ok(mut st) = crate::store::MessageStore::open(account.history_path()) {
-                    let _ = crate::store::persist_threads(&mut st, &snapshot);
-                }
-            })
-            .await;
-        });
+        self.persist_snapshot(&snapshot);
+    }
+
+    fn flush_pending_snapshot(&mut self) {
+        let Some((session, stamp, threads)) = self.pending_snapshot.take() else {
+            return;
+        };
+        let command = StoreCommand::Snapshot {
+            session: session.clone(),
+            stamp: stamp.clone(),
+            threads: threads.clone(),
+            completion: BgSender {
+                tx: self.bg_tx.clone(),
+                stamp: stamp.clone(),
+            },
+        };
+        match self.writer.try_send(command) {
+            Ok(()) => {}
+            Err(StoreAdmissionError::Full) => {
+                self.pending_snapshot = Some((session, stamp, threads))
+            }
+            Err(StoreAdmissionError::Disconnected) => {
+                self.status = "Không thể lưu lịch sử cục bộ".into();
+            }
+        }
     }
 
     fn spawn_poll(&mut self) {
@@ -659,28 +1273,11 @@ impl<'a> TuiApp<'a> {
         let session = self.session_clone();
         let mut state = self.poll_state.clone();
         let mut threads = self.threads.clone();
-        let history_path = self.session.history_path();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         tokio::spawn(async move {
-            match chat::poll_new_messages(&session, &mut state, &mut threads).await {
+            match chat::receive_new_messages(&session, &mut state, &mut threads).await {
                 Ok(()) => {
-                    let filtered = tokio::task::spawn_blocking(move || {
-                        filter_deleted_batch(history_path, threads)
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                    match filtered {
-                        Ok(threads) => {
-                            let _ = tx.send(BgEvent::PollDone { threads, state });
-                        }
-                        Err(error) => {
-                            logger::log_error("tui::poll_filter_deleted", &error);
-                            let _ = tx.send(BgEvent::PollFailed(
-                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
-                            ));
-                        }
-                    }
+                    let _ = tx.send(BgEvent::PollDone { threads, state });
                 }
                 Err(e) => {
                     logger::log_error("tui::poll_new_messages", &e.to_string());
@@ -693,8 +1290,7 @@ impl<'a> TuiApp<'a> {
     fn spawn_refresh(&mut self) {
         self.status = "Dang lam moi...".into();
         let session = self.session_clone();
-        let history_path = self.session.history_path();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         tokio::spawn(async move {
             let result = async {
                 let mut list = chat::get_friends(&session).await?;
@@ -708,23 +1304,7 @@ impl<'a> TuiApp<'a> {
             .await;
             match result {
                 Ok(list) => {
-                    let filtered = tokio::task::spawn_blocking(move || {
-                        filter_deleted_batch(history_path, list)
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                    match filtered {
-                        Ok(list) => {
-                            let _ = tx.send(BgEvent::ThreadsRefreshed(list));
-                        }
-                        Err(error) => {
-                            logger::log_error("tui::refresh_filter_deleted", &error);
-                            let _ = tx.send(BgEvent::ActionFailed(
-                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
-                            ));
-                        }
-                    }
+                    let _ = tx.send(BgEvent::ThreadsRefreshed(list));
                 }
                 Err(e) => {
                     logger::log_error("tui::refresh::get_friends", &e.to_string());
@@ -748,35 +1328,16 @@ impl<'a> TuiApp<'a> {
         }
         let group_id = t.id.clone();
         let thread = t.clone();
-        let history_path = self.session.history_path();
         self.status = "Dang tai lich su nhom...".into();
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         let gid = group_id.clone();
         tokio::spawn(async move {
             match chat::get_group_history(&session, &gid, 50).await {
                 Ok(resp) => {
                     let mut loaded = thread;
                     chat::merge_group_history(&mut loaded, &resp);
-                    let filtered = tokio::task::spawn_blocking(move || {
-                        filter_deleted_batch(history_path, vec![loaded])
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result.map_err(|error| error.to_string()));
-                    match filtered {
-                        Ok(mut threads) => {
-                            if let Some(thread) = threads.pop() {
-                                let _ = tx.send(BgEvent::HistoryLoaded { thread });
-                            }
-                        }
-                        Err(error) => {
-                            logger::log_error("tui::history_filter_deleted", &error);
-                            let _ = tx.send(BgEvent::ActionFailed(
-                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
-                            ));
-                        }
-                    }
+                    let _ = tx.send(BgEvent::HistoryLoaded { thread: loaded });
                 }
                 Err(e) => {
                     logger::log_error("tui::get_group_history", &e.to_string());
@@ -788,7 +1349,7 @@ impl<'a> TuiApp<'a> {
 
     fn spawn_hidden_refresh(&self) {
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         tokio::spawn(async move {
             match crate::hidden_chat::restore_cached(&session).await {
                 Ok(Some(_)) => {
@@ -819,7 +1380,7 @@ impl<'a> TuiApp<'a> {
         }
         self.sticker.loading = true;
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         tokio::spawn(async move {
             match chat::fetch_sticker_store_packs(&session).await {
                 Ok(packs) => {
@@ -859,7 +1420,7 @@ impl<'a> TuiApp<'a> {
             self.sticker.loading = true;
             self.sticker.loaded_name = name.clone();
             let session = self.session_clone();
-            let tx = self.bg_tx.clone();
+            let tx = self.bg_sender();
             tokio::spawn(async move {
                 match chat::fetch_sticker_pack_items(&session, cate_id, &name).await {
                     Ok(items) => {
@@ -906,65 +1467,50 @@ impl<'a> TuiApp<'a> {
         let to_id = t.id.clone();
         let is_group = t.is_group;
 
-        let now = crate::ui::clock();
-        let ts = unix_now_ms();
-        let client_id = chat::next_client_message_id();
-        let msg = ChatMessage {
-            id: format!("local_{client_id}"),
-            client_message_id: client_id.to_string(),
-            sender: "Toi".into(),
-            text: String::new(),
-            time: now.clone(),
-            is_outgoing: true,
-            ts,
-            sticker_id: Some(item.sticker_id),
-            sticker_cate_id: Some(item.cate_id),
-            sticker_type: Some(item.sticker_type),
-            ..Default::default()
-        };
+        let mut msg = crate::outgoing::pending(
+            String::new(),
+            is_group,
+            crate::outgoing::Payload::Sticker {
+                id: item.sticker_id,
+                category: item.cate_id,
+                kind: item.sticker_type,
+            },
+        );
+        msg.sticker_id = Some(item.sticker_id);
+        msg.sticker_cate_id = Some(item.cate_id);
+        msg.sticker_type = Some(item.sticker_type);
         if let Some(t) = self.threads.get_mut(self.selected_thread) {
-            t.messages.push(msg);
+            t.messages.push(msg.clone());
             t.preview = "[Nhan dan]".into();
-            t.time = now;
+            t.time = msg.time.clone();
         }
+        let thread_snapshot = self.threads[self.selected_thread].clone();
         self.selected_msg = None;
         self.follow_tail = true;
-        self.persist_current_snapshot();
-        chat::save_threads_cache(self.session, &self.threads);
-
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
-            match chat::send_sticker_with_client_id(
-                &session,
-                &to_id,
-                item.sticker_id,
-                item.cate_id,
-                item.sticker_type,
-                is_group,
-                client_id,
-            )
-            .await
-            {
-                Ok(_) => {
-                    let _ = tx.send(BgEvent::StickerSent { thread_id: to_id });
-                }
-                Err(e) => {
-                    logger::log_error("tui::send_sticker", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi gui nhan dan: {e}")));
-                }
-            }
-        });
+        let tx = self.bg_sender();
+        let writer = self.writer.clone();
+        let Some(active) = crate::outgoing::Active::start(&msg.client_message_id) else {
+            self.status = "Tin nhắn này đang được gửi".into();
+            return;
+        };
+        let critical = self.critical_task();
+        tokio::spawn(deliver_outgoing(
+            session,
+            to_id,
+            thread_snapshot,
+            msg,
+            writer,
+            tx,
+            active,
+            critical,
+        ));
         self.status = "Da gui nhan dan".into();
     }
 
     fn send_attachment(&mut self, path: PathBuf) {
         if !self.selected_thread_allowed() {
             self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
-            return;
-        }
-        if !path.is_file() {
-            self.status = format!("Khong tim thay tep: {}", path.display());
             return;
         }
         let Some(t) = self.threads.get(self.selected_thread) else {
@@ -974,24 +1520,39 @@ impl<'a> TuiApp<'a> {
         let is_group = t.is_group;
         let caption = self.input_text.trim().to_string();
         self.input_text.clear();
-        self.status = format!("Dang gui tep {}...", path.display());
-
+        let mut pending = crate::outgoing::pending(
+            caption.clone(),
+            is_group,
+            crate::outgoing::Payload::Attachment {
+                path: path.clone(),
+                caption,
+                stamp: None,
+                hd_source: None,
+            },
+        );
+        pending.sender = "Toi".into();
+        pending.kind = crate::message_model::MessageKind::File;
+        if let Some(thread) = self.threads.get_mut(self.selected_thread) {
+            thread.messages.push(pending.clone());
+            thread.preview = if pending.text.is_empty() {
+                "[Tep dinh kem]".into()
+            } else {
+                pending.text.clone()
+            };
+            thread.time = pending.time.clone();
+        }
+        let thread = self.threads[self.selected_thread].clone();
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
-            match chat::send_attachment(&session, &to_id, is_group, &path, &caption).await {
-                Ok((_resp, msg)) => {
-                    let _ = tx.send(BgEvent::AttachmentSent {
-                        thread_id: to_id,
-                        msg,
-                    });
-                }
-                Err(e) => {
-                    logger::log_error("tui::send_attachment", &e.to_string());
-                    let _ = tx.send(BgEvent::ActionFailed(format!("Loi gui tep: {e}")));
-                }
-            }
-        });
+        let tx = self.bg_sender();
+        let writer = self.writer.clone();
+        let Some(active) = crate::outgoing::Active::start(&pending.client_message_id) else {
+            self.status = "Tin nhắn này đang được gửi".into();
+            return;
+        };
+        let critical = self.critical_task();
+        tokio::spawn(deliver_outgoing(
+            session, to_id, thread, pending, writer, tx, active, critical,
+        ));
     }
 
     fn submit_prompt(&mut self, kind: PromptKind, text: String) {
@@ -1007,7 +1568,7 @@ impl<'a> TuiApp<'a> {
             PromptKind::HiddenPin => {
                 let pin = zeroize::Zeroizing::new(text);
                 let session = self.session_clone();
-                let tx = self.bg_tx.clone();
+                let tx = self.bg_sender();
                 tokio::spawn(async move {
                     let result = crate::hidden_chat::execute(
                         &session,
@@ -1041,72 +1602,122 @@ impl<'a> TuiApp<'a> {
 
         self.input_text.clear();
         let reply = self.reply_target.take();
-        let now = crate::ui::clock();
-        let ts = unix_now_ms();
-        let client_id = chat::next_client_message_id();
-        let msg = ChatMessage {
-            id: format!("local_{client_id}"),
-            client_message_id: client_id.to_string(),
-            sender: "Toi".into(),
-            text: text.clone(),
-            time: now.clone(),
-            is_outgoing: true,
-            ts,
-            reply_to_id: reply.as_ref().map(|m| m.id.clone()),
-            reply_to_sender: reply.as_ref().map(|m| m.sender.clone()),
-            reply_to_text: reply.as_ref().map(|m| m.text.clone()),
-            ..Default::default()
-        };
+        let payload = reply
+            .clone()
+            .map(|quoted| crate::outgoing::Payload::Quote(Box::new(quoted)))
+            .unwrap_or(crate::outgoing::Payload::Text);
+        let mut msg = crate::outgoing::pending(text.clone(), is_group, payload);
+        msg.reply_to_id = reply.as_ref().map(|quoted| quoted.id.clone());
+        msg.reply_to_sender = reply.as_ref().map(|quoted| quoted.sender.clone());
+        msg.reply_to_text = reply.as_ref().map(|quoted| quoted.text.clone());
         if let Some(t) = self.threads.get_mut(self.selected_thread) {
-            t.messages.push(msg);
+            t.messages.push(msg.clone());
             t.preview = text.clone();
-            t.time = now;
+            t.time = msg.time.clone();
         }
+        let thread_snapshot = self.threads[self.selected_thread].clone();
         self.selected_msg = None;
         self.follow_tail = true;
-        self.persist_current_snapshot();
-        chat::save_threads_cache(self.session, &self.threads);
         self.bump_thread(&to_id);
 
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
-            let result = match (&reply, is_group) {
-                (Some(q), true) => chat::send_quote_message_with_client_id(
-                    &session, &to_id, &text, q, true, client_id,
-                )
-                .await
-                .map(|_| ()),
-                (Some(q), false) => chat::send_quote_message_with_client_id(
-                    &session, &to_id, &text, q, false, client_id,
-                )
-                .await
-                .map(|_| ()),
-                (None, true) => {
-                    chat::send_group_message_with_client_id(&session, &to_id, &text, client_id)
-                        .await
-                        .map(|_| ())
-                }
-                (None, false) => {
-                    chat::send_message_with_client_id(&session, &to_id, &text, client_id)
-                        .await
-                        .map(|_| ())
-                }
-            };
-            match result {
-                Ok(()) => {
-                    let _ = tx.send(BgEvent::MessageSent {
-                        thread_id: to_id,
-                        text,
-                    });
-                }
-                Err(e) => {
-                    logger::log_error("tui::send_message", &e.to_string());
-                    let _ = tx.send(BgEvent::SendFailed(e.to_string()));
-                }
-            }
-        });
+        let tx = self.bg_sender();
+        let writer = self.writer.clone();
+        let Some(active) = crate::outgoing::Active::start(&msg.client_message_id) else {
+            self.status = "Tin nhắn này đang được gửi".into();
+            return;
+        };
+        let critical = self.critical_task();
+        tokio::spawn(deliver_outgoing(
+            session,
+            to_id,
+            thread_snapshot,
+            msg,
+            writer,
+            tx,
+            active,
+            critical,
+        ));
         self.status = "Dang gui tin nhan...".into();
+    }
+
+    fn confirm_retry_selected(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
+        let (Some(message_idx), Some(thread)) =
+            (self.selected_msg, self.threads.get(self.selected_thread))
+        else {
+            return;
+        };
+        let Some(message) = thread.messages.get(message_idx) else {
+            return;
+        };
+        if message.outgoing_job.is_none()
+            || !matches!(
+                message.delivery,
+                crate::message_model::DeliveryState::Failed
+                    | crate::message_model::DeliveryState::DeliveryUnknown
+            )
+        {
+            self.status = "Tin nhắn này chưa sẵn sàng để gửi lại".into();
+            return;
+        }
+        self.confirm = Some(ConfirmAction {
+            question: "Kiểm tra hội thoại trước khi gửi lại cùng mã tin nhắn?".into(),
+            detail: message.text.chars().take(60).collect(),
+            kind: ConfirmKind::RetryMessage,
+            thread_id: thread.id.clone(),
+            msg_id: message.id.clone(),
+        });
+    }
+
+    fn retry_message(&mut self, thread_id: &str, msg_id: &str) {
+        let Some(thread_idx) = self
+            .threads
+            .iter()
+            .position(|thread| thread.id == thread_id)
+        else {
+            return;
+        };
+        let Some(message_idx) = self.threads[thread_idx]
+            .messages
+            .iter()
+            .position(|message| message.id == msg_id)
+        else {
+            return;
+        };
+        let mut message = self.threads[thread_idx].messages[message_idx].clone();
+        let Some(job) = message.outgoing_job.as_mut() else {
+            self.status = "Thiếu dữ liệu gửi lại".into();
+            return;
+        };
+        if crate::outgoing::is_active(&message.client_message_id) {
+            self.status = "Tin nhắn này đang được gửi".into();
+            return;
+        }
+        job.attempt = job.attempt.saturating_add(1);
+        job.error.clear();
+        message.delivery = crate::message_model::DeliveryState::Pending;
+        self.threads[thread_idx].messages[message_idx] = message.clone();
+        let thread = self.threads[thread_idx].clone();
+        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+            self.status = "Tin nhắn này đang được gửi".into();
+            return;
+        };
+        self.status = "Đang gửi lại cùng mã tin nhắn...".into();
+        let critical = self.critical_task();
+        tokio::spawn(deliver_outgoing(
+            self.session_clone(),
+            thread_id.to_owned(),
+            thread,
+            message,
+            self.writer.clone(),
+            self.bg_sender(),
+            active,
+            critical,
+        ));
     }
 
     fn react_quick(&mut self, key: char) {
@@ -1147,7 +1758,7 @@ impl<'a> TuiApp<'a> {
             }
         }
         let session = self.session_clone();
-        let tx = self.bg_tx.clone();
+        let tx = self.bg_sender();
         let msg_id = msg.id.clone();
         tokio::spawn(async move {
             match chat::send_reaction(&session, &to_id, is_group, &msg, emoji).await {
@@ -1200,7 +1811,7 @@ impl<'a> TuiApp<'a> {
         let Some(m) = t.messages.get(mi) else {
             return;
         };
-        if m.id.is_empty() || m.id.starts_with("local_") {
+        if m.id.is_empty() || m.id.starts_with("local_") || m.id.starts_with("out_") {
             self.status = "Tin nhan chua dong bo, chua the xoa tren server".into();
             return;
         }
@@ -1243,10 +1854,12 @@ impl<'a> TuiApp<'a> {
                     self.status = format!("Không thể xóa phiên: {e}");
                     return;
                 }
-                self.store = None;
                 self.session.hidden.lock();
                 self.clear_private_draft();
                 self.session.logout();
+                self.pending_snapshot = None;
+                self.poll_inflight = false;
+                self.delete_inflight = false;
                 self.threads.clear();
                 self.filtered.clear();
                 self.list_state.select(None);
@@ -1256,6 +1869,10 @@ impl<'a> TuiApp<'a> {
                 self.status = "Da dang xuat. Bam 'q' de thoat.".into();
             }
             ConfirmKind::DeleteMessage => {
+                if self.delete_inflight {
+                    self.status = "Đang lưu một thao tác xóa khác".into();
+                    return;
+                }
                 let thread_id = action.thread_id;
                 let msg_id = action.msg_id;
                 let Some(t) = self.threads.iter().find(|t| t.id == thread_id) else {
@@ -1266,21 +1883,57 @@ impl<'a> TuiApp<'a> {
                 };
                 let is_group = t.is_group;
                 let session = self.session_clone();
-                let history_path = self.session.history_path();
-                let tx = self.bg_tx.clone();
-                let db_thread_id = thread_id.clone();
+                let tx = self.bg_sender();
                 let db_msg = msg.clone();
                 let deleted = DeletedIdentity::from_message(&msg);
+                let writer = self.writer.clone();
+                let threads = self.threads.clone();
+                let permit = match self.writer.try_reserve_delete() {
+                    Ok(permit) => permit,
+                    Err(StoreAdmissionError::Full) => {
+                        self.status =
+                            "Hàng đợi lưu lịch sử đang đầy; thao tác xóa chưa được gửi".into();
+                        return;
+                    }
+                    Err(StoreAdmissionError::Disconnected) => {
+                        self.status = "Bộ lưu lịch sử đã dừng; thao tác xóa chưa được gửi".into();
+                        return;
+                    }
+                };
+                // Acquire capacity before the API call so an ACK can always enqueue its tombstone.
+                self.delete_inflight = true;
+                let critical = self.critical_task();
                 tokio::spawn(async move {
+                    let _critical = critical;
                     match chat::delete_message_for_me(&session, &thread_id, is_group, &msg).await {
                         Ok(_) => {
-                            let db_result = tokio::task::spawn_blocking(move || {
-                                let mut store = crate::store::MessageStore::open(history_path)?;
-                                persist_acknowledged_delete(&mut store, &db_thread_id, &db_msg)
-                            })
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
+                            let (reply, wait) = tokio::sync::oneshot::channel();
+                            let command = StoreCommand::Delete {
+                                session: session.clone(),
+                                stamp: RuntimeStamp::for_session(&session),
+                                thread_id: thread_id.clone(),
+                                message: Box::new(db_msg),
+                                threads,
+                                reply,
+                            };
+                            let admitted = writer.enqueue_reserved(command, permit).map_err(
+                                |error| match error {
+                                    StoreAdmissionError::Full => {
+                                        "Hàng đợi lưu lịch sử đầy; dấu xóa cục bộ chưa được lưu"
+                                            .to_owned()
+                                    }
+                                    StoreAdmissionError::Disconnected => {
+                                        "Bộ lưu lịch sử đã dừng; dấu xóa cục bộ chưa được lưu"
+                                            .to_owned()
+                                    }
+                                },
+                            );
+                            let db_result = match admitted {
+                                Ok(()) => wait
+                                    .await
+                                    .unwrap_or_else(|_| Err("Bộ lưu lịch sử đã dừng".into())),
+                                Err(error) => Err(error),
+                            };
                             let _ = tx.send(BgEvent::DeleteDone {
                                 thread_id,
                                 deleted,
@@ -1290,12 +1943,13 @@ impl<'a> TuiApp<'a> {
                         Err(e) => {
                             logger::log_error("tui::delete_message_for_me", &e.to_string());
                             let _ =
-                                tx.send(BgEvent::ActionFailed(format!("Loi xoa tin nhan: {e}")));
+                                tx.send(BgEvent::DeleteFailed(format!("Loi xoa tin nhan: {e}")));
                         }
                     }
                 });
                 self.status = "Dang xoa tin nhan...".into();
             }
+            ConfirmKind::RetryMessage => self.retry_message(&action.thread_id, &action.msg_id),
         }
     }
 
@@ -1447,7 +2101,7 @@ impl<'a> TuiApp<'a> {
                 let hidden = self.hidden_view();
                 if hidden.unlocked {
                     let session = self.session_clone();
-                    let tx = self.bg_tx.clone();
+                    let tx = self.bg_sender();
                     tokio::spawn(async move {
                         let result = crate::hidden_chat::execute(
                             &session,
@@ -1486,6 +2140,10 @@ impl<'a> TuiApp<'a> {
             KeyCode::Char('R') if self.focus != Focus::Input => {
                 self.spawn_hidden_refresh();
                 self.status = "Đang xác minh trạng thái hội thoại ẩn...".into();
+                return;
+            }
+            KeyCode::Char('y') if self.focus != Focus::Input => {
+                self.confirm_retry_selected();
                 return;
             }
             KeyCode::Char('h') if self.focus != Focus::Input => {
@@ -1701,19 +2359,27 @@ impl<'a> TuiApp<'a> {
             }
         }
         self.rebuild_filter();
-        chat::save_threads_cache(self.session, &self.threads);
         self.persist_async();
     }
 
     fn check_background_events(&mut self) {
-        while let Ok(event) = self.bg_rx.try_recv() {
+        self.flush_pending_snapshot();
+        while let Ok(envelope) = self.bg_rx.try_recv() {
+            if !envelope.stamp.matches(self.session) {
+                continue;
+            }
+            let event = envelope.event;
             match event {
+                BgEvent::Hydrated(threads) => {
+                    self.threads = threads;
+                    self.rebuild_filter();
+                    self.ensure_msg_selection();
+                }
                 BgEvent::PollDone { threads, state } => {
                     self.poll_inflight = false;
                     let changed = self.apply_polled(threads, state);
                     self.status = format!("Cap nhat {}", crate::ui::clock());
                     if changed {
-                        chat::save_threads_cache(self.session, &self.threads);
                         self.persist_async();
                     }
                 }
@@ -1751,8 +2417,7 @@ impl<'a> TuiApp<'a> {
                         count = t.messages.len();
                     }
                     if count > 0 {
-                        self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(self.session, &self.threads);
+                        self.persist_async();
                         self.selected_msg = None;
                         self.follow_tail = true;
                         self.status = format!("Da tai lich su nhom ({count} tin)");
@@ -1760,38 +2425,83 @@ impl<'a> TuiApp<'a> {
                         self.status = "Khong co tin nhan moi tu nhom".into();
                     }
                 }
-                BgEvent::MessageSent { thread_id, text } => {
-                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                        t.preview = text;
-                    }
-                    self.bump_thread(&thread_id);
-                    self.status = "Da gui tin nhan".into();
-                }
-                BgEvent::AttachmentSent { thread_id, msg } => {
-                    let mut appended = false;
-                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                        if !t.messages.iter().any(|m| m.id == msg.id) {
-                            t.messages.push(msg.clone());
-                            appended = true;
-                        }
-                        t.preview = if msg.text.is_empty() {
-                            "[Tep dinh kem]".into()
+                BgEvent::SendOutcome {
+                    thread_id,
+                    client_message_id,
+                    outcome,
+                } => {
+                    let mut accepted = false;
+                    if let Some(message) = self
+                        .threads
+                        .iter_mut()
+                        .find(|thread| thread.id == thread_id)
+                        .and_then(|thread| {
+                            thread
+                                .messages
+                                .iter_mut()
+                                .find(|message| message.client_message_id == client_message_id)
+                        })
+                    {
+                        let echoed = !message.id.is_empty()
+                            && !message.id.starts_with("out_")
+                            && !message.id.starts_with("local_");
+                        if echoed {
+                            message.delivery = message
+                                .delivery
+                                .merge(crate::message_model::DeliveryState::ServerAccepted);
+                            message.outgoing_job = None;
+                            self.status = "Đã được máy chủ xác nhận".into();
+                            accepted = true;
                         } else {
-                            msg.text.clone()
-                        };
-                        t.time = msg.time.clone();
+                            match outcome {
+                                SendDisposition::Accepted(mut sent) => {
+                                    let state = message.delivery.merge(sent.delivery);
+                                    if message.id.starts_with("out_")
+                                        || message.id.starts_with("local_")
+                                    {
+                                        sent.delivery = state;
+                                        *message = *sent;
+                                    } else {
+                                        message.delivery = state;
+                                    }
+                                    message.outgoing_job = None;
+                                    self.status = "Đã được máy chủ xác nhận".into();
+                                    accepted = true;
+                                }
+                                SendDisposition::Rejected(error) => {
+                                    message.delivery = message
+                                        .delivery
+                                        .merge(crate::message_model::DeliveryState::Failed);
+                                    if let Some(job) = message.outgoing_job.as_mut() {
+                                        job.error = error.clone();
+                                    }
+                                    self.status = format!("Máy chủ từ chối gửi: {error}");
+                                }
+                                SendDisposition::Unknown(error) => {
+                                    message.delivery = message.delivery.merge(
+                                        crate::message_model::DeliveryState::DeliveryUnknown,
+                                    );
+                                    if let Some(job) = message.outgoing_job.as_mut() {
+                                        job.error = error.clone();
+                                    }
+                                    self.status = format!("Chưa rõ máy chủ đã nhận tin: {error}");
+                                }
+                                SendDisposition::NotSent(error) => {
+                                    message.delivery = message
+                                        .delivery
+                                        .merge(crate::message_model::DeliveryState::Failed);
+                                    if let Some(job) = message.outgoing_job.as_mut() {
+                                        job.error = error.clone();
+                                    }
+                                    self.status = format!("Chưa gửi được tin: {error}");
+                                }
+                            }
+                        }
                     }
-                    if appended {
+                    if accepted {
                         self.bump_thread(&thread_id);
-                        self.persist_thread_by_id(&thread_id);
-                        chat::save_threads_cache(self.session, &self.threads);
-                        self.follow_tail = true;
-                        self.status = "Da gui tep dinh kem".into();
                     }
-                }
-                BgEvent::StickerSent { thread_id } => {
-                    self.bump_thread(&thread_id);
-                    self.status = "Da gui nhan dan".into();
+                    self.persist_async();
                 }
                 BgEvent::ReactionDone {
                     thread_id,
@@ -1816,22 +2526,27 @@ impl<'a> TuiApp<'a> {
                     deleted,
                     result,
                 } => {
+                    self.delete_inflight = false;
+                    let ids = self.deleted_messages.entry(thread_id.clone()).or_default();
+                    ids.push(deleted.clone());
+                    let deleted_ids = ids.clone();
+                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                        Self::filter_deleted_replays(t, &deleted_ids);
+                    }
+                    self.selected_msg = None;
                     match result {
                         Ok(()) => {
-                            let ids = self.deleted_messages.entry(thread_id.clone()).or_default();
-                            ids.push(deleted.clone());
-                            let deleted_ids = ids.clone();
-                            if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                                Self::filter_deleted_replays(t, &deleted_ids);
-                            }
-                            self.selected_msg = None;
-                            chat::save_threads_cache(self.session, &self.threads);
+                            self.persist_async();
                             self.status = "Đã xóa tin nhắn trên máy chủ và lưu cục bộ".into();
                         }
                         Err(error) => {
                             self.status = format!("Máy chủ đã xác nhận xóa, nhưng chưa lưu được bản xóa cục bộ: {error}");
                         }
                     }
+                }
+                BgEvent::DeleteFailed(error) => {
+                    self.delete_inflight = false;
+                    self.status = error;
                 }
                 BgEvent::HiddenStateChanged(result) => {
                     self.rebuild_filter();
@@ -1848,6 +2563,14 @@ impl<'a> TuiApp<'a> {
                             self.status =
                                 "Không xác minh được hội thoại ẩn; đang chặn hiển thị".into()
                         }
+                    }
+                }
+                BgEvent::StoreFailed(error) => {
+                    self.status = format!("Không lưu được lịch sử cục bộ: {error}");
+                }
+                BgEvent::StoreSaved => {
+                    if self.status == "Đang chờ lưu lịch sử cục bộ" {
+                        self.status = "Đã lưu lịch sử cục bộ".into();
                     }
                 }
                 BgEvent::StickerPacks(packs) => {
@@ -1871,9 +2594,6 @@ impl<'a> TuiApp<'a> {
                         format!("Bo nhan dan: {n} sticker")
                     };
                 }
-                BgEvent::SendFailed(err) => {
-                    self.status = format!("Gui tin nhan that bai: {err}");
-                }
                 BgEvent::ActionFailed(err) => {
                     self.status = err;
                 }
@@ -1895,13 +2615,21 @@ pub async fn run_tui(mut app: TuiApp<'_>) -> Result<()> {
 
     let result = run_loop(&mut terminal, &mut app).await;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    let terminal_restore = (|| -> Result<()> {
+        disable_raw_mode()?;
+        execute!(
+            terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        )?;
+        terminal.show_cursor()?;
+        Ok(())
+    })();
+    let drained = app.shutdown_writer().await;
+    if !drained {
+        eprintln!("TUI đã hết thời gian chờ lưu. Một thao tác gửi hoặc xóa có thể chưa được xác nhận cục bộ; hãy kiểm tra hội thoại trước khi thử lại. Tin chưa xác nhận được giữ ở trạng thái cần kiểm tra và không tự gửi lại.");
+    }
+    terminal_restore?;
     result
 }
 
@@ -2591,22 +3319,12 @@ fn day_label(day: i64) -> String {
     }
 }
 
-fn unix_now_ms() -> i64 {
-    crate::login::unix_now() * 1000
-}
-
 fn persist_acknowledged_delete(
     store: &mut crate::store::MessageStore,
     thread_id: &str,
     message: &ChatMessage,
 ) -> Result<()> {
     store.delete_chat_message(thread_id, message)
-}
-
-fn filter_deleted_batch(path: PathBuf, mut threads: Vec<Thread>) -> Result<Vec<Thread>> {
-    let store = crate::store::MessageStore::open(path)?;
-    store.filter_deleted(&mut threads)?;
-    Ok(threads)
 }
 
 fn open_external_url(url: &str) {
@@ -2682,6 +3400,10 @@ fn render_help(f: &mut Frame, area: Rect) {
     ));
     content.push(help_line("y", "Tra loi tin dang chon"));
     content.push(help_line("d", "Xoa tin nhan (chi phia ban)"));
+    content.push(help_line(
+        "y",
+        "Gửi lại tin thất bại hoặc chưa rõ (giữ nguyên mã)",
+    ));
     content.push(help_line("o", "Mo lien ket cua tin nhan"));
     content.push(Line::raw(""));
     content.push(Line::from(Span::styled(
@@ -3059,6 +3781,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn runtime_stamp_rejects_events_from_revoked_session() {
+        let mut session = crate::session::Session::new(false, false, false).unwrap();
+        let stamp = RuntimeStamp::for_session(&session);
+        assert!(stamp.matches(&session));
+
+        session.logout();
+        assert!(!stamp.matches(&session));
+    }
+
+    #[test]
+    fn history_writer_admission_is_bounded_and_nonblocking() {
+        let (writer, rx) = StoreWriter::channel();
+        let session = crate::session::Session::new(false, false, false).unwrap();
+        let (event_tx, _event_rx) = channel();
+        let snapshot = || {
+            let stamp = RuntimeStamp::for_session(&session);
+            StoreCommand::Snapshot {
+                session: session.clone(),
+                stamp: stamp.clone(),
+                threads: Vec::new(),
+                completion: BgSender {
+                    tx: event_tx.clone(),
+                    stamp,
+                },
+            }
+        };
+
+        // Reserve the final slot for a delete that may be acknowledged remotely.
+        let delete_reservation = writer.try_reserve_delete().unwrap();
+        for _ in 1..StoreWriter::CAPACITY {
+            writer.try_send(snapshot()).unwrap();
+        }
+        assert!(matches!(
+            writer.try_reserve_delete(),
+            Err(StoreAdmissionError::Full)
+        ));
+        writer
+            .enqueue_reserved(snapshot(), delete_reservation)
+            .expect("reserved admission remains available after remote ACK");
+        assert_eq!(rx.try_iter().count(), StoreWriter::CAPACITY);
+    }
+
+    fn unauthenticated_snapshot(
+        session: &crate::session::Session,
+        event_tx: &Sender<BgEnvelope>,
+    ) -> StoreCommand {
+        // No login: the worker must reply with an error and never open a real DB.
+        let stamp = RuntimeStamp::for_session(session);
+        StoreCommand::Snapshot {
+            session: session.clone(),
+            stamp: stamp.clone(),
+            threads: Vec::new(),
+            completion: BgSender {
+                tx: event_tx.clone(),
+                stamp,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn history_writer_shutdown_drains_queue_then_rejects_admission() {
+        let writer = StoreWriter::new();
+        let session = crate::session::Session::new(false, false, false).unwrap();
+        let (event_tx, event_rx) = channel();
+        for _ in 0..4 {
+            writer
+                .try_send(unauthenticated_snapshot(&session, &event_tx))
+                .unwrap();
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            writer.shutdown_until(deadline).await,
+            "clean drain must report success"
+        );
+        let outcomes: Vec<_> = event_rx.try_iter().collect();
+        assert_eq!(
+            outcomes.len(),
+            4,
+            "every queued command gets an explicit outcome"
+        );
+        assert!(outcomes
+            .iter()
+            .all(|envelope| matches!(envelope.event, BgEvent::StoreFailed(_))));
+        assert!(matches!(
+            writer.try_send(unauthenticated_snapshot(&session, &event_tx)),
+            Err(StoreAdmissionError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn history_writer_shutdown_reports_failure_after_worker_panic() {
+        let writer = StoreWriter::new();
+        writer.try_send(StoreCommand::PanicForTest).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        assert!(
+            !writer.shutdown_until(deadline).await,
+            "panicked worker is not a clean save"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failure is detected before the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_writer_shutdown_is_bounded_when_worker_is_stuck() {
+        // Receiver kept alive but never read: simulates a blocked worker.
+        let (writer, _rx) = StoreWriter::channel();
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        assert!(!writer.shutdown_until(deadline).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "exit must not wait unbounded"
+        );
+    }
+
+    #[test]
     fn wraps_words_to_width() {
         assert_eq!(
             wrap_text("a b c", 3),
@@ -3292,7 +4132,6 @@ mod tests {
             focus: Focus::Messages,
             status: "test".into(),
             should_quit: false,
-            store: None,
             poll_state: chat::PollState::default(),
             filtered: vec![0],
             filter: FilterTab::All,
@@ -3313,8 +4152,12 @@ mod tests {
             prompt: None,
             confirm: None,
             poll_inflight: false,
+            delete_inflight: false,
+            critical_inflight: Arc::new(AtomicUsize::new(0)),
             bg_rx: rx,
             bg_tx: tx,
+            writer: StoreWriter::new(),
+            pending_snapshot: None,
         };
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = Terminal::new(backend).unwrap();

@@ -458,11 +458,20 @@ pub enum GuiEvent {
     },
     Reacted {
         owner: String,
+        intent_id: u64,
         action_id: String,
         thread_id: String,
         msg_id: String,
         ts: i64,
         reaction: String,
+    },
+    ReactionFailed {
+        owner: String,
+        intent_id: u64,
+        thread_id: String,
+        msg_id: String,
+        ts: i64,
+        message: String,
     },
     MessageDeleted {
         owner: String,
@@ -608,6 +617,7 @@ pub enum GuiEvent {
     LoggedOut,
     DownloadFolderPicked(Option<Result<std::path::PathBuf, String>>),
     DownloadFolderFailed(String),
+    DiagnosticsFolderOpened(std::result::Result<(), String>),
     CameraUnavailable(String),
     UploadProgress {
         upload_id: String,
@@ -620,8 +630,15 @@ pub enum GuiEvent {
     ProfileSwitched {
         session: Box<Session>,
     },
-    AppUnlocked,
-    AppUnlockFailed,
+    AppUnlockCompleted {
+        request_id: u64,
+        runtime_id: usize,
+        verified: bool,
+    },
+    AppUnlockFailed {
+        request_id: u64,
+        runtime_id: usize,
+    },
     MessageTranslated {
         thread_id: String,
         msg_id: String,
@@ -953,6 +970,7 @@ pub struct ZaloGuiApp {
     // App lock state (WP16-4)
     lock_guard: auth_guard::AppLockGuard,
     auth_in_progress: bool,
+    auth_request_generation: u64,
 
     // Account switcher state (WP16-3)
     #[allow(dead_code)]
@@ -1018,6 +1036,8 @@ pub struct ZaloGuiApp {
     safety_number_modal: Option<SafetyNumberModalState>,
     trusted_peers: HashSet<String>,
     trial_peers: HashSet<String>,
+    pending_reaction_actions: HashMap<(String, String), u64>,
+    next_reaction_action_id: u64,
     profiles: Vec<crate::profiles::Profile>,
     profiles_requested: bool,
     sidebar_order: Option<SidebarOrderCache>,
@@ -1105,9 +1125,11 @@ pub struct ZaloGuiApp {
     send_contact_modal_open: bool,
     send_contact_query: String,
     batch_forward_modal_open: bool,
-    voice_recorder: Option<crate::voice::VoiceRecorder>,
-    voice_preview: Option<crate::voice::VoicePreviewPlayer>,
-    recorded_voice_samples: Option<(Vec<f32>, u32, std::time::Duration)>,
+    voice_worker: Option<crate::voice::VoiceWorker>,
+    voice_start_pending: bool,
+    voice_finish_pending: bool,
+    voice_send_after_finish: bool,
+    recorded_voice_samples: Option<(std::sync::Arc<[f32]>, u32, std::time::Duration)>,
     voice_binding: Option<VoiceDraftBinding>,
     voice_context_generation: u64,
     settings_tab: SettingsTab,
@@ -1313,6 +1335,8 @@ impl ZaloGuiApp {
             safety_number_modal: None,
             trusted_peers: HashSet::new(),
             trial_peers: HashSet::new(),
+            pending_reaction_actions: HashMap::new(),
+            next_reaction_action_id: 0,
             profiles: Vec::new(),
             profiles_requested: false,
             sidebar_order: None,
@@ -1407,8 +1431,10 @@ impl ZaloGuiApp {
             send_contact_modal_open: false,
             send_contact_query: String::new(),
             batch_forward_modal_open: false,
-            voice_recorder: None,
-            voice_preview: None,
+            voice_worker: None,
+            voice_start_pending: false,
+            voice_finish_pending: false,
+            voice_send_after_finish: false,
             recorded_voice_samples: None,
             voice_binding: None,
             voice_context_generation: 0,
@@ -1469,6 +1495,7 @@ impl ZaloGuiApp {
             quick_schedule: None,
             lock_guard: auth_guard::AppLockGuard::new(),
             auth_in_progress: false,
+            auth_request_generation: 0,
             account_switcher: account_switcher::AccountSwitcher::default(),
         };
 
@@ -1974,6 +2001,7 @@ impl ZaloGuiApp {
         self.profiles_requested = false;
         self.trusted_peers.clear();
         self.trial_peers.clear();
+        self.pending_reaction_actions.clear();
         self.safety_number_modal = None;
         self.typing_map.clear();
         self.typing_sent.clear();
@@ -2463,6 +2491,8 @@ impl ZaloGuiApp {
                     self.profiles.clear();
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
                         self.cancel_voice_recording();
+                        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+                        self.auth_in_progress = false;
                     }
                     if self.user_uin != uin {
                         self.clear_presence_state();
@@ -2962,6 +2992,8 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::SessionExpired(reason) => {
                     self.cancel_voice_recording();
+                    self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+                    self.auth_in_progress = false;
                     self.clear_presence_state();
                     self.flush_composer_before_logout();
                     self.live_mailbox = None;
@@ -2994,6 +3026,16 @@ impl ZaloGuiApp {
                     self.show_toast(reason);
                 }
                 GuiEvent::DownloadFolderFailed(message) => self.show_toast(message),
+                GuiEvent::DiagnosticsFolderOpened(result) => {
+                    self.tools.diagnostics_opening = false;
+                    match result {
+                        Ok(()) => self.status_msg = "Đã mở thư mục chẩn đoán".into(),
+                        Err(message) => {
+                            self.status_msg = message.clone();
+                            self.show_toast(message);
+                        }
+                    }
+                }
                 GuiEvent::DownloadFolderPicked(result) => {
                     self.download_picker_pending = false;
                     match result {
@@ -3025,6 +3067,8 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::LoggedOut => {
                     self.cancel_voice_recording();
+                    self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+                    self.auth_in_progress = false;
                     self.clear_presence_state();
                     self.deleted_message_ids.clear();
                     self.quick_schedule = None;
@@ -3097,6 +3141,8 @@ impl ZaloGuiApp {
                 GuiEvent::ProfileSwitched { session } => {
                     let uid = session.account_key().to_owned();
                     let runtime_id = session.runtime_id();
+                    self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+                    self.auth_in_progress = false;
                     // A20: Profile switched; thoroughly isolate and reset UI state for new profile
                     self.cancel_voice_recording();
                     self.clear_presence_state();
@@ -3160,19 +3206,39 @@ impl ZaloGuiApp {
                         let _ = tx.send(WorkerCmd::RefreshThreads);
                     }
                 }
-                GuiEvent::AppUnlocked => {
-                    // WP16-4: Windows Hello authentication succeeded
-                    self.lock_guard.unlock();
-                    crate::desktop_notice::privacy_lock(&self.user_uin, false);
+                GuiEvent::AppUnlockCompleted {
+                    request_id,
+                    runtime_id,
+                    verified,
+                } => {
+                    if request_id != self.auth_request_generation
+                        || runtime_id != self.account_runtime_id
+                        || !self.lock_guard.is_locked()
+                    {
+                        continue;
+                    }
                     self.auth_in_progress = false;
-                    self.status_msg = "Đã mở khóa ứng dụng".into();
-                    // Refresh UI state after unlock
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::RefreshThreads);
+                    if verified {
+                        self.lock_guard.unlock();
+                        crate::desktop_notice::privacy_lock(&self.user_uin, false);
+                        self.status_msg = "Đã mở khóa ứng dụng".into();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                        }
+                    } else {
+                        self.status_msg = "Xác thực thất bại. Vui lòng thử lại.".into();
                     }
                 }
-                GuiEvent::AppUnlockFailed => {
-                    // WP16-4: Windows Hello authentication failed
+                GuiEvent::AppUnlockFailed {
+                    request_id,
+                    runtime_id,
+                } => {
+                    if request_id != self.auth_request_generation
+                        || runtime_id != self.account_runtime_id
+                        || !self.lock_guard.is_locked()
+                    {
+                        continue;
+                    }
                     self.auth_in_progress = false;
                     self.status_msg = "Xác thực thất bại. Vui lòng thử lại.".into();
                 }
@@ -3899,6 +3965,7 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::Reacted {
                     owner,
+                    intent_id,
                     action_id,
                     thread_id,
                     msg_id,
@@ -3908,6 +3975,16 @@ impl ZaloGuiApp {
                     if owner != self.user_uin || !self.is_logged_in {
                         continue;
                     }
+                    let message_key = if msg_id.is_empty() {
+                        format!("ts:{ts}")
+                    } else {
+                        msg_id.clone()
+                    };
+                    let key = (thread_id.clone(), message_key);
+                    if self.pending_reaction_actions.get(&key) != Some(&intent_id) {
+                        continue;
+                    }
+                    self.pending_reaction_actions.remove(&key);
                     let clearing = reaction.is_empty();
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         if let Some(m) = t.messages.iter_mut().find(|m| {
@@ -3933,6 +4010,28 @@ impl ZaloGuiApp {
                         "Đã thả cảm xúc"
                     }
                     .into();
+                }
+                GuiEvent::ReactionFailed {
+                    owner,
+                    intent_id,
+                    thread_id,
+                    msg_id,
+                    ts,
+                    message,
+                } => {
+                    if owner != self.user_uin || !self.is_logged_in {
+                        continue;
+                    }
+                    let key_id = if msg_id.is_empty() {
+                        format!("ts:{ts}")
+                    } else {
+                        msg_id
+                    };
+                    let key = (thread_id, key_id);
+                    if self.pending_reaction_actions.get(&key) == Some(&intent_id) {
+                        self.pending_reaction_actions.remove(&key);
+                        self.show_toast(message);
+                    }
                 }
                 GuiEvent::MessageDeleted {
                     owner,
@@ -5075,6 +5174,10 @@ impl eframe::App for ZaloGuiApp {
         if self.is_logged_in && self.lock_guard.should_lock() {
             self.lock_guard.lock();
         }
+        if self.lock_guard.is_locked() && self.voice_binding.is_some() {
+            self.cancel_voice_recording();
+        }
+        self.poll_voice_events();
 
         // Update lock guard on user interaction (WP16-4) — but only if not locked
         // A21: Input after idle should not reset deadline if we're already locked
@@ -5717,20 +5820,31 @@ impl ZaloGuiApp {
                         .on_hover_cursor(CursorIcon::PointingHand)
                         .clicked()
                     {
-                        // Trigger authentication via worker task
+                        let Some(hwnd) = self.native_hwnd else {
+                            self.status_msg =
+                                "Không thể xác thực: chưa có cửa sổ Windows hợp lệ".into();
+                            return;
+                        };
                         self.auth_in_progress = true;
+                        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
+                        let request_id = self.auth_request_generation;
+                        let runtime_id = self.account_runtime_id;
                         let ctx_clone = ctx.clone();
                         let event_tx = self.event_tx.clone();
 
                         tokio::spawn(async move {
-                            match auth_guard::request_windows_hello().await {
-                                Ok(true) => {
-                                    let _ = event_tx.send(GuiEvent::AppUnlocked);
-                                }
-                                _ => {
-                                    let _ = event_tx.send(GuiEvent::AppUnlockFailed);
-                                }
-                            }
+                            let event = match auth_guard::request_windows_hello(hwnd).await {
+                                Ok(verified) => GuiEvent::AppUnlockCompleted {
+                                    request_id,
+                                    runtime_id,
+                                    verified,
+                                },
+                                Err(_) => GuiEvent::AppUnlockFailed {
+                                    request_id,
+                                    runtime_id,
+                                },
+                            };
+                            let _ = event_tx.send(event);
                             ctx_clone.request_repaint();
                         });
                     }
@@ -7350,7 +7464,11 @@ mod voice_draft_boundary_tests {
             is_group: false,
             generation: 0,
         });
-        app.recorded_voice_samples = Some((vec![0.25, -0.25], 16_000, Duration::from_secs(1)));
+        app.recorded_voice_samples = Some((
+            std::sync::Arc::from(vec![0.25, -0.25]),
+            16_000,
+            Duration::from_secs(1),
+        ));
         app
     }
 
@@ -7369,6 +7487,11 @@ mod voice_draft_boundary_tests {
             .as_ref()
             .unwrap()
             .matches("owner-a", runtime_id, "thread-x", false, 1,));
+        assert!(!app
+            .voice_binding
+            .as_ref()
+            .unwrap()
+            .matches("owner-a", runtime_id, "thread-x", false, 2));
     }
 
     #[test]
@@ -7393,7 +7516,11 @@ mod voice_draft_boundary_tests {
             is_group: false,
             generation: app.voice_context_generation,
         });
-        app.recorded_voice_samples = Some((vec![0.25, -0.25], 16_000, Duration::from_secs(1)));
+        app.recorded_voice_samples = Some((
+            std::sync::Arc::from(vec![0.25, -0.25]),
+            16_000,
+            Duration::from_secs(1),
+        ));
         app.send_voice_recording("thread-y", false);
 
         assert!(app.recorded_voice_samples.is_none());
@@ -7449,5 +7576,43 @@ mod voice_draft_boundary_tests {
 
         assert!(app.threads[0].messages.is_empty());
         assert_eq!(app.status_msg, "current session");
+    }
+
+    #[test]
+    fn stale_or_cross_runtime_hello_completion_cannot_unlock_app() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_voice_draft();
+        let runtime_id = app.account_runtime_id;
+        app.lock_guard.lock();
+        app.auth_in_progress = true;
+        app.auth_request_generation = 9;
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+
+        tx.send(GuiEvent::AppUnlockCompleted {
+            request_id: 8,
+            runtime_id,
+            verified: true,
+        })
+        .unwrap();
+        tx.send(GuiEvent::AppUnlockCompleted {
+            request_id: 9,
+            runtime_id: runtime_id.wrapping_add(1),
+            verified: true,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.lock_guard.is_locked());
+        assert!(app.auth_in_progress);
+
+        tx.send(GuiEvent::AppUnlockCompleted {
+            request_id: 9,
+            runtime_id,
+            verified: true,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.lock_guard.is_locked());
+        assert!(!app.auth_in_progress);
     }
 }

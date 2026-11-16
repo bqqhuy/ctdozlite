@@ -23,7 +23,7 @@ pub fn open_crypto_db() -> Result<Connection> {
 
 /// Open a crypto store at an explicit path (used by tests and tooling).
 /// Current schema version of the SQLite E2EE key store (A40).
-pub const CURRENT_SCHEMA_VERSION: i32 = 8;
+pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 
 pub fn open_crypto_db_at(path: &std::path::Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
@@ -192,6 +192,14 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if version < 8 {
         tx.execute_batch("CREATE TABLE e2ee_received(profile_id TEXT NOT NULL,peer_id TEXT NOT NULL,message_id TEXT NOT NULL,payload_hash BLOB NOT NULL,plaintext_enc BLOB NOT NULL,identity_changed INTEGER NOT NULL,history_path TEXT NOT NULL,PRIMARY KEY(profile_id,peer_id,message_id));
             CREATE INDEX e2ee_received_history ON e2ee_received(history_path,peer_id,message_id);")?;
+    }
+    if version < 9 {
+        // Old verification used a key-only fingerprint. Keep keys and sessions,
+        // but require explicit verification under the identifier-bound scheme.
+        tx.execute(
+            "UPDATE trusted_identity SET verified=0,verified_at=NULL",
+            [],
+        )?;
     }
     tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
     tx.commit()?;
@@ -930,5 +938,42 @@ mod tests {
                 .unwrap(),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn fingerprint_upgrade_revokes_old_verification_once_without_losing_keys() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        save_trusted_identity(&conn, "owner", "peer", &[42; 32]).unwrap();
+        set_identity_verified(&conn, "owner", "peer", true).unwrap();
+        // Construct an old-version fixture; never downgrade a user database.
+        conn.pragma_update(None, "user_version", 8).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            get_trusted_identity(&conn, "owner", "peer").unwrap(),
+            Some(([42; 32], false))
+        );
+        set_identity_verified(&conn, "owner", "peer", true).unwrap();
+        migrate(&mut conn).unwrap();
+        assert!(is_identity_verified(&conn, "owner", "peer").unwrap());
+    }
+
+    #[test]
+    fn fingerprint_upgrade_failure_does_not_bump_schema_or_partially_reset_trust() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        save_trusted_identity(&conn, "owner", "peer", &[42; 32]).unwrap();
+        set_identity_verified(&conn, "owner", "peer", true).unwrap();
+        conn.execute_batch("PRAGMA user_version=8; CREATE TRIGGER reject_trust_upgrade BEFORE UPDATE ON trusted_identity BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+        assert!(migrate(&mut conn).is_err());
+        let version: i32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 8);
+        assert!(is_identity_verified(&conn, "owner", "peer").unwrap());
+        conn.execute_batch("DROP TRIGGER reject_trust_upgrade;")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        assert!(!is_identity_verified(&conn, "owner", "peer").unwrap());
     }
 }

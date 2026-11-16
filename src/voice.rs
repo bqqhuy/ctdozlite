@@ -7,13 +7,36 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Sample;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc::{self, Receiver, SyncSender},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
 /// Target sample rate for speech encoding (16 kHz mono).
 pub const VOICE_SAMPLE_RATE: u32 = 16_000;
+/// Local recording duration budget, not a claim about Zalo's server limit.
+pub const VOICE_MAX_DURATION: Duration = Duration::from_secs(5 * 60);
+/// Maximum captured mono PCM storage before the device worker finishes recording.
+pub const VOICE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const VOICE_MAX_SAMPLES: usize = VOICE_MAX_BYTES / std::mem::size_of::<f32>();
+
+fn recording_limit_reached(duration: Duration, sample_count: usize) -> bool {
+    duration >= VOICE_MAX_DURATION || sample_count >= VOICE_MAX_SAMPLES
+}
+
+fn invalidate_recording_generation(active_generation: &AtomicU64, generation: u64) {
+    let _ = active_generation.compare_exchange(
+        generation,
+        generation.wrapping_add(1),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn preview_generation_is_active(active_generation: &AtomicU64, generation: u64) -> bool {
+    active_generation.load(Ordering::Acquire) == generation
+}
 
 /// Pure-Rust 16-bit mono PCM WAV encoder.
 /// Produces standard 44-byte RIFF header followed by signed 16-bit little-endian samples.
@@ -74,6 +97,36 @@ struct RecorderInner {
     window_samples: Vec<f32>,
     start_time: Instant,
     sample_rate: u32,
+    limit_reached: bool,
+}
+
+fn append_sample(
+    inner: &mut RecorderInner,
+    sample: f32,
+    window_size: usize,
+    active: &AtomicBool,
+) -> bool {
+    if recording_limit_reached(inner.start_time.elapsed(), inner.samples.len()) {
+        inner.limit_reached = true;
+        active.store(false, Ordering::Relaxed);
+        return false;
+    }
+    inner.samples.push(sample);
+    inner.window_samples.push(sample);
+    if inner.window_samples.len() >= window_size {
+        let rms = calculate_rms(&inner.window_samples);
+        inner.waveform_levels.push(rms);
+        if inner.waveform_levels.len() > 60 {
+            inner.waveform_levels.remove(0);
+        }
+        inner.window_samples.clear();
+    }
+    if recording_limit_reached(Duration::ZERO, inner.samples.len()) {
+        inner.limit_reached = true;
+        active.store(false, Ordering::Relaxed);
+        return false;
+    }
+    true
 }
 
 /// Active voice recording session.
@@ -104,6 +157,7 @@ impl VoiceRecorder {
             window_samples: Vec::new(),
             start_time: Instant::now(),
             sample_rate,
+            limit_reached: false,
         }));
 
         let inner_clone = inner.clone();
@@ -126,15 +180,8 @@ impl VoiceRecorder {
                     if let Ok(mut lock) = inner_clone.lock() {
                         for chunk in data.chunks_exact(channels) {
                             let mono = chunk.iter().sum::<f32>() / (channels as f32);
-                            lock.samples.push(mono);
-                            lock.window_samples.push(mono);
-                            if lock.window_samples.len() >= window_size {
-                                let rms = calculate_rms(&lock.window_samples);
-                                lock.waveform_levels.push(rms);
-                                if lock.waveform_levels.len() > 60 {
-                                    lock.waveform_levels.remove(0);
-                                }
-                                lock.window_samples.clear();
+                            if !append_sample(&mut lock, mono, window_size, &active_clone) {
+                                break;
                             }
                         }
                     }
@@ -153,15 +200,8 @@ impl VoiceRecorder {
                             let mono: f32 =
                                 chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>()
                                     / (channels as f32);
-                            lock.samples.push(mono);
-                            lock.window_samples.push(mono);
-                            if lock.window_samples.len() >= window_size {
-                                let rms = calculate_rms(&lock.window_samples);
-                                lock.waveform_levels.push(rms);
-                                if lock.waveform_levels.len() > 60 {
-                                    lock.waveform_levels.remove(0);
-                                }
-                                lock.window_samples.clear();
+                            if !append_sample(&mut lock, mono, window_size, &active_clone) {
+                                break;
                             }
                         }
                     }
@@ -180,15 +220,8 @@ impl VoiceRecorder {
                             let mono: f32 =
                                 chunk.iter().map(|&s| s.to_sample::<f32>()).sum::<f32>()
                                     / (channels as f32);
-                            lock.samples.push(mono);
-                            lock.window_samples.push(mono);
-                            if lock.window_samples.len() >= window_size {
-                                let rms = calculate_rms(&lock.window_samples);
-                                lock.waveform_levels.push(rms);
-                                if lock.waveform_levels.len() > 60 {
-                                    lock.waveform_levels.remove(0);
-                                }
-                                lock.window_samples.clear();
+                            if !append_sample(&mut lock, mono, window_size, &active_clone) {
+                                break;
                             }
                         }
                     }
@@ -228,21 +261,43 @@ impl VoiceRecorder {
         }
     }
 
-    /// Stop recording, release device, and return recorded samples resampled to 16 kHz.
-    pub fn finish(self) -> (Vec<f32>, u32, Duration) {
-        self.active.store(false, Ordering::Relaxed);
-        let (samples, sample_rate, duration) = if let Ok(lock) = self.inner.lock() {
-            let dur = lock.start_time.elapsed();
-            (lock.samples.clone(), lock.sample_rate, dur)
+    fn snapshot(&self) -> (Duration, Vec<f32>, usize, bool) {
+        if let Ok(lock) = self.inner.lock() {
+            let duration = lock.start_time.elapsed();
+            (
+                duration,
+                lock.waveform_levels.clone(),
+                lock.samples.len(),
+                lock.limit_reached || duration >= VOICE_MAX_DURATION,
+            )
         } else {
-            (Vec::new(), VOICE_SAMPLE_RATE, Duration::ZERO)
-        };
-        (samples, sample_rate, duration)
+            (Duration::ZERO, Vec::new(), 0, false)
+        }
+    }
+
+    /// Stop recording, release the device, and move out the bounded mono sample buffer.
+    pub fn finish(mut self) -> (Vec<f32>, u32, Duration, bool) {
+        self.active.store(false, Ordering::Relaxed);
+        self._stream.take();
+        let (samples, sample_rate, duration, limit_reached) =
+            if let Ok(mut lock) = self.inner.lock() {
+                let dur = lock.start_time.elapsed();
+                (
+                    std::mem::take(&mut lock.samples),
+                    lock.sample_rate,
+                    dur,
+                    lock.limit_reached || dur >= VOICE_MAX_DURATION,
+                )
+            } else {
+                (Vec::new(), VOICE_SAMPLE_RATE, Duration::ZERO, false)
+            };
+        (samples, sample_rate, duration, limit_reached)
     }
 
     /// Discard recording and stop stream.
-    pub fn cancel(self) {
+    pub fn cancel(mut self) {
         self.active.store(false, Ordering::Relaxed);
+        self._stream.take();
     }
 }
 
@@ -277,12 +332,12 @@ pub fn resample_to_16k(samples: &[f32], source_rate: u32) -> Vec<f32> {
 pub struct VoicePreviewPlayer {
     _stream: Option<cpal::Stream>,
     playing: Arc<AtomicBool>,
-    playback_pos: Arc<Mutex<usize>>,
+    playback_pos: Arc<Mutex<f64>>,
     total_samples: usize,
 }
 
 impl VoicePreviewPlayer {
-    pub fn play(samples: Vec<f32>, sample_rate: u32) -> Result<Self> {
+    pub fn play(samples: Arc<[f32]>, sample_rate: u32) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -295,36 +350,18 @@ impl VoicePreviewPlayer {
         let out_sample_rate = supported_config.sample_rate().0;
         let channels = supported_config.channels() as usize;
 
-        // Resample to output device rate if needed
-        let play_samples = if out_sample_rate != sample_rate {
-            let ratio = out_sample_rate as f64 / sample_rate as f64;
-            let target_len = (samples.len() as f64 * ratio).round() as usize;
-            let mut out = Vec::with_capacity(target_len);
-            for i in 0..target_len {
-                let src_idx = i as f64 / ratio;
-                let left = src_idx.floor() as usize;
-                let right = (left + 1).min(samples.len().saturating_sub(1));
-                let frac = (src_idx - left as f64) as f32;
-                let val = if left < samples.len() {
-                    samples[left] * (1.0_f32 - frac) + samples[right] * frac
-                } else {
-                    0.0
-                };
-                out.push(val);
-            }
-            out
-        } else {
-            samples
-        };
-
-        let total_samples = play_samples.len();
-        let playback_pos = Arc::new(Mutex::new(0usize));
+        anyhow::ensure!(
+            sample_rate > 0 && out_sample_rate > 0,
+            "Tần số mẫu âm thanh không hợp lệ"
+        );
+        let total_samples = samples.len();
+        let source_step = sample_rate as f64 / out_sample_rate as f64;
+        let playback_pos = Arc::new(Mutex::new(0.0f64));
         let pos_clone = playback_pos.clone();
         let playing = Arc::new(AtomicBool::new(true));
         let playing_clone = playing.clone();
 
-        let samples_arc = Arc::new(play_samples);
-        let samples_clone = samples_arc.clone();
+        let samples_clone = samples;
 
         let err_fn = |err| {
             crate::logger::log_error("voice_player", &format!("Lỗi loa phát: {err}"));
@@ -340,10 +377,14 @@ impl VoicePreviewPlayer {
                     }
                     if let Ok(mut pos) = pos_clone.lock() {
                         for frame in data.chunks_exact_mut(channels) {
-                            if *pos < samples_clone.len() {
-                                let s = samples_clone[*pos];
+                            if *pos < samples_clone.len() as f64 {
+                                let left = (*pos).floor() as usize;
+                                let right = (left + 1).min(samples_clone.len().saturating_sub(1));
+                                let frac = (*pos - left as f64) as f32;
+                                let s = samples_clone[left] * (1.0 - frac)
+                                    + samples_clone[right] * frac;
                                 frame.fill(s);
-                                *pos += 1;
+                                *pos += source_step;
                             } else {
                                 frame.fill(0.0);
                                 playing_clone.store(false, Ordering::Relaxed);
@@ -387,9 +428,430 @@ impl VoicePreviewPlayer {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct VoiceSnapshot {
+    pub(crate) recording: bool,
+    pub(crate) duration: Duration,
+    pub(crate) waveform: Vec<f32>,
+    pub(crate) recorded_bytes: usize,
+    pub(crate) preview_playing: bool,
+}
+
+pub(crate) enum VoiceEvent {
+    Finished {
+        generation: u64,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+        duration: Duration,
+        limit_reached: bool,
+        send_after_finish: bool,
+    },
+    Failed {
+        generation: u64,
+        message: String,
+    },
+    PreviewFailed {
+        generation: u64,
+        message: String,
+    },
+}
+
+enum VoiceCommand {
+    Start {
+        generation: u64,
+    },
+    Finish {
+        generation: u64,
+        send_after_finish: bool,
+    },
+    Cancel {
+        generation: u64,
+    },
+    PlayPreview {
+        generation: u64,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+    },
+    StopPreview {
+        generation: u64,
+    },
+    Shutdown,
+}
+
+/// Device-owning worker; CPAL streams remain on the dedicated thread because some host backends
+/// do not permit moving their stream handles between threads.
+pub(crate) struct VoiceWorker {
+    commands: SyncSender<VoiceCommand>,
+    events: Receiver<VoiceEvent>,
+    snapshot: Arc<Mutex<VoiceSnapshot>>,
+    active_generation: Arc<AtomicU64>,
+}
+
+impl VoiceWorker {
+    pub(crate) fn new(ctx: eframe::egui::Context) -> Result<Self> {
+        let (command_tx, command_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
+        let snapshot = Arc::new(Mutex::new(VoiceSnapshot::default()));
+        let thread_snapshot = Arc::clone(&snapshot);
+        let active_generation = Arc::new(AtomicU64::new(0));
+        let thread_generation = Arc::clone(&active_generation);
+        std::thread::Builder::new()
+            .name("voice-device".into())
+            .spawn(move || {
+                voice_worker_loop(
+                    command_rx,
+                    event_tx,
+                    thread_snapshot,
+                    thread_generation,
+                    ctx,
+                )
+            })
+            .context("Không khởi chạy được bộ xử lý âm thanh")?;
+        Ok(Self {
+            commands: command_tx,
+            events: event_rx,
+            snapshot,
+            active_generation,
+        })
+    }
+
+    pub(crate) fn start(&self, generation: u64) -> Result<()> {
+        self.active_generation.store(generation, Ordering::Release);
+        self.send(VoiceCommand::Start { generation })
+    }
+
+    pub(crate) fn finish(&self, generation: u64, send_after_finish: bool) -> Result<()> {
+        self.send(VoiceCommand::Finish {
+            generation,
+            send_after_finish,
+        })
+    }
+
+    pub(crate) fn cancel(&self, generation: u64) -> Result<()> {
+        invalidate_recording_generation(&self.active_generation, generation);
+        let _ = self.commands.try_send(VoiceCommand::Cancel { generation });
+        Ok(())
+    }
+
+    pub(crate) fn play_preview(
+        &self,
+        generation: u64,
+        samples: Arc<[f32]>,
+        sample_rate: u32,
+    ) -> Result<()> {
+        self.send(VoiceCommand::PlayPreview {
+            generation,
+            samples,
+            sample_rate,
+        })
+    }
+
+    pub(crate) fn stop_preview(&self, generation: u64) -> Result<()> {
+        self.send(VoiceCommand::StopPreview { generation })
+    }
+
+    pub(crate) fn snapshot(&self) -> VoiceSnapshot {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn try_events(&self) -> impl Iterator<Item = VoiceEvent> + '_ {
+        self.events.try_iter()
+    }
+
+    fn send(&self, command: VoiceCommand) -> Result<()> {
+        self.commands
+            .try_send(command)
+            .map_err(|_| anyhow::anyhow!("Bộ xử lý âm thanh đang bận hoặc đã dừng"))
+    }
+}
+
+impl Drop for VoiceWorker {
+    fn drop(&mut self) {
+        let _ = self.commands.try_send(VoiceCommand::Shutdown);
+    }
+}
+
+fn voice_worker_loop(
+    commands: Receiver<VoiceCommand>,
+    events: mpsc::Sender<VoiceEvent>,
+    snapshot: Arc<Mutex<VoiceSnapshot>>,
+    active_generation: Arc<AtomicU64>,
+    ctx: eframe::egui::Context,
+) {
+    let mut recorder = None;
+    let mut recording_generation = None;
+    let mut preview: Option<VoicePreviewPlayer> = None;
+    let mut preview_generation = None;
+    loop {
+        let received = if recorder.is_none() && preview.is_none() {
+            commands
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        } else {
+            commands.recv_timeout(Duration::from_millis(40))
+        };
+        match received {
+            Ok(VoiceCommand::Start { generation })
+                if recorder.is_none()
+                    && active_generation.load(Ordering::Acquire) == generation =>
+            {
+                match VoiceRecorder::start() {
+                    Ok(active) => {
+                        recorder = Some(active);
+                        recording_generation = Some(generation);
+                        if let Ok(mut current) = snapshot.lock() {
+                            *current = VoiceSnapshot {
+                                recording: true,
+                                ..Default::default()
+                            };
+                        }
+                        ctx.request_repaint();
+                    }
+                    Err(error) => {
+                        let _ = events.send(VoiceEvent::Failed {
+                            generation,
+                            message: error.to_string(),
+                        });
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Ok(VoiceCommand::Finish {
+                generation,
+                send_after_finish,
+            }) => {
+                if recording_generation == Some(generation) {
+                    if let Some(active) = recorder.take() {
+                        let (samples, sample_rate, duration, limit_reached) = active.finish();
+                        recording_generation = None;
+                        if let Ok(mut current) = snapshot.lock() {
+                            *current = VoiceSnapshot::default();
+                        }
+                        let _ = events.send(VoiceEvent::Finished {
+                            generation,
+                            samples: Arc::from(samples),
+                            sample_rate,
+                            duration,
+                            limit_reached,
+                            send_after_finish,
+                        });
+                        ctx.request_repaint();
+                    }
+                }
+            }
+            Ok(VoiceCommand::Cancel { generation }) => {
+                let mut cancelled_recording = false;
+                if recording_generation == Some(generation) {
+                    if let Some(active) = recorder.take() {
+                        active.cancel();
+                    }
+                    recording_generation = None;
+                    cancelled_recording = true;
+                }
+                if preview_generation == Some(generation) {
+                    if let Some(active) = preview.take() {
+                        active.stop();
+                    }
+                    preview_generation = None;
+                    if let Ok(mut current) = snapshot.lock() {
+                        current.preview_playing = false;
+                    }
+                }
+                if cancelled_recording {
+                    if let Ok(mut current) = snapshot.lock() {
+                        *current = VoiceSnapshot::default();
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Ok(VoiceCommand::PlayPreview {
+                generation,
+                samples,
+                sample_rate,
+            }) => {
+                if preview_generation_is_active(&active_generation, generation) {
+                    if let Some(active) = preview.take() {
+                        active.stop();
+                    }
+                    preview_generation = None;
+                    match VoicePreviewPlayer::play(samples, sample_rate) {
+                        Ok(active) => {
+                            preview = Some(active);
+                            preview_generation = Some(generation);
+                        }
+                        Err(error) => {
+                            let _ = events.send(VoiceEvent::PreviewFailed {
+                                generation,
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+            }
+            Ok(VoiceCommand::StopPreview { generation }) => {
+                if preview_generation == Some(generation) {
+                    if let Some(active) = preview.take() {
+                        active.stop();
+                    }
+                    preview_generation = None;
+                    if let Ok(mut current) = snapshot.lock() {
+                        current.preview_playing = false;
+                    }
+                }
+                ctx.request_repaint();
+            }
+            Ok(VoiceCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(VoiceCommand::Start { .. }) => {}
+        }
+
+        if recording_generation
+            .is_some_and(|generation| !preview_generation_is_active(&active_generation, generation))
+        {
+            if let Some(active) = recorder.take() {
+                active.cancel();
+            }
+            recording_generation = None;
+            if let Ok(mut current) = snapshot.lock() {
+                *current = VoiceSnapshot::default();
+            }
+            ctx.request_repaint();
+        }
+
+        if preview_generation
+            .is_some_and(|generation| !preview_generation_is_active(&active_generation, generation))
+        {
+            if let Some(active) = preview.take() {
+                active.stop();
+            }
+            preview_generation = None;
+            if let Ok(mut current) = snapshot.lock() {
+                current.preview_playing = false;
+            }
+            ctx.request_repaint();
+        }
+
+        if preview.as_ref().is_some_and(|active| !active.is_playing()) {
+            preview.take();
+            preview_generation = None;
+            if let Ok(mut current) = snapshot.lock() {
+                current.preview_playing = false;
+            }
+            ctx.request_repaint();
+        }
+
+        if let Some(active) = recorder.as_ref() {
+            let (duration, waveform, sample_count, limit_reached) = active.snapshot();
+            if limit_reached {
+                if let Some(active) = recorder.take() {
+                    let (samples, sample_rate, duration, limit_reached) = active.finish();
+                    if let Ok(mut current) = snapshot.lock() {
+                        *current = VoiceSnapshot::default();
+                    }
+                    let _ = events.send(VoiceEvent::Finished {
+                        generation: recording_generation.unwrap_or_default(),
+                        samples: Arc::from(samples),
+                        sample_rate,
+                        duration,
+                        limit_reached,
+                        send_after_finish: false,
+                    });
+                    recording_generation = None;
+                    ctx.request_repaint();
+                }
+            } else if let Ok(mut current) = snapshot.lock() {
+                current.recording = true;
+                current.duration = duration;
+                current.waveform = waveform;
+                current.recorded_bytes = sample_count * std::mem::size_of::<f32>();
+                current.preview_playing =
+                    preview.as_ref().is_some_and(VoicePreviewPlayer::is_playing);
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+        } else if let Ok(mut current) = snapshot.lock() {
+            current.preview_playing = preview.as_ref().is_some_and(VoicePreviewPlayer::is_playing);
+        }
+    }
+
+    if let Some(active) = recorder.take() {
+        active.cancel();
+    }
+    if let Some(active) = preview.take() {
+        active.stop();
+    }
+    if let Ok(mut current) = snapshot.lock() {
+        *current = VoiceSnapshot::default();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_limit_is_bounded_by_duration_and_sample_storage() {
+        assert!(!recording_limit_reached(
+            VOICE_MAX_DURATION - Duration::from_millis(1),
+            0
+        ));
+        assert!(recording_limit_reached(VOICE_MAX_DURATION, 0));
+        assert!(!recording_limit_reached(
+            Duration::ZERO,
+            VOICE_MAX_SAMPLES - 1
+        ));
+        assert!(recording_limit_reached(Duration::ZERO, VOICE_MAX_SAMPLES));
+        assert_eq!(VOICE_MAX_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cancellation_generation_invalidates_recording_when_command_queue_is_full() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        assert!(commands
+            .try_send(VoiceCommand::Start { generation: 0 })
+            .is_ok());
+        assert!(commands
+            .try_send(VoiceCommand::Start { generation: 1 })
+            .is_err());
+        let active_generation = AtomicU64::new(0);
+
+        invalidate_recording_generation(&active_generation, 0);
+
+        assert_eq!(active_generation.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(VoiceCommand::Start { generation: 0 })
+        ));
+    }
+
+    #[test]
+    fn queued_stale_preview_is_rejected_after_cancel_cannot_enter_full_queue() {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        assert!(commands
+            .try_send(VoiceCommand::PlayPreview {
+                generation: 4,
+                samples: Arc::from(vec![0.25, -0.25]),
+                sample_rate: VOICE_SAMPLE_RATE,
+            })
+            .is_ok());
+        assert!(commands
+            .try_send(VoiceCommand::Cancel { generation: 4 })
+            .is_err());
+        let active_generation = AtomicU64::new(4);
+
+        invalidate_recording_generation(&active_generation, 4);
+
+        let Ok(VoiceCommand::PlayPreview { generation, .. }) = receiver.try_recv() else {
+            panic!("expected the queued preview command");
+        };
+        assert!(!preview_generation_is_active(
+            &active_generation,
+            generation
+        ));
+    }
 
     #[test]
     fn wav_encoder_creates_valid_riff_header() {

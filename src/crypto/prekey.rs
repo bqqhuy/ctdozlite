@@ -14,14 +14,16 @@ pub struct RemoteBundle {
     pub signed_pre_key_id: u32,
     pub signed_pre_key: [u8; 32],
     pub signature: [u8; 64],
-    /// Ed25519 identity key of the peer, when the server exposes it separately
-    /// from the Curve25519 DH identity key.  Used to verify the signed prekey.
+    /// Optional synthetic signing-key hint. It cannot authenticate another DH
+    /// identity; distinct keys require a binding contract not supported here.
     pub signing_identity_key: Option<[u8; 32]>,
     pub one_time_pre_key: Option<([u8; 32], u32)>,
 }
 
-/// Parse a bundle from a server response.  Accepts both the nested `data` shape
-/// and a flat shape, and tolerates hex or base64 encoded keys.
+/// Parse a synthetic fixture or explicitly opted-in trial bundle hypothesis.
+/// Nested/flat and hex/base64 support does not establish a server schema.
+/// # Errors
+/// Rejects malformed required fields, key lengths and explicit server failures.
 pub fn parse_bundle(dec: &Value) -> Result<RemoteBundle> {
     if dec.get("error_code").is_some() {
         let code = dec

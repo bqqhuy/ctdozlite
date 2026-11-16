@@ -306,6 +306,9 @@ pub enum WorkerCmd {
         msg: ChatMessage,
     },
     React {
+        owner: String,
+        runtime_id: usize,
+        intent_id: u64,
         to_id: String,
         is_group: bool,
         msg: ChatMessage,
@@ -344,7 +347,8 @@ pub enum WorkerCmd {
         runtime_id: usize,
         to_id: String,
         is_group: bool,
-        wav_bytes: Vec<u8>,
+        samples: std::sync::Arc<[f32]>,
+        sample_rate: u32,
         duration_secs: u32,
     },
     SendSticker {
@@ -1403,7 +1407,7 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                                     let mgr = crate::crypto::session::E2eeManager::open(&owner)?;
                                     let (key, verified) = mgr.get_trusted_identity(&peer_id)?
                                         .ok_or_else(|| anyhow::anyhow!("Chưa có khóa danh tính đã xác thực của đối phương; chưa thể tính mã an toàn"))?;
-                                    Ok((mgr.safety_number(&key)?, verified))
+                                    Ok((mgr.safety_number(&peer_id, &key)?, verified))
                                 })();
                                 let event = match result {
                                     Ok((safety_number, is_verified)) => GuiEvent::SafetyNumberLoaded { owner, peer_id, peer_name, safety_number, is_verified, identity_changed: false },
@@ -2931,6 +2935,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể gửi loại tin nhắn này".into()));
                         }
                         WorkerCmd::React {
+                            owner,
+                            runtime_id,
+                            intent_id,
                             to_id,
                             is_group,
                             msg,
@@ -2941,6 +2948,21 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
+                                if !s.is_active()
+                                    || s.account_key() != owner
+                                    || s.runtime_id() != runtime_id
+                                {
+                                    let _ = gui_tx_clone.send(GuiEvent::ReactionFailed {
+                                        owner,
+                                        intent_id,
+                                        thread_id: to_id,
+                                        msg_id: msg.id,
+                                        ts: msg.ts,
+                                        message: "Tài khoản đã thay đổi; không áp dụng cảm xúc cũ".into(),
+                                    });
+                                    ctx_clone.request_repaint();
+                                    return;
+                                }
                                 let res = crate::chat::send_reaction(
                                     &s, &to_id, is_group, &msg, &reaction,
                                 )
@@ -2949,6 +2971,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Ok(resp) if resp_error_code(&resp).is_none() => {
                                         let _ = gui_tx_clone.send(GuiEvent::Reacted {
                                             owner: s.account_key().to_owned(),
+                                            intent_id,
                                             action_id: resp.get("client_action_id").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
                                             thread_id: to_id,
                                             msg_id: msg.id.clone(),
@@ -2962,15 +2985,25 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             resp_error_code(&resp).unwrap_or(0)
                                         );
                                         crate::logger::log_error("gui::react", &err_s);
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Thả cảm xúc thất bại: {err_s}"
-                                        )));
+                                        let _ = gui_tx_clone.send(GuiEvent::ReactionFailed {
+                                            owner,
+                                            intent_id,
+                                            thread_id: to_id,
+                                            msg_id: msg.id,
+                                            ts: msg.ts,
+                                            message: format!("Thả cảm xúc thất bại: {err_s}"),
+                                        });
                                     }
                                     Err(e) => {
                                         crate::logger::log_error("gui::react", &e.to_string());
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Thả cảm xúc thất bại: {e}"
-                                        )));
+                                        let _ = gui_tx_clone.send(GuiEvent::ReactionFailed {
+                                            owner,
+                                            intent_id,
+                                            thread_id: to_id,
+                                            msg_id: msg.id,
+                                            ts: msg.ts,
+                                            message: format!("Thả cảm xúc thất bại: {e}"),
+                                        });
                                     }
                                 }
                                 ctx_clone.request_repaint();
@@ -3353,7 +3386,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             runtime_id,
                             to_id,
                             is_group,
-                            wav_bytes,
+                            samples,
+                            sample_rate,
                             duration_secs,
                         } => {
                             let current = session.lock().await.clone();
@@ -3375,6 +3409,60 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
+                                let before_encode = session_clone.lock().await.clone();
+                                if !voice_send_session_matches(
+                                    before_encode.is_active(),
+                                    before_encode.account_key(),
+                                    before_encode.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    let _ = events.send(GuiEvent::VoiceSendRejected {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                    });
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                if samples.len() > crate::voice::VOICE_MAX_BYTES / std::mem::size_of::<f32>()
+                                    || duration_secs > crate::voice::VOICE_MAX_DURATION.as_secs() as u32
+                                    || sample_rate == 0
+                                {
+                                    let _ = events.send(GuiEvent::VoiceSendStatus {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm vượt quá giới hạn hoặc có định dạng không hợp lệ".into(),
+                                    });
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                                let wav_bytes = match tokio::task::spawn_blocking(move || {
+                                    let target_samples = (samples.len() as u128)
+                                        .saturating_mul(crate::voice::VOICE_SAMPLE_RATE as u128)
+                                        .div_ceil(sample_rate as u128);
+                                    anyhow::ensure!(target_samples <= crate::voice::VOICE_MAX_BYTES as u128 / 2,
+                                        "Bản ghi âm sau đổi tần số vượt quá 64 MiB");
+                                    let pcm = crate::voice::resample_to_16k(&samples, sample_rate);
+                                    anyhow::ensure!(pcm.len() <= crate::voice::VOICE_MAX_BYTES / 2,
+                                        "Bản ghi âm sau đổi tần số vượt quá 64 MiB");
+                                    Ok::<_, anyhow::Error>(crate::voice::pcm_to_wav(
+                                        &pcm,
+                                        crate::voice::VOICE_SAMPLE_RATE,
+                                    ))
+                                }).await {
+                                    Ok(Ok(wav)) => wav,
+                                    Ok(Err(error)) => {
+                                        let _ = events.send(GuiEvent::VoiceSendStatus { owner, runtime_id, message: format!("Không mã hóa được bản ghi âm: {error}") });
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                    Err(error) => {
+                                        let _ = events.send(GuiEvent::VoiceSendStatus { owner, runtime_id, message: format!("Tác vụ mã hóa âm thanh thất bại: {error}") });
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                };
                                 let s = session_clone.lock().await.clone();
                                 if !voice_send_session_matches(
                                     s.is_active(),

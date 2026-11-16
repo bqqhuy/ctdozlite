@@ -75,16 +75,13 @@ impl MessageStore {
         } else {
             Connection::open(path)?
         };
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(
-            schema <= 13,
-            "Database requires a newer application version"
-        );
+        anyhow::ensure!(schema <= 13, "Cơ sở dữ liệu cần phiên bản ứng dụng mới hơn");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT NOT NULL,
@@ -227,23 +224,8 @@ impl MessageStore {
         if schema < 12 {
             crate::message_lifecycle::migrate_v12(&conn)?;
         }
-        if schema < 13 {
-            let has_col: bool = conn
-                .prepare("PRAGMA table_info(threads)")
-                .ok()
-                .and_then(|mut s| {
-                    s.query_map([], |r| r.get::<_, String>(1))
-                        .ok()
-                        .map(|rows| rows.flatten().any(|c| c == "last_read_msg_id"))
-                })
-                .unwrap_or(false);
-            if !has_col {
-                let _ = conn.execute(
-                    "ALTER TABLE threads ADD COLUMN last_read_msg_id TEXT NOT NULL DEFAULT ''",
-                    [],
-                );
-            }
-            let _ = conn.execute("PRAGMA user_version = 13", []);
+        if schema <= 13 {
+            migrate_thread_read_cursor(&conn, schema < 13)?;
         }
         Ok(Self { conn })
     }
@@ -1474,6 +1456,237 @@ impl MessageStore {
         }
         crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
+    }
+}
+
+fn last_read_cursor_column(conn: &Connection) -> Result<Option<(String, bool, Option<String>)>> {
+    let mut statement = conn.prepare("PRAGMA table_info(threads)")?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == "last_read_msg_id" {
+            return Ok(Some((row.get(2)?, row.get::<_, bool>(3)?, row.get(4)?)));
+        }
+    }
+    Ok(None)
+}
+
+fn migrate_thread_read_cursor(conn: &Connection, bump_version: bool) -> Result<()> {
+    let migration = conn.unchecked_transaction()?;
+    let column = last_read_cursor_column(&migration)?;
+    if let Some((kind, not_null, default)) = column {
+        anyhow::ensure!(
+            kind.eq_ignore_ascii_case("TEXT") && not_null && default.as_deref() == Some("''"),
+            "Cột con trỏ đã đọc trong threads có cấu trúc không được hỗ trợ"
+        );
+    } else {
+        migration.execute(
+            "ALTER TABLE threads ADD COLUMN last_read_msg_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+
+    let column = last_read_cursor_column(&migration)?;
+    anyhow::ensure!(
+        column.is_some_and(|(kind, not_null, default)| {
+            kind.eq_ignore_ascii_case("TEXT") && not_null && default.as_deref() == Some("''")
+        }),
+        "Không thể xác minh cột con trỏ đã đọc sau khi nâng cấp cơ sở dữ liệu"
+    );
+    if bump_version {
+        migration.pragma_update(None, "user_version", 13)?;
+    }
+    migration.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod thread_read_cursor_migration_tests {
+    use super::*;
+
+    fn column_shape(conn: &Connection) -> Result<Option<(String, bool, Option<String>)>> {
+        last_read_cursor_column(conn)
+    }
+
+    #[test]
+    fn schema12_adds_cursor_atomically_and_keeps_thread_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads(thread_id TEXT PRIMARY KEY, name TEXT, is_group INTEGER, last_ts INTEGER);
+             INSERT INTO threads(thread_id,name,is_group,last_ts) VALUES('thread-1','kept',0,42);
+             PRAGMA user_version=12;",
+        )
+        .unwrap();
+
+        migrate_thread_read_cursor(&conn, true).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            column_shape(&conn).unwrap(),
+            Some(("TEXT".into(), true, Some("''".into())))
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT name,last_read_msg_id FROM threads WHERE thread_id='thread-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            ("kept".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn schema12_with_existing_cursor_is_validated_and_bumped() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads(thread_id TEXT PRIMARY KEY, last_read_msg_id TEXT NOT NULL DEFAULT '');
+             INSERT INTO threads(thread_id,last_read_msg_id) VALUES('thread-1','cursor-1');
+             PRAGMA user_version=12;",
+        )
+        .unwrap();
+
+        migrate_thread_read_cursor(&conn, true).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT last_read_msg_id FROM threads WHERE thread_id='thread-1'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "cursor-1"
+        );
+    }
+
+    #[test]
+    fn schema13_missing_cursor_is_repaired_without_changing_version_or_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads(thread_id TEXT PRIMARY KEY, name TEXT);
+             INSERT INTO threads(thread_id,name) VALUES('thread-1','kept');
+             PRAGMA user_version=13;",
+        )
+        .unwrap();
+
+        migrate_thread_read_cursor(&conn, false).unwrap();
+
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            column_shape(&conn).unwrap(),
+            Some(("TEXT".into(), true, Some("''".into())))
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT name,last_read_msg_id FROM threads WHERE thread_id='thread-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            ("kept".into(), String::new())
+        );
+    }
+
+    #[test]
+    fn schema13_with_invalid_cursor_shape_fails_without_version_or_data_change() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads(thread_id TEXT PRIMARY KEY, name TEXT, last_read_msg_id INTEGER);
+             INSERT INTO threads(thread_id,name,last_read_msg_id) VALUES('thread-1','kept',9);
+             PRAGMA user_version=13;",
+        )
+        .unwrap();
+
+        assert!(migrate_thread_read_cursor(&conn, false).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT name,last_read_msg_id FROM threads WHERE thread_id='thread-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            )
+            .unwrap(),
+            ("kept".into(), 9)
+        );
+    }
+
+    #[test]
+    fn migration_failure_altering_a_view_rolls_back_without_bumping_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE threads_data(thread_id TEXT PRIMARY KEY, name TEXT);
+             INSERT INTO threads_data(thread_id,name) VALUES('thread-1','kept');
+             CREATE VIEW threads AS SELECT thread_id,name FROM threads_data;
+             PRAGMA user_version=12;",
+        )
+        .unwrap();
+
+        assert!(migrate_thread_read_cursor(&conn, true).is_err());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            12
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT name FROM threads_data WHERE thread_id='thread-1'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "kept"
+        );
+        assert!(column_shape(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn open_rejects_newer_schema_before_creating_tables() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-schema-99-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        drop(conn);
+
+        assert!(MessageStore::open(&path).is_err());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            99
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 }
 

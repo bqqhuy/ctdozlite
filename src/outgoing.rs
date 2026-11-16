@@ -342,8 +342,12 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             sent.id = id;
         }
     }
-    sent.delivery = DeliveryState::ServerAccepted;
-    sent.outgoing_job = None;
+    if crate::chat::server_message_id(&sent).is_some() {
+        sent.delivery = sent.delivery.merge(DeliveryState::ServerAccepted);
+        sent.outgoing_job = None;
+    } else {
+        sent.delivery = sent.delivery.merge(DeliveryState::DeliveryUnknown);
+    }
     Ok(sent)
 }
 
@@ -663,6 +667,26 @@ pub(crate) fn failure_message(error: &anyhow::Error) -> String {
     format!("{error}. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin.")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SendFailureKind {
+    ExplicitlyRejected,
+    Unknown,
+}
+
+/// Classify only an explicit nonzero server mutation code as rejection.
+/// Transport and opaque response failures may have happened after acceptance.
+pub(crate) fn send_failure_kind(error: &anyhow::Error) -> SendFailureKind {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<crate::chat::ServerRejected>()
+            .is_some()
+    }) {
+        SendFailureKind::ExplicitlyRejected
+    } else {
+        SendFailureKind::Unknown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,5 +823,16 @@ mod persistence_tests {
             err_msg.contains("E2EE") || err_msg.contains("mã hóa"),
             "Error must clearly indicate E2EE failure: {err_msg}"
         );
+    }
+
+    #[test]
+    fn only_explicit_server_rejection_is_classified_as_rejected() {
+        let rejected = anyhow::Error::new(crate::chat::ServerRejected { code: Some(5) });
+        let timeout = anyhow::anyhow!("timeout after send");
+        assert_eq!(
+            send_failure_kind(&rejected),
+            SendFailureKind::ExplicitlyRejected
+        );
+        assert_eq!(send_failure_kind(&timeout), SendFailureKind::Unknown);
     }
 }

@@ -1,0 +1,19 @@
+{
+  "snapshot": "f0d3206e875d083c7f8a0a2e5c3ae6d14c2e45b9",
+  "method": "Python mirror of local src/crypto/safety.rs, not Rust binary execution",
+  "primary_source": "https://raw.githubusercontent.com/signalapp/libsignal/main/rust/protocol/src/fingerprint.rs",
+  "primary_source_lines": "148-190 algorithm; 205-217 keys/IDs/expected; 233-278 test",
+  "public_test_vector": {
+    "alice_djb_hex": "0506863bc66d02b40d27b8d49ca7c09e9239236f9d7d25d6fcca5ce13c7064d868",
+    "bob_djb_hex": "05f781b6fb32fed9ba1cf2de978d4d5da28dc34046ae814402b5c0dbd96fda907b",
+    "alice_stable_id": "+14152222222",
+    "bob_stable_id": "+14153333333",
+    "iterations": 5200,
+    "normalization": "Strip initial 0x05 DJB type from each 33-byte public key to raw32 for current local API",
+    "ids_used_by_local_algorithm": false
+  },
+  "current_local_algorithm_output": "293174380292842574899914978875101211575590763278798213874170",
+  "signal_official_expected": "300354477692869396892869876765458257569162576843440918079131",
+  "matches": false,
+  "scope": "Proves difference from published Signal vector; does not establish Zalo native expected output or a live exploit"
+}

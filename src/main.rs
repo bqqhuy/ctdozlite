@@ -314,11 +314,6 @@ async fn main() -> Result<()> {
 
     // Fetch initial threads and hydrate with local SQLite history
     let mut initial_threads = chat::load_threads_cache(&s);
-    store::load_history_into_threads(
-        s.history_path(),
-        &mut initial_threads,
-        store::MessageStore::PRELOAD_MSGS,
-    );
     if s.login.is_some() {
         match chat::get_friends(&s).await {
             Ok(list) => {
@@ -334,7 +329,7 @@ async fn main() -> Result<()> {
                 }
                 let mut poll_state = chat::PollState::default();
                 if let Err(e) =
-                    chat::poll_new_messages(&s, &mut poll_state, &mut initial_threads).await
+                    chat::receive_new_messages(&s, &mut poll_state, &mut initial_threads).await
                 {
                     crate::logger::log_error("main::poll_new_messages", &e.to_string());
                     eprintln!("! Lỗi tải tin nhắn gần nhất: {e}");

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "D1_upsert_snapshot_does_not_delete",
+    "visible_after_delete": 0,
+    "rows_after_rehydrate": 1,
+    "reproduced": true,
+    "kind": "SQLite control-flow model, not Rust execution"
+  },
+  {
+    "name": "D5_ignored_alter_can_advance_schema",
+    "alter_failed": true,
+    "version": 13,
+    "missing_column": true,
+    "reproduced": true,
+    "kind": "fault-injected SQLite model, not Rust execution"
+  }
+]

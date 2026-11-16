@@ -4,6 +4,8 @@ use super::*;
 #[derive(Default)]
 pub(super) struct ToolsPanel {
     pub open: bool,
+    /// One diagnostics-folder open at a time; cleared by its completion event.
+    pub diagnostics_opening: bool,
     pub loaded_for: String,
     pub config: crate::tools::Preferences,
     pub tasks: Vec<crate::tools::Scheduled>,
@@ -1221,9 +1223,24 @@ impl ZaloGuiApp {
         ui.label("Xem hoặc xuất nhật ký chẩn đoán giao thức mã hóa đầu cuối (E2EE) đã che thông tin nhạy cảm.");
         let diag_dir = crate::storage::root().join("diagnostics");
         ui.horizontal(|ui| {
-            if ui.button("📁 Mở thư mục nhật ký").clicked() {
-                let _ = std::fs::create_dir_all(&diag_dir);
-                crate::platform::open_folder(&diag_dir);
+            let opening = self.tools.diagnostics_opening;
+            let label = if opening {
+                "⏳ Đang mở thư mục…"
+            } else {
+                "📁 Mở thư mục nhật ký"
+            };
+            if ui.add_enabled(!opening, egui::Button::new(label)).clicked() {
+                // Disk and shell work never runs on the render/input path.
+                self.tools.diagnostics_opening = true;
+                self.status_msg = "Đang mở thư mục chẩn đoán…".into();
+                let dir = diag_dir.clone();
+                let tx = self.event_tx.clone();
+                let context = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let result = open_diagnostics_dir(&dir, crate::platform::open_folder);
+                    let _ = tx.send(GuiEvent::DiagnosticsFolderOpened(result));
+                    context.request_repaint();
+                });
             }
             if ui.button("📋 Sao chép đường dẫn").clicked() {
                 ui.output_mut(|o| o.copied_text = diag_dir.display().to_string());
@@ -1232,6 +1249,19 @@ impl ZaloGuiApp {
         });
     }
 }
+/// Background body of "open diagnostics folder"; every path ends in an explicit outcome.
+fn open_diagnostics_dir(
+    dir: &std::path::Path,
+    open: impl FnOnce(&std::path::Path) -> bool,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|_| "Không tạo được thư mục chẩn đoán".to_owned())?;
+    if open(dir) {
+        Ok(())
+    } else {
+        Err("Không mở được thư mục chẩn đoán".to_owned())
+    }
+}
+
 fn scheduled_time(text: &str, minutes: i64) -> Option<i64> {
     if text.trim().is_empty() {
         Some(crate::login::unix_now() + minutes.max(1) * 60)
@@ -1247,6 +1277,49 @@ use chrono::{TimeZone, Timelike};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ctdoz-diag-{tag}-{}",
+            crate::param_cipher::random_hex(12)
+        ))
+    }
+
+    #[test]
+    fn diagnostics_open_creates_missing_dir_then_reports_success() {
+        let dir = temp_dir("ok").join("nested thư mục");
+        let mut opened = None;
+        let result = open_diagnostics_dir(&dir, |path| {
+            opened = Some(path.to_path_buf());
+            true
+        });
+        assert_eq!(result, Ok(()));
+        assert!(dir.is_dir());
+        assert_eq!(opened.as_deref(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    fn diagnostics_open_reports_shell_failure_instead_of_silent_success() {
+        let dir = temp_dir("shell");
+        let result = open_diagnostics_dir(&dir, |_| false);
+        assert_eq!(result, Err("Không mở được thư mục chẩn đoán".to_owned()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diagnostics_open_reports_create_failure_without_calling_shell() {
+        let file = temp_dir("file");
+        std::fs::write(&file, b"x").unwrap();
+        let mut called = false;
+        let result = open_diagnostics_dir(&file.join("child"), |_| {
+            called = true;
+            true
+        });
+        assert_eq!(result, Err("Không tạo được thư mục chẩn đoán".to_owned()));
+        assert!(!called);
+        let _ = std::fs::remove_file(&file);
+    }
 
     #[test]
     fn test_tools_panel_initial_state() {

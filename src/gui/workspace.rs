@@ -238,40 +238,6 @@ impl ZaloGuiApp {
                         self.profile_menu_open = !self.profile_menu_open;
                     }
 
-                    // Account switcher dropdown
-                    if self.profile_menu_open && !self.profiles.is_empty() {
-                        let profiles_list: Vec<(&str, &crate::profiles::Profile)> = self
-                            .profiles
-                            .iter()
-                            .map(|profile| (profile.name.as_str(), profile))
-                            .collect();
-                        let active = profiles_list
-                            .iter()
-                            .find(|(_, p)| p.uid == self.user_uin)
-                            .map(|(_, p)| *p);
-                        if let Some(target_uid) =
-                            self.account_switcher.show(ui, active, &profiles_list)
-                        {
-                            if target_uid != self.user_uin {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::SwitchProfile {
-                                        owner: self.user_uin.clone(),
-                                        target_uid,
-                                    });
-                                }
-                            }
-                            self.profile_menu_open = false;
-                        }
-                    }
-
-                    if self.profile_menu_open && ui.button("Thêm tài khoản").clicked() {
-                        if let Some(tx) = WORKER_TX.get() {
-                            if tx.send(WorkerCmd::AddAccount).is_err() {
-                                self.show_toast("Không kết nối được bộ xử lý tài khoản");
-                            }
-                        }
-                        self.profile_menu_open = false;
-                    }
                     ui.add_space(18.0);
 
                     // Navigation Icon 1: Tin nhắn (All / Active Chat) with Unread Count Badge
@@ -3048,28 +3014,23 @@ impl ZaloGuiApp {
                                     self.forward_filter.clear();
                                 }
                                 BubbleAction::React(r) => {
-                                    if let Some(real) = self
+                                    let current = self
                                         .threads
-                                        .get_mut(self.selected_thread_index)
-                                        .and_then(|t| t.messages.get_mut(idx))
-                                    {
-                                        if real.reactions.contains(&r.to_string()) {
-                                            real.reactions.clear();
-                                            self.status_msg = "Đã bỏ cảm xúc".into();
-                                        } else {
-                                            real.reactions = vec![r.to_string()];
-                                            self.status_msg = format!("Đã thả cảm xúc {r}");
-                                        }
-                                    }
-                                    self.persist_threads_async();
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::React {
-                                            to_id: thread_id.clone(),
-                                            is_group,
-                                            msg: m,
-                                            reaction: r.to_string(),
-                                        });
-                                    }
+                                        .get(self.selected_thread_index)
+                                        .and_then(|t| t.messages.get(idx))
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let reaction = reaction_toggle_intent(
+                                        &current,
+                                        &self.user_uin,
+                                        r,
+                                    );
+                                    self.dispatch_reaction_intent(
+                                        &thread_id,
+                                        is_group,
+                                        m,
+                                        reaction,
+                                    );
                                 }
                                 BubbleAction::PinOnServer=>{self.pin_server_message(thread_id.clone(),is_group,m);}
                                 BubbleAction::Reminder => {self.open_server_board(thread_id.clone(),is_group,m.text.chars().take(4000).collect());}
@@ -3684,7 +3645,7 @@ impl ZaloGuiApp {
 
                                 // 8. Microphone Recording Button
                                 self.cancel_voice_if_thread_changed(&thread_id, is_group);
-                                let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
+                                let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
                                 let (mic_rect, mic_resp) = ui.allocate_exact_size(
                                     Vec2::new(32.0, 32.0),
                                     Sense::click(),
@@ -3708,7 +3669,7 @@ impl ZaloGuiApp {
                                     .on_hover_text(crate::i18n::tr("Thu âm & gửi tin nhắn thoại"))
                                     .clicked()
                                 {
-                                    self.toggle_voice_recorder();
+                                    self.toggle_voice_recorder(ui.ctx());
                                 }
                             });
 
@@ -3735,24 +3696,25 @@ impl ZaloGuiApp {
                                         self.composer_ime_active = ime_active;
                                         let mut enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
                                             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
-                                        let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
+                                        let voice_snapshot = self.voice_worker.as_ref().map(crate::voice::VoiceWorker::snapshot).unwrap_or_default();
+                                        let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
                                         let (response, cursor) = if is_voice_active {
-                                            let is_recording = self.voice_recorder.is_some();
-                                            let dur = if let Some(ref rec) = self.voice_recorder {
-                                                rec.duration()
+                                            let is_recording = voice_snapshot.recording || self.voice_start_pending;
+                                            let dur = if voice_snapshot.recording {
+                                                voice_snapshot.duration
                                             } else if let Some((_, _, ref d)) = self.recorded_voice_samples {
                                                 *d
                                             } else {
-                                                std::time::Duration::ZERO
+                                                voice_snapshot.duration
                                             };
                                             let fallback_wave = vec![0.3, 0.5, 0.8, 0.4, 0.6, 0.3, 0.7, 0.9, 0.5, 0.4];
-                                            let waveform = if let Some(ref rec) = self.voice_recorder {
-                                                rec.waveform()
+                                            let waveform = if voice_snapshot.recording {
+                                                voice_snapshot.waveform.clone()
                                             } else {
                                                 fallback_wave
                                             };
-                                            let is_preview_playing = self.voice_preview.as_ref().is_some_and(|p| p.is_playing());
-                                            let preview_samples = self.recorded_voice_samples.as_ref().map(|(s, r, _)| (s.clone(), *r));
+                                            let is_preview_playing = voice_snapshot.preview_playing;
+                                            let preview_samples = self.recorded_voice_samples.as_ref().map(|(s, r, _)| (std::sync::Arc::clone(s), *r));
 
                                             let mut action = VoiceBarAction::None;
                                             egui::ScrollArea::vertical()
@@ -3777,16 +3739,18 @@ impl ZaloGuiApp {
                                                 });
 
                                             match action {
-                                                VoiceBarAction::StopRecording => self.toggle_voice_recorder(),
+                                                VoiceBarAction::StopRecording => self.toggle_voice_recorder(ui.ctx()),
                                                 VoiceBarAction::CancelRecording => self.cancel_voice_recording(),
                                                 VoiceBarAction::StopPreview => {
-                                                    if let Some(prev) = self.voice_preview.take() {
-                                                        prev.stop();
+                                                    if let (Some(worker), Some(binding)) = (self.voice_worker.as_ref(), self.voice_binding.as_ref()) {
+                                                        let _ = worker.stop_preview(binding.generation);
                                                     }
                                                 }
                                                 VoiceBarAction::TogglePreview(samples, rate) => {
-                                                    if let Ok(prev) = crate::voice::VoicePreviewPlayer::play(samples, rate) {
-                                                        self.voice_preview = Some(prev);
+                                                    if let (Some(worker), Some(binding)) = (self.voice_worker.as_ref(), self.voice_binding.as_ref()) {
+                                                        if let Err(error) = worker.play_preview(binding.generation, samples, rate) {
+                                                            self.show_toast(error.to_string());
+                                                        }
                                                     }
                                                 }
                                                 VoiceBarAction::None => {}
@@ -3949,7 +3913,7 @@ impl ZaloGuiApp {
                                             self.sticker_picker_open = !self.sticker_picker_open;
                                         }
                                         // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
+                                        let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
                                         let can_send = is_voice_active || !self.input_message.trim().is_empty()
                                             || self.pending_clipboard_image.is_some() || self.attachment_drafts.len(&thread_id)>0;
                                         let (send_rect, send_resp) = ui.allocate_exact_size(
@@ -4268,6 +4232,46 @@ impl ZaloGuiApp {
                     is_group,
                 });
             }
+        }
+    }
+
+    fn dispatch_reaction_intent(
+        &mut self,
+        thread_id: &str,
+        is_group: bool,
+        message: ChatMessage,
+        reaction: String,
+    ) {
+        if !self.is_logged_in || self.user_uin.is_empty() {
+            return;
+        }
+        self.next_reaction_action_id = self.next_reaction_action_id.wrapping_add(1);
+        let intent_id = self.next_reaction_action_id;
+        let message_key = if message.id.is_empty() {
+            format!("ts:{}", message.ts)
+        } else {
+            message.id.clone()
+        };
+        let key = (thread_id.to_owned(), message_key);
+        self.pending_reaction_actions.insert(key.clone(), intent_id);
+        let owner = self.user_uin.clone();
+        let result = WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::React {
+                owner,
+                runtime_id: self.account_runtime_id,
+                intent_id,
+                to_id: thread_id.to_owned(),
+                is_group,
+                msg: message,
+                reaction,
+            })
+            .is_ok()
+        });
+        if !result {
+            if self.pending_reaction_actions.get(&key) == Some(&intent_id) {
+                self.pending_reaction_actions.remove(&key);
+            }
+            self.show_toast("Không thể gửi yêu cầu cảm xúc");
         }
     }
 
@@ -6670,18 +6674,29 @@ impl ZaloGuiApp {
                     .inner_margin(Margin::symmetric(12.0, 10.0))
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("🔒 Mã hóa đầu cuối (E2EE)")
+                            RichText::new("E2EE thử nghiệm · chưa xác minh với Zalo PC/Web")
                                 .size(12.5)
                                 .color(pal.text_primary)
                                 .strong(),
                         );
                         ui.add_space(4.0);
+                        let trial_enabled = crate::e2ee_trial::enabled();
+                        let peer_trial_enabled = self.trial_peers.contains(d_id);
+                        ui.label(
+                            RichText::new(e2ee_drawer_status(
+                                d_is_group,
+                                trial_enabled,
+                                peer_trial_enabled,
+                            ))
+                            .size(11.0)
+                            .color(pal.text_secondary),
+                        );
                         let is_trusted = self.trusted_peers.contains(d_id);
                         ui.label(
                             RichText::new(if is_trusted {
-                                "✓ Mã an toàn đã được xác minh. Cuộc trò chuyện được bảo vệ toàn diện."
+                                "Danh tính khóa của đối phương đã được xác minh; điều này không xác nhận mọi tin nhắn hoặc tệp được mã hóa."
                             } else {
-                                "Tin nhắn được bảo vệ theo giao thức mã hóa Zalo."
+                                "Danh tính khóa của đối phương chưa được xác minh."
                             })
                             .size(11.0)
                             .color(pal.text_secondary),
@@ -6973,14 +6988,7 @@ impl ZaloGuiApp {
         });
         ctx.data_mut(|data| data.insert_temp(Id::new("reaction_details_filter"), selected));
         if clear {
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::React {
-                    to_id: thread_id.clone(),
-                    is_group: group,
-                    msg: message,
-                    reaction: String::new(),
-                });
-            }
+            self.dispatch_reaction_intent(&thread_id, group, message, String::new());
         }
         if !open {
             ctx.data_mut(|data| {
@@ -7039,16 +7047,20 @@ impl ZaloGuiApp {
         }
     }
 
-    fn toggle_voice_recorder(&mut self) {
-        if self.voice_recorder.is_some() {
-            self.cancel_voice_if_context_changed();
-            if self.voice_recorder.is_none() {
+    fn toggle_voice_recorder(&mut self, ctx: &egui::Context) {
+        if self.voice_binding.is_some() {
+            if self.voice_finish_pending {
                 return;
             }
-            let rec = self.voice_recorder.take().unwrap();
-            let (samples, rate, dur) = rec.finish();
-            if !samples.is_empty() && dur.as_secs_f32() >= 0.3 {
-                self.recorded_voice_samples = Some((samples, rate, dur));
+            self.cancel_voice_if_context_changed();
+            if self.voice_binding.is_none() {
+                return;
+            }
+            if let Some(worker) = self.voice_worker.as_ref() {
+                match worker.finish(self.voice_context_generation, false) {
+                    Ok(()) => self.voice_finish_pending = true,
+                    Err(error) => self.show_toast(error.to_string()),
+                }
             }
         } else {
             let Some(thread) = self.threads.get(self.selected_thread_index) else {
@@ -7064,33 +7076,134 @@ impl ZaloGuiApp {
                 is_group: thread.is_group,
                 generation: self.voice_context_generation,
             };
-            if let Some(prev) = self.voice_preview.take() {
-                prev.stop();
-            }
+            let thread_id = thread.id.clone();
+            let is_group = thread.is_group;
             self.recorded_voice_samples = None;
             self.voice_binding = Some(binding);
-            match crate::voice::VoiceRecorder::start() {
-                Ok(rec) => {
-                    self.voice_recorder = Some(rec);
-                }
-                Err(e) => {
-                    self.voice_binding = None;
-                    self.status_msg = format!("Lỗi bật micro: {e}");
+            self.voice_finish_pending = false;
+            self.voice_send_after_finish = false;
+            if self.voice_worker.is_none() {
+                match crate::voice::VoiceWorker::new(ctx.clone()) {
+                    Ok(worker) => self.voice_worker = Some(worker),
+                    Err(error) => {
+                        self.voice_binding = None;
+                        self.show_toast(error.to_string());
+                        return;
+                    }
                 }
             }
+            if let Some(worker) = self.voice_worker.as_ref() {
+                if let Err(e) = worker.start(self.voice_context_generation) {
+                    self.show_toast(format!("Lỗi bật micro: {e}"));
+                    self.voice_binding = None;
+                } else {
+                    self.voice_start_pending = true;
+                }
+            }
+            self.cancel_voice_if_thread_changed(&thread_id, is_group);
         }
     }
 
     pub(super) fn cancel_voice_recording(&mut self) {
-        if let Some(rec) = self.voice_recorder.take() {
-            rec.cancel();
-        }
-        if let Some(prev) = self.voice_preview.take() {
-            prev.stop();
+        let generation = self.voice_context_generation;
+        self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
+        if let Some(worker) = self.voice_worker.as_ref() {
+            let _ = worker.cancel(generation);
         }
         self.recorded_voice_samples = None;
         self.voice_binding = None;
-        self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
+        self.voice_start_pending = false;
+        self.voice_finish_pending = false;
+        self.voice_send_after_finish = false;
+    }
+
+    pub(super) fn poll_voice_events(&mut self) {
+        let events = self
+            .voice_worker
+            .as_ref()
+            .map(|worker| worker.try_events().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in events {
+            match event {
+                crate::voice::VoiceEvent::Finished {
+                    generation,
+                    samples,
+                    sample_rate,
+                    duration,
+                    limit_reached,
+                    send_after_finish,
+                } => {
+                    let current_binding = self.voice_binding.as_ref().is_some_and(|binding| {
+                        binding.generation == generation
+                            && binding.matches(
+                                &self.user_uin,
+                                self.account_runtime_id,
+                                self.threads
+                                    .get(self.selected_thread_index)
+                                    .map(|thread| thread.id.as_str())
+                                    .unwrap_or_default(),
+                                self.threads
+                                    .get(self.selected_thread_index)
+                                    .is_some_and(|thread| thread.is_group),
+                                self.voice_context_generation,
+                            )
+                    });
+                    if !current_binding {
+                        continue;
+                    }
+                    self.voice_start_pending = false;
+                    self.voice_finish_pending = false;
+                    self.voice_send_after_finish = false;
+                    if limit_reached {
+                        self.show_toast(
+                            "Đã đạt giới hạn thu âm 5 phút hoặc 64 MiB; bản ghi đã dừng",
+                        );
+                    }
+                    if send_after_finish {
+                        if samples.is_empty() || duration.as_secs_f32() < 0.3 {
+                            self.voice_binding = None;
+                            self.show_toast("Bản ghi quá ngắn để gửi");
+                        } else {
+                            self.send_voice_samples(samples, sample_rate, duration);
+                        }
+                    } else if !samples.is_empty() && duration.as_secs_f32() >= 0.3 {
+                        self.recorded_voice_samples = Some((samples, sample_rate, duration));
+                    } else {
+                        self.voice_binding = None;
+                        self.show_toast("Bản ghi quá ngắn; hãy giữ để thu âm lâu hơn");
+                    }
+                }
+                crate::voice::VoiceEvent::Failed {
+                    generation,
+                    message,
+                } => {
+                    if self
+                        .voice_binding
+                        .as_ref()
+                        .is_none_or(|binding| binding.generation != generation)
+                    {
+                        continue;
+                    }
+                    self.voice_start_pending = false;
+                    self.voice_finish_pending = false;
+                    self.voice_binding = None;
+                    self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
+                    self.show_toast(format!("Lỗi bật micro: {message}"));
+                }
+                crate::voice::VoiceEvent::PreviewFailed {
+                    generation,
+                    message,
+                } => {
+                    if self
+                        .voice_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.generation == generation)
+                    {
+                        self.show_toast(format!("Không phát được bản ghi âm: {message}"));
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn send_voice_recording(&mut self, thread_id: &str, is_group: bool) {
@@ -7099,32 +7212,75 @@ impl ZaloGuiApp {
             self.status_msg = "Bản ghi âm đã bị hủy do tài khoản hoặc hội thoại thay đổi".into();
             return;
         }
-        let (samples, rate, dur) = if let Some((s, r, d)) = self.recorded_voice_samples.take() {
-            (s, r, d)
-        } else if let Some(rec) = self.voice_recorder.take() {
-            rec.finish()
-        } else {
+        if self.recorded_voice_samples.is_none() {
+            if self.voice_finish_pending || self.voice_send_after_finish {
+                return;
+            }
+            if let Some(worker) = self.voice_worker.as_ref() {
+                match worker.finish(self.voice_context_generation, true) {
+                    Ok(()) => {
+                        self.voice_finish_pending = true;
+                        self.voice_send_after_finish = true;
+                        return;
+                    }
+                    Err(error) => self.show_toast(error.to_string()),
+                }
+            }
+            return;
+        }
+        let (samples, rate, dur) = self.recorded_voice_samples.take().unwrap();
+        self.send_voice_samples(samples, rate, dur);
+    }
+
+    fn send_voice_samples(
+        &mut self,
+        samples: std::sync::Arc<[f32]>,
+        rate: u32,
+        dur: std::time::Duration,
+    ) {
+        if !self.voice_draft_matches(
+            &self.user_uin,
+            self.account_runtime_id,
+            self.threads
+                .get(self.selected_thread_index)
+                .map(|t| t.id.as_str())
+                .unwrap_or_default(),
+            self.threads
+                .get(self.selected_thread_index)
+                .is_some_and(|t| t.is_group),
+        ) {
+            self.cancel_voice_recording();
+            return;
+        }
+        let binding = self.voice_binding.clone();
+        let Some(binding) = binding else {
             return;
         };
-        if let Some(prev) = self.voice_preview.take() {
-            prev.stop();
+        let Some(tx) = WORKER_TX.get() else {
+            self.show_toast("Không kết nối được bộ xử lý tin nhắn thoại");
+            self.recorded_voice_samples = Some((samples, rate, dur));
+            return;
+        };
+        let result = tx.send(WorkerCmd::SendVoiceMessage {
+            owner: binding.owner.clone(),
+            runtime_id: binding.runtime_id,
+            to_id: binding.thread_id.clone(),
+            is_group: binding.is_group,
+            samples: std::sync::Arc::clone(&samples),
+            sample_rate: rate,
+            duration_secs: dur.as_secs().max(1) as u32,
+        });
+        if result.is_err() {
+            self.show_toast("Không thể xếp tin nhắn thoại để gửi");
+            self.recorded_voice_samples = Some((samples, rate, dur));
+        } else {
+            if let Some(worker) = self.voice_worker.as_ref() {
+                let _ = worker.cancel(binding.generation);
+            }
+            self.voice_binding = None;
+            self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
+            self.status_msg = "Đang gửi tin nhắn thoại…".into();
         }
-        self.voice_binding = None;
-        self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
-        let resampled = crate::voice::resample_to_16k(&samples, rate);
-        let wav = crate::voice::pcm_to_wav(&resampled, crate::voice::VOICE_SAMPLE_RATE);
-        let duration_secs = dur.as_secs().max(1) as u32;
-        if let Some(tx) = WORKER_TX.get() {
-            let _ = tx.send(WorkerCmd::SendVoiceMessage {
-                owner: self.user_uin.clone(),
-                runtime_id: self.account_runtime_id,
-                to_id: thread_id.to_string(),
-                is_group,
-                wav_bytes: wav,
-                duration_secs,
-            });
-        }
-        self.status_msg = "Đang gửi tin nhắn thoại…".into();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7136,7 +7292,7 @@ impl ZaloGuiApp {
         dur: std::time::Duration,
         waveform: &[f32],
         is_preview_playing: bool,
-        preview_samples: Option<(Vec<f32>, u32)>,
+        preview_samples: Option<(std::sync::Arc<[f32]>, u32)>,
     ) -> VoiceBarAction {
         let mut action = VoiceBarAction::None;
         ui.allocate_ui_with_layout(
@@ -7223,8 +7379,35 @@ enum VoiceBarAction {
     None,
     StopRecording,
     CancelRecording,
-    TogglePreview(Vec<f32>, u32),
+    TogglePreview(std::sync::Arc<[f32]>, u32),
     StopPreview,
+}
+
+fn reaction_toggle_intent(message: &ChatMessage, owner: &str, emoji: &str) -> String {
+    let owned_reaction = message.reaction_summaries.iter().any(|summary| {
+        summary.emoji == emoji && summary.reactor_ids.iter().any(|reactor| reactor == owner)
+    });
+    if owned_reaction {
+        String::new()
+    } else {
+        emoji.to_owned()
+    }
+}
+
+fn e2ee_drawer_status(
+    is_group: bool,
+    experiment_enabled: bool,
+    peer_enabled: bool,
+) -> &'static str {
+    if is_group {
+        "E2EE nhóm chưa được hỗ trợ hoặc xác minh; không có trạng thái bảo vệ đầu cuối cho nhóm này."
+    } else if !experiment_enabled {
+        "Thử nghiệm E2EE đang tắt. Ứng dụng chưa xác minh cơ chế này tương thích Zalo PC/Web."
+    } else if !peer_enabled {
+        "Thử nghiệm đang bật cho ứng dụng nhưng chưa được yêu cầu cho hội thoại này."
+    } else {
+        "Đã yêu cầu thử gửi mã hóa cho tin văn bản mới. Tương thích Zalo PC/Web và mã hóa media chưa được xác minh."
+    }
 }
 
 #[cfg(test)]
@@ -7255,5 +7438,41 @@ mod tests {
         // Invalidation: simulating message mutation or recall
         heights.retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
         assert!(heights.is_empty());
+    }
+
+    #[test]
+    fn repeated_own_reaction_becomes_clear_intent_but_peer_reaction_does_not() {
+        let mut message = ChatMessage {
+            reaction_summaries: vec![crate::reactions::ReactionSummary {
+                emoji: "👍".into(),
+                count: 1,
+                reactor_ids: vec!["peer-1".into()],
+                count_is_lower_bound: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(reaction_toggle_intent(&message, "owner-1", "👍"), "👍");
+
+        message.reaction_summaries[0]
+            .reactor_ids
+            .push("owner-1".into());
+        assert_eq!(reaction_toggle_intent(&message, "owner-1", "👍"), "");
+    }
+
+    #[test]
+    fn e2ee_drawer_never_claims_group_or_unverified_conversation_protection() {
+        assert!(e2ee_drawer_status(true, true, true).contains("chưa được hỗ trợ"));
+        assert!(e2ee_drawer_status(false, false, true).contains("đang tắt"));
+        assert!(e2ee_drawer_status(false, true, false).contains("chưa được yêu cầu"));
+        assert!(e2ee_drawer_status(false, true, true).contains("Đã yêu cầu thử gửi"));
+        for status in [
+            e2ee_drawer_status(true, true, true),
+            e2ee_drawer_status(false, false, false),
+            e2ee_drawer_status(false, true, true),
+        ] {
+            assert!(!status.contains("được bảo vệ toàn diện"));
+        }
     }
 }

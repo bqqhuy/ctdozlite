@@ -221,6 +221,10 @@ pub const STICKER_LEGACY: &str = "https://tt-sticker-wpa.zaloapp.com";
 /// Canonical compatibility endpoint; changing callers must preserve the selected service.
 pub const STICKER_COMPAT: &str = "https://sticker-wpa.chat.zalo.me";
 
+/// Sticker catalogue CDN used only when the category-list response omits `dataUrl`.
+/// A server-supplied `dataUrl` always takes precedence.
+pub const STICKER_CATALOG_FALLBACK: &str = "https://zalo-api.zadn.vn/api/emoticon/pcweb/getAllCate";
+
 /// Canonical compatibility endpoint; changing callers must preserve the selected service.
 pub const CHAT: &str = "https://tt-chat-wpa.chat.zalo.me";
 

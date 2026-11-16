@@ -273,7 +273,7 @@ impl E2eeManager {
         let (key, _) = self
             .get_trusted_identity(peer_id)?
             .context("Chưa có khóa danh tính đối phương")?;
-        let actual = self.safety_number(&key)?;
+        let actual = self.safety_number(peer_id, &key)?;
         anyhow::ensure!(
             actual == expected,
             "Khóa đối phương đã thay đổi; hãy mở lại mã an toàn"
@@ -288,10 +288,18 @@ impl E2eeManager {
         store::is_identity_verified(&self.conn, &self.profile_id, peer_id)
     }
 
-    /// Safety number between our identity and the peer's identity.
-    pub fn safety_number(&self, peer_identity: &[u8; 32]) -> Result<String> {
+    /// Identifier-bound display fingerprint for this account and a peer.
+    /// # Errors
+    /// Returns key-store failures or invalid stable identifiers. Zalo native
+    /// fingerprint parity remains unverified; the production boundary stays closed.
+    pub fn safety_number(&self, peer_id: &str, peer_identity: &[u8; 32]) -> Result<String> {
         let ours = self.identity()?;
-        super::safety::safety_number(&ours.dh.public, peer_identity)
+        super::safety::safety_number_with_identifiers(
+            &self.profile_id,
+            &ours.dh.public,
+            peer_id,
+            peer_identity,
+        )
     }
 
     /// Build a `PreKeyWhisperMessage` for a peer using a freshly fetched bundle.
@@ -550,31 +558,20 @@ impl E2eeManager {
 
 /// Verify the peer's signed prekey signature with the peer's identity key.
 ///
-/// The Zalo bundle exposes a single `identityKey`; the signature scheme used by
-/// the official client could not be confirmed live, so this check accepts the
-/// Ed25519 form and otherwise reports "not verifiable" instead of failing the
-/// session outright.
+/// Only the local model's XEdDSA signature under the DH identity is supported.
+/// A separate signing-key hint cannot replace that identity without an
+/// authenticated binding contract (ADR-0038). Official Zalo parity is unknown.
 pub fn verify_signed_prekey(remote: &super::prekey::RemoteBundle) -> bool {
-    let identity = remote.signing_identity_key.unwrap_or(remote.identity_key);
-    let djb_bytes = super::keystore::to_djb_bytes(&remote.signed_pre_key);
-
-    // 1. Try XEdDSA verification against Curve25519 identity key (Signal Protocol / Zalo PC parity)
-    if super::keystore::xeddsa_verify(&identity, &djb_bytes, &remote.signature) {
-        return true;
-    }
-    if super::keystore::xeddsa_verify(&identity, &remote.signed_pre_key, &remote.signature) {
-        return true;
-    }
-
-    // 2. Fall back to Ed25519 verifying key for legacy fixtures
-    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&identity) else {
+    if remote
+        .signing_identity_key
+        .is_some_and(|hint| hint != remote.identity_key)
+    {
         return false;
-    };
-    let sig = ed25519_dalek::Signature::from_bytes(&remote.signature);
-    if vk.verify_strict(&remote.signed_pre_key, &sig).is_ok() {
-        return true;
     }
-    vk.verify_strict(&djb_bytes, &sig).is_ok()
+    let identity = &remote.identity_key;
+    let djb_bytes = super::keystore::to_djb_bytes(&remote.signed_pre_key);
+    super::keystore::xeddsa_verify(identity, &djb_bytes, &remote.signature)
+        || super::keystore::xeddsa_verify(identity, &remote.signed_pre_key, &remote.signature)
 }
 
 fn now_ms() -> i64 {
@@ -672,12 +669,9 @@ mod tests {
         assert!(bob.decrypt("alice", &ct).is_err());
     }
 
-    /// Audit A03 regression: a *validly signed* bundle fixture must survive the
-    /// production serialize → `parse_bundle` → `verify_signed_prekey` path.
-    ///
-    /// The Ed25519 signing key travels in `signingIdentityKey`, separate from
-    /// the Curve25519 DH identity key (audit A04) — without it the verifier
-    /// falls back to the DH key and fails even on a correctly signed bundle.
+    /// A local XEdDSA fixture survives serialization and the parser/verifier path.
+    /// The optional signing hint repeats the DH identity; it is not an
+    /// independently authenticated Ed25519 credential or a server schema proof.
     #[test]
     fn parsed_bundle_signature_verifies_through_production_path() {
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -705,12 +699,45 @@ mod tests {
     }
 
     #[test]
+    fn replacing_dh_identity_cannot_reuse_an_independent_signing_hint() {
+        let alice = manager("binding-alice");
+        let bob = manager("binding-bob");
+        let mut remote = peer_bundle(&bob);
+        assert!(verify_signed_prekey(&remote));
+        let bound_identity = remote.identity_key;
+        remote.identity_key = manager("binding-other").identity().unwrap().dh.public;
+        assert_eq!(remote.signing_identity_key, Some(bound_identity));
+        assert!(!verify_signed_prekey(&remote));
+        assert!(alice
+            .start_session("binding-bob", &remote, b"synthetic")
+            .is_err());
+        assert!(alice.load_session("binding-bob").unwrap().is_none());
+        assert!(alice.get_trusted_identity("binding-bob").unwrap().is_none());
+        let receipts: i64 = alice
+            .conn
+            .query_row(
+                "SELECT count(*) FROM seen_base_key WHERE profile_id=?1 AND peer_id=?2",
+                rusqlite::params![alice.profile_id(), "binding-bob"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipts, 0);
+        remote.identity_key = bound_identity;
+        remote.signing_identity_key = None;
+        assert!(verify_signed_prekey(&remote));
+    }
+
+    #[test]
     fn safety_number_is_stable_for_a_peer() {
         let alice = manager("alice4");
         let bob = manager("bob4");
         let bob_identity = bob.identity().unwrap();
-        let a = alice.safety_number(&bob_identity.dh.public).unwrap();
-        let b = alice.safety_number(&bob_identity.dh.public).unwrap();
+        let a = alice
+            .safety_number("bob4", &bob_identity.dh.public)
+            .unwrap();
+        let b = alice
+            .safety_number("bob4", &bob_identity.dh.public)
+            .unwrap();
         assert_eq!(a, b);
         assert_eq!(a.split(' ').count(), 12);
     }
@@ -955,12 +982,12 @@ mod tests {
         assert!(manager.verify_identity("missing").is_err());
         assert!(manager.get_trusted_identity("missing").unwrap().is_none());
         manager.trust_identity("peer", &[7; 32]).unwrap();
-        let displayed = manager.safety_number(&[7; 32]).unwrap();
+        let displayed = manager.safety_number("peer", &[7; 32]).unwrap();
         manager.trust_identity("peer", &[8; 32]).unwrap();
         assert!(manager.verify_identity_number("peer", &displayed).is_err());
         assert!(!manager.is_identity_verified("peer").unwrap());
         manager
-            .verify_identity_number("peer", &manager.safety_number(&[8; 32]).unwrap())
+            .verify_identity_number("peer", &manager.safety_number("peer", &[8; 32]).unwrap())
             .unwrap();
         assert!(manager.is_identity_verified("peer").unwrap());
     }

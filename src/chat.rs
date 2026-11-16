@@ -1720,7 +1720,9 @@ pub(crate) fn confirmed_mutation(mut response: Value) -> Result<Value> {
         .get("error_code")
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         .context("Máy chủ chưa xác nhận thao tác; kiểm tra hội thoại trước khi thử lại")?;
-    anyhow::ensure!(code == 0, "server error {code}: thao tác bị từ chối");
+    if code != 0 {
+        return Err(ServerRejected { code: Some(code) }.into());
+    }
     if let Some(text) = response.get("data").and_then(Value::as_str) {
         response["data"] = serde_json::from_str(text)
             .context("Không đọc được xác nhận thao tác; chưa thay đổi dữ liệu cục bộ")?;
@@ -1732,13 +1734,31 @@ pub(crate) fn confirmed_mutation(mut response: Value) -> Result<Value> {
         "Máy chủ chưa xác nhận thao tác; chưa thay đổi dữ liệu cục bộ"
     );
     if let Some(code) = response.pointer("/data/error_code") {
-        anyhow::ensure!(
-            code.as_i64().or_else(|| code.as_str()?.parse().ok()) == Some(0),
-            "Máy chủ từ chối thao tác"
-        );
+        let code = code
+            .as_i64()
+            .or_else(|| code.as_str().and_then(|v| v.parse().ok()));
+        if code != Some(0) {
+            return Err(ServerRejected { code }.into());
+        }
     }
     Ok(response)
 }
+
+#[derive(Debug)]
+pub(crate) struct ServerRejected {
+    pub(crate) code: Option<i64>,
+}
+
+impl std::fmt::Display for ServerRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.code {
+            Some(code) => write!(formatter, "server error {code}: thao tác bị từ chối"),
+            None => formatter.write_str("Máy chủ từ chối thao tác"),
+        }
+    }
+}
+
+impl std::error::Error for ServerRejected {}
 
 /// Read a confirmed server message ID without treating a client reference or zero as one.
 pub(crate) fn sent_server_id(response: &Value) -> String {
@@ -3234,6 +3254,44 @@ pub struct StickerItem {
     pub label: String,
 }
 
+/// Server `dataUrl` wins; otherwise the canonical fallback from `endpoints`. Plain
+/// `http://` is upgraded exactly as before.
+fn sticker_catalog_url(data: &Value) -> String {
+    data.get("dataUrl")
+        .and_then(Value::as_str)
+        .unwrap_or(crate::endpoints::STICKER_CATALOG_FALLBACK)
+        .replace("http://", "https://")
+}
+
+#[cfg(test)]
+mod sticker_catalog_url_tests {
+    use super::*;
+
+    #[test]
+    fn server_data_url_takes_precedence_and_is_upgraded() {
+        let data = serde_json::json!({ "dataUrl": "http://cdn.example.invalid/cate.json" });
+        assert_eq!(
+            sticker_catalog_url(&data),
+            "https://cdn.example.invalid/cate.json"
+        );
+    }
+
+    #[test]
+    fn missing_or_non_string_data_url_uses_canonical_fallback() {
+        for data in [serde_json::json!({}), serde_json::json!({ "dataUrl": 7 })] {
+            assert_eq!(
+                sticker_catalog_url(&data),
+                crate::endpoints::STICKER_CATALOG_FALLBACK
+            );
+        }
+        assert_eq!(
+            crate::endpoints::STICKER_CATALOG_FALLBACK,
+            "https://zalo-api.zadn.vn/api/emoticon/pcweb/getAllCate",
+            "refactor must not change the fallback request target"
+        );
+    }
+}
+
 /// Fetch the complete Zalo Sticker Store catalog (`getStickerCatsV2` -> `getAllCate` in `compact-app-pc.js:14288962`).
 ///
 /// Returns ~390 official Zalo sticker packs sorted by newest/featured first and caches them to
@@ -3290,11 +3348,7 @@ pub async fn fetch_sticker_store_packs(s: &Session) -> Result<Vec<StickerPackInf
         .map(|arr| arr.iter().filter_map(Value::as_u64).collect())
         .unwrap_or_default();
 
-    let data_url = data
-        .get("dataUrl")
-        .and_then(Value::as_str)
-        .unwrap_or("https://zalo-api.zadn.vn/api/emoticon/pcweb/getAllCate")
-        .replace("http://", "https://");
+    let data_url = sticker_catalog_url(data);
 
     let cdn_resp = s.http.get(&data_url).send().await?;
     let raw_bytes =
@@ -5642,8 +5696,8 @@ pub async fn poll_new_messages(
 
 /// Receive and merge network updates without writing history or cache.
 /// # Errors
-/// Returns authentication errors. GUI callers persist the batch before committing cursors.
-pub(crate) async fn receive_new_messages(
+/// Returns authentication or transport errors. Callers own persistence and cursor commits.
+pub async fn receive_new_messages(
     s: &Session,
     state: &mut PollState,
     threads: &mut Vec<Thread>,
@@ -6124,8 +6178,11 @@ fn parse_chat_message_in_context(
         .map(str::to_string)
         .unwrap_or_else(|| uid_from.clone());
 
+    // The caller's account UID resolves self messages when the wire omits direction flags.
     let is_outgoing = uid_from == "0"
         || uid_from.is_empty()
+        || profile_id
+            .is_some_and(|account_uid| !account_uid.is_empty() && uid_from.as_str() == account_uid)
         || it
             .get("isOutgoing")
             .and_then(Value::as_bool)
@@ -7980,6 +8037,18 @@ mod send_ack_tests {
             assert!(confirmed_send(response).is_err());
         }
         assert!(confirmed_send(json!({"error_code":0,"data":{"msgId":"msg-1"}})).is_ok());
+        let rejected = confirmed_mutation(json!({"error_code":91,"data":{}})).unwrap_err();
+        assert_eq!(rejected.to_string(), "server error 91: thao tác bị từ chối");
+        assert_eq!(
+            rejected.downcast_ref::<ServerRejected>().unwrap().code,
+            Some(91)
+        );
+        let nested =
+            confirmed_mutation(json!({"error_code":0,"data":{"error_code":92}})).unwrap_err();
+        assert_eq!(
+            nested.downcast_ref::<ServerRejected>().unwrap().code,
+            Some(92)
+        );
         let response =
             confirmed_send(json!({"error_code":"0","data":"{\"msgId\":\"msg-1\"}"})).unwrap();
         assert_eq!(response["data"]["msgId"], "msg-1");
@@ -8002,6 +8071,90 @@ mod send_ack_tests {
         assert_eq!(message.sender, "user-1");
         assert_eq!(message.text, "hello");
         assert_eq!(message.delivery, crate::message_model::DeliveryState::Read);
+    }
+}
+
+#[cfg(test)]
+mod own_uid_direction_tests {
+    use super::*;
+
+    fn message(sender: &str, recipient: &str) -> Value {
+        json!({
+            "msgId": "server-1",
+            "cliMsgId": "123",
+            "msgType": "webchat",
+            "uidFrom": sender,
+            "idTo": recipient,
+            "content": "hello"
+        })
+    }
+
+    #[test]
+    fn account_uid_marks_new_direct_and_group_messages_outgoing() {
+        let direct =
+            parse_chat_message_with_profile(&message("account-1", "peer-1"), Some("account-1"))
+                .unwrap();
+        assert!(direct.is_outgoing);
+
+        let group = json!({
+            "msgId": "group-server-1",
+            "msgType": "webchat",
+            "isGroup": true,
+            "uidFrom": "account-1",
+            "idTo": "group-1",
+            "content": "hello"
+        });
+        assert!(
+            parse_chat_message_with_profile(&group, Some("account-1"))
+                .unwrap()
+                .is_outgoing
+        );
+    }
+
+    #[test]
+    fn peer_and_context_free_messages_keep_existing_direction_rules() {
+        let peer =
+            parse_chat_message_with_profile(&message("peer-1", "account-1"), Some("account-1"))
+                .unwrap();
+        assert!(!peer.is_outgoing);
+
+        let without_context =
+            parse_chat_message_with_profile(&message("account-1", "peer-1"), None).unwrap();
+        assert!(!without_context.is_outgoing);
+    }
+
+    #[test]
+    fn account_uid_direction_survives_preview_insert_and_echo_merge() {
+        let wire = message("account-1", "peer-1");
+        let response = json!({
+            "data": {
+                "conversations": [{
+                    "id": "peer-1",
+                    "messages": [wire]
+                }]
+            }
+        });
+        let mut threads = vec![Thread {
+            id: "peer-1".into(),
+            ..Default::default()
+        }];
+        merge_previews_with_profile(&mut threads, &response, Some("account-1"));
+        assert_eq!(threads[0].messages.len(), 1);
+        assert!(threads[0].messages[0].is_outgoing);
+
+        let optimistic = ChatMessage {
+            id: "out_123".into(),
+            client_message_id: "123".into(),
+            sender: "Me".into(),
+            text: "hello".into(),
+            is_outgoing: true,
+            ..Default::default()
+        };
+        threads[0].messages = vec![optimistic];
+        merge_previews_with_profile(&mut threads, &response, Some("account-1"));
+        assert_eq!(threads[0].messages.len(), 1);
+        assert_eq!(threads[0].messages[0].id, "server-1");
+        assert!(threads[0].messages[0].is_outgoing);
     }
 }
 
