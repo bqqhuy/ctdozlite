@@ -265,6 +265,10 @@ pub const WS_PRIMARY: &str = "wss://ws1-msg.chat.zalo.me";
 pub fn builtin_sticker_thumbnail(id: impl std::fmt::Display) -> String {
     format!("https://stc-chat.zdn.vn/images/stickers/default/thumb/{id}.png")
 }
+/// Public animated sprite sheet endpoint for Zalo stickers.
+pub fn sticker_sprite_url(id: impl std::fmt::Display) -> String {
+    format!("https://zalo-api.zadn.vn/api/emoticon/sprite?eid={id}&size=130")
+}
 /// Public legacy image for a sticker id.
 pub fn legacy_sticker_image(id: impl std::fmt::Display) -> String {
     format!("https://api.zaloapp.com/api/emoticon/sticker/webpc?eid={id}&size=130")
