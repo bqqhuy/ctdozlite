@@ -31,7 +31,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use serde_json::Value;
 
 use crate::chat::{self, ChatMessage, StickerItem, StickerPackInfo, Thread};
 use crate::logger::{self, FindingLevel};
@@ -92,6 +91,7 @@ enum Overlay {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromptKind {
     Attachment,
+    HiddenPin,
 }
 
 struct PromptState {
@@ -134,8 +134,7 @@ enum BgEvent {
     PollFailed(String),
     ThreadsRefreshed(Vec<Thread>),
     HistoryLoaded {
-        thread_id: String,
-        resp: Value,
+        thread: Thread,
     },
     MessageSent {
         thread_id: String,
@@ -155,12 +154,68 @@ enum BgEvent {
     },
     DeleteDone {
         thread_id: String,
-        msg_id: String,
+        deleted: DeletedIdentity,
+        result: std::result::Result<(), String>,
     },
+    HiddenStateChanged(std::result::Result<(), String>),
     StickerPacks(Vec<StickerPackInfo>),
     StickerItems(Vec<StickerItem>),
     SendFailed(String),
     ActionFailed(String),
+}
+
+#[derive(Clone)]
+struct DeletedIdentity {
+    msg_id: String,
+    client_message_id: String,
+    is_local: bool,
+    is_outgoing: bool,
+    sender_id: String,
+}
+
+impl DeletedIdentity {
+    fn from_message(message: &ChatMessage) -> Self {
+        let msg_id = if message.id.is_empty() {
+            format!("msg_{}", message.ts)
+        } else {
+            message.id.clone()
+        };
+        Self {
+            is_local: msg_id.starts_with("out_") || msg_id.starts_with("local_"),
+            msg_id,
+            client_message_id: message.client_message_id.clone(),
+            is_outgoing: message.is_outgoing,
+            sender_id: message
+                .wire_ref
+                .sender
+                .as_ref()
+                .map(serde_json::Value::to_string)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn matches(&self, message: &ChatMessage) -> bool {
+        if self.msg_id == message.id {
+            return true;
+        }
+        let provisional = message.id.starts_with("phone-client:")
+            || message.id.starts_with("out_")
+            || message.id.starts_with("local_");
+        !self.client_message_id.is_empty()
+            && self.client_message_id != "0"
+            && self.client_message_id == message.client_message_id
+            && self.is_outgoing == message.is_outgoing
+            && (self.is_local || provisional)
+            && (self.is_outgoing
+                || (!self.sender_id.is_empty()
+                    && self.sender_id
+                        == message
+                            .wire_ref
+                            .sender
+                            .as_ref()
+                            .map(serde_json::Value::to_string)
+                            .unwrap_or_default()))
+    }
 }
 
 pub struct TuiApp<'a> {
@@ -179,6 +234,7 @@ pub struct TuiApp<'a> {
     search: String,
     search_mode: bool,
     unread: HashMap<String, usize>,
+    deleted_messages: HashMap<String, Vec<DeletedIdentity>>,
     selected_msg: Option<usize>,
     msg_scroll: usize,
     follow_tail: bool,
@@ -198,6 +254,7 @@ pub struct TuiApp<'a> {
 
 impl<'a> TuiApp<'a> {
     pub fn new(session: &'a mut Session, mut threads: Vec<Thread>) -> Self {
+        session.hidden.enable();
         let store = crate::store::MessageStore::open(session.history_path()).ok();
         if let Some(ref st) = store {
             let _ = st.hydrate_threads(&mut threads, 200);
@@ -221,6 +278,7 @@ impl<'a> TuiApp<'a> {
             search: String::new(),
             search_mode: false,
             unread: HashMap::new(),
+            deleted_messages: HashMap::new(),
             selected_msg: None,
             msg_scroll: 0,
             follow_tail: true,
@@ -257,26 +315,27 @@ impl<'a> TuiApp<'a> {
 
     fn rebuild_filter_prefer(&mut self, preferred: Option<String>) {
         let query = self.search.to_lowercase();
+        let hidden = self.hidden_view();
+        let previous_hidden = preferred.as_deref().is_some_and(|id| {
+            self.threads
+                .iter()
+                .find(|thread| thread.id == id)
+                .is_some_and(|thread| {
+                    let identity = crate::server_pins::identity(&thread.id, thread.is_group).ok();
+                    !Self::thread_allowed(&hidden, self.session.hidden.enforced(), thread)
+                        || identity.is_some_and(|identity| hidden.ids.contains(&identity))
+                })
+        });
         let mut filtered = Vec::new();
         for (i, t) in self.threads.iter().enumerate() {
-            if self.filter == FilterTab::Direct && t.is_group {
+            if !Self::thread_matches_filter(
+                t,
+                &hidden,
+                self.session.hidden.enforced(),
+                self.filter,
+                &query,
+            ) {
                 continue;
-            }
-            if self.filter == FilterTab::Group && !t.is_group {
-                continue;
-            }
-            if !query.is_empty() {
-                let hit = t.name.to_lowercase().contains(&query)
-                    || t.id.contains(&query)
-                    || t.preview.to_lowercase().contains(&query)
-                    || t.messages
-                        .iter()
-                        .rev()
-                        .take(20)
-                        .any(|m| m.text.to_lowercase().contains(&query));
-                if !hit {
-                    continue;
-                }
             }
             filtered.push(i);
         }
@@ -287,6 +346,9 @@ impl<'a> TuiApp<'a> {
             self.selected_thread = self.threads.len();
             self.selected_msg = None;
             self.msg_ranges.clear();
+            if previous_hidden {
+                self.clear_private_draft();
+            }
             return;
         }
 
@@ -307,11 +369,82 @@ impl<'a> TuiApp<'a> {
             self.selected_msg = self.threads[idx].messages.len().checked_sub(1);
             self.follow_tail = true;
             self.msg_scroll = 0;
+            if previous_hidden {
+                self.clear_private_draft();
+            }
         }
         self.selected_thread = idx;
     }
 
+    fn clear_private_draft(&mut self) {
+        self.reply_target = None;
+        self.input_text.clear();
+        if let Some(mut prompt) = self.prompt.take() {
+            use zeroize::Zeroize;
+            prompt.text.zeroize();
+        }
+    }
+
+    fn hidden_view(&self) -> crate::hidden_chat::Snapshot {
+        self.session.hidden.view(self.session.account_key())
+    }
+
+    fn thread_allowed(
+        hidden: &crate::hidden_chat::Snapshot,
+        enforced: bool,
+        thread: &Thread,
+    ) -> bool {
+        !enforced || hidden.allows(&thread.id, thread.is_group)
+    }
+
+    fn filter_deleted_replays(thread: &mut Thread, deleted: &[DeletedIdentity]) {
+        let last_was_deleted = deleted
+            .iter()
+            .any(|identity| identity.msg_id == thread.presentation.last_message_id);
+        let previous_len = thread.messages.len();
+        thread
+            .messages
+            .retain(|message| !deleted.iter().any(|identity| identity.matches(message)));
+        if last_was_deleted || thread.messages.len() != previous_len {
+            thread.refresh_after_removal();
+        }
+    }
+
+    fn thread_matches_filter(
+        thread: &Thread,
+        hidden: &crate::hidden_chat::Snapshot,
+        enforced: bool,
+        filter: FilterTab,
+        query: &str,
+    ) -> bool {
+        Self::thread_allowed(hidden, enforced, thread)
+            && !(filter == FilterTab::Direct && thread.is_group)
+            && !(filter == FilterTab::Group && !thread.is_group)
+            && (query.is_empty()
+                || thread.name.to_lowercase().contains(query)
+                || thread.id.contains(query)
+                || thread.preview.to_lowercase().contains(query)
+                || thread
+                    .messages
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .any(|message| message.text.to_lowercase().contains(query)))
+    }
+
+    fn selected_thread_allowed(&self) -> bool {
+        self.current_thread().is_some_and(|thread| {
+            Self::thread_allowed(&self.hidden_view(), self.session.hidden.enforced(), thread)
+        })
+    }
+
     fn select_index(&mut self, thread_idx: usize) {
+        let previous_hidden = self.current_thread().is_some_and(|thread| {
+            let hidden = self.hidden_view();
+            let identity = crate::server_pins::identity(&thread.id, thread.is_group).ok();
+            !Self::thread_allowed(&hidden, self.session.hidden.enforced(), thread)
+                || identity.is_some_and(|identity| hidden.ids.contains(&identity))
+        });
         let pos = self.filtered.iter().position(|&i| i == thread_idx);
         self.list_state.select(pos);
         self.selected_thread = thread_idx;
@@ -325,6 +458,9 @@ impl<'a> TuiApp<'a> {
         self.msg_scroll = 0;
         self.follow_tail = true;
         self.reply_target = None;
+        if previous_hidden {
+            self.input_text.clear();
+        }
         self.msg_ranges.clear();
     }
 
@@ -523,11 +659,28 @@ impl<'a> TuiApp<'a> {
         let session = self.session_clone();
         let mut state = self.poll_state.clone();
         let mut threads = self.threads.clone();
+        let history_path = self.session.history_path();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             match chat::poll_new_messages(&session, &mut state, &mut threads).await {
                 Ok(()) => {
-                    let _ = tx.send(BgEvent::PollDone { threads, state });
+                    let filtered = tokio::task::spawn_blocking(move || {
+                        filter_deleted_batch(history_path, threads)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    match filtered {
+                        Ok(threads) => {
+                            let _ = tx.send(BgEvent::PollDone { threads, state });
+                        }
+                        Err(error) => {
+                            logger::log_error("tui::poll_filter_deleted", &error);
+                            let _ = tx.send(BgEvent::PollFailed(
+                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     logger::log_error("tui::poll_new_messages", &e.to_string());
@@ -540,6 +693,7 @@ impl<'a> TuiApp<'a> {
     fn spawn_refresh(&mut self) {
         self.status = "Dang lam moi...".into();
         let session = self.session_clone();
+        let history_path = self.session.history_path();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = async {
@@ -554,7 +708,23 @@ impl<'a> TuiApp<'a> {
             .await;
             match result {
                 Ok(list) => {
-                    let _ = tx.send(BgEvent::ThreadsRefreshed(list));
+                    let filtered = tokio::task::spawn_blocking(move || {
+                        filter_deleted_batch(history_path, list)
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    match filtered {
+                        Ok(list) => {
+                            let _ = tx.send(BgEvent::ThreadsRefreshed(list));
+                        }
+                        Err(error) => {
+                            logger::log_error("tui::refresh_filter_deleted", &error);
+                            let _ = tx.send(BgEvent::ActionFailed(
+                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     logger::log_error("tui::refresh::get_friends", &e.to_string());
@@ -565,6 +735,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn spawn_history(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(t) = self.threads.get(self.selected_thread) else {
             return;
         };
@@ -573,6 +747,8 @@ impl<'a> TuiApp<'a> {
             return;
         }
         let group_id = t.id.clone();
+        let thread = t.clone();
+        let history_path = self.session.history_path();
         self.status = "Dang tai lich su nhom...".into();
         let session = self.session_clone();
         let tx = self.bg_tx.clone();
@@ -580,14 +756,56 @@ impl<'a> TuiApp<'a> {
         tokio::spawn(async move {
             match chat::get_group_history(&session, &gid, 50).await {
                 Ok(resp) => {
-                    let _ = tx.send(BgEvent::HistoryLoaded {
-                        thread_id: gid,
-                        resp,
-                    });
+                    let mut loaded = thread;
+                    chat::merge_group_history(&mut loaded, &resp);
+                    let filtered = tokio::task::spawn_blocking(move || {
+                        filter_deleted_batch(history_path, vec![loaded])
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    match filtered {
+                        Ok(mut threads) => {
+                            if let Some(thread) = threads.pop() {
+                                let _ = tx.send(BgEvent::HistoryLoaded { thread });
+                            }
+                        }
+                        Err(error) => {
+                            logger::log_error("tui::history_filter_deleted", &error);
+                            let _ = tx.send(BgEvent::ActionFailed(
+                                "Không xác minh được lịch sử đã xóa cục bộ".into(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     logger::log_error("tui::get_group_history", &e.to_string());
                     let _ = tx.send(BgEvent::ActionFailed(format!("Loi tai lich su nhom: {e}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_hidden_refresh(&self) {
+        let session = self.session_clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match crate::hidden_chat::restore_cached(&session).await {
+                Ok(Some(_)) => {
+                    let _ = tx.send(BgEvent::HiddenStateChanged(Ok(())));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    logger::log_error("tui::restore_hidden_membership", &error.to_string());
+                }
+            }
+            match crate::hidden_chat::execute(&session, &crate::hidden_chat::Action::Read).await {
+                Ok(_) => {
+                    let _ = tx.send(BgEvent::HiddenStateChanged(Ok(())));
+                }
+                Err(error) => {
+                    logger::log_error("tui::read_hidden_membership", &error.to_string());
+                    let _ = tx.send(BgEvent::HiddenStateChanged(Err(error.to_string())));
                 }
             }
         });
@@ -741,6 +959,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn send_attachment(&mut self, path: PathBuf) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         if !path.is_file() {
             self.status = format!("Khong tim thay tep: {}", path.display());
             return;
@@ -782,10 +1004,30 @@ impl<'a> TuiApp<'a> {
                 }
                 self.send_attachment(PathBuf::from(trimmed));
             }
+            PromptKind::HiddenPin => {
+                let pin = zeroize::Zeroizing::new(text);
+                let session = self.session_clone();
+                let tx = self.bg_tx.clone();
+                tokio::spawn(async move {
+                    let result = crate::hidden_chat::execute(
+                        &session,
+                        &crate::hidden_chat::Action::Unlock(pin),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(BgEvent::HiddenStateChanged(result));
+                });
+                self.status = "Đang xác minh PIN hội thoại ẩn...".into();
+            }
         }
     }
 
     fn send_current(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let text = self.input_text.trim().to_string();
         if text.is_empty() {
             return;
@@ -868,6 +1110,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn react_quick(&mut self, key: char) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(idx) = key
             .to_digit(10)
             .map(|d| d as usize)
@@ -922,6 +1168,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn quote_selected(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(mi) = self.selected_msg else {
             return;
         };
@@ -937,6 +1187,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn confirm_delete_selected(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(mi) = self.selected_msg else {
             return;
         };
@@ -961,6 +1215,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn open_selected_link(&mut self) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(mi) = self.selected_msg else {
             return;
         };
@@ -986,6 +1244,8 @@ impl<'a> TuiApp<'a> {
                     return;
                 }
                 self.store = None;
+                self.session.hidden.lock();
+                self.clear_private_draft();
                 self.session.logout();
                 self.threads.clear();
                 self.filtered.clear();
@@ -1006,11 +1266,26 @@ impl<'a> TuiApp<'a> {
                 };
                 let is_group = t.is_group;
                 let session = self.session_clone();
+                let history_path = self.session.history_path();
                 let tx = self.bg_tx.clone();
+                let db_thread_id = thread_id.clone();
+                let db_msg = msg.clone();
+                let deleted = DeletedIdentity::from_message(&msg);
                 tokio::spawn(async move {
                     match chat::delete_message_for_me(&session, &thread_id, is_group, &msg).await {
                         Ok(_) => {
-                            let _ = tx.send(BgEvent::DeleteDone { thread_id, msg_id });
+                            let db_result = tokio::task::spawn_blocking(move || {
+                                let mut store = crate::store::MessageStore::open(history_path)?;
+                                persist_acknowledged_delete(&mut store, &db_thread_id, &db_msg)
+                            })
+                            .await
+                            .map_err(|error| error.to_string())
+                            .and_then(|result| result.map_err(|error| error.to_string()));
+                            let _ = tx.send(BgEvent::DeleteDone {
+                                thread_id,
+                                deleted,
+                                result: db_result,
+                            });
                         }
                         Err(e) => {
                             logger::log_error("tui::delete_message_for_me", &e.to_string());
@@ -1058,10 +1333,12 @@ impl<'a> TuiApp<'a> {
         if let Some(mut prompt) = self.prompt.take() {
             match code {
                 KeyCode::Esc => {
+                    use zeroize::Zeroize;
+                    prompt.text.zeroize();
                     self.status = "Da huy nhap".into();
                 }
                 KeyCode::Enter => {
-                    let text = prompt.text.clone();
+                    let text = std::mem::take(&mut prompt.text);
                     self.submit_prompt(prompt.kind, text);
                 }
                 KeyCode::Backspace => {
@@ -1166,6 +1443,37 @@ impl<'a> TuiApp<'a> {
                 self.cycle_filter();
                 return;
             }
+            KeyCode::Char('p') if self.focus != Focus::Input => {
+                let hidden = self.hidden_view();
+                if hidden.unlocked {
+                    let session = self.session_clone();
+                    let tx = self.bg_tx.clone();
+                    tokio::spawn(async move {
+                        let result = crate::hidden_chat::execute(
+                            &session,
+                            &crate::hidden_chat::Action::Lock,
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| error.to_string());
+                        let _ = tx.send(BgEvent::HiddenStateChanged(result));
+                    });
+                    self.status = "Đang khóa hội thoại ẩn...".into();
+                } else if !hidden.ready || !hidden.pin_known {
+                    self.spawn_hidden_refresh();
+                    self.status = "Chưa tải được trạng thái PIN; đang thử đồng bộ lại".into();
+                } else if !hidden.has_pin {
+                    self.status =
+                        "Tài khoản chưa cấu hình PIN hội thoại ẩn; nhấn R để tải lại".into();
+                } else {
+                    self.prompt = Some(PromptState {
+                        kind: PromptKind::HiddenPin,
+                        text: String::new(),
+                    });
+                    self.status = "Nhập PIN hội thoại ẩn".into();
+                }
+                return;
+            }
             KeyCode::Char('u') if self.focus != Focus::Input => {
                 self.unread.clear();
                 self.status = "Da xoa thong bao chua doc".into();
@@ -1173,6 +1481,11 @@ impl<'a> TuiApp<'a> {
             }
             KeyCode::Char('r') if self.focus != Focus::Input => {
                 self.spawn_refresh();
+                return;
+            }
+            KeyCode::Char('R') if self.focus != Focus::Input => {
+                self.spawn_hidden_refresh();
+                self.status = "Đang xác minh trạng thái hội thoại ẩn...".into();
                 return;
             }
             KeyCode::Char('h') if self.focus != Focus::Input => {
@@ -1290,7 +1603,12 @@ impl<'a> TuiApp<'a> {
         }
     }
 
-    fn apply_polled(&mut self, polled: Vec<Thread>, state: chat::PollState) -> bool {
+    fn apply_polled(&mut self, mut polled: Vec<Thread>, state: chat::PollState) -> bool {
+        for thread in &mut polled {
+            if let Some(ids) = self.deleted_messages.get(&thread.id) {
+                Self::filter_deleted_replays(thread, ids);
+            }
+        }
         self.poll_state = state;
         let current_id = self.current_thread().map(|t| t.id.clone());
 
@@ -1408,10 +1726,28 @@ impl<'a> TuiApp<'a> {
                     self.apply_refresh(list);
                     self.status = format!("Da lam moi ({n} hoi thoai)");
                 }
-                BgEvent::HistoryLoaded { thread_id, resp } => {
+                BgEvent::HistoryLoaded { thread } => {
+                    let thread_id = thread.id.clone();
+                    let allowed = self
+                        .threads
+                        .iter()
+                        .find(|existing| existing.id == thread_id)
+                        .is_some_and(|existing| {
+                            !self.session.hidden.enforced()
+                                || self.hidden_view().allows(&existing.id, existing.is_group)
+                        });
+                    if !allowed {
+                        continue;
+                    }
                     let mut count = 0usize;
+                    let deleted_ids = self
+                        .deleted_messages
+                        .get(&thread_id)
+                        .cloned()
+                        .unwrap_or_default();
                     if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                        chat::merge_group_history(t, &resp);
+                        chat::merge_thread_into(t, thread, false);
+                        Self::filter_deleted_replays(t, &deleted_ids);
                         count = t.messages.len();
                     }
                     if count > 0 {
@@ -1475,14 +1811,44 @@ impl<'a> TuiApp<'a> {
                     }
                     self.status = "Da tha cam xuc".into();
                 }
-                BgEvent::DeleteDone { thread_id, msg_id } => {
-                    if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                        t.messages.retain(|m| m.id != msg_id);
+                BgEvent::DeleteDone {
+                    thread_id,
+                    deleted,
+                    result,
+                } => {
+                    match result {
+                        Ok(()) => {
+                            let ids = self.deleted_messages.entry(thread_id.clone()).or_default();
+                            ids.push(deleted.clone());
+                            let deleted_ids = ids.clone();
+                            if let Some(t) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                                Self::filter_deleted_replays(t, &deleted_ids);
+                            }
+                            self.selected_msg = None;
+                            chat::save_threads_cache(self.session, &self.threads);
+                            self.status = "Đã xóa tin nhắn trên máy chủ và lưu cục bộ".into();
+                        }
+                        Err(error) => {
+                            self.status = format!("Máy chủ đã xác nhận xóa, nhưng chưa lưu được bản xóa cục bộ: {error}");
+                        }
                     }
-                    self.selected_msg = None;
-                    self.persist_thread_by_id(&thread_id);
-                    chat::save_threads_cache(self.session, &self.threads);
-                    self.status = "Da xoa tin nhan".into();
+                }
+                BgEvent::HiddenStateChanged(result) => {
+                    self.rebuild_filter();
+                    self.clear_private_draft();
+                    match result {
+                        Ok(()) => {
+                            self.status = if self.hidden_view().unlocked {
+                                "Danh sách hội thoại ẩn đã được mở khóa".into()
+                            } else {
+                                "Đã cập nhật trạng thái hội thoại ẩn".into()
+                            }
+                        }
+                        Err(_) => {
+                            self.status =
+                                "Không xác minh được hội thoại ẩn; đang chặn hiển thị".into()
+                        }
+                    }
                 }
                 BgEvent::StickerPacks(packs) => {
                     self.sticker.loading = false;
@@ -1517,6 +1883,10 @@ impl<'a> TuiApp<'a> {
 }
 
 pub async fn run_tui(mut app: TuiApp<'_>) -> Result<()> {
+    app.session.hidden.enable();
+    app.status = "Đang xác minh trạng thái hội thoại ẩn...".into();
+    app.rebuild_filter();
+    app.spawn_hidden_refresh();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1604,7 +1974,13 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         )
     };
 
-    let total_unread: usize = app.unread.values().sum();
+    let hidden = app.hidden_view();
+    let total_unread: usize = app
+        .threads
+        .iter()
+        .filter(|thread| TuiApp::thread_allowed(&hidden, app.session.hidden.enforced(), thread))
+        .map(|thread| app.unread.get(&thread.id).copied().unwrap_or_default())
+        .sum();
     let mut header_spans = vec![
         Span::styled(
             " Zalo Rust Client ",
@@ -1709,13 +2085,18 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         })
         .collect();
 
+    let visible_thread_count = app
+        .threads
+        .iter()
+        .filter(|thread| TuiApp::thread_allowed(&hidden, app.session.hidden.enforced(), thread))
+        .count();
     let threads_title = if app.search_mode {
         format!(" Tim: {}_ ", app.search)
     } else if !app.search.is_empty() {
         format!(
             " Hoi thoai {}/{} [{}] tim '{}' ",
             app.filtered.len(),
-            app.threads.len(),
+            visible_thread_count,
             app.filter.label(),
             app.search
         )
@@ -1723,7 +2104,7 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         format!(
             " Hoi thoai {}/{} [{}] ",
             app.filtered.len(),
-            app.threads.len(),
+            visible_thread_count,
             app.filter.label()
         )
     };
@@ -1752,7 +2133,12 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     f.render_stateful_widget(threads_list, body_chunks[0], &mut app.list_state);
 
     // 2b. Right column: contact header, messages, reply bar, input
-    let reply_h = if app.reply_target.is_some() { 2 } else { 0 };
+    let selected_allowed = app.selected_thread_allowed();
+    let reply_h = if app.reply_target.is_some() && selected_allowed {
+        2
+    } else {
+        0
+    };
     let chat_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1763,7 +2149,11 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         ])
         .split(body_chunks[1]);
 
-    let (name, id, is_group, msg_count) = match app.threads.get(app.selected_thread) {
+    let (name, id, is_group, msg_count) = match app
+        .threads
+        .get(app.selected_thread)
+        .filter(|_| app.selected_thread_allowed())
+    {
         Some(t) => (t.name.clone(), t.id.clone(), t.is_group, t.messages.len()),
         None => ("Chua chon hoi thoai".to_string(), String::new(), false, 0),
     };
@@ -1800,7 +2190,11 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
     let inner_w = chat_chunks[1].width.saturating_sub(2) as usize;
     let inner_h = chat_chunks[1].height.saturating_sub(2) as usize;
     let highlight = app.focus == Focus::Messages;
-    let (lines, ranges) = match app.threads.get(app.selected_thread) {
+    let (lines, ranges) = match app
+        .threads
+        .get(app.selected_thread)
+        .filter(|_| app.selected_thread_allowed())
+    {
         Some(t) => build_chat_lines(t, inner_w, app.selected_msg, highlight),
         None => (
             vec![Line::from(Span::styled(
@@ -1849,26 +2243,28 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         .scroll(((app.msg_scroll.min(u16::MAX as usize)) as u16, 0));
     f.render_widget(chat_body, chat_chunks[1]);
 
-    if let Some(q) = &app.reply_target {
-        let quote = format!(
-            " {}: {}",
-            q.sender,
-            q.text
-                .replace('\n', " ")
-                .chars()
-                .take(120)
-                .collect::<String>()
-        );
-        let reply = Paragraph::new(quote)
-            .block(
-                Block::default()
-                    .title(" Dang tra loi [Ctrl+X huy] ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Plain)
-                    .border_style(Style::default().fg(Color::Magenta)),
-            )
-            .style(Style::default().fg(Color::Gray));
-        f.render_widget(reply, chat_chunks[2]);
+    if selected_allowed {
+        if let Some(q) = &app.reply_target {
+            let quote = format!(
+                " {}: {}",
+                q.sender,
+                q.text
+                    .replace('\n', " ")
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            );
+            let reply = Paragraph::new(quote)
+                .block(
+                    Block::default()
+                        .title(" Dang tra loi [Ctrl+X huy] ")
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Plain)
+                        .border_style(Style::default().fg(Color::Magenta)),
+                )
+                .style(Style::default().fg(Color::Gray));
+            f.render_widget(reply, chat_chunks[2]);
+        }
     }
 
     let input_title = if app.focus == Focus::Input {
@@ -1884,7 +2280,12 @@ fn ui_draw(f: &mut Frame, app: &mut TuiApp<'_>) {
         Style::default().fg(Color::DarkGray)
     };
     let cursor = if app.focus == Focus::Input { "_" } else { "" };
-    let input_widget = Paragraph::new(format!(" {}{cursor}", app.input_text)).block(
+    let input_text = if selected_allowed {
+        app.input_text.as_str()
+    } else {
+        ""
+    };
+    let input_widget = Paragraph::new(format!(" {input_text}{cursor}")).block(
         Block::default()
             .title(input_title)
             .borders(Borders::ALL)
@@ -2194,6 +2595,20 @@ fn unix_now_ms() -> i64 {
     crate::login::unix_now() * 1000
 }
 
+fn persist_acknowledged_delete(
+    store: &mut crate::store::MessageStore,
+    thread_id: &str,
+    message: &ChatMessage,
+) -> Result<()> {
+    store.delete_chat_message(thread_id, message)
+}
+
+fn filter_deleted_batch(path: PathBuf, mut threads: Vec<Thread>) -> Result<Vec<Thread>> {
+    let store = crate::store::MessageStore::open(path)?;
+    store.filter_deleted(&mut threads)?;
+    Ok(threads)
+}
+
 fn open_external_url(url: &str) {
     let _ = crate::platform::open_url(url);
 }
@@ -2247,6 +2662,8 @@ fn render_help(f: &mut Frame, area: Rect) {
     content.push(help_line("f", "Loc: Tat ca -> Ca nhan -> Nhom"));
     content.push(help_line("u", "Xoa tat ca thong bao chua doc"));
     content.push(help_line("r", "Lam moi danh sach tu server (nen)"));
+    content.push(help_line("R", "Tai lai trang thai/PIN hoi thoai an"));
+    content.push(help_line("p", "Mo khoa PIN hoi thoai an; nhan lai de khoa"));
     content.push(help_line("h", "Tai lich su nhom (50 tin)"));
     content.push(help_line("x", "Dang xuat (co xac nhan)"));
     content.push(Line::raw(""));
@@ -2472,18 +2889,30 @@ fn render_prompt(f: &mut Frame, area: Rect, prompt: &PromptState) {
 
     let title = match prompt.kind {
         PromptKind::Attachment => " Gui tep dinh kem: nhap duong dan tep ",
+        PromptKind::HiddenPin => " Nhap PIN hoi thoai an ",
     };
     let content = vec![
         Line::raw(""),
         Line::from(Span::styled(
-            format!("  {}_", prompt.text),
+            format!(
+                "  {}_",
+                if prompt.kind == PromptKind::HiddenPin {
+                    "•".repeat(prompt.text.chars().count())
+                } else {
+                    prompt.text.clone()
+                }
+            ),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(Span::styled(
-            "  [Enter] Gui    [Esc] Huy",
+            if prompt.kind == PromptKind::HiddenPin {
+                "  [Enter] Mo khoa    [Esc] Huy"
+            } else {
+                "  [Enter] Gui    [Esc] Huy"
+            },
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -2652,6 +3081,172 @@ mod tests {
     }
 
     #[test]
+    fn hidden_membership_gates_tui_list_search_and_unlock_visibility() {
+        let ordinary = Thread {
+            id: "303".into(),
+            name: "Ordinary contact".into(),
+            preview: "ordinary preview".into(),
+            ..Default::default()
+        };
+        let hidden = Thread {
+            id: "101".into(),
+            name: "Secret contact".into(),
+            preview: "secret preview".into(),
+            messages: vec![ChatMessage {
+                text: "secret body".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let membership = crate::hidden_chat::Snapshot {
+            ready: true,
+            has_pin: true,
+            pin_known: true,
+            ids: HashSet::from(["u101".into()]),
+            ..Default::default()
+        };
+
+        assert!(TuiApp::thread_matches_filter(
+            &ordinary,
+            &membership,
+            true,
+            FilterTab::All,
+            "ordinary"
+        ));
+        assert!(!TuiApp::thread_matches_filter(
+            &hidden,
+            &membership,
+            true,
+            FilterTab::All,
+            "secret"
+        ));
+        assert!(!TuiApp::thread_matches_filter(
+            &ordinary,
+            &crate::hidden_chat::Snapshot::default(),
+            true,
+            FilterTab::All,
+            "ordinary"
+        ));
+        let unlocked = crate::hidden_chat::Snapshot {
+            unlocked: true,
+            ..membership
+        };
+        assert!(TuiApp::thread_matches_filter(
+            &hidden,
+            &unlocked,
+            true,
+            FilterTab::All,
+            "secret body"
+        ));
+    }
+
+    #[test]
+    fn tui_acknowledged_delete_persists_tombstone_and_rejects_hydrate_and_replay() {
+        let mut store = crate::store::MessageStore::open(":memory:").unwrap();
+        let message = ChatMessage {
+            id: "server-1".into(),
+            client_message_id: "client-1".into(),
+            text: "deleted content".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("sender-a")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let deleted_thread = Thread {
+            id: "thread-a".into(),
+            messages: vec![message.clone()],
+            ..Default::default()
+        };
+        crate::store::persist_threads(&mut store, std::slice::from_ref(&deleted_thread)).unwrap();
+        persist_acknowledged_delete(&mut store, "thread-a", &message).unwrap();
+
+        let mut hydrated = vec![deleted_thread.clone()];
+        store.hydrate_threads(&mut hydrated, 20).unwrap();
+        assert!(hydrated[0].messages.is_empty());
+
+        let mut aliased_replay = message.clone();
+        aliased_replay.id = "phone-client:8:sender-a:client-1".into();
+        let stale_snapshot = Thread {
+            messages: vec![aliased_replay.clone()],
+            ..deleted_thread.clone()
+        };
+        let replay = crate::store::persist_threads_counted(&mut store, &[stale_snapshot]).unwrap();
+        assert_eq!(replay.deleted, 1);
+
+        let mut sender_collision = aliased_replay.clone();
+        sender_collision.wire_ref.sender = Some(serde_json::json!("sender-b"));
+        let collision_thread = Thread {
+            messages: vec![sender_collision],
+            ..deleted_thread.clone()
+        };
+        let collision =
+            crate::store::persist_threads_counted(&mut store, &[collision_thread]).unwrap();
+        assert_eq!(collision.inserted, 1);
+
+        let mut distinct_server_id = message.clone();
+        distinct_server_id.id = "server-2".into();
+        let distinct_thread = Thread {
+            messages: vec![distinct_server_id.clone()],
+            ..deleted_thread.clone()
+        };
+        let distinct =
+            crate::store::persist_threads_counted(&mut store, &[distinct_thread]).unwrap();
+        assert_eq!(distinct.inserted, 1);
+
+        let other_thread = Thread {
+            id: "thread-b".into(),
+            messages: vec![distinct_server_id],
+            ..Default::default()
+        };
+        let independent =
+            crate::store::persist_threads_counted(&mut store, &[other_thread]).unwrap();
+        assert_eq!(independent.inserted, 1);
+    }
+
+    #[test]
+    fn tui_delete_alias_filter_keeps_distinct_ids_and_sender_collisions() {
+        let deleted = DeletedIdentity::from_message(&ChatMessage {
+            id: "server-1".into(),
+            client_message_id: "client-1".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("sender-a")),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let provisional_alias = ChatMessage {
+            id: "phone-client:8:sender-a:client-1".into(),
+            client_message_id: "client-1".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("sender-a")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sender_collision = ChatMessage {
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("sender-b")),
+                ..provisional_alias.wire_ref.clone()
+            },
+            ..provisional_alias.clone()
+        };
+        let direction_collision = ChatMessage {
+            is_outgoing: true,
+            ..provisional_alias.clone()
+        };
+        let distinct_server_id = ChatMessage {
+            id: "server-2".into(),
+            ..provisional_alias.clone()
+        };
+
+        assert!(deleted.matches(&provisional_alias));
+        assert!(!deleted.matches(&sender_collision));
+        assert!(!deleted.matches(&direction_collision));
+        assert!(!deleted.matches(&distinct_server_id));
+    }
+
+    #[test]
     fn draws_thread_and_messages_without_panicking() {
         let mut session = crate::session::Session::new(false, false, false).unwrap();
         let (tx, rx) = channel();
@@ -2704,6 +3299,7 @@ mod tests {
             search: String::new(),
             search_mode: false,
             unread: HashMap::new(),
+            deleted_messages: HashMap::new(),
             selected_msg: Some(1),
             msg_scroll: 0,
             follow_tail: true,
