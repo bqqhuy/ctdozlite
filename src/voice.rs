@@ -706,7 +706,15 @@ fn voice_worker_loop(
             }
             Ok(VoiceCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(VoiceCommand::Start { .. }) => {}
+            // Never ignore a Start silently: the UI waits for an outcome. A stale
+            // generation's Failed is discarded by the UI's own binding check.
+            Ok(VoiceCommand::Start { generation }) => {
+                let _ = events.send(VoiceEvent::Failed {
+                    generation,
+                    message: "Micro đang bận với bản ghi khác; hãy thử lại".into(),
+                });
+                ctx.request_repaint();
+            }
         }
 
         if recording_generation

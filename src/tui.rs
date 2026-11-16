@@ -639,6 +639,16 @@ fn execute_store_command(
     Ok(())
 }
 
+/// Merge DB-hydrated threads into the live list without dropping live-only messages.
+fn merge_hydrated(live: &mut Vec<Thread>, hydrated: Vec<Thread>) {
+    for thread in hydrated {
+        match live.iter().position(|current| current.id == thread.id) {
+            Some(pos) => chat::merge_thread_into(&mut live[pos], thread, false),
+            None => live.push(thread),
+        }
+    }
+}
+
 fn write_threads_cache(session: &Session, threads: &[Thread]) -> std::result::Result<(), String> {
     let mut slim = threads.to_vec();
     for thread in &mut slim {
@@ -1225,7 +1235,9 @@ impl<'a> TuiApp<'a> {
             },
         };
         match self.writer.try_send(command) {
-            Ok(()) => {}
+            // A full snapshot supersedes any older one still waiting for a slot;
+            // keeping it would let stale state be written after this one.
+            Ok(()) => self.pending_snapshot = None,
             Err(StoreAdmissionError::Full) => {
                 self.pending_snapshot = Some((session, stamp, snapshot));
                 self.status = "Đang chờ lưu lịch sử cục bộ".into();
@@ -1296,7 +1308,11 @@ impl<'a> TuiApp<'a> {
                 let mut list = chat::get_friends(&session).await?;
                 let ids: Vec<String> = list.iter().map(|t| t.id.clone()).collect();
                 match chat::get_last_msgs(&session, &ids).await {
-                    Ok(resp) => chat::merge_previews(&mut list, &resp),
+                    Ok(resp) => chat::merge_previews_with_profile(
+                        &mut list,
+                        &resp,
+                        Some(session.account_key()),
+                    ),
                     Err(e) => logger::log_error("tui::refresh::get_last_msgs", &e.to_string()),
                 }
                 Ok::<Vec<Thread>, anyhow::Error>(list)
@@ -1336,7 +1352,11 @@ impl<'a> TuiApp<'a> {
             match chat::get_group_history(&session, &gid, 50).await {
                 Ok(resp) => {
                     let mut loaded = thread;
-                    chat::merge_group_history(&mut loaded, &resp);
+                    chat::merge_group_history_with_profile(
+                        &mut loaded,
+                        &resp,
+                        Some(session.account_key()),
+                    );
                     let _ = tx.send(BgEvent::HistoryLoaded { thread: loaded });
                 }
                 Err(e) => {
@@ -1461,6 +1481,10 @@ impl<'a> TuiApp<'a> {
     }
 
     fn send_sticker(&mut self, item: StickerItem) {
+        if !self.selected_thread_allowed() {
+            self.status = "Trạng thái hội thoại ẩn chưa được xác minh hoặc đang khóa".into();
+            return;
+        }
         let Some(t) = self.threads.get(self.selected_thread) else {
             return;
         };
@@ -1850,6 +1874,13 @@ impl<'a> TuiApp<'a> {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
             ConfirmKind::Logout => {
+                // An acknowledged delete must commit its tombstone under this runtime;
+                // revoking it now would let the message reappear after next login.
+                if self.critical_inflight.load(Ordering::Acquire) > 0 {
+                    self.status =
+                        "Đang chờ xác nhận gửi/xóa tin; hãy đăng xuất lại sau giây lát".into();
+                    return;
+                }
                 if let Err(e) = crate::storage::remove_session() {
                     self.status = format!("Không thể xóa phiên: {e}");
                     return;
@@ -2142,7 +2173,8 @@ impl<'a> TuiApp<'a> {
                 self.status = "Đang xác minh trạng thái hội thoại ẩn...".into();
                 return;
             }
-            KeyCode::Char('y') if self.focus != Focus::Input => {
+            // `y` stays "reply"; retry has its own key so neither shadows the other.
+            KeyCode::Char('Y') if self.focus != Focus::Input => {
                 self.confirm_retry_selected();
                 return;
             }
@@ -2371,9 +2403,12 @@ impl<'a> TuiApp<'a> {
             let event = envelope.event;
             match event {
                 BgEvent::Hydrated(threads) => {
-                    self.threads = threads;
+                    // Hydration is async: merge so sends, polls and history that
+                    // arrived meanwhile are kept, then persist the startup batch.
+                    merge_hydrated(&mut self.threads, threads);
                     self.rebuild_filter();
                     self.ensure_msg_selection();
+                    self.persist_async();
                 }
                 BgEvent::PollDone { threads, state } => {
                     self.poll_inflight = false;
@@ -3401,7 +3436,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     content.push(help_line("y", "Tra loi tin dang chon"));
     content.push(help_line("d", "Xoa tin nhan (chi phia ban)"));
     content.push(help_line(
-        "y",
+        "Y",
         "Gửi lại tin thất bại hoặc chưa rõ (giữ nguyên mã)",
     ));
     content.push(help_line("o", "Mo lien ket cua tin nhan"));
@@ -3821,6 +3856,58 @@ mod tests {
             .enqueue_reserved(snapshot(), delete_reservation)
             .expect("reserved admission remains available after remote ACK");
         assert_eq!(rx.try_iter().count(), StoreWriter::CAPACITY);
+    }
+
+    #[test]
+    fn hydration_merges_history_without_dropping_live_sends_or_new_threads() {
+        let message = |id: &str, client: &str, ts: i64| ChatMessage {
+            id: id.into(),
+            client_message_id: client.into(),
+            ts,
+            ..Default::default()
+        };
+        let thread = |id: &str, messages: Vec<ChatMessage>| Thread {
+            id: id.into(),
+            messages,
+            ..Default::default()
+        };
+        // Live state: an optimistic send typed before hydration completed, plus a
+        // thread first seen by an early poll.
+        let mut live = vec![
+            thread("peer-1", vec![message("out_1", "cli-1", 300)]),
+            thread("polled-only", vec![message("srv-9", "", 400)]),
+        ];
+        let hydrated = vec![
+            thread(
+                "peer-1",
+                vec![message("srv-1", "", 100), message("srv-2", "", 200)],
+            ),
+            thread("history-only", vec![message("srv-5", "", 50)]),
+        ];
+        merge_hydrated(&mut live, hydrated);
+
+        let ids = |id: &str| -> Vec<String> {
+            live.iter()
+                .find(|t| t.id == id)
+                .map(|t| t.messages.iter().map(|m| m.id.clone()).collect())
+                .unwrap_or_default()
+        };
+        let peer = ids("peer-1");
+        assert!(
+            peer.contains(&"out_1".to_owned()),
+            "optimistic send survives: {peer:?}"
+        );
+        assert!(peer.contains(&"srv-1".to_owned()) && peer.contains(&"srv-2".to_owned()));
+        assert_eq!(ids("polled-only"), vec!["srv-9".to_owned()]);
+        assert_eq!(ids("history-only"), vec!["srv-5".to_owned()]);
+        let pending = live[0]
+            .messages
+            .iter()
+            .find(|m| m.client_message_id == "cli-1");
+        assert!(
+            pending.is_some(),
+            "SendOutcome can still find the client ID"
+        );
     }
 
     fn unauthenticated_snapshot(

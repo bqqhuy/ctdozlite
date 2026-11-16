@@ -4253,6 +4253,12 @@ impl ZaloGuiApp {
             message.id.clone()
         };
         let key = (thread_id.to_owned(), message_key);
+        // The toggle reads confirmed state; a second click before the first outcome
+        // would re-send "add". The worker always answers, so the key is released.
+        if self.pending_reaction_actions.contains_key(&key) {
+            self.show_toast("Đang xử lý cảm xúc trước đó");
+            return;
+        }
         self.pending_reaction_actions.insert(key.clone(), intent_id);
         let owner = self.user_uin.clone();
         let result = WORKER_TX.get().is_some_and(|tx| {
@@ -5859,20 +5865,17 @@ impl ZaloGuiApp {
                             });
                         });
                         ui.add_space(6.0);
-                        let is_trusted = self.trusted_peers.contains(d_id);
-                        ui.label(
-                            RichText::new(if is_trusted {
-                                "🔒 Mã hóa đầu cuối: Đã xác minh"
-                            } else {
-                                "🔒 Mã hóa đầu cuối: Tiêu chuẩn"
-                            })
-                            .size(11.5)
-                            .color(if is_trusted {
-                                pal.primary
-                            } else {
-                                pal.text_secondary
-                            }),
+                        let (summary, is_trusted) = e2ee_security_summary(
+                            d_is_group,
+                            crate::e2ee_trial::enabled(),
+                            self.trial_peers.contains(d_id),
+                            self.trusted_peers.contains(d_id),
                         );
+                        ui.label(RichText::new(summary).size(11.5).color(if is_trusted {
+                            pal.primary
+                        } else {
+                            pal.text_secondary
+                        }));
                         let current_ttl = self
                             .policy_panel
                             .snapshot
@@ -7410,9 +7413,57 @@ fn e2ee_drawer_status(
     }
 }
 
+/// One-line security summary; highlighted only for a verified safety number on an
+/// opted-in DM trial. Never implies end-to-end protection the app does not provide.
+fn e2ee_security_summary(
+    is_group: bool,
+    experiment_enabled: bool,
+    peer_enabled: bool,
+    identity_verified: bool,
+) -> (&'static str, bool) {
+    if is_group {
+        ("🔓 Mã hóa đầu cuối nhóm: chưa hỗ trợ", false)
+    } else if !experiment_enabled {
+        ("🔓 Mã hóa đầu cuối: thử nghiệm đang tắt", false)
+    } else if !peer_enabled {
+        ("🔓 Mã hóa đầu cuối: chưa yêu cầu cho hội thoại này", false)
+    } else if identity_verified {
+        ("🧪 E2EE thử nghiệm · đã đối chiếu mã an toàn", true)
+    } else {
+        ("🧪 E2EE thử nghiệm · chưa đối chiếu mã an toàn", false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_summary_never_claims_standard_or_group_protection() {
+        for is_group in [false, true] {
+            for experiment in [false, true] {
+                for peer in [false, true] {
+                    for verified in [false, true] {
+                        let (text, highlighted) =
+                            e2ee_security_summary(is_group, experiment, peer, verified);
+                        assert!(!text.contains("Tiêu chuẩn"), "{text}");
+                        assert!(!text.contains("🔒"), "{text}");
+                        assert_eq!(
+                            highlighted,
+                            !is_group && experiment && peer && verified,
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(e2ee_security_summary(true, true, true, true)
+            .0
+            .contains("chưa hỗ trợ"));
+        assert!(e2ee_security_summary(false, false, true, true)
+            .0
+            .contains("đang tắt"));
+    }
 
     #[test]
     fn test_measured_height_cache_insertion_and_separation() {

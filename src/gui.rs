@@ -638,6 +638,7 @@ pub enum GuiEvent {
     AppUnlockFailed {
         request_id: u64,
         runtime_id: usize,
+        message: String,
     },
     MessageTranslated {
         thread_id: String,
@@ -3232,6 +3233,7 @@ impl ZaloGuiApp {
                 GuiEvent::AppUnlockFailed {
                     request_id,
                     runtime_id,
+                    message,
                 } => {
                     if request_id != self.auth_request_generation
                         || runtime_id != self.account_runtime_id
@@ -3240,7 +3242,8 @@ impl ZaloGuiApp {
                         continue;
                     }
                     self.auth_in_progress = false;
-                    self.status_msg = "Xác thực thất bại. Vui lòng thử lại.".into();
+                    // Timeout / busy / invalid-window need different user actions.
+                    self.status_msg = format!("Xác thực thất bại: {message}");
                 }
                 GuiEvent::Tools { owner, result } => {
                     if owner != self.user_uin || !self.is_logged_in {
@@ -5839,9 +5842,10 @@ impl ZaloGuiApp {
                                     runtime_id,
                                     verified,
                                 },
-                                Err(_) => GuiEvent::AppUnlockFailed {
+                                Err(error) => GuiEvent::AppUnlockFailed {
                                     request_id,
                                     runtime_id,
+                                    message: error.to_string(),
                                 },
                             };
                             let _ = event_tx.send(event);

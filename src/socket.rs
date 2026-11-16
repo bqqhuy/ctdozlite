@@ -1004,7 +1004,8 @@ async fn run_once(
                     // Send immediate first ping right upon auth
                     let body = json!({ "eventId": now_ms() });
                     let f = encode_frame(CMD_PING, SUB_KEEP_CONNECTION, 1, Some(&body));
-                    let _ = send_ws_bounded(&mut ws, Message::Binary(f), tx).await;
+                    // A stalled first write ends the epoch now instead of after liveness expiry.
+                    send_ws_bounded(&mut ws, Message::Binary(f), tx).await?;
                     trace("-> first ping (auth)");
                     ready.send_replace(Some(epoch));
                     forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload: auth.clone() }, epoch).await?;
@@ -1046,12 +1047,12 @@ async fn run_once(
                             "lastId": "1",
                             "reqId": id,
                         });
-                        let _ = send_ws_bounded(
+                        send_ws_bounded(
                             &mut ws,
                             Message::Binary(encode_frame(CMD_GET_MSG, 0, 1, Some(&get_req))),
                             tx,
                         )
-                        .await;
+                        .await?;
                         trace(format!("-> get_msg 570_0 {id}"));
                     }
                 }
