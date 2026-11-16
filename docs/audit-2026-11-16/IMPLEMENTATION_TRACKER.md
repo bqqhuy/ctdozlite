@@ -56,4 +56,33 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 | `cargo test --locked --no-fail-fast --features experimental-e2ee` | 910 passed, 0 failed, 13 ignored | 912 passed, 0 failed, 13 ignored |
 | `python -I scripts/tests/test_audit_prepush.py` | 4 OK | 4 OK |
 
-Test ignored không được tính là pass. Log nằm trong `implementation-logs/` (gitignore). `tests/audit_regressions.rs` cần `CTDOZ_ALLOW_TEST_LOOPBACK=1` vì cfg(test) không áp dụng cho integration test.
+
+
+---
+
+# Audit `bd44cc1` — Implementation Tracker
+
+**Kế hoạch:** [ANTIGRAVITY_REMEDIATION_PLAN_BD44CC1.md](ANTIGRAVITY_REMEDIATION_PLAN_BD44CC1.md) · **Audit gốc:** [CONSENSUS_AUDIT_BD44CC1.md](CONSENSUS_AUDIT_BD44CC1.md)
+**Nhánh:** `antigravity/phase-1-security-fixes`
+
+## Phase 1 — Lỗ hổng an ninh (Critical / High)
+
+| ID | Mức | Trạng thái | Commit | Kiểm chứng | Native / official | Ghi chú & Rủi ro còn lại |
+|---|---|---|---|---|---|---|
+| C-01 | Critical | Đóng (code/fixture) | `e6803ee` | `crypto::wire::tests::c01_*` (3 test: PoC debug+release, fuzz 10k random bytes); `chat::tests::c01_*` (văn bản thường `MyL///////////8B` parse thành text thường, không vào parser wire) | Cần kiểm chứng khi nhận tin trên thiết bị thật | `decode_varint` dùng `checked_add`, giới hạn `u32::MAX` cho u32 fields, `checked_add` cho offset/len, cắt slice qua `get(offset..end)` trả `Err` |
+| H-01 | High | Đóng (code/fixture) | `bd5f9c8` | `platform::tests::h01_*` (3 test: allowlist chấp nhận định dạng an toàn, từ chối đuôi nguy hiểm/macro; Mark-of-the-Web ADS ZoneId=3); `media_download::tests::h01_*` (safe_name chuẩn hóa trailing dots/spaces, DOS device names CON/PRN...) | Cần nghiệm thu trên Windows 11 ARM64 (nhận `x.exe .` và `a.hta`) | Đổi sang allowlist an toàn; file ngoài allowlist gọi `open_folder_and_select`; đính kèm Mark-of-the-Web NTFS stream Zone.Identifier sau khi tải |
+
+## Cổng Phase 1 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
+
+| Lệnh | Kết quả | Ghi chú |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | Không còn lỗi format |
+| `cargo check --locked --all-targets` | exit 0 | 0 error, 0 warning |
+| `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo test --release --lib c01` | 3 passed, 0 failed, 0 ignored | PoC overflow + Fuzz 10,000 cases pass ở release mode |
+| `cargo test --locked --no-fail-fast` | 916 passed, 0 failed, 13 ignored | 16 test binaries pass sạch |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | 919 passed, 0 failed, 13 ignored | 16 test binaries pass sạch |
+| `python -I scripts/tests/test_audit_prepush.py` | 4 OK | Pass toàn bộ regex & audit checks |
+| `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
+

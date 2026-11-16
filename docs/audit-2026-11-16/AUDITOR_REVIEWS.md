@@ -48,3 +48,32 @@ Lỗi mới và xử lý:
 | A2 | Khóa reaction pending chỉ được nhả nhờ worker trả lời hoặc logout | Rủi ro còn lại (không có đường lỗi hiện tại); ghi vào bàn giao |
 
 Hai auditor thống nhất: không còn blocker/major. F21 (đường đăng xuất trên màn khóa khi WinRT treo) giữ là rủi ro còn lại, phải nằm trong kế hoạch nghiệm thu native ARM64.
+
+---
+
+# Kết quả Review Độc lập — Audit `bd44cc1` Phase 1 (Security Fixes)
+
+Phạm vi review: Commit `e6803ee` (C-01) và `bd5f9c8` (H-01) trên nhánh `antigravity/phase-1-security-fixes`.
+Hai Pro auditor (`Phase 1 Pro Auditor 1` và `Phase 1 Pro Auditor 2`) đã tiến hành kiểm toán độc lập, chạy test và rà soát diff.
+
+## Đánh giá tổng hợp Phase 1
+
+| Chỉ số | Pro Auditor 1 | Pro Auditor 2 |
+|---|---|---|
+| **Kết luận** | **APPROVE** | **APPROVE** |
+| **Blocker** | 0 | 0 |
+| **Major** | 0 | 0 |
+| **Minor** | 2 | 2 |
+
+### Xác nhận C-01:
+- Cắt slice an toàn `data.get(start..end)`, `checked_add` triệt tiêu mọi phép toán tràn số u64/usize.
+- `decode_varint_u32` từ chối giá trị > `u32::MAX`.
+- Early gate tại `src/chat.rs`: tin nhắn văn bản thuần không có metadata trong chat thông thường không bao giờ đi vào parser E2EE wire.
+- Fixture test PoC pass cả debug và release. Fuzz test 10,000 cases ngẫu nhiên pass không panic.
+
+### Xác nhận H-01:
+- Chuyển hoàn toàn sang allowlist tĩnh `SAFE_OPEN_EXTENSIONS` cho thao tác mở trực tiếp.
+- Đuôi file nguy hiểm hoặc ngoài allowlist chuyển sang `open_folder_and_select(path)` (reveal in Explorer).
+- Vòng lặp cắt tỉa trailing dots/spaces và tiền tố hóa thiết bị DOS (`_CON.txt`) vô hiệu hóa triệt để bypass Win32.
+- Gắn stream NTFS ADS `Zone.Identifier` với `ZoneId=3` (Mark-of-the-Web).
+
