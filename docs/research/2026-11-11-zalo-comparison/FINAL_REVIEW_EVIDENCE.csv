@@ -1,0 +1,9 @@
+source,sha256,term,first_byte_offset,level
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,XOR_KEY:147,813998,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,XOR_LEN:100,814082,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,077a416c4f07,814018,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,_copyDownloadNoise(,601165,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,noiseFile: untrusted source,1074760,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,fileNoise,416982,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,noiseDownload,600856,E2
+PC26.11.10/main-dist/main.js,edf53935a8233715c5c079a44d029bed34e63325d3756b2c01ef3d3b6beaa52d,.Z_SIGN_BUFFER,601924,E2

@@ -1,0 +1,461 @@
+﻿quoted_path_not_contract,PC_core_first_byte_offset,Web_core_first_byte_offset,Rust_text_mentions_not_coverage
+/api/action/query,15205202,11707668,
+/api/aifeatures/translate/v1/auto,12397159,9696375,
+/api/aifeatures/translate/v1/manual,12397090,9696306,
+/api/aifeatures/translate/v1/setting,12396948,9696164,
+/api/aifeatures/translate/v1/suggest,12397229,9696445,
+/api/aifeatures/voice2text,17152326,13015604,
+/api/alias/list,2984777,2506965,src/account_metadata.rs:40
+/api/alias/list/v2,2984961,2507149,
+/api/alias/remove,2984899,2507087,src/contact_actions.rs:167
+/api/alias/update,2984837,2507025,src/contact_actions.rs:171; src/contact_actions.rs:416
+/api/archivedchat/list,2987417,2509605,src/archive.rs:74
+/api/archivedchat/update,2987484,2509672,src/archive.rs:110
+/api/autoreply/create,3009246,2531434,
+/api/autoreply/delete,3009314,2531502,
+/api/autoreply/list,3009214,2531402,
+/api/autoreply/update,3009280,2531468,
+/api/backuppc2mb/upload,3010075,2532263,
+/api/banner/v1/info,8598467,6635826,
+/api/board/list,2997723,2519911,src/board.rs:279; src/group_content.rs:279; src/group_content.rs:564
+/api/board/listReminder,2998908,2521096,src/board.rs:279
+/api/board/multi_unpin,2998501,2520689,
+/api/board/oneone/create,2998634,2520822,src/board.rs:322
+/api/board/oneone/list,2998841,2521029,src/board.rs:281
+/api/board/oneone/remove,2998772,2520960,src/board.rs:352
+/api/board/oneone/update,2998703,2520891,src/board.rs:323
+/api/board/personal/delete,3008868,2531056,
+/api/board/personal/get,3008988,2531176,
+/api/board/personal/list,3008907,2531095,
+/api/board/personal/todo/create,3008780,2530968,
+/api/board/personal/todo/ding,3009024,2531212,
+/api/board/personal/todo/dingack,3009066,2531254,
+/api/board/personal/todo/status,3008944,2531132,
+/api/board/personal/todo/update,3008824,2531012,
+/api/board/personal/todo/verify,3009111,2531299,
+/api/board/pin,2998318,2520506,src/board.rs:267
+/api/board/pin/list,2997783,2519971,src/board.rs:267
+/api/board/pin/update,2997847,2520035,
+/api/board/pinv2,2998257,2520445,
+/api/board/topic/create,2997983,2520171,src/board.rs:237; src/board.rs:320; src/group_content.rs:359
+/api/board/topic/createv2,2997913,2520101,
+/api/board/topic/getReminder,2999136,2521324,src/board.rs:295
+/api/board/topic/listResponseEvent,2999057,2521245,
+/api/board/topic/remove,2998189,2520377,src/board.rs:350; src/group_content.rs:378
+/api/board/topic/update,2998121,2520309,src/board.rs:321; src/group_content.rs:357
+/api/board/topic/updateEventResponse,2998976,2521164,
+/api/board/topic/updatev2,2998051,2520239,
+/api/board/unpin,2998440,2520628,src/board.rs:252
+/api/board/unpinv2,2998377,2520565,src/board.rs:252
+/api/chk,15206688,11709154,
+/api/cm/getoldv2,3007692,2529880,src/chat.rs:5336; src/chat.rs:5388; src/session.rs:86
+/api/cm/getpath,3007777,2529965,
+/api/cm/getrecentv2,3007720,2529908,src/chat.rs:5336; src/chat.rs:5390; src/session.rs:86
+/api/cm/mget,3007804,2529992,
+/api/cm/pc/dl,3007828,2530016,
+/api/cm/rgetv2,3007751,2529939,
+/api/conv/addUnreadMark,2986399,2508587,src/unread.rs:617
+/api/conv/autodelete/getConvers,2987174,2509362,
+/api/conv/autodelete/updateConvers,2987250,2509438,src/conversation_policy.rs:218
+/api/conv/blocksharing/getConvers,17434611,13250094,
+/api/conv/blocksharing/updateConvers,17434649,13250132,src/conversation_policy.rs:230
+/api/conv/cm/grOfl,2987553,2509741,
+/api/conv/getUnreadMark,2986331,2508519,src/unread.rs:462
+/api/conv/removeUnreadMark,2986467,2508655,src/unread.rs:629; src/unread.rs:705
+/api/convlabel/get,2999662,2521850,src/labels.rs:244
+/api/convlabel/manage/add,8346995,6488723,
+/api/convlabel/manage/delete,8347058,6488786,
+/api/convlabel/manage/reorder,8347091,6488819,
+/api/convlabel/manage/update,8347025,6488753,
+/api/convlabel/update,2998568,2520756,src/labels.rs:290
+/api/devices/linked,15206829,11709295,
+/api/e2ee/pc/group/contact,2988831,2511019,
+/api/e2ee/pc/group/deleteConv,2988423,2510611,
+/api/e2ee/pc/group/deleteMsg,2988383,2510571,
+/api/e2ee/pc/group/file,2988796,2510984,
+/api/e2ee/pc/group/forward,2988869,2511057,
+/api/e2ee/pc/group/gif,2988688,2510876,
+/api/e2ee/pc/group/link,2988653,2510841,
+/api/e2ee/pc/group/mention,2988545,2510733,
+/api/e2ee/pc/group/multiUndoMsg,2988502,2510690,
+/api/e2ee/pc/group/photo,2988760,2510948,
+/api/e2ee/pc/group/quote,2988617,2510805,
+/api/e2ee/pc/group/sms,2988583,2510771,
+/api/e2ee/pc/group/sticker,2988722,2510910,
+/api/e2ee/pc/group/undoMsg,2988464,2510652,
+/api/e2ee/pc/message/contact,2988163,2510351,
+/api/e2ee/pc/message/delete,2987738,2509926,
+/api/e2ee/pc/message/deleteconver,2987777,2509965,
+/api/e2ee/pc/message/file,2988126,2510314,
+/api/e2ee/pc/message/forward,2988203,2510391,
+/api/e2ee/pc/message/gif,2988012,2510200,
+/api/e2ee/pc/message/link,2987975,2510163,
+/api/e2ee/pc/message/multi_undo,2987859,2510047,
+/api/e2ee/pc/message/photo,2988088,2510276,
+/api/e2ee/pc/message/quote,2987937,2510125,
+/api/e2ee/pc/message/sms,2987901,2510089,src/e2ee_trial.rs:412
+/api/e2ee/pc/message/sticker,2988048,2510236,
+/api/e2ee/pc/message/undo,2987822,2510010,
+/api/e2ee/pc/t/group/delivered,2988304,2510492,
+/api/e2ee/pc/t/group/seen,2988346,2510534,
+/api/e2ee/pc/t/message/delivered,2987655,2509843,
+/api/e2ee/pc/t/message/seen,2987699,2509887,
+/api/enterprise/login/emailPassword,3006100,2528288,
+/api/enterprise/loginEmailPassword,15081069,11583459,
+/api/enterprise/profiles,3002585,2524773,
+/api/exta/rnw,15207076,11709542,
+/api/feedback,3006372,2528560,
+/api/flp/sn,3009727,2531915,
+/api/friend/accept,2992434,2514622,src/chat.rs:6804; src/chat.rs:6817
+/api/friend/block,2992981,2515169,src/contact_actions.rs:105; src/contact_actions.rs:128
+/api/friend/blocklistv2,2993107,2515295,src/contact_actions.rs:105
+/api/friend/closefr/update,2993392,2515580,
+/api/friend/context/multiget,2992234,2514422,
+/api/friend/feed/block,2993598,2515786,
+/api/friend/group/related,2992687,2514875,src/groups.rs:457
+/api/friend/last-read-contact-tab,2993665,2515853,
+/api/friend/mget-qr,2993463,2515651,src/contact_actions.rs:115; src/contact_actions.rs:473
+/api/friend/profile/get,2993175,2515363,src/chat.rs:6889; src/chat.rs:6903; src/chat.rs:6926
+/api/friend/profile/multiget,2993319,2515507,
+/api/friend/read-contact-tab,2993743,2515931,
+/api/friend/recommends/remove,2992757,2514945,
+/api/friend/recommendsv2/list,2992831,2515019,
+/api/friend/recommendsv2/read-requests,2993816,2516004,
+/api/friend/recommendsv2/remove,2992905,2515093,
+/api/friend/reject,2992497,2514685,src/chat.rs:6856; src/chat.rs:6869
+/api/friend/remove,2992371,2514559,src/contact_actions.rs:154; src/contact_actions.rs:413
+/api/friend/reqstatus,2992621,2514809,src/chat.rs:6690; src/chat.rs:6741; src/chat.rs:6746; src/chat.rs:6759; src/contact_actions.rs:121
+/api/friend/requested/list,2993527,2515715,
+/api/friend/search/by-user-name,2993243,2515431,src/contact_actions.rs:87; src/contact_actions.rs:509
+/api/friend/sendreq,2992307,2514495,src/chat.rs:6767; src/chat.rs:6786
+/api/friend/unblock,2993043,2515231,src/contact_actions.rs:130; src/contact_actions.rs:408
+/api/friend/undo,2992560,2514748,src/chat.rs:6835; src/chat.rs:6848
+/api/friendboard/create,3009409,2531597,
+/api/friendboard/list,3009445,2531633,
+/api/friendboard/multi_unpin,3009516,2531704,
+/api/friendboard/reorder,3009479,2531667,
+/api/getCloudViewerKey,1622766,1391306,src/zcloud.rs:5; src/zcloud.rs:60; src/zcloud.rs:134; src/zcloud.rs:137
+/api/getFamilyViewerKey,1622814,1391354,
+/api/gid/decrypt,3000633,2522821,src/chat.rs:4910
+/api/gid/encrypt,3000572,2522760,
+/api/group/admins/add,2994313,2516501,src/groups.rs:406
+/api/group/admins/remove,2994379,2516567,src/groups.rs:408
+/api/group/analyse,2996475,2518663,
+/api/group/asyncfile/msg,2990327,2512515,src/chat.rs:2360
+/api/group/asyncfile/upload,2991287,2513475,src/chat.rs:2243
+/api/group/blockedmems/add,2994520,2516708,src/groups.rs:367
+/api/group/blockedmems/list,2994448,2516636,src/groups.rs:355
+/api/group/blockedmems/remove,2994591,2516779,src/groups.rs:369
+/api/group/change-owner,2997069,2519257,src/groups.rs:417; src/groups.rs:777
+/api/group/contact,2995678,2517866,src/chat.rs:4514; src/chat.rs:4547
+/api/group/create,2994726,2516914,src/groups.rs:314
+/api/group/create/v2,2994788,2516976,src/groups.rs:314
+/api/group/deleteconver,2996603,2518791,src/chat.rs:8202
+/api/group/deletemsg,2996538,2518726,src/chat.rs:4423
+/api/group/delivered,2994853,2517041,
+/api/group/deliveredv2,2994918,2517106,
+/api/group/disperse,2995363,2517551,src/groups.rs:427
+/api/group/forward,2989092,2511280,src/chat.rs:2492; src/chat.rs:2514
+/api/group/getStatusMsg,2997001,2519189,
+/api/group/getgi,15087092,11589513,
+/api/group/getgi/v2,2994107,2516295,
+/api/group/getlg,15085487,11587908,src/chat.rs:4811
+/api/group/getlg/e2ee,2997137,2519325,
+/api/group/getlg/v2,15085731,11588152,
+/api/group/getlg/v3,2993915,2516103,
+/api/group/getlg/v4,2993979,2516167,src/chat.rs:4811
+/api/group/getmg,2996803,2518991,src/chat.rs:4868; src/chat.rs:4945
+/api/group/getmg-v2,2994043,2516231,src/chat.rs:4868; src/chat.rs:4945
+/api/group/gif,2989735,2511923,
+/api/group/history,2996412,2518600,src/chat.rs:4711; src/chat.rs:4733; src/chat.rs:4747; src/chat.rs:4774
+/api/group/inv-box/inv-info,2997411,2519599,src/group_entry.rs:223
+/api/group/inv-box/join,2997343,2519531,src/group_entry.rs:119
+/api/group/inv-box/list,2997203,2519391,src/group_entry.rs:106
+/api/group/inv-box/mdel-inv,2997271,2519459,src/group_entry.rs:123; src/group_entry.rs:307
+/api/group/invite,2995236,2517424,src/groups.rs:389
+/api/group/invite/multi,2996864,2519052,
+/api/group/invite/v2,2995298,2517486,src/groups.rs:389
+/api/group/kickout,2995173,2517361,src/groups.rs:397
+/api/group/kickout/multi,2996932,2519120,
+/api/group/leave,2994665,2516853,src/groups.rs:423; src/groups.rs:766
+/api/group/link/detail,2995872,2518060,src/groups.rs:345
+/api/group/link/disable,2996003,2518191,src/groups.rs:347
+/api/group/link/ginfo,2996071,2518259,src/group_entry.rs:111
+/api/group/link/join,2996137,2518325,src/group_entry.rs:115
+/api/group/link/new,2995939,2518127,src/groups.rs:346
+/api/group/mention,2995615,2517803,src/chat.rs:8097
+/api/group/mforward,2989220,2511408,
+/api/group/multi_undomsg,2996734,2518922,src/chat.rs:4622
+/api/group/pending-mems/list,2996202,2518390,src/groups.rs:348
+/api/group/pending-mems/review,2996275,2518463,src/groups.rs:381
+/api/group/photo_original/send,2990467,2512655,src/chat.rs:2083
+/api/group/photo_original/upload,2991063,2513251,src/chat.rs:1992
+/api/group/photo_url,2989409,2511597,
+/api/group/quota/community,2997556,2519744,src/groups.rs:320
+/api/group/quota/members-comm,2997627,2519815,src/groups.rs:549
+/api/group/quote,2995554,2517742,src/chat.rs:3865; src/chat.rs:3974; src/chat.rs:8098
+/api/group/react_delivered,3007435,2529623,
+/api/group/react_seen,3007473,2529661,
+/api/group/reaction,3007541,2529729,src/chat.rs:4320
+/api/group/seen,2994985,2517173,
+/api/group/seenv2,2995045,2517233,
+/api/group/sendlink,2995490,2517678,src/chat.rs:2979; src/chat.rs:3054
+/api/group/sendmp3,2989860,2512048,
+/api/group/sendmsg,2995427,2517615,src/chat.rs:1831
+/api/group/sendpt,2989284,2511472,src/chat.rs:2117; src/chat.rs:2119
+/api/group/setting/update,2994243,2516431,src/groups.rs:343
+/api/group/sharefile,2990132,2512320,
+/api/group/sharefile_full,2989995,2512183,
+/api/group/sticker,2995741,2517929,src/chat.rs:3109; src/chat.rs:3167
+/api/group/topic/remove,2995804,2517992,
+/api/group/typing,2996350,2518538,src/presence.rs:12; src/presence.rs:220; src/presence.rs:319
+/api/group/undomsg,2996671,2518859,src/chat.rs:4486
+/api/group/upavatar,2990263,2512451,src/avatar.rs:108; src/avatar.rs:194
+/api/group/updateinfo,2995107,2517295,src/groups.rs:335
+/api/group/upgrade/community,2997483,2519671,src/groups.rs:325; src/groups.rs:850
+/api/group/upload/photo,2991998,2514186,
+/api/group/userctx/multiget,2994171,2516359,
+/api/group/video/file/upload,2991433,2513621,
+/api/group/video/thumb/upload,2991581,2513769,
+/api/group/voice/upload,2991731,2513919,
+/api/group/zcloud-upload/photo,2992137,2514325,
+/api/hiddenconvers/add-remove,2986879,2509067,src/hidden_chat.rs:300
+/api/hiddenconvers/get-all,2986808,2508996,src/hidden_chat.rs:266
+/api/hiddenconvers/reset,2987027,2509215,
+/api/hiddenconvers/update-pin,2986953,2509141,src/hidden_chat.rs:293
+/api/lan/friends,3008478,2530666,
+/api/lan/leave,3008535,2530723,
+/api/lan/samemacs,3008562,2530750,
+/api/lan/status,3008450,2530638,
+/api/lan/submit,3008507,2530695,
+/api/login/actlistv2,3007100,2529288,
+/api/login/chkUpdate,3006276,2528464,
+/api/login/completeRemoveData,3007300,2529488,
+/api/login/fbAuth,3006503,2528691,
+/api/login/fblogout,3007041,2529229,
+/api/login/getActiveCodeByZalo,3006780,2528968,
+/api/login/getCaptcha,3006030,2528218,
+/api/login/getFbAuthInfo,3006467,2528655,
+/api/login/getLoginInfo,3006308,2528496,src/call.rs:295; src/login.rs:258; src/login.rs:277; src/param_cipher.rs:101
+/api/login/getServerInfo,3006147,2528335,src/login.rs:90; src/login.rs:97; src/login.rs:122
+/api/login/getSupportCountry,3006397,2528585,
+/api/login/hasNewMsg,3007228,2529416,
+/api/login/linkFacebook,3006866,2529054,
+/api/login/logOut,3006343,2528531,
+/api/login/loginByFacebook,3006532,2528720,
+/api/login/loginByFacebookWithSecure,3006570,2528758,
+/api/login/loginByPassw,15080576,11582966,src/login.rs:151; src/login.rs:169; src/login.rs:179; src/login.rs:217
+/api/login/loginByPasswv2,3006063,2528251,src/login.rs:169; src/login.rs:179; src/login.rs:217
+/api/login/loginByResetPwd,3006964,2529152,
+/api/login/migrateSS,15147866,11650333,
+/api/login/popup,3007072,2529260,
+/api/login/reqqr,3006002,2528190,src/qr.rs:1; src/qr.rs:19; src/qr.rs:91; src/qr.rs:146
+/api/login/setting,3006437,2528625,
+/api/login/ssoSyncMp3,3007195,2529383,
+/api/media/oneone/list,3000265,2522453,src/server_media.rs:5; src/server_media.rs:54; src/server_media.rs:178; src/server_media.rs:186
+/api/media/oneone/preview,3000299,2522487,
+/api/media/oneone/remove,3000336,2522524,
+/api/mediastore/list,3000099,2522287,src/server_media.rs:5; src/server_media.rs:54; src/server_media.rs:154; src/server_media.rs:162
+/api/mediastore/preview,3000131,2522319,
+/api/mediastore/remove,3000166,2522354,
+/api/message/asyncfile/msg,2990396,2512584,src/chat.rs:2362
+/api/message/asyncfile/upload,2991359,2513547,src/chat.rs:2245
+/api/message/cancel_pull_mobile_msg,2990759,2512947,src/phone_sync/legacy.rs:153
+/api/message/contact,2985681,2507869,src/chat.rs:4514; src/chat.rs:4572
+/api/message/delete,2985874,2508062,src/chat.rs:4446; src/chat.rs:8204
+/api/message/delete_snapshot_mobile_msg,2990839,2513027,
+/api/message/deleteconver,2985938,2508126,src/chat.rs:8204
+/api/message/delivered,2985061,2507249,
+/api/message/deliveredv2,2985128,2507316,
+/api/message/effect/get,3004164,2526352,
+/api/message/effects,3003742,2525930,
+/api/message/fetchImportant,2985367,2507555,
+/api/message/forward,2989155,2511343,src/chat.rs:2492; src/chat.rs:2518; src/video_meta.rs:3
+/api/message/getStatusMsg,2986216,2508404,
+/api/message/get_backupmsginfo,2990923,2513111,
+/api/message/get_crossdb,2990619,2512807,
+/api/message/gif,2989607,2511795,
+/api/message/giphy/cates,3004542,2526730,
+/api/message/giphy/dicts,3004689,2526877,
+/api/message/giphy/gifs,3004578,2526766,
+/api/message/giphy/gifsbydict,3004725,2526913,
+/api/message/giphy/search,3004652,2526840,
+/api/message/giphy/trending,3004613,2526801,
+/api/message/guggy/default,3004424,2526612,
+/api/message/guggy/search,3004462,2526650,
+/api/message/link,2985619,2507807,src/chat.rs:2978; src/chat.rs:3092
+/api/message/mforward,2989541,2511729,
+/api/message/multi_undo,2986070,2508258,src/chat.rs:4643
+/api/message/parselink,2988960,2511148,src/chat.rs:2890; src/chat.rs:2921
+/api/message/photo,2989346,2511534,src/chat.rs:1994; src/chat.rs:2085; src/chat.rs:2117; src/chat.rs:2121
+/api/message/photo_original/send,2990542,2512730,src/chat.rs:2085
+/api/message/photo_original/upload,2991140,2513328,src/chat.rs:1994
+/api/message/photo_url,2989474,2511662,
+/api/message/pull_mobile_msg,2990686,2512874,src/phone_sync/legacy.rs:155
+/api/message/quote,2985811,2507999,src/chat.rs:3864; src/chat.rs:4007
+/api/message/react_delivered,3007395,2529583,
+/api/message/react_seen,3007506,2529694,
+/api/message/reaction,3007572,2529760,src/chat.rs:4333
+/api/message/renewlink,2989668,2511856,src/media_renew.rs:224
+/api/message/scanurl,2990998,2513186,
+/api/message/seen,2985197,2507385,
+/api/message/seenv2,2985259,2507447,
+/api/message/sharefile,2990065,2512253,
+/api/message/sharefile_full,2989923,2512111,
+/api/message/sms,2985558,2507746,src/chat.rs:1783; src/chat.rs:1824
+/api/message/sticker,2985746,2507934,src/chat.rs:3108; src/chat.rs:3193; src/chat.rs:3280; src/chat.rs:3388; src/chat.rs:3466; src/chat.rs:3467; src/chat.rs:3570; src/chat.rs:3577; src/chat.rs:3634; src/chat.rs:3683; src/chat.rs:3749; src/session.rs:92
+/api/message/sticker/ai/list,3004282,2526470,
+/api/message/sticker/category/detail,3003869,2526057,
+/api/message/sticker/category/list,3003774,2525962,src/chat.rs:3280
+/api/message/sticker/category/list/v2,3003820,2526008,src/chat.rs:3280
+/api/message/sticker/category/sticker_detail,3003964,2526152,src/chat.rs:3388
+/api/message/sticker/personalized/list,3004322,2526510,
+/api/message/sticker/personalized/update,3004372,2526560,
+/api/message/sticker/recommended,3004238,2526426,
+/api/message/sticker/search,3004199,2526387,src/chat.rs:3467; src/chat.rs:3683; src/chat.rs:3749
+/api/message/sticker/sticker_detail,3003917,2526105,
+/api/message/sticker/suggest/keywords,3004020,2526208,src/chat.rs:3570; src/chat.rs:3577
+/api/message/sticker/suggest/stickers,3004069,2526257,src/chat.rs:3466; src/chat.rs:3634; src/chat.rs:3749
+/api/message/sticker/suggestion,3004499,2526687,
+/api/message/sticker/tenor/mapping,3004118,2526306,
+/api/message/typing,2985439,2507627,src/presence.rs:11; src/presence.rs:225; src/presence.rs:316
+/api/message/undo,2986008,2508196,src/chat.rs:4508
+/api/message/upload/photo,2991961,2514149,
+/api/message/upthumb,2989027,2511215,
+/api/message/video/file/upload,2991506,2513694,
+/api/message/video/thumb/upload,2991655,2513843,
+/api/message/voice/upload,2991799,2513987,
+/api/message/voicemp3,2989794,2511982,
+/api/message/zcloud-upload/photo,2992093,2514281,
+/api/pinconvers/list,2986538,2508726,src/chat.rs:4695; src/chat.rs:4703
+/api/pinconvers/update,2986603,2508791,src/server_pins.rs:101
+/api/pinconvers/updatev2,2986670,2508858,
+/api/poll/create,2999230,2521418,src/group_content.rs:410
+/api/poll/detail,2999291,2521479,src/group_content.rs:232
+/api/poll/end,2999536,2521724,src/group_content.rs:474
+/api/poll/option/add,2999352,2521540,src/group_content.rs:455
+/api/poll/share,2999476,2521664,
+/api/poll/vote,2999417,2521605,src/group_content.rs:432
+/api/preloadconvers/get-last-msgs,2987096,2509284,src/account_metadata.rs:146; src/chat.rs:4649; src/chat.rs:4651; src/chat.rs:4686
+/api/preloadconvers/get-last-seen,2986138,2508326,
+/api/prodcatalog/catalog/create,3008171,2530359,
+/api/prodcatalog/catalog/delete,3008259,2530447,
+/api/prodcatalog/catalog/list,3008349,2530537,
+/api/prodcatalog/catalog/register,3008303,2530491,
+/api/prodcatalog/catalog/update,3008215,2530403,
+/api/prodcatalog/product/create,3007910,2530098,
+/api/prodcatalog/product/delete,3007998,2530186,
+/api/prodcatalog/product/list,3008087,2530275,
+/api/prodcatalog/product/mdelete,3008042,2530230,
+/api/prodcatalog/product/update,3007954,2530142,
+/api/prodcatalog/product/view,3008129,2530317,
+/api/product/upload/photo,2991219,2513407,
+/api/profile/upavatar,2990197,2512385,src/avatar.rs:102
+/api/quickmessage/create,3003581,2525769,
+/api/quickmessage/delete,3003653,2525841,
+/api/quickmessage/list,3003547,2525735,
+/api/quickmessage/update,3003617,2525805,
+/api/react/gLastSn,3007605,2529793,
+/api/recentsearch/list,3008654,2530842,
+/api/recentsearch/update,3008689,2530877,
+/api/register/,15149139,11651606,
+/api/register/getActiveCodeBySms,3006690,2528878,
+/api/register/getActiveCodeByVoice,3006734,2528922,
+/api/register/signUpWithPwd,3007002,2529190,
+/api/register/validateActiveCode,3006822,2529010,
+/api/register/verifyExt,3006655,2528843,
+/api/register/verifyPhone,3006618,2528806,
+/api/report/abuse-v2,3000920,2523108,
+/api/session/kickout-info,15206521,11708987,
+/api/setting/me,3006183,2528371,src/privacy.rs:108
+/api/setting/rating,3007132,2529320,
+/api/setting/update,3006210,2528398,src/privacy.rs:124
+/api/social/avatar-list,3003189,2525377,src/avatar_history.rs:107
+/api/social/del-avatars,3003257,2525445,src/avatar_history.rs:114
+/api/social/ekyc/push-oa,3001508,2523696,
+/api/social/friend/active-pcweb,3002795,2524983,
+/api/social/friend/get-bizacc,3002511,2524699,
+/api/social/friend/getclosedfriends,3000764,2522952,src/contact_actions.rs:94
+/api/social/friend/getfriends,3000498,2522686,src/account_metadata.rs:104; src/chat.rs:1538; src/chat.rs:1570
+/api/social/friend/getminiprofiles,3003110,2525298,src/chat.rs:5001; src/chat.rs:5012
+/api/social/friend/getprofiles,15090683,11593141,
+/api/social/friend/getprofiles/v2,3000985,2523173,
+/api/social/friend/onlines,3001719,2523907,
+/api/social/friend/phonebook,3001790,2523978,
+/api/social/friend/phonebook/v2,3001863,2524051,
+/api/social/friend/verify,3000428,2522616,
+/api/social/group/members,3000694,2522882,
+/api/social/oa/block,3003394,2525582,
+/api/social/oa/convertid,3002014,2524202,
+/api/social/oa/unblock,3003459,2525647,
+/api/social/profile/avatar,3001063,2523251,
+/api/social/profile/avatar-url,3001134,2523322,
+/api/social/profile/biz-off-remind,3003031,2525219,
+/api/social/profile/biz-register-trial,3002948,2525136,
+/api/social/profile/biz-register-trial-v2,3001577,2523765,
+/api/social/profile/changefgtobg,3002871,2525059,
+/api/social/profile/deactive,3002291,2524479,
+/api/social/profile/extra,3002083,2524271,
+/api/social/profile/getmute,3001281,2523469,src/mute_sync.rs:176
+/api/social/profile/getrank,3002439,2524627,
+/api/social/profile/lastOnline,3002364,2524552,src/last_activity.rs:59
+/api/social/profile/me,15090437,11592895,src/profile.rs:128; src/session.rs:485; src/session.rs:503; src/session.rs:514
+/api/social/profile/me-v2,3002654,2524842,src/profile.rs:128; src/session.rs:485; src/session.rs:503; src/session.rs:514
+/api/social/profile/mode,3002153,2524341,
+/api/social/profile/ping,3002222,2524410,
+/api/social/profile/reportabuse,3000844,2523032,src/contact_actions.rs:147; src/contact_actions.rs:448; src/contact_actions.rs:485
+/api/social/profile/setmute,3001209,2523397,src/mute_sync.rs:214
+/api/social/profile/status,3001353,2523541,
+/api/social/profile/update,3002724,2524912,src/profile.rs:157
+/api/social/profile/updatelang,3001939,2524127,
+/api/social/profile/verification/status,3001424,2523612,
+/api/social/reuse-avatar,3003325,2525513,src/avatar_history.rs:110; src/avatar_history.rs:221
+/api/subtab/seen,6494867,5230149,
+/api/suggestconvers/list,2986739,2508927,
+/api/survey/iap/nps,15206300,11708766,
+/api/sync_action/media,3009582,2531770,
+/api/syncmsg/confirm,3007163,2529351,
+/api/transfer-sync-v2/request-sync,2991869,2514057,
+/api/transfer/card,3009822,2532010,
+/api/transfer/conf,3009952,2532140,
+/api/transfer/create,3009853,2532041,
+/api/transfer/delete,3009919,2532107,
+/api/transfer/list,3009983,2532171,
+/api/transfer/update,3009886,2532074,
+/api/update/checkHasPassword,3007260,2529448,
+/api/update/password,3006932,2529120,
+/api/update/profile,3006901,2529089,
+/api/update/setting/2FA,3006241,2528429,
+/api/v1/emoji-status/friends,11451714,9182689,
+/api/v1/emoji-status/resource-config,11451673,9182648,
+/api/v2/login/logOut,15083760,11586181,
+/api/voicecall/answer,3004929,2527117,src/call.rs:421; src/call.rs:457; src/call.rs:459; src/call.rs:467; src/call.rs:1712; src/call.rs:2007
+/api/voicecall/answerack,3004962,2527150,src/call.rs:459; src/call.rs:467
+/api/voicecall/cancel,3004998,2527186,src/call.rs:469; src/call.rs:478
+/api/voicecall/conf,3005722,2527910,src/call.rs:523; src/call.rs:532; src/call.rs:4259
+/api/voicecall/endcall,3005031,2527219,src/call.rs:480; src/call.rs:488
+/api/voicecall/group/adduser,3005328,2527516,src/call.rs:567; src/call.rs:579
+/api/voicecall/group/answer,3005368,2527556,src/call.rs:581; src/call.rs:592
+/api/voicecall/group/broadcast,3005680,2527868,src/call.rs:680; src/call.rs:691
+/api/voicecall/group/cancel,3005407,2527595,src/call.rs:594; src/call.rs:605
+/api/voicecall/group/endcall,3005446,2527634,src/call.rs:607; src/call.rs:618
+/api/voicecall/group/finish,3005565,2527753,src/call.rs:642; src/call.rs:654
+/api/voicecall/group/join,3005843,2528031,src/call.rs:693; src/call.rs:705
+/api/voicecall/group/notify,3005604,2527792,src/call.rs:656; src/call.rs:665
+/api/voicecall/group/ping,3005643,2527831,src/call.rs:667; src/call.rs:678
+/api/voicecall/group/request,3005288,2527476,src/call.rs:268; src/call.rs:543; src/call.rs:552; src/call.rs:554; src/call.rs:565
+/api/voicecall/group/requestcall,3005244,2527432,src/call.rs:268; src/call.rs:543; src/call.rs:552
+/api/voicecall/group/ringring,3005486,2527674,src/call.rs:620; src/call.rs:631
+/api/voicecall/group/sharescreen,3005880,2528068,src/call.rs:707; src/call.rs:718; src/call.rs:4314
+/api/voicecall/group/state,3005527,2527715,src/call.rs:633; src/call.rs:640
+/api/voicecall/holdreq,3005065,2527253,src/call.rs:490; src/call.rs:493
+/api/voicecall/holdresp,3005099,2527287,src/call.rs:495; src/call.rs:498
+/api/voicecall/logendcall,3005207,2527395,src/call.rs:510; src/call.rs:521
+/api/voicecall/request,3004860,2527048,src/call.rs:381; src/call.rs:390; src/call.rs:392; src/call.rs:409; src/call.rs:534; src/call.rs:541; src/call.rs:1711; src/call.rs:1712; src/call.rs:4305
+/api/voicecall/requestaudio2video,3005753,2527941,
+/api/voicecall/requestcall,3004822,2527010,src/call.rs:381; src/call.rs:390; src/call.rs:1712
+/api/voicecall/requestsharescreen,3005798,2527986,src/call.rs:534; src/call.rs:541; src/call.rs:4305
+/api/voicecall/ringring,3004894,2527082,src/call.rs:411; src/call.rs:419
+/api/voicecall/unholdreq,3005134,2527322,src/call.rs:500; src/call.rs:503
+/api/voicecall/unholdresp,3005170,2527358,src/call.rs:505; src/call.rs:508
+/api/znoise,3001663,2523851,src/phone_sync/legacy.rs:344

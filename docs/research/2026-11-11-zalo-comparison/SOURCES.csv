@@ -1,0 +1,50 @@
+﻿kind,name,sha256,bytes,source
+PC ASAR,app.asar,70f1b53c4db61321bf1b11c722a9049823711328b87e17b0d19338f83a5f6ed3,181099771,Drive file 1iCY7K5kMJ1n59wXey4Z6IP7B_yhmNt21
+PC extracted E2,package.json,b7eccff1a85224360193d7d4b14aafac4d3f904d9478b579b3f3b1b4a30b4d2d,4000,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/child.html,603b253d13834cef6a9924aa6ea5decee8945a589c6948e77a536a53b415ed54,3403,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/compact-app-pc.5c0110a3a8749b3aacde.css,eda6cf060beaf2500f81d4529ab49780f59b887467484ca03a5559a482aa2066,2366824,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/compact-app-pc.5c0110a3a8749b3aacde.js,db5966d4b02771f7c32f0884be6be2ec4c9f1b49a1628ae981f535d411150869,21691083,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/compact-app.html,72b25cbddb6ba72d2350783c9d53b4e6b3fa9ff71c7594777b4bf4f240c86600,1307,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/index.html,699161761030d57add981b6f7200ba20d3beb143ac3ffe92171b8599e09ccb40,6267,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/login.html,b1c416a2789e3b5c33d9d1727baa9e34b881fd7ec1c480f000bd25cd6ebdb561,6605,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/popup-viewer.html,f765f589c94670ca9c7775fd606b645b581b1b1552e8f0ff0f0406b065369829,4077,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/project.json,bc219f5f8760fd5ee7243ab41e1b1c5cc4c7764a3bb1bdccbfe973fe305c7e10,181,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/shared-worker.html,6f8033dddab15d0f6e00ac7aaef62929f070ba8d2bd4ec72b421354330e4d4e0,2649,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/sqlite.html,b4d4fdc2c97fd3dac5e7e1ebb9082c5d7cb72690911e5cc89c1e1ead476637e1,316,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/stast.json,8410d27c794fc89b621a5ce07ba344ad03b4b5fef39e03c94a4cdc4d290fe47c,74623,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/sync-v2-sub-worker.5c0110a3a8749b3aacde.css,71ade44409f2a01a43ad02ec93e84a172ff966b989a725c94a3292ff896f344d,45533,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/sync-v2-sub-worker.5c0110a3a8749b3aacde.js,3a89a48db4ff3930bebc6228b14770c66fca07ba1220b375f6862a77c1e9d08d,21952717,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/znotification.html,836910703596fd812f34aafcb4fd2c1139c6e34026653ed8c086efeb42e7c7b6,2278,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/libs/libsignal-protocol.static.js,a53709c414c63eb2303859574d9fb1d2d082f746e6f76f9f51c7241f2402dec4,629683,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/lazy/lang-vi.bd6430df3fbb9dc6dc93.js,e7088dc670115457f8f128ebc966c3cda288683d20ee286610bfd00ca2f344a3,459584,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/emoji-data-invert.json,09a4396a22f50f2eed53b8f238a55e9f5ff4820cb8c42008680291c254ab1281,56134,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/emoji-data.json,d176f35c40169eae316c4de288aa8f2eb7dd1c74165adc3731852dadcac3b244,56131,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/emoji-pos-all.json,74fe0c530e4bf1b98fff73341adcb878b623d55d23044d2969e58d6377efcf5f,73995,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/emoji-pos.json,1471d9a45610977425966245dfa25b6810ba8f799260188c2d641198e5c1c445,45817,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/emoji-rc.json,ff5f24b016cff1c58f0ab4e97edc022de29e45ad43db97c56207f65d8fdc415d,50754,Zalo PC 26.11.10 installer
+PC extracted E2,pc-dist/emoji/sg_emo.json,b71fd7ebc9116ef5f784d92ad9580cdc57e56e992f46aec11fba668cbcbd9775,319895,Zalo PC 26.11.10 installer
+PC extracted E2,main-dist/preload-render.js,883849c789c185866a6452851e1de6018c3f483cd4c51245229239428c02e841,2002591,Zalo PC 26.11.10 installer
+PC extracted E2,main-dist/stast.json,0dd2ec59d36e260d2661ad067f3a6e60d9188430fad2220b32f84f64b2d96f40,1305,Zalo PC 26.11.10 installer
+Web public E2,session-sdk_session-sdk.min.js,b67896103b82aeaddd97260cb8eacc438293448c447397978d30565c8413b15b,20284,https://stc-sp.zadn.vn/session-sdk/session-sdk.min.js
+Web public E2,v1_lazy_14.1529669323de1588caef.js,f9fba1049984768e49a7dd389d5d02b873acf4a10f2b67efd3034a0b454d203b,80321,https://zalo-chat-static.zadn.vn/v1/lazy/14.1529669323de1588caef.js
+Web public E2,v1_lazy_3.037eb2baf9d1ad9f2d7e.js,7809c2ed151ad6fe86dea248d2bd904435b38e5bed944150b946f7ebe00d5df6,36477,https://zalo-chat-static.zadn.vn/v1/lazy/3.037eb2baf9d1ad9f2d7e.js
+Web public E2,v1_lazy_4.733701f2750eeefc49d7.js,5911fea711695b701bb82f8853d704106a479fe2d47026128c5400726ffc4516,861,https://zalo-chat-static.zadn.vn/v1/lazy/4.733701f2750eeefc49d7.js
+Web public E2,v1_lazy_default-embed-render-trusted-device-bridge.945a394c838bda8229c0.js,36b9e8bd08e74076482e737554e80cb0470e5417682b5c0c8d531af3465b4210,2869,https://zalo-chat-static.zadn.vn/v1/lazy/default-embed-render-trusted-device-bridge.945a394c838bda8229c0.js
+Web public E2,v1_lazy_default-embed-render.0f437fad1343714f4897.js,d9b8e96d5fba1d18cb992569c57b41b2dbc6b4b1e194bb17cee312cccfe4dfcb,946093,https://zalo-chat-static.zadn.vn/v1/lazy/default-embed-render.0f437fad1343714f4897.js
+Web public E2,v1_lazy_vendors-embed-render-trusted-device-bridge.85a0370800e761976138.js,fb57e3e23b25a7b4d11fe8ad759b4f895cb1af97d2910b12c14a79824c271af3,26789,https://zalo-chat-static.zadn.vn/v1/lazy/vendors-embed-render-trusted-device-bridge.85a0370800e761976138.js
+Web public E2,v1_lazy_vendors-embed-render.0f79c9d9451c44466079.js,c6b6463675fb24fd1b92e4f29e7103c0894cd720e55905c4ecb3e32d3b2a8c91,1156542,https://zalo-chat-static.zadn.vn/v1/lazy/vendors-embed-render.0f79c9d9451c44466079.js
+Web public E2,v1_render.081738ba2350940a6b28.js,b9244a51f741d50d7f4cb75d827726f1ee4ffd28672aab7d1bba2ae39dbf5553,203673,https://zalo-chat-static.zadn.vn/v1/render.081738ba2350940a6b28.js
+Web public E2,v1_sync-v2-worker.081738ba2350940a6b28.js,91519f6656c81afb41f7f6989e78a6aa43beef33f75079754559b54568b33e72,3928826,https://zalo-chat-static.zadn.vn/v1/sync-v2-worker.081738ba2350940a6b28.js
+Web public E2,libs_libsignal-protocol.static.js,f4ddc940b69ac675ae773156cbd747d2ab11dea88f8c6923e2f568ed717b9124,234133,https://chat.zalo.me/libs/libsignal-protocol.static.js
+Web public E2,0.c94b307c60405fc53745.js,dd981837fd1e86057e5752deba4e5c0a57aedc074def69316b8733019d23b7f7,1903,https://zalo-chat-static.zadn.vn/v1/lazy/0.c94b307c60405fc53745.js
+Web public E2,1.c72c0957b455ab70b73c.js,29784a88e51221a64f854b059e49e68707ae58cee7a4114bc722ce028a887bf1,16302277,https://zalo-chat-static.zadn.vn/v1/lazy/1.c72c0957b455ab70b73c.js
+Web public E2,2.c3bf296c1dc0dcd10294.js,1f9cd862ee6f5e63c3a30bf9cbfdcfd0401372cd1d24f12882bed4123ff8beb7,2339447,https://zalo-chat-static.zadn.vn/v1/lazy/2.c3bf296c1dc0dcd10294.js
+Web public E2,ai-translation-language-model.83623ce6f225ae411a33.js,fdacb1bc7ea2c9c1c38673789462000f17bcb7ff6007ec2b04b582b6a4958846,566718,https://zalo-chat-static.zadn.vn/v1/lazy/ai-translation-language-model.83623ce6f225ae411a33.js
+Web public E2,lang-vi.81401760339cc690532c.js,741c6e3bd99a1fd881df2531e27fd19bf0cb4fa7980e0eac963cce562dfb85f4,459633,https://zalo-chat-static.zadn.vn/v1/lazy/lang-vi.81401760339cc690532c.js
+Web public E2,vendors-web-startup.be15797b10fe9afd5ad0.js,b031e129537aee181f8eaee63af93fa891d81c683ac2c74abd28100d1313eac6,438207,https://zalo-chat-static.zadn.vn/v1/lazy/vendors-web-startup.be15797b10fe9afd5ad0.js
+Web public E2,web-startup.a00a02c532982ab4915a.js,5dc90183d21e826518884e9b67e74d9d265593816952984e9d4ac0cde132cf01,2393291,https://zalo-chat-static.zadn.vn/v1/lazy/web-startup.a00a02c532982ab4915a.js
+PC installer,ZaloSetup-26.11.10.exe,7166ea28925b3121369ffb25e87b4749a648f47a861272009dcb14094b5a5511,213369880,Drive
+Web page,web/index.html,7cb634703d2c766feb074cd195f9db2e47f5554625f88330537514e083f40bc4,4991,https://chat.zalo.me/
+Web decoded library,web/libs_libsignal-protocol.static.js.decoded.js,a53709c414c63eb2303859574d9fb1d2d082f746e6f76f9f51c7241f2402dec4,629683,https://chat.zalo.me/
+User reference,zalo_pc_web_olaz_upstream_deep_analysis.md,5a451bb3c1a1b3fadbbd9d54a2e8a022d00f02ed792fc85ab1632bb59d150e9e,30516,D:/Henry/Downloads/zalo_pc_web_olaz_upstream_deep_analysis.md
+PC extracted E2,pc-dist/signal/MessageProtocol.proto,e3341b8051f0b0601233b6dc136a1e3c173fabc9b1dd20f77a87dc58f28f996b,4818,ASAR 70f1b53c4db61321bf1b11c722a9049823711328b87e17b0d19338f83a5f6ed3
