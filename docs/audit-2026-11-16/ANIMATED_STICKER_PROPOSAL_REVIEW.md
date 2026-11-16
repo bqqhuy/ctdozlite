@@ -50,7 +50,8 @@ the static PNG URL.
 - Zalo stickers: fetch `sprite?eid={id}&size=130` (new endpoint constant in
   `src/endpoints.rs`). On failure or invalid geometry, fall back to the
   current static `webpc` image.
-- Bundled stickers: decode the embedded GIF frames and delays.
+- Bundled stickers: decode the embedded GIF frames and delays, then pack
+  them into a horizontal sprite in the worker (see the unified type below).
 
 ### Decode (worker, `spawn_blocking`)
 - Use the existing bounded path: `limits::read_bounded_response` /
@@ -100,6 +101,81 @@ the static PNG URL.
   (for example to ≥ 20 ms).
 - Gates per `AGENTS.md` (fmt, check, clippy default + all-features, tests
   default + `experimental-e2ee`, prepush scripts).
+
+## Round 2: Antigravity rebuttal (2026-11-16)
+
+### Accepted
+- Dynamic geometry: `frames = width / height`, require `width % height == 0`,
+  `1 <= frames <= 64`. One frame means static: no animation state and no
+  repaint scheduling.
+- UV for frame `i` of `N`: `u0 = i/N`, `u1 = (i+1)/N`, `v0 = 0`, `v1 = 1`.
+- `endpoints::sticker_sprite_url(id)` with fallback to `legacy_sticker_image`.
+- `size=130` may not equal the delivered frame size (eid 23339 returned
+  180 px frames). This is consistent with the probe but unverified as a rule.
+  Code must not assume a fixed size either way.
+
+### Rejected or unproven
+1. **Sticker `type` semantics (1 static, 2/7 animated, 8 sound): unproven and
+   contradicted by the code.** `src/chat.rs` defaults `type` to 7 for every
+   parsed sticker (`unwrap_or(7)`), and the built-in "Củ hành" set
+   (`cate_id == 0`, static thumbnails) is hard-coded `sticker_type: 7`. If 7
+   meant "animated", every sticker would animate. **`type` must not gate
+   animation** until a cited source proves the mapping.
+2. **"1.2–1.8 s per loop / 80 ms per frame" has no source.** No JS file,
+   offset or CSS `steps()` rule was cited. Repository policy requires a
+   citation for values taken from Zalo clients.
+3. **"Chat messages carry only `{id, cate_id, type}` and no timing":**
+   plausible, but stated as fact without evidence. Check the sticker detail
+   payload for fps/duration fields before concluding.
+4. **`StickerAsset::MultiFrameGif { frames: Vec<TextureHandle> }`
+   contradicts the agreed single-texture rule.** Replaced by the unified
+   type below.
+5. **Fallback only on network error / non-200 is incomplete.** Fallback must
+   also cover decode failure, invalid geometry and limit violations, in one
+   place.
+6. **The consensus design dropped:** the 3–5 concurrent animation cap and
+   the disable-animation setting. Both remain required.
+7. **Spike size 15–30 is below the required ≥ 30 IDs.** Results must be
+   recorded per category.
+8. Minor: "DirectX 12 descriptor heap pressure" is not the main concern. The
+   default build uses `glow`; only one target enables `wgpu` dx12.
+
+### Unified type (replaces the three-variant `StickerAsset`)
+
+```rust
+pub struct StickerSprite {
+    pub texture: egui::TextureHandle, // one horizontal strip, counted in texture_budget
+    pub frames: u16,                   // 1 = static
+    pub delays: Vec<std::time::Duration>, // len == frames; Zalo sprite: all equal
+}
+```
+
+- Zalo sprite: `delays = vec![ZALO_SPRITE_FRAME_DELAY; frames]`.
+- Bundled GIF: frames packed into one strip in the worker. Delays come from
+  the GIF, clamped to at least 20 ms.
+- Static image: `frames = 1`, `delays = vec![Duration::ZERO]`.
+- One render path: frame chosen from cumulative delays; repaint scheduled
+  only while visible and within the animation cap.
+
+### Frame delay constant
+
+Until a source is found:
+
+```rust
+/// PROVISIONAL, unverified: no Zalo client source cited yet.
+/// Replace with the cited value from the Zalo PC/Web client.
+pub const ZALO_SPRITE_FRAME_DELAY: Duration = Duration::from_millis(80);
+```
+
+### Conditions to finalise the spec
+1. Spike ≥ 30 sprite IDs across categories; record geometry per ID in docs.
+2. Find and cite the Zalo source for frame timing and for how the client
+   decides a sticker is animated. If not found, keep the provisional
+   constant above and do **not** use `type`.
+3. Implement the unified `StickerSprite` for both Zalo sprites and bundled
+   GIFs.
+4. Keep the animation cap, the disable setting, texture budget accounting
+   and every test in "Required tests".
 
 ## Acceptance left to the owner
 
