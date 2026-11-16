@@ -71,6 +71,50 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
     crate::chat::merge_sent_message(thread, message);
 }
 
+fn apply_outgoing_state(app: &mut ZaloGuiApp, thread_id: String, message: ChatMessage) {
+    if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
+        if !thread.is_group
+            && message.is_outgoing
+            && matches!(
+                message.delivery,
+                crate::message_model::DeliveryState::ServerAccepted
+                    | crate::message_model::DeliveryState::Delivered
+                    | crate::message_model::DeliveryState::Read
+            )
+        {
+            thread.presentation.inbox.responded_by_me = Some(true);
+        }
+        if let Some(existing) = thread
+            .messages
+            .iter_mut()
+            .find(|m| m.client_message_id == message.client_message_id)
+        {
+            if existing.outgoing_job.as_ref().is_some_and(|old| {
+                message
+                    .outgoing_job
+                    .as_ref()
+                    .is_none_or(|new| new.attempt >= old.attempt)
+            }) {
+                *existing = message;
+            }
+        } else {
+            thread.messages.push(message);
+        }
+        thread.preview = thread
+            .messages
+            .last()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        thread.time = thread
+            .messages
+            .last()
+            .map(|m| m.time.clone())
+            .unwrap_or_default();
+        thread.refresh_sidebar_presentation();
+        app.persist_threads_async();
+    }
+}
+
 pub enum GuiEvent {
     E2eeTrialPrepared {
         owner: String,
@@ -289,6 +333,7 @@ pub enum GuiEvent {
         name: String,
         uin: String,
         avatar: Option<String>,
+        runtime_id: usize,
     },
     LoginFailed(String),
     ThreadsUpdated {
@@ -304,6 +349,22 @@ pub enum GuiEvent {
         owner: String,
         thread_id: String,
         message: ChatMessage,
+    },
+    VoiceOutgoingState {
+        owner: String,
+        runtime_id: usize,
+        thread_id: String,
+        message: ChatMessage,
+    },
+    VoiceSendRejected {
+        owner: String,
+        runtime_id: usize,
+        message: String,
+    },
+    VoiceSendStatus {
+        owner: String,
+        runtime_id: usize,
+        message: String,
     },
     MessageSent {
         client_message_id: String,
@@ -798,6 +859,32 @@ struct UiSmoke {
 type SidebarSortKey = (usize, bool, usize, i64, String);
 type SidebarOrderCache = (Vec<SidebarSortKey>, Vec<usize>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VoiceDraftBinding {
+    owner: String,
+    runtime_id: usize,
+    thread_id: String,
+    is_group: bool,
+    generation: u64,
+}
+
+impl VoiceDraftBinding {
+    fn matches(
+        &self,
+        owner: &str,
+        runtime_id: usize,
+        thread_id: &str,
+        is_group: bool,
+        generation: u64,
+    ) -> bool {
+        self.owner == owner
+            && self.runtime_id == runtime_id
+            && self.thread_id == thread_id
+            && self.is_group == is_group
+            && self.generation == generation
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum MediaTab {
     #[default]
@@ -861,6 +948,7 @@ pub struct ZaloGuiApp {
     user_name: String,
     user_uin: String,
     user_avatar: Option<String>,
+    account_runtime_id: usize,
 
     // App lock state (WP16-4)
     lock_guard: auth_guard::AppLockGuard,
@@ -1020,6 +1108,8 @@ pub struct ZaloGuiApp {
     voice_recorder: Option<crate::voice::VoiceRecorder>,
     voice_preview: Option<crate::voice::VoicePreviewPlayer>,
     recorded_voice_samples: Option<(Vec<f32>, u32, std::time::Duration)>,
+    voice_binding: Option<VoiceDraftBinding>,
+    voice_context_generation: u64,
     settings_tab: SettingsTab,
     settings: AppSettings,
 
@@ -1096,6 +1186,7 @@ impl ZaloGuiApp {
         bootstrap: bool,
     ) -> Self {
         setup_custom_fonts(ctx);
+        let account_runtime_id = session.runtime_id();
         let loaded_settings = if bootstrap {
             AppSettings::load()
         } else {
@@ -1177,6 +1268,7 @@ impl ZaloGuiApp {
             user_name,
             user_uin,
             user_avatar,
+            account_runtime_id,
             login_tab: LoginTab::QrCode,
             phone_input: String::new(),
             password_input: String::new(),
@@ -1318,6 +1410,8 @@ impl ZaloGuiApp {
             voice_recorder: None,
             voice_preview: None,
             recorded_voice_samples: None,
+            voice_binding: None,
+            voice_context_generation: 0,
             settings_tab: SettingsTab::General,
             tools: tools_panel::ToolsPanel::default(),
             history_search: Default::default(),
@@ -2359,9 +2453,17 @@ impl ZaloGuiApp {
                     self.qr_status =
                         format!("Đã quét bởi {name} — Vui lòng bấm 'Đăng nhập' trên điện thoại…");
                 }
-                GuiEvent::LoginSuccess { name, uin, avatar } => {
+                GuiEvent::LoginSuccess {
+                    name,
+                    uin,
+                    avatar,
+                    runtime_id,
+                } => {
                     self.profiles_requested = false;
                     self.profiles.clear();
+                    if self.user_uin != uin || self.account_runtime_id != runtime_id {
+                        self.cancel_voice_recording();
+                    }
                     if self.user_uin != uin {
                         self.clear_presence_state();
                         self.deleted_message_ids.clear();
@@ -2381,6 +2483,7 @@ impl ZaloGuiApp {
                         self.image_failures.clear();
                     }
                     self.is_logged_in = true;
+                    self.account_runtime_id = runtime_id;
                     self.user_name = name;
                     self.user_uin = uin;
                     if avatar.is_some() {
@@ -2858,12 +2961,14 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::SessionExpired(reason) => {
+                    self.cancel_voice_recording();
                     self.clear_presence_state();
                     self.flush_composer_before_logout();
                     self.live_mailbox = None;
                     crate::desktop_notice::account("");
                     self.clear_downloads();
                     self.is_logged_in = false;
+                    self.account_runtime_id = 0;
                     self.threads.clear();
                     self.user_uin.clear();
                     self.user_name.clear();
@@ -2919,6 +3024,7 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::LoggedOut => {
+                    self.cancel_voice_recording();
                     self.clear_presence_state();
                     self.deleted_message_ids.clear();
                     self.quick_schedule = None;
@@ -2927,6 +3033,7 @@ impl ZaloGuiApp {
                     crate::desktop_notice::account("");
                     self.clear_downloads();
                     self.is_logged_in = false;
+                    self.account_runtime_id = 0;
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
@@ -2989,7 +3096,9 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::ProfileSwitched { session } => {
                     let uid = session.account_key().to_owned();
+                    let runtime_id = session.runtime_id();
                     // A20: Profile switched; thoroughly isolate and reset UI state for new profile
+                    self.cancel_voice_recording();
                     self.clear_presence_state();
                     self.deleted_message_ids.clear();
                     self.quick_schedule = None;
@@ -2998,6 +3107,7 @@ impl ZaloGuiApp {
                     crate::desktop_notice::account(&uid);
                     self.clear_downloads();
                     self.user_uin = uid.clone();
+                    self.account_runtime_id = runtime_id;
                     self.user_name.clear();
                     self.threads.clear();
                     self.selected_thread_index = 0;
@@ -3274,46 +3384,37 @@ impl ZaloGuiApp {
                     if !self.is_logged_in || owner != self.user_uin {
                         continue;
                     }
-                    if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
-                        if !thread.is_group
-                            && message.is_outgoing
-                            && matches!(
-                                message.delivery,
-                                crate::message_model::DeliveryState::ServerAccepted
-                                    | crate::message_model::DeliveryState::Delivered
-                                    | crate::message_model::DeliveryState::Read
-                            )
-                        {
-                            thread.presentation.inbox.responded_by_me = Some(true);
-                        }
-                        if let Some(existing) = thread
-                            .messages
-                            .iter_mut()
-                            .find(|m| m.client_message_id == message.client_message_id)
-                        {
-                            if existing.outgoing_job.as_ref().is_some_and(|old| {
-                                message
-                                    .outgoing_job
-                                    .as_ref()
-                                    .is_none_or(|new| new.attempt >= old.attempt)
-                            }) {
-                                *existing = message;
-                            }
-                        } else {
-                            thread.messages.push(message);
-                        }
-                        thread.preview = thread
-                            .messages
-                            .last()
-                            .map(|m| m.text.clone())
-                            .unwrap_or_default();
-                        thread.time = thread
-                            .messages
-                            .last()
-                            .map(|m| m.time.clone())
-                            .unwrap_or_default();
-                        thread.refresh_sidebar_presentation();
-                        self.persist_threads_async();
+                    apply_outgoing_state(self, thread_id, message);
+                }
+                GuiEvent::VoiceOutgoingState {
+                    owner,
+                    runtime_id,
+                    thread_id,
+                    message,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    apply_outgoing_state(self, thread_id, message);
+                }
+                GuiEvent::VoiceSendRejected {
+                    owner,
+                    runtime_id,
+                    message,
+                }
+                | GuiEvent::VoiceSendStatus {
+                    owner,
+                    runtime_id,
+                    message,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.show_toast(message);
                     }
                 }
                 GuiEvent::MessageSent {
@@ -4967,6 +5068,7 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.cancel_voice_if_context_changed();
         self.lock_guard.poll_availability();
         // A21 fix: Check and update lock state BEFORE processing input/events/render
         // This ensures lock transition happens before any sensitive operation can execute.
@@ -7218,5 +7320,134 @@ mod audit_lock_tests {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_draft_boundary_tests {
+    use super::*;
+
+    fn app_with_voice_draft() -> ZaloGuiApp {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "thread-x".into(),
+                is_group: false,
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner-a".into();
+        let runtime_id = app.account_runtime_id;
+        app.voice_binding = Some(VoiceDraftBinding {
+            owner: "owner-a".into(),
+            runtime_id,
+            thread_id: "thread-x".into(),
+            is_group: false,
+            generation: 0,
+        });
+        app.recorded_voice_samples = Some((vec![0.25, -0.25], 16_000, Duration::from_secs(1)));
+        app
+    }
+
+    #[test]
+    fn voice_draft_is_bound_to_owner_thread_kind_and_generation() {
+        let app = app_with_voice_draft();
+
+        let runtime_id = app.account_runtime_id;
+        assert!(app.voice_draft_matches("owner-a", runtime_id, "thread-x", false));
+        assert!(!app.voice_draft_matches("owner-b", runtime_id, "thread-x", false));
+        assert!(!app.voice_draft_matches("owner-a", runtime_id, "thread-y", false));
+        assert!(!app.voice_draft_matches("owner-a", runtime_id, "thread-x", true));
+        assert!(!app.voice_draft_matches("owner-a", runtime_id.wrapping_add(1), "thread-x", false,));
+        assert!(!app
+            .voice_binding
+            .as_ref()
+            .unwrap()
+            .matches("owner-a", runtime_id, "thread-x", false, 1,));
+    }
+
+    #[test]
+    fn changing_thread_cancels_synthetic_audio_before_it_can_be_sent() {
+        let mut app = app_with_voice_draft();
+        app.threads.push(Thread {
+            id: "thread-y".into(),
+            is_group: false,
+            ..Default::default()
+        });
+        app.selected_thread_index = 1;
+        app.cancel_voice_if_context_changed();
+
+        assert!(app.recorded_voice_samples.is_none());
+        assert!(app.voice_binding.is_none());
+        assert_eq!(app.voice_context_generation, 1);
+
+        app.voice_binding = Some(VoiceDraftBinding {
+            owner: app.user_uin.clone(),
+            runtime_id: app.account_runtime_id,
+            thread_id: "thread-x".into(),
+            is_group: false,
+            generation: app.voice_context_generation,
+        });
+        app.recorded_voice_samples = Some((vec![0.25, -0.25], 16_000, Duration::from_secs(1)));
+        app.send_voice_recording("thread-y", false);
+
+        assert!(app.recorded_voice_samples.is_none());
+        assert!(app.voice_binding.is_none());
+        assert_eq!(app.voice_context_generation, 2);
+        assert_eq!(
+            app.status_msg,
+            "Bản ghi âm đã bị hủy do tài khoản hoặc hội thoại thay đổi"
+        );
+    }
+
+    #[test]
+    fn logged_out_owner_invalidates_an_existing_audio_draft() {
+        let mut app = app_with_voice_draft();
+        app.cancel_voice_recording();
+        app.is_logged_in = false;
+        app.user_uin.clear();
+
+        assert!(app.recorded_voice_samples.is_none());
+        assert!(app.voice_binding.is_none());
+        assert_eq!(app.voice_context_generation, 1);
+    }
+
+    #[test]
+    fn stale_voice_worker_events_do_not_update_a_relogged_same_uid() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_voice_draft();
+        let old_runtime = app.account_runtime_id;
+        app.account_runtime_id = old_runtime.wrapping_add(1);
+        app.status_msg = "current session".into();
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        tx.send(GuiEvent::VoiceOutgoingState {
+            owner: "owner-a".into(),
+            runtime_id: old_runtime,
+            thread_id: "thread-x".into(),
+            message: ChatMessage {
+                client_message_id: "old-voice".into(),
+                text: "[Tin nhắn thoại]".into(),
+                is_outgoing: true,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        tx.send(GuiEvent::VoiceSendStatus {
+            owner: "owner-a".into(),
+            runtime_id: old_runtime,
+            message: "Đã gửi tin nhắn thoại".into(),
+        })
+        .unwrap();
+
+        app.check_events(&ctx);
+
+        assert!(app.threads[0].messages.is_empty());
+        assert_eq!(app.status_msg, "current session");
     }
 }

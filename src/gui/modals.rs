@@ -246,7 +246,9 @@ impl ZaloGuiApp {
 
         if do_logout {
             self.flush_composer_before_logout();
+            self.cancel_voice_recording();
             self.is_logged_in = false;
+            self.account_runtime_id = 0;
             self.user_name.clear();
             self.user_uin.clear();
             self.threads.clear();

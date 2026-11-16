@@ -3683,6 +3683,7 @@ impl ZaloGuiApp {
                                 }
 
                                 // 8. Microphone Recording Button
+                                self.cancel_voice_if_thread_changed(&thread_id, is_group);
                                 let is_voice_active = self.voice_recorder.is_some() || self.recorded_voice_samples.is_some();
                                 let (mic_rect, mic_resp) = ui.allocate_exact_size(
                                     Vec2::new(32.0, 32.0),
@@ -6989,30 +6990,98 @@ impl ZaloGuiApp {
         }
     }
 
+    pub(super) fn voice_draft_matches(
+        &self,
+        owner: &str,
+        runtime_id: usize,
+        thread_id: &str,
+        is_group: bool,
+    ) -> bool {
+        self.is_logged_in
+            && self.voice_binding.as_ref().is_some_and(|binding| {
+                binding.matches(
+                    owner,
+                    runtime_id,
+                    thread_id,
+                    is_group,
+                    self.voice_context_generation,
+                )
+            })
+    }
+
+    pub(super) fn cancel_voice_if_context_changed(&mut self) {
+        let matches_selected = self
+            .threads
+            .get(self.selected_thread_index)
+            .is_some_and(|thread| {
+                self.voice_draft_matches(
+                    &self.user_uin,
+                    self.account_runtime_id,
+                    &thread.id,
+                    thread.is_group,
+                )
+            });
+        if self.voice_binding.is_some() && !matches_selected {
+            self.cancel_voice_recording();
+        }
+    }
+
+    fn cancel_voice_if_thread_changed(&mut self, thread_id: &str, is_group: bool) {
+        if self.voice_binding.is_some()
+            && !self.voice_draft_matches(
+                &self.user_uin,
+                self.account_runtime_id,
+                thread_id,
+                is_group,
+            )
+        {
+            self.cancel_voice_recording();
+        }
+    }
+
     fn toggle_voice_recorder(&mut self) {
         if self.voice_recorder.is_some() {
+            self.cancel_voice_if_context_changed();
+            if self.voice_recorder.is_none() {
+                return;
+            }
             let rec = self.voice_recorder.take().unwrap();
             let (samples, rate, dur) = rec.finish();
             if !samples.is_empty() && dur.as_secs_f32() >= 0.3 {
                 self.recorded_voice_samples = Some((samples, rate, dur));
             }
         } else {
+            let Some(thread) = self.threads.get(self.selected_thread_index) else {
+                return;
+            };
+            if !self.is_logged_in || thread.id.is_empty() {
+                return;
+            }
+            let binding = VoiceDraftBinding {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                thread_id: thread.id.clone(),
+                is_group: thread.is_group,
+                generation: self.voice_context_generation,
+            };
             if let Some(prev) = self.voice_preview.take() {
                 prev.stop();
             }
             self.recorded_voice_samples = None;
+            self.voice_binding = Some(binding);
             match crate::voice::VoiceRecorder::start() {
                 Ok(rec) => {
                     self.voice_recorder = Some(rec);
                 }
                 Err(e) => {
+                    self.voice_binding = None;
                     self.status_msg = format!("Lỗi bật micro: {e}");
                 }
             }
         }
     }
 
-    fn cancel_voice_recording(&mut self) {
+    pub(super) fn cancel_voice_recording(&mut self) {
         if let Some(rec) = self.voice_recorder.take() {
             rec.cancel();
         }
@@ -7020,9 +7089,16 @@ impl ZaloGuiApp {
             prev.stop();
         }
         self.recorded_voice_samples = None;
+        self.voice_binding = None;
+        self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
     }
 
-    fn send_voice_recording(&mut self, thread_id: &str, is_group: bool) {
+    pub(super) fn send_voice_recording(&mut self, thread_id: &str, is_group: bool) {
+        if !self.voice_draft_matches(&self.user_uin, self.account_runtime_id, thread_id, is_group) {
+            self.cancel_voice_recording();
+            self.status_msg = "Bản ghi âm đã bị hủy do tài khoản hoặc hội thoại thay đổi".into();
+            return;
+        }
         let (samples, rate, dur) = if let Some((s, r, d)) = self.recorded_voice_samples.take() {
             (s, r, d)
         } else if let Some(rec) = self.voice_recorder.take() {
@@ -7033,11 +7109,15 @@ impl ZaloGuiApp {
         if let Some(prev) = self.voice_preview.take() {
             prev.stop();
         }
+        self.voice_binding = None;
+        self.voice_context_generation = self.voice_context_generation.wrapping_add(1);
         let resampled = crate::voice::resample_to_16k(&samples, rate);
         let wav = crate::voice::pcm_to_wav(&resampled, crate::voice::VOICE_SAMPLE_RATE);
         let duration_secs = dur.as_secs().max(1) as u32;
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::SendVoiceMessage {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
                 to_id: thread_id.to_string(),
                 is_group,
                 wav_bytes: wav,

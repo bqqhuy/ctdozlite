@@ -1,5 +1,16 @@
 use super::*;
 
+fn voice_send_session_matches(
+    session_active: bool,
+    actual_owner: &str,
+    actual_runtime_id: usize,
+    expected_owner: &str,
+    expected_runtime_id: usize,
+) -> bool {
+    // A UID can be reused after logout; runtime identity binds queued audio to one session.
+    session_active && actual_owner == expected_owner && actual_runtime_id == expected_runtime_id
+}
+
 pub enum WorkerCmd {
     PrepareE2eeTrial {
         owner: String,
@@ -329,6 +340,8 @@ pub enum WorkerCmd {
         messages: Vec<ChatMessage>,
     },
     SendVoiceMessage {
+        owner: String,
+        runtime_id: usize,
         to_id: String,
         is_group: bool,
         wav_bytes: Vec<u8>,
@@ -2298,6 +2311,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                                 name: dname,
                                                                 uin,
                                                                 avatar: u_ava,
+                                                                runtime_id: s.runtime_id(),
                                                             },
                                                         );
                                                         ctx_clone.request_repaint();
@@ -2686,6 +2700,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             name,
                                             uin: uid,
                                             avatar: u_ava,
+                                            runtime_id: s.runtime_id(),
                                         });
                                     }
                                     let mut list = match crate::chat::get_friends(&s).await {
@@ -3334,29 +3349,116 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             tokio::spawn(send_attachment_batch(s,batch,gui_tx.clone(),egui_ctx.clone()));
                         }
                         WorkerCmd::SendVoiceMessage {
+                            owner,
+                            runtime_id,
                             to_id,
                             is_group,
                             wav_bytes,
                             duration_secs,
                         } => {
+                            let current = session.lock().await.clone();
+                            if !voice_send_session_matches(
+                                current.is_active(),
+                                current.account_key(),
+                                current.runtime_id(),
+                                &owner,
+                                runtime_id,
+                            ) {
+                                let _ = gui_tx.send(GuiEvent::VoiceSendRejected {
+                                    owner,
+                                    runtime_id,
+                                    message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                });
+                                continue;
+                            }
                             let session_clone = session.clone();
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if !s.is_active() {
+                                if !voice_send_session_matches(
+                                    s.is_active(),
+                                    s.account_key(),
+                                    s.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    let _ = events.send(GuiEvent::VoiceSendRejected {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                    });
                                     return;
                                 }
-                                let owner = s.account_key().to_owned();
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
-                                let voice_dir = std::env::temp_dir().join("ctdozlite_voice");
-                                let _ = tokio::fs::create_dir_all(&voice_dir).await;
-                                let temp_file = voice_dir.join(format!("voice_{now}.wav"));
-                                if let Err(e) = tokio::fs::write(&temp_file, &wav_bytes).await {
-                                    let _ = events.send(GuiEvent::StatusUpdate(format!("Lỗi lưu tệp âm thanh: {e}")));
+                                let voice_dir = std::env::temp_dir()
+                                    .join("ctdozlite_voice")
+                                    .join(format!("session-{runtime_id}"));
+                                if let Err(e) = tokio::fs::create_dir_all(&voice_dir).await {
+                                    let _ = events.send(GuiEvent::VoiceSendStatus {
+                                        owner,
+                                        runtime_id,
+                                        message: format!("Lỗi lưu tệp âm thanh: {e}"),
+                                    });
+                                    return;
+                                }
+                                let mut random_id = [0u8; 16];
+                                if crate::random::fill(&mut random_id).is_err() {
+                                    let _ = events.send(GuiEvent::VoiceSendStatus {
+                                        owner,
+                                        runtime_id,
+                                        message: "Không tạo được tên tệp âm thanh an toàn".into(),
+                                    });
+                                    return;
+                                }
+                                let temp_file = voice_dir.join(format!(
+                                    "voice_{now}_{}.wav",
+                                    hex::encode(random_id)
+                                ));
+                                let mut voice_file = match tokio::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(&temp_file)
+                                    .await
+                                {
+                                    Ok(file) => file,
+                                    Err(error) => {
+                                        let _ = events.send(GuiEvent::VoiceSendStatus {
+                                            owner,
+                                            runtime_id,
+                                            message: format!("Lỗi lưu tệp âm thanh: {error}"),
+                                        });
+                                        return;
+                                    }
+                                };
+                                use tokio::io::AsyncWriteExt;
+                                if let Err(error) = voice_file.write_all(&wav_bytes).await {
+                                    drop(voice_file);
+                                    let _ = tokio::fs::remove_file(&temp_file).await;
+                                    let _ = events.send(GuiEvent::VoiceSendStatus {
+                                        owner,
+                                        runtime_id,
+                                        message: format!("Lỗi lưu tệp âm thanh: {error}"),
+                                    });
+                                    return;
+                                }
+                                drop(voice_file);
+                                if !voice_send_session_matches(
+                                    s.is_active(),
+                                    s.account_key(),
+                                    s.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    let _ = tokio::fs::remove_file(&temp_file).await;
+                                    let _ = events.send(GuiEvent::VoiceSendRejected {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                    });
                                     return;
                                 }
                                 // Outgoing voice recorded audio is sent as a standard WAV audio attachment (Payload::Attachment)
@@ -3375,34 +3477,101 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 );
                                 message.kind = crate::message_model::MessageKind::Voice;
                                 let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+                                    let _ = tokio::fs::remove_file(&temp_file).await;
+                                    let _ = events.send(GuiEvent::VoiceSendStatus {
+                                        owner,
+                                        runtime_id,
+                                        message: "Không thể bắt đầu gửi tin nhắn thoại".into(),
+                                    });
                                     return;
                                 };
+                                if !voice_send_session_matches(
+                                    s.is_active(),
+                                    s.account_key(),
+                                    s.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    drop(active);
+                                    let _ = tokio::fs::remove_file(&temp_file).await;
+                                    let _ = events.send(GuiEvent::VoiceSendRejected {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                    });
+                                    return;
+                                }
                                 persist_outgoing(&s, &to_id, &message).await;
-                                let _ = events.send(GuiEvent::OutgoingState {
+                                let _ = events.send(GuiEvent::VoiceOutgoingState {
                                     owner: owner.clone(),
+                                    runtime_id,
                                     thread_id: to_id.clone(),
                                     message: message.clone(),
                                 });
                                 ctx.request_repaint();
 
+                                if !voice_send_session_matches(
+                                    s.is_active(),
+                                    s.account_key(),
+                                    s.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    message.delivery = crate::message_model::DeliveryState::Failed;
+                                    if let Some(job) = message.outgoing_job.as_mut() {
+                                        job.error = "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into();
+                                    }
+                                    persist_outgoing(&s, &to_id, &message).await;
+                                    drop(active);
+                                    let _ = events.send(GuiEvent::VoiceOutgoingState {
+                                        owner: owner.clone(),
+                                        runtime_id,
+                                        thread_id: to_id.clone(),
+                                        message,
+                                    });
+                                    let _ = events.send(GuiEvent::VoiceSendRejected {
+                                        owner,
+                                        runtime_id,
+                                        message: "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into(),
+                                    });
+                                    return;
+                                }
                                 match crate::outgoing::send(&s, &to_id, &message).await {
                                     Ok(mut sent) => {
                                         sent.kind = crate::message_model::MessageKind::Voice;
                                         message = sent;
-                                        let _ = events.send(GuiEvent::StatusUpdate("Đã gửi tin nhắn thoại".into()));
+                                        let _ = events.send(GuiEvent::VoiceSendStatus {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            message: "Đã gửi tin nhắn thoại".into(),
+                                        });
                                     }
                                     Err(error) => {
                                         message.delivery = crate::message_model::DeliveryState::Failed;
                                         if let Some(job) = message.outgoing_job.as_mut() {
                                             job.error = crate::outgoing::failure_message(&error);
                                         }
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Gửi tin nhắn thoại thất bại: {error}")));
+                                        let _ = events.send(GuiEvent::VoiceSendStatus {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            message: format!("Gửi tin nhắn thoại thất bại: {error}"),
+                                        });
                                     }
+                                }
+                                if !voice_send_session_matches(
+                                    s.is_active(),
+                                    s.account_key(),
+                                    s.runtime_id(),
+                                    &owner,
+                                    runtime_id,
+                                ) {
+                                    return;
                                 }
                                 persist_outgoing(&s, &to_id, &message).await;
                                 drop(active);
-                                let _ = events.send(GuiEvent::OutgoingState {
+                                let _ = events.send(GuiEvent::VoiceOutgoingState {
                                     owner,
+                                    runtime_id,
                                     thread_id: to_id,
                                     message,
                                 });
@@ -3924,6 +4093,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                     name,
                                                     uin,
                                                     avatar: u_ava,
+                                                    runtime_id: s.runtime_id(),
                                                 });
                                                 ctx_clone.request_repaint();
 
@@ -5310,6 +5480,27 @@ mod audit_progress_tests {
         assert!(matches!(
             events.last(),
             Some(GuiEvent::UploadProgress { completed: 9, .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod voice_send_owner_tests {
+    use super::*;
+
+    #[test]
+    fn voice_send_rejects_different_owner_or_session_runtime() {
+        assert!(voice_send_session_matches(
+            true, "owner-a", 11, "owner-a", 11
+        ));
+        assert!(!voice_send_session_matches(
+            true, "owner-b", 11, "owner-a", 11
+        ));
+        assert!(!voice_send_session_matches(
+            true, "owner-a", 12, "owner-a", 11
+        ));
+        assert!(!voice_send_session_matches(
+            false, "owner-a", 11, "owner-a", 11
         ));
     }
 }
