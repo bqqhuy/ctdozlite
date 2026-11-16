@@ -60,6 +60,7 @@ impl ZaloGuiApp {
             self.forward_msg = None;
             self.replying_to = None;
             self.sticker_textures.clear();
+            self.sticker_sprites.clear();
             self.loading_stickers.clear();
             self.image_retry_at.clear();
             self.image_failures.clear();

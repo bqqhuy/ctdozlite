@@ -1618,7 +1618,7 @@ impl ZaloGuiApp {
                                         if elapsed_ms >= acc && elapsed_ms < acc + d_ms {
                                             frame_idx = i;
                                             rem_dur = std::time::Duration::from_millis(
-                                                (acc + d_ms - elapsed_ms) as u64,
+                                                (acc + d_ms).saturating_sub(elapsed_ms) as u64,
                                             );
                                             break;
                                         }
@@ -1960,7 +1960,9 @@ impl ZaloGuiApp {
                                                             let d_ms = d.as_millis();
                                                             if elapsed_ms >= acc && elapsed_ms < acc + d_ms {
                                                                 frame_idx = i;
-                                                                rem_dur = std::time::Duration::from_millis((acc + d_ms - elapsed_ms) as u64);
+                                                                rem_dur = std::time::Duration::from_millis(
+                                                                    (acc + d_ms).saturating_sub(elapsed_ms) as u64,
+                                                                );
                                                                 break;
                                                             }
                                                             acc += d_ms;
