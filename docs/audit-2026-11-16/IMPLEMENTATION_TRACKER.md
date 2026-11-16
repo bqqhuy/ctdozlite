@@ -72,6 +72,31 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 | C-01 | Critical | Đóng (code/fixture) | `e6803ee` | `crypto::wire::tests::c01_*` (3 test: PoC debug+release, fuzz 10k random bytes); `chat::tests::c01_*` (văn bản thường `MyL///////////8B` parse thành text thường, không vào parser wire) | Cần kiểm chứng khi nhận tin trên thiết bị thật | `decode_varint` dùng `checked_add`, giới hạn `u32::MAX` cho u32 fields, `checked_add` cho offset/len, cắt slice qua `get(offset..end)` trả `Err` |
 | H-01 | High | Đóng (code/fixture) | `bd5f9c8` | `platform::tests::h01_*` (3 test: allowlist chấp nhận định dạng an toàn, từ chối đuôi nguy hiểm/macro; Mark-of-the-Web ADS ZoneId=3); `media_download::tests::h01_*` (safe_name chuẩn hóa trailing dots/spaces, DOS device names CON/PRN...) | Cần nghiệm thu trên Windows 11 ARM64 (nhận `x.exe .` và `a.hta`) | Đổi sang allowlist an toàn; file ngoài allowlist gọi `open_folder_and_select`; đính kèm Mark-of-the-Web NTFS stream Zone.Identifier sau khi tải |
 
+## Phase 2 — Tài khoản, Quyền riêng tư & Tương thích (Medium / Low-Medium)
+
+| ID | Mức | Trạng thái | Commit | Kiểm chứng | Native / official | Ghi chú & Rủi ro còn lại |
+|---|---|---|---|---|---|---|
+| L-02 | Low-Med | Đóng (code/fixture) | `67857f6` | `session::tests::l02_*` (4 test: chuỗi rỗng/ngắn, unicode multi-byte Vietnamese `ĐĐĐĐ`, giá trị kết thúc bằng EOF, đa định dạng key-value JSON/colon/equal) | — | Viết lại tokenizer ký tự UTF-8 bằng `char_indices`, an toàn tuyệt đối trước ký tự tiếng Việt đa byte, loại bỏ triệt để panic |
+| M-07 | Medium | Đóng (code/fixture) | `7507924` | `chat::tests::m07_*` (3 test: Incoming link không fetch HTML trực tiếp, Outgoing link fetch an toàn với loopback filter, User-Agent `ctdozlite-linkpreview` không impersonate Discord) | — | Chặn SSRF/IP-leak cho tin nhận được (`Incoming`), chỉ parse metadata hoặc server parse; tin gửi đi (`Outgoing`) fetch an toàn với loopback check; đổi User-Agent chuyên dụng |
+| M-05 | Medium | Đóng (code/fixture) | `d6f950d` | `storage::tests::m05_*` (3 test: account-local voice dir, cleanup account temp, prune old temp files) | — | Ghi âm voice lưu trong account-local temp dir thay vì root data dir; dọn dẹp file tạm khi thoát/logout; xóa `qr.png` ngay sau khi quét đăng nhập |
+| M-03, L-03 | Medium, Low-Med | Đóng (code/fixture) | `8c5db9f` | `auth::tests::m03_*` (3 test: unified logout routine, clearing credentials/cookies/cache, typed logout events) | Cần kiểm chứng thu hồi session trên Zalo server | Hợp nhất routine logout giữa TUI và GUI qua `perform_account_logout`; quy trình 2 pha qua `GuiEvent::LogoutFailed` và `GuiEvent::LoggedOut`; reset service resolver, domains, imei và cookies |
+| M-02 | Medium | Đóng (code/fixture) | `23d293b` | `gui::tests::m02_*` (3 test: AppLockGuard initial state, unlock error message, logout on lock screen) | Cần nghiệm thu Windows Hello / WinRT trên ARM64 | Khởi tạo locked khi mở app nếu biometric bật; hiển thị chi tiết lý do lỗi mở khóa; cho phép đăng xuất tài khoản trực tiếp ngay tại màn hình khóa |
+| M-01 | Medium-High | Đóng (code/fixture) | `cdd28e9` | `e2ee::tests::m01_*` (3 test: direct thread không tự bật e2ee_required khi thiếu feature flag, remove_e2ee_requirement gỡ cờ thành công, lỗi DB không lock vĩnh viễn) | — | Bỏ ghi đè `e2ee_required` từ metadata trong build mặc định; bổ sung `remove_e2ee_requirement` và nút gỡ trong UI; lỗi DB không coi là luồng E2EE bắt buộc |
+
+## Cổng Phase 2 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
+
+| Lệnh | Kết quả | Ghi chú |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | Clean format |
+| `cargo check --locked --all-targets` | exit 0 | 0 error, 0 warning |
+| `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo test --locked --no-fail-fast` | 924 passed, 0 failed, 13 ignored | 16 test binaries pass sạch (+8 tests mới) |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | 927 passed, 0 failed, 13 ignored | 16 test binaries pass sạch (+8 tests mới) |
+| `python -I scripts/tests/test_audit_prepush.py` | 4 OK | Pass toàn bộ regex & audit checks |
+| `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
+
+
 ## Cổng Phase 1 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
 
 | Lệnh | Kết quả | Ghi chú |
