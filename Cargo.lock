@@ -975,7 +975,6 @@ dependencies = [
  "md-5",
  "opus",
  "qrcode",
- "rand_core 0.10.1",
  "ratatui",
  "raw-window-handle",
  "reqwest",

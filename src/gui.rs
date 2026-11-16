@@ -1179,6 +1179,17 @@ enum DevTab {
     CryptoState,
 }
 
+/// Determines whether a status update message represents an actionable error that should trigger a toast notice.
+pub fn is_status_error(msg: &str) -> bool {
+    msg.starts_with("Không ")
+        || msg.starts_with("Lỗi ")
+        || msg.starts_with("Thất bại")
+        || msg.starts_with("Chưa ")
+        || msg.contains("thất bại")
+        || msg.contains("không thể")
+        || msg.contains("Không thể")
+}
+
 impl ZaloGuiApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
@@ -5047,14 +5058,7 @@ impl ZaloGuiApp {
                     unreachable!("local call record normalized before dispatch")
                 }
                 GuiEvent::StatusUpdate(msg) => {
-                    let is_error = msg.starts_with("Không ")
-                        || msg.starts_with("Lỗi ")
-                        || msg.starts_with("Thất bại")
-                        || msg.starts_with("Chưa ")
-                        || msg.contains("thất bại")
-                        || msg.contains("không thể")
-                        || msg.contains("Không thể");
-                    if is_error {
+                    if is_status_error(&msg) {
                         self.show_toast(msg);
                     } else {
                         self.status_msg = msg;

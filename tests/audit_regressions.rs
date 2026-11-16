@@ -663,35 +663,38 @@ fn audit_a35_ipv6_link_local_and_site_local_guards() {
 
 #[test]
 fn test_m04_status_update_error_classification() {
-    let err_msg = "Không thể kết nối đến máy chủ";
-    let is_error = err_msg.starts_with("Không ")
-        || err_msg.starts_with("Lỗi ")
-        || err_msg.starts_with("Thất bại")
-        || err_msg.starts_with("Chưa ")
-        || err_msg.contains("thất bại")
-        || err_msg.contains("không thể")
-        || err_msg.contains("Không thể");
-    assert!(is_error);
+    assert!(zalo_rust::gui::is_status_error(
+        "Không thể kết nối đến máy chủ"
+    ));
+    assert!(zalo_rust::gui::is_status_error(
+        "Lỗi đọc danh sách tài khoản"
+    ));
+    assert!(zalo_rust::gui::is_status_error("Thất bại khi gửi tin nhắn"));
+    assert!(zalo_rust::gui::is_status_error("Chưa tải được âm báo Zalo"));
+    assert!(zalo_rust::gui::is_status_error(
+        "Thu hồi hàng loạt thất bại"
+    ));
 
-    let progress_msg = "Đang tải tin nhắn…";
-    let is_not_error = progress_msg.starts_with("Không ")
-        || progress_msg.starts_with("Lỗi ")
-        || progress_msg.starts_with("Thất bại")
-        || progress_msg.starts_with("Chưa ")
-        || progress_msg.contains("thất bại")
-        || progress_msg.contains("không thể")
-        || progress_msg.contains("Không thể");
-    assert!(!is_not_error);
+    assert!(!zalo_rust::gui::is_status_error("Đang tải tin nhắn…"));
+    assert!(!zalo_rust::gui::is_status_error("Đã tạo cuộc bình chọn"));
+    assert!(!zalo_rust::gui::is_status_error("Đã gửi tin nhắn thoại…"));
 }
 
 #[test]
 fn test_perf_logger_vecdeque_fifo() {
-    // Test logger FIFO behavior
     zalo_rust::logger::init(true);
-    zalo_rust::logger::log_error("test_context", "Test error 1");
-    zalo_rust::logger::log_error("test_context", "Test error 2");
+    // Write 505 entries to verify FIFO eviction beyond 500 limit
+    for i in 1..=505 {
+        zalo_rust::logger::log_error("test_context", &format!("Error {i}"));
+    }
     let entries = zalo_rust::logger::get_entries();
-    assert!(entries.len() >= 2);
-    let last = entries.last().unwrap();
-    assert_eq!(last.error_msg.as_deref(), Some("Test error 2"));
+    assert_eq!(entries.len(), 500);
+    assert_eq!(
+        entries.first().unwrap().error_msg.as_deref(),
+        Some("Error 6")
+    );
+    assert_eq!(
+        entries.last().unwrap().error_msg.as_deref(),
+        Some("Error 505")
+    );
 }

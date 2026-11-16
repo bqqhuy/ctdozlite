@@ -43,7 +43,6 @@ wasmi = "0.40"
 zstd = "0.14.3"
 zeroize = { version = "1", features = ["derive"] }
 hex = "0.4"
-rand_core = "0.10"
 unicode-segmentation = "1.13"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
