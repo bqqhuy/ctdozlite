@@ -1,0 +1,142 @@
+{
+  "asset_count": 15,
+  "oversize_count": 7,
+  "aggregate_rgba_bytes": 272889440,
+  "items": [
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_01.gif",
+      "width": 640,
+      "height": 598,
+      "frames": 10,
+      "sheet_width": 6400,
+      "rgba_bytes": 15308800,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_02.gif",
+      "width": 640,
+      "height": 560,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 28672000,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_03.gif",
+      "width": 640,
+      "height": 526,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 26931200,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_04.gif",
+      "width": 640,
+      "height": 554,
+      "frames": 9,
+      "sheet_width": 5760,
+      "rgba_bytes": 12764160,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_05.gif",
+      "width": 640,
+      "height": 538,
+      "frames": 10,
+      "sheet_width": 6400,
+      "rgba_bytes": 13772800,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_06.gif",
+      "width": 640,
+      "height": 582,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 29798400,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_07.gif",
+      "width": 640,
+      "height": 578,
+      "frames": 10,
+      "sheet_width": 6400,
+      "rgba_bytes": 14796800,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_08.gif",
+      "width": 640,
+      "height": 450,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 23040000,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_09.gif",
+      "width": 286,
+      "height": 200,
+      "frames": 10,
+      "sheet_width": 2860,
+      "rgba_bytes": 2288000,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_10.gif",
+      "width": 640,
+      "height": 592,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 30310400,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_11.gif",
+      "width": 640,
+      "height": 476,
+      "frames": 20,
+      "sheet_width": 12800,
+      "rgba_bytes": 24371200,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_12.gif",
+      "width": 640,
+      "height": 608,
+      "frames": 10,
+      "sheet_width": 6400,
+      "rgba_bytes": 15564800,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_13.gif",
+      "width": 640,
+      "height": 414,
+      "frames": 19,
+      "sheet_width": 12160,
+      "rgba_bytes": 20136960,
+      "exceeds_8192": true
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_14.gif",
+      "width": 640,
+      "height": 548,
+      "frames": 9,
+      "sheet_width": 5760,
+      "rgba_bytes": 12625920,
+      "exceeds_8192": false
+    },
+    {
+      "asset": "src\\assets\\ami_fat_cat\\ami_fat_cat_15.gif",
+      "width": 209,
+      "height": 200,
+      "frames": 15,
+      "sheet_width": 3135,
+      "rgba_bytes": 2508000,
+      "exceeds_8192": false
+    }
+  ]
+}
