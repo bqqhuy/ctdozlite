@@ -324,7 +324,9 @@ pub async fn login_via_qr(s: &mut Session, language: &str) -> Result<Value> {
         } else {
             println!("✓ Đã lưu phiên vào session.json (tự động khôi phục cho các lần chạy sau)");
         }
+        let _ = std::fs::remove_file(crate::storage::root().join("qr.png"));
     } else {
+        let _ = std::fs::remove_file(crate::storage::root().join("qr.png"));
         bail!("getLoginInfo không trả về data: {info}");
     }
 

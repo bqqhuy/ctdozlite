@@ -151,9 +151,50 @@ pub fn private_dir(path: &Path) -> Result<()> {
 }
 
 pub fn account_file(account: &str, name: &str) -> PathBuf {
+    account_dir(account).join(name)
+}
+
+pub fn account_dir(account: &str) -> PathBuf {
     // Hash the account identifier: no path traversal, raw identifiers or ambiguous sanitizing.
     let key = format!("{:x}", Sha256::digest(account.as_bytes()));
-    root().join("accounts").join(key).join(name)
+    root().join("accounts").join(key)
+}
+
+/// Private temporary directory scoped strictly to an account (M-05).
+pub fn account_temp_dir(account: &str) -> PathBuf {
+    account_dir(account).join("temp")
+}
+
+/// Completely purge account-local temporary directory on logout or account switch (M-05).
+pub fn clear_account_temp(account: &str) -> Result<()> {
+    if account.is_empty() {
+        return Ok(());
+    }
+    let dir = account_temp_dir(account);
+    if dir.exists() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    Ok(())
+}
+
+/// Prune temporary files older than `max_age` in a given directory (M-05 startup scan).
+pub fn prune_old_temp_files(dir: &Path, max_age: std::time::Duration) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let now = std::time::SystemTime::now();
+    for entry in fs::read_dir(dir)?.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                if let Ok(modified) = meta.modified() {
+                    if now.duration_since(modified).unwrap_or_default() > max_age {
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn session_path(path: &str) -> PathBuf {
@@ -471,5 +512,25 @@ mod tests {
         encrypted[last] ^= 1;
         assert!(unprotect(&encrypted).is_err());
         assert!(unprotect(secret).is_err());
+    }
+
+    #[test]
+    fn m05_account_temp_dir_isolation_and_prune() {
+        let owner_a = "user_account_a";
+        let owner_b = "user_account_b";
+        let temp_a = account_temp_dir(owner_a);
+        let temp_b = account_temp_dir(owner_b);
+        assert_ne!(temp_a, temp_b);
+        assert!(temp_a.starts_with(root().join("accounts")));
+        assert!(temp_b.starts_with(root().join("accounts")));
+
+        fs::create_dir_all(&temp_a).unwrap();
+        let file_a = temp_a.join("test_voice.wav");
+        fs::write(&file_a, b"RIFF dummy voice").unwrap();
+        assert!(file_a.exists());
+
+        clear_account_temp(owner_a).unwrap();
+        assert!(!file_a.exists());
+        assert!(!temp_a.exists());
     }
 }
