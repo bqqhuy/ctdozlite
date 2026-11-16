@@ -2126,6 +2126,13 @@ impl ZaloGuiApp {
     }
 
     fn store_texture(&mut self, ctx: &egui::Context, key: String, image: egui::ColorImage) {
+        if image.size[0] > 8192 || image.size[1] > 8192 {
+            crate::logger::log_error(
+                "store_texture",
+                &format!("Texture {key} dimensions {:?} exceed 8192 limit", image.size),
+            );
+            return;
+        }
         let bytes = image.pixels.len() as u64 * 4;
         if bytes > crate::media_resources::TEXTURE_BUDGET {
             return;

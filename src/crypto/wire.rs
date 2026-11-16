@@ -361,6 +361,14 @@ fn deserialize_legacy(payload: &[u8]) -> Result<DecodedMessage> {
 }
 
 fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
+    deserialize_signal_proto_with_depth(payload, 0)
+}
+
+fn deserialize_signal_proto_with_depth(payload: &[u8], depth: usize) -> Result<DecodedMessage> {
+    anyhow::ensure!(
+        depth <= 2,
+        "Độ sâu lồng nhau của gói tin Signal protobuf vượt quá giới hạn (max depth = 2, actual = {depth})"
+    );
     anyhow::ensure!(
         payload.len() > 1,
         "Gói tin Signal protobuf quá ngắn ({} bytes)",
@@ -419,6 +427,10 @@ fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
     }
 
     if is_prekey {
+        anyhow::ensure!(
+            depth == 0,
+            "PreKeySignalMessage không được phép lồng nhau bên trong gói tin khác (depth = {depth})"
+        );
         // PreKeySignalMessage: entire body is protobuf (NO outer MAC)
         let mut offset = 0;
         while offset < body.len() {
@@ -457,7 +469,7 @@ fn deserialize_signal_proto(payload: &[u8]) -> Result<DecodedMessage> {
         let nested_bytes = nested_msg_bytes.context("Thiếu message trong PreKeySignalMessage")?;
 
         // The nested message is a complete WhisperMessage: [0x33] || protobuf(SignalMessage) || 8-byte MAC
-        let inner_decoded = deserialize_signal_proto(nested_bytes)?;
+        let inner_decoded = deserialize_signal_proto_with_depth(nested_bytes, depth + 1)?;
         let inner_whisper = match inner_decoded {
             DecodedMessage::Whisper(w) => w,
             DecodedMessage::PreKey(_) => anyhow::bail!("Nested message không thể là PreKey"),
@@ -708,5 +720,22 @@ mod tests {
             // Must never panic
             let _ = deserialize(&buf);
         }
+    }
+
+    #[test]
+    fn test_prekey_recursion_depth_capped() {
+        // Construct a PreKey message that wraps another PreKey message
+        // Depth check must reject nested PreKey at depth > 0 with Err
+        let mut inner_prekey = vec![0x33];
+        // tag for field 4 (nested message, length delimited: 4 << 3 | 2 = 0x22)
+        inner_prekey.extend_from_slice(&[0x22, 0x02, 0xaa, 0xbb]);
+        let err = deserialize_signal_proto_with_depth(&inner_prekey, 1);
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("không được phép lồng nhau"));
+
+        // Max depth > 2 must also immediately bail
+        let err_depth = deserialize_signal_proto_with_depth(&[0x33, 0x01], 3);
+        assert!(err_depth.is_err());
+        assert!(err_depth.unwrap_err().to_string().contains("vượt quá giới hạn"));
     }
 }

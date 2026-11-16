@@ -149,21 +149,58 @@ pub fn decode_gif_sprite(id: u64) -> Option<crate::gui::DecodedSpriteData> {
     }
 
     let frame_count = frames.len();
-    let width = frames[0].buffer().width() as usize;
-    let height = frames[0].buffer().height() as usize;
-    if width == 0 || height == 0 {
+    let orig_width = frames[0].buffer().width() as usize;
+    let orig_height = frames[0].buffer().height() as usize;
+    if orig_width == 0 || orig_height == 0 {
         return None;
     }
 
+    // Target preview scale: Zalo sticker preview size is ~116-130px.
+    // If original width > 160 or total_width > 4096, scale down each frame to 160px width
+    // to strictly preserve GPU max_texture_side <= 8192 and conserve 90% VRAM/RAM.
+    let (width, height, resized_frames) = if orig_width > 160 || orig_width * frame_count > 4096 {
+        let target_w = 160usize;
+        let target_h = ((orig_height * target_w) / orig_width).max(1);
+        let mut resized = Vec::with_capacity(frame_count);
+        for frame in &frames {
+            let resized_buf = image::imageops::resize(
+                frame.buffer(),
+                target_w as u32,
+                target_h as u32,
+                image::imageops::FilterType::Triangle,
+            );
+            resized.push(resized_buf);
+        }
+        (target_w, target_h, Some(resized))
+    } else {
+        (orig_width, orig_height, None)
+    };
+
     let total_width = width * frame_count;
+    if total_width > 8192 || height > 8192 {
+        return None;
+    }
+
     let mut stitched_pixels = vec![0u8; total_width * height * 4];
 
     for (f, frame) in frames.iter().enumerate() {
-        let buffer = frame.buffer();
-        let frame_w = (buffer.width() as usize).min(width);
-        let frame_h = (buffer.height() as usize).min(height);
-        let raw = buffer.as_raw();
-        let buffer_stride = buffer.width() as usize * 4;
+        let (frame_w, frame_h, raw, buffer_stride) = if let Some(ref r) = resized_frames {
+            let buf = &r[f];
+            (
+                buf.width() as usize,
+                buf.height() as usize,
+                buf.as_raw().as_slice(),
+                buf.width() as usize * 4,
+            )
+        } else {
+            let buf = frame.buffer();
+            (
+                (buf.width() as usize).min(width),
+                (buf.height() as usize).min(height),
+                buf.as_raw().as_slice(),
+                buf.width() as usize * 4,
+            )
+        };
 
         for y in 0..frame_h {
             let src_start = y * buffer_stride;
@@ -229,6 +266,8 @@ mod tests {
             let frame_width = sprite.image.size[0] / sprite.frames as usize;
             assert!(frame_width > 0);
             assert!(sprite.image.size[1] > 0);
+            assert!(sprite.image.size[0] <= 8192, "Sprite width {} exceeds 8192", sprite.image.size[0]);
+            assert!(sprite.image.size[1] <= 8192, "Sprite height {} exceeds 8192", sprite.image.size[1]);
         }
     }
     #[tokio::test]

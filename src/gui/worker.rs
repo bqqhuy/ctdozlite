@@ -719,6 +719,10 @@ fn decode_sprite_from_bytes(bytes: &[u8]) -> anyhow::Result<crate::gui::DecodedS
     let width = rgba.width();
     let height = rgba.height();
     anyhow::ensure!(width > 0 && height > 0, "Empty image dimensions");
+    anyhow::ensure!(
+        width <= 8192 && height <= 8192,
+        "Image dimensions ({width}x{height}) exceed maximum texture dimension 8192"
+    );
     let size = [width as usize, height as usize];
     let pixels = rgba.as_flat_samples();
     let color_img = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());

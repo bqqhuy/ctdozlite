@@ -84,66 +84,109 @@ impl ZaloGuiApp {
         {
             return;
         }
+        let compact_h = ctx.screen_rect().height() < 300.0;
+        let sync_h = if compact_h { 34.0 } else { 92.0 };
         egui::TopBottomPanel::bottom("main_sync_status")
             .resizable(false)
-            .exact_height(92.0)
+            .exact_height(sync_h)
             .frame(
                 egui::Frame::none()
                     .fill(pal.bg_app)
-                    .inner_margin(Margin::symmetric(12.0, 8.0)),
+                    .inner_margin(Margin::symmetric(12.0, if compact_h { 4.0 } else { 8.0 })),
             )
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    if running {
-                        ui.spinner();
-                    }
-                    let sync_title = if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {
-                        crate::i18n::tr("Đồng bộ từ điện thoại")
-                    } else {
-                        crate::i18n::tr("Đồng bộ từ máy chủ")
-                    };
-                    ui.add(egui::Label::new(RichText::new(sync_title).strong().color(pal.text_primary)));
-                    if (self.phone_sync_running || self.history_sync_running)
-                        && ui
-                            .add_enabled(
-                                !self.sync_cancel_requested,
-                                egui::Button::new(if self.sync_cancel_requested {
-                                    "Đang dừng…"
-                                } else {
-                                    "Dừng"
-                                }),
-                            )
-                            .clicked()
-                    {
-                        if let Some(tx) = WORKER_TX.get() {
-                            if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::CancelHistorySync}).is_ok() {
-                                self.sync_cancel_requested = true;
+                if compact_h {
+                    ui.horizontal(|ui| {
+                        if running {
+                            ui.spinner();
+                        }
+                        let sync_title = if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {
+                            crate::i18n::tr("Đồng bộ từ điện thoại")
+                        } else {
+                            crate::i18n::tr("Đồng bộ từ máy chủ")
+                        };
+                        ui.add(egui::Label::new(RichText::new(sync_title).strong().color(pal.text_primary)));
+                        let phone=self.phone_sync_running || (!self.phone_sync_status.is_empty() && !self.history_sync_running && !self.refresh_sync_running);
+                        let download=if phone && !self.phone_download_status.is_empty(){self.phone_download_status.as_str()}else{self.sync_status_message()};
+                        ui.add(egui::Label::new(RichText::new(download).color(pal.text_primary)).truncate()).on_hover_text(download);
+                        if (self.phone_sync_running || self.history_sync_running)
+                            && ui
+                                .add_enabled(
+                                    !self.sync_cancel_requested,
+                                    egui::Button::new(if self.sync_cancel_requested {
+                                        "Đang dừng…"
+                                    } else {
+                                        "Dừng"
+                                    }),
+                                )
+                                .clicked()
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::CancelHistorySync}).is_ok() {
+                                    self.sync_cancel_requested = true;
+                                }
                             }
                         }
-                    }
-                    if self.phone_sync_running
-                        && !self.sync_cancel_requested
-                        && ui
-                            .button("Đánh thức điện thoại")
-                            .on_hover_text(crate::i18n::tr("Gửi lại thông báo tới Zalo trên điện thoại khi việc gửi lịch sử bị đứng"))
-                            .clicked()
-                    {
-                        crate::phone_sync::request_wake();
-                    }
-                    if ui.button(crate::i18n::tr("Chi tiết")).clicked() {
-                        self.settings_tab = SettingsTab::Sync;
-                        self.settings_modal_open = true;
-                    }
-                    if !running && ui.button(crate::i18n::tr("Ẩn trạng thái")).clicked() {
-                        self.sync_notice_dismissed = true;
-                    }
-                });
-                let phone=self.phone_sync_running || (!self.phone_sync_status.is_empty() && !self.history_sync_running && !self.refresh_sync_running);
-                let download=if phone && !self.phone_download_status.is_empty(){self.phone_download_status.as_str()}else{self.sync_status_message()};
-                ui.add(egui::Label::new(RichText::new(download).color(pal.text_primary)).truncate()).on_hover_text(download);
-                let importing=if phone && !self.phone_import_status.is_empty(){self.phone_import_status.as_str()}else{"Tiến độ chi tiết nằm trong mục Đồng bộ"};
-                ui.add(egui::Label::new(RichText::new(importing).color(pal.text_secondary)).truncate()).on_hover_text(importing);
-
+                        if ui.button(crate::i18n::tr("Chi tiết")).clicked() {
+                            self.settings_tab = SettingsTab::Sync;
+                            self.settings_modal_open = true;
+                        }
+                        if !running && ui.button(crate::i18n::tr("Ẩn")).clicked() {
+                            self.sync_notice_dismissed = true;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if running {
+                            ui.spinner();
+                        }
+                        let sync_title = if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {
+                            crate::i18n::tr("Đồng bộ từ điện thoại")
+                        } else {
+                            crate::i18n::tr("Đồng bộ từ máy chủ")
+                        };
+                        ui.add(egui::Label::new(RichText::new(sync_title).strong().color(pal.text_primary)));
+                        if (self.phone_sync_running || self.history_sync_running)
+                            && ui
+                                .add_enabled(
+                                    !self.sync_cancel_requested,
+                                    egui::Button::new(if self.sync_cancel_requested {
+                                        "Đang dừng…"
+                                    } else {
+                                        "Dừng"
+                                    }),
+                                )
+                                .clicked()
+                        {
+                            if let Some(tx) = WORKER_TX.get() {
+                                if tx.send(if self.phone_sync_running {WorkerCmd::CancelPhoneHistory}else{WorkerCmd::CancelHistorySync}).is_ok() {
+                                    self.sync_cancel_requested = true;
+                                }
+                            }
+                        }
+                        if self.phone_sync_running
+                            && !self.sync_cancel_requested
+                            && ui
+                                .button("Đánh thức điện thoại")
+                                .on_hover_text(crate::i18n::tr("Gửi lại thông báo tới Zalo trên điện thoại khi việc gửi lịch sử bị đứng"))
+                                .clicked()
+                        {
+                            crate::phone_sync::request_wake();
+                        }
+                        if ui.button(crate::i18n::tr("Chi tiết")).clicked() {
+                            self.settings_tab = SettingsTab::Sync;
+                            self.settings_modal_open = true;
+                        }
+                        if !running && ui.button(crate::i18n::tr("Ẩn trạng thái")).clicked() {
+                            self.sync_notice_dismissed = true;
+                        }
+                    });
+                    let phone=self.phone_sync_running || (!self.phone_sync_status.is_empty() && !self.history_sync_running && !self.refresh_sync_running);
+                    let download=if phone && !self.phone_download_status.is_empty(){self.phone_download_status.as_str()}else{self.sync_status_message()};
+                    ui.add(egui::Label::new(RichText::new(download).color(pal.text_primary)).truncate()).on_hover_text(download);
+                    let importing=if phone && !self.phone_import_status.is_empty(){self.phone_import_status.as_str()}else{"Tiến độ chi tiết nằm trong mục Đồng bộ"};
+                    ui.add(egui::Label::new(RichText::new(importing).color(pal.text_secondary)).truncate()).on_hover_text(importing);
+                }
             });
     }
 
