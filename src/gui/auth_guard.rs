@@ -28,10 +28,17 @@ pub struct AppLockGuard {
 }
 
 impl AppLockGuard {
-    /// Create a new lock guard (app starts unlocked, no initial lock required).
+    /// Create a new lock guard (app starts unlocked).
     pub fn new() -> Self {
+        Self::with_initial_lock(false)
+    }
+
+    /// Create a lock guard with explicit initial lock state (M-02).
+    /// If app lock is enabled and session was restored from disk on startup,
+    /// it initializes locked to prevent app lock bypass on restart.
+    pub fn with_initial_lock(locked: bool) -> Self {
         Self {
-            locked: false,
+            locked,
             last_interaction: Instant::now(),
             idle_timeout: Duration::from_secs(5 * 60), // 5 minutes
             biometric_available: false,
@@ -280,6 +287,14 @@ mod tests {
     fn lock_guard_starts_unlocked() {
         let guard = AppLockGuard::new();
         assert!(!guard.is_locked());
+    }
+
+    #[test]
+    fn m02_lock_guard_with_initial_lock_starts_locked() {
+        let guard = AppLockGuard::with_initial_lock(true);
+        assert!(guard.is_locked());
+        let guard_unlocked = AppLockGuard::with_initial_lock(false);
+        assert!(!guard_unlocked.is_locked());
     }
 
     #[test]

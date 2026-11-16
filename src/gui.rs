@@ -615,6 +615,9 @@ pub enum GuiEvent {
         count: usize,
     },
     LoggedOut,
+    LogoutFailed {
+        message: String,
+    },
     DownloadFolderPicked(Option<Result<std::path::PathBuf, String>>),
     DownloadFolderFailed(String),
     DiagnosticsFolderOpened(std::result::Result<(), String>),
@@ -783,6 +786,8 @@ struct AppSettings {
     selected_camera_device: String,
     // 8. Tính năng AI & Quyền riêng tư
     ai_translation_consent: bool,
+    /// Whether application auto-locks with Windows Hello / PIN (M-02)
+    enable_app_lock: bool,
 }
 
 impl Default for AppSettings {
@@ -833,6 +838,7 @@ impl Default for AppSettings {
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
             ai_translation_consent: false,
+            enable_app_lock: true,
         }
     }
 }
@@ -1215,6 +1221,7 @@ impl ZaloGuiApp {
         } else {
             AppSettings::default()
         };
+        let enable_app_lock = loaded_settings.enable_app_lock;
         loaded_settings.appearance.apply_context(ctx);
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
@@ -1494,7 +1501,9 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             quote_jump: None,
             quick_schedule: None,
-            lock_guard: auth_guard::AppLockGuard::new(),
+            lock_guard: auth_guard::AppLockGuard::with_initial_lock(
+                is_logged_in && enable_app_lock,
+            ),
             auth_in_progress: false,
             auth_request_generation: 0,
             account_switcher: account_switcher::AccountSwitcher::default(),
@@ -3065,6 +3074,10 @@ impl ZaloGuiApp {
                         };
                         self.show_toast(summary);
                     }
+                }
+                GuiEvent::LogoutFailed { message } => {
+                    self.show_toast(format!("Đăng xuất thất bại: {message}"));
+                    self.status_msg = format!("Lỗi đăng xuất: {message}");
                 }
                 GuiEvent::LoggedOut => {
                     self.cancel_voice_recording();
@@ -5851,6 +5864,37 @@ impl ZaloGuiApp {
                             let _ = event_tx.send(event);
                             ctx_clone.request_repaint();
                         });
+                    }
+
+                    ui.add_space(12.0);
+                    let logout_btn = egui::Button::new(
+                        RichText::new("Đăng xuất tài khoản")
+                            .color(pal.text_secondary)
+                            .size(13.0),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(240.0, 38.0));
+
+                    if ui
+                        .add(logout_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        self.status_msg = "Đang đăng xuất…".into();
+                        if let Some(tx) = WORKER_TX.get() {
+                            let _ = tx.send(WorkerCmd::Logout);
+                        }
+                    }
+
+                    if !self.status_msg.is_empty() {
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(&self.status_msg)
+                                .color(pal.text_secondary)
+                                .size(12.5),
+                        );
                     }
                 });
             });
