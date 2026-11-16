@@ -3242,7 +3242,10 @@ impl ZaloGuiApp {
         }
         if self.loading_link_previews.insert(url.clone()) {
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
+                let _ = tx.send(WorkerCmd::ParseLinkPreview {
+                    url: url.clone(),
+                    origin: crate::chat::LinkOrigin::Outgoing,
+                });
             }
         }
         let domain = url

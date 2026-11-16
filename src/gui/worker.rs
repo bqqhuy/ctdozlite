@@ -392,6 +392,7 @@ pub enum WorkerCmd {
     },
     ParseLinkPreview {
         url: String,
+        origin: crate::chat::LinkOrigin,
     },
     LookupPhone {
         phone: String,
@@ -3346,13 +3347,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 .await;
                             });
                         }
-                        WorkerCmd::ParseLinkPreview { url } => {
+                        WorkerCmd::ParseLinkPreview { url, origin } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url).await {
+                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url, origin).await {
                                     let _ = gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta));
                                     ctx_clone.request_repaint();
                                 }

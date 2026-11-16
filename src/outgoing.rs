@@ -211,15 +211,19 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                     result
                 }
                 TextRoute::Link(url) => {
-                    let meta = crate::chat::parse_link_metadata(s, &url).await.unwrap_or(
-                        crate::chat::LinkMetadata {
-                            title: url.clone(),
-                            url,
-                            desc: String::new(),
-                            thumb: String::new(),
-                            src: "Liên kết".into(),
-                        },
-                    );
+                    let meta = crate::chat::parse_link_metadata(
+                        s,
+                        &url,
+                        crate::chat::LinkOrigin::Outgoing,
+                    )
+                    .await
+                    .unwrap_or(crate::chat::LinkMetadata {
+                        title: url.clone(),
+                        url,
+                        desc: String::new(),
+                        thumb: String::new(),
+                        src: "Liên kết".into(),
+                    });
                     let result = crate::chat::send_link_message_with_client_id(
                         s,
                         to,

@@ -2816,7 +2816,7 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
         .build()
         .ok()?;
     let user_agent = crate::endpoints::sanitize_header_value(
-        "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+        "Mozilla/5.0 (compatible; ctdozlite-linkpreview)",
     );
     let accept_lang = crate::endpoints::sanitize_header_value("vi-VN,vi;q=0.9,en-US;q=0.8");
     let resp = client
@@ -2907,9 +2907,24 @@ fn is_placeholder_zalo_thumb(thumb: &str) -> bool {
         || thumb.contains("aHR0cHM6Ly9yZXMtemFsby56YWRuLnZuL3VwbG9hZC9tZWRpYS8yMDE5LzEwLzE1L2ZlZWRfdGh1bWJfbGlua19fMV9fMTU3MTEzMzEyMjc3OF85Mzc4MC5wbmc=")
 }
 
+/// Origin of a link being previewed.
+///
+/// Under M-07, incoming links (from peers) must NEVER trigger direct HTML scraping
+/// from the user's IP to prevent IP/timestamp tracking via rogue preview URLs.
+/// Direct OpenGraph scraping is only permitted for outgoing messages composed by the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOrigin {
+    Incoming,
+    Outgoing,
+}
+
 /// Parse rich link metadata (`title`, `desc`, `thumb`, `src`) via Zalo's `/api/message/parselink`
-/// (`cmd 11285`) combined with direct OpenGraph HTML scraping fallback.
-pub async fn parse_link_metadata(s: &Session, raw_url: &str) -> Result<LinkMetadata> {
+/// (`cmd 11285`) combined with direct OpenGraph HTML scraping fallback for outgoing links only.
+pub async fn parse_link_metadata(
+    s: &Session,
+    raw_url: &str,
+    origin: LinkOrigin,
+) -> Result<LinkMetadata> {
     let url = raw_url.trim().to_string();
     let domain = url
         .split("://")
@@ -2971,7 +2986,11 @@ pub async fn parse_link_metadata(s: &Session, raw_url: &str) -> Result<LinkMetad
         }
     }
 
-    if meta.title.is_empty() || meta.thumb.is_empty() || meta.desc.is_empty() {
+    // M-07: Direct OpenGraph HTML scraping is strictly restricted to Outgoing links.
+    // Incoming links received from other parties rely solely on Zalo's server-side parselink API.
+    if origin == LinkOrigin::Outgoing
+        && (meta.title.is_empty() || meta.thumb.is_empty() || meta.desc.is_empty())
+    {
         if let Some(og) = scrape_opengraph_metadata(&url).await {
             if meta.title.is_empty() && !og.title.is_empty() {
                 meta.title = og.title;

@@ -112,6 +112,41 @@ async fn unicode_html_comment_does_not_abort_link_scraping() {
     task.await.unwrap();
 }
 #[tokio::test]
+async fn m07_incoming_link_never_scrapes_directly_from_client_ip() {
+    let (url, task) = fixture(Some("<title>Rogue Tracker Title</title>")).await;
+    let s = Session::new(false, false, false).unwrap();
+    let meta = chat::parse_link_metadata(&s, &url, chat::LinkOrigin::Incoming)
+        .await
+        .unwrap();
+    assert_ne!(meta.title, "Rogue Tracker Title");
+    let requests = task.await.unwrap();
+    assert_eq!(
+        requests.len(),
+        0,
+        "Incoming link must not issue any HTTP request to the target host"
+    );
+}
+#[tokio::test]
+async fn m07_outgoing_link_scrapes_with_sanitized_user_agent_not_discord() {
+    let (url, task) = fixture(Some("<title>Legitimate Webpage</title>")).await;
+    let s = Session::new(false, false, false).unwrap();
+    let meta = chat::parse_link_metadata(&s, &url, chat::LinkOrigin::Outgoing)
+        .await
+        .unwrap();
+    assert_eq!(meta.title, "Legitimate Webpage");
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert!(
+        !req.contains("Discord"),
+        "User-Agent must not impersonate Discordbot"
+    );
+    assert!(
+        req.contains("ctdozlite-linkpreview"),
+        "User-Agent must identify as ctdozlite-linkpreview"
+    );
+}
+#[tokio::test]
 async fn uncertain_quote_delivery_never_issues_a_second_mutation() {
     let (url, task) = fixture(None).await;
     assert!(

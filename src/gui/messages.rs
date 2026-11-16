@@ -783,7 +783,10 @@ pub(super) fn render_message_body(
         let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
         if loading_stickers.insert(meta_key) {
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::ParseLinkPreview { url: url.clone() });
+                let _ = tx.send(WorkerCmd::ParseLinkPreview {
+                    url: url.clone(),
+                    origin: crate::chat::LinkOrigin::Incoming,
+                });
             }
         }
     }
