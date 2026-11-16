@@ -97,6 +97,28 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 | `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
 
 
+## Phase 3 — Hiển thị lỗi và hiệu năng (Medium / Low)
+
+| ID | Mức | Trạng thái | Commit | Kiểm chứng | Native / official | Ghi chú & Rủi ro còn lại |
+|---|---|---|---|---|---|---|
+| M-04 | Medium | Đóng (code/fixture) | `accecd0` | `tests::audit_regressions::test_m04_status_update_error_classification` | — | Phân loại thông điệp lỗi tự động hiển thị qua toast banner nổi bật; giữ nguyên trạng thái trên thanh status bar |
+| M-06 | Medium | Đóng (code/fixture) | `accecd0` | `worker::save_to_file` offloaded to `spawn_blocking`; session mutex nhả trước khi gọi I/O đĩa | — | Giải phóng async worker loop khỏi block do I/O mã hóa DPAPI và ghi file |
+| L-01 | Low-Med | Đóng (code/fixture) | `accecd0` | Scheduler tách `MissedTickBehavior::Skip` cho task automation | — | Ngăn chặn hiện tượng dồn tích tick khi worker bận |
+| Logger / Voice | Low | Đóng (code/fixture) | `accecd0` | `tests::audit_regressions::test_perf_logger_vecdeque_fifo`, voice buffer pre-reserve 30s | — | Chuyển đổi `Vec::remove(0)` O(N) sang `VecDeque::pop_front` O(1); cấp phát trước buffer âm thanh |
+
+## Cổng Phase 3 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
+
+| Lệnh | Kết quả | Ghi chú |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | Clean format |
+| `cargo check --locked --all-targets` | exit 0 | 0 error, 0 warning |
+| `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo test --locked --no-fail-fast` | 926 passed, 0 failed, 13 ignored | 16 test binaries pass sạch (+2 tests mới) |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | 929 passed, 0 failed, 13 ignored | 16 test binaries pass sạch (+2 tests mới) |
+| `python -I scripts/tests/test_audit_prepush.py` | 4 OK | Pass toàn bộ regex & audit checks |
+| `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
+
 ## Cổng Phase 1 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
 
 | Lệnh | Kết quả | Ghi chú |
