@@ -1106,6 +1106,28 @@ pub(super) fn render_chat_bubble(
             + 4.0
     };
 
+    let mut content_width = content_width;
+    if is_file_card {
+        content_width = content_width.max(260.0).min(max_text_width);
+    }
+    if let Some(job) = &msg.outgoing_job {
+        if msg.delivery == crate::message_model::DeliveryState::Failed {
+            let err_w = ui.fonts(|f| {
+                f.layout(
+                    job.error.clone(),
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                    max_text_width.min(340.0),
+                )
+                .size()
+                .x
+            });
+            content_width = content_width.max(err_w).max(240.0).min(max_text_width);
+        } else if msg.delivery == crate::message_model::DeliveryState::Pending {
+            content_width = content_width.max(180.0).min(max_text_width);
+        }
+    }
+
     let h_margin = if has_sticker || is_frameless_photo {
         2.0_f32
     } else {
@@ -1121,7 +1143,7 @@ pub(super) fn render_chat_bubble(
     if msg.is_outgoing {
         let out_resp = ui.vertical(|ui| {
             let row_resp = ui.horizontal(|ui| {
-                let left_pad = (ui.available_width() - total_bubble_w - 6.0).max(0.0);
+                let left_pad = (ui.available_width() - total_bubble_w - 10.0).max(0.0);
                 if left_pad > 0.0 {
                     ui.add_space(left_pad);
                 }

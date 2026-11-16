@@ -97,7 +97,12 @@ impl ZaloGuiApp {
                     if running {
                         ui.spinner();
                     }
-                    ui.strong(if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {"Đồng bộ từ điện thoại"}else{"Đồng bộ từ máy chủ"});
+                    let sync_title = if self.phone_sync_running || self.sync_status_message()==self.phone_sync_status && !self.phone_sync_status.is_empty() {
+                        crate::i18n::tr("Đồng bộ từ điện thoại")
+                    } else {
+                        crate::i18n::tr("Đồng bộ từ máy chủ")
+                    };
+                    ui.add(egui::Label::new(RichText::new(sync_title).strong().color(pal.text_primary)));
                     if (self.phone_sync_running || self.history_sync_running)
                         && ui
                             .add_enabled(

@@ -635,8 +635,8 @@ impl ZaloGuiApp {
         let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
-        let win_w = (screen.width() - 16.0).clamp(160.0, 900.0);
-        let win_h = (screen.height() - 16.0).clamp(160.0, 680.0);
+        let win_w = (screen.width() - 16.0).clamp(160.0, 800.0);
+        let win_h = (screen.height() - 16.0).clamp(160.0, 560.0);
         let compact = win_w < 700.0;
         let sidebar_w = if compact { 48.0 } else { 200.0 };
 
@@ -1209,15 +1209,29 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(RichText::new(crate::i18n::tr("Phát âm thanh khi có tin nhắn & thông báo mới")).color(pal.text_primary).size(13.2));
-                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            render_toggle_switch(ui, &mut self.settings.play_notification_sound, pal);
-                                                            if ui.add_enabled(!self.sound_preparing,egui::Button::new(crate::i18n::tr("Thử âm báo"))).clicked(){
-                                                                if let Some(tx)=WORKER_TX.get(){self.sound_preparing=tx.send(WorkerCmd::PrepareNotificationSound{play:true}).is_ok();self.sound_attempts=0;}
-                                                            }
+                                                    let avail = ui.available_width();
+                                                    if avail < 520.0 {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new(crate::i18n::tr("Phát âm thanh khi có tin nhắn & thông báo mới")).color(pal.text_primary).size(13.2));
+                                                            ui.add_space(4.0);
+                                                            ui.horizontal(|ui| {
+                                                                render_toggle_switch(ui, &mut self.settings.play_notification_sound, pal);
+                                                                if ui.add_enabled(!self.sound_preparing,egui::Button::new(crate::i18n::tr("Thử âm báo"))).clicked(){
+                                                                    if let Some(tx)=WORKER_TX.get(){self.sound_preparing=tx.send(WorkerCmd::PrepareNotificationSound{play:true}).is_ok();self.sound_attempts=0;}
+                                                                }
+                                                            });
                                                         });
-                                                    });
+                                                    } else {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(RichText::new(crate::i18n::tr("Phát âm thanh khi có tin nhắn & thông báo mới")).color(pal.text_primary).size(13.2));
+                                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                                render_toggle_switch(ui, &mut self.settings.play_notification_sound, pal);
+                                                                if ui.add_enabled(!self.sound_preparing,egui::Button::new(crate::i18n::tr("Thử âm báo"))).clicked(){
+                                                                    if let Some(tx)=WORKER_TX.get(){self.sound_preparing=tx.send(WorkerCmd::PrepareNotificationSound{play:true}).is_ok();self.sound_attempts=0;}
+                                                                }
+                                                            });
+                                                        });
+                                                    }
                                                 });
                                         }
                                         SettingsTab::Messages => {

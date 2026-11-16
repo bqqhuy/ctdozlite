@@ -1295,9 +1295,16 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                             let active = active;
                             message.delivery = crate::message_model::DeliveryState::Pending;
                             if let Some(job) = message.outgoing_job.as_mut() { job.error.clear(); }
-                            persist_outgoing(&s, &thread_id, &message).await;
+                            // Instant optimistic UI update
                             let _ = tx.send(GuiEvent::OutgoingState { owner: owner.clone(), thread_id: thread_id.clone(), message: message.clone() });
                             ctx.request_repaint();
+                            // Persist in background concurrently
+                            let s_persist = s.clone();
+                            let t_persist = thread_id.clone();
+                            let m_persist = message.clone();
+                            tokio::spawn(async move {
+                                persist_outgoing(&s_persist, &t_persist, &m_persist).await;
+                            });
                             let result = crate::outgoing::send(&s, &thread_id, &message).await;
                             let expired = result.as_ref().err().is_some_and(|error| is_session_expired_error(&error.to_string()));
                             match result {
@@ -4374,18 +4381,26 @@ async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMess
             return Ok(());
         }
         let mut store = crate::store::MessageStore::open(session.history_path())?;
-        let saved = store
-            .all_threads()?
-            .into_iter()
-            .find(|thread| thread.thread_id == thread_id);
+        let meta = store.thread_meta(&thread_id)?;
         let is_group = message
             .outgoing_job
             .as_ref()
             .is_some_and(|job| job.is_group);
+        let (thread_name, is_group) = match meta {
+            Some((name, grp)) => (
+                if name.is_empty() {
+                    thread_id.clone()
+                } else {
+                    name
+                },
+                grp,
+            ),
+            None => (thread_id.clone(), is_group),
+        };
         let thread = Thread {
             id: thread_id.clone(),
-            name: saved.as_ref().map(|t| t.name.clone()).unwrap_or(thread_id),
-            is_group: saved.as_ref().map(|t| t.is_group).unwrap_or(is_group),
+            name: thread_name,
+            is_group,
             messages: vec![message],
             ..Default::default()
         };

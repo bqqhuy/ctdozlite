@@ -1082,6 +1082,24 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Query thread name and group flag by thread_id without loading all threads or messages.
+    pub fn thread_meta(&self, id: &str) -> Result<Option<(String, bool)>> {
+        use rusqlite::OptionalExtension;
+        self.conn
+            .query_row(
+                "SELECT name, is_group FROM threads WHERE thread_id=?1",
+                params![id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0).unwrap_or_default(),
+                        r.get::<_, i64>(1).unwrap_or(0) != 0,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Persist the read-point (last read message ID) of a thread.
     /// Upserts safely even if the thread does not have a row yet.
     pub fn set_thread_read(&self, thread_id: &str, last_msg_id: &str) -> Result<()> {

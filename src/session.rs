@@ -382,6 +382,7 @@ impl Session {
         );
         default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         let http = crate::proxy::apply(Client::builder())?
+            .tcp_nodelay(true)
             .cookie_provider(Arc::clone(&jar))
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
