@@ -3,6 +3,7 @@
 //! In Dev mode (`--dev`), logs raw decrypted payloads, endpoint metrics, and provides
 //! a diagnostic scanner. In Production mode, logs and dev panels are hidden and sanitized.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex};
 
 #[derive(Debug, Clone)]
@@ -36,7 +37,7 @@ pub enum FindingLevel {
 
 pub struct LoggerState {
     pub dev_mode: bool,
-    pub entries: Vec<LogEntry>,
+    pub entries: VecDeque<LogEntry>,
     pub max_entries: usize,
     counter: usize,
 }
@@ -45,7 +46,7 @@ impl Default for LoggerState {
     fn default() -> Self {
         Self {
             dev_mode: false,
-            entries: Vec::new(),
+            entries: VecDeque::new(),
             max_entries: 500,
             counter: 0,
         }
@@ -105,9 +106,9 @@ pub fn log_request(
             error_msg: error_msg.map(crate::session::redact_text),
         };
 
-        state.entries.push(entry);
+        state.entries.push_back(entry);
         if state.entries.len() > state.max_entries {
-            state.entries.remove(0);
+            state.entries.pop_front();
         }
     }
 }
@@ -139,15 +140,18 @@ pub fn log_error(context: &str, err: &str) {
             error_msg: Some(crate::session::redact_text(err)),
         };
 
-        state.entries.push(entry);
+        state.entries.push_back(entry);
         if state.entries.len() > state.max_entries {
-            state.entries.remove(0);
+            state.entries.pop_front();
         }
     }
 }
 
 pub fn get_entries() -> Vec<LogEntry> {
-    LOGGER.lock().map(|s| s.entries.clone()).unwrap_or_default()
+    LOGGER
+        .lock()
+        .map(|s| s.entries.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 pub fn clear_entries() {

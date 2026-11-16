@@ -152,9 +152,9 @@ impl VoiceRecorder {
         let channels = supported_config.channels() as usize;
 
         let inner = Arc::new(Mutex::new(RecorderInner {
-            samples: Vec::new(),
-            waveform_levels: Vec::new(),
-            window_samples: Vec::new(),
+            samples: Vec::with_capacity((sample_rate as usize) * 30), // Pre-reserve 30s of mono samples
+            waveform_levels: Vec::with_capacity(30 * 25),
+            window_samples: Vec::with_capacity((sample_rate / 25) as usize),
             start_time: Instant::now(),
             sample_rate,
             limit_reached: false,

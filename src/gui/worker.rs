@@ -1298,9 +1298,17 @@ pub(super) fn spawn_session_worker(
                 }
 
                 {
-                    let commands=commands.clone();
-                    tokio::spawn(async move {let mut tick=tokio::time::interval(Duration::from_secs(2));loop{tick.tick().await;let Some(tx)=commands.upgrade()else{break;};if tx.send(WorkerCmd::RunAutomation).is_err(){break;}
-if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
+                    let commands = commands.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(2));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tick.tick().await;
+                            let Some(tx) = commands.upgrade() else { break; };
+                            if tx.send(WorkerCmd::RunAutomation).is_err() { break; }
+                            if tx.send(WorkerCmd::PruneExpired).is_err() { break; }
+                        }
+                    });
                 }
                 let mut recovered_accounts=HashSet::new();
                 let automation_running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2169,11 +2177,21 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
                         }
                         WorkerCmd::PersistSession => {
-                            let s = session.lock().await;
-                            if s.login.is_some() {
-                                if let Err(e) = s.save_to_file("session.json") {
-                                    let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                            let snapshot = {
+                                let s = session.lock().await;
+                                if s.login.is_some() {
+                                    Some(s.clone())
+                                } else {
+                                    None
                                 }
+                            };
+                            if let Some(s) = snapshot {
+                                let tx = gui_tx.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = s.save_to_file("session.json") {
+                                        let _ = tx.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                    }
+                                });
                             }
                         }
                         WorkerCmd::RequestQr => {
@@ -4171,31 +4189,37 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 if !auth_mgr.is_current(attempt_id) {
                                                     return;
                                                 }
-                                                *s = candidate;
-                                                if let Err(e) = s.save_to_file("session.json") {
-                                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
-                                                }
-
-                                                let uin = s
+                                                let uin = candidate
                                                     .login
                                                     .as_ref()
                                                     .map(|l| l.uin.clone())
                                                     .unwrap_or_default();
-                                                let name = s
+                                                let name = candidate
                                                     .login
                                                     .as_ref()
                                                     .map(|l| l.display_name.clone())
                                                     .unwrap_or_default();
-                                                let u_ava = s
+                                                let u_ava = candidate
                                                     .login
                                                     .as_ref()
                                                     .map(|l| l.avatar.clone())
                                                     .filter(|a| !a.is_empty());
+                                                let runtime_id = candidate.runtime_id();
+
+                                                let s_clone = candidate.clone();
+                                                *s = candidate;
+                                                drop(s);
+                                                let tx_save = gui_tx_clone.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    if let Err(e) = s_clone.save_to_file("session.json") {
+                                                        let _ = tx_save.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
+                                                    }
+                                                });
                                                 let _ = gui_tx_clone.send(GuiEvent::LoginSuccess {
                                                     name,
                                                     uin,
                                                     avatar: u_ava,
-                                                    runtime_id: s.runtime_id(),
+                                                    runtime_id,
                                                 });
                                                 ctx_clone.request_repaint();
 

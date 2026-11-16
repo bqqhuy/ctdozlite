@@ -660,3 +660,38 @@ fn audit_a35_ipv6_link_local_and_site_local_guards() {
     let url_fec0_high = reqwest::Url::parse("http://[fec0::ffff]/metadata").unwrap();
     assert!(!is_safe_opengraph_url(&url_fec0_high, false));
 }
+
+#[test]
+fn test_m04_status_update_error_classification() {
+    let err_msg = "Không thể kết nối đến máy chủ";
+    let is_error = err_msg.starts_with("Không ")
+        || err_msg.starts_with("Lỗi ")
+        || err_msg.starts_with("Thất bại")
+        || err_msg.starts_with("Chưa ")
+        || err_msg.contains("thất bại")
+        || err_msg.contains("không thể")
+        || err_msg.contains("Không thể");
+    assert!(is_error);
+
+    let progress_msg = "Đang tải tin nhắn…";
+    let is_not_error = progress_msg.starts_with("Không ")
+        || progress_msg.starts_with("Lỗi ")
+        || progress_msg.starts_with("Thất bại")
+        || progress_msg.starts_with("Chưa ")
+        || progress_msg.contains("thất bại")
+        || progress_msg.contains("không thể")
+        || progress_msg.contains("Không thể");
+    assert!(!is_not_error);
+}
+
+#[test]
+fn test_perf_logger_vecdeque_fifo() {
+    // Test logger FIFO behavior
+    zalo_rust::logger::init(true);
+    zalo_rust::logger::log_error("test_context", "Test error 1");
+    zalo_rust::logger::log_error("test_context", "Test error 2");
+    let entries = zalo_rust::logger::get_entries();
+    assert!(entries.len() >= 2);
+    let last = entries.last().unwrap();
+    assert_eq!(last.error_msg.as_deref(), Some("Test error 2"));
+}

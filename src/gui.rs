@@ -5047,7 +5047,18 @@ impl ZaloGuiApp {
                     unreachable!("local call record normalized before dispatch")
                 }
                 GuiEvent::StatusUpdate(msg) => {
-                    self.status_msg = msg;
+                    let is_error = msg.starts_with("Không ")
+                        || msg.starts_with("Lỗi ")
+                        || msg.starts_with("Thất bại")
+                        || msg.starts_with("Chưa ")
+                        || msg.contains("thất bại")
+                        || msg.contains("không thể")
+                        || msg.contains("Không thể");
+                    if is_error {
+                        self.show_toast(msg);
+                    } else {
+                        self.status_msg = msg;
+                    }
                 }
                 GuiEvent::ServerMediaLoaded {
                     thread_id,
