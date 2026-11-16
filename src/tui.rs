@@ -1882,10 +1882,14 @@ impl<'a> TuiApp<'a> {
                     return;
                 }
                 let owner = self.session.account_key().to_owned();
-                if let Err(e) = crate::profiles::perform_account_logout(&owner) {
-                    self.status = format!("Không thể xóa phiên: {e}");
-                    return;
-                }
+                std::thread::spawn(move || {
+                    if let Err(e) = crate::profiles::perform_account_logout(&owner) {
+                        crate::logger::log_error(
+                            "tui logout",
+                            &format!("Không thể xóa phiên: {e}"),
+                        );
+                    }
+                });
                 self.session.hidden.lock();
                 self.clear_private_draft();
                 self.session.logout();

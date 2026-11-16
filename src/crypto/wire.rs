@@ -731,11 +731,17 @@ mod tests {
         inner_prekey.extend_from_slice(&[0x22, 0x02, 0xaa, 0xbb]);
         let err = deserialize_signal_proto_with_depth(&inner_prekey, 1);
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("không được phép lồng nhau"));
+        assert!(err
+            .unwrap_err()
+            .to_string()
+            .contains("không được phép lồng nhau"));
 
         // Max depth > 2 must also immediately bail
         let err_depth = deserialize_signal_proto_with_depth(&[0x33, 0x01], 3);
         assert!(err_depth.is_err());
-        assert!(err_depth.unwrap_err().to_string().contains("vượt quá giới hạn"));
+        assert!(err_depth
+            .unwrap_err()
+            .to_string()
+            .contains("vượt quá giới hạn"));
     }
 }

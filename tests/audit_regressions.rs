@@ -708,3 +708,19 @@ fn test_perf_logger_vecdeque_fifo() {
     zalo_rust::logger::clear_entries();
     zalo_rust::logger::init(false);
 }
+
+#[test]
+fn test_m05_clipboard_temp_file_account_isolation() {
+    let acc_id = "audit_clipboard_acc_999";
+    let temp_dir = zalo_rust::storage::account_temp_dir(acc_id);
+    let _ = zalo_rust::storage::private_dir(&temp_dir);
+    assert!(temp_dir.exists());
+
+    let test_file = temp_dir.join("clipboard_123456.png");
+    std::fs::write(&test_file, b"test-clipboard-bytes").unwrap();
+    assert!(test_file.exists());
+
+    // Clearing account temp cleans up clipboard files
+    zalo_rust::storage::clear_account_temp(acc_id).unwrap();
+    assert!(!test_file.exists());
+}

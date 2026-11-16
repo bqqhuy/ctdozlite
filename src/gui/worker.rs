@@ -765,20 +765,48 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
 ) -> anyhow::Result<crate::gui::DecodedSpriteData> {
     if let Some((cid, sid)) = parse_sticker_key(key) {
         if cid == crate::bundled_stickers::CATEGORY {
-            if let Some(sprite) = crate::bundled_stickers::decode_gif_sprite(sid) {
+            if let Ok(Some(sprite)) =
+                tokio::task::spawn_blocking(move || crate::bundled_stickers::decode_gif_sprite(sid))
+                    .await
+            {
                 return Ok(sprite);
             }
             if let Some(png_bytes) = crate::bundled_stickers::thumbnail(key) {
-                if let Ok(sprite) = decode_sprite_from_bytes(png_bytes) {
+                let png_vec = png_bytes.to_vec();
+                if let Ok(Ok(sprite)) =
+                    tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&png_vec)).await
+                {
                     return Ok(sprite);
                 }
+            }
+        }
+
+        // Check local disk cache first before hitting network
+        let cache_dir = crate::storage::cache_dir();
+        let cache_path = cache_dir.join(format!("{key}.png"));
+        let cached_path_read = cache_path.clone();
+        if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
+            crate::limits::read_file(&cached_path_read, crate::limits::IMAGE_BYTES)
+        })
+        .await
+        {
+            let bytes_clone = bytes.clone();
+            if let Ok(Ok(sprite)) =
+                tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await
+            {
+                return Ok(sprite);
             }
         }
 
         if cid == 0 && (1..=30).contains(&sid) {
             let primary = crate::endpoints::builtin_sticker_thumbnail(sid);
             if let Ok(bytes) = download_sticker_image_bytes(&primary).await {
-                if let Ok(sprite) = decode_sprite_from_bytes(&bytes) {
+                let bytes_clone = bytes.clone();
+                if let Ok(Ok(sprite)) =
+                    tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone))
+                        .await
+                {
+                    let _ = crate::storage::atomic_write(&cache_path, &bytes);
                     return Ok(sprite);
                 }
             }
@@ -788,13 +816,22 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
                 crate::endpoints::legacy_sticker_image(sid)
             };
             let bytes = download_sticker_image_bytes(&fallback).await?;
-            return decode_sprite_from_bytes(&bytes);
+            let bytes_clone = bytes.clone();
+            let sprite =
+                tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone))
+                    .await??;
+            let _ = crate::storage::atomic_write(&cache_path, &bytes);
+            return Ok(sprite);
         }
 
         // Sticker khác: Thử tải crate::endpoints::sticker_sprite_url(sid) trước
         let sprite_url = crate::endpoints::sticker_sprite_url(sid);
         if let Ok(bytes) = download_sticker_image_bytes(&sprite_url).await {
-            if let Ok(sprite) = decode_sprite_from_bytes(&bytes) {
+            let bytes_clone = bytes.clone();
+            if let Ok(Ok(sprite)) =
+                tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await
+            {
+                let _ = crate::storage::atomic_write(&cache_path, &bytes);
                 return Ok(sprite);
             }
         }
@@ -806,11 +843,16 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
             crate::endpoints::legacy_sticker_image(sid)
         };
         let bytes = download_sticker_image_bytes(&fallback).await?;
-        return decode_sprite_from_bytes(&bytes);
+        let bytes_clone = bytes.clone();
+        let sprite =
+            tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await??;
+        let _ = crate::storage::atomic_write(&cache_path, &bytes);
+        return Ok(sprite);
     }
 
     let bytes = download_sticker_image_bytes(url).await?;
-    decode_sprite_from_bytes(&bytes)
+    let bytes_clone = bytes.clone();
+    tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await?
 }
 
 // Hidden viewports may stop rendering. Persist worker deltas before notifying UI
@@ -1097,6 +1139,7 @@ pub(super) fn spawn_session_worker(
                                             let _ = tx.send(GuiEvent::StickerSpriteReady {
                                                 key: key.clone(),
                                                 sprite,
+                                                permit: Some(job),
                                             });
                                         }
                                         Err(error) => {
@@ -1525,11 +1568,22 @@ pub(super) fn spawn_session_worker(
                         }
                         WorkerCmd::ResetE2eeRequirement { owner, peer_id } => {
                             let account = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
                             tokio::task::spawn_blocking(move || {
-                                if account.is_active() && !owner.is_empty() && account.account_key() == owner {
-                                    let _ = crate::e2ee_integration::remove_e2ee_requirement(&owner, &peer_id);
-                                    crate::logger::log_error("e2ee_requirement_reset", &format!("owner={owner} peer={peer_id}"));
-                                }
+                                let success = if account.is_active() && !owner.is_empty() && account.account_key() == owner {
+                                    let ok = crate::e2ee_integration::remove_e2ee_requirement(&owner, &peer_id).is_ok();
+                                    crate::logger::log_error("e2ee_requirement_reset", &format!("owner={owner} peer={peer_id} success={ok}"));
+                                    ok
+                                } else {
+                                    false
+                                };
+                                let _ = tx.send(GuiEvent::E2eeRequirementResetResult {
+                                    owner,
+                                    peer_id,
+                                    success,
+                                });
+                                ctx.request_repaint();
                             }).await.ok();
                         }
                         WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
@@ -2008,7 +2062,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             before = now;
                                             // The clipboard may change before all image formats are ready.
                                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                            if let Some(image) = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten() {
+                                            let owner_for_cap = owner.clone();
+                                            if let Some(image) = tokio::task::spawn_blocking(move || {
+                                                super::messages::read_clipboard_image_to_png(Some(&owner_for_cap))
+                                            }).await.ok().flatten() {
                                                 return Ok(image);
                                             }
                                         }
@@ -2022,8 +2079,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         WorkerCmd::ReadClipboardImage{owner,thread} => {
                             let account=session.lock().await.clone();if owner!=account.account_key()||!account.is_active(){continue;}
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            let owner_for_read = owner.clone();
                             tokio::spawn(async move {
-                                let image = tokio::task::spawn_blocking(super::messages::read_clipboard_image_to_png).await.ok().flatten();
+                                let image = tokio::task::spawn_blocking(move || {
+                                    super::messages::read_clipboard_image_to_png(Some(&owner_for_read))
+                                }).await.ok().flatten();
                                 if account.is_active(){let _ = tx.send(GuiEvent::ClipboardImageRead{owner,thread,image});ctx.request_repaint();}
                             });
                         }
@@ -3393,6 +3453,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         let _ = gui_tx_clone.send(GuiEvent::StickerSpriteReady {
                                             key: key.clone(),
                                             sprite,
+                                            permit: None,
                                         });
                                     }
                                     Err(error) => {

@@ -433,6 +433,12 @@ pub enum GuiEvent {
     StickerSpriteReady {
         key: String,
         sprite: DecodedSpriteData,
+        permit: Option<crate::media_resources::MediaJobPermit>,
+    },
+    E2eeRequirementResetResult {
+        owner: String,
+        peer_id: String,
+        success: bool,
     },
     StickerStoreLoaded(Vec<crate::chat::StickerPackInfo>),
     StickerPackItemsLoaded {
@@ -2129,7 +2135,10 @@ impl ZaloGuiApp {
         if image.size[0] > 8192 || image.size[1] > 8192 {
             crate::logger::log_error(
                 "store_texture",
-                &format!("Texture {key} dimensions {:?} exceed 8192 limit", image.size),
+                &format!(
+                    "Texture {key} dimensions {:?} exceed 8192 limit",
+                    image.size
+                ),
             );
             return;
         }
@@ -2444,6 +2453,11 @@ impl ZaloGuiApp {
                     }
                     match result {
                         Ok((path, w, h, image)) => {
+                            if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                                std::thread::spawn(move || {
+                                    let _ = std::fs::remove_file(old_path);
+                                });
+                            }
                             let texture = ctx.load_texture(
                                 "clipboard-preview",
                                 image,
@@ -2500,6 +2514,11 @@ impl ZaloGuiApp {
                         continue;
                     }
                     if let Some((path, w, h, image)) = image {
+                        if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_file(old_path);
+                            });
+                        }
                         self.clipboard_alternative_text =
                             self.clipboard_text_fallback.take().filter(|text| {
                                 self.settings.excel_paste_mode == "ask" && text.contains('\t')
@@ -3153,7 +3172,11 @@ impl ZaloGuiApp {
                     self.forward_msg = None;
                     self.forward_filter.clear();
                     self.clipboard_read_pending = false;
-                    self.pending_clipboard_image = None;
+                    if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                        std::thread::spawn(move || {
+                            let _ = std::fs::remove_file(old_path);
+                        });
+                    }
                     self.search_query.clear();
                     self.phone_lookup_result = None;
                     self.phone_modal_input.clear();
@@ -3224,7 +3247,11 @@ impl ZaloGuiApp {
                     self.forward_msg = None;
                     self.forward_filter.clear();
                     self.clipboard_read_pending = false;
-                    self.pending_clipboard_image = None;
+                    if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                        std::thread::spawn(move || {
+                            let _ = std::fs::remove_file(old_path);
+                        });
+                    }
                     self.search_query.clear();
                     self.phone_lookup_result = None;
                     self.phone_modal_input.clear();
@@ -4277,7 +4304,11 @@ impl ZaloGuiApp {
                     self.image_failures.remove(&key);
                     self.store_texture(ctx, key, image);
                 }
-                GuiEvent::StickerSpriteReady { key, sprite } => {
+                GuiEvent::StickerSpriteReady {
+                    key,
+                    sprite,
+                    permit,
+                } => {
                     self.loading_stickers.remove(&key);
                     self.image_retry_at.remove(&key);
                     self.image_failures.remove(&key);
@@ -4293,6 +4324,19 @@ impl ZaloGuiApp {
                                 delays,
                             },
                         );
+                    }
+                    drop(permit);
+                }
+                GuiEvent::E2eeRequirementResetResult {
+                    owner: _,
+                    peer_id,
+                    success,
+                } => {
+                    if success {
+                        self.trial_peers.remove(&peer_id);
+                        self.show_toast("Đã gỡ yêu cầu E2EE cho hội thoại này");
+                    } else {
+                        self.show_toast("Không thể gỡ yêu cầu E2EE: lỗi cập nhật cơ sở dữ liệu");
                     }
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {

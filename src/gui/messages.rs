@@ -206,17 +206,22 @@ pub(super) fn is_clipboard_paste_triggered(ctx: &egui::Context) -> bool {
 #[cfg(windows)]
 pub(super) fn finalize_clipboard_rgba_image(
     rgba: image::RgbaImage,
+    owner: Option<&str>,
 ) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
         return None;
     }
-    let _ = std::fs::create_dir_all(crate::storage::cache_dir());
+    let target_dir = match owner.filter(|s| !s.is_empty()) {
+        Some(o) => crate::storage::account_temp_dir(o),
+        None => crate::storage::root().join("temp"),
+    };
+    let _ = crate::storage::private_dir(&target_dir);
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let path = crate::storage::cache_dir().join(format!("clipboard_{now_ms}.png"));
+    let path = target_dir.join(format!("clipboard_{now_ms}.png"));
     rgba.save(&path).ok()?;
 
     let thumb = if width > 240 || height > 240 {
@@ -264,16 +269,18 @@ pub(super) fn clipboard_has_image() -> bool {
 /// 2. `CF_HDROP` (`15`) copied image files from Windows Explorer or ShareX
 /// 3. `CF_DIB` (`8`) / `CF_DIBV5` (`17`) 24-bit & 32-bit bitmaps (`BI_RGB` & `BI_BITFIELDS`)
 pub(super) fn read_clipboard_image_to_png(
+    owner: Option<&str>,
 ) -> Option<(std::path::PathBuf, u32, u32, egui::ColorImage)> {
     crate::crash_report::phase("clipboard-copy");
     #[cfg(windows)]
     {
         let rgba = crate::clipboard_image::read_windows().ok()??;
         crate::crash_report::phase("clipboard-preview");
-        finalize_clipboard_rgba_image(rgba)
+        finalize_clipboard_rgba_image(rgba, owner)
     }
     #[cfg(not(windows))]
     {
+        let _ = owner;
         None
     }
 }

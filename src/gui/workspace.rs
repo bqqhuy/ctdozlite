@@ -3428,8 +3428,12 @@ impl ZaloGuiApp {
                             });
                         }
                         if clear_clip {
-                            self.pending_clipboard_image = None;
-                            self.clipboard_alternative_text=None;
+                            if let Some((path, _, _, _)) = self.pending_clipboard_image.take() {
+                                std::thread::spawn(move || {
+                                    let _ = std::fs::remove_file(path);
+                                });
+                            }
+                            self.clipboard_alternative_text = None;
                         }
                     }
 
@@ -5937,13 +5941,16 @@ impl ZaloGuiApp {
                                 .clicked()
                             {
                                 if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::ResetE2eeRequirement {
-                                        owner: self.user_uin.clone(),
-                                        peer_id: d_id.to_string(),
-                                    });
+                                    if tx
+                                        .send(WorkerCmd::ResetE2eeRequirement {
+                                            owner: self.user_uin.clone(),
+                                            peer_id: d_id.to_string(),
+                                        })
+                                        .is_ok()
+                                    {
+                                        self.show_toast("Đang gỡ yêu cầu E2EE…");
+                                    }
                                 }
-                                self.trial_peers.remove(d_id);
-                                self.show_toast("Đã gỡ yêu cầu E2EE cho hội thoại này");
                             }
                         }
                         let current_ttl = self

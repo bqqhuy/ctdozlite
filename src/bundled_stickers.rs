@@ -266,8 +266,16 @@ mod tests {
             let frame_width = sprite.image.size[0] / sprite.frames as usize;
             assert!(frame_width > 0);
             assert!(sprite.image.size[1] > 0);
-            assert!(sprite.image.size[0] <= 8192, "Sprite width {} exceeds 8192", sprite.image.size[0]);
-            assert!(sprite.image.size[1] <= 8192, "Sprite height {} exceeds 8192", sprite.image.size[1]);
+            assert!(
+                sprite.image.size[0] <= 8192,
+                "Sprite width {} exceeds 8192",
+                sprite.image.size[0]
+            );
+            assert!(
+                sprite.image.size[1] <= 8192,
+                "Sprite height {} exceeds 8192",
+                sprite.image.size[1]
+            );
         }
     }
     #[tokio::test]
