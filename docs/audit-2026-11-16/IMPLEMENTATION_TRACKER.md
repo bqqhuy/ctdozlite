@@ -119,6 +119,27 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 | `python -I scripts/tests/test_audit_prepush.py` | 4 OK | Pass toàn bộ regex & audit checks |
 | `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
 
+## Phase 4 — Dọn dẹp, hoàn thiện & kiểm chứng (Low / Cleanup)
+
+| ID | Mức | Trạng thái | Commit | Kiểm chứng | Native / official | Ghi chú & Rủi ro còn lại |
+|---|---|---|---|---|---|---|
+| Cleanup `rand_core` | Low | Đóng (code/fixture) | `40eeafa` | Loại bỏ crate `rand_core` khỏi `Cargo.toml` và `Cargo.lock` | — | Zero caller trong codebase; hoàn tất dọn dẹp dependency rác |
+| M-04 Refactor | Low | Đóng (code/fixture) | `40eeafa` | `zalo_rust::gui::is_status_error` helper + test ma trận phân loại lỗi | — | Tách hàm phân loại lỗi rõ ràng, gắn kết trực tiếp giữa test và production code |
+| Logger FIFO Test | Low | Đóng (code/fixture) | `40eeafa` | Test 505 entries đẩy eviction ring-buffer `VecDeque::pop_front` | — | Kiểm chứng xác thực eviction 5 bản ghi đầu tiên ở ngưỡng 500 entries |
+
+## Cổng Phase 4 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
+
+| Lệnh | Kết quả | Ghi chú |
+|---|---|---|
+| `cargo fmt --all -- --check` | exit 0 | Clean format |
+| `cargo check --locked --all-targets` | exit 0 | 0 error, 0 warning |
+| `cargo clippy --all-targets --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | exit 0 | 0 warning |
+| `cargo test --locked --no-fail-fast` | 926 passed, 0 failed, 13 ignored | 16 test binaries pass sạch |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | 929 passed, 0 failed, 13 ignored | 16 test binaries pass sạch |
+| `python -I scripts/tests/test_audit_prepush.py` | 4 OK | Pass toàn bộ regex & audit checks |
+| `powershell scripts/audit-prepush.ps1` | CHECKED=7, HEURISTIC=1, SKIPPED=1 | All hard gates passed |
+
 ## Cổng Phase 1 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
 
 | Lệnh | Kết quả | Ghi chú |
