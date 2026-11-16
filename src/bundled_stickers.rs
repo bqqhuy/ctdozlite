@@ -182,10 +182,8 @@ pub fn decode_gif_sprite(id: u64) -> Option<crate::gui::DecodedSpriteData> {
         })
         .collect();
 
-    let image = eframe::egui::ColorImage::from_rgba_unmultiplied(
-        [total_width, height],
-        &stitched_pixels,
-    );
+    let image =
+        eframe::egui::ColorImage::from_rgba_unmultiplied([total_width, height], &stitched_pixels);
 
     Some(crate::gui::DecodedSpriteData {
         image,

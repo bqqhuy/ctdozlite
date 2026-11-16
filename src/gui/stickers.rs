@@ -1350,13 +1350,16 @@ impl ZaloGuiApp {
                                             Vec2::splat(44.0),
                                         );
                                         if let Some(tex) = self.sticker_textures.get(&icon_key) {
+                                            let uv = if let Some(sp) = self.sticker_sprites.get(&icon_key) {
+                                                let f = sp.frames.max(1) as f32;
+                                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0 / f, 1.0))
+                                            } else {
+                                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+                                            };
                                             ui.painter().image(
                                                 tex.id(),
                                                 ic_rect,
-                                                Rect::from_min_max(
-                                                    Pos2::ZERO,
-                                                    Pos2::new(1.0, 1.0),
-                                                ),
+                                                uv,
                                                 Color32::WHITE,
                                             );
                                         } else {
@@ -1597,12 +1600,46 @@ impl ZaloGuiApp {
 
                         if let Some(tex) = self.sticker_textures.get(&key) {
                             let img_rect = cell_rect.shrink(4.0);
-                            ui.painter().image(
-                                tex.id(),
-                                img_rect,
-                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                Color32::WHITE,
-                            );
+                            let uv = if let Some(sp) = self.sticker_sprites.get(&key) {
+                                if cell_resp.hovered() && sp.frames > 1 && !sp.delays.is_empty() {
+                                    let total_ms = sp
+                                        .delays
+                                        .iter()
+                                        .map(|d| d.as_millis())
+                                        .sum::<u128>()
+                                        .max(1);
+                                    let time_now = ui.input(|i| i.time);
+                                    let elapsed_ms = (time_now * 1000.0) as u128 % total_ms;
+                                    let mut acc = 0u128;
+                                    let mut frame_idx = 0;
+                                    let mut rem_dur = std::time::Duration::from_millis(80);
+                                    for (i, d) in sp.delays.iter().enumerate() {
+                                        let d_ms = d.as_millis();
+                                        if elapsed_ms >= acc && elapsed_ms < acc + d_ms {
+                                            frame_idx = i;
+                                            rem_dur = std::time::Duration::from_millis(
+                                                (acc + d_ms - elapsed_ms) as u64,
+                                            );
+                                            break;
+                                        }
+                                        acc += d_ms;
+                                    }
+                                    ui.ctx().request_repaint_after(
+                                        rem_dur.max(std::time::Duration::from_millis(16)),
+                                    );
+                                    let f = sp.frames as f32;
+                                    Rect::from_min_max(
+                                        Pos2::new(frame_idx as f32 / f, 0.0),
+                                        Pos2::new((frame_idx + 1) as f32 / f, 1.0),
+                                    )
+                                } else {
+                                    let f = sp.frames.max(1) as f32;
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0 / f, 1.0))
+                                }
+                            } else {
+                                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+                            };
+                            ui.painter().image(tex.id(), img_rect, uv, Color32::WHITE);
                         } else {
                             ui.painter().text(
                                 cell_rect.center(),
@@ -1891,7 +1928,12 @@ impl ZaloGuiApp {
 
                                             if let Some(tex) = self.sticker_textures.get(&key) {
                                                 let [tw, th] = tex.size();
-                                                let tw_f = (tw.max(1)) as f32;
+                                                let frames = self
+                                                    .sticker_sprites
+                                                    .get(&key)
+                                                    .map(|s| s.frames.max(1))
+                                                    .unwrap_or(1);
+                                                let frame_w = (tw.max(1) as f32) / frames as f32;
                                                 let th_f = (th.max(1)) as f32;
                                                 let box_side = if hovered || is_kb_sel {
                                                     58.0_f32
@@ -1899,20 +1941,47 @@ impl ZaloGuiApp {
                                                     54.0_f32
                                                 };
                                                 let scale =
-                                                    (box_side / tw_f).min(box_side / th_f);
+                                                    (box_side / frame_w).min(box_side / th_f);
                                                 let draw_size =
-                                                    Vec2::new(tw_f * scale, th_f * scale);
+                                                    Vec2::new(frame_w * scale, th_f * scale);
                                                 let img_rect = Rect::from_center_size(
                                                     cell_rect.center(),
                                                     draw_size,
                                                 );
+                                                let uv = if let Some(sp) = self.sticker_sprites.get(&key) {
+                                                    if (hovered || is_kb_sel) && sp.frames > 1 && !sp.delays.is_empty() {
+                                                        let total_ms = sp.delays.iter().map(|d| d.as_millis()).sum::<u128>().max(1);
+                                                        let time_now = ui.input(|i| i.time);
+                                                        let elapsed_ms = (time_now * 1000.0) as u128 % total_ms;
+                                                        let mut acc = 0u128;
+                                                        let mut frame_idx = 0;
+                                                        let mut rem_dur = std::time::Duration::from_millis(80);
+                                                        for (i, d) in sp.delays.iter().enumerate() {
+                                                            let d_ms = d.as_millis();
+                                                            if elapsed_ms >= acc && elapsed_ms < acc + d_ms {
+                                                                frame_idx = i;
+                                                                rem_dur = std::time::Duration::from_millis((acc + d_ms - elapsed_ms) as u64);
+                                                                break;
+                                                            }
+                                                            acc += d_ms;
+                                                        }
+                                                        ui.ctx().request_repaint_after(rem_dur.max(std::time::Duration::from_millis(16)));
+                                                        let f = sp.frames as f32;
+                                                        Rect::from_min_max(
+                                                            Pos2::new(frame_idx as f32 / f, 0.0),
+                                                            Pos2::new((frame_idx + 1) as f32 / f, 1.0),
+                                                        )
+                                                    } else {
+                                                        let f = sp.frames.max(1) as f32;
+                                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0 / f, 1.0))
+                                                    }
+                                                } else {
+                                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+                                                };
                                                 ui.painter().image(
                                                     tex.id(),
                                                     img_rect,
-                                                    Rect::from_min_max(
-                                                        Pos2::ZERO,
-                                                        Pos2::new(1.0, 1.0),
-                                                    ),
+                                                    uv,
                                                     Color32::WHITE,
                                                 );
                                             } else {

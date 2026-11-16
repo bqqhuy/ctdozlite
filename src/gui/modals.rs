@@ -1383,6 +1383,13 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.suggest_stickers_while_typing, pal);
                                                         });
                                                     });
+                                                    ui.separator();
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(crate::i18n::tr("Hiệu ứng nhãn dán động (Sprite Sheet Zalo)")).color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.enable_animated_stickers, pal);
+                                                        });
+                                                    });
                                                 });
                                             ui.add_space(16.0);
 

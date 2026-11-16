@@ -119,9 +119,16 @@ pub const ZALO_SPRITE_FRAME_DELAY: std::time::Duration = std::time::Duration::fr
 
 #[derive(Clone, Debug)]
 pub struct DecodedSpriteData {
-    pub image: egui::ColorImage, // Dải ngang chứa 1 hoặc nhiều frame
-    pub frames: u16,             // Số frame (width / height)
+    pub image: egui::ColorImage,          // Dải ngang chứa 1 hoặc nhiều frame
+    pub frames: u16,                      // Số frame (width / height)
     pub delays: Vec<std::time::Duration>, // Thời gian hiển thị từng frame
+}
+
+#[derive(Clone)]
+pub struct StickerSprite {
+    pub texture: egui::TextureHandle,
+    pub frames: u16,
+    pub delays: Vec<std::time::Duration>,
 }
 
 pub enum GuiEvent {
@@ -794,6 +801,7 @@ struct AppSettings {
     suggest_mentions: bool,
     enable_gif_search: bool,
     enable_sticker_keyword_search: bool,
+    pub enable_animated_stickers: bool,
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
     selected_camera_device: String,
@@ -848,6 +856,7 @@ impl Default for AppSettings {
             suggest_mentions: true,
             enable_gif_search: true,
             enable_sticker_keyword_search: true,
+            enable_animated_stickers: true,
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
             ai_translation_consent: false,
@@ -1077,6 +1086,7 @@ pub struct ZaloGuiApp {
     sticker_picker_open: bool,
     sticker_tab: StickerTab,
     sticker_textures: HashMap<String, TextureHandle>,
+    pub sticker_sprites: HashMap<String, StickerSprite>,
     texture_budget: crate::media_resources::ResourceLru,
     loading_stickers: HashSet<String>,
     update_offer: Option<crate::updater::ReleaseUpdate>,
@@ -1387,6 +1397,7 @@ impl ZaloGuiApp {
             sticker_picker_open: false,
             sticker_tab: StickerTab::Popular,
             sticker_textures: HashMap::new(),
+            sticker_sprites: HashMap::new(),
             texture_budget: crate::media_resources::ResourceLru::new(
                 crate::media_resources::TEXTURE_BUDGET,
             ),
@@ -2121,6 +2132,7 @@ impl ZaloGuiApp {
         }
         for evicted in self.texture_budget.insert(key.clone(), bytes) {
             self.sticker_textures.remove(&evicted);
+            self.sticker_sprites.remove(&evicted);
         }
         if let Some(texture) = self.sticker_textures.get_mut(&key) {
             texture.set(image, TextureOptions::LINEAR);
@@ -2539,6 +2551,7 @@ impl ZaloGuiApp {
                         self.show_hidden_conversations = false;
                         self.clear_history_confirmation = None;
                         self.sticker_textures.clear();
+                        self.sticker_sprites.clear();
                         self.texture_budget = crate::media_resources::ResourceLru::new(
                             crate::media_resources::TEXTURE_BUDGET,
                         );
@@ -3150,6 +3163,7 @@ impl ZaloGuiApp {
                     self.show_hidden_conversations = false;
                     self.clear_history_confirmation = None;
                     self.sticker_textures.clear();
+                    self.sticker_sprites.clear();
                     self.texture_budget = crate::media_resources::ResourceLru::new(
                         crate::media_resources::TEXTURE_BUDGET,
                     );
@@ -3220,6 +3234,7 @@ impl ZaloGuiApp {
                     self.show_hidden_conversations = false;
                     self.clear_history_confirmation = None;
                     self.sticker_textures.clear();
+                    self.sticker_sprites.clear();
                     self.texture_budget = crate::media_resources::ResourceLru::new(
                         crate::media_resources::TEXTURE_BUDGET,
                     );
@@ -4259,7 +4274,19 @@ impl ZaloGuiApp {
                     self.loading_stickers.remove(&key);
                     self.image_retry_at.remove(&key);
                     self.image_failures.remove(&key);
-                    self.store_texture(ctx, key, sprite.image);
+                    let frames = sprite.frames;
+                    let delays = sprite.delays;
+                    self.store_texture(ctx, key.clone(), sprite.image);
+                    if let Some(tex) = self.sticker_textures.get(&key) {
+                        self.sticker_sprites.insert(
+                            key,
+                            StickerSprite {
+                                texture: tex.clone(),
+                                frames,
+                                delays,
+                            },
+                        );
+                    }
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;

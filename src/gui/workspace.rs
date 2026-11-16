@@ -2710,8 +2710,10 @@ impl ZaloGuiApp {
                                                         sender_ava_opt,
                                                         pal,
                                                         &self.sticker_textures,
+                                                        &self.sticker_sprites,
                                                         &mut self.loading_stickers,
                                                         &self.emoji_textures,
+                                                        self.settings.enable_animated_stickers,
                                                         idx,
                                                     ) {
                                                         pending_action = Some((idx, action));

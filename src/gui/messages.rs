@@ -31,7 +31,9 @@ pub(super) fn render_sticker_widget(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     sticker_textures: &HashMap<String, TextureHandle>,
+    sticker_sprites: &HashMap<String, crate::gui::StickerSprite>,
     loading_stickers: &mut HashSet<String>,
+    animated: bool,
 ) -> bool {
     let Some((sid, cid)) = is_sticker_message(msg) else {
         return false;
@@ -56,8 +58,52 @@ pub(super) fn render_sticker_widget(
         }
     }
 
-    if let Some(tex) = sticker_textures.get(&key) {
-        ui.image((tex.id(), Vec2::new(116.0, 116.0)));
+    let size = Vec2::new(116.0, 116.0);
+    if let Some(sprite) = sticker_sprites.get(&key) {
+        if animated && sprite.frames > 1 && !sprite.delays.is_empty() {
+            let total_duration_ms: u128 = sprite.delays.iter().map(|d| d.as_millis()).sum();
+            if total_duration_ms > 0 {
+                let time_now = ui.input(|i| i.time);
+                let elapsed_ms = (time_now * 1000.0) as u128 % total_duration_ms;
+                let mut acc_ms = 0u128;
+                let mut current_frame = 0usize;
+                let mut time_until_next = std::time::Duration::from_millis(80);
+
+                for (idx, delay) in sprite.delays.iter().enumerate() {
+                    let d_ms = delay.as_millis();
+                    if elapsed_ms >= acc_ms && elapsed_ms < acc_ms + d_ms {
+                        current_frame = idx;
+                        let rem_ms = (acc_ms + d_ms).saturating_sub(elapsed_ms);
+                        time_until_next = std::time::Duration::from_millis(rem_ms as u64)
+                            .max(std::time::Duration::from_millis(16));
+                        break;
+                    }
+                    acc_ms += d_ms;
+                }
+
+                let frames = sprite.frames as f32;
+                let u0 = current_frame as f32 / frames;
+                let u1 = (current_frame + 1) as f32 / frames;
+                let uv = egui::Rect::from_min_max(egui::pos2(u0, 0.0), egui::pos2(u1, 1.0));
+
+                let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+                ui.painter()
+                    .image(sprite.texture.id(), rect, uv, egui::Color32::WHITE);
+                if ui.is_rect_visible(rect) {
+                    ui.ctx().request_repaint_after(time_until_next);
+                }
+                return true;
+            }
+        }
+        let u0 = 0.0;
+        let u1 = 1.0 / sprite.frames.max(1) as f32;
+        let uv = egui::Rect::from_min_max(egui::pos2(u0, 0.0), egui::pos2(u1, 1.0));
+        let (rect, _resp) = ui.allocate_exact_size(size, egui::Sense::hover());
+        ui.painter()
+            .image(sprite.texture.id(), rect, uv, egui::Color32::WHITE);
+        true
+    } else if let Some(tex) = sticker_textures.get(&key) {
+        ui.image((tex.id(), size));
         true
     } else {
         false
@@ -981,8 +1027,10 @@ pub(super) fn render_chat_bubble(
     sender_avatar: Option<&str>,
     pal: &ThemePalette,
     sticker_textures: &HashMap<String, TextureHandle>,
+    sticker_sprites: &HashMap<String, crate::gui::StickerSprite>,
     loading_stickers: &mut HashSet<String>,
     emoji_textures: &HashMap<String, TextureHandle>,
+    animated_stickers: bool,
     _idx: usize,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
@@ -1238,7 +1286,14 @@ pub(super) fn render_chat_bubble(
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             quote_action = render_quote_block(ui, msg, pal, true, content_width);
-                            if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers) {
+                            if !render_sticker_widget(
+                                ui,
+                                msg,
+                                sticker_textures,
+                                sticker_sprites,
+                                loading_stickers,
+                                animated_stickers,
+                            ) {
                                 card_action = render_message_body(
                                     ui,
                                     msg,
@@ -1405,7 +1460,14 @@ pub(super) fn render_chat_bubble(
                                 ui.add_space(2.0);
                             }
                             quote_action = render_quote_block(ui, msg, pal, false, content_width);
-                            if !render_sticker_widget(ui, msg, sticker_textures, loading_stickers) {
+                            if !render_sticker_widget(
+                                ui,
+                                msg,
+                                sticker_textures,
+                                sticker_sprites,
+                                loading_stickers,
+                                animated_stickers,
+                            ) {
                                 card_action = render_message_body(
                                     ui,
                                     msg,
@@ -2231,8 +2293,10 @@ mod quote_navigation_tests {
                                 None,
                                 &ThemePalette::light(),
                                 &HashMap::new(),
+                                &HashMap::new(),
                                 &mut HashSet::new(),
                                 &HashMap::new(),
+                                true,
                                 0,
                             );
                         });
@@ -2411,6 +2475,7 @@ mod media_visibility_tests {
             ..Default::default()
         };
         let textures = HashMap::new();
+        let sprites = HashMap::new();
         let mut loading = HashSet::new();
         let input = || egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
@@ -2419,7 +2484,7 @@ mod media_visibility_tests {
         let _ = ctx.run(input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.add_space(2000.0);
-                render_sticker_widget(ui, &msg, &textures, &mut loading);
+                render_sticker_widget(ui, &msg, &textures, &sprites, &mut loading, true);
             });
         });
         assert!(
@@ -2428,10 +2493,63 @@ mod media_visibility_tests {
         );
         let _ = ctx.run(input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                render_sticker_widget(ui, &msg, &textures, &mut loading);
+                render_sticker_widget(ui, &msg, &textures, &sprites, &mut loading, true);
             });
         });
         assert!(loading.contains("stk_0_1"));
+    }
+
+    #[test]
+    fn animated_sticker_renders_uv_and_requests_repaint() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            sticker_id: Some(1001),
+            sticker_cate_id: Some(61900),
+            ..Default::default()
+        };
+        let textures = HashMap::new();
+        let mut sprites = HashMap::new();
+        let mut loading = HashSet::new();
+
+        let tex = ctx.load_texture(
+            "stk_61900_1001",
+            egui::ColorImage::new([300, 100], Color32::WHITE),
+            Default::default(),
+        );
+        sprites.insert(
+            "stk_61900_1001".to_string(),
+            crate::gui::StickerSprite {
+                texture: tex,
+                frames: 3,
+                delays: vec![
+                    std::time::Duration::from_millis(80),
+                    std::time::Duration::from_millis(80),
+                    std::time::Duration::from_millis(80),
+                ],
+            },
+        );
+
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 400.0))),
+            time: Some(0.04), // 40ms -> frame 0
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rendered =
+                    render_sticker_widget(ui, &msg, &textures, &sprites, &mut loading, true);
+                assert!(rendered);
+            });
+        });
+
+        // Test with animation disabled
+        let _ = ctx.run(input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let rendered =
+                    render_sticker_widget(ui, &msg, &textures, &sprites, &mut loading, false);
+                assert!(rendered);
+            });
+        });
     }
 }
 
