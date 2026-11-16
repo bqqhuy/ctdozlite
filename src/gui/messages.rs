@@ -903,6 +903,66 @@ pub(super) fn render_message_body(
     body_action
 }
 
+/// Calculate clustered corner rounding based on group proximity and message direction.
+pub(super) fn clustered_bubble_rounding(
+    is_outgoing: bool,
+    prev_same_sender: bool,
+    next_same_sender: bool,
+    frameless: bool,
+) -> Rounding {
+    if frameless {
+        return Rounding::ZERO;
+    }
+    match (is_outgoing, prev_same_sender, next_same_sender) {
+        // Standalone message (isolated): round all 4 corners 12px
+        (_, false, false) => Rounding::same(12.0),
+        // Outgoing cluster (sender on right):
+        // First in cluster: bottom-right (se) is sharp (4px)
+        (true, false, true) => Rounding {
+            nw: 12.0,
+            ne: 12.0,
+            se: 4.0,
+            sw: 12.0,
+        },
+        // Middle in cluster: top-right (ne) and bottom-right (se) are sharp (4px)
+        (true, true, true) => Rounding {
+            nw: 12.0,
+            ne: 4.0,
+            se: 4.0,
+            sw: 12.0,
+        },
+        // Last in cluster: top-right (ne) is sharp (4px), bottom-right (se) is rounded (12px)
+        (true, true, false) => Rounding {
+            nw: 12.0,
+            ne: 4.0,
+            se: 12.0,
+            sw: 12.0,
+        },
+        // Incoming cluster (sender on left):
+        // First in cluster: bottom-left (sw) is sharp (4px)
+        (false, false, true) => Rounding {
+            nw: 12.0,
+            ne: 12.0,
+            se: 12.0,
+            sw: 4.0,
+        },
+        // Middle in cluster: top-left (nw) and bottom-left (sw) are sharp (4px)
+        (false, true, true) => Rounding {
+            nw: 4.0,
+            ne: 12.0,
+            se: 12.0,
+            sw: 4.0,
+        },
+        // Last in cluster: top-left (nw) is sharp (4px), bottom-left (sw) is rounded (12px)
+        (false, true, false) => Rounding {
+            nw: 4.0,
+            ne: 12.0,
+            se: 12.0,
+            sw: 12.0,
+        },
+    }
+}
+
 // Rendering arguments describe one immediate-mode paint operation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_chat_bubble(
@@ -1091,11 +1151,7 @@ pub(super) fn render_chat_bubble(
         } else {
             0.0_f32
         };
-        let ts_min_w = if show_timestamp && is_latest_outgoing && msg.is_outgoing {
-            96.0_f32
-        } else {
-            44.0_f32
-        };
+        let ts_min_w = if show_timestamp { 48.0_f32 } else { 0.0_f32 };
         text_w
             .max(quote_w)
             .max(sender_w)
@@ -1160,7 +1216,12 @@ pub(super) fn render_chat_bubble(
                 } else {
                     Stroke::new(1.0_f32, Color32::from_rgb(53, 76, 104))
                 };
-                let rounding = Rounding::same(8.0);
+                let rounding = clustered_bubble_rounding(
+                    true,
+                    prev_same_sender,
+                    next_same_sender,
+                    has_sticker || is_frameless_photo,
+                );
 
                 let mut card_action = None;
                 let mut quote_action = None;
@@ -1189,9 +1250,6 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                 );
                             }
-                            if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
-                                card_action = Some(action);
-                            }
                             if let Some(job) = &msg.outgoing_job {
                                 if msg.delivery == crate::message_model::DeliveryState::Failed {
                                     ui.horizontal(|ui| {
@@ -1215,46 +1273,67 @@ pub(super) fn render_chat_bubble(
                                 }
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
-                                let ts_txt = if is_latest_outgoing {
-                                    match msg.delivery {
-                                        crate::message_model::DeliveryState::ServerAccepted => {
-                                            format!("{} · Đã gửi", msg.display_time())
-                                        }
-                                        crate::message_model::DeliveryState::Delivered => {
-                                            format!("{} · Đã nhận", msg.display_time())
-                                        }
-                                        crate::message_model::DeliveryState::Read => {
-                                            format!("{} · Đã xem", msg.display_time())
-                                        }
-                                        crate::message_model::DeliveryState::Pending => {
-                                            format!("{} · Đang gửi", msg.display_time())
-                                        }
-                                        crate::message_model::DeliveryState::Failed => {
-                                            format!("{} · Gửi lỗi", msg.display_time())
-                                        }
-                                        _ => msg.display_time(),
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    ui.label(
+                                        RichText::new(msg.display_time())
+                                            .size(11.0)
+                                            .color(pal.bubble_out_meta),
+                                    );
+                                    // WP16-3: E2EE lock badge
+                                    if msg.is_e2ee {
+                                        ui.label(RichText::new("🔒").size(10.0));
                                     }
-                                } else {
-                                    msg.display_time()
-                                };
-                                ui.label(
-                                    RichText::new(ts_txt).size(11.0).color(pal.bubble_out_meta),
-                                );
-                                // WP16-3: E2EE lock badge
-                                if msg.is_e2ee {
-                                    ui.label(RichText::new("🔒").size(11.0));
-                                }
+                                });
+                            }
+                            if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
+                                card_action = Some(action);
                             }
                         });
                     });
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(Id::new(("bubble_rect", &msg.id, msg.ts)), fr.response.rect)
+                });
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::DoubleClickReply);
                 }
                 quote_action.or(card_action)
             });
 
-            row_resp.inner
+            let inner_action = row_resp.inner;
+
+            // Separate Delivery/Read Status (outside below last outgoing bubble, right-aligned)
+            if is_latest_outgoing {
+                let status_text = match msg.delivery {
+                    crate::message_model::DeliveryState::ServerAccepted => "✓ Đã gửi",
+                    crate::message_model::DeliveryState::Delivered => "✓ Đã nhận",
+                    crate::message_model::DeliveryState::Read => "✓✓ Đã xem",
+                    crate::message_model::DeliveryState::Pending => "Đang gửi…",
+                    crate::message_model::DeliveryState::Failed => "⚠ Gửi lỗi",
+                    _ => "",
+                };
+                if !status_text.is_empty() {
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.add_space(10.0);
+                            let status_color = if msg.delivery
+                                == crate::message_model::DeliveryState::Read
+                            {
+                                pal.primary
+                            } else if msg.delivery == crate::message_model::DeliveryState::Failed {
+                                Color32::from_rgb(220, 60, 60)
+                            } else {
+                                pal.text_muted
+                            };
+                            ui.label(RichText::new(status_text).size(10.5).color(status_color));
+                        });
+                    });
+                }
+            }
+
+            inner_action
         });
         out_resp.inner
     } else {
@@ -1293,7 +1372,12 @@ pub(super) fn render_chat_bubble(
             } else {
                 Stroke::new(1.0_f32, pal.bubble_in_border)
             };
-            let rounding = Rounding::same(8.0);
+            let rounding = clustered_bubble_rounding(
+                false,
+                prev_same_sender,
+                next_same_sender,
+                has_sticker || is_frameless_photo,
+            );
 
             ui.vertical(|ui| {
                 ui.set_max_width(total_bubble_w);
@@ -1333,9 +1417,6 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                 );
                             }
-                            if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
-                                card_action = Some(action);
-                            }
                             if let Some(job) = &msg.outgoing_job {
                                 if msg.delivery == crate::message_model::DeliveryState::Failed {
                                     ui.horizontal(|ui| {
@@ -1359,19 +1440,28 @@ pub(super) fn render_chat_bubble(
                                 }
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
-                                ui.add_space(3.5);
-                                ui.label(
-                                    RichText::new(msg.display_time())
-                                        .color(pal.bubble_in_meta)
-                                        .size(11.0),
-                                );
-                                // WP16-3: E2EE lock badge
-                                if msg.is_e2ee {
-                                    ui.label(RichText::new("🔒").size(11.0));
-                                }
+                                ui.add_space(3.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 3.0;
+                                    ui.label(
+                                        RichText::new(msg.display_time())
+                                            .color(pal.bubble_in_meta)
+                                            .size(11.0),
+                                    );
+                                    // WP16-3: E2EE lock badge
+                                    if msg.is_e2ee {
+                                        ui.label(RichText::new("🔒").size(10.0));
+                                    }
+                                });
+                            }
+                            if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
+                                card_action = Some(action);
                             }
                         });
                     });
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(Id::new(("bubble_rect", &msg.id, msg.ts)), fr.response.rect)
+                });
                 if fr.response.double_clicked() {
                     return Some(BubbleAction::DoubleClickReply);
                 }
@@ -1972,8 +2062,8 @@ pub(super) fn render_reactions(
     }
 
     let mut action = None;
-    ui.add_space(3.0);
-    ui.horizontal_wrapped(|ui| {
+    ui.add_space(2.0);
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
 
         if has_pin {
@@ -1985,7 +2075,7 @@ pub(super) fn render_reactions(
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!("{} Đã ghim", lucide::PIN))
-                            .size(11.0)
+                            .size(10.5)
                             .color(pal.primary)
                             .strong(),
                     );
@@ -2001,7 +2091,7 @@ pub(super) fn render_reactions(
                 .show(ui, |ui| {
                     ui.label(
                         RichText::new(format!("{} Đã lưu", lucide::STAR))
-                            .size(11.0)
+                            .size(10.5)
                             .color(Color32::from_rgb(234, 179, 8))
                             .strong(),
                     );
@@ -2009,38 +2099,77 @@ pub(super) fn render_reactions(
         }
 
         if has_react {
-            egui::Frame::none()
-                .fill(pal.bg_elevated)
-                .stroke(Stroke::new(1.0_f32, pal.border))
-                .rounding(Rounding::same(12.0))
-                .inner_margin(Margin::symmetric(6.0, 2.0))
-                .show(ui, |ui| {
-                    if ui.small_button("Xem người thả").clicked() {
-                        action = Some(BubbleAction::ShowReactors);
-                    }
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
-                        let reactions: Vec<(String, u64)> = if msg.reaction_summaries.is_empty() {
-                            msg.reactions.iter().map(|r| (r.clone(), 1)).collect()
-                        } else {
-                            msg.reaction_summaries
-                                .iter()
-                                .map(|r| (r.emoji.clone(), r.count))
-                                .collect()
-                        };
-                        for (r, count) in &reactions {
-                            let key = emoji_to_tex_key(r);
-                            if let Some(tex) = emoji_textures.get(key) {
-                                ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(18.0)));
-                            } else {
-                                ui.label(RichText::new(r).size(13.0));
+            let pill_bg = if pal.is_dark {
+                Color32::from_rgb(38, 42, 50)
+            } else {
+                Color32::WHITE
+            };
+
+            let (reactions, total_count): (Vec<(String, u64)>, u64) =
+                if msg.reaction_summaries.is_empty() {
+                    let list: Vec<(String, u64)> =
+                        msg.reactions.iter().map(|r| (r.clone(), 1)).collect();
+                    let total = list.len() as u64;
+                    (list, total)
+                } else {
+                    let total: u64 = msg.reaction_summaries.iter().map(|r| r.count).sum();
+                    let list: Vec<(String, u64)> = msg
+                        .reaction_summaries
+                        .iter()
+                        .map(|r| (r.emoji.clone(), r.count))
+                        .collect();
+                    (list, total)
+                };
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let pill_resp = egui::Frame::none()
+                    .fill(pill_bg)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(10.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, 1.0),
+                        blur: 4.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(25),
+                    })
+                    .inner_margin(Margin::symmetric(7.0, 2.5))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
+                            for (emoji_str, _) in reactions.iter().take(3) {
+                                let key = emoji_to_tex_key(emoji_str);
+                                if let Some(tex) = emoji_textures.get(key) {
+                                    ui.add(
+                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(14.0)),
+                                    );
+                                } else {
+                                    ui.label(RichText::new(emoji_str).size(12.0));
+                                }
                             }
-                            if *count > 1 {
-                                ui.small(count.to_string());
+                            if total_count > 1 {
+                                ui.label(
+                                    RichText::new(total_count.to_string())
+                                        .size(11.0)
+                                        .color(pal.text_primary)
+                                        .strong(),
+                                );
                             }
-                        }
+                        });
                     });
-                });
+
+                let interact = ui.interact(
+                    pill_resp.response.rect,
+                    pill_resp.response.id.with("click"),
+                    Sense::click(),
+                );
+                if interact
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(crate::i18n::tr("Xem người thả cảm xúc"))
+                    .clicked()
+                {
+                    action = Some(BubbleAction::ShowReactors);
+                }
+            });
         }
     });
     action
@@ -2413,17 +2542,34 @@ pub(super) fn hover_message_actions(
     }
     let key = Id::new(("hover_message", thread));
     let identity = (&msg.id, msg.ts);
-    let bar = egui::Rect::from_min_size(
-        rect.right_top() - Vec2::new(88.0, 0.0),
-        Vec2::new(88.0, 34.0),
-    );
+
+    let bubble_rect_opt = ui
+        .ctx()
+        .data(|d| d.get_temp::<egui::Rect>(Id::new(("bubble_rect", &msg.id, msg.ts))));
+
+    let bar_w = 124.0_f32;
+    let bar_h = 32.0_f32;
+    let bar_pos = match (bubble_rect_opt, msg.is_outgoing) {
+        (Some(b), true) => egui::pos2(
+            (b.left() - bar_w - 4.0).max(ui.clip_rect().left() + 4.0),
+            b.top(),
+        ),
+        (Some(b), false) => egui::pos2(
+            (b.right() + 4.0).min(ui.clip_rect().right() - bar_w - 4.0),
+            b.top(),
+        ),
+        (None, _) => egui::pos2(rect.right() - bar_w, rect.top()),
+    };
+    let bar = egui::Rect::from_min_size(bar_pos, Vec2::new(bar_w, bar_h));
+    let bubble_rect = bubble_rect_opt.unwrap_or(rect);
+
     let active = ui
         .ctx()
         .data(|d| d.get_temp::<(String, i64, egui::Rect)>(key));
     let pointer = ui.input(|i| i.pointer.hover_pos());
     let over_active_bar = active
         .as_ref()
-        .is_some_and(|(_, _, bar)| pointer.is_some_and(|p| bar.expand(3.0).contains(p)));
+        .is_some_and(|(_, _, bar)| pointer.is_some_and(|p| bar.expand(4.0).contains(p)));
     let this_active = active
         .as_ref()
         .is_some_and(|(id, ts, _)| (id, *ts) == (identity.0, identity.1));
@@ -2432,11 +2578,12 @@ pub(super) fn hover_message_actions(
         return None;
     }
     if !(this_active && popup_open)
-        && !pointer.is_some_and(|p| rect.contains(p))
+        && !pointer.is_some_and(|p| rect.contains(p) || bubble_rect.contains(p))
         && !(this_active
             && pointer.is_some_and(|p| {
-                rect.union(active.as_ref().map(|a| a.2).unwrap_or(bar))
-                    .expand(6.0)
+                rect.union(bubble_rect)
+                    .union(active.as_ref().map(|a| a.2).unwrap_or(bar))
+                    .expand(8.0)
                     .contains(p)
             }))
     {
@@ -2445,6 +2592,7 @@ pub(super) fn hover_message_actions(
     let mut action = None;
     let toolbar = egui::Area::new(Id::new(("hover_actions", thread, &msg.id, msg.ts)))
         .order(egui::Order::Foreground)
+        .default_size(Vec2::new(bar_w, bar_h))
         .fixed_pos(bar.left_top())
         .constrain_to(ui.clip_rect())
         .show(ui.ctx(), |ui| {
@@ -2459,7 +2607,7 @@ pub(super) fn hover_message_actions(
                                     let response = if let Some(tex) = emoji.get(key) {
                                         ui.add(egui::ImageButton::new(
                                             egui::Image::new(tex)
-                                                .fit_to_exact_size(Vec2::splat(24.0)),
+                                                .fit_to_exact_size(Vec2::splat(22.0)),
                                         ))
                                     } else {
                                         ui.button(code)
@@ -2472,7 +2620,8 @@ pub(super) fn hover_message_actions(
                             });
                         })
                         .response
-                        .on_hover_text("Thả cảm xúc");
+                        .on_hover_text(crate::i18n::tr("Thả cảm xúc"));
+
                         if ui
                             .button("↩")
                             .on_hover_text(crate::i18n::tr("Trả lời"))
@@ -2480,6 +2629,59 @@ pub(super) fn hover_message_actions(
                         {
                             action = Some(BubbleAction::Reply);
                         }
+
+                        if ui
+                            .button("↪")
+                            .on_hover_text(crate::i18n::tr("Chuyển tiếp"))
+                            .clicked()
+                        {
+                            action = Some(BubbleAction::Forward);
+                        }
+
+                        ui.menu_button("⋯", |ui| {
+                            ui.set_min_width(170.0);
+                            if ui.button(crate::i18n::tr("Ghim tin nhắn")).clicked() {
+                                action = Some(BubbleAction::PinOnServer);
+                                ui.close_menu();
+                            }
+                            let star_label = if msg.is_starred {
+                                crate::i18n::tr("Bỏ lưu tin nhắn")
+                            } else {
+                                crate::i18n::tr("Lưu tin nhắn")
+                            };
+                            if ui.button(star_label).clicked() {
+                                action = Some(BubbleAction::ToggleStar);
+                                ui.close_menu();
+                            }
+                            if ui.button(crate::i18n::tr("Tạo nhắc hẹn…")).clicked() {
+                                action = Some(BubbleAction::Reminder);
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if msg.is_outgoing
+                                && ui
+                                    .button(
+                                        RichText::new(crate::i18n::tr("Thu hồi"))
+                                            .color(Color32::from_rgb(249, 115, 22)),
+                                    )
+                                    .clicked()
+                            {
+                                action = Some(BubbleAction::RecallForEveryone);
+                                ui.close_menu();
+                            }
+                            if ui
+                                .button(
+                                    RichText::new(crate::i18n::tr("Xóa chỉ ở phía tôi"))
+                                        .color(Color32::from_rgb(220, 60, 60)),
+                                )
+                                .clicked()
+                            {
+                                action = Some(BubbleAction::DeleteForMe);
+                                ui.close_menu();
+                            }
+                        })
+                        .response
+                        .on_hover_text(crate::i18n::tr("Thêm"));
                     });
                 });
         });
@@ -2576,5 +2778,297 @@ mod hover_action_tests {
             }
         }
         assert!(matches!(result, Some(BubbleAction::React("👍"))));
+    }
+}
+
+#[cfg(test)]
+mod clustered_rounding_tests {
+    use super::*;
+
+    #[test]
+    fn test_clustered_bubble_rounding_standalone() {
+        let r_out = clustered_bubble_rounding(true, false, false, false);
+        assert_eq!(r_out, Rounding::same(12.0));
+
+        let r_in = clustered_bubble_rounding(false, false, false, false);
+        assert_eq!(r_in, Rounding::same(12.0));
+    }
+
+    #[test]
+    fn test_clustered_bubble_rounding_outgoing() {
+        // First in cluster
+        let r_first = clustered_bubble_rounding(true, false, true, false);
+        assert_eq!(
+            r_first,
+            Rounding {
+                nw: 12.0,
+                ne: 12.0,
+                se: 4.0,
+                sw: 12.0,
+            }
+        );
+
+        // Middle in cluster
+        let r_mid = clustered_bubble_rounding(true, true, true, false);
+        assert_eq!(
+            r_mid,
+            Rounding {
+                nw: 12.0,
+                ne: 4.0,
+                se: 4.0,
+                sw: 12.0,
+            }
+        );
+
+        // Last in cluster
+        let r_last = clustered_bubble_rounding(true, true, false, false);
+        assert_eq!(
+            r_last,
+            Rounding {
+                nw: 12.0,
+                ne: 4.0,
+                se: 12.0,
+                sw: 12.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_clustered_bubble_rounding_incoming() {
+        // First in cluster
+        let r_first = clustered_bubble_rounding(false, false, true, false);
+        assert_eq!(
+            r_first,
+            Rounding {
+                nw: 12.0,
+                ne: 12.0,
+                se: 12.0,
+                sw: 4.0,
+            }
+        );
+
+        // Middle in cluster
+        let r_mid = clustered_bubble_rounding(false, true, true, false);
+        assert_eq!(
+            r_mid,
+            Rounding {
+                nw: 4.0,
+                ne: 12.0,
+                se: 12.0,
+                sw: 4.0,
+            }
+        );
+
+        // Last in cluster
+        let r_last = clustered_bubble_rounding(false, true, false, false);
+        assert_eq!(
+            r_last,
+            Rounding {
+                nw: 4.0,
+                ne: 12.0,
+                se: 12.0,
+                sw: 12.0,
+            }
+        );
+    }
+
+    #[test]
+    fn test_clustered_bubble_rounding_frameless() {
+        let r_frameless = clustered_bubble_rounding(true, true, true, true);
+        assert_eq!(r_frameless, Rounding::ZERO);
+
+        let r_frameless_in = clustered_bubble_rounding(false, false, false, true);
+        assert_eq!(r_frameless_in, Rounding::ZERO);
+    }
+}
+
+#[cfg(test)]
+mod reaction_pill_tests {
+    use super::*;
+
+    #[test]
+    fn test_reaction_pill_click_triggers_show_reactors() {
+        let ctx = egui::Context::default();
+        let msg = ChatMessage {
+            id: "msg-with-reacts".into(),
+            text: "Hello with reaction".into(),
+            reactions: vec!["❤️".into(), "👍".into(), "❤️".into()],
+            reaction_summaries: vec![
+                crate::reactions::ReactionSummary {
+                    emoji: "❤️".into(),
+                    count: 2,
+                    ..Default::default()
+                },
+                crate::reactions::ReactionSummary {
+                    emoji: "👍".into(),
+                    count: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let pal = ThemePalette::light();
+        let mut clicked_action = None;
+        let mut click_pos = egui::pos2(380.0, 10.0);
+
+        for frame in 0..4 {
+            let mut events = vec![egui::Event::PointerMoved(click_pos)];
+            if frame == 1 {
+                events.push(egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                });
+            } else if frame == 2 {
+                events.push(egui::Event::PointerButton {
+                    pos: click_pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                });
+            }
+
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(400.0, 200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(act) = render_reactions(ui, &msg, &pal, &HashMap::new()) {
+                            clicked_action = Some(act);
+                        }
+                    });
+                },
+            );
+
+            // In frame 0, find the position of the reaction text shape to click exactly on it
+            if frame == 0 {
+                if let Some(shape_pos) = output.shapes.iter().find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.job.text.contains("❤️") => {
+                        Some(t.pos + t.galley.size() * 0.5)
+                    }
+                    _ => None,
+                }) {
+                    click_pos = shape_pos;
+                }
+            }
+        }
+
+        // Clicking the pill triggers ShowReactors
+        assert!(matches!(clicked_action, Some(BubbleAction::ShowReactors)));
+    }
+}
+
+#[cfg(test)]
+mod hover_action_position_tests {
+    use super::*;
+
+    #[test]
+    fn test_hover_actions_position_tight_to_bubble() {
+        let ctx = egui::Context::default();
+        let msg_out = ChatMessage {
+            id: "out-msg".into(),
+            text: "outgoing".into(),
+            ts: 101,
+            is_outgoing: true,
+            ..Default::default()
+        };
+        let msg_in = ChatMessage {
+            id: "in-msg".into(),
+            text: "incoming".into(),
+            ts: 102,
+            is_outgoing: false,
+            ..Default::default()
+        };
+
+        let row_rect = egui::Rect::from_min_size(egui::pos2(10.0, 100.0), Vec2::new(700.0, 60.0));
+        let bubble_out =
+            egui::Rect::from_min_size(egui::pos2(400.0, 100.0), Vec2::new(280.0, 50.0));
+        let bubble_in = egui::Rect::from_min_size(egui::pos2(50.0, 100.0), Vec2::new(280.0, 50.0));
+
+        // Test outgoing: hover bar should be to the left of the bubble
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                Id::new(("bubble_rect", &msg_out.id, msg_out.ts)),
+                bubble_out,
+            );
+        });
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                events: vec![egui::Event::PointerMoved(bubble_out.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = hover_message_actions(
+                        ui,
+                        row_rect,
+                        "thread_pos_out",
+                        &msg_out,
+                        &HashMap::new(),
+                    );
+                });
+            },
+        );
+
+        let active_out = ctx.data(|d| {
+            d.get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_pos_out")))
+        });
+        assert!(active_out.is_some());
+        let (_, _, bar_out) = active_out.unwrap();
+        // Should be positioned to the left of bubble_out
+        assert!(bar_out.right() <= bubble_out.left());
+
+        // Test incoming: hover bar should be to the right of the bubble
+        ctx.data_mut(|d| {
+            d.insert_temp(Id::new(("bubble_rect", &msg_in.id, msg_in.ts)), bubble_in);
+        });
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                events: vec![egui::Event::PointerMoved(bubble_in.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = hover_message_actions(
+                        ui,
+                        row_rect,
+                        "thread_pos_in",
+                        &msg_in,
+                        &HashMap::new(),
+                    );
+                });
+            },
+        );
+
+        let active_in = ctx.data(|d| {
+            d.get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_pos_in")))
+        });
+        assert!(active_in.is_some());
+        let (_, _, bar_in) = active_in.unwrap();
+        // Should be positioned to the right of bubble_in
+        assert!(
+            bar_in.left() >= bubble_in.right(),
+            "Expected bar_in.left() ({}) >= bubble_in.right() ({}), bar_in: {:?}",
+            bar_in.left(),
+            bubble_in.right(),
+            bar_in
+        );
     }
 }

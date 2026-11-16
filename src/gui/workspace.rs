@@ -171,7 +171,11 @@ impl ZaloGuiApp {
         let screen_w = screen_rect.width();
         let is_compact_w = screen_w < 780.0;
         let is_narrow_w = screen_w < 620.0;
-        let left_rail_w = if is_narrow_w { 54.0 } else { theme::NAV_RAIL_WIDTH };
+        let left_rail_w = if is_narrow_w {
+            54.0
+        } else {
+            theme::NAV_RAIL_WIDTH
+        };
 
         // -------------------------------------------------------------------
         // 1. LEFT NAVIGATION RAIL (Zalo PC Parity: #0068FF Light / #22262B Dark)
@@ -301,13 +305,24 @@ impl ZaloGuiApp {
                     // Red unread badge on top-right of chat icon
                     let total_unread: usize = self.unread_counts.values().sum();
                     if total_unread > 0 {
-                        let badge_w = if total_unread > 99 { 24.0 } else if total_unread > 9 { 18.0 } else { 16.0 };
+                        let badge_w = if total_unread > 99 {
+                            24.0
+                        } else if total_unread > 9 {
+                            18.0
+                        } else {
+                            16.0
+                        };
                         let badge_rect = Rect::from_center_size(
                             Pos2::new(nav1_rect.right() - 5.0, nav1_rect.top() + 5.0),
                             Vec2::new(badge_w, 14.0),
                         );
-                        ui.painter().rect_filled(badge_rect, Rounding::same(7.0), pal.danger);
-                        let badge_txt = if total_unread > 99 { "99+".to_string() } else { total_unread.to_string() };
+                        ui.painter()
+                            .rect_filled(badge_rect, Rounding::same(7.0), pal.danger);
+                        let badge_txt = if total_unread > 99 {
+                            "99+".to_string()
+                        } else {
+                            total_unread.to_string()
+                        };
                         ui.painter().text(
                             badge_rect.center(),
                             egui::Align2::CENTER_CENTER,

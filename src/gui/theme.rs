@@ -140,7 +140,7 @@ impl ThemePalette {
             bubble_in_border: Color32::from_rgb(50, 56, 64), // #323840 Gutter Border
             bubble_in_text: Color32::from_rgb(241, 245, 249), // #F1F5F9
             bubble_in_meta: Color32::from_rgb(148, 163, 184), // #94A3B8
-            bg_nav_rail: Color32::from_rgb(34, 38, 43), // #22262B Zalo Dark Base
+            bg_nav_rail: Color32::from_rgb(34, 38, 43),   // #22262B Zalo Dark Base
             nav_rail_fg: Color32::from_rgb(180, 188, 200),
             nav_rail_fg_active: Color32::from_rgb(0, 104, 255),
             nav_rail_item_hover: Color32::from_rgb(52, 58, 66),
