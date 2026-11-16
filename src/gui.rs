@@ -797,6 +797,27 @@ struct UiSmoke {
 type SidebarSortKey = (usize, bool, usize, i64, String);
 type SidebarOrderCache = (Vec<SidebarSortKey>, Vec<usize>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum MediaTab {
+    #[default]
+    Photos,
+    Files,
+    Links,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DrawerView {
+    #[default]
+    Overview,
+    Members,
+    Board,
+    MediaStorage {
+        tab: MediaTab,
+    },
+    SearchInThread,
+    SecuritySettings,
+}
+
 pub struct ZaloGuiApp {
     tools: tools_panel::ToolsPanel,
     history_search: search_panel::SearchPanel,
@@ -913,6 +934,8 @@ pub struct ZaloGuiApp {
     sidebar_order: Option<SidebarOrderCache>,
 
     info_drawer_open: bool,
+    pub drawer_view: DrawerView,
+    pub drawer_search_query: String,
     profile_menu_open: bool,
     sidebar_more_menu_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
@@ -1202,6 +1225,8 @@ impl ZaloGuiApp {
             sidebar_order: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
+            drawer_view: DrawerView::Overview,
+            drawer_search_query: String::new(),
             profile_menu_open: false,
             sidebar_more_menu_open: false,
             toast_notice: None,
@@ -7030,5 +7055,167 @@ mod audit_lock_tests {
         .unwrap();
         app.check_events(&ctx);
         assert!(!app.trusted_peers.contains("peer"));
+    }
+
+    #[test]
+    fn drawer_view_default_is_overview() {
+        let ctx = egui::Context::default();
+        let app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        assert_eq!(DrawerView::default(), DrawerView::Overview);
+        assert_eq!(MediaTab::default(), MediaTab::Photos);
+        assert_eq!(app.drawer_view, DrawerView::Overview);
+        assert!(app.drawer_search_query.is_empty());
+    }
+
+    #[test]
+    fn drawer_view_navigation_transitions() {
+        let mut view = DrawerView::Overview;
+        assert_eq!(view, DrawerView::Overview);
+
+        view = DrawerView::Members;
+        assert_eq!(view, DrawerView::Members);
+
+        view = DrawerView::Board;
+        assert_eq!(view, DrawerView::Board);
+
+        view = DrawerView::MediaStorage {
+            tab: MediaTab::Photos,
+        };
+        assert_eq!(
+            view,
+            DrawerView::MediaStorage {
+                tab: MediaTab::Photos
+            }
+        );
+
+        view = DrawerView::MediaStorage {
+            tab: MediaTab::Files,
+        };
+        assert_eq!(
+            view,
+            DrawerView::MediaStorage {
+                tab: MediaTab::Files
+            }
+        );
+
+        view = DrawerView::MediaStorage {
+            tab: MediaTab::Links,
+        };
+        assert_eq!(
+            view,
+            DrawerView::MediaStorage {
+                tab: MediaTab::Links
+            }
+        );
+
+        view = DrawerView::SearchInThread;
+        assert_eq!(view, DrawerView::SearchInThread);
+
+        view = DrawerView::SecuritySettings;
+        assert_eq!(view, DrawerView::SecuritySettings);
+
+        view = DrawerView::Overview;
+        assert_eq!(view, DrawerView::Overview);
+    }
+
+    #[test]
+    fn open_thread_resets_drawer_view_to_overview_and_clears_search() {
+        let ctx = egui::Context::default();
+        let thread_a = Thread {
+            id: "thread-a".into(),
+            name: "Hội thoại A".into(),
+            is_group: false,
+            ..Default::default()
+        };
+        let thread_b = Thread {
+            id: "thread-b".into(),
+            name: "Hội thoại B".into(),
+            is_group: false,
+            ..Default::default()
+        };
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread_a, thread_b],
+            false,
+        );
+
+        app.selected_thread_index = 0;
+        app.drawer_view = DrawerView::MediaStorage {
+            tab: MediaTab::Files,
+        };
+        app.drawer_search_query = "tài liệu kế toán".into();
+
+        // Switch to thread 1
+        app.open_thread(&ctx, 1, "thread-b".into(), false);
+
+        assert_eq!(app.selected_thread_index, 1);
+        assert_eq!(app.drawer_view, DrawerView::Overview);
+        assert!(app.drawer_search_query.is_empty());
+    }
+
+    #[test]
+    fn drawer_view_headless_render_smoke_test() {
+        let ctx = egui::Context::default();
+        let thread_msg = ChatMessage {
+            id: "msg-1".into(),
+            sender: "User".into(),
+            text: "Xin chào bạn".into(),
+            time: "10:30".into(),
+            is_outgoing: false,
+            ts: 1700000000000,
+            ..Default::default()
+        };
+        let thread_group = Thread {
+            id: "group-1".into(),
+            name: "Nhóm dự án".into(),
+            is_group: true,
+            messages: vec![thread_msg],
+            ..Default::default()
+        };
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread_group],
+            false,
+        );
+        app.is_logged_in = true;
+        app.info_drawer_open = true;
+
+        for view in [
+            DrawerView::Overview,
+            DrawerView::Members,
+            DrawerView::Board,
+            DrawerView::MediaStorage {
+                tab: MediaTab::Photos,
+            },
+            DrawerView::MediaStorage {
+                tab: MediaTab::Files,
+            },
+            DrawerView::MediaStorage {
+                tab: MediaTab::Links,
+            },
+            DrawerView::SearchInThread,
+            DrawerView::SecuritySettings,
+        ] {
+            app.drawer_view = view;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1024.0, 768.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    app.render_chat_workspace(ctx, &app.palette());
+                },
+            );
+        }
     }
 }

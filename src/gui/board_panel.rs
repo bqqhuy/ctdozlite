@@ -47,7 +47,7 @@ impl ZaloGuiApp {
             message: Box::new(message),
         });
     }
-    fn board_command(&mut self, action: crate::board::Action) {
+    pub(super) fn board_command(&mut self, action: crate::board::Action) {
         if self.server_board.pending {
             return;
         }
