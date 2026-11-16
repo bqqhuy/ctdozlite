@@ -274,14 +274,59 @@ impl Drop for Partial {
     }
 }
 pub fn safe_name(name: &str) -> String {
-    let s: String = name
+    // 1. Remove control characters and Windows-forbidden characters.
+    // Note: ':' is explicitly stripped to prevent NTFS Alternate Data Stream attacks ("file.txt:stream").
+    let filtered: String = name
         .chars()
         .filter(|c| !c.is_control() && !"<>:\"/\\|?*".contains(*c))
         .take(150)
         .collect();
-    let s = s.trim().trim_matches('.');
+
+    // 2. Normalize and strip trailing/leading whitespace and dots repeatedly (prevent "evil.exe .")
+    let mut s = filtered.as_str();
+    loop {
+        let prev_len = s.len();
+        s = s.trim_end_matches([' ', '.']);
+        s = s.trim_start_matches([' ', '.']);
+        if s.len() == prev_len {
+            break;
+        }
+    }
+
     if s.is_empty() {
-        "Tệp đính kèm".into()
+        return "Tệp đính kèm".into();
+    }
+
+    // 3. Reject / prefix Windows DOS reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+    let stem = s.split('.').next().unwrap_or(s).to_ascii_uppercase();
+    let is_device_name = matches!(
+        stem.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    );
+
+    if is_device_name {
+        format!("_{s}")
     } else {
         s.into()
     }
@@ -496,6 +541,8 @@ async fn save_inner<F: FnMut(u64, Option<u64>)>(
             "Tệp đích đã tồn tại hoặc không thể hoàn tất; chọn tên khác"
         );
     }
+    // H-01: Attach Zone.Identifier ADS (Mark-of-the-Web ZoneId=3) to trigger SmartScreen / Protected View
+    crate::platform::apply_mark_of_the_web(path);
     progress(total, expected);
     Ok(total)
 }
@@ -557,6 +604,31 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn h01_safe_name_normalizes_dots_spaces_and_device_names() {
+        // Trailing whitespace and dots
+        assert_eq!(safe_name("evil.exe ."), "evil.exe");
+        assert_eq!(safe_name("evil.exe. . "), "evil.exe");
+        assert_eq!(safe_name("a.hta"), "a.hta");
+        assert_eq!(safe_name("normal_document.pdf"), "normal_document.pdf");
+
+        // Windows reserved device names
+        assert_eq!(safe_name("CON.txt"), "_CON.txt");
+        assert_eq!(safe_name("prn.pdf"), "_prn.pdf");
+        assert_eq!(safe_name("aux"), "_aux");
+        assert_eq!(safe_name("NUL"), "_NUL");
+        assert_eq!(safe_name("com1.zip"), "_com1.zip");
+        assert_eq!(safe_name("LPT3.doc"), "_LPT3.doc");
+
+        // NTFS alternate data stream syntax (colon)
+        assert_eq!(safe_name("x.txt:stream"), "x.txtstream");
+        assert_eq!(safe_name("bad:name:here.png"), "badnamehere.png");
+
+        // Empty / only invalid chars
+        assert_eq!(safe_name("...   "), "Tệp đính kèm");
+        assert_eq!(safe_name(":::<>\""), "Tệp đính kèm");
     }
 
     #[tokio::test]
