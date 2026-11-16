@@ -125,7 +125,7 @@ Quy ước trạng thái: **Đóng (code/fixture)** = root cause sửa ở bound
 |---|---|---|---|---|---|---|
 | Cleanup `rand_core` | Low | Đóng (code/fixture) | `40eeafa` | Loại bỏ crate `rand_core` khỏi `Cargo.toml` và `Cargo.lock` | — | Zero caller trong codebase; hoàn tất dọn dẹp dependency rác |
 | M-04 Refactor | Low | Đóng (code/fixture) | `40eeafa` | `zalo_rust::gui::is_status_error` helper + test ma trận phân loại lỗi | — | Tách hàm phân loại lỗi rõ ràng, gắn kết trực tiếp giữa test và production code |
-| Logger FIFO Test | Low | Đóng (code/fixture) | `40eeafa` | Test 505 entries đẩy eviction ring-buffer `VecDeque::pop_front` | — | Kiểm chứng xác thực eviction 5 bản ghi đầu tiên ở ngưỡng 500 entries |
+| Logger FIFO Test | Low | Đóng (code/fixture) | `40eeafa`, `54093a6` | `tests::audit_regressions::test_perf_logger_vecdeque_fifo`, `logger::tests::test_logger_vecdeque_fifo_ring_buffer` | — | Kiểm chứng xác thực eviction 5 bản ghi đầu tiên ở ngưỡng 500 entries, cô lập hoàn toàn khỏi singleton race condition |
 
 ## Cổng Phase 4 (Môi trường cô lập, `CTDOZ_ALLOW_TEST_LOOPBACK=1`)
 
