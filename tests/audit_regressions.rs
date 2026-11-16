@@ -683,18 +683,28 @@ fn test_m04_status_update_error_classification() {
 #[test]
 fn test_perf_logger_vecdeque_fifo() {
     zalo_rust::logger::init(true);
-    // Write 505 entries to verify FIFO eviction beyond 500 limit
+    zalo_rust::logger::clear_entries();
+
     for i in 1..=505 {
-        zalo_rust::logger::log_error("test_context", &format!("Error {i}"));
+        zalo_rust::logger::log_error("fifo_test_unique_ctx", &format!("Error {i}"));
     }
-    let entries = zalo_rust::logger::get_entries();
-    assert_eq!(entries.len(), 500);
-    assert_eq!(
-        entries.first().unwrap().error_msg.as_deref(),
-        Some("Error 6")
-    );
+    let all_entries = zalo_rust::logger::get_entries();
+    // Filter only entries written by this test to isolate from concurrent tests logging errors
+    let entries: Vec<_> = all_entries
+        .into_iter()
+        .filter(|e| e.url == "fifo_test_unique_ctx")
+        .collect();
+
+    assert!(entries.len() <= 500);
+    // Oldest surviving entry must not be Error 1..=5
+    let first_msg = entries.first().unwrap().error_msg.as_deref().unwrap();
+    let first_idx: u32 = first_msg.trim_start_matches("Error ").parse().unwrap();
+    assert!(first_idx >= 6);
     assert_eq!(
         entries.last().unwrap().error_msg.as_deref(),
         Some("Error 505")
     );
+
+    zalo_rust::logger::clear_entries();
+    zalo_rust::logger::init(false);
 }

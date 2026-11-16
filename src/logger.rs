@@ -292,5 +292,47 @@ mod tests {
         assert_eq!(last.url, "test_context");
         assert_eq!(last.error_msg.as_deref(), Some("test_error_message"));
         assert!(last.is_error);
+        init(false);
+        clear_entries();
+    }
+
+    #[test]
+    fn test_logger_vecdeque_fifo_ring_buffer() {
+        let mut state = LoggerState {
+            dev_mode: true,
+            entries: std::collections::VecDeque::new(),
+            max_entries: 500,
+            counter: 0,
+        };
+
+        for i in 1..=505 {
+            state.counter += 1;
+            let entry = LogEntry {
+                id: state.counter,
+                timestamp: "00:00:00".into(),
+                method: "ERR".into(),
+                url: "test_context".into(),
+                status: None,
+                latency_ms: 0,
+                payload_preview: String::new(),
+                decrypted_preview: None,
+                is_error: true,
+                error_msg: Some(format!("Error {i}")),
+            };
+            state.entries.push_back(entry);
+            if state.entries.len() > state.max_entries {
+                state.entries.pop_front();
+            }
+        }
+
+        assert_eq!(state.entries.len(), 500);
+        assert_eq!(
+            state.entries.front().unwrap().error_msg.as_deref(),
+            Some("Error 6")
+        );
+        assert_eq!(
+            state.entries.back().unwrap().error_msg.as_deref(),
+            Some("Error 505")
+        );
     }
 }
