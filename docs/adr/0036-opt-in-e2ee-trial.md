@@ -39,6 +39,17 @@ No key/message content is stored in the attempt table. Migration is forward-only
 schema-6 binaries reject schema 7. Back up the entire isolated test profile with
 the application closed before testing; never lower `user_version` manually.
 
+## Recovery Path (M-01)
+
+When a contact was previously engaged in trial E2EE or received speculative metadata,
+the user may reset the `e2ee_required` lock for that contact via the drawer action
+"Gỡ yêu cầu E2EE". This invokes `remove_e2ee_requirement(profile_id, peer_id)`, deleting
+the row from SQLite `e2ee_required` and logging an audit security entry. In default builds
+without experimental E2EE enabled, incoming E2EE metadata does not permanently write
+`e2ee_required`. Transient database errors when querying E2EE requirement do not permanently
+lock contacts from sending plaintext; only the single failing transaction is rejected with a
+typed storage error.
+
 ## Diagnostics
 
 Use the existing nonblocking channel (256 events) and rotating JSONL writer

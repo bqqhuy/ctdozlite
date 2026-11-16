@@ -98,9 +98,25 @@ pub fn remember_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> 
     })
 }
 
+/// Remove encrypted-message requirement for a direct peer (M-01 recovery path).
+pub fn remove_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !profile_id.is_empty() && !peer_id.is_empty(),
+        "Thiếu tài khoản hoặc người nhận E2EE"
+    );
+    with_manager(profile_id, |manager| {
+        manager.conn().execute(
+            "DELETE FROM e2ee_required WHERE profile_id=?1 AND peer_id=?2",
+            rusqlite::params![profile_id, peer_id],
+        )?;
+        Ok(())
+    })
+}
+
 /// Convenience wrapper for is_thread_e2ee that treats errors safely.
+/// Under M-01, database read errors must NOT permanently lock contacts from sending plaintext.
 pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
-    check_thread_e2ee(profile_id, peer_id).unwrap_or(true)
+    check_thread_e2ee(profile_id, peer_id).unwrap_or(false)
 }
 
 /// Decrypt incoming E2EE payload.
@@ -333,5 +349,21 @@ mod tests {
                 .unwrap_err();
         assert!(error.to_string().contains("chưa xác minh"));
         assert!(!error.to_string().contains("private text"));
+    }
+
+    #[test]
+    fn m01_remember_and_remove_e2ee_requirement() {
+        let owner = "m01_owner_test";
+        let peer = "m01_peer_test";
+        let initial = check_thread_e2ee(owner, peer).unwrap();
+        assert!(!initial);
+
+        remember_e2ee_requirement(owner, peer).unwrap();
+        let required = check_thread_e2ee(owner, peer).unwrap();
+        assert!(required);
+
+        remove_e2ee_requirement(owner, peer).unwrap();
+        let removed = check_thread_e2ee(owner, peer).unwrap();
+        assert!(!removed);
     }
 }

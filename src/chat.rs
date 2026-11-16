@@ -1817,12 +1817,18 @@ pub(crate) async fn send_message_with_client_id(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    // Audit A01: fail-closed if E2EE is required for this direct peer.
+    // Audit A01 & M-01: fail-closed if E2EE is required for this direct peer.
     // Never send to plaintext endpoint when thread requires E2EE.
-    if crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id) {
-        anyhow::bail!(
-            "Hội thoại yêu cầu mã hóa đầu cuối (E2EE); không được gửi qua endpoint thường"
-        );
+    match crate::e2ee_integration::check_thread_e2ee(s.account_key(), to_id) {
+        Ok(true) => {
+            anyhow::bail!(
+                "Hội thoại yêu cầu mã hóa đầu cuối (E2EE); không được gửi qua endpoint thường"
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            anyhow::bail!("Không kiểm tra được chính sách mã hóa đầu cuối (E2EE): {e}");
+        }
     }
     let body = obj(&[
         ("toid", json!(to_id)),
@@ -2815,9 +2821,8 @@ pub async fn scrape_opengraph_metadata(url: &str) -> Option<LinkMetadata> {
         .redirect(redirect_policy)
         .build()
         .ok()?;
-    let user_agent = crate::endpoints::sanitize_header_value(
-        "Mozilla/5.0 (compatible; ctdozlite-linkpreview)",
-    );
+    let user_agent =
+        crate::endpoints::sanitize_header_value("Mozilla/5.0 (compatible; ctdozlite-linkpreview)");
     let accept_lang = crate::endpoints::sanitize_header_value("vi-VN,vi;q=0.9,en-US;q=0.8");
     let resp = client
         .get(url)
@@ -9020,6 +9025,7 @@ pub fn try_decrypt_e2ee_content(
         return None;
     }
 
+    #[cfg(feature = "experimental-e2ee")]
     if is_e2ee_meta
         && crate::e2ee_integration::remember_e2ee_requirement(profile_id, peer_id).is_err()
     {

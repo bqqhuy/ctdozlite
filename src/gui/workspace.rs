@@ -5876,6 +5876,31 @@ impl ZaloGuiApp {
                         } else {
                             pal.text_secondary
                         }));
+                        if !d_is_group && self.trial_peers.contains(d_id) {
+                            ui.add_space(4.0);
+                            let reset_btn = egui::Button::new(
+                                RichText::new("Gỡ yêu cầu E2EE")
+                                    .size(11.5)
+                                    .color(pal.text_primary),
+                            )
+                            .rounding(Rounding::same(4.0));
+                            if ui
+                                .add(reset_btn)
+                                .on_hover_text(
+                                    "Xóa trạng thái bắt buộc E2EE để khôi phục gửi tin nhắn thường",
+                                )
+                                .clicked()
+                            {
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::ResetE2eeRequirement {
+                                        owner: self.user_uin.clone(),
+                                        peer_id: d_id.to_string(),
+                                    });
+                                }
+                                self.trial_peers.remove(d_id);
+                                self.show_toast("Đã gỡ yêu cầu E2EE cho hội thoại này");
+                            }
+                        }
                         let current_ttl = self
                             .policy_panel
                             .snapshot

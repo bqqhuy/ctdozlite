@@ -114,7 +114,7 @@ pub fn check_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> Resu
 }
 
 pub fn is_thread_e2ee(account_key: &str, to_id: &str, is_group: bool) -> bool {
-    check_thread_e2ee(account_key, to_id, is_group).unwrap_or(true)
+    check_thread_e2ee(account_key, to_id, is_group).unwrap_or(false)
 }
 
 /// Where a plain-text payload goes (audit A01/A02).
