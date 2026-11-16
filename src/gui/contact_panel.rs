@@ -98,6 +98,13 @@ impl ZaloGuiApp {
         if !self.contact_panel.open {
             return;
         }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && !self.contact_panel.pending {
+            self.contact_panel.open = false;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "contact_panel_backdrop");
+
         let mut open = true;
         let mut intent = None;
         let mut selected_contact = None;
@@ -118,11 +125,27 @@ impl ZaloGuiApp {
                 self.contact_panel.presence_checked = Some(std::time::Instant::now());
             }
         }
-        egui::Window::new("Liên hệ và quyền riêng tư").id(Id::new("contact-actions")).open(&mut open)
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() - 48.0).max(180.0);
+        let max_h = (screen.height() - 100.0).max(100.0);
+        egui::Window::new("Liên hệ và quyền riêng tư")
+            .id(Id::new("contact-actions"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
             .vscroll(true)
             .min_width(120.0)
-            .max_width((ctx.screen_rect().width()-32.0).max(180.0))
-            .max_height((ctx.screen_rect().height()-64.0).max(100.0)).default_width(420.0_f32.min((ctx.screen_rect().width()-48.0).max(160.0))).show(ctx,|ui| {
+            .max_width(max_w)
+            .max_height(max_h)
+            .default_width(420.0_f32.min(max_w))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(18.0, 16.0)),
+            )
+            .show(ctx, |ui| {
                 ui.style_mut().wrap_mode=Some(egui::TextWrapMode::Wrap);
             if self.contact_panel.lookup_mode {
                 ui.label("Tra cứu tên đăng nhập Zalo (username), khác tên hiển thị và số điện thoại.");

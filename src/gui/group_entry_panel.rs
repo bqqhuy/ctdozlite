@@ -24,7 +24,7 @@ impl ZaloGuiApp {
             });
         }
     }
-    fn group_entry_command(&mut self, action: crate::group_entry::Action) {
+    pub(super) fn group_entry_command(&mut self, action: crate::group_entry::Action) {
         if self.group_entry_panel.pending {
             return;
         }
@@ -47,16 +47,39 @@ impl ZaloGuiApp {
             self.group_entry_panel = Default::default();
             return;
         }
-        if !self.group_entry_panel.open {
+        if !self.group_entry_panel.open || self.contacts_view_open {
             return;
         }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.group_entry_panel.open = false;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "group_entry_backdrop");
+
         let mut open = true;
         let mut intent = None;
-        egui::Window::new("Tham gia nhóm").id(Id::new("group-entry")).open(&mut open)
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() - 48.0).max(180.0);
+        let max_h = (screen.height() - 100.0).max(100.0);
+        egui::Window::new("Tham gia nhóm")
+            .id(Id::new("group-entry"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
             .vscroll(true)
             .min_width(120.0)
-            .max_width((ctx.screen_rect().width()-32.0).max(180.0))
-            .max_height((ctx.screen_rect().height()-64.0).max(100.0)).default_width(500.0_f32.min((ctx.screen_rect().width()-48.0).max(160.0))).show(ctx,|ui| {
+            .max_width(max_w)
+            .max_height(max_h)
+            .default_width(500.0_f32.min(max_w))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(18.0, 16.0)),
+            )
+            .show(ctx, |ui| {
                 ui.style_mut().wrap_mode=Some(egui::TextWrapMode::Wrap);
             ui.label(&self.group_entry_panel.status);if self.group_entry_panel.pending{ui.spinner();}
             ui.add_enabled_ui(!self.group_entry_panel.pending,|ui| {

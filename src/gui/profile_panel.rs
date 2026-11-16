@@ -62,16 +62,35 @@ impl ZaloGuiApp {
         if !self.profile_panel.open {
             return;
         }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.profile_panel.open = false;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "profile_panel_backdrop");
+
         let mut open = true;
         let mut intent = None;
-        egui::Window::new("Hồ sơ của tôi")
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() - 48.0).max(180.0);
+        let max_h = (screen.height() - 100.0).max(100.0);
+        egui::Window::new("👤 Hồ sơ của tôi")
             .id(Id::new("own-profile"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
             .vscroll(true)
             .min_width(120.0)
-            .max_width((ctx.screen_rect().width() - 32.0).max(180.0))
-            .max_height((ctx.screen_rect().height() - 64.0).max(100.0))
-            .default_width(400.0_f32.min((ctx.screen_rect().width() - 48.0).max(160.0)))
+            .max_width(max_w)
+            .max_height(max_h)
+            .default_width(420.0_f32.min(max_w))
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(18.0, 16.0)),
+            )
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 if ui.button("Thay ảnh đại diện…").clicked() {

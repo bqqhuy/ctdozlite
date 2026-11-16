@@ -41,6 +41,7 @@ mod labels_panel;
 mod mention_composer;
 mod messages;
 mod modals;
+pub(super) use modals::render_modal_backdrop;
 mod policy_panel;
 mod privacy_panel;
 mod profile_panel;

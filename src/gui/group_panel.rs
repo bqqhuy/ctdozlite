@@ -76,23 +76,42 @@ impl ZaloGuiApp {
         if !self.groups_panel.open {
             return;
         }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.groups_panel.open = false;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "group_panel_backdrop");
+
         let mut open = true;
         let mut intent = None;
         let mut selected_group = None;
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() - 48.0).max(180.0);
+        let max_h = (screen.height() - 100.0).max(100.0);
         egui::Window::new(if self.groups_panel.create {
-            "Tạo nhóm"
+            "👥 Tạo nhóm"
         } else if self.groups_panel.group {
-            "Quản lý nhóm"
+            "⚙️ Quản lý nhóm"
         } else {
-            "Nhóm chung"
+            "👥 Nhóm chung"
         })
         .id(Id::new("group-panel"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .open(&mut open)
-            .vscroll(true)
-            .min_width(120.0)
-            .max_width((ctx.screen_rect().width()-32.0).max(180.0))
-            .max_height((ctx.screen_rect().height()-64.0).max(100.0))
-        .default_width(480.0_f32.min((ctx.screen_rect().width()-48.0).max(160.0)))
+        .collapsible(false)
+        .resizable(false)
+        .vscroll(true)
+        .min_width(120.0)
+        .max_width(max_w)
+        .max_height(max_h)
+        .default_width(460.0_f32.min(max_w))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::symmetric(18.0, 16.0)),
+        )
         .show(ctx, |ui| {
                 ui.style_mut().wrap_mode=Some(egui::TextWrapMode::Wrap);
             if self.groups_panel.pending {

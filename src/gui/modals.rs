@@ -1,5 +1,18 @@
 use super::*;
 
+/// Paint a standard dimmed backdrop behind centered modals.
+pub fn render_modal_backdrop(ctx: &egui::Context, id: &str) {
+    let screen = ctx.screen_rect();
+    egui::Area::new(Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            ui.painter()
+                .rect_filled(rect, Rounding::ZERO, Color32::from_black_alpha(110));
+        });
+}
+
 impl ZaloGuiApp {
     pub(super) fn render_profile_popover(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if !self.profile_menu_open {
@@ -299,12 +312,15 @@ impl ZaloGuiApp {
             return;
         }
 
+        render_modal_backdrop(ctx, "phone_modal_backdrop");
+
         let mut open = true;
         let mut trigger_lookup: Option<String> = None;
         let mut open_chat_user: Option<crate::chat::PhoneLookupResult> = None;
         let mut add_friend_user: Option<(String, String)> = None;
 
         egui::Window::new(crate::i18n::tr("Tìm kiếm Số điện thoại & Kết bạn Zalo"))
+            .order(egui::Order::Foreground)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -632,6 +648,8 @@ impl ZaloGuiApp {
             return;
         }
 
+        render_modal_backdrop(ctx, "settings_modal_backdrop");
+
         let previous_remember = self.settings.remember_login;
         let mut open = true;
         let screen = ctx.screen_rect();
@@ -647,6 +665,7 @@ impl ZaloGuiApp {
 
         let response = egui::Window::new("settings_window_modal")
             .title_bar(false)
+            .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -2386,9 +2405,12 @@ impl ZaloGuiApp {
             .take(500)
             .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
             .collect();
+        render_modal_backdrop(ctx, "forward_modal_backdrop");
+
         let mut open = true;
         let mut chosen: Option<(String, bool)> = None;
         egui::Window::new(crate::i18n::tr("Chuyển tiếp tin nhắn"))
+            .order(egui::Order::Foreground)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -3064,6 +3086,8 @@ impl ZaloGuiApp {
             return;
         }
 
+        render_modal_backdrop(ctx, "safety_number_modal_backdrop");
+
         let mut is_open = true;
         let mut close_clicked = false;
         let mut trust_action = false;
@@ -3072,11 +3096,17 @@ impl ZaloGuiApp {
 
         egui::Window::new(format!("🔒 Mã an toàn E2EE — {peer_name}"))
             .id(Id::new("safety_number_verification_modal"))
+            .order(egui::Order::Foreground)
             .open(&mut is_open)
             .resizable(false)
             .collapsible(false)
             .default_width(440.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(18.0, 16.0)),
+            )
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(8.0);
