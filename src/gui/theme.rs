@@ -30,7 +30,15 @@ pub(super) struct ThemePalette {
     pub(super) bubble_in_border: Color32,
     pub(super) bubble_in_text: Color32,
     pub(super) bubble_in_meta: Color32,
+    pub(super) bg_nav_rail: Color32,
+    pub(super) nav_rail_fg: Color32,
+    pub(super) nav_rail_fg_active: Color32,
+    pub(super) nav_rail_item_hover: Color32,
+    pub(super) nav_rail_item_active: Color32,
 }
+
+pub const NAV_RAIL_WIDTH: f32 = 64.0;
+pub const SIDEBAR_DEFAULT_WIDTH: f32 = 320.0;
 
 impl ThemePalette {
     pub(super) fn apply_tools_theme(&mut self, value: &serde_json::Value) {
@@ -132,6 +140,11 @@ impl ThemePalette {
             bubble_in_border: Color32::from_rgb(50, 56, 64), // #323840 Gutter Border
             bubble_in_text: Color32::from_rgb(241, 245, 249), // #F1F5F9
             bubble_in_meta: Color32::from_rgb(148, 163, 184), // #94A3B8
+            bg_nav_rail: Color32::from_rgb(34, 38, 43), // #22262B Zalo Dark Base
+            nav_rail_fg: Color32::from_rgb(180, 188, 200),
+            nav_rail_fg_active: Color32::from_rgb(0, 104, 255),
+            nav_rail_item_hover: Color32::from_rgb(52, 58, 66),
+            nav_rail_item_active: Color32::from_rgb(26, 44, 74),
         }
     }
 
@@ -162,6 +175,11 @@ impl ThemePalette {
             bubble_in_border: Color32::from_rgb(216, 224, 236),
             bubble_in_text: Color32::from_rgb(8, 27, 58), // #081B3A Zalo Ink text
             bubble_in_meta: Color32::from_rgb(100, 116, 139),
+            bg_nav_rail: Color32::from_rgb(0, 104, 255), // #0068FF Zalo Brand Blue
+            nav_rail_fg: Color32::from_rgba_unmultiplied(255, 255, 255, 204),
+            nav_rail_fg_active: Color32::WHITE,
+            nav_rail_item_hover: Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+            nav_rail_item_active: Color32::from_rgb(0, 82, 204), // #0052CC Pressed Blue
         }
     }
     pub(super) fn apply_to_ctx(&self, ctx: &egui::Context) {
@@ -422,6 +440,18 @@ fn paint_single_circle_avatar(
                 });
             }
         }
+    }
+
+    // Distinctive avatar for "Cloud của tôi" (Zalo PC parity)
+    if name.contains("Cloud của tôi") {
+        painter.circle_filled(center, radius, Color32::from_rgb(0, 104, 255));
+        painter.circle_stroke(
+            center,
+            radius,
+            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 80)),
+        );
+        draw_icon_cloud(painter, center, radius * 1.15, Color32::WHITE);
+        return;
     }
 
     let av_col = avatar_color_for(name, is_group);
@@ -747,6 +777,10 @@ pub(super) fn draw_icon_chat_nav(painter: &egui::Painter, center: Pos2, size: f3
 
 pub(super) fn draw_icon_contacts(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::USERS, size, color);
+}
+
+pub(super) fn draw_icon_todo(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    draw_lucide_icon(painter, center, lucide::CHECK, size, color);
 }
 
 pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -1284,5 +1318,17 @@ mod customization_tests {
             });
         });
         assert_eq!(ctx.zoom_factor(), 1.0);
+    }
+    #[test]
+    fn test_phase1_nav_rail_design_tokens() {
+        let light = ThemePalette::light();
+        assert_eq!(light.bg_nav_rail, Color32::from_rgb(0, 104, 255));
+        assert_eq!(light.nav_rail_fg_active, Color32::WHITE);
+        assert_eq!(NAV_RAIL_WIDTH, 64.0);
+        assert_eq!(SIDEBAR_DEFAULT_WIDTH, 320.0);
+
+        let dark = ThemePalette::dark();
+        assert_eq!(dark.bg_nav_rail, Color32::from_rgb(34, 38, 43));
+        assert_eq!(dark.nav_rail_fg_active, Color32::from_rgb(0, 104, 255));
     }
 }

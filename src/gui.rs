@@ -914,6 +914,7 @@ pub struct ZaloGuiApp {
 
     info_drawer_open: bool,
     profile_menu_open: bool,
+    sidebar_more_menu_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
     phone_modal_open: bool,
     phone_modal_input: String,
@@ -1202,6 +1203,7 @@ impl ZaloGuiApp {
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             profile_menu_open: false,
+            sidebar_more_menu_open: false,
             toast_notice: None,
             phone_modal_open: false,
             phone_modal_input: String::new(),
