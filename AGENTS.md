@@ -142,3 +142,10 @@ For AI agents continuing work after the E2EE trial build and user testing, consu
 - Current baseline (`main` branch with Signal Protobuf wire, truncated 8-byte MAC, WebSocket command IDs).
 - Concrete actions if user testing passes: empirical parity elevation (E1), real-time inbound WebSocket push decryption (`CMD_SIGNAL_RECEIVE_1_1` = 551), group sender keys, and media encryption.
 - Concrete debugging steps if user testing reports an error via `diagnostics/sync-media.jsonl`.
+
+## GUI/UX Overhaul Handover & Parity Protocol
+
+For AI agents continuing GUI & UX overhaul work (including conversation `d9f5916e-d894-4e09-aebf-00a2920b78a0` and subsequent sessions):
+- Consult [docs/ZALO_GUI_UX_OVERHAUL_PLAN.md](docs/ZALO_GUI_UX_OVERHAUL_PLAN.md) for full design parity specs, 4-zone layout architecture, and the live Phase Tracking Matrix.
+- Consult [docs/GUI_UX_HANDOVER_AI_GUIDE.md](docs/GUI_UX_HANDOVER_AI_GUIDE.md) for step-by-step implementation instructions for Phases 1 through 5, compiler verification requirements, and the status handoff protocol.
+- **Tracking Rule:** Whenever a phase is completed, verified, and merged into `main`, update the Phase Tracking Matrix in `docs/ZALO_GUI_UX_OVERHAUL_PLAN.md` with commit SHA, conversation ID, and completion date so subsequent AI agents immediately pick up the next phase.
