@@ -394,6 +394,10 @@ pub enum WorkerCmd {
         url: String,
         origin: crate::chat::LinkOrigin,
     },
+    ResetE2eeRequirement {
+        owner: String,
+        peer_id: String,
+    },
     LookupPhone {
         phone: String,
     },
@@ -1381,6 +1385,15 @@ if tx.send(WorkerCmd::PruneExpired).is_err(){break;}}});
                                 let _ = tx.send(GuiEvent::E2eeTrialPrepared { owner, peer_id, result }); ctx.request_repaint();
                             });
                         }
+                        WorkerCmd::ResetE2eeRequirement { owner, peer_id } => {
+                            let account = session.lock().await.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if account.is_active() && !owner.is_empty() && account.account_key() == owner {
+                                    let _ = crate::e2ee_integration::remove_e2ee_requirement(&owner, &peer_id);
+                                    crate::logger::log_error("e2ee_requirement_reset", &format!("owner={owner} peer={peer_id}"));
+                                }
+                            }).await.ok();
+                        }
                         WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
                             let account = session.lock().await.clone();
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
@@ -2045,12 +2058,18 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         command @ (WorkerCmd::Logout | WorkerCmd::AddAccount) => {
                             let keep = matches!(command, WorkerCmd::AddAccount);
                             let current = session.lock().await.clone();
+                            let owner = current.account_key().to_owned();
                             let saved = tokio::task::spawn_blocking(move || {
                                 if keep { current.save_to_file("session.json") }
-                                else { crate::profiles::forget_session(current.account_key()) }
+                                else { crate::profiles::perform_account_logout(&owner) }
                             }).await;
                             if !matches!(saved, Ok(Ok(()))) {
-                                let _ = gui_tx.send(GuiEvent::StatusUpdate("Không cập nhật được phiên tài khoản; chưa chuyển màn hình đăng nhập".into()));
+                                let msg = match saved {
+                                    Ok(Err(e)) => e.to_string(),
+                                    Err(e) => e.to_string(),
+                                    _ => "Không cập nhật được phiên tài khoản".into(),
+                                };
+                                let _ = gui_tx.send(GuiEvent::LogoutFailed { message: msg });
                                 egui_ctx.request_repaint();
                                 continue;
                             }
@@ -2066,10 +2085,6 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&account)).await;
                             }
                             session.lock().await.logout();
-                            if let Err(e) = crate::storage::remove_session() {
-                                let _ = gui_tx.send(GuiEvent::StatusUpdate(format!("Không thể xóa phiên: {e}")));
-                                continue;
-                            }
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
                             egui_ctx.request_repaint();
                             // Dropping this runtime cancels all old network tasks. A fresh UI channel
@@ -3483,9 +3498,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as u64)
                                     .unwrap_or(0);
-                                let voice_dir = std::env::temp_dir()
-                                    .join("ctdozlite_voice")
-                                    .join(format!("session-{runtime_id}"));
+                                let voice_dir = crate::storage::account_temp_dir(&owner).join("voice");
                                 if let Err(e) = tokio::fs::create_dir_all(&voice_dir).await {
                                     let _ = events.send(GuiEvent::VoiceSendStatus {
                                         owner,

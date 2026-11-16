@@ -1881,7 +1881,8 @@ impl<'a> TuiApp<'a> {
                         "Đang chờ xác nhận gửi/xóa tin; hãy đăng xuất lại sau giây lát".into();
                     return;
                 }
-                if let Err(e) = crate::storage::remove_session() {
+                let owner = self.session.account_key().to_owned();
+                if let Err(e) = crate::profiles::perform_account_logout(&owner) {
                     self.status = format!("Không thể xóa phiên: {e}");
                     return;
                 }

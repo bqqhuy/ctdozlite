@@ -160,6 +160,19 @@ pub fn forget_session(owner: &str) -> Result<()> {
     registry.save()
 }
 
+/// Perform a unified account logout routine (M-03):
+/// 1. Removes the account credential file from `accounts/<sha>/session.dat` and cleans registry.
+/// 2. Clears account temporary private files (M-05).
+/// 3. Removes global `session.dat` via `storage::remove_session()`.
+pub fn perform_account_logout(owner: &str) -> Result<()> {
+    if !owner.is_empty() {
+        forget_session(owner)?;
+        let _ = crate::storage::clear_account_temp(owner);
+    }
+    crate::storage::remove_session()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

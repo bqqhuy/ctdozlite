@@ -240,16 +240,8 @@ impl ZaloGuiApp {
         if do_logout {
             self.flush_composer_before_logout();
             self.cancel_voice_recording();
-            self.is_logged_in = false;
-            self.account_runtime_id = 0;
-            self.user_name.clear();
-            self.user_uin.clear();
-            self.threads.clear();
-            self.selected_thread_index = 0;
-            self.qr_texture = None;
-            self.login_status_msg.clear();
-            self.qr_status = "Đang xin mã QR mới…".into();
-            self.status_msg = "Đã đăng xuất".into();
+            // L-03: Two-phase logout. Do not switch UI or clear session until worker confirms LoggedOut.
+            self.status_msg = "Đang đăng xuất…".into();
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Logout);
             }

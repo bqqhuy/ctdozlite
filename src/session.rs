@@ -569,6 +569,11 @@ impl Session {
         self.zpw_sek = None;
         self.secret_key = None;
         self.session_key = None;
+        self.domains = Domains::default();
+        self.imei = random_imei();
+        self.service_resolver = Arc::new(std::sync::RwLock::new(
+            crate::service_resolver::ServiceResolver::new(),
+        ));
         self.jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
@@ -576,8 +581,9 @@ impl Session {
             HeaderValue::from_static(crate::endpoints::WEB_ORIGIN),
         );
         default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
-        if let Ok(c) = crate::proxy::apply(Client::builder()).and_then(|builder| {
-            Ok(builder
+        let builder = crate::proxy::apply(Client::builder())
+            .unwrap_or_else(|_| Client::builder())
+            .tcp_nodelay(true)
             .cookie_provider(Arc::clone(&self.jar))
             .redirect(reqwest::redirect::Policy::none())
             .default_headers(default_headers)
@@ -586,11 +592,8 @@ impl Session {
             .user_agent(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                  (KHTML, like Gecko) ZaloPC/26.10.11 Chrome/122.0.0.0 Electron/29.0.0 Safari/537.36",
-            )
-            .build()?)
-        }) {
-            self.http = c;
-        }
+            );
+        self.http = builder.build().unwrap_or_default();
     }
 
     /// Process-local identity shared by clones and replaced when login is revoked.
@@ -1398,12 +1401,14 @@ fn scrub_sensitive_tokens(text: &str) -> String {
                     let key_end = cursor + key.len();
                     // Followed by non-word char or delimiter
                     if key_end == text.len()
-                        || (!text_bytes[key_end].is_ascii_alphanumeric() && text_bytes[key_end] != b'_')
+                        || (!text_bytes[key_end].is_ascii_alphanumeric()
+                            && text_bytes[key_end] != b'_')
                     {
                         matched_key_end = Some(key_end);
                         break;
                     }
-                } else if (remaining_lower.starts_with('"') && remaining_lower[1..].starts_with(key))
+                } else if (remaining_lower.starts_with('"')
+                    && remaining_lower[1..].starts_with(key))
                     || (remaining_lower.starts_with('\'') && remaining_lower[1..].starts_with(key))
                 {
                     let quote = text_bytes[cursor];
