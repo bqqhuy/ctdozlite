@@ -77,3 +77,51 @@ Hai Pro auditor (`Phase 1 Pro Auditor 1` và `Phase 1 Pro Auditor 2`) đã tiế
 - Vòng lặp cắt tỉa trailing dots/spaces và tiền tố hóa thiết bị DOS (`_CON.txt`) vô hiệu hóa triệt để bypass Win32.
 - Gắn stream NTFS ADS `Zone.Identifier` với `ZoneId=3` (Mark-of-the-Web).
 
+---
+
+# Kết quả Review Độc lập — Audit `bd44cc1` Phase 2 (Account, Privacy & Compatibility)
+
+Phạm vi review: Commit `67857f6..a89810e` trên nhánh `antigravity/phase-2-account-and-privacy`.
+Hai Pro auditor (`Phase 2 Pro Auditor 1` và `Phase 2 Pro Auditor 2`) đã tiến hành kiểm toán độc lập, chạy test và rà soát diff.
+
+## Đánh giá tổng hợp Phase 2
+
+| Chỉ số | Pro Auditor 1 | Pro Auditor 2 |
+|---|---|---|
+| **Kết luận** | **APPROVE** | **APPROVE** |
+| **Blocker** | 0 | 0 |
+| **Major** | 0 | 0 |
+| **Minor** | 0 | 0 |
+| **Suggestions** | 2 | 2 |
+
+### Xác nhận L-02:
+- Tokenizer `scrub_sensitive_tokens` trong `src/session.rs` duyệt bằng `char_indices` và `char.len_utf8()`, an toàn 100% ranh giới ký tự UTF-8.
+- Xử lý mượt mà các chuỗi có ký tự tiếng Việt đa byte (`Đ`, `à`, `ẵ`...), không bao giờ panic.
+- Nhận diện và che giấu đầy đủ các định dạng `key=value`, `key: value`, `"key":"value"`.
+
+### Xác nhận M-07:
+- Tin nhắn nhận từ bên ngoài (`LinkOrigin::Incoming`) hoàn toàn không cào trực tiếp HTML từ IP máy client (loại bỏ SSRF / IP leak).
+- Tin nhắn gửi đi (`LinkOrigin::Outgoing`) cào an toàn qua `PublicResolver` (chặn loopback/private IP), giới hạn timeout 3800ms, payload 128 KiB.
+- User-Agent đổi sang `Mozilla/5.0 (compatible; ctdozlite-linkpreview)`, loại bỏ triệt để chuỗi mạo danh Discord.
+
+### Xác nhận M-05:
+- Voice record lưu trữ trong `storage::account_temp_dir(owner)/voice` (cách ly hoàn toàn theo tài khoản).
+- File tạm tài khoản được dọn dẹp sạch khi gọi `perform_account_logout`.
+- File `qr.png` tạo tạm trong CLI được dọn dẹp ngay sau khi đăng nhập thành công hoặc thất bại.
+
+### Xác nhận M-03 & L-03:
+- Hợp nhất routine đăng xuất `perform_account_logout(owner)` cho cả GUI worker và TUI.
+- Quy trình đăng xuất GUI 2 pha: chỉ reset giao diện khi nhận được `GuiEvent::LoggedOut`; giữ nguyên trạng thái phiên và báo lỗi nếu nhận `GuiEvent::LogoutFailed`.
+- `Session::logout` reset domains, imei, service resolver, cookie jar và bật `tcp_nodelay(true)`.
+
+### Xác nhận M-02:
+- `AppLockGuard::with_initial_lock(is_logged_in && enable_app_lock)` khởi tạo app ở trạng thái khóa ngay từ đầu nếu đã đăng nhập và bật bảo vệ.
+- Hiển thị thông báo chi tiết khi mở khóa thất bại.
+- Bổ sung nút "Đăng xuất tài khoản" trực tiếp trên màn hình khóa, chống kẹt khi cảm biến sinh trắc học hoặc WinRT bị lỗi.
+
+### Xác nhận M-01:
+- Không tự động bật `e2ee_required` từ metadata tin nhắn đến trong bản build thông thường (không có feature `experimental-e2ee`).
+- Thêm hàm `remove_e2ee_requirement` và nút "Gỡ yêu cầu E2EE" trong giao diện drawer của hội thoại.
+- Lỗi DB trong `check_thread_e2ee` được trả về dưới dạng lỗi gửi tin thông thường, không khóa vĩnh viễn thread liên hệ.
+
+
