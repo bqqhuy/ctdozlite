@@ -705,6 +705,110 @@ async fn prefetch_missing_sticker_thumbnails(
     }
 }
 
+fn parse_sticker_key(key: &str) -> Option<(u64, u64)> {
+    let stripped = key.strip_prefix("stk_")?;
+    let mut parts = stripped.split('_');
+    let cid = parts.next()?.parse::<u64>().ok()?;
+    let sid = parts.next()?.parse::<u64>().ok()?;
+    Some((cid, sid))
+}
+
+fn decode_sprite_from_bytes(bytes: &[u8]) -> anyhow::Result<crate::gui::DecodedSpriteData> {
+    let dyn_img = crate::limits::decode_image(bytes)?;
+    let rgba = dyn_img.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    anyhow::ensure!(width > 0 && height > 0, "Empty image dimensions");
+    let size = [width as usize, height as usize];
+    let pixels = rgba.as_flat_samples();
+    let color_img = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+
+    let (frames, delays) = if height > 0 && width >= height && width % height == 0 {
+        let f = (width / height) as u16;
+        if (1..=64).contains(&f) {
+            (f, vec![crate::gui::ZALO_SPRITE_FRAME_DELAY; f as usize])
+        } else {
+            (1, vec![std::time::Duration::ZERO])
+        }
+    } else {
+        (1, vec![std::time::Duration::ZERO])
+    };
+
+    Ok(crate::gui::DecodedSpriteData {
+        image: color_img,
+        frames,
+        delays,
+    })
+}
+
+async fn download_sticker_image_bytes(raw_url: &str) -> anyhow::Result<Vec<u8>> {
+    let _permit = crate::limits::image_network_permit(true).await?;
+    let compatible = crate::media_recovery::compatible_image_url(raw_url, true)?;
+    let response = crate::media_download::response(&compatible, Duration::from_secs(15)).await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "HTTP error {}",
+        response.status()
+    );
+    crate::media_resources::read_bounded_response(response, crate::limits::IMAGE_BYTES)
+        .await
+        .map_err(|e| anyhow::anyhow!("Sticker download read error: {e:?}"))
+}
+
+pub(super) async fn fetch_and_decode_sticker_sprite(
+    key: &str,
+    url: &str,
+) -> anyhow::Result<crate::gui::DecodedSpriteData> {
+    if let Some((cid, sid)) = parse_sticker_key(key) {
+        if cid == crate::bundled_stickers::CATEGORY {
+            if let Some(sprite) = crate::bundled_stickers::decode_gif_sprite(sid) {
+                return Ok(sprite);
+            }
+            if let Some(png_bytes) = crate::bundled_stickers::thumbnail(key) {
+                if let Ok(sprite) = decode_sprite_from_bytes(png_bytes) {
+                    return Ok(sprite);
+                }
+            }
+        }
+
+        if cid == 0 && (1..=30).contains(&sid) {
+            let primary = crate::endpoints::builtin_sticker_thumbnail(sid);
+            if let Ok(bytes) = download_sticker_image_bytes(&primary).await {
+                if let Ok(sprite) = decode_sprite_from_bytes(&bytes) {
+                    return Ok(sprite);
+                }
+            }
+            let fallback = if !url.is_empty() {
+                url.to_string()
+            } else {
+                crate::endpoints::legacy_sticker_image(sid)
+            };
+            let bytes = download_sticker_image_bytes(&fallback).await?;
+            return decode_sprite_from_bytes(&bytes);
+        }
+
+        // Sticker khác: Thử tải crate::endpoints::sticker_sprite_url(sid) trước
+        let sprite_url = crate::endpoints::sticker_sprite_url(sid);
+        if let Ok(bytes) = download_sticker_image_bytes(&sprite_url).await {
+            if let Ok(sprite) = decode_sprite_from_bytes(&bytes) {
+                return Ok(sprite);
+            }
+        }
+
+        // Fallback sang url ban đầu (legacy_sticker_image(sid))
+        let fallback = if !url.is_empty() {
+            url.to_string()
+        } else {
+            crate::endpoints::legacy_sticker_image(sid)
+        };
+        let bytes = download_sticker_image_bytes(&fallback).await?;
+        return decode_sprite_from_bytes(&bytes);
+    }
+
+    let bytes = download_sticker_image_bytes(url).await?;
+    decode_sprite_from_bytes(&bytes)
+}
+
 // Hidden viewports may stop rendering. Persist worker deltas before notifying UI
 // so delivery and history do not depend on a visible application window.
 fn deliver_thread_updates() -> bool {
@@ -983,9 +1087,31 @@ pub(super) fn spawn_session_worker(
                                 let _background = background;
                                 let owner = s.account_key().to_owned();
                                 let expires_at = context.as_ref().and_then(|source| crate::message_lifecycle::expires_at(&source.message));
-                                match fetch_chat_image(&s,&key,&url,context,&tx).await {
-                                    Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { owner,expires_at,key,image,permit:job }); },
-                                    Err(error) => { let failure=error.downcast_ref::<crate::media_recovery::Failure>().cloned().unwrap_or(crate::media_recovery::Failure::Local);crate::transfer_diagnostics::media(&failure);let _ = tx.send(GuiEvent::ImageUnavailable { key,failure }); }
+                                if key.starts_with("stk_") {
+                                    match fetch_and_decode_sticker_sprite(&key, &url).await {
+                                        Ok(sprite) => {
+                                            let _ = tx.send(GuiEvent::StickerSpriteReady {
+                                                key: key.clone(),
+                                                sprite,
+                                            });
+                                        }
+                                        Err(error) => {
+                                            let failure = error
+                                                .downcast_ref::<crate::media_recovery::Failure>()
+                                                .cloned()
+                                                .unwrap_or(crate::media_recovery::Failure::Local);
+                                            crate::transfer_diagnostics::media(&failure);
+                                            let _ = tx.send(GuiEvent::ImageUnavailable {
+                                                key,
+                                                failure,
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    match fetch_chat_image(&s,&key,&url,context,&tx).await {
+                                        Ok(image) => { let _ = tx.send(GuiEvent::PreviewImageReady { owner,expires_at,key,image,permit:job }); },
+                                        Err(error) => { let failure=error.downcast_ref::<crate::media_recovery::Failure>().cloned().unwrap_or(crate::media_recovery::Failure::Local);crate::transfer_diagnostics::media(&failure);let _ = tx.send(GuiEvent::ImageUnavailable { key,failure }); }
+                                    }
                                 }
                                 ctx.request_repaint();
                             });
@@ -3254,7 +3380,33 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx_clone.request_repaint();
                             });
                         }
-                        WorkerCmd::FetchStickerImage { .. } | WorkerCmd::FetchChatImage {..} => {},
+                        WorkerCmd::FetchStickerImage { key, url } => {
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                match fetch_and_decode_sticker_sprite(&key, &url).await {
+                                    Ok(sprite) => {
+                                        let _ = gui_tx_clone.send(GuiEvent::StickerSpriteReady {
+                                            key: key.clone(),
+                                            sprite,
+                                        });
+                                    }
+                                    Err(error) => {
+                                        let failure = error
+                                            .downcast_ref::<crate::media_recovery::Failure>()
+                                            .cloned()
+                                            .unwrap_or(crate::media_recovery::Failure::Local);
+                                        crate::transfer_diagnostics::media(&failure);
+                                        let _ = gui_tx_clone.send(GuiEvent::ImageUnavailable {
+                                            key,
+                                            failure,
+                                        });
+                                    }
+                                }
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchChatImage { .. } => {}
                         WorkerCmd::FetchStickerStore => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
@@ -4276,6 +4428,76 @@ mod lifecycle_tests {
 #[cfg(test)]
 mod image_pipeline_tests {
     use super::*;
+
+    #[test]
+    fn parse_sticker_key_extracts_cid_and_sid() {
+        assert_eq!(parse_sticker_key("stk_0_15"), Some((0, 15)));
+        assert_eq!(parse_sticker_key("stk_61900_98930"), Some((61900, 98930)));
+        assert_eq!(parse_sticker_key("stk_99901_999001"), Some((99901, 999001)));
+        assert_eq!(parse_sticker_key("stk_invalid"), None);
+        assert_eq!(parse_sticker_key("stk_0"), None);
+        assert_eq!(parse_sticker_key("ava_12345"), None);
+    }
+
+    #[test]
+    fn decode_sprite_geometry_checks() {
+        // Multi-frame sprite sheet (2 frames of 100x100 -> 200x100)
+        let png_2frames = {
+            let img = image::RgbaImage::new(200, 100);
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+            cur.into_inner()
+        };
+        let sprite = decode_sprite_from_bytes(&png_2frames).unwrap();
+        assert_eq!(sprite.frames, 2);
+        assert_eq!(sprite.delays.len(), 2);
+        assert_eq!(sprite.delays[0], crate::gui::ZALO_SPRITE_FRAME_DELAY);
+
+        // Single frame square (100x100)
+        let png_1frame = {
+            let img = image::RgbaImage::new(100, 100);
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+            cur.into_inner()
+        };
+        let sprite = decode_sprite_from_bytes(&png_1frame).unwrap();
+        assert_eq!(sprite.frames, 1);
+        assert_eq!(sprite.delays.len(), 1);
+        assert_eq!(sprite.delays[0], crate::gui::ZALO_SPRITE_FRAME_DELAY);
+
+        // Non-divisible geometry (150x100)
+        let png_non_div = {
+            let img = image::RgbaImage::new(150, 100);
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+            cur.into_inner()
+        };
+        let sprite = decode_sprite_from_bytes(&png_non_div).unwrap();
+        assert_eq!(sprite.frames, 1);
+        assert_eq!(sprite.delays.len(), 1);
+        assert_eq!(sprite.delays[0], std::time::Duration::ZERO);
+
+        // Excessive frames > 64 (6500x100 -> 65 frames)
+        let png_excessive = {
+            let img = image::RgbaImage::new(650, 10);
+            let mut cur = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut cur, image::ImageFormat::Png).unwrap();
+            cur.into_inner()
+        };
+        let sprite = decode_sprite_from_bytes(&png_excessive).unwrap();
+        assert_eq!(sprite.frames, 1);
+        assert_eq!(sprite.delays.len(), 1);
+        assert_eq!(sprite.delays[0], std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_decode_bundled_sticker_sprite() {
+        let sprite = fetch_and_decode_sticker_sprite("stk_99901_999001", "")
+            .await
+            .expect("Bundled sticker should decode directly");
+        assert!(sprite.frames > 0);
+        assert_eq!(sprite.delays.len(), sprite.frames as usize);
+    }
     #[tokio::test]
     async fn bundled_thumbnail_never_uses_network_or_private_disk_cache() {
         let mut session = Session::new(false, false, false).unwrap();

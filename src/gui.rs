@@ -115,6 +115,15 @@ fn apply_outgoing_state(app: &mut ZaloGuiApp, thread_id: String, message: ChatMe
     }
 }
 
+pub const ZALO_SPRITE_FRAME_DELAY: std::time::Duration = std::time::Duration::from_millis(80);
+
+#[derive(Clone, Debug)]
+pub struct DecodedSpriteData {
+    pub image: egui::ColorImage, // Dải ngang chứa 1 hoặc nhiều frame
+    pub frames: u16,             // Số frame (width / height)
+    pub delays: Vec<std::time::Duration>, // Thời gian hiển thị từng frame
+}
+
 pub enum GuiEvent {
     E2eeTrialPrepared {
         owner: String,
@@ -413,6 +422,10 @@ pub enum GuiEvent {
     StickerImageReady {
         key: String,
         image: egui::ColorImage,
+    },
+    StickerSpriteReady {
+        key: String,
+        sprite: DecodedSpriteData,
     },
     StickerStoreLoaded(Vec<crate::chat::StickerPackInfo>),
     StickerPackItemsLoaded {
@@ -4241,6 +4254,12 @@ impl ZaloGuiApp {
                     self.image_retry_at.remove(&key);
                     self.image_failures.remove(&key);
                     self.store_texture(ctx, key, image);
+                }
+                GuiEvent::StickerSpriteReady { key, sprite } => {
+                    self.loading_stickers.remove(&key);
+                    self.image_retry_at.remove(&key);
+                    self.image_failures.remove(&key);
+                    self.store_texture(ctx, key, sprite.image);
                 }
                 GuiEvent::StickerStoreLoaded(packs) => {
                     self.sticker_store_loading = false;

@@ -136,6 +136,64 @@ pub(crate) async fn stage(
     })
     .await?
 }
+/// Decode a bundled animated GIF sticker into a horizontally stitched sprite sheet.
+pub fn decode_gif_sprite(id: u64) -> Option<crate::gui::DecodedSpriteData> {
+    use image::codecs::gif::GifDecoder;
+    use image::AnimationDecoder;
+
+    let item = find(id)?;
+    let decoder = GifDecoder::new(std::io::Cursor::new(item.gif)).ok()?;
+    let frames = decoder.into_frames().collect_frames().ok()?;
+    if frames.is_empty() {
+        return None;
+    }
+
+    let frame_count = frames.len();
+    let width = frames[0].buffer().width() as usize;
+    let height = frames[0].buffer().height() as usize;
+    if width == 0 || height == 0 {
+        return None;
+    }
+
+    let total_width = width * frame_count;
+    let mut stitched_pixels = vec![0u8; total_width * height * 4];
+
+    for (f, frame) in frames.iter().enumerate() {
+        let buffer = frame.buffer();
+        let frame_w = (buffer.width() as usize).min(width);
+        let frame_h = (buffer.height() as usize).min(height);
+        let raw = buffer.as_raw();
+        let buffer_stride = buffer.width() as usize * 4;
+
+        for y in 0..frame_h {
+            let src_start = y * buffer_stride;
+            let src_end = src_start + frame_w * 4;
+            let dst_start = (y * total_width + f * width) * 4;
+            let dst_end = dst_start + frame_w * 4;
+            stitched_pixels[dst_start..dst_end].copy_from_slice(&raw[src_start..src_end]);
+        }
+    }
+
+    let delays: Vec<std::time::Duration> = frames
+        .iter()
+        .map(|f| {
+            let d: std::time::Duration = f.delay().into();
+            d.max(std::time::Duration::from_millis(20))
+        })
+        .collect();
+
+    let image = eframe::egui::ColorImage::from_rgba_unmultiplied(
+        [total_width, height],
+        &stitched_pixels,
+    );
+
+    Some(crate::gui::DecodedSpriteData {
+        image,
+        frames: frame_count as u16,
+        delays,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +216,22 @@ mod tests {
         assert!(thumbnail("stk_61900_999001").is_none());
         assert!(thumbnail("stk_99901_../../file").is_none());
         assert!(find(999999).is_none());
+    }
+    #[test]
+    fn test_decode_gif_sprite() {
+        assert!(decode_gif_sprite(999999).is_none());
+        for item in ITEMS {
+            let sprite = decode_gif_sprite(item.id).expect("Sprite decode failed");
+            assert!(sprite.frames > 0);
+            assert_eq!(sprite.delays.len(), sprite.frames as usize);
+            for d in &sprite.delays {
+                assert!(*d >= std::time::Duration::from_millis(20));
+            }
+            assert_eq!(sprite.image.size[0] % sprite.frames as usize, 0);
+            let frame_width = sprite.image.size[0] / sprite.frames as usize;
+            assert!(frame_width > 0);
+            assert!(sprite.image.size[1] > 0);
+        }
     }
     #[tokio::test]
     async fn logged_out_gif_send_never_creates_an_upload_file() {
