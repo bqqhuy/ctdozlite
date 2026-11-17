@@ -1228,6 +1228,7 @@ pub(super) fn spawn_session_worker(
                         Err(_) => crate::logger::log_error("live baseline", "Cannot prime cached message identities"),
                     }
                     let _ = crate::login::get_server_info(&s).await;
+                    hydrate_e2ee_peers(&s, &gui_tx, &egui_ctx);
                 }
                 {
                     let s_kw = session.clone();
