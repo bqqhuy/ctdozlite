@@ -11,6 +11,7 @@ use zalo_rust::{
 };
 
 async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    std::env::set_var("CTDOZ_ALLOW_TEST_LOOPBACK", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
     let body = body.map(str::to_owned);
