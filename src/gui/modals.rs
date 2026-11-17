@@ -397,6 +397,11 @@ impl ZaloGuiApp {
                         .rounding(Rounding::same(12.0))
                         .inner_margin(Margin::symmetric(14.0, 12.0))
                         .show(ui, |ui| {
+                            let resolved_phone_name = resolve_contact_name_from(
+                                &self.server_aliases,
+                                &prof.user_id,
+                                &prof.display_name,
+                            );
                             ui.horizontal(|ui| {
                                 let (av_rect, _) =
                                     ui.allocate_exact_size(Vec2::splat(54.0), Sense::hover());
@@ -404,7 +409,7 @@ impl ZaloGuiApp {
                                     ui.painter(),
                                     av_rect.center(),
                                     27.0,
-                                    &prof.display_name,
+                                    resolved_phone_name,
                                     false,
                                     Some(prof.avatar.as_str()),
                                     &self.sticker_textures,
@@ -415,7 +420,7 @@ impl ZaloGuiApp {
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(
-                                            RichText::new(&prof.display_name)
+                                            RichText::new(resolved_phone_name)
                                                 .size(15.0)
                                                 .color(pal.text_primary)
                                                 .strong(),
@@ -450,6 +455,21 @@ impl ZaloGuiApp {
                                                 );
                                             });
                                     });
+                                    let zalo_sub = (!prof.zalo_name.trim().is_empty()
+                                        && prof.zalo_name.trim() != resolved_phone_name)
+                                        .then_some(prof.zalo_name.trim())
+                                        .or_else(|| {
+                                            (!prof.display_name.trim().is_empty()
+                                                && prof.display_name.trim() != resolved_phone_name)
+                                                .then_some(prof.display_name.trim())
+                                        });
+                                    if let Some(zalo_name) = zalo_sub {
+                                        ui.label(
+                                            RichText::new(format!("Tên Zalo: {zalo_name}"))
+                                                .size(11.5)
+                                                .color(pal.text_muted),
+                                        );
+                                    }
                                     ui.label(
                                         RichText::new(format!(
                                             "SĐT: {} · UID: {}",
@@ -582,6 +602,9 @@ impl ZaloGuiApp {
         }
 
         if let Some(prof) = open_chat_user {
+            let opened_name = self
+                .resolve_contact_name(&prof.user_id, &prof.display_name)
+                .to_owned();
             if let Some(idx) = self.threads.iter().position(|t| t.id == prof.user_id) {
                 self.selected_thread_index = idx;
             } else {
@@ -603,12 +626,17 @@ impl ZaloGuiApp {
                         messages: Vec::new(),
                     },
                 );
-                self.selected_thread_index = 0;
+                self.apply_server_aliases();
+                self.selected_thread_index = self
+                    .threads
+                    .iter()
+                    .position(|t| t.id == prof.user_id)
+                    .unwrap_or(0);
                 self.persist_threads_async();
             }
             self.search_query.clear();
             self.phone_modal_open = false;
-            self.show_toast(format!("Đã mở cuộc trò chuyện với {}", prof.display_name));
+            self.show_toast(format!("Đã mở cuộc trò chuyện với {opened_name}"));
         }
 
         if let Some((uid, uname)) = add_friend_user {
@@ -629,7 +657,7 @@ impl ZaloGuiApp {
         if !self.settings_modal_open {
             return;
         }
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if !self.pin_setup_modal_open && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.settings_modal_open = false;
             self.save_settings();
             return;
@@ -688,6 +716,7 @@ impl ZaloGuiApp {
 
                                 let tabs = [
                                     (SettingsTab::General, lucide::SETTINGS, "Cài đặt chung"),
+                                    (SettingsTab::AccountSecurity, lucide::SHIELD_CHECK, "Tài khoản & bảo mật"),
                                     (SettingsTab::Privacy, lucide::LOCK, "Quyền riêng tư"),
                                     (SettingsTab::Sync, lucide::REFRESH, "Đồng bộ tin nhắn"),
                                     (SettingsTab::Appearance, lucide::PAINTBRUSH, "Giao diện"),
@@ -770,6 +799,7 @@ impl ZaloGuiApp {
                             ui.horizontal(|ui| {
                                 let tab_title = match self.settings_tab {
                                     SettingsTab::General => "Cài đặt chung",
+                                    SettingsTab::AccountSecurity => "Tài khoản & bảo mật",
                                     SettingsTab::Privacy => "Quyền riêng tư",
                                     SettingsTab::Sync => "Đồng bộ tin nhắn",
                                     SettingsTab::Appearance => "Cài đặt giao diện",
@@ -784,6 +814,7 @@ impl ZaloGuiApp {
                                         .show_ui(ui, |ui| {
                                             for (tab, title) in [
                                                 (SettingsTab::General,"Cài đặt chung"),
+                                                (SettingsTab::AccountSecurity,"Tài khoản & bảo mật"),
                                                 (SettingsTab::Privacy,"Quyền riêng tư"),
                                                 (SettingsTab::Sync,"Lịch sử tin nhắn"),
                                                 (SettingsTab::Appearance,"Giao diện"),
@@ -999,6 +1030,176 @@ impl ZaloGuiApp {
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             if ui.small_button(format!("{} Quét lại thiết bị", lucide::REFRESH)).clicked() {
                                                                 let _ = crate::media::list_media_devices(true);
+                                                            }
+                                                        });
+                                                    });
+                                                });
+                                        }
+                                        SettingsTab::AccountSecurity => {
+                                            ui.label(
+                                                RichText::new(crate::i18n::tr("Khóa ứng dụng Zalo"))
+                                                    .color(pal.text_primary)
+                                                    .size(13.5)
+                                                    .strong(),
+                                            );
+                                            ui.add_space(2.0);
+                                            ui.label(
+                                                RichText::new(crate::i18n::tr(
+                                                    "Bảo vệ ứng dụng bằng mã PIN 4 số hoặc Windows Hello khi khởi động và khi khóa nhanh (Ctrl+L)",
+                                                ))
+                                                .color(pal.text_secondary)
+                                                .size(12.0),
+                                            );
+                                            ui.add_space(6.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 12.0))
+                                                .show(ui, |ui| {
+                                                    ui.set_min_width(ui.available_width());
+
+                                                    // Row 1: Bật/Tắt Khóa ứng dụng Zalo
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(
+                                                                RichText::new(crate::i18n::tr("Khóa ứng dụng Zalo"))
+                                                                    .color(pal.text_primary)
+                                                                    .size(13.2)
+                                                                    .strong(),
+                                                            );
+                                                            ui.label(
+                                                                RichText::new(crate::i18n::tr(
+                                                                    "Yêu cầu xác thực khi mở ứng dụng hoặc sau 5 phút không hoạt động",
+                                                                ))
+                                                                .color(pal.text_secondary)
+                                                                .size(11.8),
+                                                            );
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let mut lock_toggle = self.settings.enable_app_lock;
+                                                            if render_toggle_switch(ui, &mut lock_toggle, pal).changed() {
+                                                                if lock_toggle {
+                                                                    if self.settings.has_pin() {
+                                                                        self.settings.enable_app_lock = true;
+                                                                        self.save_settings();
+                                                                    } else {
+                                                                        self.pin_setup_modal_open = true;
+                                                                        self.pin_setup_enable_after = true;
+                                                                        self.pin_setup_first.clear();
+                                                                        self.pin_setup_confirm.clear();
+                                                                        self.pin_setup_error = None;
+                                                                    }
+                                                                } else {
+                                                                    self.settings.enable_app_lock = false;
+                                                                    self.save_settings();
+                                                                }
+                                                            }
+                                                        });
+                                                    });
+
+                                                    ui.add_space(10.0);
+                                                    ui.separator();
+                                                    ui.add_space(10.0);
+
+                                                    // Row 2: Mã PIN 4 số
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(
+                                                                RichText::new(crate::i18n::tr("Mã PIN 4 số"))
+                                                                    .color(pal.text_primary)
+                                                                    .size(13.2)
+                                                                    .strong(),
+                                                            );
+                                                            let pin_status = if self.settings.has_pin() {
+                                                                "Đã thiết lập mã PIN 4 số"
+                                                            } else {
+                                                                "Chưa thiết lập mã PIN"
+                                                            };
+                                                            ui.label(
+                                                                RichText::new(crate::i18n::tr(pin_status))
+                                                                    .color(pal.text_secondary)
+                                                                    .size(11.8),
+                                                            );
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let btn_label = if self.settings.has_pin() {
+                                                                "Đổi mã PIN"
+                                                            } else {
+                                                                "Tạo mã PIN"
+                                                            };
+                                                            if ui.button(crate::i18n::tr(btn_label)).clicked() {
+                                                                self.pin_setup_modal_open = true;
+                                                                self.pin_setup_enable_after = !self.settings.has_pin();
+                                                                self.pin_setup_first.clear();
+                                                                self.pin_setup_confirm.clear();
+                                                                self.pin_setup_error = None;
+                                                            }
+                                                            if self.can_lock_app()
+                                                                && ui.button(crate::i18n::tr("Khóa ngay (Ctrl+L)")).clicked()
+                                                            {
+                                                                open = false;
+                                                                self.lock_app();
+                                                            }
+                                                        });
+                                                    });
+
+                                                    ui.add_space(10.0);
+                                                    ui.separator();
+                                                    ui.add_space(10.0);
+
+                                                    // Row 3: Mở khóa bằng Windows Hello
+                                                    let bio_avail = self.lock_guard.is_biometric_available();
+                                                    let hello_tooltip = crate::i18n::tr(
+                                                        "Thiết bị không hỗ trợ Windows Hello hoặc chưa được thiết lập",
+                                                    );
+                                                    ui.horizontal(|ui| {
+                                                        let label_col = if bio_avail {
+                                                            pal.text_primary
+                                                        } else {
+                                                            pal.text_muted
+                                                        };
+                                                        let sub_col = if bio_avail {
+                                                            pal.text_secondary
+                                                        } else {
+                                                            pal.text_muted
+                                                        };
+                                                        let info_resp = ui
+                                                            .vertical(|ui| {
+                                                                ui.label(
+                                                                    RichText::new(crate::i18n::tr("Mở khóa bằng Windows Hello"))
+                                                                        .color(label_col)
+                                                                        .size(13.2)
+                                                                        .strong(),
+                                                                );
+                                                                ui.label(
+                                                                    RichText::new(crate::i18n::tr(
+                                                                        "Dùng vân tay, khuôn mặt hoặc Windows Hello thay cho mã PIN",
+                                                                    ))
+                                                                    .color(sub_col)
+                                                                    .size(11.8),
+                                                                );
+                                                            })
+                                                            .response;
+                                                        if !bio_avail {
+                                                            info_resp.on_hover_text(hello_tooltip);
+                                                        }
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let mut hello_toggle = self.settings.use_windows_hello;
+                                                            let toggle_resp = ui
+                                                                .add_enabled_ui(bio_avail, |ui| {
+                                                                    render_toggle_switch(ui, &mut hello_toggle, pal)
+                                                                })
+                                                                .inner;
+                                                            if bio_avail {
+                                                                if toggle_resp.changed() {
+                                                                    self.settings.use_windows_hello = hello_toggle;
+                                                                    self.save_settings();
+                                                                }
+                                                            } else {
+                                                                toggle_resp
+                                                                    .on_hover_text(hello_tooltip)
+                                                                    .on_disabled_hover_text(hello_tooltip);
                                                             }
                                                         });
                                                     });
@@ -1531,6 +1732,169 @@ impl ZaloGuiApp {
         if !open {
             self.settings_modal_open = false;
             self.save_settings();
+        }
+    }
+
+    pub(super) fn render_pin_setup_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.pin_setup_modal_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.pin_setup_modal_open = false;
+            self.pin_setup_enable_after = false;
+            self.pin_setup_first.clear();
+            self.pin_setup_confirm.clear();
+            self.pin_setup_error = None;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "pin_setup_modal_backdrop");
+
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        let title = if self.settings.has_pin() {
+            "Đổi mã PIN 4 số"
+        } else {
+            "Thiết lập mã PIN 4 số"
+        };
+
+        egui::Window::new(crate::i18n::tr(title))
+            .id(Id::new("pin_setup_modal_window"))
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .default_width(340.0)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .fill(pal.bg_elevated)
+                    .rounding(Rounding::same(12.0))
+                    .stroke(Stroke::new(1.2_f32, pal.primary))
+                    .inner_margin(Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(crate::i18n::tr(
+                        "Nhập mã PIN gồm 4 chữ số (0-9) để khóa và mở khóa ứng dụng Zalo.",
+                    ))
+                    .size(12.2)
+                    .color(pal.text_secondary),
+                );
+                ui.add_space(10.0);
+
+                ui.label(
+                    RichText::new(crate::i18n::tr("Mã PIN mới (4 số):"))
+                        .size(12.5)
+                        .color(pal.text_primary),
+                );
+                ui.add_space(4.0);
+                let first_resp = ui.add(
+                    egui::TextEdit::singleline(&mut *self.pin_setup_first)
+                        .password(true)
+                        .char_limit(4)
+                        .hint_text("••••")
+                        .margin(Margin::symmetric(10.0, 7.0))
+                        .desired_width(ui.available_width()),
+                );
+                self.pin_setup_first.retain(|c| c.is_ascii_digit());
+                if first_resp.changed() {
+                    self.pin_setup_error = None;
+                }
+
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(crate::i18n::tr("Xác nhận mã PIN:"))
+                        .size(12.5)
+                        .color(pal.text_primary),
+                );
+                ui.add_space(4.0);
+                let confirm_resp = ui.add(
+                    egui::TextEdit::singleline(&mut *self.pin_setup_confirm)
+                        .password(true)
+                        .char_limit(4)
+                        .hint_text("••••")
+                        .margin(Margin::symmetric(10.0, 7.0))
+                        .desired_width(ui.available_width()),
+                );
+                self.pin_setup_confirm.retain(|c| c.is_ascii_digit());
+                if confirm_resp.changed() {
+                    self.pin_setup_error = None;
+                }
+
+                if (first_resp.lost_focus()
+                    || confirm_resp.lost_focus()
+                    || confirm_resp.has_focus())
+                    && ui.input(|i| i.key_pressed(Key::Enter))
+                {
+                    submit = true;
+                }
+
+                if let Some(ref err) = self.pin_setup_error {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(err).size(12.0).color(pal.danger));
+                }
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let save_btn = egui::Button::new(
+                            RichText::new(crate::i18n::tr("Lưu mã PIN"))
+                                .color(Color32::WHITE)
+                                .size(12.8)
+                                .strong(),
+                        )
+                        .fill(pal.primary)
+                        .rounding(Rounding::same(8.0))
+                        .min_size(Vec2::new(96.0, 32.0));
+                        if ui
+                            .add(save_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            submit = true;
+                        }
+                        if ui.button(crate::i18n::tr("Hủy")).clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        if submit {
+            if self.pin_setup_first.len() != 4
+                || !self.pin_setup_first.bytes().all(|b| b.is_ascii_digit())
+            {
+                self.pin_setup_error = Some("Mã PIN phải gồm đúng 4 chữ số (0-9).".into());
+            } else if *self.pin_setup_first != *self.pin_setup_confirm {
+                self.pin_setup_error = Some("Mã PIN xác nhận không khớp.".into());
+            } else {
+                let new_pin = self.pin_setup_first.clone();
+                match self.settings.set_pin(&new_pin) {
+                    Ok(()) => {
+                        if self.pin_setup_enable_after {
+                            self.settings.enable_app_lock = true;
+                        }
+                        self.pin_setup_modal_open = false;
+                        self.pin_setup_enable_after = false;
+                        self.pin_setup_first.clear();
+                        self.pin_setup_confirm.clear();
+                        self.pin_setup_error = None;
+                        self.save_settings();
+                        self.show_toast("Đã lưu mã PIN khóa ứng dụng");
+                    }
+                    Err(msg) => {
+                        self.pin_setup_error = Some(msg.into());
+                    }
+                }
+            }
+        } else if cancel || !open {
+            self.pin_setup_modal_open = false;
+            self.pin_setup_enable_after = false;
+            self.pin_setup_first.clear();
+            self.pin_setup_confirm.clear();
+            self.pin_setup_error = None;
         }
     }
 
@@ -2365,23 +2729,710 @@ impl ZaloGuiApp {
             self.active_call = Some(call);
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardItemStatus {
+    Queued,
+    Sending,
+    Success,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ForwardTargetDelivery {
+    pub(crate) target_id: String,
+    pub(crate) target_name: String,
+    pub(crate) is_group: bool,
+    #[allow(dead_code)]
+    pub(crate) avatar: Option<String>,
+    pub(crate) forward_msg: ChatMessage,
+    pub(crate) forward_status: ForwardItemStatus,
+    pub(crate) note_msg: Option<ChatMessage>,
+    pub(crate) note_status: Option<ForwardItemStatus>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ForwardSessionState {
+    pub(crate) original_msg: ChatMessage,
+    pub(crate) note_text: String,
+    pub(crate) targets: Vec<ForwardTargetDelivery>,
+}
+
+impl ForwardSessionState {
+    pub(crate) fn all_finished(&self) -> bool {
+        self.targets.iter().all(|t| {
+            let fwd_done = matches!(
+                t.forward_status,
+                ForwardItemStatus::Success | ForwardItemStatus::Failed(_)
+            );
+            let note_done = t.note_status.as_ref().is_none_or(|s| {
+                matches!(s, ForwardItemStatus::Success | ForwardItemStatus::Failed(_))
+            });
+            fwd_done && note_done
+        })
+    }
+
+    pub(super) fn counts(&self) -> (usize, usize, usize) {
+        let total = self.targets.len();
+        let succeeded = self
+            .targets
+            .iter()
+            .filter(|t| {
+                t.forward_status == ForwardItemStatus::Success
+                    && t.note_status
+                        .as_ref()
+                        .is_none_or(|s| *s == ForwardItemStatus::Success)
+            })
+            .count();
+        let failed = self
+            .targets
+            .iter()
+            .filter(|t| {
+                matches!(t.forward_status, ForwardItemStatus::Failed(_))
+                    || t.note_status
+                        .as_ref()
+                        .is_some_and(|s| matches!(s, ForwardItemStatus::Failed(_)))
+            })
+            .count();
+        (total, succeeded, failed)
+    }
+
+    pub(super) fn update_outgoing_state(&mut self, thread_id: &str, message: &ChatMessage) -> bool {
+        let mut changed = false;
+        for target in &mut self.targets {
+            if target.target_id == thread_id {
+                if target.forward_msg.client_message_id == message.client_message_id {
+                    target.forward_msg = message.clone();
+                    let new_status = match message.delivery {
+                        crate::message_model::DeliveryState::ServerAccepted
+                        | crate::message_model::DeliveryState::Delivered
+                        | crate::message_model::DeliveryState::Read => ForwardItemStatus::Success,
+                        crate::message_model::DeliveryState::Failed => {
+                            let err = message
+                                .outgoing_job
+                                .as_ref()
+                                .and_then(|j| {
+                                    if j.error.is_empty() {
+                                        None
+                                    } else {
+                                        Some(j.error.clone())
+                                    }
+                                })
+                                .unwrap_or_else(|| "Máy chủ từ chối tin nhắn".to_string());
+                            ForwardItemStatus::Failed(err)
+                        }
+                        _ => ForwardItemStatus::Sending,
+                    };
+                    if target.forward_status != new_status {
+                        target.forward_status = new_status;
+                        changed = true;
+                    }
+                }
+                if let Some(note) = &mut target.note_msg {
+                    if note.client_message_id == message.client_message_id {
+                        *note = message.clone();
+                        let new_status = match message.delivery {
+                            crate::message_model::DeliveryState::ServerAccepted
+                            | crate::message_model::DeliveryState::Delivered
+                            | crate::message_model::DeliveryState::Read => {
+                                ForwardItemStatus::Success
+                            }
+                            crate::message_model::DeliveryState::Failed => {
+                                let err = message
+                                    .outgoing_job
+                                    .as_ref()
+                                    .and_then(|j| {
+                                        if j.error.is_empty() {
+                                            None
+                                        } else {
+                                            Some(j.error.clone())
+                                        }
+                                    })
+                                    .unwrap_or_else(|| "Máy chủ từ chối lời nhắn".to_string());
+                                ForwardItemStatus::Failed(err)
+                            }
+                            _ => ForwardItemStatus::Sending,
+                        };
+                        if target.note_status.as_ref() != Some(&new_status) {
+                            target.note_status = Some(new_status);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// Retry failed mutations for a specific target, returning the number of commands sent.
+    /// Preserves client identity and never resends mutations that already succeeded.
+    pub(super) fn retry_target(&mut self, target_id: &str, tx: Option<&WorkerSender>) -> usize {
+        let mut sent_count = 0;
+        for target in &mut self.targets {
+            if target.target_id == target_id {
+                if matches!(target.forward_status, ForwardItemStatus::Failed(_)) {
+                    let cmd = WorkerCmd::RetryOutgoing {
+                        thread_id: target.target_id.clone(),
+                        message: target.forward_msg.clone(),
+                    };
+                    if let Some(tx) = tx {
+                        if tx.send(cmd).is_ok() {
+                            target.forward_status = ForwardItemStatus::Sending;
+                            sent_count += 1;
+                        } else {
+                            target.forward_status =
+                                ForwardItemStatus::Failed("Không thể gửi lệnh tới worker".into());
+                        }
+                    } else {
+                        target.forward_status =
+                            ForwardItemStatus::Failed("Worker chưa sẵn sàng".into());
+                    }
+                }
+                if let Some(note) = &target.note_msg {
+                    if matches!(target.note_status, Some(ForwardItemStatus::Failed(_))) {
+                        let cmd = WorkerCmd::RetryOutgoing {
+                            thread_id: target.target_id.clone(),
+                            message: note.clone(),
+                        };
+                        if let Some(tx) = tx {
+                            if tx.send(cmd).is_ok() {
+                                target.note_status = Some(ForwardItemStatus::Sending);
+                                sent_count += 1;
+                            } else {
+                                target.note_status = Some(ForwardItemStatus::Failed(
+                                    "Không thể gửi lệnh tới worker".into(),
+                                ));
+                            }
+                        } else {
+                            target.note_status =
+                                Some(ForwardItemStatus::Failed("Worker chưa sẵn sàng".into()));
+                        }
+                    }
+                }
+            }
+        }
+        sent_count
+    }
+}
+
+impl ZaloGuiApp {
+    /// Start an active tracking session for outbound forwards and optional accompanying notes.
+    /// Preserves exact client identity, verifies queueing per target, and tracks delivery state.
+    pub(super) fn start_forward_session(&mut self) -> Option<usize> {
+        let msg = self.forward_msg.as_ref()?.clone();
+        if self.forward_targets.is_empty() {
+            return None;
+        }
+        let note = self.forward_note.trim().to_string();
+        let mut target_deliveries = Vec::new();
+
+        for t in &self.threads {
+            if !self.forward_targets.contains(&t.id) || !self.private_access(&t.id, t.is_group) {
+                continue;
+            }
+            let mut original = msg.clone();
+            original.outgoing_job = None;
+            let mut forward_msg = crate::outgoing::pending(
+                msg.text.clone(),
+                t.is_group,
+                crate::outgoing::Payload::Forward(Box::new(original)),
+            );
+            forward_msg.sticker_id = msg.sticker_id;
+            forward_msg.sticker_cate_id = msg.sticker_cate_id;
+            forward_msg.sticker_type = msg.sticker_type;
+
+            let note_msg = if !note.is_empty() {
+                Some(crate::outgoing::pending(
+                    note.clone(),
+                    t.is_group,
+                    crate::outgoing::Payload::Text,
+                ))
+            } else {
+                None
+            };
+
+            target_deliveries.push(ForwardTargetDelivery {
+                target_id: t.id.clone(),
+                target_name: self.resolve_thread_name(t).to_string(),
+                is_group: t.is_group,
+                avatar: t.avatar.clone(),
+                forward_msg,
+                forward_status: ForwardItemStatus::Queued,
+                note_msg,
+                note_status: if !note.is_empty() {
+                    Some(ForwardItemStatus::Queued)
+                } else {
+                    None
+                },
+            });
+        }
+
+        if target_deliveries.is_empty() {
+            return None;
+        }
+
+        let tx = WORKER_TX.get();
+        for target in &mut target_deliveries {
+            let fwd_cmd = WorkerCmd::RetryOutgoing {
+                thread_id: target.target_id.clone(),
+                message: target.forward_msg.clone(),
+            };
+            if let Some(ref tx) = tx {
+                if tx.send(fwd_cmd).is_ok() {
+                    target.forward_status = ForwardItemStatus::Sending;
+                } else {
+                    target.forward_status =
+                        ForwardItemStatus::Failed("Không thể gửi lệnh tới worker".into());
+                }
+            } else {
+                target.forward_status = ForwardItemStatus::Failed("Worker chưa sẵn sàng".into());
+            }
+
+            if let Some(note_msg) = &target.note_msg {
+                let note_cmd = WorkerCmd::RetryOutgoing {
+                    thread_id: target.target_id.clone(),
+                    message: note_msg.clone(),
+                };
+                if let Some(ref tx) = tx {
+                    if tx.send(note_cmd).is_ok() {
+                        target.note_status = Some(ForwardItemStatus::Sending);
+                    } else {
+                        target.note_status = Some(ForwardItemStatus::Failed(
+                            "Không thể gửi lệnh tới worker".into(),
+                        ));
+                    }
+                } else {
+                    target.note_status =
+                        Some(ForwardItemStatus::Failed("Worker chưa sẵn sàng".into()));
+                }
+            }
+        }
+
+        let target_count = target_deliveries.len();
+        self.forward_session = Some(ForwardSessionState {
+            original_msg: msg,
+            note_text: note,
+            targets: target_deliveries,
+        });
+        self.forward_msg = None;
+        self.forward_targets.clear();
+        self.forward_note.clear();
+        self.forward_filter.clear();
+        Some(target_count)
+    }
+
+    /// Build outbound forward and optional note commands for all selected targets.
+    #[allow(dead_code)]
+    pub(super) fn build_forward_commands(&self) -> (usize, Vec<WorkerCmd>) {
+        let Some(msg) = self.forward_msg.as_ref() else {
+            return (0, Vec::new());
+        };
+        if self.forward_targets.is_empty() {
+            return (0, Vec::new());
+        }
+        let note = self.forward_note.trim();
+        let mut target_count = 0usize;
+        let mut cmds = Vec::new();
+        for t in &self.threads {
+            if !self.forward_targets.contains(&t.id) || !self.private_access(&t.id, t.is_group) {
+                continue;
+            }
+            target_count += 1;
+            cmds.push(WorkerCmd::Forward {
+                target_id: t.id.clone(),
+                target_is_group: t.is_group,
+                msg: msg.clone(),
+            });
+            if !note.is_empty() {
+                cmds.push(WorkerCmd::SendMessage {
+                    to_id: t.id.clone(),
+                    text: note.to_owned(),
+                    is_group: t.is_group,
+                });
+            }
+        }
+        (target_count, cmds)
+    }
+
+    pub(super) fn render_forward_session_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if self.forward_session.is_none() {
+            return;
+        }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+            self.clear_forward_dialog();
+            return;
+        }
+
+        render_modal_backdrop(ctx, "forward_session_modal_backdrop");
+
+        let mut open = true;
+        let mut do_close = false;
+        let mut retry_target_id: Option<String> = None;
+        let mut retry_all = false;
+
+        let win_w = 460.0_f32.min((ctx.screen_rect().width() - 32.0).max(280.0));
+        let win_h = 520.0_f32.min((ctx.screen_rect().height() - 48.0).max(280.0));
+
+        let (total, succeeded, failed, all_done, preview, note_text, targets_summary) = {
+            let session = self.forward_session.as_ref().unwrap();
+            let (tot, succ, fail) = session.counts();
+            let done = session.all_finished();
+            let prev = truncate_chars(&crate::message_view::summary(&session.original_msg), 100)
+                .into_owned();
+            let note = session.note_text.clone();
+            let summaries: Vec<(
+                String,
+                String,
+                bool,
+                ForwardItemStatus,
+                Option<ForwardItemStatus>,
+            )> = session
+                .targets
+                .iter()
+                .map(|t| {
+                    (
+                        t.target_id.clone(),
+                        t.target_name.clone(),
+                        t.is_group,
+                        t.forward_status.clone(),
+                        t.note_status.clone(),
+                    )
+                })
+                .collect();
+            (tot, succ, fail, done, prev, note, summaries)
+        };
+
+        egui::Window::new(crate::i18n::tr("Trạng thái chia sẻ"))
+            .id(Id::new("forward_session_status_modal"))
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .fixed_size(Vec2::new(win_w, win_h))
+            .show(ctx, |ui| {
+                // Header summary banner
+                let (status_text, status_color) = if all_done {
+                    if failed == 0 {
+                        (
+                            format!("✓ Đã chia sẻ thành công tới {succeeded}/{total} hội thoại"),
+                            pal.accent_online,
+                        )
+                    } else if succeeded == 0 {
+                        (
+                            format!("✗ Chia sẻ thất bại cho tất cả {failed} hội thoại"),
+                            pal.danger,
+                        )
+                    } else {
+                        (
+                            format!("! Hoàn tất với {succeeded} thành công, {failed} thất bại"),
+                            pal.warning,
+                        )
+                    }
+                } else {
+                    let in_progress = total.saturating_sub(succeeded + failed);
+                    (
+                        format!(
+                            "Đang gửi... ({succeeded} hoàn thành, {failed} lỗi, {in_progress} đang chờ)",
+                        ),
+                        pal.primary,
+                    )
+                };
+
+                egui::Frame::none()
+                    .fill(status_color.linear_multiply(0.12))
+                    .stroke(Stroke::new(1.0_f32, status_color))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(12.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(status_text)
+                                .size(13.0)
+                                .color(status_color)
+                                .strong(),
+                        );
+                    });
+
+                ui.add_space(8.0);
+
+                // Content preview
+                egui::Frame::none()
+                    .fill(pal.bg_input)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(10.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(crate::i18n::tr("Tin nhắn chia sẻ"))
+                                .size(11.0)
+                                .color(pal.text_muted)
+                                .strong(),
+                        );
+                        ui.label(RichText::new(preview).size(12.0).color(pal.text_primary));
+                        if !note_text.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(format!("Lời nhắn kèm: {note_text}"))
+                                    .size(11.5)
+                                    .color(pal.text_secondary)
+                                    .italics(),
+                            );
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!("Chi tiết các đích nhận ({total}):"))
+                        .size(12.0)
+                        .color(pal.text_secondary)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+
+                let list_h = (win_h - 240.0).clamp(100.0, 260.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("forward_session_targets_scroll")
+                    .max_height(list_h)
+                    .show(ui, |ui| {
+                        for (target_id, target_name, is_group, forward_status, note_status) in
+                            &targets_summary
+                        {
+                            egui::Frame::none()
+                                .fill(pal.bg_input)
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(Margin::symmetric(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let has_failed =
+                                            matches!(forward_status, ForwardItemStatus::Failed(_))
+                                                || note_status.as_ref().is_some_and(|s| {
+                                                    matches!(s, ForwardItemStatus::Failed(_))
+                                                });
+
+                                        let display_name = if *is_group {
+                                            format!("[Nhóm] {target_name}")
+                                        } else {
+                                            target_name.clone()
+                                        };
+
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                RichText::new(truncate_chars(&display_name, 28))
+                                                    .size(12.5)
+                                                    .color(pal.text_primary)
+                                                    .strong(),
+                                            );
+                                            // Forward status
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new("Tin nhắn: ")
+                                                        .size(11.0)
+                                                        .color(pal.text_muted),
+                                                );
+                                                match forward_status {
+                                                    ForwardItemStatus::Queued => {
+                                                        ui.label(
+                                                            RichText::new("Chờ gửi...")
+                                                                .size(11.0)
+                                                                .color(pal.text_muted),
+                                                        );
+                                                    }
+                                                    ForwardItemStatus::Sending => {
+                                                        ui.label(
+                                                            RichText::new("Đang gửi...")
+                                                                .size(11.0)
+                                                                .color(pal.primary),
+                                                        );
+                                                    }
+                                                    ForwardItemStatus::Success => {
+                                                        ui.label(
+                                                            RichText::new("✓ Đã gửi")
+                                                                .size(11.0)
+                                                                .color(pal.accent_online),
+                                                        );
+                                                    }
+                                                    ForwardItemStatus::Failed(err) => {
+                                                        ui.label(
+                                                            RichText::new(format!("✗ {err}"))
+                                                                .size(11.0)
+                                                                .color(pal.danger),
+                                                        );
+                                                    }
+                                                }
+                                            });
+
+                                            // Note status if any
+                                            if let Some(note_st) = note_status {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        RichText::new("Lời nhắn: ")
+                                                            .size(11.0)
+                                                            .color(pal.text_muted),
+                                                    );
+                                                    match note_st {
+                                                        ForwardItemStatus::Queued => {
+                                                            ui.label(
+                                                                RichText::new("Chờ gửi...")
+                                                                    .size(11.0)
+                                                                    .color(pal.text_muted),
+                                                            );
+                                                        }
+                                                        ForwardItemStatus::Sending => {
+                                                            ui.label(
+                                                                RichText::new("Đang gửi...")
+                                                                    .size(11.0)
+                                                                    .color(pal.primary),
+                                                            );
+                                                        }
+                                                        ForwardItemStatus::Success => {
+                                                            ui.label(
+                                                                RichText::new("✓ Đã gửi")
+                                                                    .size(11.0)
+                                                                    .color(pal.accent_online),
+                                                            );
+                                                        }
+                                                        ForwardItemStatus::Failed(err) => {
+                                                            ui.label(
+                                                                RichText::new(format!("✗ {err}"))
+                                                                    .size(11.0)
+                                                                    .color(pal.danger),
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        });
+
+                                        if has_failed {
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    let retry_btn = egui::Button::new(
+                                                        RichText::new("Thử lại")
+                                                            .size(11.5)
+                                                            .color(Color32::WHITE),
+                                                    )
+                                                    .fill(pal.primary)
+                                                    .rounding(Rounding::same(4.0))
+                                                    .min_size(Vec2::new(60.0, 24.0));
+                                                    if ui.add(retry_btn).clicked() {
+                                                        retry_target_id = Some(target_id.clone());
+                                                    }
+                                                },
+                                            );
+                                        }
+                                    });
+                                });
+                            ui.add_space(4.0);
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if failed > 0 {
+                        let retry_all_btn = egui::Button::new(
+                            RichText::new("Thử lại tất cả lỗi")
+                                .size(12.0)
+                                .color(pal.primary),
+                        )
+                        .fill(pal.bg_input)
+                        .stroke(Stroke::new(1.0_f32, pal.primary))
+                        .rounding(Rounding::same(6.0))
+                        .min_size(Vec2::new(120.0, 28.0));
+                        if ui.add(retry_all_btn).clicked() {
+                            retry_all = true;
+                        }
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let close_label = if all_done { "Hoàn tất" } else { "Đóng" };
+                        let close_btn = egui::Button::new(
+                            RichText::new(crate::i18n::tr(close_label))
+                                .size(13.0)
+                                .color(pal.text_primary),
+                        )
+                        .fill(pal.bg_input)
+                        .rounding(Rounding::same(6.0))
+                        .min_size(Vec2::new(80.0, 30.0));
+                        if ui.add(close_btn).clicked() {
+                            do_close = true;
+                        }
+                    });
+                });
+            });
+
+        if let Some(target_id) = retry_target_id {
+            if let Some(session) = &mut self.forward_session {
+                session.retry_target(&target_id, WORKER_TX.get().as_ref());
+                ctx.request_repaint();
+            }
+        }
+        if retry_all {
+            if let Some(session) = &mut self.forward_session {
+                let failed_ids: Vec<String> = session
+                    .targets
+                    .iter()
+                    .filter(|t| {
+                        matches!(t.forward_status, ForwardItemStatus::Failed(_))
+                            || t.note_status
+                                .as_ref()
+                                .is_some_and(|s| matches!(s, ForwardItemStatus::Failed(_)))
+                    })
+                    .map(|t| t.target_id.clone())
+                    .collect();
+                for id in failed_ids {
+                    session.retry_target(&id, WORKER_TX.get().as_ref());
+                }
+                ctx.request_repaint();
+            }
+        }
+
+        if do_close || !open {
+            self.clear_forward_dialog();
+            if total > 0 {
+                if failed == 0 {
+                    let notice = format!("Đã chia sẻ tin nhắn tới {succeeded} hội thoại");
+                    self.status_msg = notice.clone();
+                    self.show_toast(notice);
+                } else if succeeded > 0 {
+                    let notice =
+                        format!("Chia sẻ hoàn tất: {succeeded} thành công, {failed} thất bại");
+                    self.status_msg = notice.clone();
+                    self.show_toast(notice);
+                } else {
+                    let notice = format!("Chia sẻ thất bại ({failed} lỗi)");
+                    self.status_msg = notice.clone();
+                    self.show_toast(notice);
+                }
+            }
+        }
+    }
 
     pub(super) fn render_forward_dialog(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if self.forward_session.is_some() {
+            self.render_forward_session_modal(ctx, pal);
+            return;
+        }
         if self.forward_msg.is_none() {
             return;
         }
         if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
-            self.forward_msg = None;
-            self.forward_filter.clear();
+            self.clear_forward_dialog();
             return;
         }
         let preview = self
             .forward_msg
             .as_ref()
-            .map(|m| truncate_chars(&crate::message_view::summary(m), 80).into_owned())
+            .map(|m| truncate_chars(&crate::message_view::summary(m), 120).into_owned())
             .unwrap_or_default();
         let query = crate::search::fold(self.forward_filter.trim());
-        let candidates: Vec<(String, String, bool)> = self
+        let candidates: Vec<(String, String, bool, Option<String>)> = self
             .threads
             .iter()
             .filter(|t| {
@@ -2393,81 +3444,263 @@ impl ZaloGuiApp {
             })
             .filter(|t| {
                 query.is_empty()
-                    || crate::search::fold(&t.name).contains(&query)
+                    || crate::search::fold(self.resolve_thread_name(t)).contains(&query)
+                    || t.presentation
+                        .base_name
+                        .as_deref()
+                        .is_some_and(|b| crate::search::fold(b).contains(&query))
                     || t.id.contains(&query)
             })
             .take(500)
-            .map(|t| (t.id.clone(), t.name.clone(), t.is_group))
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    self.resolve_thread_name(t).to_owned(),
+                    t.is_group,
+                    t.avatar.clone(),
+                )
+            })
             .collect();
         render_modal_backdrop(ctx, "forward_modal_backdrop");
 
         let mut open = true;
-        let mut chosen: Option<(String, bool)> = None;
-        egui::Window::new(crate::i18n::tr("Chuyển tiếp tin nhắn"))
+        let mut do_cancel = false;
+        let mut do_send = false;
+        let mut toggled_id: Option<String> = None;
+        let mut clear_selection = false;
+
+        let win_w = 420.0_f32.min((ctx.screen_rect().width() - 32.0).max(260.0));
+        let win_h = 540.0_f32.min((ctx.screen_rect().height() - 48.0).max(260.0));
+        egui::Window::new(crate::i18n::tr("Chia sẻ"))
+            .id(Id::new("forward_message_modal"))
             .order(egui::Order::Foreground)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .fixed_size(Vec2::new(
-                360.0_f32.min((ctx.screen_rect().width() - 32.0).max(220.0)),
-                420.0_f32.min((ctx.screen_rect().height() - 64.0).max(180.0)),
-            ))
+            .fixed_size(Vec2::new(win_w, win_h))
             .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!("Nội dung: {preview}"))
-                        .size(12.5)
-                        .color(pal.text_secondary),
-                );
-                ui.add_space(6.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.forward_filter)
-                        .hint_text(crate::i18n::tr("Tìm hội thoại…"))
+                        .hint_text(crate::i18n::tr("Tìm hội thoại, bạn bè, nhóm…"))
                         .desired_width(f32::INFINITY),
                 );
                 ui.add_space(6.0);
-                egui::ScrollArea::vertical()
-                    .max_height((ctx.screen_rect().height() - 200.0).clamp(80.0, 320.0))
-                    .show(ui, |ui| {
-                        for (id, name, is_group) in &candidates {
-                            let label = if *is_group {
-                                format!("[Nhóm] {name} • {id}")
+
+                ui.horizontal(|ui| {
+                    let count = self.forward_targets.len();
+                    ui.label(
+                        RichText::new(format!("Đã chọn: {count}"))
+                            .size(12.0)
+                            .color(if count > 0 {
+                                pal.primary
                             } else {
-                                format!("{name} • {id}")
-                            };
-                            let btn = egui::Button::new(RichText::new(label).size(13.5))
-                                .fill(pal.bg_input);
+                                pal.text_secondary
+                            })
+                            .strong(),
+                    );
+                    if count > 0 {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if ui
-                                .add_sized([ui.available_width(), 30.0], btn)
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(crate::i18n::tr("Bỏ chọn tất cả"))
+                                            .size(11.5)
+                                            .color(pal.text_secondary),
+                                    )
+                                    .frame(false),
+                                )
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .clicked()
                             {
-                                chosen = Some((id.clone(), *is_group));
+                                clear_selection = true;
                             }
+                        });
+                    }
+                });
+                ui.add_space(4.0);
+
+                let list_h = (win_h - 265.0).clamp(110.0, 250.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("forward_targets_scroll")
+                    .max_height(list_h)
+                    .show(ui, |ui| {
+                        if candidates.is_empty() {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new(crate::i18n::tr(
+                                        "Không tìm thấy hội thoại phù hợp",
+                                    ))
+                                    .size(12.5)
+                                    .color(pal.text_muted),
+                                );
+                            });
+                            return;
+                        }
+                        for (id, name, is_group, avatar) in &candidates {
+                            let selected = self.forward_targets.contains(id);
+                            let row_w = ui.available_width();
+                            let (row_rect, row_resp) =
+                                ui.allocate_exact_size(Vec2::new(row_w, 38.0), Sense::click());
+                            let row_bg = if selected {
+                                pal.primary.linear_multiply(0.12)
+                            } else if row_resp.hovered() {
+                                pal.bg_hover
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+                            ui.painter()
+                                .rect_filled(row_rect, Rounding::same(6.0), row_bg);
+
+                            let check_center =
+                                egui::pos2(row_rect.left() + 14.0, row_rect.center().y);
+                            let check_box =
+                                egui::Rect::from_center_size(check_center, Vec2::splat(16.0));
+                            if selected {
+                                ui.painter().rect_filled(
+                                    check_box,
+                                    Rounding::same(4.0),
+                                    pal.primary,
+                                );
+                                ui.painter().text(
+                                    check_center,
+                                    egui::Align2::CENTER_CENTER,
+                                    "✓",
+                                    FontId::proportional(11.5),
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter().rect_stroke(
+                                    check_box,
+                                    Rounding::same(4.0),
+                                    Stroke::new(1.2_f32, pal.border),
+                                );
+                            }
+
+                            let ava_center =
+                                egui::pos2(row_rect.left() + 42.0, row_rect.center().y);
+                            paint_user_avatar(
+                                ui.painter(),
+                                ava_center,
+                                13.0,
+                                name,
+                                *is_group,
+                                avatar.as_deref(),
+                                &self.sticker_textures,
+                                &mut self.loading_stickers,
+                            );
+
+                            let display_name = if *is_group {
+                                format!("[Nhóm] {name}")
+                            } else {
+                                name.clone()
+                            };
+                            let text_pos = egui::pos2(row_rect.left() + 62.0, row_rect.center().y);
+                            ui.painter().text(
+                                text_pos,
+                                egui::Align2::LEFT_CENTER,
+                                truncate_chars(&display_name, 34),
+                                FontId::proportional(13.2),
+                                pal.text_primary,
+                            );
+
+                            if row_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                                toggled_id = Some(id.clone());
+                            }
+                            ui.add_space(2.0);
                         }
                     });
+
+                ui.add_space(8.0);
+                egui::Frame::none()
+                    .fill(pal.bg_input)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            RichText::new(crate::i18n::tr("Nội dung chia sẻ"))
+                                .size(11.0)
+                                .color(pal.text_muted)
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(RichText::new(&preview).size(12.5).color(pal.text_primary));
+                    });
+
+                ui.add_space(8.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.forward_note)
+                        .hint_text(crate::i18n::tr("Nhập lời nhắn..."))
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY),
+                );
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let can_send = !self.forward_targets.is_empty();
+                        let share_btn = egui::Button::new(
+                            RichText::new(crate::i18n::tr("Chia sẻ"))
+                                .size(13.0)
+                                .color(if can_send {
+                                    Color32::WHITE
+                                } else {
+                                    pal.text_muted
+                                })
+                                .strong(),
+                        )
+                        .fill(if can_send { pal.primary } else { pal.bg_input })
+                        .rounding(Rounding::same(6.0))
+                        .min_size(Vec2::new(92.0, 32.0));
+                        if ui
+                            .add_enabled(can_send, share_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            do_send = true;
+                        }
+
+                        let cancel_btn = egui::Button::new(
+                            RichText::new(crate::i18n::tr("Hủy"))
+                                .size(13.0)
+                                .color(pal.text_primary),
+                        )
+                        .fill(pal.bg_input)
+                        .rounding(Rounding::same(6.0))
+                        .min_size(Vec2::new(76.0, 32.0));
+                        if ui
+                            .add(cancel_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            do_cancel = true;
+                        }
+                    });
+                });
             });
-        if let Some((target_id, target_is_group)) = chosen {
-            if let (Some(msg), Some(tx)) = (self.forward_msg.as_ref(), WORKER_TX.get()) {
-                if tx
-                    .send(WorkerCmd::Forward {
-                        target_id,
-                        target_is_group,
-                        msg: msg.clone(),
-                    })
-                    .is_ok()
-                {
-                    self.forward_msg = None;
-                    self.forward_filter.clear();
-                    self.status_msg = "Đang chuyển tiếp…".into();
-                } else {
-                    self.show_toast("Worker chưa sẵn sàng; tin chưa được chuyển tiếp");
-                }
-            } else {
-                self.show_toast("Worker chưa sẵn sàng; tin chưa được chuyển tiếp");
+
+        if clear_selection {
+            self.forward_targets.clear();
+        }
+        if let Some(id) = toggled_id {
+            if !self.forward_targets.remove(&id) {
+                self.forward_targets.insert(id);
             }
-        } else if !open {
-            self.forward_msg = None;
+        }
+
+        if do_cancel || !open {
+            self.clear_forward_dialog();
+        } else if do_send {
+            if self.start_forward_session().is_some() {
+                ctx.request_repaint();
+            } else {
+                self.show_toast("Vui lòng chọn ít nhất một hội thoại để chia sẻ");
+            }
         }
     }
 
@@ -3051,6 +4284,7 @@ impl ZaloGuiApp {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn open_safety_number_modal(&mut self, peer_id: String, peer_name: String) {
         let is_verified = self.trusted_peers.contains(&peer_id);
         self.safety_number_modal = Some(super::SafetyNumberModalState {
@@ -3070,6 +4304,9 @@ impl ZaloGuiApp {
         }
     }
 
+    // Retained for compatibility with the dormant E2EE state/engine; MAP-10 no longer
+    // exposes this experimental modal in the product UI.
+    #[allow(dead_code)]
     pub(super) fn render_safety_number_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         let Some(ref mut modal) = self.safety_number_modal else {
             return;
@@ -3217,21 +4454,342 @@ impl ZaloGuiApp {
         }
     }
 
+    pub(super) fn render_auto_delete_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let Some(ref mut modal) = self.auto_delete_modal else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.auto_delete_modal = None;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "auto_delete_modal_backdrop");
+
+        let mut is_open = true;
+        let mut cancel_clicked = false;
+        let mut save_ttl: Option<(String, bool, i64)> = None;
+        let thread_id = modal.thread_id.clone();
+        let is_group = modal.is_group;
+        let thread_name = modal.thread_name.clone();
+        let pending = self.policy_panel.pending;
+
+        egui::Window::new("Tin nhắn tự xóa")
+            .id(Id::new("auto_delete_modal"))
+            .order(egui::Order::Foreground)
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(380.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                if !thread_name.is_empty() {
+                    ui.label(
+                        RichText::new(thread_name)
+                            .size(12.0)
+                            .color(pal.text_muted),
+                    );
+                    ui.add_space(4.0);
+                }
+                ui.label(
+                    RichText::new(
+                        "Tin nhắn sẽ tự động biến mất đối với cả hai bên sau khoảng thời gian đã chọn.",
+                    )
+                    .size(12.5)
+                    .color(pal.text_secondary),
+                );
+                ui.add_space(12.0);
+
+                egui::Frame::none()
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .inner_margin(Margin::symmetric(14.0, 10.0))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 8.0;
+                        for (ttl, label) in [
+                            (0_i64, "Không bao giờ (Tắt)"),
+                            (86_400_000_i64, "1 ngày"),
+                            (604_800_000_i64, "7 ngày"),
+                            (2_592_000_000_i64, "30 ngày"),
+                        ] {
+                            ui.radio_value(&mut modal.selected_ttl, ttl, label);
+                        }
+                    });
+
+                ui.add_space(14.0);
+                if pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Đang đồng bộ thiết lập với Zalo…")
+                                .size(11.5)
+                                .color(pal.text_secondary),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let save_btn = egui::Button::new(
+                        RichText::new("Lưu")
+                            .size(13.0)
+                            .color(Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(pal.primary)
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(88.0, 32.0));
+                    if ui
+                        .add_enabled(!pending, save_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        save_ttl = Some((thread_id, is_group, modal.selected_ttl));
+                    }
+
+                    ui.add_space(6.0);
+                    let cancel_btn = egui::Button::new(
+                        RichText::new("Hủy").size(13.0).color(pal.text_primary),
+                    )
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(80.0, 32.0));
+                    if ui
+                        .add(cancel_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if let Some((thread, group, ttl)) = save_ttl {
+            self.policy_command(crate::conversation_policy::Action::SetTtl { thread, group, ttl });
+            self.auto_delete_modal = None;
+            let toast_label = match ttl {
+                0 => "Đã gửi yêu cầu tắt tin nhắn tự xóa".to_string(),
+                86_400_000 => "Đã gửi yêu cầu đặt tin nhắn tự xóa: 1 ngày".to_string(),
+                604_800_000 => "Đã gửi yêu cầu đặt tin nhắn tự xóa: 7 ngày".to_string(),
+                2_592_000_000 => "Đã gửi yêu cầu đặt tin nhắn tự xóa: 30 ngày".to_string(),
+                _ => format!(
+                    "Đã gửi yêu cầu đặt tin nhắn tự xóa: {} giờ",
+                    ttl / 3_600_000
+                ),
+            };
+            self.show_toast(toast_label);
+        } else if !is_open || cancel_clicked {
+            self.auto_delete_modal = None;
+        }
+    }
+
+    pub(super) fn render_content_protection_modal(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &ThemePalette,
+    ) {
+        let Some(ref modal) = self.content_protection_modal else {
+            return;
+        };
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.content_protection_modal = None;
+            return;
+        }
+
+        render_modal_backdrop(ctx, "content_protection_modal_backdrop");
+
+        let mut is_open = true;
+        let mut cancel_clicked = false;
+        let mut confirm_action: Option<(String, bool, bool)> = None;
+        let thread_id = modal.thread_id.clone();
+        let is_group = modal.is_group;
+        let thread_name = modal.thread_name.clone();
+        let current_enabled = modal.current_enabled;
+        let pending = self.policy_panel.pending;
+
+        egui::Window::new("Chặn sao chép & chia sẻ")
+            .id(Id::new("content_protection_modal"))
+            .order(egui::Order::Foreground)
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(400.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(12.0))
+                    .inner_margin(Margin::symmetric(20.0, 16.0)),
+            )
+            .show(ctx, |ui| {
+                if !thread_name.is_empty() {
+                    ui.label(
+                        RichText::new(thread_name)
+                            .size(12.0)
+                            .color(pal.text_muted),
+                    );
+                    ui.add_space(4.0);
+                }
+                let desc = if current_enabled {
+                    "Hội thoại này hiện đang bật chế độ chặn sao chép, tải về và chuyển tiếp nội dung. Bạn có muốn tắt bảo vệ nội dung?"
+                } else {
+                    "Khi bật, các thành viên sẽ bị hạn chế sao chép, tải về và chuyển tiếp tin nhắn, ảnh hoặc tập tin trong hội thoại này."
+                };
+                ui.label(RichText::new(desc).size(12.5).color(pal.text_secondary));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Lưu ý: Máy chủ Zalo quyết định quyền thực thi; tính năng này không ngăn được mọi cách chụp màn hình.")
+                        .size(11.0)
+                        .color(pal.text_muted),
+                );
+                ui.add_space(14.0);
+
+                if pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Đang đồng bộ thiết lập với Zalo…")
+                                .size(11.5)
+                                .color(pal.text_secondary),
+                        );
+                    });
+                    ui.add_space(6.0);
+                }
+
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let confirm_text = if current_enabled {
+                        "Tắt chặn chia sẻ"
+                    } else {
+                        "Bật chặn chia sẻ"
+                    };
+                    let confirm_btn = egui::Button::new(
+                        RichText::new(confirm_text)
+                            .size(13.0)
+                            .color(Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(pal.primary)
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(124.0, 32.0));
+                    if ui
+                        .add_enabled(!pending, confirm_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        confirm_action = Some((thread_id, is_group, !current_enabled));
+                    }
+
+                    ui.add_space(6.0);
+                    let cancel_btn = egui::Button::new(
+                        RichText::new("Hủy").size(13.0).color(pal.text_primary),
+                    )
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(80.0, 32.0));
+                    if ui
+                        .add(cancel_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        cancel_clicked = true;
+                    }
+                });
+            });
+
+        if let Some((thread, group, enabled)) = confirm_action {
+            self.policy_command(crate::conversation_policy::Action::SetProtection {
+                thread,
+                group,
+                enabled,
+            });
+            self.content_protection_modal = None;
+            self.show_toast(if enabled {
+                "Đã gửi yêu cầu bật chặn chia sẻ nội dung"
+            } else {
+                "Đã gửi yêu cầu tắt chặn chia sẻ nội dung"
+            });
+        } else if !is_open || cancel_clicked {
+            self.content_protection_modal = None;
+        }
+    }
+
     /// Detect an `http://` or `https://` URL in `self.input_message` and asynchronously fetch its
     /// OpenGraph / Zalo `parselink` metadata (`title`, `desc`, `thumb`, `src`).
     pub(super) fn resolve_composer_link_preview(
         &mut self,
         ctx: &egui::Context,
+        thread_id: &str,
     ) -> Option<crate::chat::LinkMetadata> {
+        let debounce_key = Id::new((
+            "composer_link_preview_debounce",
+            self.user_uin.as_str(),
+            thread_id,
+        ));
         let Some(url) = crate::chat::extract_first_url(&self.input_message) else {
             self.dismissed_link_preview_for.clear();
+            ctx.data_mut(|data| {
+                data.remove::<(
+                    String,
+                    String,
+                    String,
+                    std::time::Instant,
+                    std::time::Instant,
+                )>(debounce_key);
+            });
             return None;
         };
         if self.dismissed_link_preview_for == url {
             return None;
         }
-        let elapsed = self.last_composer_edit_at.elapsed();
-        let debounce = Duration::from_millis(200);
+
+        let owner = self.user_uin.clone();
+        let last_edit = self.last_composer_edit_at;
+        let state = ctx.data(|data| {
+            data.get_temp::<(
+                String,
+                String,
+                String,
+                std::time::Instant,
+                std::time::Instant,
+            )>(debounce_key)
+        });
+        let (scheduled_at, same_draft) = match state {
+            Some((saved_owner, saved_thread, saved_url, saved_edit, scheduled_at))
+                if saved_owner == owner
+                    && saved_thread == thread_id
+                    && saved_url == url
+                    && saved_edit == last_edit =>
+            {
+                (scheduled_at, true)
+            }
+            Some((saved_owner, saved_thread, saved_url, _, _))
+                if saved_owner == owner && saved_thread == thread_id && saved_url == url =>
+            {
+                (last_edit, false)
+            }
+            _ => (std::time::Instant::now(), false),
+        };
+        if !same_draft {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    debounce_key,
+                    (
+                        owner,
+                        thread_id.to_owned(),
+                        url.clone(),
+                        last_edit,
+                        scheduled_at,
+                    ),
+                );
+            });
+        }
+
+        let debounce = Duration::from_millis(350);
+        let elapsed = scheduled_at.elapsed().max(last_edit.elapsed());
         if elapsed < debounce {
             ctx.request_repaint_after(debounce - elapsed + Duration::from_millis(15));
             return self.link_metadata_cache.get(&url).cloned();
@@ -3576,5 +5134,601 @@ mod safety_number_modal_tests {
         // Simulate identity trusted
         modal.is_verified = true;
         assert!(modal.is_verified);
+    }
+}
+
+#[cfg(test)]
+mod forward_dialog_tests {
+    use super::*;
+
+    fn test_app() -> (ZaloGuiApp, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![
+                Thread {
+                    id: "u1".into(),
+                    name: "Bạn A".into(),
+                    is_group: false,
+                    ..Default::default()
+                },
+                Thread {
+                    id: "g2".into(),
+                    name: "Nhóm B".into(),
+                    is_group: true,
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        app.is_logged_in = true;
+        app.hidden_panel.view.ready = true;
+        (app, ctx)
+    }
+
+    #[test]
+    fn modal_gate_tracks_open_modals_and_dialogs() {
+        let (mut app, _) = test_app();
+        assert!(!app.is_any_modal_open());
+
+        app.settings_modal_open = true;
+        assert!(app.is_any_modal_open());
+        app.settings_modal_open = false;
+
+        app.pin_setup_modal_open = true;
+        assert!(app.is_any_modal_open());
+        app.pin_setup_modal_open = false;
+
+        app.auto_delete_modal = Some(super::super::AutoDeleteModalState {
+            thread_id: "u1".into(),
+            is_group: false,
+            thread_name: "Bạn A".into(),
+            selected_ttl: 0,
+        });
+        assert!(app.is_any_modal_open());
+        app.auto_delete_modal = None;
+
+        app.content_protection_modal = Some(super::super::ContentProtectionModalState {
+            thread_id: "u1".into(),
+            is_group: false,
+            thread_name: "Bạn A".into(),
+            current_enabled: false,
+        });
+        assert!(app.is_any_modal_open());
+        app.content_protection_modal = None;
+
+        app.profile_panel.open = true;
+        assert!(app.is_any_modal_open());
+        app.profile_panel.open = false;
+
+        app.forward_msg = Some(ChatMessage {
+            id: "m1".into(),
+            text: "Xin chào".into(),
+            ..Default::default()
+        });
+        assert!(app.is_any_modal_open());
+        app.clear_forward_dialog();
+        assert!(!app.is_any_modal_open());
+    }
+
+    fn find_text_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Pos2> {
+        fn walk(shape: &egui::Shape, needle: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains(needle) => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                egui::Shape::Vec(children) => children.iter().find_map(|s| walk(s, needle)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|cs| walk(&cs.shape, needle))
+    }
+
+    #[test]
+    fn forward_dialog_selects_targets_and_builds_commands_without_instant_send() {
+        let (mut app, ctx) = test_app();
+        app.forward_msg = Some(ChatMessage {
+            id: "m-fwd".into(),
+            text: "Tài liệu cuộc họp".into(),
+            ..Default::default()
+        });
+        let pal = ThemePalette::light();
+
+        // Run two warmup frames so egui::Window anchor & ScrollArea lay out the rows.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.render_forward_dialog(ctx, &pal),
+        );
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                time: Some(0.05),
+                ..Default::default()
+            },
+            |ctx| app.render_forward_dialog(ctx, &pal),
+        );
+        let row_pos =
+            find_text_center(&output.shapes, "Bạn A").expect("recipient row should render");
+
+        // Clicking recipient toggles selection only and keeps the dialog open.
+        for (pressed, t) in [(true, 0.1), (false, 0.2)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 700.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(row_pos),
+                        egui::Event::PointerButton {
+                            pos: row_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.render_forward_dialog(ctx, &pal),
+            );
+        }
+        assert!(app.forward_msg.is_some());
+        assert!(app.forward_targets.contains("u1"));
+        assert_eq!(app.forward_targets.len(), 1);
+
+        // Selecting a second target and adding an accompanying note prepares 4 commands.
+        app.forward_targets.insert("g2".into());
+        app.forward_note = "Xem giúp mình nhé".into();
+        let (target_count, cmds) = app.build_forward_commands();
+        assert_eq!(target_count, 2);
+        assert_eq!(cmds.len(), 4);
+        assert!(matches!(
+            &cmds[0],
+            WorkerCmd::Forward { target_id, target_is_group: false, .. } if target_id == "u1"
+        ));
+        assert!(matches!(
+            &cmds[1],
+            WorkerCmd::SendMessage { to_id, text, is_group: false } if to_id == "u1" && text == "Xem giúp mình nhé"
+        ));
+        assert!(matches!(
+            &cmds[2],
+            WorkerCmd::Forward { target_id, target_is_group: true, .. } if target_id == "g2"
+        ));
+        assert!(matches!(
+            &cmds[3],
+            WorkerCmd::SendMessage { to_id, text, is_group: true } if to_id == "g2" && text == "Xem giúp mình nhé"
+        ));
+
+        // Clicking "Hủy" closes the dialog and wipes all forward state.
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                time: Some(0.3),
+                ..Default::default()
+            },
+            |ctx| app.render_forward_dialog(ctx, &pal),
+        );
+        let cancel_pos =
+            find_text_center(&output.shapes, "Hủy").expect("cancel button should render");
+        for (pressed, t) in [(true, 0.4), (false, 0.5)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 700.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(cancel_pos),
+                        egui::Event::PointerButton {
+                            pos: cancel_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.render_forward_dialog(ctx, &pal),
+            );
+        }
+        assert!(app.forward_msg.is_none());
+        assert!(app.forward_targets.is_empty());
+        assert!(app.forward_note.is_empty());
+        assert!(app.forward_filter.is_empty());
+    }
+
+    #[test]
+    fn auto_delete_modal_selects_ttl_and_saves_or_cancels() {
+        let (mut app, ctx) = test_app();
+        app.auto_delete_modal = Some(super::super::AutoDeleteModalState {
+            thread_id: "u1".into(),
+            is_group: false,
+            thread_name: "Bạn A".into(),
+            selected_ttl: 0,
+        });
+        let pal = ThemePalette::light();
+
+        for t in [0.0, 0.05] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 700.0),
+                    )),
+                    time: Some(t),
+                    ..Default::default()
+                },
+                |ctx| app.render_auto_delete_modal(ctx, &pal),
+            );
+        }
+
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(900.0, 700.0),
+                )),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ctx| app.render_auto_delete_modal(ctx, &pal),
+        );
+        let radio_7d =
+            find_text_center(&output.shapes, "7 ngày").expect("7-day radio option should render");
+        for (pressed, t) in [(true, 0.15), (false, 0.2)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 700.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(radio_7d),
+                        egui::Event::PointerButton {
+                            pos: radio_7d,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.render_auto_delete_modal(ctx, &pal),
+            );
+        }
+        assert_eq!(
+            app.auto_delete_modal.as_ref().map(|m| m.selected_ttl),
+            Some(604_800_000)
+        );
+
+        let save_pos = find_text_center(&output.shapes, "Lưu").expect("save button should render");
+        for (pressed, t) in [(true, 0.25), (false, 0.3)] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(900.0, 700.0),
+                    )),
+                    time: Some(t),
+                    events: vec![
+                        egui::Event::PointerMoved(save_pos),
+                        egui::Event::PointerButton {
+                            pos: save_pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| app.render_auto_delete_modal(ctx, &pal),
+            );
+        }
+        assert!(app.auto_delete_modal.is_none());
+        assert!(app
+            .toast_notice
+            .as_ref()
+            .is_some_and(|(msg, _)| msg.contains("7 ngày")));
+    }
+
+    #[test]
+    fn forward_server_rejected_shows_failure_and_permits_retry() {
+        let (mut app, ctx) = test_app();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender = super::super::worker::WorkerSender::new_for_test(cmd_tx, ctx.clone());
+
+        let fwd_msg = ChatMessage {
+            id: "msg_orig".into(),
+            client_message_id: "1111".into(),
+            text: "Báo cáo tiến độ".into(),
+            ..Default::default()
+        };
+        app.forward_msg = Some(fwd_msg.clone());
+        app.forward_targets.insert("u1".into());
+
+        // Start session: creates session state and tracks delivery per recipient
+        let target_count = app.start_forward_session();
+        assert_eq!(target_count, Some(1));
+        assert!(app.forward_session.is_some());
+        assert!(app.forward_msg.is_none());
+
+        let session = app.forward_session.as_mut().unwrap();
+        let fwd_client_id = session.targets[0].forward_msg.client_message_id.clone();
+
+        // Simulate server rejection
+        let mut failed_msg = session.targets[0].forward_msg.clone();
+        failed_msg.delivery = crate::message_model::DeliveryState::Failed;
+        failed_msg.outgoing_job = Some(Box::new(crate::outgoing::Job {
+            payload: crate::outgoing::Payload::Text,
+            is_group: false,
+            is_e2ee: false,
+            attempt: 1,
+            error: "Hội thoại bị chặn".into(),
+        }));
+
+        let changed = session.update_outgoing_state("u1", &failed_msg);
+        assert!(changed);
+        assert_eq!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Failed("Hội thoại bị chặn".into())
+        );
+        let (total, succeeded, failed) = session.counts();
+        assert_eq!(total, 1);
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, 1);
+        assert!(session.all_finished());
+
+        // Retry preserves original client identity and transitions to Sending
+        let retried = session.retry_target("u1", Some(&sender));
+        assert_eq!(retried, 1);
+        assert_eq!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Sending
+        );
+        assert_eq!(
+            session.targets[0].forward_msg.client_message_id,
+            fwd_client_id
+        );
+
+        let sent_cmd = cmd_rx.try_recv().expect("must receive retry command");
+        match sent_cmd {
+            WorkerCmd::RetryOutgoing { thread_id, message } => {
+                assert_eq!(thread_id, "u1");
+                assert_eq!(message.client_message_id, fwd_client_id);
+            }
+            _ => panic!("unexpected command sent on retry"),
+        }
+    }
+
+    #[test]
+    fn forward_mixed_batch_and_selective_retry_preserves_succeeded_targets() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender =
+            super::super::worker::WorkerSender::new_for_test(cmd_tx, egui::Context::default());
+
+        let fwd_msg = ChatMessage {
+            id: "msg_batch".into(),
+            client_message_id: "2222".into(),
+            text: "Kế hoạch tuần tới".into(),
+            ..Default::default()
+        };
+
+        let t1_msg = crate::outgoing::pending(
+            fwd_msg.text.clone(),
+            false,
+            crate::outgoing::Payload::Forward(Box::new(fwd_msg.clone())),
+        );
+        let t2_msg = crate::outgoing::pending(
+            fwd_msg.text.clone(),
+            true,
+            crate::outgoing::Payload::Forward(Box::new(fwd_msg.clone())),
+        );
+        let t1_client_id = t1_msg.client_message_id.clone();
+        let t2_client_id = t2_msg.client_message_id.clone();
+        assert_ne!(t1_client_id, t2_client_id);
+
+        let mut session = ForwardSessionState {
+            original_msg: fwd_msg,
+            note_text: String::new(),
+            targets: vec![
+                ForwardTargetDelivery {
+                    target_id: "u1".into(),
+                    target_name: "Bạn A".into(),
+                    is_group: false,
+                    avatar: None,
+                    forward_msg: t1_msg,
+                    forward_status: ForwardItemStatus::Sending,
+                    note_msg: None,
+                    note_status: None,
+                },
+                ForwardTargetDelivery {
+                    target_id: "g2".into(),
+                    target_name: "Nhóm B".into(),
+                    is_group: true,
+                    avatar: None,
+                    forward_msg: t2_msg,
+                    forward_status: ForwardItemStatus::Sending,
+                    note_msg: None,
+                    note_status: None,
+                },
+            ],
+        };
+
+        // Target 1 succeeds
+        let mut ack_t1 = session.targets[0].forward_msg.clone();
+        ack_t1.delivery = crate::message_model::DeliveryState::ServerAccepted;
+        session.update_outgoing_state("u1", &ack_t1);
+
+        // Target 2 fails
+        let mut rej_t2 = session.targets[1].forward_msg.clone();
+        rej_t2.delivery = crate::message_model::DeliveryState::Failed;
+        rej_t2.outgoing_job = Some(Box::new(crate::outgoing::Job {
+            payload: crate::outgoing::Payload::Text,
+            is_group: true,
+            is_e2ee: false,
+            attempt: 1,
+            error: "Nhóm đã giải tán".into(),
+        }));
+        session.update_outgoing_state("g2", &rej_t2);
+
+        let (total, succ, fail) = session.counts();
+        assert_eq!(total, 2);
+        assert_eq!(succ, 1);
+        assert_eq!(fail, 1);
+        assert!(session.all_finished());
+
+        // Selective retry on g2 only resends g2; u1 is NOT re-sent
+        let retried = session.retry_target("g2", Some(&sender));
+        assert_eq!(retried, 1);
+        assert_eq!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Success
+        );
+        assert_eq!(
+            session.targets[1].forward_status,
+            ForwardItemStatus::Sending
+        );
+
+        let sent_cmd = cmd_rx.try_recv().expect("must receive retry for g2");
+        match sent_cmd {
+            WorkerCmd::RetryOutgoing { thread_id, message } => {
+                assert_eq!(thread_id, "g2");
+                assert_eq!(message.client_message_id, t2_client_id);
+            }
+            _ => panic!("unexpected command sent"),
+        }
+        // Verify no other commands sent (u1 was untouched)
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn forward_queue_failure_midway_preserves_state() {
+        let (mut app, _) = test_app();
+        let fwd_msg = ChatMessage {
+            id: "msg_nofw".into(),
+            text: "Nội dung cần chuyển".into(),
+            ..Default::default()
+        };
+        app.forward_msg = Some(fwd_msg);
+        app.forward_targets.insert("u1".into());
+
+        // When worker is not initialized, start_forward_session marks target as Failed but preserves state
+        let count = app.start_forward_session();
+        assert_eq!(count, Some(1));
+        assert!(app.forward_session.is_some());
+
+        let session = app.forward_session.as_ref().unwrap();
+        assert_eq!(session.targets.len(), 1);
+        assert!(matches!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Failed(_)
+        ));
+        let (total, succ, fail) = session.counts();
+        assert_eq!(total, 1);
+        assert_eq!(succ, 0);
+        assert_eq!(fail, 1);
+    }
+
+    #[test]
+    fn forward_note_mutation_independent_tracking_and_retry() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let sender =
+            super::super::worker::WorkerSender::new_for_test(cmd_tx, egui::Context::default());
+
+        let fwd_msg = ChatMessage {
+            id: "fwd_item".into(),
+            client_message_id: "3001".into(),
+            text: "Ảnh đính kèm".into(),
+            ..Default::default()
+        };
+        let note_msg = ChatMessage {
+            id: "note_item".into(),
+            client_message_id: "3002".into(),
+            text: "Gửi bạn xem nhé".into(),
+            ..Default::default()
+        };
+
+        let mut session = ForwardSessionState {
+            original_msg: fwd_msg.clone(),
+            note_text: "Gửi bạn xem nhé".into(),
+            targets: vec![ForwardTargetDelivery {
+                target_id: "u1".into(),
+                target_name: "Bạn A".into(),
+                is_group: false,
+                avatar: None,
+                forward_msg: fwd_msg,
+                forward_status: ForwardItemStatus::Sending,
+                note_msg: Some(note_msg),
+                note_status: Some(ForwardItemStatus::Sending),
+            }],
+        };
+
+        // Forward message succeeds
+        let mut fwd_ack = session.targets[0].forward_msg.clone();
+        fwd_ack.delivery = crate::message_model::DeliveryState::ServerAccepted;
+        session.update_outgoing_state("u1", &fwd_ack);
+
+        // Note message fails
+        let mut note_fail = session.targets[0].note_msg.as_ref().unwrap().clone();
+        note_fail.delivery = crate::message_model::DeliveryState::Failed;
+        note_fail.outgoing_job = Some(Box::new(crate::outgoing::Job {
+            payload: crate::outgoing::Payload::Text,
+            is_group: false,
+            is_e2ee: false,
+            attempt: 1,
+            error: "Quá giới hạn tốc độ gửi".into(),
+        }));
+        session.update_outgoing_state("u1", &note_fail);
+
+        assert_eq!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Success
+        );
+        assert_eq!(
+            session.targets[0].note_status,
+            Some(ForwardItemStatus::Failed("Quá giới hạn tốc độ gửi".into()))
+        );
+
+        // Retry on u1 MUST only retry the failed note mutation, NOT resend forward
+        let retried = session.retry_target("u1", Some(&sender));
+        assert_eq!(retried, 1);
+        assert_eq!(
+            session.targets[0].forward_status,
+            ForwardItemStatus::Success
+        );
+        assert_eq!(
+            session.targets[0].note_status,
+            Some(ForwardItemStatus::Sending)
+        );
+
+        let sent_cmd = cmd_rx
+            .try_recv()
+            .expect("must receive retry command for note");
+        match sent_cmd {
+            WorkerCmd::RetryOutgoing { thread_id, message } => {
+                assert_eq!(thread_id, "u1");
+                assert_eq!(message.client_message_id, "3002");
+                assert_eq!(message.text, "Gửi bạn xem nhé");
+            }
+            _ => panic!("unexpected command sent"),
+        }
+        assert!(cmd_rx.try_recv().is_err());
     }
 }

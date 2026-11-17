@@ -5,6 +5,66 @@
 
 use std::collections::BTreeMap;
 
+/// Service identity kept in diagnostics without retaining request paths or query data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceKey {
+    Chat,
+    Friend,
+    Conversation,
+    Profile,
+    Group,
+    File,
+    Reaction,
+    VoiceCall,
+    Sticker,
+    Other,
+}
+
+impl ServiceKey {
+    pub(crate) fn from_key(key: &str) -> Self {
+        match key {
+            "chat" => Self::Chat,
+            "friend" => Self::Friend,
+            "conversation" => Self::Conversation,
+            "profile" => Self::Profile,
+            "group" => Self::Group,
+            "file" => Self::File,
+            "reaction" => Self::Reaction,
+            "voice_call" => Self::VoiceCall,
+            "sticker" => Self::Sticker,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// One bounded HTTP attempt summary. It deliberately contains neither URL paths nor IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestAttemptTiming {
+    pub phase: TimingPhase,
+    pub service: ServiceKey,
+    pub candidate_index: Option<u8>,
+    pub elapsed_ms: u32,
+    pub result: AttemptResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingPhase {
+    HttpRequest,
+    LinkPreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptResult {
+    Success,
+    HttpFailure,
+    ConnectFailure,
+    Timeout,
+    TransportFailure,
+    PreviewReady,
+    PreviewCacheHit,
+    PreviewFallback,
+}
+
 /// Service endpoint resolver with dynamic fallback support.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceResolver {
@@ -54,6 +114,86 @@ impl ServiceResolver {
             self.service_endpoints
                 .insert(service_key.to_string(), hosts);
             self.active_indices.insert(service_key.to_string(), 0);
+        }
+    }
+
+    /// Replace the resolver snapshot from the sanitized session map. Discovered
+    /// candidates retain their server order; canonical endpoints are last-resort.
+    pub(crate) fn sync_from_domains(&mut self, domains: &crate::session::Domains) {
+        self.set_from_domains(domains, false);
+    }
+
+    /// Rebuild a resolver snapshot after restoring a session/account.
+    pub(crate) fn reset_from_domains(&mut self, domains: &crate::session::Domains) {
+        self.set_from_domains(domains, true);
+    }
+
+    fn set_from_domains(&mut self, domains: &crate::session::Domains, reset: bool) {
+        for key in [
+            "chat",
+            "friend",
+            "conversation",
+            "profile",
+            "group",
+            "file",
+            "reaction",
+            "voice_call",
+            "sticker",
+            "alias",
+            "label",
+        ] {
+            let Some(canonical) = crate::endpoints::service(key) else {
+                continue;
+            };
+            let mut candidates = domains
+                .service_fallbacks
+                .get(canonical)
+                .into_iter()
+                .flatten()
+                .filter(|host| {
+                    crate::session::trusted_service_url(host)
+                        && !((key == "chat"
+                            && (host.contains("-msg-chat.") || host.contains("tt-chat2-wpa")))
+                            || (key == "conversation" && host.contains("-ctl-chat.")))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.truncate(crate::session::MAX_SERVICE_CANDIDATES.saturating_sub(1));
+            if !candidates.iter().any(|host| host == canonical) {
+                candidates.push(canonical.to_owned());
+            }
+            candidates.truncate(crate::session::MAX_SERVICE_CANDIDATES);
+            if reset || self.service_endpoints.get(key) != Some(&candidates) {
+                self.register_service(key, candidates);
+            }
+        }
+    }
+
+    pub(crate) fn candidates_for_url(&self, url: &str) -> Option<(String, Vec<String>)> {
+        for (key, hosts) in &self.service_endpoints {
+            let canonical = crate::endpoints::service(key)?;
+            let Some(path) = url.strip_prefix(canonical) else {
+                continue;
+            };
+            if !path.starts_with('/') {
+                continue;
+            }
+            let active = self.active_indices.get(key).copied().unwrap_or(0) % hosts.len();
+            let ordered = (0..hosts.len())
+                .map(|offset| &hosts[(active + offset) % hosts.len()])
+                .map(|host| format!("{host}{path}"))
+                .collect();
+            return Some((key.clone(), ordered));
+        }
+        None
+    }
+
+    pub(crate) fn record_success_for_url(&mut self, service_key: &str, url: &str) {
+        let Some(hosts) = self.service_endpoints.get(service_key) else {
+            return;
+        };
+        if let Some(index) = hosts.iter().position(|host| url.starts_with(host)) {
+            self.active_indices.insert(service_key.to_owned(), index);
         }
     }
 

@@ -18,13 +18,15 @@ pub(super) enum ContactsTab {
     GroupInvitations,
 }
 
-/// Group thread indices into alphabetical sections by diacritic-folded name.
+/// Group thread indices into alphabetical sections by diacritic-folded display name,
+/// prioritizing saved `aliases` for 1-1 contacts.
 ///
 /// Excludes Cloud, hidden conversations and threads of the other kind. Letters outside A–Z
 /// share the `#` section, which sorts last.
-pub(super) fn contact_sections(
+pub(super) fn contact_sections_with_aliases(
     threads: &[Thread],
     preferences: &HashMap<String, crate::store::ConversationPreference>,
+    aliases: &HashMap<String, String>,
     tab: ContactsTab,
     query: &str,
 ) -> Vec<(char, Vec<usize>)> {
@@ -36,8 +38,20 @@ pub(super) fn contact_sections(
         .filter(|(_, t)| t.is_group == is_group_target)
         .filter(|(_, t)| !t.id.is_empty() && !t.name.contains("Cloud của tôi"))
         .filter(|(_, t)| !preferences.get(&t.id).is_some_and(|p| p.hidden))
-        .map(|(i, t)| (fold_vn_search(t.name.trim()), i))
-        .filter(|(name, _)| query.is_empty() || name.contains(&query))
+        .filter_map(|(i, t)| {
+            let resolved = if t.is_group {
+                t.name.as_str()
+            } else {
+                resolve_contact_name_from(aliases, &t.id, &t.name)
+            };
+            let folded = fold_vn_search(resolved.trim());
+            let base_matches = t
+                .presentation
+                .base_name
+                .as_deref()
+                .is_some_and(|b| fold_vn_search(b.trim()).contains(&query));
+            (query.is_empty() || folded.contains(&query) || base_matches).then_some((folded, i))
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
     let mut sections: Vec<(char, Vec<usize>)> = Vec::new();
@@ -56,10 +70,36 @@ pub(super) fn contact_sections(
     sections
 }
 
+/// Group thread indices into alphabetical sections by diacritic-folded name.
+///
+/// Excludes Cloud, hidden conversations and threads of the other kind. Letters outside A–Z
+/// share the `#` section, which sorts last.
+#[cfg(test)]
+pub(super) fn contact_sections(
+    threads: &[Thread],
+    preferences: &HashMap<String, crate::store::ConversationPreference>,
+    tab: ContactsTab,
+    query: &str,
+) -> Vec<(char, Vec<usize>)> {
+    static EMPTY: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    contact_sections_with_aliases(
+        threads,
+        preferences,
+        EMPTY.get_or_init(HashMap::new),
+        tab,
+        query,
+    )
+}
+
 impl ZaloGuiApp {
     fn visible_contact_sections(&self, tab: ContactsTab, query: &str) -> Vec<(char, Vec<usize>)> {
-        let mut sections =
-            contact_sections(&self.threads, &self.conversation_preferences, tab, query);
+        let mut sections = contact_sections_with_aliases(
+            &self.threads,
+            &self.conversation_preferences,
+            &self.server_aliases,
+            tab,
+            query,
+        );
         for (_, indices) in &mut sections {
             indices.retain(|index| {
                 let thread = &self.threads[*index];
@@ -436,17 +476,19 @@ impl ZaloGuiApp {
                                 .rect_filled(rect, Rounding::same(8.0), pal.bg_hover);
                         }
 
+                        let display_name = self.resolve_contact_name(&thread.id, &thread.name);
+
                         // Avatar
                         let center = Pos2::new(rect.left() + 28.0, rect.center().y);
                         ui.painter().circle_filled(
                             center,
                             18.0,
-                            avatar_color_for(&thread.name, false),
+                            avatar_color_for(display_name, false),
                         );
                         ui.painter().text(
                             center,
                             egui::Align2::CENTER_CENTER,
-                            avatar_initials(&thread.name),
+                            avatar_initials(display_name),
                             FontId::proportional(13.0),
                             Color32::WHITE,
                         );
@@ -455,7 +497,7 @@ impl ZaloGuiApp {
                         ui.painter().text(
                             Pos2::new(rect.left() + 58.0, rect.center().y - 8.0),
                             egui::Align2::LEFT_CENTER,
-                            &thread.name,
+                            display_name,
                             FontId::proportional(13.8),
                             pal.text_primary,
                         );
@@ -685,14 +727,21 @@ impl ZaloGuiApp {
                 self.friend_status_map.get(&t.id)
                     == Some(&crate::chat::FriendshipStatus::IncomingPending)
             })
-            .map(|(i, t)| (Some(i), t.id.clone(), t.name.clone()))
+            .map(|(i, t)| {
+                (
+                    Some(i),
+                    t.id.clone(),
+                    self.resolve_contact_name(&t.id, &t.name).to_owned(),
+                )
+            })
             .collect();
 
         for (uid, &status) in &self.friend_status_map {
             if status == crate::chat::FriendshipStatus::IncomingPending
                 && !incoming_requests.iter().any(|(_, tid, _)| tid == uid)
             {
-                incoming_requests.push((None, uid.clone(), uid.clone()));
+                let name = self.resolve_contact_name(uid, uid).to_owned();
+                incoming_requests.push((None, uid.clone(), name));
             }
         }
 
@@ -706,14 +755,21 @@ impl ZaloGuiApp {
                 self.friend_status_map.get(&t.id)
                     == Some(&crate::chat::FriendshipStatus::OutgoingPending)
             })
-            .map(|(i, t)| (Some(i), t.id.clone(), t.name.clone()))
+            .map(|(i, t)| {
+                (
+                    Some(i),
+                    t.id.clone(),
+                    self.resolve_contact_name(&t.id, &t.name).to_owned(),
+                )
+            })
             .collect();
 
         for (uid, &status) in &self.friend_status_map {
             if status == crate::chat::FriendshipStatus::OutgoingPending
                 && !outgoing_requests.iter().any(|(_, tid, _)| tid == uid)
             {
-                outgoing_requests.push((None, uid.clone(), uid.clone()));
+                let name = self.resolve_contact_name(uid, uid).to_owned();
+                outgoing_requests.push((None, uid.clone(), name));
             }
         }
 
@@ -1396,5 +1452,62 @@ mod tests {
         // Groups tab only includes groups
         let group_sections = contact_sections(&threads, &HashMap::new(), ContactsTab::Groups, "");
         assert_eq!(group_sections, vec![('N', vec![1])]);
+    }
+
+    #[test]
+    fn contact_sections_prioritize_saved_phonebook_aliases_and_match_both_names() {
+        let mut t1 = thread("10", "Zalo User", false);
+        t1.presentation.base_name = Some("Zalo User".into());
+        let t2 = thread("20", "Anh Bình", false);
+        let grp = thread("10", "Nhóm Dự Án", true);
+        let threads = vec![t1, t2, grp];
+        let aliases = HashMap::from([
+            ("10".to_string(), "Bố Yêu".to_string()),
+            ("20".to_string(), "   ".to_string()),
+        ]);
+
+        // "10" sorts under 'B' after "Anh Bình" under 'A' when using alias "Bố Yêu", while empty alias falls back to "Anh Bình".
+        assert_eq!(
+            contact_sections_with_aliases(
+                &threads,
+                &HashMap::new(),
+                &aliases,
+                ContactsTab::Friends,
+                "",
+            ),
+            vec![('A', vec![1]), ('B', vec![0])]
+        );
+        // Searching either the phonebook alias or original Zalo base_name finds the contact.
+        assert_eq!(
+            contact_sections_with_aliases(
+                &threads,
+                &HashMap::new(),
+                &aliases,
+                ContactsTab::Friends,
+                "bo yeu",
+            ),
+            vec![('B', vec![0])]
+        );
+        assert_eq!(
+            contact_sections_with_aliases(
+                &threads,
+                &HashMap::new(),
+                &aliases,
+                ContactsTab::Friends,
+                "zalo user",
+            ),
+            vec![('B', vec![0])]
+        );
+        // Group threads never inherit a user alias on the same numeric ID.
+        assert_eq!(
+            contact_sections_with_aliases(
+                &threads,
+                &HashMap::new(),
+                &aliases,
+                ContactsTab::Groups,
+                "",
+            ),
+            vec![('N', vec![2])]
+        );
     }
 }

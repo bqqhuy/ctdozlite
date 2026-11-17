@@ -565,6 +565,21 @@ impl WorkerSender {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        commands: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
+        ctx: egui::Context,
+    ) -> Self {
+        let (images, _) = tokio::sync::mpsc::channel(1);
+        let (events, _) = std::sync::mpsc::channel();
+        Self {
+            commands,
+            images,
+            events,
+            ctx,
+        }
+    }
 }
 pub(super) struct WorkerMailbox(std::sync::Mutex<Option<WorkerSender>>);
 impl WorkerMailbox {
@@ -622,11 +637,13 @@ struct RefreshNotice {
     sender: Sender<GuiEvent>,
     ctx: egui::Context,
     message: String,
+    success: bool,
 }
 impl Drop for RefreshNotice {
     fn drop(&mut self) {
         let _ = self.sender.send(GuiEvent::ConversationRefreshStatus {
             running: false,
+            success: self.success,
             message: std::mem::take(&mut self.message),
         });
         self.ctx.request_repaint();
@@ -2707,7 +2724,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         }
                         WorkerCmd::CancelPhoneHistory => {
                             phone_sync_cancel.store(true,std::sync::atomic::Ordering::Relaxed);
-                            if phone_sync_running.load(std::sync::atomic::Ordering::SeqCst){let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Đang dừng đồng bộ và dọn tác vụ; giữ dữ liệu đã lưu…".into()});egui_ctx.request_repaint();}
+                            if phone_sync_running.load(std::sync::atomic::Ordering::SeqCst){let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,success:false,message:"Đang dừng đồng bộ và dọn tác vụ; giữ dữ liệu đã lưu…".into()});egui_ctx.request_repaint();}
                         }
                         command @ (WorkerCmd::SyncPhoneHistory{..} | WorkerCmd::RescanPhoneHistory{..} | WorkerCmd::SyncPhoneRecent | WorkerCmd::SyncPhoneLegacy) => {
                             let legacy=matches!(command,WorkerCmd::SyncPhoneLegacy);
@@ -2715,13 +2732,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let recent_only=matches!(command,WorkerCmd::SyncPhoneRecent);
                             let range_days=match command {WorkerCmd::SyncPhoneHistory{range_days}|WorkerCmd::RescanPhoneHistory{range_days}=>range_days,_=>0};
                             if phone_sync_running.swap(true,std::sync::atomic::Ordering::SeqCst) {
-                                let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Phiên trước chưa kết thúc; chờ dọn tác vụ xong rồi bấm đồng bộ lại".into()});egui_ctx.request_repaint();continue;
+                                let _=gui_tx.send(GuiEvent::PhoneSyncStatus{running:true,success:false,message:"Phiên trước chưa kết thúc; chờ dọn tác vụ xong rồi bấm đồng bộ lại".into()});egui_ctx.request_repaint();continue;
                             }
                             phone_sync_cancel.store(false,std::sync::atomic::Ordering::Relaxed);
                             let cancel=phone_sync_cancel.clone();let running=phone_sync_running.clone();
                             let transport=phone_transport_rx.borrow().clone();
                             let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
-                            let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,message:"Đang chuẩn bị đồng bộ từ điện thoại…".into()});
+                            let _=tx.send(GuiEvent::PhoneSyncStatus{running:true,success:false,message:"Đang chuẩn bị đồng bộ từ điện thoại…".into()});
                             ctx.request_repaint();
                             tokio::spawn(async move {
                                 let _guard=PollGuard(running);
@@ -2729,16 +2746,17 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let result=if let Some(transport)=transport {
                                     if legacy {
                                         crate::phone_sync::legacy::download(&account,transport,cancel,
-                                            move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();}},
-                                            |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
+                                            move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,success:false,message});progress_ctx.request_repaint();}},
+                                            |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await.map(|message| crate::history_sync::SyncReport { complete: false, message })
                                     } else {
                                     crate::phone_sync::download(&account,transport,cancel,full_rescan,recent_only,range_days,
-                                        move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,message});progress_ctx.request_repaint();}},
+                                        move |message|{if !progress_cancel.load(std::sync::atomic::Ordering::Acquire){let _=progress_tx.send(GuiEvent::PhoneSyncStatus{running:true,success:false,message});progress_ctx.request_repaint();}},
                                         |thread|{if deliver_thread_updates() {let _=tx.send(GuiEvent::ThreadsUpdated{threads:vec![thread],source:ThreadUpdateSource::History});ctx.request_repaint();}}).await
                                     }
                                 }else{Err(anyhow::anyhow!("WebSocket chưa sẵn sàng; chờ kết nối rồi thử lại"))};
-                                let message=result.unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
-                                let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,message});ctx.request_repaint();
+                                let success=result.as_ref().is_ok_and(|report| report.complete);
+                                let message=result.map(|report| report.message).unwrap_or_else(|e|format!("Đồng bộ điện thoại đã dừng: {e}"));
+                                let _=tx.send(GuiEvent::PhoneSyncStatus{running:false,success,message});ctx.request_repaint();
                             });
                         }
                         WorkerCmd::PickDesktopBackup{owner,generation}=>{
@@ -2928,15 +2946,16 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let cancel = history_sync_cancel.clone();
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
-                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message: "Đang tải dữ liệu máy chủ còn cung cấp (nhóm và Cloud)…".into() });
+                            let _ = tx.send(GuiEvent::HistorySyncStatus { running: true,success:false, message: "Đang tải dữ liệu máy chủ còn cung cấp (nhóm và Cloud)…".into() });
                             ctx.request_repaint();
                             tokio::spawn(async move {
                                 let result = crate::history_sync::download(&s, threads, cancel, retry_filtered,
-                                    |message| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true, message }); ctx.request_repaint(); } },
+                                    |message| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::HistorySyncStatus { running: true,success:false, message }); ctx.request_repaint(); } },
                                     |thread| { if deliver_thread_updates() { let _ = tx.send(GuiEvent::ThreadsUpdated {threads:vec![thread],source:ThreadUpdateSource::History}); ctx.request_repaint(); } }).await;
                                 running.store(false, std::sync::atomic::Ordering::SeqCst);
-                                let message = result.unwrap_or_else(|e| format!("Lỗi tải lịch sử: {e}"));
-                                let _ = tx.send(GuiEvent::HistorySyncStatus { running: false, message });
+                                let success = result.as_ref().is_ok_and(|report| report.complete);
+                                let message = result.map(|report| report.message).unwrap_or_else(|e| format!("Lỗi tải lịch sử: {e}"));
+                                let _ = tx.send(GuiEvent::HistorySyncStatus { running: false, success, message });
                                 ctx.request_repaint();
                             });
                         }
@@ -3007,8 +3026,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let poll_delivery = poll_delivery.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
-                                let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into()};
-                                let _=gui_tx_clone.send(GuiEvent::ConversationRefreshStatus {running:true,message:"Đang cập nhật hội thoại và tin nhắn gần đây…".into()});
+                                let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into(),success:false};
+                                let _=gui_tx_clone.send(GuiEvent::ConversationRefreshStatus {running:true,success:false,message:"Đang cập nhật hội thoại và tin nhắn gần đây…".into()});
                                 ctx_clone.request_repaint();
                                 let mut s = session_clone.lock().await.clone();
                                 if s.login.is_some() {
@@ -3099,6 +3118,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     // Startup refreshes live/offline queues; historical backfill is explicit.
                                     let count = list.len();
                                     let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
+                                    notice.success = stored && recent_result.is_ok();
                                     notice.message=if !stored {
                                         "Chưa lưu được cập nhật vào CSDL; giữ cursor cũ để lấy bù lần sau".into()
                                     } else { match recent_result {
@@ -3724,15 +3744,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::ParseLinkPreview { url, origin } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
+                            let s = session.lock().await.clone();
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                if let Ok(meta) = crate::chat::parse_link_metadata(&s, &url, origin).await {
-                                    let _ = gui_tx_clone.send(GuiEvent::LinkPreviewReady(meta));
-                                    ctx_clone.request_repaint();
-                                }
+                                let outgoing = origin == crate::chat::LinkOrigin::Outgoing;
+                                let cached = outgoing.then(|| s.cached_link_preview(&url, origin)).flatten();
+                                let result = if let Some(meta) = cached { Ok(meta) } else {
+                                    match tokio::time::timeout(crate::outgoing::LINK_PREVIEW_BUDGET,
+                                        crate::chat::parse_link_metadata(&s, &url, origin)).await {
+                                        Ok(Ok(meta)) => {
+                                            if outgoing { s.cache_link_preview(&url, origin, meta.clone()); }
+                                            Ok(meta)
+                                        }
+                                        Ok(Err(_)) => Err("Không tải được thông tin liên kết".into()),
+                                        Err(_) => Err("Hết thời gian tải thông tin liên kết".into()),
+                                    }
+                                };
+                                let _ = tx.send(GuiEvent::LinkPreviewReady {
+                                    owner: s.account_key().to_owned(), runtime_id: s.runtime_id(), url, result,
+                                });
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::PrepareDroppedFile {owner,thread,id,path} => {
@@ -4797,11 +4829,12 @@ mod refresh_notice_tests {
                 sender: tx,
                 ctx: egui::Context::default(),
                 message: "Chưa hoàn tất".into(),
+                success: false,
             };
             notice.message = "Không thể kết nối máy chủ".into();
         }
         assert!(
-            matches!(rx.try_recv().unwrap(),GuiEvent::ConversationRefreshStatus {running:false,message} if message=="Không thể kết nối máy chủ")
+            matches!(rx.try_recv().unwrap(),GuiEvent::ConversationRefreshStatus {running:false,message,..} if message=="Không thể kết nối máy chủ")
         );
     }
 }

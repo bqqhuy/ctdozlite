@@ -210,6 +210,15 @@ impl HistoryCheckpoint {
     }
 }
 
+/// Terminal sync result, separate from the localized human-readable summary.
+#[derive(Debug)]
+pub struct SyncReport {
+    /// No interrupted or failed work remains in the requested scope.
+    pub complete: bool,
+    /// Summary retains partial counts and server limitations.
+    pub message: String,
+}
+
 /// Download the group and Cloud history the server still provides.
 /// `retry_filtered` ignores the memo of conversations the server recently limited.
 pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
@@ -219,7 +228,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     retry_filtered: bool,
     mut progress: F,
     mut page_ready: G,
-) -> Result<String> {
+) -> Result<SyncReport> {
     let memo_path = session
         .history_path()
         .with_extension("server-filtered.json");
@@ -293,9 +302,10 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                     let memo_copy = memo.clone();
                     let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save)).await;
                 }
-                return Ok(format!(
-                    "Đã dừng; lưu {inserted} tin mới và vị trí tiếp tục"
-                ));
+                return Ok(SyncReport {
+                    complete: false,
+                    message: format!("Đã dừng; lưu {inserted} tin mới và vị trí tiếp tục"),
+                });
             }
             progress(format!(
                 "Lịch sử {}/{total}: {} — trang {}, {inserted} tin mới",
@@ -366,7 +376,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                             let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save))
                                 .await;
                         }
-                        return Ok(format!("Máy chủ giới hạn tốc độ; đã lưu {inserted} tin mới. Thử đồng bộ lại sau; vị trí tiếp tục được giữ."));
+                        return Ok(SyncReport { complete: false, message: format!("Máy chủ giới hạn tốc độ; đã lưu {inserted} tin mới. Thử đồng bộ lại sau; vị trí tiếp tục được giữ.") });
                     }
                     failed += 1;
                     progress(format!(
@@ -396,7 +406,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     } else {
         String::new()
     };
-    Ok(format!("Đã kiểm tra {downloaded_pages} trang, lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị máy chủ giới hạn lịch sử cho thiết bị này; {skipped} chat cá nhân không có lịch sử trên máy chủ (dùng Đồng bộ từ điện thoại).{remembered} Đây là dữ liệu máy chủ còn cung cấp, chưa chắc là toàn bộ lịch sử."))
+    Ok(SyncReport { complete: failed == 0 && filtered == 0, message: format!("Đã kiểm tra {downloaded_pages} trang, lưu {inserted} tin mới; {failed} hội thoại lỗi; {filtered} hội thoại bị máy chủ giới hạn lịch sử cho thiết bị này; {skipped} chat cá nhân không có lịch sử trên máy chủ (dùng Đồng bộ từ điện thoại).{remembered} Đây là dữ liệu máy chủ còn cung cấp, chưa chắc là toàn bộ lịch sử.") })
 }
 #[cfg(test)]
 mod tests {

@@ -300,9 +300,10 @@ impl ZaloGuiApp {
                                 egui::ScrollArea::vertical().id_salt("group-pending-list").max_height(180.0).show_rows(ui,24.0,self.groups_panel.pending_members.len(),|ui,range| {
                                     for index in range {
                                         let (uid,name)=&self.groups_panel.pending_members[index];
+                                        let display_name = resolve_contact_name_from(&self.server_aliases, uid, name);
                                         ui.horizontal(|ui| {
                                             let width=(ui.available_width()-115.0).max(20.0);
-                                            ui.add_sized([width,24.0],egui::Label::new(name).truncate()).on_hover_text(format!("{name} • {uid}"));
+                                            ui.add_sized([width,24.0],egui::Label::new(display_name).truncate()).on_hover_text(format!("{display_name} • {uid}"));
                                             for (label,approve) in [("Duyệt",true),("Từ chối",false)] {
                                                 if ui.button(label).clicked(){self.groups_panel.confirm=Some(crate::groups::Action::Review {members:vec![uid.clone()],approve});}
                                             }
@@ -324,6 +325,7 @@ impl ZaloGuiApp {
                                     .threads
                                     .iter()
                                     .filter(|t| {
+                                        let display_name = resolve_thread_name_from(&self.server_aliases, t);
                                         !t.is_group
                                             && t.id != self.user_uin
                                             && !self
@@ -331,13 +333,18 @@ impl ZaloGuiApp {
                                                 .get(&t.id)
                                                 .is_some_and(|p| p.hidden)
                                             && (query.is_empty()
-                                                || crate::search::fold(&t.name).contains(&query))
+                                                || crate::search::fold(display_name).contains(&query)
+                                                || t.presentation
+                                                    .base_name
+                                                    .as_deref()
+                                                    .is_some_and(|b| crate::search::fold(b).contains(&query)))
                                     })
                                     .take(500)
                                 {
+                                    let display_name = resolve_thread_name_from(&self.server_aliases, thread);
                                     let mut checked =
                                         self.groups_panel.selected.contains(&thread.id);
-                                    if ui.checkbox(&mut checked, &thread.name).changed() {
+                                    if ui.checkbox(&mut checked, display_name).changed() {
                                         if checked {
                                             self.groups_panel.selected.insert(thread.id.clone());
                                         } else {
@@ -380,18 +387,34 @@ impl ZaloGuiApp {
                                     .map(|t| t.presentation.members.clone())
                             })
                             .unwrap_or_default();
+                        let selected_member_label = if self.groups_panel.member.is_empty() {
+                            "Chọn thành viên"
+                        } else {
+                            let fallback = roster
+                                .iter()
+                                .find(|m| m.id == self.groups_panel.member && !m.name.is_empty())
+                                .map(|m| m.name.as_str())
+                                .unwrap_or(self.groups_panel.member.as_str());
+                            resolve_contact_name_from(
+                                &self.server_aliases,
+                                &self.groups_panel.member,
+                                fallback,
+                            )
+                        };
                         egui::ComboBox::from_id_salt("admin-member-picker")
-                            .selected_text(if self.groups_panel.member.is_empty() {
-                                "Chọn thành viên"
-                            } else {
-                                &self.groups_panel.member
-                            })
+                            .selected_text(selected_member_label)
                             .show_ui(ui, |ui| {
-                                for member in roster {
+                                for member in &roster {
+                                    let display_name = resolve_contact_name_from(
+                                        &self.server_aliases,
+                                        &member.id,
+                                        &member.name,
+                                    )
+                                    .to_owned();
                                     ui.selectable_value(
                                         &mut self.groups_panel.member,
-                                        member.id,
-                                        member.name,
+                                        member.id.clone(),
+                                        display_name,
                                     );
                                 }
                             });

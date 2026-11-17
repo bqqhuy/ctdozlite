@@ -1292,7 +1292,23 @@ pub fn merge_thread_into(
     if !incoming.name.is_empty()
         && (!is_generic_thread_name(&incoming.name) || is_generic_thread_name(&target.name))
     {
-        target.name = incoming.name;
+        if !target.is_group
+            && !incoming.is_group
+            && target.presentation.server_alias.is_some()
+            && incoming.presentation.server_alias.is_none()
+        {
+            if !is_generic_thread_name(&incoming.name) {
+                target.presentation.base_name = Some(incoming.name);
+            }
+        } else {
+            target.name = incoming.name;
+            if incoming.presentation.server_alias.is_some() {
+                target.presentation.server_alias = incoming.presentation.server_alias;
+                if incoming.presentation.base_name.is_some() {
+                    target.presentation.base_name = incoming.presentation.base_name;
+                }
+            }
+        }
     }
     if incoming.avatar.is_some()
         && (target.avatar.is_none()
@@ -5204,7 +5220,7 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                         t.presentation.inbox.apply_profile(p);
                         if t.name.starts_with("Người dùng ") || t.name.is_empty() {
                             if let Some(name) =
-                                pick_str(p, &["zaloName", "displayName", "name", "display_name"])
+                                pick_str(p, &["displayName", "zaloName", "display_name", "name"])
                             {
                                 if !name.is_empty() {
                                     t.name = name;
@@ -7413,6 +7429,35 @@ mod tests {
         merge_thread_into(&mut target, incoming, false);
         let ids: Vec<&str> = target.messages.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "77", "79", "78"]);
+    }
+
+    #[test]
+    fn merge_thread_into_preserves_server_alias_and_updates_base_name() {
+        let mut target = Thread {
+            id: "12".into(),
+            name: "Chị Lan Danh Bạ".into(),
+            presentation: SidebarPresentation {
+                server_alias: Some("Chị Lan Danh Bạ".into()),
+                base_name: Some("Lan Zalo Cũ".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let incoming = Thread {
+            id: "12".into(),
+            name: "Lan Zalo Mới".into(),
+            ..Default::default()
+        };
+        merge_thread_into(&mut target, incoming, true);
+        assert_eq!(target.name, "Chị Lan Danh Bạ");
+        assert_eq!(
+            target.presentation.server_alias.as_deref(),
+            Some("Chị Lan Danh Bạ")
+        );
+        assert_eq!(
+            target.presentation.base_name.as_deref(),
+            Some("Lan Zalo Mới")
+        );
     }
 
     #[test]

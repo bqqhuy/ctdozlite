@@ -559,6 +559,8 @@ pub(super) fn render_message_body(
     max_text_width: f32,
     sticker_textures: &HashMap<String, TextureHandle>,
     loading_stickers: &mut HashSet<String>,
+    resolved_sender: Option<&str>,
+    server_aliases: &HashMap<String, String>,
 ) -> Option<BubbleAction> {
     let mut body_action = None;
     let (text_col, meta_col) = if outgoing {
@@ -580,6 +582,8 @@ pub(super) fn render_message_body(
 
     let sender_label = if msg.is_outgoing {
         "Bạn".to_string()
+    } else if let Some(resolved) = resolved_sender.filter(|s| !s.is_empty() && *s != "0") {
+        resolved.to_string()
     } else if !msg.sender.is_empty() && msg.sender != "0" {
         msg.sender.clone()
     } else {
@@ -769,7 +773,7 @@ pub(super) fn render_message_body(
     }
 
     if msg.kind == crate::message_model::MessageKind::Contact || msg.contact_id.is_some() {
-        return render_contact_card_widget(ui, msg, pal, outgoing, max_text_width);
+        return render_contact_card_widget(ui, msg, pal, outgoing, max_text_width, server_aliases);
     }
 
     if msg.kind == crate::message_model::MessageKind::Voice
@@ -1038,6 +1042,9 @@ pub(super) fn render_chat_bubble(
     emoji_textures: &HashMap<String, TextureHandle>,
     animated_stickers: bool,
     _idx: usize,
+    resolved_sender: Option<&str>,
+    resolved_quote_sender: Option<&str>,
+    server_aliases: &HashMap<String, String>,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
@@ -1070,9 +1077,12 @@ pub(super) fn render_chat_bubble(
         && msg.reply_to_text.is_none()
         && (msg.is_outgoing || !is_group);
 
-    let sender_is_name = !msg.sender.is_empty()
-        && msg.sender != "0"
-        && !msg.sender.chars().all(|c| c.is_ascii_digit());
+    let effective_sender = resolved_sender
+        .filter(|s| !s.is_empty() && *s != "0")
+        .unwrap_or(msg.sender.as_str());
+    let sender_is_name = !effective_sender.is_empty()
+        && effective_sender != "0"
+        && !effective_sender.chars().all(|c| c.is_ascii_digit());
     let show_group_sender = !msg.is_outgoing && !prev_same_sender && is_group && sender_is_name;
 
     // Pre-measure exact content width for both outgoing and incoming bubbles so every bubble,
@@ -1176,11 +1186,7 @@ pub(super) fn render_chat_bubble(
                     .size()
                     .x
                 });
-                let who = msg
-                    .reply_to_sender
-                    .as_deref()
-                    .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or("Tin nhắn trích dẫn");
+                let who = resolve_quote_who(msg, resolved_quote_sender, server_aliases);
                 let q_who_w = ui.fonts(|f| {
                     f.layout_no_wrap(who.to_string(), FontId::proportional(11.5), Color32::WHITE)
                         .size()
@@ -1193,7 +1199,7 @@ pub(super) fn render_chat_bubble(
         let sender_w = if show_group_sender {
             ui.fonts(|f| {
                 f.layout_no_wrap(
-                    truncate_chars(&msg.sender, 22).into_owned(),
+                    truncate_chars(effective_sender, 22).into_owned(),
                     FontId::proportional(12.0),
                     Color32::WHITE,
                 )
@@ -1291,7 +1297,15 @@ pub(super) fn render_chat_bubble(
                         ui.set_min_width(content_width);
                         ui.set_max_width(content_width);
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
-                            quote_action = render_quote_block(ui, msg, pal, true, content_width);
+                            quote_action = render_quote_block(
+                                ui,
+                                msg,
+                                pal,
+                                true,
+                                content_width,
+                                resolved_quote_sender,
+                                server_aliases,
+                            );
                             if !render_sticker_widget(
                                 ui,
                                 msg,
@@ -1312,6 +1326,8 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    resolved_sender,
+                                    server_aliases,
                                 );
                             }
                             if let Some(job) = &msg.outgoing_job {
@@ -1345,10 +1361,6 @@ pub(super) fn render_chat_bubble(
                                             .size(11.0)
                                             .color(pal.bubble_out_meta),
                                     );
-                                    // WP16-3: E2EE lock badge
-                                    if msg.is_e2ee {
-                                        ui.label(RichText::new("🔒").size(10.0));
-                                    }
                                 });
                             }
                             if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
@@ -1403,7 +1415,7 @@ pub(super) fn render_chat_bubble(
     } else {
         ui.horizontal_top(|ui| {
             let display_sender = if sender_is_name {
-                &msg.sender
+                effective_sender
             } else {
                 thread_name
             };
@@ -1458,14 +1470,22 @@ pub(super) fn render_chat_bubble(
                         ui.with_layout(Layout::top_down(Align::Min), |ui| {
                             if show_group_sender {
                                 ui.label(
-                                    RichText::new(truncate_chars(&msg.sender, 22))
+                                    RichText::new(truncate_chars(effective_sender, 22))
                                         .color(sender_accent)
                                         .size(12.0)
                                         .strong(),
                                 );
                                 ui.add_space(2.0);
                             }
-                            quote_action = render_quote_block(ui, msg, pal, false, content_width);
+                            quote_action = render_quote_block(
+                                ui,
+                                msg,
+                                pal,
+                                false,
+                                content_width,
+                                resolved_quote_sender,
+                                server_aliases,
+                            );
                             if !render_sticker_widget(
                                 ui,
                                 msg,
@@ -1486,6 +1506,8 @@ pub(super) fn render_chat_bubble(
                                     content_width,
                                     sticker_textures,
                                     loading_stickers,
+                                    resolved_sender,
+                                    server_aliases,
                                 );
                             }
                             if let Some(job) = &msg.outgoing_job {
@@ -1519,10 +1541,6 @@ pub(super) fn render_chat_bubble(
                                             .color(pal.bubble_in_meta)
                                             .size(11.0),
                                     );
-                                    // WP16-3: E2EE lock badge
-                                    if msg.is_e2ee {
-                                        ui.label(RichText::new("🔒").size(10.0));
-                                    }
                                 });
                             }
                             if let Some(action) = render_reactions(ui, msg, pal, emoji_textures) {
@@ -1983,6 +2001,7 @@ pub(super) fn render_contact_card_widget(
     pal: &ThemePalette,
     outgoing: bool,
     max_text_width: f32,
+    server_aliases: &HashMap<String, String>,
 ) -> Option<BubbleAction> {
     let mut action = None;
     let card_w = max_text_width.clamp(200.0, 280.0);
@@ -1992,9 +2011,10 @@ pub(super) fn render_contact_card_widget(
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
 
-    let name = msg.contact_name.as_deref().unwrap_or("Liên hệ");
-    let phone = msg.contact_phone.as_deref().unwrap_or("");
     let contact_id = msg.contact_id.as_deref().unwrap_or("");
+    let raw_name = msg.contact_name.as_deref().unwrap_or("Liên hệ");
+    let name = resolve_contact_name_from(server_aliases, contact_id, raw_name);
+    let phone = msg.contact_phone.as_deref().unwrap_or("");
 
     ui.allocate_ui_with_layout(Vec2::new(card_w, 0.0), Layout::top_down(Align::Min), |ui| {
         ui.set_width(card_w);
@@ -2049,6 +2069,23 @@ pub(super) fn render_contact_card_widget(
     action
 }
 
+fn resolve_quote_who<'a>(
+    msg: &'a ChatMessage,
+    resolved_quote_sender: Option<&'a str>,
+    server_aliases: &'a HashMap<String, String>,
+) -> &'a str {
+    resolved_quote_sender
+        .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
+        .or_else(|| {
+            msg.reply_to_sender.as_deref().and_then(|sn| {
+                let resolved = resolve_contact_name_from(server_aliases, sn, sn);
+                (!resolved.is_empty() && !resolved.chars().all(|c| c.is_ascii_digit()))
+                    .then_some(resolved)
+            })
+        })
+        .unwrap_or("Tin nhắn trích dẫn")
+}
+
 /// Quoted-message block shown at the top of a reply bubble.
 pub(super) fn render_quote_block(
     ui: &mut egui::Ui,
@@ -2056,6 +2093,8 @@ pub(super) fn render_quote_block(
     pal: &ThemePalette,
     outgoing: bool,
     max_w: f32,
+    resolved_quote_sender: Option<&str>,
+    server_aliases: &HashMap<String, String>,
 ) -> Option<BubbleAction> {
     let qt = msg.reply_to_text.as_ref()?;
     let (text_col, meta_col) = if outgoing {
@@ -2087,11 +2126,7 @@ pub(super) fn render_quote_block(
                     .rect_filled(bar_rect, Rounding::same(1.5), bar_col);
                 ui.vertical(|ui| {
                     ui.set_width(inner_col_w);
-                    let who = msg
-                        .reply_to_sender
-                        .as_deref()
-                        .filter(|sn| !sn.is_empty() && !sn.chars().all(|c| c.is_ascii_digit()))
-                        .unwrap_or("Tin nhắn trích dẫn");
+                    let who = resolve_quote_who(msg, resolved_quote_sender, server_aliases);
                     ui.label(RichText::new(who).color(bar_col).size(11.5).strong());
                     ui.add(
                         egui::Label::new(
@@ -2304,6 +2339,9 @@ mod quote_navigation_tests {
                                 &HashMap::new(),
                                 true,
                                 0,
+                                None,
+                                None,
+                                &HashMap::new(),
                             );
                         });
                     },
@@ -2353,7 +2391,16 @@ mod quote_navigation_tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        action = render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0);
+                        let empty = HashMap::new();
+                        action = render_quote_block(
+                            ui,
+                            &msg,
+                            &ThemePalette::light(),
+                            false,
+                            300.0,
+                            None,
+                            &empty,
+                        );
                     });
                 },
             );
@@ -2379,7 +2426,16 @@ mod quote_navigation_tests {
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        render_quote_block(ui, &msg, &ThemePalette::light(), false, 300.0);
+                        let empty = HashMap::new();
+                        render_quote_block(
+                            ui,
+                            &msg,
+                            &ThemePalette::light(),
+                            false,
+                            300.0,
+                            None,
+                            &empty,
+                        );
                     });
                 },
             );
@@ -2452,6 +2508,8 @@ mod photo_viewer_tests {
                                 300.0,
                                 &textures,
                                 &mut HashSet::new(),
+                                None,
+                                &HashMap::new(),
                             );
                         });
                     },
@@ -2656,98 +2714,188 @@ mod thumbnail_geometry_tests {
     }
 }
 
-/// Native controls on a stable message identity; the row-to-toolbar corridor avoids hover gaps.
+/// Native controls on a stable message identity; requires >150ms steady dwell and honors modal gating.
 pub(super) fn hover_message_actions(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     thread: &str,
     msg: &ChatMessage,
     emoji: &HashMap<String, TextureHandle>,
+    modal_open: bool,
 ) -> Option<BubbleAction> {
+    const HOVER_DWELL_SECS: f64 = 0.15;
+    const HOVER_MOVE_TOLERANCE_PX: f32 = 6.0;
+
+    let key = Id::new(("hover_message", thread));
+    let dwell_key = Id::new(("hover_message_dwell", thread));
+    let react_key = Id::new(("hover_reaction_btn", thread));
+    let menu_key = Id::new(("hover_message_menu", thread));
+
+    if modal_open {
+        ui.ctx().data_mut(|d| {
+            d.remove::<(String, i64, egui::Rect)>(key);
+            d.remove::<(String, i64, f64, Pos2)>(dwell_key);
+            d.remove::<(String, i64, egui::Rect)>(react_key);
+            d.remove::<(String, i64)>(menu_key);
+        });
+        return None;
+    }
+
     if !ui.is_rect_visible(rect) || is_system_notice_message(msg) || msg.id.is_empty() {
         return None;
     }
-    let key = Id::new(("hover_message", thread));
-    let identity = (&msg.id, msg.ts);
 
     let bubble_rect_opt = ui
         .ctx()
         .data(|d| d.get_temp::<egui::Rect>(Id::new(("bubble_rect", &msg.id, msg.ts))));
-
-    let bar_w = 124.0_f32;
-    let bar_h = 32.0_f32;
-    let bar_pos = match (bubble_rect_opt, msg.is_outgoing) {
-        (Some(b), true) => egui::pos2(
-            (b.left() - bar_w - 4.0).max(ui.clip_rect().left() + 4.0),
-            b.top(),
-        ),
-        (Some(b), false) => egui::pos2(
-            (b.right() + 4.0).min(ui.clip_rect().right() - bar_w - 4.0),
-            b.top(),
-        ),
-        (None, _) => egui::pos2(rect.right() - bar_w, rect.top()),
-    };
-    let bar = egui::Rect::from_min_size(bar_pos, Vec2::new(bar_w, bar_h));
     let bubble_rect = bubble_rect_opt.unwrap_or(rect);
+    let clip = ui.clip_rect();
+
+    // Compact 3-button toolbar (Reply, Share, More) tucked beside the bottom edge of the bubble.
+    let bar_w = 88.0_f32;
+    let bar_h = 28.0_f32;
+    let bar_y = (bubble_rect.bottom() - bar_h)
+        .max(bubble_rect.top())
+        .clamp(clip.top(), (clip.bottom() - bar_h).max(clip.top()));
+    // Separate reaction trigger placed at the bottom corner of the bubble.
+    let react_size = Vec2::splat(22.0);
+    let bar_x = match (bubble_rect_opt, msg.is_outgoing) {
+        (Some(b), true) => (b.left() - bar_w - 4.0).max(clip.left() + 4.0),
+        (Some(b), false) => {
+            (b.right() + 4.0).min((clip.right() - bar_w - 4.0).max(clip.left() + 4.0))
+        }
+        (None, true) => (rect.right() - bar_w).max(clip.left() + 4.0),
+        (None, false) => (rect.right() - bar_w - react_size.x - 8.0).max(clip.left() + 4.0),
+    };
+    let bar = egui::Rect::from_min_size(egui::pos2(bar_x, bar_y), Vec2::new(bar_w, bar_h));
+
+    let react_x = if msg.is_outgoing {
+        (bubble_rect.left() + 2.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - react_size.x - 4.0).max(clip.left() + 4.0),
+        )
+    } else {
+        (bubble_rect.right() - react_size.x - 2.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - react_size.x - 4.0).max(clip.left() + 4.0),
+        )
+    };
+    let react_y = (bubble_rect.bottom() - react_size.y * 0.75)
+        .max(bubble_rect.top())
+        .clamp(clip.top(), (clip.bottom() - react_size.y).max(clip.top()));
+    let react_rect = egui::Rect::from_min_size(egui::pos2(react_x, react_y), react_size);
 
     let active = ui
         .ctx()
         .data(|d| d.get_temp::<(String, i64, egui::Rect)>(key));
+    let active_react = ui
+        .ctx()
+        .data(|d| d.get_temp::<(String, i64, egui::Rect)>(react_key));
     let pointer = ui.input(|i| i.pointer.hover_pos());
-    let over_active_bar = active
-        .as_ref()
-        .is_some_and(|(_, _, bar)| pointer.is_some_and(|p| bar.expand(4.0).contains(p)));
     let this_active = active
         .as_ref()
-        .is_some_and(|(id, ts, _)| (id, *ts) == (identity.0, identity.1));
-    let popup_open = ui.memory(|m| m.any_popup_open());
-    if (over_active_bar || popup_open) && !this_active {
+        .is_some_and(|(id, ts, _)| (id.as_str(), *ts) == (msg.id.as_str(), msg.ts));
+    let over_active_controls = active
+        .as_ref()
+        .is_some_and(|(_, _, r)| pointer.is_some_and(|p| r.contains(p)))
+        || active_react
+            .as_ref()
+            .is_some_and(|(_, _, r)| pointer.is_some_and(|p| r.contains(p)));
+    let popup_open = ui.memory(|m| m.any_popup_open())
+        || ui
+            .ctx()
+            .data(|d| d.get_temp::<(String, i64)>(menu_key).is_some());
+    let this_menu_open = ui.ctx().data(|d| {
+        d.get_temp::<(String, i64)>(menu_key)
+            .is_some_and(|(id, ts)| (id.as_str(), ts) == (msg.id.as_str(), msg.ts))
+    });
+
+    if (over_active_controls || popup_open) && !this_active {
         return None;
     }
-    if !(this_active && popup_open)
-        && !pointer.is_some_and(|p| rect.contains(p) || bubble_rect.contains(p))
-        && !(this_active
-            && pointer.is_some_and(|p| {
-                rect.union(bubble_rect)
-                    .union(active.as_ref().map(|a| a.2).unwrap_or(bar))
-                    .expand(8.0)
-                    .contains(p)
-            }))
-    {
-        return None;
+
+    let active_bar = active.as_ref().map(|a| a.2).unwrap_or(bar);
+    let active_react_box = active_react.as_ref().map(|a| a.2).unwrap_or(react_rect);
+    // Exact horizontal corridor between bubble and toolbar; no vertical expansion into neighbor rows.
+    let corridor = egui::Rect::from_min_max(
+        egui::pos2(
+            bubble_rect.left().min(active_bar.left()),
+            bubble_rect.top().min(active_bar.top()),
+        ),
+        egui::pos2(
+            bubble_rect.right().max(active_bar.right()),
+            bubble_rect.bottom().max(active_bar.bottom()),
+        ),
+    );
+
+    if this_active {
+        let keep_alive = this_menu_open
+            || ui.memory(|m| m.any_popup_open())
+            || pointer.is_some_and(|p| {
+                bubble_rect.contains(p)
+                    || active_bar.contains(p)
+                    || active_react_box.contains(p)
+                    || corridor.contains(p)
+            });
+        if !keep_alive {
+            ui.ctx().data_mut(|d| {
+                d.remove::<(String, i64, egui::Rect)>(key);
+                d.remove::<(String, i64, egui::Rect)>(react_key);
+                d.remove::<(String, i64)>(menu_key);
+                if d.get_temp::<(String, i64, f64, Pos2)>(dwell_key)
+                    .is_some_and(|(id, ts, _, _)| (id.as_str(), ts) == (msg.id.as_str(), msg.ts))
+                {
+                    d.remove::<(String, i64, f64, Pos2)>(dwell_key);
+                }
+            });
+            return None;
+        }
+    } else {
+        let p = pointer.filter(|p| bubble_rect.contains(*p))?;
+        let now = ui.input(|i| i.time);
+        let dwell = ui
+            .ctx()
+            .data(|d| d.get_temp::<(String, i64, f64, Pos2)>(dwell_key));
+        let elapsed = match dwell {
+            Some((ref id, ts, since, prev_pos))
+                if (id.as_str(), ts) == (msg.id.as_str(), msg.ts) =>
+            {
+                if p.distance(prev_pos) > HOVER_MOVE_TOLERANCE_PX {
+                    ui.ctx().data_mut(|d| {
+                        d.insert_temp(dwell_key, (msg.id.clone(), msg.ts, now, p));
+                    });
+                    0.0
+                } else {
+                    now - since
+                }
+            }
+            _ => {
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(dwell_key, (msg.id.clone(), msg.ts, now, p));
+                });
+                0.0
+            }
+        };
+        if elapsed <= HOVER_DWELL_SECS {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(160));
+            return None;
+        }
     }
+
     let mut action = None;
+    let mut child_menu_open = false;
     let toolbar = egui::Area::new(Id::new(("hover_actions", thread, &msg.id, msg.ts)))
         .order(egui::Order::Foreground)
         .default_size(Vec2::new(bar_w, bar_h))
         .fixed_pos(bar.left_top())
-        .constrain_to(ui.clip_rect())
+        .constrain_to(clip)
         .show(ui.ctx(), |ui| {
             egui::Frame::popup(ui.style())
-                .inner_margin(3.0)
+                .inner_margin(2.0)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        ui.menu_button("☺", |ui| {
-                            ui.horizontal(|ui| {
-                                for &(code, key, hint) in &REACTION_LIST {
-                                    let response = if let Some(tex) = emoji.get(key) {
-                                        ui.add(egui::ImageButton::new(
-                                            egui::Image::new(tex)
-                                                .fit_to_exact_size(Vec2::splat(22.0)),
-                                        ))
-                                    } else {
-                                        ui.button(code)
-                                    };
-                                    if response.on_hover_text(hint).clicked() {
-                                        action = Some(BubbleAction::React(code));
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        })
-                        .response
-                        .on_hover_text(crate::i18n::tr("Thả cảm xúc"));
 
                         if ui
                             .button("↩")
@@ -2759,13 +2907,14 @@ pub(super) fn hover_message_actions(
 
                         if ui
                             .button("↪")
-                            .on_hover_text(crate::i18n::tr("Chuyển tiếp"))
+                            .on_hover_text(crate::i18n::tr("Chia sẻ"))
                             .clicked()
                         {
                             action = Some(BubbleAction::Forward);
                         }
 
                         ui.menu_button("⋯", |ui| {
+                            child_menu_open = true;
                             ui.set_min_width(170.0);
                             if ui.button(crate::i18n::tr("Ghim tin nhắn")).clicked() {
                                 action = Some(BubbleAction::PinOnServer);
@@ -2812,14 +2961,64 @@ pub(super) fn hover_message_actions(
                     });
                 });
         });
-    ui.ctx()
-        .data_mut(|d| d.insert_temp(key, (msg.id.clone(), msg.ts, toolbar.response.rect)));
+
+    let react_area = egui::Area::new(Id::new(("hover_react_btn", thread, &msg.id, msg.ts)))
+        .order(egui::Order::Foreground)
+        .default_size(react_size)
+        .fixed_pos(react_rect.left_top())
+        .constrain_to(clip)
+        .show(ui.ctx(), |ui| {
+            ui.spacing_mut().button_padding = Vec2::new(3.0, 1.0);
+            let btn_bg = ui.style().visuals.window_fill();
+            let btn_stroke = ui.style().visuals.widgets.noninteractive.bg_stroke;
+            egui::Frame::none()
+                .fill(btn_bg)
+                .stroke(btn_stroke)
+                .rounding(Rounding::same(11.0))
+                .inner_margin(Margin::symmetric(2.0, 1.0))
+                .show(ui, |ui| {
+                    ui.menu_button("☺", |ui| {
+                        child_menu_open = true;
+                        ui.horizontal(|ui| {
+                            for &(code, key, hint) in &REACTION_LIST {
+                                let response = if let Some(tex) = emoji.get(key) {
+                                    ui.add(egui::ImageButton::new(
+                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(22.0)),
+                                    ))
+                                } else {
+                                    ui.button(code)
+                                };
+                                if response.on_hover_text(hint).clicked() {
+                                    action = Some(BubbleAction::React(code));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    })
+                    .response
+                    .on_hover_text(crate::i18n::tr("Thả cảm xúc"));
+                });
+        });
+
+    ui.ctx().data_mut(|d| {
+        d.insert_temp(key, (msg.id.clone(), msg.ts, toolbar.response.rect));
+        d.insert_temp(
+            react_key,
+            (msg.id.clone(), msg.ts, react_area.response.rect),
+        );
+        if child_menu_open && action.is_none() {
+            d.insert_temp(menu_key, (msg.id.clone(), msg.ts));
+        } else {
+            d.remove::<(String, i64)>(menu_key);
+        }
+    });
     action
 }
 
 #[cfg(test)]
 mod hover_action_tests {
     use super::*;
+
     #[test]
     fn native_reaction_click_keeps_target_when_another_row_appears() {
         let ctx = egui::Context::default();
@@ -2838,13 +3037,13 @@ mod hover_action_tests {
         let rect = egui::Rect::from_min_size(egui::pos2(20.0, 50.0), Vec2::new(600.0, 100.0));
         let mut point = rect.center();
         let mut result = None;
-        for frame in 0..9 {
+        for frame in 0..11 {
             let mut events = vec![egui::Event::PointerMoved(point)];
-            if matches!(frame, 3 | 4 | 6 | 7) {
+            if matches!(frame, 4 | 5 | 7 | 8) {
                 events.push(egui::Event::PointerButton {
                     pos: point,
                     button: egui::PointerButton::Primary,
-                    pressed: frame == 3 || frame == 6,
+                    pressed: frame == 4 || frame == 7,
                     modifiers: Default::default(),
                 });
             }
@@ -2854,12 +3053,13 @@ mod hover_action_tests {
                         Pos2::ZERO,
                         Vec2::new(800.0, 600.0),
                     )),
+                    time: Some(frame as f64 * 0.1),
                     events,
                     ..Default::default()
                 },
                 |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        if frame >= 2 {
+                        if frame >= 3 {
                             // A neighboring row must not steal an already hovered toolbar.
                             let overlapping = rect.translate(Vec2::new(0.0, -30.0));
                             assert!(hover_message_actions(
@@ -2867,19 +3067,25 @@ mod hover_action_tests {
                                 overlapping,
                                 "group_1",
                                 &other,
-                                &HashMap::new()
+                                &HashMap::new(),
+                                false,
                             )
                             .is_none());
                         }
-                        if let Some(action) =
-                            hover_message_actions(ui, rect, "group_1", &message, &HashMap::new())
-                        {
+                        if let Some(action) = hover_message_actions(
+                            ui,
+                            rect,
+                            "group_1",
+                            &message,
+                            &HashMap::new(),
+                            false,
+                        ) {
                             result = Some(action);
                         }
                     });
                 },
             );
-            if frame == 5 {
+            if frame == 6 {
                 point = output
                     .shapes
                     .iter()
@@ -2892,19 +3098,143 @@ mod hover_action_tests {
                     .expect("picker opens only after clicking the reaction button");
                 assert!(result.is_none());
             }
-            if frame == 1 {
-                let (_, _, toolbar) = ctx
+            if frame == 2 {
+                let (_, _, react_btn) = ctx
                     .data(|d| {
                         d.get_temp::<(String, i64, egui::Rect)>(Id::new((
-                            "hover_message",
+                            "hover_reaction_btn",
                             "group_1",
                         )))
                     })
-                    .unwrap();
-                point = toolbar.left_top() + Vec2::new(12.0, 12.0);
+                    .expect("reaction button should appear after >150ms dwell");
+                point = react_btn.center();
             }
         }
         assert!(matches!(result, Some(BubbleAction::React("👍"))));
+    }
+
+    #[test]
+    fn dwell_delay_suppresses_brief_hover_and_modal_gate_resets_state() {
+        let ctx = egui::Context::default();
+        let message = ChatMessage {
+            id: "dwell-target".into(),
+            text: "hello".into(),
+            ts: 300,
+            ..Default::default()
+        };
+        let rect = egui::Rect::from_min_size(egui::pos2(40.0, 80.0), Vec2::new(300.0, 60.0));
+
+        // Frame 0 (t=0.0s): dwell starts, toolbar must not show immediately.
+        // Frame 1 (t=0.1s): <=150ms, toolbar still suppressed.
+        for t in [0.0_f64, 0.10] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    time: Some(t),
+                    events: vec![egui::Event::PointerMoved(rect.center())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        assert!(hover_message_actions(
+                            ui,
+                            rect,
+                            "thread_dwell",
+                            &message,
+                            &HashMap::new(),
+                            false,
+                        )
+                        .is_none());
+                    });
+                },
+            );
+            assert!(ctx
+                .data(|d| d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                    "hover_message",
+                    "thread_dwell"
+                ))))
+                .is_none());
+        }
+
+        // Steady hover past >150ms (t=0.30s) activates toolbar and reaction button.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                time: Some(0.30),
+                events: vec![egui::Event::PointerMoved(rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = hover_message_actions(
+                        ui,
+                        rect,
+                        "thread_dwell",
+                        &message,
+                        &HashMap::new(),
+                        false,
+                    );
+                });
+            },
+        );
+        assert!(ctx
+            .data(|d| d
+                .get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_dwell"))))
+            .is_some());
+        assert!(ctx
+            .data(|d| d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                "hover_reaction_btn",
+                "thread_dwell"
+            ))))
+            .is_some());
+
+        // Modal gate immediately clears active hover and dwell state.
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(800.0, 600.0),
+                )),
+                time: Some(0.40),
+                events: vec![egui::Event::PointerMoved(rect.center())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(hover_message_actions(
+                        ui,
+                        rect,
+                        "thread_dwell",
+                        &message,
+                        &HashMap::new(),
+                        true,
+                    )
+                    .is_none());
+                });
+            },
+        );
+        assert!(ctx
+            .data(|d| d
+                .get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_dwell"))))
+            .is_none());
+        assert!(ctx
+            .data(|d| d.get_temp::<(String, i64, f64, Pos2)>(Id::new((
+                "hover_message_dwell",
+                "thread_dwell"
+            ))))
+            .is_none());
+        assert!(ctx
+            .data(|d| d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                "hover_reaction_btn",
+                "thread_dwell"
+            ))))
+            .is_none());
     }
 }
 
@@ -3119,7 +3449,7 @@ mod hover_action_position_tests {
             egui::Rect::from_min_size(egui::pos2(400.0, 100.0), Vec2::new(280.0, 50.0));
         let bubble_in = egui::Rect::from_min_size(egui::pos2(50.0, 100.0), Vec2::new(280.0, 50.0));
 
-        // Test outgoing: hover bar should be to the left of the bubble
+        // Test outgoing: hover bar should be to the left of the bubble after >150ms dwell
         ctx.data_mut(|d| {
             d.insert_temp(
                 Id::new(("bubble_rect", &msg_out.id, msg_out.ts)),
@@ -3127,69 +3457,88 @@ mod hover_action_position_tests {
             );
         });
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(800.0, 600.0),
-                )),
-                events: vec![egui::Event::PointerMoved(bubble_out.center())],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = hover_message_actions(
-                        ui,
-                        row_rect,
-                        "thread_pos_out",
-                        &msg_out,
-                        &HashMap::new(),
-                    );
-                });
-            },
-        );
+        for t in [0.0_f64, 0.25] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    time: Some(t),
+                    events: vec![egui::Event::PointerMoved(bubble_out.center())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = hover_message_actions(
+                            ui,
+                            row_rect,
+                            "thread_pos_out",
+                            &msg_out,
+                            &HashMap::new(),
+                            false,
+                        );
+                    });
+                },
+            );
+        }
 
         let active_out = ctx.data(|d| {
             d.get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_pos_out")))
         });
         assert!(active_out.is_some());
         let (_, _, bar_out) = active_out.unwrap();
-        // Should be positioned to the left of bubble_out
+        // Should be positioned to the left of bubble_out and aligned near the bottom
         assert!(bar_out.right() <= bubble_out.left());
+        assert!(bar_out.bottom() >= bubble_out.center().y);
+        let react_out = ctx
+            .data(|d| {
+                d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                    "hover_reaction_btn",
+                    "thread_pos_out",
+                )))
+            })
+            .expect("separate reaction button for outgoing bubble");
+        assert!(react_out.2.left() >= bubble_out.left());
+        assert!(!bar_out.intersects(react_out.2));
 
-        // Test incoming: hover bar should be to the right of the bubble
+        // Test incoming: hover bar should be to the right of the bubble after >150ms dwell
         ctx.data_mut(|d| {
             d.insert_temp(Id::new(("bubble_rect", &msg_in.id, msg_in.ts)), bubble_in);
         });
 
-        let _ = ctx.run(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    Pos2::ZERO,
-                    Vec2::new(800.0, 600.0),
-                )),
-                events: vec![egui::Event::PointerMoved(bubble_in.center())],
-                ..Default::default()
-            },
-            |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let _ = hover_message_actions(
-                        ui,
-                        row_rect,
-                        "thread_pos_in",
-                        &msg_in,
-                        &HashMap::new(),
-                    );
-                });
-            },
-        );
+        for t in [0.30_f64, 0.55] {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        Pos2::ZERO,
+                        Vec2::new(800.0, 600.0),
+                    )),
+                    time: Some(t),
+                    events: vec![egui::Event::PointerMoved(bubble_in.center())],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = hover_message_actions(
+                            ui,
+                            row_rect,
+                            "thread_pos_in",
+                            &msg_in,
+                            &HashMap::new(),
+                            false,
+                        );
+                    });
+                },
+            );
+        }
 
         let active_in = ctx.data(|d| {
             d.get_temp::<(String, i64, egui::Rect)>(Id::new(("hover_message", "thread_pos_in")))
         });
         assert!(active_in.is_some());
         let (_, _, bar_in) = active_in.unwrap();
-        // Should be positioned to the right of bubble_in
+        // Should be positioned to the right of bubble_in and aligned near the bottom
         assert!(
             bar_in.left() >= bubble_in.right(),
             "Expected bar_in.left() ({}) >= bubble_in.right() ({}), bar_in: {:?}",
@@ -3197,5 +3546,16 @@ mod hover_action_position_tests {
             bubble_in.right(),
             bar_in
         );
+        assert!(bar_in.bottom() >= bubble_in.center().y);
+        let react_in = ctx
+            .data(|d| {
+                d.get_temp::<(String, i64, egui::Rect)>(Id::new((
+                    "hover_reaction_btn",
+                    "thread_pos_in",
+                )))
+            })
+            .expect("separate reaction button for incoming bubble");
+        assert!(react_in.2.right() <= bubble_in.right());
+        assert!(!bar_in.intersects(react_in.2));
     }
 }

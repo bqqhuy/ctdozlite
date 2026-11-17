@@ -1,5 +1,7 @@
 # Hướng dẫn Bàn giao & Triển khai Tái cấu trúc GUI & UX (AI Agent Handover Guide)
 
+> **Bổ sung khảo sát thực tế 17/11/2026:** xem [bảng tổng hợp và hướng dẫn Antigravity](ZALO_PC_UI_UX_ANTIGRAVITY_HANDOFF_2026-11-17.md) trước khi tiếp tục sửa UX/UI. Tài liệu này ghi các sai khác sau 5 phase, gồm lỗi glyph dấu vuông, modal xuyên hover, forward gửi ngay khi chọn và responsive. Trạng thái phase cũ không thay thế nghiệm thu các mục mới.
+
 > **Dành cho các AI Agent (Gemini, Claude, GPT, v.v., bao gồm conversation ID `d9f5916e-d894-4e09-aebf-00a2920b78a0` và các phiên tiếp nối):**
 > Tài liệu này hướng dẫn chi tiết quy trình triển khai, kiểm chuẩn và chuyển giao từng giai đoạn (Phase 1 → Phase 5) của dự án tái cấu trúc GUI/UX Zalo PC Parity trong `ctdozlite`.
 

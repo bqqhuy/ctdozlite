@@ -106,9 +106,28 @@ impl AppLockGuard {
         self.last_interaction = Instant::now();
     }
 
-    /// Check if the app should auto-lock due to idle timeout.
+    /// Check if biometric authentication (Windows Hello) is available on this device.
+    pub fn is_biometric_available(&self) -> bool {
+        self.biometric_available
+    }
+
+    /// Check if the app should auto-lock due to idle timeout (legacy biometric-only check).
+    #[cfg(test)]
     pub fn should_lock(&self) -> bool {
         self.biometric_available
+            && !self.locked
+            && self.last_interaction.elapsed() >= self.idle_timeout
+    }
+
+    /// Check if the app should auto-lock due to idle timeout based on user lock settings.
+    pub fn should_auto_lock(
+        &self,
+        app_lock_enabled: bool,
+        has_pin: bool,
+        use_windows_hello: bool,
+    ) -> bool {
+        app_lock_enabled
+            && (has_pin || (use_windows_hello && self.biometric_available))
             && !self.locked
             && self.last_interaction.elapsed() >= self.idle_timeout
     }
@@ -399,5 +418,33 @@ mod tests {
         .is_err());
         assert_eq!(native_calls, 0);
         assert!(validate_hwnd(123, |_| false).is_err());
+    }
+
+    #[test]
+    fn is_biometric_available_reflects_probe_state() {
+        let mut guard = AppLockGuard::new();
+        assert!(!guard.is_biometric_available());
+        guard.biometric_available = true;
+        assert!(guard.is_biometric_available());
+    }
+
+    #[test]
+    fn should_auto_lock_respects_enabled_flag_and_unlock_methods() {
+        let mut guard = AppLockGuard::new();
+        guard.biometric_available = true;
+        guard.idle_timeout = Duration::from_millis(20);
+        thread::sleep(Duration::from_millis(30));
+
+        // Disabled app lock must never auto-lock even when biometric is available.
+        assert!(!guard.should_auto_lock(false, true, true));
+        // Enabled app lock with neither PIN nor Hello must never trap the user.
+        assert!(!guard.should_auto_lock(true, false, false));
+        // Enabled app lock with PIN works even without biometric hardware.
+        guard.biometric_available = false;
+        assert!(guard.should_auto_lock(true, true, false));
+        assert!(!guard.should_auto_lock(true, false, true));
+        // Enabled app lock with Windows Hello works when biometric is available.
+        guard.biometric_available = true;
+        assert!(guard.should_auto_lock(true, false, true));
     }
 }

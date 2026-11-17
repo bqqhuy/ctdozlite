@@ -146,6 +146,29 @@ pub fn route_text(text: &str, is_group: bool, is_e2ee: bool) -> TextRoute {
     }
 }
 
+pub(crate) const LINK_PREVIEW_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn bounded_link_preview(
+    session: &Session,
+    url: &str,
+    preview: impl std::future::Future<Output = Result<crate::chat::LinkMetadata>>,
+) -> Option<crate::chat::LinkMetadata> {
+    if let Some(metadata) = session.cached_link_preview(url, crate::chat::LinkOrigin::Outgoing) {
+        session.record_link_preview_cache_hit();
+        return Some(metadata);
+    }
+    let started = std::time::Instant::now();
+    let result = match tokio::time::timeout(LINK_PREVIEW_BUDGET, preview).await {
+        Ok(Ok(metadata)) => Some(metadata),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    session.record_link_preview_timing(started.elapsed(), result.is_some());
+    if let Some(metadata) = &result {
+        session.cache_link_preview(url, crate::chat::LinkOrigin::Outgoing, metadata.clone());
+    }
+    result
+}
+
 pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMessage> {
     let job = message
         .outgoing_job
@@ -211,34 +234,41 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                     result
                 }
                 TextRoute::Link(url) => {
-                    let meta = crate::chat::parse_link_metadata(
+                    // PC preview wait defaults to 2s (E2, send-latency guide P05).
+                    // The deadline covers both parselink and outgoing scraping.
+                    let meta = bounded_link_preview(
                         s,
                         &url,
-                        crate::chat::LinkOrigin::Outgoing,
+                        crate::chat::parse_link_metadata(
+                            s,
+                            &url,
+                            crate::chat::LinkOrigin::Outgoing,
+                        ),
                     )
-                    .await
-                    .unwrap_or(crate::chat::LinkMetadata {
-                        title: url.clone(),
-                        url,
-                        desc: String::new(),
-                        thumb: String::new(),
-                        src: "Liên kết".into(),
-                    });
-                    let result = crate::chat::send_link_message_with_client_id(
-                        s,
-                        to,
-                        &message.text,
-                        &meta,
-                        job.is_group,
-                        id,
-                    )
-                    .await?;
-                    sent.link_url = Some(meta.url);
-                    sent.link_title = Some(meta.title);
-                    sent.link_desc = Some(meta.desc);
-                    sent.link_thumb = Some(meta.thumb);
-                    sent.link_src = Some(meta.src);
-                    result
+                    .await;
+                    if let Some(meta) = meta {
+                        let result = crate::chat::send_link_message_with_client_id(
+                            s,
+                            to,
+                            &message.text,
+                            &meta,
+                            job.is_group,
+                            id,
+                        )
+                        .await?;
+                        sent.link_url = Some(meta.url);
+                        sent.link_title = Some(meta.title);
+                        sent.link_desc = Some(meta.desc);
+                        sent.link_thumb = Some(meta.thumb);
+                        sent.link_src = Some(meta.src);
+                        result
+                    } else if job.is_group {
+                        // Explicit endpoints prevent routing back into preview.
+                        crate::chat::send_group_message_with_client_id(s, to, &message.text, id)
+                            .await?
+                    } else {
+                        crate::chat::send_message_with_client_id(s, to, &message.text, id).await?
+                    }
                 }
                 TextRoute::Group => {
                     crate::chat::send_group_message_with_client_id(s, to, &message.text, id).await?
@@ -663,7 +693,7 @@ impl Drop for Active {
 pub(crate) fn failure_message(error: &anyhow::Error) -> String {
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
-            return if error.is_connect() { "Không kết nối được mạng. Kiểm tra kết nối rồi gửi lại." }
+            return if error.is_connect() { "Không kết nối được máy chủ gửi tin. Có thể do DNS, máy chủ hoặc đường truyền; kiểm tra hội thoại trước khi gửi lại." }
                 else if error.is_timeout() { "Hết thời gian chờ xác nhận. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin." }
                 else { "Kết nối bị gián đoạn. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin." }.into();
         }

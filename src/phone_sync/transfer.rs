@@ -863,7 +863,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     range_days: u32,
     mut progress: F,
     page: G,
-) -> Result<String> {
+) -> Result<crate::history_sync::SyncReport> {
     let _owner = SYNC_OWNER.lock().await;
     ensure!(
         session.is_active() && session.login.is_some(),
@@ -1405,7 +1405,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     } else {
         String::new()
     };
-    Ok(format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có{deleted_note}; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail} {plan_summary}."))
+    Ok(crate::history_sync::SyncReport { complete: skipped == 0 && failures == 0 && unmapped == 0, message: format!("Đã hoàn tất tải và nhập lịch sử: đọc {read} tin, {inserted} tin mới, {existing} tin đã có{deleted_note}; {unmapped} tin chưa xác định hội thoại được giữ riêng.{tail} {plan_summary}.") })
 }
 
 /// Vietnamese summary of what an update run will check.

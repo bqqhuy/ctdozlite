@@ -791,6 +791,10 @@ pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f3
     draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
 }
 
+pub(super) fn draw_icon_lock(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    draw_lucide_icon(painter, center, lucide::LOCK, size, color);
+}
+
 pub(super) fn draw_icon_drawer(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
     draw_lucide_icon(painter, center, lucide::PANEL_RIGHT, size, color);
 }
@@ -890,20 +894,28 @@ pub(super) fn render_toggle_switch(
     value: &mut bool,
     pal: &ThemePalette,
 ) -> egui::Response {
+    let enabled = ui.is_enabled();
     let (rect, mut resp) = ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
-    if resp.clicked() {
+    if enabled && resp.clicked() {
         *value = !*value;
         resp.mark_changed();
     }
-    resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if enabled {
+        resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    }
 
-    let bg = if *value {
+    let mut bg = if *value {
         pal.primary
     } else if pal.is_dark {
         Color32::from_rgb(58, 63, 75)
     } else {
         Color32::from_rgb(203, 213, 225)
     };
+    let mut knob_col = Color32::WHITE;
+    if !enabled {
+        bg = bg.linear_multiply(0.45);
+        knob_col = Color32::from_white_alpha(150);
+    }
     ui.painter().rect_filled(rect, Rounding::same(10.0), bg);
 
     let knob_radius = 7.5_f32;
@@ -912,11 +924,8 @@ pub(super) fn render_toggle_switch(
     } else {
         rect.left() + 10.0
     };
-    ui.painter().circle_filled(
-        Pos2::new(knob_x, rect.center().y),
-        knob_radius,
-        Color32::WHITE,
-    );
+    ui.painter()
+        .circle_filled(Pos2::new(knob_x, rect.center().y), knob_radius, knob_col);
     resp
 }
 
@@ -971,6 +980,18 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
             break;
         }
     }
+    // Load outline-capable Windows emoji and symbol fallbacks so user emojis and
+    // special characters render cleanly without tofu boxes (`ab_glyph` requires glyf/CFF).
+    for (key, filename) in [
+        ("emoji_font", "seguiemj.ttf"),
+        ("symbol_font", "seguisym.ttf"),
+    ] {
+        if let Ok(data) = std::fs::read(font_dir.join(filename)) {
+            fonts
+                .font_data
+                .insert(key.into(), egui::FontData::from_owned(data));
+        }
+    }
     if with_cjk {
         for name in ["msyh.ttc", "simsun.ttc", "meiryo.ttc", "malgun.ttf"] {
             if let Ok(data) = std::fs::read(font_dir.join(name)) {
@@ -982,32 +1003,32 @@ fn build_fonts(ctx: &egui::Context, with_cjk: bool) {
         }
     }
 
-    // Fallback order: bundled sans guarantees Vietnamese coverage, CJK supplies Han/Kana/Hangul, Lucide supplies icon glyphs
-    let prop = fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default();
-    prop.insert(0, "bundled_sans".to_owned());
-    if fonts.font_data.contains_key("vietnamese_font") {
-        prop.insert(1, "vietnamese_font".to_owned());
+    // Fallback order: Be Vietnam Pro -> Windows Vietnamese UI -> Ubuntu-Light -> Windows Emoji
+    // -> built-in NotoEmoji / emoji-icon-font -> Lucide (before symbol_font to avoid PUA collisions)
+    // -> Windows Symbol -> lazy CJK.
+    let tail = [
+        "bundled_sans",
+        "vietnamese_font",
+        "Ubuntu-Light",
+        "emoji_font",
+        "NotoEmoji-Regular",
+        "emoji-icon-font",
+        "lucide_font",
+        "symbol_font",
+        "cjk_font",
+    ];
+    for (family_kind, prefix) in [
+        (egui::FontFamily::Proportional, None),
+        (egui::FontFamily::Monospace, Some("Hack")),
+    ] {
+        let list = fonts.families.entry(family_kind).or_default();
+        list.clear();
+        for name in prefix.into_iter().chain(tail.iter().copied()) {
+            if fonts.font_data.contains_key(name) {
+                list.push(name.to_owned());
+            }
+        }
     }
-    if fonts.font_data.contains_key("cjk_font") {
-        prop.push("cjk_font".to_owned());
-    }
-    prop.push("lucide_font".to_owned());
-
-    let mono = fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default();
-    mono.push("bundled_sans".to_owned());
-    if fonts.font_data.contains_key("vietnamese_font") {
-        mono.push("vietnamese_font".to_owned());
-    }
-    if fonts.font_data.contains_key("cjk_font") {
-        mono.push("cjk_font".to_owned());
-    }
-    mono.push("lucide_font".to_owned());
 
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("available-ui-fonts"), fonts.clone()));
     let family = ctx
@@ -1330,5 +1351,64 @@ mod customization_tests {
         let dark = ThemePalette::dark();
         assert_eq!(dark.bg_nav_rail, Color32::from_rgb(34, 38, 43));
         assert_eq!(dark.nav_rail_fg_active, Color32::from_rgb(0, 104, 255));
+    }
+    #[test]
+    fn font_pipeline_orders_vietnamese_emoji_lucide_and_renders_without_tofu() {
+        let ctx = egui::Context::default();
+        setup_custom_fonts(&ctx);
+        let defs = ctx
+            .data(|d| d.get_temp::<egui::FontDefinitions>(egui::Id::new("available-ui-fonts")))
+            .expect("available-ui-fonts should be populated");
+        let prop = defs
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("Proportional family should exist");
+        assert_eq!(prop.first().map(String::as_str), Some("bundled_sans"));
+        let lucide_idx = prop
+            .iter()
+            .position(|name| name == "lucide_font")
+            .expect("lucide_font should be in Proportional");
+        if let Some(symbol_idx) = prop.iter().position(|name| name == "symbol_font") {
+            assert!(
+                lucide_idx < symbol_idx,
+                "lucide_font must precede symbol_font to prevent PUA glyph collisions"
+            );
+        }
+        if let Some(emoji_idx) = prop.iter().position(|name| name == "emoji_font") {
+            assert!(
+                emoji_idx > 0 && emoji_idx < lucide_idx,
+                "emoji_font must follow primary text font and precede lucide_font"
+            );
+        }
+
+        // Switching between system and bundled preserves fallback fonts after index 0/1.
+        AppearanceSettings {
+            font: "system".into(),
+            ..Default::default()
+        }
+        .apply_context(&ctx);
+        AppearanceSettings {
+            font: "bundled".into(),
+            ..Default::default()
+        }
+        .apply_context(&ctx);
+
+        // Render Vietnamese text, user emojis (including FE0F variation selector), symbols, and Lucide icons.
+        let _ = ctx.run(Default::default(), |ctx| {
+            let galley = ctx.fonts(|f| {
+                f.layout_no_wrap(
+                    format!(
+                        "Xin chào Việt Nam 😀 ❤️ 👍 🎉 🔥 🥺 🫶 ✓ ✕ {}{}{}",
+                        lucide::SEARCH,
+                        lucide::LOCK,
+                        lucide::SETTINGS
+                    ),
+                    FontId::proportional(14.0),
+                    Color32::WHITE,
+                )
+            });
+            assert!(!galley.rows.is_empty());
+            assert!(galley.rows[0].glyphs.iter().all(|g| g.chr != '\u{FFFD}'));
+        });
     }
 }

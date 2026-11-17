@@ -144,11 +144,94 @@ pub fn summary(m: &ChatMessage) -> String {
             .collect(),
     }
 }
+fn is_valid_sender_name(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty()
+        || t == "0"
+        || t == "Một thành viên"
+        || t.starts_with("phone:")
+        || t.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    for prefix in ["Người dùng ", "Thành viên #"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let r = rest.trim();
+            if !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn resolve_group_sender<'a>(
+    t: &'a Thread,
+    sender: &'a str,
+    sender_uid: Option<&str>,
+    resolve_name: &impl Fn(&str) -> Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(uid) = sender_uid.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(name) = resolve_name(uid)
+            .map(str::trim)
+            .filter(|n| is_valid_sender_name(n))
+        {
+            return Some(name);
+        }
+        if let Some(member) = t
+            .presentation
+            .members
+            .iter()
+            .find(|m| m.id == uid && is_valid_sender_name(&m.name))
+        {
+            return Some(member.name.trim());
+        }
+    }
+    let trimmed_sender = sender.trim();
+    if !trimmed_sender.is_empty() {
+        if let Some(name) = resolve_name(trimmed_sender)
+            .map(str::trim)
+            .filter(|n| is_valid_sender_name(n))
+        {
+            return Some(name);
+        }
+        if let Some(member) = t
+            .presentation
+            .members
+            .iter()
+            .find(|m| m.id == trimmed_sender && is_valid_sender_name(&m.name))
+        {
+            return Some(member.name.trim());
+        }
+    }
+    if is_valid_sender_name(trimmed_sender) {
+        return Some(trimmed_sender);
+    }
+    if let Some(uid) = sender_uid.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(prev) = t.messages.iter().rev().find(|m| {
+            crate::chat::sidebar_sender_id(m).as_deref() == Some(uid)
+                && is_valid_sender_name(&m.sender)
+        }) {
+            return Some(prev.sender.trim());
+        }
+    }
+    None
+}
+
 pub fn preview(t: &Thread) -> String {
     preview_with_reactor(t, None)
 }
 /// Resolve a reactor profile without changing the message-summary fallback.
 pub fn preview_with_reactor(t: &Thread, reactor_name: Option<&str>) -> String {
+    preview_with_resolver(t, reactor_name, |_| None)
+}
+
+/// Format sidebar preview text, using `resolve_name(uid)` before thread-local member/message fallbacks.
+pub fn preview_with_resolver<'a>(
+    t: &'a Thread,
+    reactor_name: Option<&str>,
+    resolve_name: impl Fn(&str) -> Option<&'a str>,
+) -> String {
     let newest = t
         .messages
         .iter()
@@ -158,38 +241,66 @@ pub fn preview_with_reactor(t: &Thread, reactor_name: Option<&str>) -> String {
         )))
         .max()
         .unwrap_or(0);
-    if t.presentation
+    if let Some(reaction) = t
+        .presentation
         .reaction_preview
         .as_ref()
-        .is_some_and(|reaction| reaction.ts >= newest)
+        .filter(|reaction| reaction.ts >= newest)
     {
-        return t.sidebar_preview_with_reactor(reactor_name);
+        let resolved_reactor = reactor_name
+            .map(str::trim)
+            .filter(|name| is_valid_sender_name(name))
+            .or_else(|| {
+                resolve_name(&reaction.reactor)
+                    .map(str::trim)
+                    .filter(|name| is_valid_sender_name(name))
+            });
+        let has_member = t
+            .presentation
+            .members
+            .iter()
+            .any(|m| m.id == reaction.reactor && is_valid_sender_name(&m.name));
+        let fallback = if t.is_group
+            && !reaction.by_self
+            && resolved_reactor.is_none()
+            && !has_member
+            && !is_valid_sender_name(&reaction.reactor)
+        {
+            Some("Thành viên")
+        } else {
+            resolved_reactor
+        };
+        return t.sidebar_preview_with_reactor(fallback);
     }
     let last = t
         .messages
         .iter()
         .filter(|m| !is_call_log(m))
         .max_by_key(|m| m.ts);
-    let (body, sender, outgoing) = if let Some(m) = last.filter(|m| {
+    let last_valid = last.filter(|m| {
         crate::clock::normalize_ts_ms(m.ts)
             >= crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
-    }) {
-        (summary(m), m.sender.as_str(), m.is_outgoing)
+    });
+    let (body, sender, sender_uid, outgoing) = if let Some(m) = last_valid {
+        (
+            summary(m),
+            m.sender.as_str(),
+            crate::chat::sidebar_sender_id(m),
+            m.is_outgoing,
+        )
     } else {
         (
             t.preview.clone(),
             t.presentation.last_sender.as_str(),
+            (!t.presentation.last_sender_id.is_empty())
+                .then(|| t.presentation.last_sender_id.clone()),
             t.presentation.last_outgoing,
         )
     };
     if body.is_empty() {
         return "Chưa có tin nhắn".into();
     }
-    let preview_id = last
-        .filter(|m| {
-            crate::clock::normalize_ts_ms(m.ts)
-                >= crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
-        })
+    let preview_id = last_valid
         .map(|m| m.id.as_str())
         .unwrap_or(&t.presentation.last_message_id);
     let mentioned = !outgoing && t.unread.mention_ids.contains(preview_id);
@@ -202,16 +313,16 @@ pub fn preview_with_reactor(t: &Thread, reactor_name: Option<&str>) -> String {
         return format!("Bạn: {}", body.strip_prefix("Bạn: ").unwrap_or(&body));
     }
     if t.is_group {
-        let sender = if sender.is_empty()
-            || sender == "0"
-            || sender.starts_with("phone:")
-            || sender.bytes().all(|b| b.is_ascii_digit())
-        {
-            "Một thành viên"
+        if let Some(name) = resolve_group_sender(t, sender, sender_uid.as_deref(), &resolve_name) {
+            let prefix = format!("{name}: ");
+            if body.starts_with(&prefix) {
+                body
+            } else {
+                format!("{prefix}{body}")
+            }
         } else {
-            sender
-        };
-        format!("{sender}: {body}")
+            body
+        }
     } else {
         body
     }
@@ -244,6 +355,123 @@ fn url(v: &Value) -> Option<String> {
         && u.username().is_empty()
         && u.password().is_none())
     .then(|| s.to_owned())
+}
+
+const MEDIA_URL_EXTENSIONS: &[&str] = &[
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".avi", ".m4v", ".webm", ".jxl",
+];
+const VIDEO_URL_EXTENSIONS: &[&str] = &[".mp4", ".mov", ".avi", ".m4v", ".webm"];
+const NON_MEDIA_DOCUMENT_EXTENSIONS: &[&str] = &[
+    ".html", ".htm", ".xhtml", ".xlsx", ".xls", ".docx", ".doc", ".pptx", ".ppt", ".pdf", ".zip",
+    ".rar", ".7z", ".tar", ".gz", ".txt", ".json", ".csv", ".xml",
+];
+
+/// Confirmed Zalo video CDN hosts from evidence and re-notes.
+fn is_confirmed_zalo_video_host(host: &str) -> bool {
+    let is_zalo_family = host == "zdn.vn"
+        || host.ends_with(".zdn.vn")
+        || host == "zadn.vn"
+        || host.ends_with(".zadn.vn")
+        || host.ends_with(".dlmd.me")
+        || host.ends_with(".zalo.me")
+        || host.ends_with(".zaloapp.com");
+    if !is_zalo_family {
+        return false;
+    }
+    host == "video.zdn.vn"
+        || host.ends_with(".video.zdn.vn")
+        || host == "video.zadn.vn"
+        || host.ends_with(".video.zadn.vn")
+        || host
+            .split('.')
+            .any(|label| label == "video" || label.starts_with("video-"))
+}
+
+/// Confirmed Zalo photo CDN hosts from evidence and re-notes.
+fn is_confirmed_zalo_photo_host(host: &str) -> bool {
+    let is_zalo_family = host == "zdn.vn"
+        || host.ends_with(".zdn.vn")
+        || host == "zadn.vn"
+        || host.ends_with(".zadn.vn")
+        || host.ends_with(".dlmd.me")
+        || host.ends_with(".zalo.me")
+        || host.ends_with(".zaloapp.com");
+    if !is_zalo_family {
+        return false;
+    }
+    host == "photo.zdn.vn"
+        || host.ends_with(".photo.zdn.vn")
+        || host == "photo.zadn.vn"
+        || host.ends_with(".photo.zadn.vn")
+        || host == "zpcloud.zdn.vn"
+        || host.split('.').any(|label| {
+            label == "photo"
+                || label.starts_with("photo-")
+                || label.ends_with("-zpc")
+                || label == "stc-chat"
+        })
+}
+
+/// Return true when `url` refers to a video file extension or a confirmed Zalo video CDN host.
+pub fn is_video_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    let host = match parsed.host_str() {
+        Some(h) if !h.is_empty() => h.to_ascii_lowercase(),
+        _ => return false,
+    };
+    let path = parsed.path().to_ascii_lowercase();
+    if NON_MEDIA_DOCUMENT_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return false;
+    }
+    if VIDEO_URL_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return true;
+    }
+    is_confirmed_zalo_video_host(&host)
+}
+
+/// Return true when `url` refers to an image/video file extension or an evidence-backed Zalo media CDN URL.
+pub fn is_media_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https")
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return false;
+    }
+    let host = match parsed.host_str() {
+        Some(h) if !h.is_empty() => h.to_ascii_lowercase(),
+        _ => return false,
+    };
+    let path = parsed.path().to_ascii_lowercase();
+
+    // 1. Explicit negative check: document, web page or archive extensions are never media
+    if NON_MEDIA_DOCUMENT_EXTENSIONS
+        .iter()
+        .any(|ext| path.ends_with(ext))
+    {
+        return false;
+    }
+
+    // 2. Explicit positive check: confirmed image or video file extension
+    if MEDIA_URL_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        return true;
+    }
+
+    // 3. Confirmed Zalo photo or video CDN hosts from evidence/re-notes (can serve opaque paths)
+    is_confirmed_zalo_video_host(&host) || is_confirmed_zalo_photo_host(&host)
 }
 fn legacy_media(m: &ChatMessage) -> Option<(MediaKind, String)> {
     if m.sticker_id.is_some() || m.text.starts_with('[') {
@@ -536,6 +764,111 @@ mod tests {
         assert_eq!(preview(&t), "An: Xin chào");
     }
     #[test]
+    fn group_preview_never_shows_mot_thanh_vien_or_raw_numeric_uid() {
+        for raw_sender in [
+            "",
+            "0",
+            "84912345678",
+            "1234567890123456",
+            "phone:0901234567",
+            "Một thành viên",
+            "Người dùng 123456",
+        ] {
+            let t = Thread {
+                is_group: true,
+                messages: vec![ChatMessage {
+                    sender: raw_sender.into(),
+                    text: "Họp lúc 9h nhé".into(),
+                    ts: 2000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let out = preview(&t);
+            assert_eq!(out, "Họp lúc 9h nhé", "raw_sender={raw_sender:?}");
+            assert!(!out.contains("Một thành viên"));
+        }
+
+        // Outgoing group message always formats as "Bạn: <body/>".
+        let outgoing_thread = Thread {
+            is_group: true,
+            messages: vec![ChatMessage {
+                sender: "84912345678".into(),
+                text: "Ok bạn".into(),
+                is_outgoing: true,
+                ts: 3000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(preview(&outgoing_thread), "Bạn: Ok bạn");
+    }
+    #[test]
+    fn group_preview_resolves_numeric_uid_from_members_messages_or_resolver() {
+        let mut m = ChatMessage {
+            sender: "99887766".into(),
+            text: "Đã gửi file".into(),
+            ts: 4000,
+            ..Default::default()
+        };
+        m.wire_ref.sender = Some(serde_json::json!("99887766"));
+
+        let mut with_member = Thread {
+            is_group: true,
+            messages: vec![m.clone()],
+            ..Default::default()
+        };
+        with_member
+            .presentation
+            .members
+            .push(crate::chat::SidebarMember {
+                id: "99887766".into(),
+                name: "Minh Anh".into(),
+                ..Default::default()
+            });
+        assert_eq!(preview(&with_member), "Minh Anh: Đã gửi file");
+
+        // External resolver (e.g. server_aliases / contacts) takes precedence over member cache.
+        let via_resolver = preview_with_resolver(&with_member, None, |uid| {
+            (uid == "99887766").then_some("Em Minh Anh (Cty)")
+        });
+        assert_eq!(via_resolver, "Em Minh Anh (Cty): Đã gửi file");
+
+        // Falls back to an earlier resolved message from the same UID if member list is empty.
+        let mut earlier = ChatMessage {
+            sender: "Tuấn".into(),
+            text: "Alo".into(),
+            ts: 3500,
+            ..Default::default()
+        };
+        earlier.wire_ref.sender = Some(serde_json::json!("99887766"));
+        let with_earlier = Thread {
+            is_group: true,
+            messages: vec![earlier, m],
+            ..Default::default()
+        };
+        assert_eq!(preview(&with_earlier), "Tuấn: Đã gửi file");
+
+        // Group reaction preview with unresolved numeric UID must not leak raw UID or "Một thành viên".
+        let mut rx_thread = Thread {
+            is_group: true,
+            ..Default::default()
+        };
+        rx_thread.presentation.reaction_preview = Some(crate::reactions::Preview {
+            reactor: "7766554433".into(),
+            emoji: "👍".into(),
+            target: "m1".into(),
+            event_id: "r1".into(),
+            ts: 5000,
+            by_self: false,
+            target_by_self: true,
+        });
+        let rx_out = preview(&rx_thread);
+        assert!(!rx_out.contains("7766554433"));
+        assert!(!rx_out.contains("Một thành viên"));
+        assert!(rx_out.contains("đã thả"));
+    }
+    #[test]
     fn quality_aliases_are_kept_separate() {
         let mut m = ChatMessage {
             kind: crate::message_model::MessageKind::Photo,
@@ -608,5 +941,67 @@ mod photo_bundle_tests {
         assert_eq!(photo_bundle(&message), Some(("bundle-a".into(), 3)));
         message.kind = crate::message_model::MessageKind::Video;
         assert!(photo_bundle(&message).is_none());
+    }
+}
+
+#[cfg(test)]
+mod media_url_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_zalo_cdn_and_media_extensions() {
+        // Positive media tests: verified image/video CDN and explicit media extensions
+        for media_url in [
+            "https://video.zdn.vn/opaque-video-stream",
+            "https://photo.zdn.vn/opaque-photo-token",
+            "https://photo-stal-16.zdn.vn/w480/abc123",
+            "https://f10-zpc.zdn.vn/image?t=1",
+            "https://b-f10-zpc.zdn.vn/orig/1",
+            "https://cdn.zadn.vn/media/clip.mp4",
+            "https://example.com/assets/photo.JPG?size=large",
+            "https://example.com/clip.mov",
+            "https://example.com/clip.avi",
+            "https://example.com/clip.m4v",
+            "https://example.com/anim.gif",
+            "https://example.com/banner.webp",
+        ] {
+            assert!(is_media_url(media_url), "expected media url: {media_url}");
+        }
+
+        // Negative media tests: documents, web pages, third-party arbitrary paths
+        for non_media_url in [
+            "https://file.zdn.vn/report.xlsx",
+            "https://cdn.zadn.vn/page.html",
+            "https://evil.example/photo/page",
+            "https://vnexpress.net/tin-tuc-12345.html",
+            "https://chat.zalo.me/",
+            "https://fake-zdn.vn.evil.com/page",
+            "ftp://photo.zdn.vn/test.jpg",
+            "https://user:pass@photo.zdn.vn/test.jpg",
+            "not-a-url",
+            "",
+        ] {
+            assert!(
+                !is_media_url(non_media_url),
+                "expected non-media url: {non_media_url}"
+            );
+        }
+
+        // Video URL tests
+        // 1. video.zdn.vn with opaque path returns true
+        assert!(is_video_url("https://video.zdn.vn/opaque-video-stream"));
+        assert!(is_video_url("https://video-stal-44.dlmd.me/stream"));
+        assert!(is_video_url("https://cdn.zadn.vn/clip.mp4"));
+        assert!(is_video_url("https://example.com/stream.webm"));
+
+        // 2. photo.zdn.vn with opaque path does NOT automatically become video
+        assert!(!is_video_url("https://photo.zdn.vn/opaque-photo-stream"));
+        assert!(!is_video_url("https://photo-stal-16.zdn.vn/w480/abc.jpg"));
+
+        // 3. invalid scheme or credentials return false
+        assert!(!is_video_url("ftp://video.zdn.vn/clip.mp4"));
+        assert!(!is_video_url("https://user:pass@video.zdn.vn/clip.mp4"));
+        assert!(!is_video_url("https://file.zdn.vn/report.xlsx"));
+        assert!(!is_video_url("not-a-url"));
     }
 }

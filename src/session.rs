@@ -17,6 +17,19 @@ use serde_json::{Map, Value};
 
 use crate::crypto;
 
+/// Maximum service-map candidates examined for one read request.
+pub(crate) const MAX_SERVICE_CANDIDATES: usize = 3;
+const MAX_REQUEST_TIMING_SAMPLES: usize = 16;
+const MAX_LINK_PREVIEW_CACHE_ENTRIES: usize = 32;
+const MAX_LINK_PREVIEW_CACHE_ENTRY_BYTES: usize = 16 * 1024;
+const LINK_PREVIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+struct CachedLinkPreview {
+    key: [u8; 32],
+    metadata: crate::chat::LinkMetadata,
+    inserted_at: std::time::Instant,
+}
+
 pub const ZPW_VER: &str = "694";
 pub const ZPW_TYPE: &str = "30";
 pub const CONFIG_DOMAIN: &str = "zaloapp.com";
@@ -155,8 +168,8 @@ impl Default for Domains {
 }
 
 impl Domains {
-    /// Keep verified REST hosts first; service discovery may advertise a PC host
-    /// which returns 404 for a Web/QR session. Long-poll and WS stay dynamic.
+    /// Keep canonical URL templates and sanitize discovered routing candidates.
+    /// Actual requests prefer the account's discovered hosts in `send`.
     fn prefer_verified_rest(&mut self) {
         self.service_fallbacks.retain(|key, values| {
             let known = [
@@ -208,7 +221,7 @@ impl Domains {
         self.conversation = self.convers_api.clone();
     }
 }
-fn trusted_service_url(value: &str) -> bool {
+pub(crate) fn trusted_service_url(value: &str) -> bool {
     reqwest::Url::parse(value)
         .map(|url| {
             url.scheme() == "https"
@@ -224,6 +237,19 @@ fn trusted_service_url(value: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
+fn record_attempt_timing(
+    samples: &std::sync::Mutex<
+        std::collections::VecDeque<crate::service_resolver::RequestAttemptTiming>,
+    >,
+    sample: crate::service_resolver::RequestAttemptTiming,
+) {
+    let mut samples = samples.lock().unwrap_or_else(|e| e.into_inner());
+    if samples.len() == MAX_REQUEST_TIMING_SAMPLES {
+        samples.pop_front();
+    }
+    samples.push_back(sample);
+}
 #[derive(Debug)]
 struct HttpFailure(u16);
 impl std::fmt::Display for HttpFailure {
@@ -232,6 +258,15 @@ impl std::fmt::Display for HttpFailure {
     }
 }
 impl std::error::Error for HttpFailure {}
+
+#[derive(Debug)]
+struct RequestDeadlineElapsed;
+impl std::fmt::Display for RequestDeadlineElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Request deadline elapsed")
+    }
+}
+impl std::error::Error for RequestDeadlineElapsed {}
 
 /// Extract a typed HTTP failure without parsing or exposing its original error text.
 pub(crate) fn http_failure_status(error: &anyhow::Error) -> Option<u16> {
@@ -299,6 +334,10 @@ impl std::fmt::Debug for SavedSession {
 pub struct Session {
     pub service_resolver:
         std::sync::Arc<std::sync::RwLock<crate::service_resolver::ServiceResolver>>,
+    request_timings: Arc<
+        std::sync::Mutex<std::collections::VecDeque<crate::service_resolver::RequestAttemptTiming>>,
+    >,
+    link_preview_cache: Arc<std::sync::Mutex<std::collections::VecDeque<CachedLinkPreview>>>,
     runtime_generation: usize,
     /// Shared in-memory PIN gate, never serialized with login credentials.
     pub hidden: Arc<crate::hidden_chat::Vault>,
@@ -394,9 +433,13 @@ impl Session {
             )
             .build()?;
         Ok(Self {
-            service_resolver: std::sync::Arc::new(std::sync::RwLock::new(
-                crate::service_resolver::ServiceResolver::new(),
-            )),
+            service_resolver: {
+                let mut resolver = crate::service_resolver::ServiceResolver::new();
+                resolver.sync_from_domains(&Domains::default());
+                std::sync::Arc::new(std::sync::RwLock::new(resolver))
+            },
+            request_timings: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            link_preview_cache: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             runtime_generation: next_runtime_generation(),
             hidden: Arc::new(crate::hidden_chat::Vault::default()),
             inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
@@ -462,8 +505,116 @@ impl Session {
     pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
         self.service_resolver
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .resolve_url(service, path)
+    }
+
+    /// Most recent bounded HTTP-attempt timings, useful for local troubleshooting.
+    /// No URL, account, message, or request payload is retained.
+    pub fn request_attempt_timings(&self) -> Vec<crate::service_resolver::RequestAttemptTiming> {
+        self.request_timings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn record_link_preview_timing(&self, elapsed: std::time::Duration, ready: bool) {
+        record_attempt_timing(
+            &self.request_timings,
+            crate::service_resolver::RequestAttemptTiming {
+                phase: crate::service_resolver::TimingPhase::LinkPreview,
+                service: crate::service_resolver::ServiceKey::Chat,
+                candidate_index: None,
+                elapsed_ms: elapsed.as_millis().min(u32::MAX as u128) as u32,
+                result: if ready {
+                    crate::service_resolver::AttemptResult::PreviewReady
+                } else {
+                    crate::service_resolver::AttemptResult::PreviewFallback
+                },
+            },
+        );
+    }
+
+    pub(crate) fn record_link_preview_cache_hit(&self) {
+        record_attempt_timing(
+            &self.request_timings,
+            crate::service_resolver::RequestAttemptTiming {
+                phase: crate::service_resolver::TimingPhase::LinkPreview,
+                service: crate::service_resolver::ServiceKey::Chat,
+                candidate_index: None,
+                elapsed_ms: 0,
+                result: crate::service_resolver::AttemptResult::PreviewCacheHit,
+            },
+        );
+    }
+
+    fn link_preview_key(url: &str, origin: crate::chat::LinkOrigin) -> [u8; 32] {
+        use sha2::Digest;
+        let origin = [match origin {
+            crate::chat::LinkOrigin::Incoming => 0,
+            crate::chat::LinkOrigin::Outgoing => 1,
+        }];
+        let mut digest = sha2::Sha256::new();
+        digest.update(origin);
+        digest.update(url.as_bytes());
+        digest.finalize().into()
+    }
+
+    /// Get a recent preview without retaining the source URL in the cache key.
+    pub(crate) fn cached_link_preview(
+        &self,
+        url: &str,
+        origin: crate::chat::LinkOrigin,
+    ) -> Option<crate::chat::LinkMetadata> {
+        if !self.is_active() {
+            return None;
+        }
+        let key = Self::link_preview_key(url, origin);
+        let now = std::time::Instant::now();
+        let mut cache = self
+            .link_preview_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|entry| now.duration_since(entry.inserted_at) < LINK_PREVIEW_CACHE_TTL);
+        let index = cache.iter().position(|entry| entry.key == key)?;
+        let entry = cache.remove(index)?;
+        let metadata = entry.metadata.clone();
+        cache.push_front(entry);
+        Some(metadata)
+    }
+
+    /// Store a successful preview in a small, in-memory LRU cache.
+    pub(crate) fn cache_link_preview(
+        &self,
+        url: &str,
+        origin: crate::chat::LinkOrigin,
+        metadata: crate::chat::LinkMetadata,
+    ) {
+        if !self.is_active() {
+            return;
+        }
+        let metadata_bytes = metadata.url.len()
+            + metadata.title.len()
+            + metadata.desc.len()
+            + metadata.thumb.len()
+            + metadata.src.len();
+        if metadata_bytes > MAX_LINK_PREVIEW_CACHE_ENTRY_BYTES {
+            return;
+        }
+        let entry = CachedLinkPreview {
+            key: Self::link_preview_key(url, origin),
+            metadata,
+            inserted_at: std::time::Instant::now(),
+        };
+        let mut cache = self
+            .link_preview_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.retain(|cached| cached.key != entry.key);
+        cache.push_front(entry);
+        cache.truncate(MAX_LINK_PREVIEW_CACHE_ENTRIES);
     }
 
     pub fn record_service_failure(&self, service: &str) -> bool {
@@ -570,10 +721,22 @@ impl Session {
         self.secret_key = None;
         self.session_key = None;
         self.domains = Domains::default();
-        self.imei = random_imei();
         self.service_resolver = Arc::new(std::sync::RwLock::new(
             crate::service_resolver::ServiceResolver::new(),
         ));
+        self.service_resolver
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .sync_from_domains(&self.domains);
+        self.request_timings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.link_preview_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.imei = random_imei();
         self.jar = Arc::new(Jar::default());
         let mut default_headers = HeaderMap::new();
         default_headers.insert(
@@ -695,6 +858,15 @@ impl Session {
         let text = crate::storage::unprotect(&bytes)?;
         let saved: SavedSession = serde_json::from_slice(&text)?;
 
+        self.link_preview_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.request_timings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+
         self.imei = if saved.imei.len() == 69 {
             saved.imei
         } else {
@@ -731,6 +903,10 @@ impl Session {
                 .unwrap_or(crate::endpoints::STICKER)
                 .into();
         }
+        self.service_resolver
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .reset_from_domains(&self.domains);
         self.session_key = saved.session_key;
         let sek = saved
             .zpw_sek
@@ -878,25 +1054,39 @@ impl Session {
                 "label",
             ] {
                 if let Some(verified) = crate::endpoints::service(key) {
-                    let candidates = self
-                        .domains
-                        .service_fallbacks
-                        .entry(verified.into())
-                        .or_default();
-                    let values = map
-                        .get(key)
-                        .map(|v| v.as_array().cloned().unwrap_or_else(|| vec![v.clone()]))
-                        .unwrap_or_default();
+                    let Some(value) = map.get(key) else { continue };
+                    let mut discovered = Vec::new();
+                    let mut has_valid_host = false;
+                    let values = value
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_else(|| vec![value.clone()]);
                     for value in values {
                         if let Some(host) = value.as_str().map(|s| s.trim_end_matches('/')) {
+                            has_valid_host |= trusted_service_url(host);
                             if trusted_service_url(host)
-                                && host != verified
-                                && !candidates.iter().any(|h| h == host)
-                                && candidates.len() < 16
+                                && !discovered.iter().any(|h| h == host)
+                                && discovered.len() < 16
                             {
-                                candidates.push(host.into());
+                                discovered.push(host.to_owned());
                             }
                         }
+                    }
+                    // An invalid/empty update must not erase a previously validated map.
+                    // A nonempty valid map replaces it atomically in server order.
+                    if has_valid_host {
+                        let candidates = self
+                            .domains
+                            .service_fallbacks
+                            .entry(verified.into())
+                            .or_default();
+                        candidates.clear();
+                        candidates.extend(discovered);
+                        self.domains
+                            .winners
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .remove(verified);
                     }
                 }
             }
@@ -926,6 +1116,10 @@ impl Session {
             }
         }
         self.domains.prefer_verified_rest();
+        self.service_resolver
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .sync_from_domains(&self.domains);
     }
 
     pub async fn get(&self, url: &str) -> Result<Value> {
@@ -1092,50 +1286,89 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
-        let mut urls = vec![url.to_string()];
-        let mut service = None;
-        for (verified, fallbacks) in &self.domains.service_fallbacks {
-            if let Some(suffix) = url.strip_prefix(&format!("{verified}/")) {
-                urls.extend(fallbacks.iter().map(|base| format!("{base}/{suffix}")));
-                service = Some((verified.clone(), suffix.to_owned()));
-                if let Some(winner) = self
-                    .domains
-                    .winners
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(verified)
-                    .filter(|w| *w == verified || fallbacks.contains(w))
-                    .cloned()
-                {
-                    let preferred = format!("{winner}/{suffix}");
-                    urls.retain(|u| u != &preferred);
-                    urls.insert(0, preferred);
-                }
+        let (service_name, mut urls) = self
+            .service_resolver
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .candidates_for_url(url)
+            .map(|(service, urls)| (Some(service), urls))
+            .unwrap_or((None, vec![url.to_owned()]));
+        urls.truncate(MAX_SERVICE_CANDIDATES);
+        let timing_service = crate::service_resolver::ServiceKey::from_key(
+            service_name.as_deref().unwrap_or("other"),
+        );
+        // Voice-call APIs use GET for state-changing signals (for example
+        // requestcall/answer/endcall). Never replay this service automatically.
+        let retryable_read = m == Method::GET && service_name.as_deref() != Some("voice_call");
+        // Keep the total read-failover wait within the ordinary request timeout.
+        // Upload/multipart flows use their own explicit timeout and do not enter here.
+        let request_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        let mut last = None;
+        for (index, candidate) in urls.into_iter().enumerate() {
+            let attempt_started = std::time::Instant::now();
+            let remaining = request_deadline.saturating_duration_since(attempt_started);
+            if remaining.is_zero() {
                 break;
             }
-        }
-        let mut last = None;
-        for candidate in urls {
-            match self.send_once(m.clone(), &candidate, body.clone()).await {
+            let result = tokio::time::timeout(
+                remaining,
+                self.send_once(m.clone(), &candidate, body.clone()),
+            )
+            .await
+            .unwrap_or_else(|_| Err(anyhow::Error::new(RequestDeadlineElapsed)));
+            let outcome = match &result {
+                Ok(_) => crate::service_resolver::AttemptResult::Success,
+                Err(error) if http_failure_status(error).is_some() => {
+                    crate::service_resolver::AttemptResult::HttpFailure
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(|e| e.is_timeout())
+                    }) || error.downcast_ref::<RequestDeadlineElapsed>().is_some() =>
+                {
+                    crate::service_resolver::AttemptResult::Timeout
+                }
+                Err(error)
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(|e| e.is_connect())
+                    }) =>
+                {
+                    crate::service_resolver::AttemptResult::ConnectFailure
+                }
+                Err(_) => crate::service_resolver::AttemptResult::TransportFailure,
+            };
+            record_attempt_timing(
+                &self.request_timings,
+                crate::service_resolver::RequestAttemptTiming {
+                    phase: crate::service_resolver::TimingPhase::HttpRequest,
+                    service: timing_service,
+                    candidate_index: Some(index.min(u8::MAX as usize) as u8),
+                    elapsed_ms: attempt_started.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                    result: outcome,
+                },
+            );
+            match result {
                 Ok(response) => {
-                    if let Some((service, suffix)) = &service {
-                        if let Some(host) = candidate.strip_suffix(&format!("/{suffix}")) {
-                            self.domains
-                                .winners
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(service.clone(), host.into());
-                        }
+                    if let Some(service) = &service_name {
+                        self.service_resolver
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .record_success_for_url(service, &candidate);
                     }
                     return Ok(response);
                 }
                 Err(e) => {
-                    // Retry GET on transport failure, or any method on a definite
-                    // 404. Never replay a possibly delivered mutation after timeout.
-                    let retry = e.downcast_ref::<HttpFailure>().is_some_and(|e| e.0 == 404)
-                        || (m == Method::GET
-                            && e.downcast_ref::<reqwest::Error>()
-                                .is_some_and(|e| e.is_connect() || e.is_timeout()));
+                    // An HTTP response alone does not prove a mutation was not
+                    // delivered. Only reads can automatically try another host.
+                    let retry = retryable_read
+                        && (e.downcast_ref::<HttpFailure>().is_some_and(|e| e.0 == 404)
+                            || e.downcast_ref::<reqwest::Error>()
+                                .is_some_and(|e| e.is_connect() || e.is_timeout())
+                            || e.downcast_ref::<RequestDeadlineElapsed>().is_some());
                     if !retry {
                         return Err(e);
                     }
@@ -1859,6 +2092,98 @@ mod candidate_persistence_tests {
         assert_eq!(restored.service_fallbacks[primary].len(), 2);
         assert!(restored.winners.lock().unwrap().is_empty());
     }
+
+    #[test]
+    fn discovered_routes_are_used_and_replaced_maps_reset_the_winner() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let canonical = crate::endpoints::service("chat").unwrap();
+        let first = "https://chat-map-one.zalo.me";
+        let second = "https://chat-map-two.zaloapp.com";
+        session.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"chat": [first, second]}
+        }));
+        assert_eq!(
+            session.resolve_service_url("chat", "/api/message/sms"),
+            format!("{first}/api/message/sms")
+        );
+        session
+            .service_resolver
+            .write()
+            .unwrap()
+            .record_success_for_url("chat", &format!("{second}/api/message/sms"));
+        assert_eq!(
+            session.resolve_service_url("chat", "/api/message/sms"),
+            format!("{second}/api/message/sms")
+        );
+
+        session.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"chat": ["https://evil.invalid"]}
+        }));
+        assert_eq!(
+            session.resolve_service_url("chat", "/api/message/sms"),
+            format!("{second}/api/message/sms")
+        );
+
+        session.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"chat": [first]}
+        }));
+        assert_eq!(
+            session.resolve_service_url("chat", "/api/message/sms"),
+            format!("{first}/api/message/sms")
+        );
+        assert_ne!(first, canonical);
+    }
+
+    #[test]
+    fn restored_discovered_candidates_are_reused_after_session_snapshot() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let discovered = "https://restored-chat-host.zaloapp.com";
+        session.apply_server_info(&serde_json::json!({
+            "zpw_service_map_v3": {"chat": [discovered]}
+        }));
+        let mut restored: Domains =
+            serde_json::from_value(serde_json::to_value(&session.domains).unwrap()).unwrap();
+        restored.prefer_verified_rest();
+        let mut resolver = crate::service_resolver::ServiceResolver::new();
+        resolver.sync_from_domains(&restored);
+        assert_eq!(
+            resolver.resolve_url("chat", "/api/message/sms"),
+            format!("{discovered}/api/message/sms")
+        );
+    }
+
+    #[test]
+    fn link_preview_cache_is_bounded_and_does_not_match_another_url() {
+        let session = Session::new(false, false, false).unwrap();
+        let metadata = |url: &str| crate::chat::LinkMetadata {
+            url: url.to_owned(),
+            title: "fixture".into(),
+            ..Default::default()
+        };
+        for index in 0..MAX_LINK_PREVIEW_CACHE_ENTRIES + 1 {
+            let url = format!("https://example.test/{index}");
+            session.cache_link_preview(&url, crate::chat::LinkOrigin::Outgoing, metadata(&url));
+        }
+        assert!(session
+            .cached_link_preview("https://example.test/0", crate::chat::LinkOrigin::Outgoing)
+            .is_none());
+        assert_eq!(
+            session
+                .cached_link_preview("https://example.test/32", crate::chat::LinkOrigin::Outgoing)
+                .unwrap()
+                .title,
+            "fixture"
+        );
+        assert!(session
+            .cached_link_preview(
+                "https://example.test/32?private=value",
+                crate::chat::LinkOrigin::Outgoing
+            )
+            .is_none());
+        assert!(session
+            .cached_link_preview("https://example.test/32", crate::chat::LinkOrigin::Incoming)
+            .is_none());
+    }
 }
 
 #[cfg(test)]
@@ -1902,18 +2227,78 @@ mod remembered_host_tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        s.domains
-            .service_fallbacks
-            .insert(primary.clone(), vec![fallback.clone()]);
+        s.service_resolver
+            .write()
+            .unwrap()
+            .register_service("chat", vec![primary.clone(), fallback.clone()]);
         for _ in 0..2 {
-            s.get(&format!("{primary}/api/fixture")).await.unwrap();
+            s.get(&format!(
+                "{}/api/fixture",
+                crate::endpoints::service("chat").unwrap()
+            ))
+            .await
+            .unwrap();
         }
         assert_eq!(
-            s.domains.winners.lock().unwrap().get(&primary),
-            Some(&fallback)
+            s.service_resolver.read().unwrap().resolve_host("chat"),
+            Some(fallback.as_str())
         );
         assert_eq!(first.await.unwrap(), 1);
         assert_eq!(second.await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn mutation_http_failure_is_not_replayed_on_another_candidate() {
+        let (primary, first) = serve("404 Not Found").await;
+        let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.service_resolver
+            .write()
+            .unwrap()
+            .register_service("chat", vec![primary, fallback]);
+        let canonical = crate::endpoints::service("chat").unwrap();
+        assert!(s
+            .post_form(
+                &format!("{canonical}/api/fixture"),
+                "payload=fixture".into()
+            )
+            .await
+            .is_err());
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 0);
+        assert_eq!(s.request_attempt_timings().len(), 1);
+        assert_eq!(
+            s.request_attempt_timings()[0].result,
+            crate::service_resolver::AttemptResult::HttpFailure
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_call_get_failure_is_not_replayed_because_get_can_mutate() {
+        let (primary, first) = serve("404 Not Found").await;
+        let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.service_resolver
+            .write()
+            .unwrap()
+            .register_service("voice_call", vec![primary, fallback]);
+        let canonical = crate::endpoints::service("voice_call").unwrap();
+        assert!(s
+            .get(&format!("{canonical}/api/voicecall/requestcall"))
+            .await
+            .is_err());
+        assert_eq!(first.await.unwrap(), 1);
+        assert_eq!(second.await.unwrap(), 0);
     }
 }
 

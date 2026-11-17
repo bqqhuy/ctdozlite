@@ -53,6 +53,7 @@ mod tools_panel;
 mod worker;
 mod workspace;
 
+use account_state::*;
 use messages::*;
 use stickers::*;
 use theme::*;
@@ -72,6 +73,9 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 fn apply_outgoing_state(app: &mut ZaloGuiApp, thread_id: String, message: ChatMessage) {
+    if let Some(session) = &mut app.forward_session {
+        session.update_outgoing_state(&thread_id, &message);
+    }
     if let Some(thread) = app.threads.iter_mut().find(|t| t.id == thread_id) {
         if !thread.is_group
             && message.is_outgoing
@@ -328,14 +332,17 @@ pub enum GuiEvent {
     },
     ConversationRefreshStatus {
         running: bool,
+        success: bool,
         message: String,
     },
     PhoneSyncStatus {
         running: bool,
+        success: bool,
         message: String,
     },
     HistorySyncStatus {
         running: bool,
+        success: bool,
         message: String,
     },
     QrReady {
@@ -463,7 +470,12 @@ pub enum GuiEvent {
         keyword: String,
         items: Vec<crate::chat::StickerItem>,
     },
-    LinkPreviewReady(crate::chat::LinkMetadata),
+    LinkPreviewReady {
+        owner: String,
+        runtime_id: usize,
+        url: String,
+        result: Result<crate::chat::LinkMetadata, String>,
+    },
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
     FriendStatusChecked {
@@ -739,6 +751,32 @@ pub struct SafetyNumberModalState {
     pub loading: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct AutoDeleteModalState {
+    pub thread_id: String,
+    pub is_group: bool,
+    pub thread_name: String,
+    pub selected_ttl: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ContentProtectionModalState {
+    pub thread_id: String,
+    pub is_group: bool,
+    pub thread_name: String,
+    pub current_enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct GroupMemberPopover {
+    pub group_id: String,
+    pub member: crate::chat::SidebarMember,
+    pub display_name: String,
+    pub anchor: Pos2,
+    pub confirm_kick: bool,
+    pub opened_this_frame: bool,
+}
+
 #[derive(Clone)]
 struct ImageViewerModal {
     source: worker::ChatImage,
@@ -761,6 +799,7 @@ struct ImageViewerModal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
     General,
+    AccountSecurity,
     Privacy,
     Sync,
     Appearance,
@@ -821,8 +860,12 @@ struct AppSettings {
     selected_camera_device: String,
     // 8. Tính năng AI & Quyền riêng tư
     ai_translation_consent: bool,
-    /// Whether application auto-locks with Windows Hello / PIN (M-02)
-    enable_app_lock: bool,
+    /// Whether application lock is enabled (defaults to false; MAP-00).
+    pub enable_app_lock: bool,
+    /// Whether Windows Hello biometric unlock is enabled as an optional unlock method.
+    pub use_windows_hello: bool,
+    /// Salted SHA-256 hash of the 4-digit app lock PIN.
+    pub app_pin_hash: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -874,7 +917,9 @@ impl Default for AppSettings {
             selected_mic_device: String::new(),
             selected_camera_device: String::new(),
             ai_translation_consent: false,
-            enable_app_lock: true,
+            enable_app_lock: false,
+            use_windows_hello: false,
+            app_pin_hash: None,
         }
     }
 }
@@ -885,6 +930,140 @@ impl AppSettings {
             .ok()
             .and_then(|s| serde_json::from_str::<Self>(&s).ok())
             .unwrap_or_default()
+    }
+
+    pub fn has_pin(&self) -> bool {
+        self.app_pin_hash.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    /// Slow KDF iteration count for PIN hashing (PBKDF2-HMAC-SHA256).
+    /// Provides strong resistance against brute-forcing 4-digit PINs if settings are exposed.
+    /// Note: App PIN lock is a UI privacy guard and does not replace Windows account/OS security.
+    pub const PIN_PBKDF2_ITERATIONS: u32 = 100_000;
+
+    pub fn set_pin(&mut self, pin: &str) -> Result<(), &'static str> {
+        if pin.len() != 4 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("Mã PIN phải gồm đúng 4 chữ số (0-9).");
+        }
+        use aws_lc_rs::pbkdf2;
+        use aws_lc_rs::rand::{SecureRandom, SystemRandom};
+        use std::num::NonZeroU32;
+
+        let mut salt = [0u8; 16];
+        SystemRandom::new()
+            .fill(&mut salt)
+            .map_err(|_| "Không tạo được salt bảo mật cho mã PIN.")?;
+        let iterations = NonZeroU32::new(Self::PIN_PBKDF2_ITERATIONS).unwrap();
+        let mut key = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            iterations,
+            &salt,
+            pin.as_bytes(),
+            &mut key,
+        );
+        self.app_pin_hash = Some(format!(
+            "pbkdf2${}${}${}",
+            Self::PIN_PBKDF2_ITERATIONS,
+            hex::encode(salt),
+            hex::encode(key)
+        ));
+        Ok(())
+    }
+
+    pub fn verify_pin(&self, pin: &str) -> bool {
+        if pin.len() != 4 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        let Some(stored) = self.app_pin_hash.as_deref() else {
+            return false;
+        };
+
+        if let Some(rest) = stored.strip_prefix("pbkdf2$") {
+            let mut parts = rest.split('$');
+            let Some(iter_str) = parts.next() else {
+                return false;
+            };
+            let Some(salt_hex) = parts.next() else {
+                return false;
+            };
+            let Some(hash_hex) = parts.next() else {
+                return false;
+            };
+            if parts.next().is_some() {
+                return false;
+            }
+
+            let Ok(iterations) = iter_str.parse::<u32>() else {
+                return false;
+            };
+            if !(10_000..=5_000_000).contains(&iterations) {
+                return false;
+            }
+            let Ok(salt) = hex::decode(salt_hex) else {
+                return false;
+            };
+            let Ok(expected) = hex::decode(hash_hex) else {
+                return false;
+            };
+            if salt.len() < 16 || expected.len() != 32 {
+                return false;
+            }
+            use aws_lc_rs::pbkdf2;
+            use std::num::NonZeroU32;
+            let Some(nonzero_iters) = NonZeroU32::new(iterations) else {
+                return false;
+            };
+            let mut computed = [0u8; 32];
+            pbkdf2::derive(
+                pbkdf2::PBKDF2_HMAC_SHA256,
+                nonzero_iters,
+                &salt,
+                pin.as_bytes(),
+                &mut computed,
+            );
+            aws_lc_rs::constant_time::verify_slices_are_equal(&computed, &expected).is_ok()
+        } else if let Some(rest) = stored.strip_prefix("sha256$") {
+            // Backwards-compatibility fallback for existing sha256 hashes
+            let Some((salt_hex, hash_hex)) = rest.split_once('$') else {
+                return false;
+            };
+            let Ok(salt) = hex::decode(salt_hex) else {
+                return false;
+            };
+            let Ok(expected) = hex::decode(hash_hex) else {
+                return false;
+            };
+            if salt.is_empty() || expected.len() != 32 {
+                return false;
+            }
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"zalolite-app-pin-v1:");
+            hasher.update(&salt);
+            hasher.update(b":");
+            hasher.update(pin.as_bytes());
+            let computed = hasher.finalize();
+            aws_lc_rs::constant_time::verify_slices_are_equal(computed.as_slice(), &expected)
+                .is_ok()
+        } else {
+            false
+        }
+    }
+
+    /// Verify PIN, and if verified against a legacy sha256 hash, automatically migrate to PBKDF2.
+    pub fn verify_and_migrate_pin(&mut self, pin: &str) -> bool {
+        if !self.verify_pin(pin) {
+            return false;
+        }
+        if self
+            .app_pin_hash
+            .as_deref()
+            .is_some_and(|h| h.starts_with("sha256$"))
+        {
+            let _ = self.set_pin(pin);
+        }
+        true
     }
 }
 
@@ -1010,10 +1189,17 @@ pub struct ZaloGuiApp {
     user_avatar: Option<String>,
     account_runtime_id: usize,
 
-    // App lock state (WP16-4)
+    // App lock state (WP16-4 / MAP-00)
     lock_guard: auth_guard::AppLockGuard,
     auth_in_progress: bool,
     auth_request_generation: u64,
+    lock_pin_input: zeroize::Zeroizing<String>,
+    lock_pin_error: Option<String>,
+    pin_setup_modal_open: bool,
+    pin_setup_enable_after: bool,
+    pin_setup_first: zeroize::Zeroizing<String>,
+    pin_setup_confirm: zeroize::Zeroizing<String>,
+    pin_setup_error: Option<String>,
 
     // Account switcher state (WP16-3)
     #[allow(dead_code)]
@@ -1070,13 +1256,18 @@ pub struct ZaloGuiApp {
     // Reply / forward state
     replying_to: Option<ChatMessage>,
     forward_msg: Option<ChatMessage>,
+    pub(super) forward_session: Option<modals::ForwardSessionState>,
     forward_filter: String,
+    forward_targets: HashSet<String>,
+    forward_note: String,
     filter_starred_only: bool,
     active_call: Option<ActiveCallOverlay>,
     call_terminals: crate::call_lifecycle::TerminalCalls,
     image_viewer: Option<ImageViewerModal>,
     doc_viewer: Option<doc_viewer::DocViewerModal>,
     safety_number_modal: Option<SafetyNumberModalState>,
+    auto_delete_modal: Option<AutoDeleteModalState>,
+    content_protection_modal: Option<ContentProtectionModalState>,
     trusted_peers: HashSet<String>,
     trial_peers: HashSet<String>,
     pub(super) reset_e2ee_confirm_peer: Option<String>,
@@ -1089,6 +1280,16 @@ pub struct ZaloGuiApp {
     info_drawer_open: bool,
     pub drawer_view: DrawerView,
     pub drawer_search_query: String,
+    // Common groups cache (MAP-07)
+    common_groups_cache: HashMap<String, Vec<Thread>>,
+    common_groups_state: HashMap<String, Option<String>>,
+    common_groups_generations: HashMap<String, u64>,
+    common_groups_expanded: bool,
+    common_groups_collapsed: bool,
+
+    // Group member popover (MAP-06)
+    group_member_popover: Option<GroupMemberPopover>,
+    pub(super) pending_drawer_group_actions: HashMap<u64, (String, String)>,
     profile_menu_open: bool,
     sidebar_more_menu_open: bool,
     toast_notice: Option<(String, std::time::Instant)>,
@@ -1161,6 +1362,7 @@ pub struct ZaloGuiApp {
     refresh_sync_running: bool,
     refresh_sync_status: String,
     sync_notice_dismissed: bool,
+    sync_success_until: Option<std::time::Instant>,
     sync_cancel_requested: bool,
     last_sync_was_history: bool,
     settings_modal_open: bool,
@@ -1270,7 +1472,6 @@ impl ZaloGuiApp {
         } else {
             AppSettings::default()
         };
-        let enable_app_lock = loaded_settings.enable_app_lock;
         loaded_settings.appearance.apply_context(ctx);
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
@@ -1337,6 +1538,14 @@ impl ZaloGuiApp {
             .filter(|t| t.unread.count() > 0)
             .map(|t| (t.id.clone(), t.unread.count()))
             .collect();
+        let mut lock_guard = auth_guard::AppLockGuard::new();
+        if is_logged_in
+            && loaded_settings.enable_app_lock
+            && (loaded_settings.app_pin_hash.is_some()
+                || (loaded_settings.use_windows_hello && lock_guard.is_biometric_available()))
+        {
+            lock_guard.lock();
+        }
         let mut app = Self {
             #[cfg(windows)]
             tray: None,
@@ -1383,13 +1592,18 @@ impl ZaloGuiApp {
             deleted_message_ids: HashSet::new(),
             replying_to: None,
             forward_msg: None,
+            forward_session: None,
             forward_filter: String::new(),
+            forward_targets: HashSet::new(),
+            forward_note: String::new(),
             filter_starred_only: false,
             active_call: None,
             call_terminals: Default::default(),
             image_viewer: None,
             doc_viewer: None,
             safety_number_modal: None,
+            auto_delete_modal: None,
+            content_protection_modal: None,
             trusted_peers: HashSet::new(),
             trial_peers: HashSet::new(),
             reset_e2ee_confirm_peer: None,
@@ -1402,6 +1616,13 @@ impl ZaloGuiApp {
             info_drawer_open: loaded_settings.info_drawer_open,
             drawer_view: DrawerView::Overview,
             drawer_search_query: String::new(),
+            common_groups_cache: HashMap::new(),
+            common_groups_state: HashMap::new(),
+            common_groups_generations: HashMap::new(),
+            common_groups_expanded: false,
+            common_groups_collapsed: false,
+            group_member_popover: None,
+            pending_drawer_group_actions: HashMap::new(),
             profile_menu_open: false,
             sidebar_more_menu_open: false,
             toast_notice: None,
@@ -1481,6 +1702,7 @@ impl ZaloGuiApp {
             refresh_sync_running: false,
             refresh_sync_status: String::new(),
             sync_notice_dismissed: false,
+            sync_success_until: None,
             sync_cancel_requested: false,
             last_sync_was_history: true,
             settings_modal_open: false,
@@ -1552,11 +1774,16 @@ impl ZaloGuiApp {
             event_tx: tx.clone(),
             quote_jump: None,
             quick_schedule: None,
-            lock_guard: auth_guard::AppLockGuard::with_initial_lock(
-                is_logged_in && enable_app_lock,
-            ),
+            lock_guard,
             auth_in_progress: false,
             auth_request_generation: 0,
+            lock_pin_input: Default::default(),
+            lock_pin_error: None,
+            pin_setup_modal_open: false,
+            pin_setup_enable_after: false,
+            pin_setup_first: Default::default(),
+            pin_setup_confirm: Default::default(),
+            pin_setup_error: None,
             account_switcher: account_switcher::AccountSwitcher::default(),
         };
 
@@ -1644,6 +1871,7 @@ impl ZaloGuiApp {
                 .map(String::as_str)
             {
                 Some("appearance") => SettingsTab::Appearance,
+                Some("security") | Some("account") => SettingsTab::AccountSecurity,
                 Some("sync") => SettingsTab::Sync,
                 _ => SettingsTab::General,
             };
@@ -1999,6 +2227,36 @@ impl ZaloGuiApp {
         app
     }
 
+    pub(super) fn can_lock_app(&self) -> bool {
+        self.settings.enable_app_lock
+            && (self.settings.has_pin()
+                || (self.settings.use_windows_hello && self.lock_guard.is_biometric_available()))
+    }
+
+    pub(super) fn lock_app(&mut self) {
+        if !self.is_logged_in || !self.can_lock_app() {
+            return;
+        }
+        self.lock_pin_input.clear();
+        self.lock_pin_error = None;
+        self.lock_guard.lock();
+    }
+
+    fn handle_key_events(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
+            self.allow_quit = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.is_logged_in
+            && !self.lock_guard.is_locked()
+            && self.can_lock_app()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::L))
+        {
+            self.lock_app();
+            ctx.request_repaint();
+        }
+    }
+
     fn save_settings(&mut self) {
         match serde_json::to_value(&self.settings) {
             Ok(settings) => {
@@ -2070,15 +2328,79 @@ impl ZaloGuiApp {
         self.reset_e2ee_confirm_peer = None;
         self.pending_reaction_actions.clear();
         self.safety_number_modal = None;
+        self.auto_delete_modal = None;
+        self.content_protection_modal = None;
         self.typing_map.clear();
         self.typing_sent.clear();
         self.group_members.clear();
+        self.group_member_popover = None;
+        self.common_groups_cache.clear();
+        self.common_groups_state.clear();
+        self.common_groups_generations.clear();
+        self.common_groups_expanded = false;
+        self.common_groups_collapsed = false;
+        self.sync_success_until = None;
         self.group_members_state.clear();
         self.group_member_search.clear();
         self.screen_capture_pending = false;
         self.clipboard_text_fallback = None;
         self.clipboard_alternative_text = None;
         self.clipboard_text_only = false;
+        self.clear_forward_dialog();
+    }
+
+    /// Clear all state belonging to the 2-step forward/share dialog.
+    pub(super) fn clear_forward_dialog(&mut self) {
+        self.forward_msg = None;
+        self.forward_session = None;
+        self.forward_filter.clear();
+        self.forward_targets.clear();
+        self.forward_note.clear();
+    }
+
+    /// Return true whenever any modal dialog, blocking overlay, or popover menu is open.
+    pub(super) fn is_any_modal_open(&self) -> bool {
+        self.settings_modal_open
+            || self.forward_msg.is_some()
+            || self.forward_session.is_some()
+            || self.phone_modal_open
+            || self.pin_setup_modal_open
+            || self.active_call.is_some()
+            || self.image_viewer.is_some()
+            || self.doc_viewer.is_some()
+            || self.safety_number_modal.is_some()
+            || self.auto_delete_modal.is_some()
+            || self.content_protection_modal.is_some()
+            || self.reset_e2ee_confirm_peer.is_some()
+            || self.send_contact_modal_open
+            || self.batch_forward_modal_open
+            || self.clear_history_confirmation.is_some()
+            || self.quick_schedule.is_some()
+            || self.tools.open
+            || self.history_search.open
+            || self.server_board.open
+            || self.groups_panel.open
+            || self.group_entry_panel.open
+            || self.contact_panel.open
+            || self.profile_panel.open
+            || self.avatar_panel.open
+            || self.hidden_panel.open
+            || self.labels_panel.open
+            || self.policy_panel.target.is_some()
+            || self.group_content.open
+            || self.backup_panel.open
+            || self.profile_menu_open
+            || self.sidebar_more_menu_open
+            || self.group_member_popover.is_some()
+    }
+
+    /// Return true when background chat hover, context menus, and tooltips must be suppressed.
+    pub(super) fn is_workspace_input_gated(&self, ctx: &egui::Context) -> bool {
+        self.is_any_modal_open()
+            || ctx.data(|d| {
+                d.get_temp::<(String, String, ChatMessage)>(Id::new("reaction_details"))
+                    .is_some()
+            })
     }
 
     fn request_screen_capture(&mut self) {
@@ -2869,6 +3191,7 @@ impl ZaloGuiApp {
                             // Message badges replace flashing the taskbar for chat alerts.
                         }
                         crate::chat::deduplicate_threads(&mut self.threads, Some(&live_ids));
+                        self.apply_server_aliases();
 
                         if let Some((sel_id, sel_grp)) = prev_selected_id {
                             if let Some(idx) = self
@@ -3106,6 +3429,9 @@ impl ZaloGuiApp {
                     self.cancel_voice_recording();
                     self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                     self.auth_in_progress = false;
+                    self.lock_guard.unlock();
+                    self.lock_pin_input.clear();
+                    self.lock_pin_error = None;
                     self.clear_presence_state();
                     self.flush_composer_before_logout();
                     self.live_mailbox = None;
@@ -3185,6 +3511,9 @@ impl ZaloGuiApp {
                     self.cancel_voice_recording();
                     self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                     self.auth_in_progress = false;
+                    self.lock_guard.unlock();
+                    self.lock_pin_input.clear();
+                    self.lock_pin_error = None;
                     self.clear_presence_state();
                     self.deleted_message_ids.clear();
                     self.quick_schedule = None;
@@ -3208,8 +3537,7 @@ impl ZaloGuiApp {
                     self.password_input.clear();
                     self.phone_input.clear();
                     self.replying_to = None;
-                    self.forward_msg = None;
-                    self.forward_filter.clear();
+                    self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
                     if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
                         std::thread::spawn(move || {
@@ -3283,8 +3611,7 @@ impl ZaloGuiApp {
                     self.user_avatar = None;
                     self.input_message.clear();
                     self.replying_to = None;
-                    self.forward_msg = None;
-                    self.forward_filter.clear();
+                    self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
                     if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
                         std::thread::spawn(move || {
@@ -3485,19 +3812,22 @@ impl ZaloGuiApp {
                             }
                             self.replying_to = None;
                             self.filter_starred_only = false;
-                            let index = self
-                                .threads
-                                .iter()
-                                .position(|t| t.id == thread.id)
-                                .unwrap_or_else(|| {
+                            let index = match self.threads.iter().position(|t| t.id == thread.id) {
+                                Some(idx) => idx,
+                                None => {
                                     self.threads.push(Thread {
                                         id: thread.id.clone(),
                                         name: thread.name.clone(),
                                         is_group: thread.is_group,
                                         ..Default::default()
                                     });
-                                    self.threads.len() - 1
-                                });
+                                    self.apply_server_aliases();
+                                    self.threads
+                                        .iter()
+                                        .position(|t| t.id == thread.id)
+                                        .unwrap_or_else(|| self.threads.len() - 1)
+                                }
+                            };
                             self.selected_thread_index = index;
                             self.sync_composer_draft(ctx);
                             let opened_id = thread.id.clone();
@@ -3970,6 +4300,29 @@ impl ZaloGuiApp {
                     mutation,
                     result,
                 } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && self.common_groups_generations.get(&target) == Some(&generation)
+                    {
+                        self.common_groups_generations.remove(&target);
+                        match result {
+                            Ok(reply) => {
+                                if let Some(groups) = reply.related {
+                                    self.common_groups_cache.insert(target.clone(), groups);
+                                    self.common_groups_state.remove(&target);
+                                } else {
+                                    self.common_groups_state.insert(
+                                        target,
+                                        Some("Máy chủ không trả danh sách nhóm chung".into()),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                self.common_groups_state.insert(target, Some(error));
+                            }
+                        }
+                        continue;
+                    }
                     if owner != self.user_uin
                         || !self.is_logged_in
                         || target != self.groups_panel.target
@@ -4426,8 +4779,25 @@ impl ZaloGuiApp {
                     self.composer_sticker_loading.remove(&keyword);
                     self.composer_sticker_cache.insert(keyword, items);
                 }
-                GuiEvent::LinkPreviewReady(meta) => {
-                    self.loading_link_previews.remove(&meta.url);
+                GuiEvent::LinkPreviewReady {
+                    owner,
+                    runtime_id,
+                    url,
+                    result,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    self.loading_link_previews.remove(&url);
+                    self.loading_stickers
+                        .remove(&format!("linkmeta_{}", crate::crypto::md5_hex(&url)));
+                    let Ok(meta) = result else { continue };
+                    if meta.url != url {
+                        continue;
+                    }
                     if !meta.thumb.is_empty() {
                         let key = format!("thumb_{}", crate::crypto::md5_hex(&meta.thumb));
                         if !self.sticker_textures.contains_key(&key)
@@ -5095,12 +5465,15 @@ impl ZaloGuiApp {
                     {
                         continue;
                     }
-                    let resolved_name = self
+                    let fallback_name = self
                         .threads
                         .iter()
-                        .find(|t| t.id == caller_id)
-                        .map(|t| t.name.clone())
+                        .find(|t| !t.is_group && t.id == caller_id)
+                        .map(|t| self.resolve_thread_name(t).to_owned())
                         .unwrap_or(caller_name);
+                    let resolved_name = self
+                        .resolve_contact_name(&caller_id, &fallback_name)
+                        .to_owned();
                     self.status_msg = format!(
                         "📲 Cuộc gọi {} đến từ {resolved_name}…",
                         if is_video { "video" } else { "thoại" }
@@ -5155,7 +5528,16 @@ impl ZaloGuiApp {
                         call.error_reason = Some(reason);
                     }
                 }
-                GuiEvent::ConversationRefreshStatus { running, message } => {
+                GuiEvent::ConversationRefreshStatus {
+                    running,
+                    success,
+                    message,
+                } => {
+                    self.sync_success_until = if !running && success {
+                        Some(std::time::Instant::now() + Duration::from_secs(3))
+                    } else {
+                        None
+                    };
                     if !self.phone_sync_running {
                         self.phone_sync_status.clear();
                     }
@@ -5165,7 +5547,16 @@ impl ZaloGuiApp {
                     self.last_sync_was_history = false;
                     self.sync_notice_dismissed = false;
                 }
-                GuiEvent::PhoneSyncStatus { running, message } => {
+                GuiEvent::PhoneSyncStatus {
+                    running,
+                    success,
+                    message,
+                } => {
+                    self.sync_success_until = if !running && success {
+                        Some(std::time::Instant::now() + Duration::from_secs(3))
+                    } else {
+                        None
+                    };
                     if !running {
                         self.phone_download_status = message.clone();
                     }
@@ -5186,7 +5577,16 @@ impl ZaloGuiApp {
                     self.status_msg = message;
                     self.sync_notice_dismissed = false;
                 }
-                GuiEvent::HistorySyncStatus { running, message } => {
+                GuiEvent::HistorySyncStatus {
+                    running,
+                    success,
+                    message,
+                } => {
+                    self.sync_success_until = if !running && success {
+                        Some(std::time::Instant::now() + Duration::from_secs(3))
+                    } else {
+                        None
+                    };
                     if !self.phone_sync_running {
                         self.phone_sync_status.clear();
                     }
@@ -5347,8 +5747,14 @@ impl eframe::App for ZaloGuiApp {
         self.lock_guard.poll_availability();
         // A21 fix: Check and update lock state BEFORE processing input/events/render
         // This ensures lock transition happens before any sensitive operation can execute.
-        if self.is_logged_in && self.lock_guard.should_lock() {
-            self.lock_guard.lock();
+        if self.is_logged_in
+            && self.lock_guard.should_auto_lock(
+                self.settings.enable_app_lock,
+                self.settings.has_pin(),
+                self.settings.use_windows_hello,
+            )
+        {
+            self.lock_app();
         }
         if self.lock_guard.is_locked() && self.voice_binding.is_some() {
             self.cancel_voice_recording();
@@ -5554,10 +5960,7 @@ impl eframe::App for ZaloGuiApp {
                 }
             }
         }
-        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(Key::Q)) {
-            self.allow_quit = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
+        self.handle_key_events(ctx);
         #[cfg(windows)]
         if let Some(tray) = &self.tray {
             if tray.control().quitting() {
@@ -5706,10 +6109,9 @@ impl eframe::App for ZaloGuiApp {
                     self.render_login_screen(ui, &pal);
                 });
         } else if self.lock_guard.is_locked() {
-            // Render lock overlay (WP16-4)
-            self.render_lock_overlay(ctx, &pal);
+            // Render lock screen (WP16-4 / MAP-00)
+            self.render_lock_screen(ctx, &pal);
         } else {
-            self.render_sync_status_bar(ctx, &pal);
             self.render_chat_workspace(ctx, &pal);
             self.render_reactor_details(ctx);
         }
@@ -5950,83 +6352,271 @@ impl ZaloGuiApp {
         });
     }
 
-    fn render_lock_overlay(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+    fn render_lock_screen(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let has_pin = self.settings.has_pin();
+        let show_hello =
+            self.settings.use_windows_hello && self.lock_guard.is_biometric_available();
+
+        let mut submit_pin = false;
+        if has_pin && !self.auth_in_progress {
+            ctx.input(|i| {
+                let has_text_digits = !i.modifiers.ctrl
+                    && !i.modifiers.alt
+                    && !i.modifiers.command
+                    && i.events.iter().any(|ev| {
+                        matches!(
+                            ev,
+                            egui::Event::Text(txt) if txt.chars().any(|c| c.is_ascii_digit())
+                        )
+                    });
+
+                for ev in &i.events {
+                    match ev {
+                        egui::Event::Text(txt)
+                            if !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command =>
+                        {
+                            for ch in txt.chars().filter(|c| c.is_ascii_digit()) {
+                                if self.lock_pin_input.len() < 4 {
+                                    self.lock_pin_input.push(ch);
+                                    self.lock_pin_error = None;
+                                }
+                            }
+                        }
+                        egui::Event::Key {
+                            key,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if !modifiers.ctrl && !modifiers.alt && !modifiers.command => match key {
+                            Key::Backspace => {
+                                self.lock_pin_input.pop();
+                                self.lock_pin_error = None;
+                            }
+                            Key::Enter if self.lock_pin_input.len() == 4 => {
+                                submit_pin = true;
+                            }
+                            _ if !has_text_digits => {
+                                if let Some(ch) = match key {
+                                    Key::Num0 => Some('0'),
+                                    Key::Num1 => Some('1'),
+                                    Key::Num2 => Some('2'),
+                                    Key::Num3 => Some('3'),
+                                    Key::Num4 => Some('4'),
+                                    Key::Num5 => Some('5'),
+                                    Key::Num6 => Some('6'),
+                                    Key::Num7 => Some('7'),
+                                    Key::Num8 => Some('8'),
+                                    Key::Num9 => Some('9'),
+                                    _ => None,
+                                } {
+                                    if self.lock_pin_input.len() < 4 {
+                                        self.lock_pin_input.push(ch);
+                                        self.lock_pin_error = None;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            });
+            if self.lock_pin_input.len() == 4 {
+                submit_pin = true;
+            }
+        }
+
+        if submit_pin {
+            let was_legacy = self
+                .settings
+                .app_pin_hash
+                .as_deref()
+                .is_some_and(|h| h.starts_with("sha256$"));
+            if self.settings.verify_and_migrate_pin(&self.lock_pin_input) {
+                if was_legacy {
+                    self.save_settings();
+                }
+                self.lock_pin_input.clear();
+                self.lock_pin_error = None;
+                self.lock_guard.unlock();
+                crate::desktop_notice::privacy_lock(&self.user_uin, false);
+                self.status_msg = "Đã mở khóa ứng dụng".into();
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::RefreshThreads);
+                }
+                ctx.request_repaint();
+                return;
+            } else {
+                self.lock_pin_input.clear();
+                self.lock_pin_error = Some("Mã PIN không đúng. Vui lòng thử lại.".into());
+            }
+        }
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     let avail_h = ui.available_height();
-                    ui.add_space((avail_h * 0.35).max(100.0));
+                    ui.add_space((avail_h * 0.22).max(56.0));
 
-                    // Lock icon
-                    ui.label(RichText::new("🔒").size(64.0));
-                    ui.add_space(16.0);
+                    // Circular user avatar & account display name
+                    let user_disp = if self.user_name.is_empty() {
+                        "Người dùng Zalo".to_string()
+                    } else {
+                        self.user_name.clone()
+                    };
+                    let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(78.0), Sense::hover());
+                    paint_user_avatar(
+                        ui.painter(),
+                        av_rect.center(),
+                        36.0,
+                        &user_disp,
+                        false,
+                        self.user_avatar.as_deref(),
+                        &self.sticker_textures,
+                        &mut self.loading_stickers,
+                    );
+                    ui.painter().circle_stroke(
+                        av_rect.center(),
+                        37.5,
+                        Stroke::new(2.0_f32, pal.primary),
+                    );
+                    ui.add_space(12.0);
 
                     ui.label(
-                        RichText::new("Ứng dụng đã bị khóa")
+                        RichText::new(&user_disp)
                             .color(pal.text_primary)
-                            .size(24.0)
+                            .size(20.0)
                             .strong(),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(4.0);
 
+                    let subtitle = if has_pin && show_hello {
+                        "Nhập mã PIN 4 số hoặc dùng Windows Hello để mở khóa"
+                    } else if has_pin {
+                        "Nhập mã PIN 4 số để mở khóa Zalo"
+                    } else if show_hello {
+                        "Xác thực bằng Windows Hello để tiếp tục"
+                    } else {
+                        "Ứng dụng đang bị khóa"
+                    };
                     ui.label(
-                        RichText::new("Xác thực bằng Windows Hello để tiếp tục")
+                        RichText::new(crate::i18n::tr(subtitle))
                             .color(pal.text_secondary)
-                            .size(14.0),
+                            .size(13.5),
                     );
-                    ui.add_space(24.0);
+                    ui.add_space(22.0);
 
-                    let btn = egui::Button::new(
-                        RichText::new(if self.auth_in_progress {
-                            "Đang xác thực..."
-                        } else {
-                            "Mở khóa với Windows Hello"
-                        })
-                        .color(Color32::WHITE)
-                        .size(14.0)
-                        .strong(),
-                    )
-                    .fill(pal.primary)
-                    .rounding(Rounding::same(8.0))
-                    .min_size(Vec2::new(240.0, 42.0));
-
-                    if ui
-                        .add_enabled(!self.auth_in_progress, btn)
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        let Some(hwnd) = self.native_hwnd else {
-                            self.status_msg =
-                                "Không thể xác thực: chưa có cửa sổ Windows hợp lệ".into();
-                            return;
-                        };
-                        self.auth_in_progress = true;
-                        self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
-                        let request_id = self.auth_request_generation;
-                        let runtime_id = self.account_runtime_id;
-                        let ctx_clone = ctx.clone();
-                        let event_tx = self.event_tx.clone();
-
-                        tokio::spawn(async move {
-                            let event = match auth_guard::request_windows_hello(hwnd).await {
-                                Ok(verified) => GuiEvent::AppUnlockCompleted {
-                                    request_id,
-                                    runtime_id,
-                                    verified,
-                                },
-                                Err(error) => GuiEvent::AppUnlockFailed {
-                                    request_id,
-                                    runtime_id,
-                                    message: error.to_string(),
-                                },
+                    if has_pin {
+                        let box_w = 46.0_f32;
+                        let box_h = 52.0_f32;
+                        let gap = 10.0_f32;
+                        let total_w = box_w * 4.0 + gap * 3.0;
+                        let (row_rect, _) =
+                            ui.allocate_exact_size(Vec2::new(total_w, box_h), Sense::hover());
+                        let entered = self.lock_pin_input.len();
+                        for idx in 0..4 {
+                            let x0 = row_rect.left() + idx as f32 * (box_w + gap);
+                            let box_rect = Rect::from_min_size(
+                                Pos2::new(x0, row_rect.top()),
+                                Vec2::new(box_w, box_h),
+                            );
+                            let is_active = idx == entered && self.lock_pin_error.is_none();
+                            let stroke_col = if self.lock_pin_error.is_some() {
+                                pal.danger
+                            } else if is_active {
+                                pal.primary
+                            } else {
+                                pal.border
                             };
-                            let _ = event_tx.send(event);
-                            ctx_clone.request_repaint();
-                        });
+                            let stroke_w = if is_active || self.lock_pin_error.is_some() {
+                                2.0_f32
+                            } else {
+                                1.0_f32
+                            };
+                            ui.painter().rect(
+                                box_rect,
+                                Rounding::same(10.0),
+                                pal.bg_input,
+                                Stroke::new(stroke_w, stroke_col),
+                            );
+                            if idx < entered {
+                                ui.painter().circle_filled(
+                                    box_rect.center(),
+                                    6.0,
+                                    pal.text_primary,
+                                );
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        if let Some(ref err) = self.lock_pin_error {
+                            ui.label(RichText::new(err).color(pal.danger).size(12.5));
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Nhập 4 chữ số trên bàn phím (0-9, Backspace, Enter)",
+                                )
+                                .color(pal.text_muted)
+                                .size(11.8),
+                            );
+                        }
+                        ui.add_space(18.0);
                     }
 
-                    ui.add_space(12.0);
+                    if show_hello {
+                        let btn = egui::Button::new(
+                            RichText::new(if self.auth_in_progress {
+                                "Đang xác thực..."
+                            } else {
+                                "Mở khóa bằng Windows Hello"
+                            })
+                            .color(Color32::WHITE)
+                            .size(14.0)
+                            .strong(),
+                        )
+                        .fill(pal.primary)
+                        .rounding(Rounding::same(8.0))
+                        .min_size(Vec2::new(240.0, 42.0));
+
+                        if ui
+                            .add_enabled(!self.auth_in_progress, btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            let Some(hwnd) = self.native_hwnd else {
+                                self.status_msg =
+                                    "Không thể xác thực: chưa có cửa sổ Windows hợp lệ".into();
+                                return;
+                            };
+                            self.auth_in_progress = true;
+                            self.auth_request_generation =
+                                self.auth_request_generation.wrapping_add(1);
+                            let request_id = self.auth_request_generation;
+                            let runtime_id = self.account_runtime_id;
+                            let ctx_clone = ctx.clone();
+                            let event_tx = self.event_tx.clone();
+
+                            tokio::spawn(async move {
+                                let event = match auth_guard::request_windows_hello(hwnd).await {
+                                    Ok(verified) => GuiEvent::AppUnlockCompleted {
+                                        request_id,
+                                        runtime_id,
+                                        verified,
+                                    },
+                                    Err(error) => GuiEvent::AppUnlockFailed {
+                                        request_id,
+                                        runtime_id,
+                                        message: error.to_string(),
+                                    },
+                                };
+                                let _ = event_tx.send(event);
+                                ctx_clone.request_repaint();
+                            });
+                        }
+                        ui.add_space(12.0);
+                    }
+
                     let logout_btn = egui::Button::new(
                         RichText::new("Đăng xuất tài khoản")
                             .color(pal.text_secondary)
@@ -6048,7 +6638,8 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    if !self.status_msg.is_empty() {
+                    if !self.status_msg.is_empty() && self.status_msg != "Đã đăng nhập · Sẵn sàng"
+                    {
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(&self.status_msg)
@@ -6124,6 +6715,7 @@ mod settings_layout_tests {
         for size in [[480.0, 360.0], [1020.0, 700.0], [320.0, 240.0]] {
             for tab in [
                 SettingsTab::General,
+                SettingsTab::AccountSecurity,
                 SettingsTab::Privacy,
                 SettingsTab::Sync,
                 SettingsTab::Appearance,
@@ -7418,6 +8010,60 @@ mod v008_relock_regression_tests {
         app.apply_server_aliases();
         assert_eq!(app.threads[0].name, "Tên gốc");
     }
+    #[test]
+    fn resolve_contact_name_and_threads_updated_prioritize_server_aliases() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "12".into(),
+                name: "Tên Zalo".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "99".into();
+        app.server_aliases_ready = true;
+        app.server_aliases.insert("12".into(), "Mẹ Yêu".into());
+        app.server_aliases.insert("13".into(), "   ".into());
+        assert_eq!(app.resolve_contact_name("12", "Tên Zalo"), "Mẹ Yêu");
+        assert_eq!(app.resolve_contact_name("13", "Fallback"), "Fallback");
+        assert_eq!(app.resolve_thread_name(&app.threads[0]), "Mẹ Yêu");
+
+        let msg = ChatMessage {
+            id: "m1".into(),
+            sender: "Tên Zalo".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("12")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            app.resolve_message_sender_name(&msg, "g1", true, "Nhóm"),
+            "Mẹ Yêu"
+        );
+
+        app.event_tx
+            .send(GuiEvent::ThreadsUpdated {
+                threads: vec![Thread {
+                    id: "12".into(),
+                    name: "Tên Zalo Mới".into(),
+                    ..Default::default()
+                }],
+                source: ThreadUpdateSource::Live,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.threads[0].name, "Mẹ Yêu");
+        assert_eq!(
+            app.threads[0].presentation.base_name.as_deref(),
+            Some("Tên Zalo Mới")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7577,6 +8223,7 @@ mod audit_lock_tests {
             tab: MediaTab::Files,
         };
         app.drawer_search_query = "tài liệu kế toán".into();
+        app.group_member_search = "thành viên ABC".into();
 
         // Switch to thread 1
         app.open_thread(&ctx, 1, "thread-b".into(), false);
@@ -7584,6 +8231,7 @@ mod audit_lock_tests {
         assert_eq!(app.selected_thread_index, 1);
         assert_eq!(app.drawer_view, DrawerView::Overview);
         assert!(app.drawer_search_query.is_empty());
+        assert!(app.group_member_search.is_empty());
     }
 
     #[test]
@@ -7822,5 +8470,261 @@ mod voice_draft_boundary_tests {
         app.check_events(&ctx);
         assert!(!app.lock_guard.is_locked());
         assert!(!app.auth_in_progress);
+    }
+
+    #[test]
+    fn app_settings_default_disables_lock_and_verifies_salted_pin() {
+        let mut settings = AppSettings::default();
+        assert!(!settings.enable_app_lock);
+        assert!(!settings.use_windows_hello);
+        assert!(settings.app_pin_hash.is_none());
+        assert!(!settings.has_pin());
+        assert!(!settings.verify_pin("1234"));
+
+        assert!(settings.set_pin("12a4").is_err());
+        assert!(settings.set_pin("123").is_err());
+        assert!(settings.set_pin("12345").is_err());
+
+        settings.set_pin("2580").unwrap();
+        assert!(settings.has_pin());
+        assert!(settings
+            .app_pin_hash
+            .as_deref()
+            .is_some_and(|h| h.starts_with("pbkdf2$100000$")));
+        assert!(settings.verify_pin("2580"));
+        assert!(!settings.verify_pin("0000"));
+    }
+
+    #[test]
+    fn pin_pbkdf2_hash_verification_error_handling_and_migration() {
+        let mut settings = AppSettings::default();
+
+        // 1. Correct vs wrong PIN with new slow PBKDF2 KDF
+        settings.set_pin("4321").unwrap();
+        assert!(settings.verify_pin("4321"));
+        assert!(!settings.verify_pin("1234"));
+        assert!(!settings.verify_pin("432a"));
+        assert!(!settings.verify_pin("432"));
+        assert!(!settings.verify_pin("43210"));
+
+        // 2. Malformed hash strings must fail gracefully without panic
+        settings.app_pin_hash = Some("corrupted".into());
+        assert!(!settings.verify_pin("4321"));
+
+        settings.app_pin_hash = Some("pbkdf2$not_a_number$abcd$1234".into());
+        assert!(!settings.verify_pin("4321"));
+
+        // Iteration count out of bounds (< 10_000)
+        settings.app_pin_hash = Some("pbkdf2$100$0102030405060708090a0b0c0d0e0f10$0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10".into());
+        assert!(!settings.verify_pin("4321"));
+
+        // Salt too short (< 16 bytes)
+        settings.app_pin_hash = Some(
+            "pbkdf2$100000$0102$0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10"
+                .into(),
+        );
+        assert!(!settings.verify_pin("4321"));
+
+        // Hash length wrong (!= 32 bytes)
+        settings.app_pin_hash = Some("pbkdf2$100000$0102030405060708090a0b0c0d0e0f10$abcd".into());
+        assert!(!settings.verify_pin("4321"));
+
+        // Invalid hex
+        settings.app_pin_hash = Some("pbkdf2$100000$not_hex_salt!zzzzzzzzzzzzzzzzzz$0102030405060708090a0b0c0d0e0f100102030405060708090a0b0c0d0e0f10".into());
+        assert!(!settings.verify_pin("4321"));
+
+        // 3. Backwards-compatibility and automatic migration from legacy sha256$...
+        use sha2::{Digest, Sha256};
+        let salt = [7u8; 16];
+        let mut hasher = Sha256::new();
+        hasher.update(b"zalolite-app-pin-v1:");
+        hasher.update(salt);
+        hasher.update(b":");
+        hasher.update(b"7890");
+        let digest = hasher.finalize();
+        let legacy_hash = format!("sha256${}${}", hex::encode(salt), hex::encode(digest));
+
+        settings.app_pin_hash = Some(legacy_hash.clone());
+        // Read-only verify works on legacy hash
+        assert!(settings.verify_pin("7890"));
+        assert!(!settings.verify_pin("0000"));
+        assert_eq!(settings.app_pin_hash.as_deref(), Some(legacy_hash.as_str()));
+
+        // verify_and_migrate_pin upgrades legacy hash to pbkdf2
+        assert!(settings.verify_and_migrate_pin("7890"));
+        let new_hash = settings.app_pin_hash.as_ref().unwrap();
+        assert!(new_hash.starts_with("pbkdf2$100000$"));
+        assert_ne!(new_hash, &legacy_hash);
+
+        // Subsequent verification works with the migrated hash
+        assert!(settings.verify_pin("7890"));
+        assert!(!settings.verify_pin("1111"));
+    }
+
+    #[test]
+    fn ctrl_l_and_pin_lock_screen_unlock_flow() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_voice_draft();
+        app.user_name = "Tester".into();
+        assert!(!app.lock_guard.is_locked());
+
+        // Ctrl+L must NOT lock when enable_app_lock is false.
+        let ctrl_l_input = egui::RawInput {
+            modifiers: egui::Modifiers::COMMAND,
+            events: vec![egui::Event::Key {
+                key: Key::L,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(ctrl_l_input.clone(), |ctx| app.handle_key_events(ctx));
+        assert!(!app.lock_guard.is_locked());
+
+        // Enable app lock with a 4-digit PIN -> Ctrl+L locks.
+        app.settings.enable_app_lock = true;
+        app.settings.set_pin("1357").unwrap();
+        let _ = ctx.run(ctrl_l_input, |ctx| app.handle_key_events(ctx));
+        assert!(app.lock_guard.is_locked());
+
+        // Wrong PIN (9999) keeps locked and records error.
+        let wrong_pin_input = egui::RawInput {
+            events: vec![
+                egui::Event::Text("9".into()),
+                egui::Event::Text("9".into()),
+                egui::Event::Text("9".into()),
+                egui::Event::Text("9".into()),
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(wrong_pin_input, |ctx| {
+            let pal = app.palette();
+            app.render_lock_screen(ctx, &pal);
+        });
+        assert!(app.lock_guard.is_locked());
+        assert!(app.lock_pin_error.is_some());
+
+        // Typing with Backspace correction via Key::Num* unlocks on 1357.
+        let right_pin_input = egui::RawInput {
+            events: vec![
+                egui::Event::Key {
+                    key: Key::Num1,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Num9,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Num3,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Num5,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: Key::Num7,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = ctx.run(right_pin_input, |ctx| {
+            let pal = app.palette();
+            app.render_lock_screen(ctx, &pal);
+        });
+        assert!(!app.lock_guard.is_locked());
+        assert!(app.lock_pin_error.is_none());
+    }
+}
+
+#[cfg(test)]
+mod phase3_completion_tests {
+    use super::*;
+    fn app() -> (egui::Context, ZaloGuiApp, Sender<GuiEvent>) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "fixture-owner".into();
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        (ctx, app, tx)
+    }
+    #[test]
+    fn only_typed_success_starts_sync_banner_expiry() {
+        let (ctx, mut app, tx) = app();
+        tx.send(GuiEvent::ConversationRefreshStatus {
+            running: false,
+            success: true,
+            message: "finished".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_success_until.is_some());
+        tx.send(GuiEvent::PhoneSyncStatus {
+            running: false,
+            success: false,
+            message: "partial".into(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_success_until.is_none());
+        assert_eq!(app.phone_sync_status, "partial");
+    }
+    #[test]
+    fn stale_preview_does_not_clear_current_runtime_pending_or_mutate_cache() {
+        let (ctx, mut app, tx) = app();
+        let url = "https://example.invalid/fixture".to_owned();
+        app.loading_link_previews.insert(url.clone());
+        tx.send(GuiEvent::LinkPreviewReady {
+            owner: app.user_uin.clone(),
+            runtime_id: app.account_runtime_id.wrapping_add(1),
+            url: url.clone(),
+            result: Err("stale".into()),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.loading_link_previews.contains(&url));
+        assert!(app.link_metadata_cache.is_empty());
+        tx.send(GuiEvent::LinkPreviewReady {
+            owner: app.user_uin.clone(),
+            runtime_id: app.account_runtime_id,
+            url: url.clone(),
+            result: Err("failed".into()),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.loading_link_previews.contains(&url));
     }
 }

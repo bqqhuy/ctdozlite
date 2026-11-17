@@ -53,9 +53,15 @@ impl ZaloGuiApp {
             self.show_toast("Đang xử lý liên hệ; chờ kết quả trước khi chuyển");
             return;
         }
+        let alias = self
+            .server_aliases
+            .get(&target)
+            .cloned()
+            .unwrap_or_default();
         self.contact_panel = ContactPanel {
             open: true,
             target,
+            alias,
             ..Default::default()
         };
         self.contact_command(crate::contact_actions::Action::Inspect);
@@ -153,9 +159,34 @@ impl ZaloGuiApp {
                 if ui.add_enabled(!self.contact_panel.pending,egui::Button::new("Tra cứu username")).clicked(){intent=Some(crate::contact_actions::Action::LookupUsername {username:self.contact_panel.username.clone()});}
                 if ui.add_enabled(!self.contact_panel.pending,egui::Button::new("Tải danh sách bạn thân từ máy chủ")).clicked(){intent=Some(crate::contact_actions::Action::CloseFriends);}
                 ui.label(&self.contact_panel.status);
-                if let Some(profile)=&self.contact_panel.lookup {ui.label(format!("{} • UID {}",profile.name,profile.uid));if ui.button("Mở thông tin liên hệ này").clicked(){selected_contact=Some(profile.uid.clone());}}
-                egui::ScrollArea::vertical().id_salt("close-friends-read").max_height(220.0).show_rows(ui,24.0,self.contact_panel.close_friends.len(),|ui,range| {for index in range {let profile=&self.contact_panel.close_friends[index];if ui.add_sized([ui.available_width(),24.0],egui::Button::new(egui::RichText::new(&profile.name))).on_hover_text(format!("UID {}",profile.uid)).clicked(){selected_contact=Some(profile.uid.clone());}}});
+                if let Some(profile)=&self.contact_panel.lookup {let display = resolve_contact_name_from(&self.server_aliases, &profile.uid, &profile.name);ui.label(format!("{display} • UID {}",profile.uid));if ui.button("Mở thông tin liên hệ này").clicked(){selected_contact=Some(profile.uid.clone());}}
+                egui::ScrollArea::vertical().id_salt("close-friends-read").max_height(220.0).show_rows(ui,24.0,self.contact_panel.close_friends.len(),|ui,range| {for index in range {let profile=&self.contact_panel.close_friends[index];let display = resolve_contact_name_from(&self.server_aliases, &profile.uid, &profile.name);if ui.add_sized([ui.available_width(),24.0],egui::Button::new(egui::RichText::new(display))).on_hover_text(format!("UID {}",profile.uid)).clicked(){selected_contact=Some(profile.uid.clone());}}});
                 if self.contact_panel.pending {ui.spinner();}return;
+            }
+            if !self.contact_panel.target.is_empty() && !self.contact_panel.group_report {
+                if let Some(thread) = self
+                    .threads
+                    .iter()
+                    .find(|t| !t.is_group && t.id == self.contact_panel.target)
+                {
+                    let display = resolve_thread_name_from(&self.server_aliases, thread);
+                    ui.label(egui::RichText::new(display).strong());
+                    if let Some(base) = thread
+                        .presentation
+                        .base_name
+                        .as_deref()
+                        .filter(|b| !b.trim().is_empty() && !crate::chat::is_generic_thread_name(b) && *b != display)
+                    {
+                        ui.label(format!("Tên Zalo: {base}"));
+                    }
+                } else if let Some(alias) = self
+                    .server_aliases
+                    .get(&self.contact_panel.target)
+                    .map(|a| a.trim())
+                    .filter(|a| !a.is_empty())
+                {
+                    ui.label(egui::RichText::new(alias).strong());
+                }
             }
             ui.label(format!("UID: {}",self.contact_panel.target));
             ui.label(&self.contact_panel.status);
@@ -163,7 +194,7 @@ impl ZaloGuiApp {
             if self.contact_panel.target.is_empty() {
                 ui.add_enabled_ui(!self.contact_panel.pending,|ui| {
                     if ui.button("Tải lại danh sách chặn").clicked(){intent=Some(crate::contact_actions::Action::Blocked {page:1});}
-                    egui::ScrollArea::vertical().max_height(350.0).show(ui,|ui| {for (uid,name) in &self.contact_panel.blocked {if ui.button(format!("{name} • {uid}")).clicked(){selected_contact=Some(uid.clone());}}});
+                    egui::ScrollArea::vertical().max_height(350.0).show(ui,|ui| {for (uid,name) in &self.contact_panel.blocked {let display = resolve_contact_name_from(&self.server_aliases, uid, name);if ui.button(format!("{display} • {uid}")).clicked(){selected_contact=Some(uid.clone());}}});
                     if self.contact_panel.blocked_more && self.contact_panel.blocked_page<400 && ui.button("Trang chặn tiếp").clicked(){intent=Some(crate::contact_actions::Action::Blocked {page:self.contact_panel.blocked_page+1});}
                 });
                 return;
