@@ -352,6 +352,10 @@ pub enum GuiEvent {
         runtime_id: usize,
     },
     LoginFailed(String),
+    E2eePeersHydrated {
+        owner: String,
+        peers: Vec<String>,
+    },
     ThreadsUpdated {
         threads: Vec<Thread>,
         source: ThreadUpdateSource,
@@ -2330,6 +2334,11 @@ impl ZaloGuiApp {
                             }
                             Err(message) => self.show_toast(message),
                         }
+                    }
+                }
+                GuiEvent::E2eePeersHydrated { owner, peers } => {
+                    if owner == self.user_uin {
+                        self.trial_peers.extend(peers);
                     }
                 }
                 GuiEvent::SafetyNumberFailed {

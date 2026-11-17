@@ -126,6 +126,42 @@ pub fn is_thread_e2ee(profile_id: &str, peer_id: &str) -> bool {
     check_thread_e2ee(profile_id, peer_id).unwrap_or(false)
 }
 
+/// Query all peer IDs that require E2EE or have an active ratchet session for this profile.
+pub fn list_e2ee_peers(profile_id: &str) -> Vec<String> {
+    if profile_id.is_empty() {
+        return Vec::new();
+    }
+    with_manager(profile_id, |manager| {
+        let mut peers = std::collections::HashSet::new();
+        if let Ok(mut stmt) = manager
+            .conn()
+            .prepare("SELECT peer_id FROM e2ee_required WHERE profile_id=?1")
+        {
+            if let Ok(rows) =
+                stmt.query_map(rusqlite::params![profile_id], |r| r.get::<_, String>(0))
+            {
+                for p in rows.flatten() {
+                    peers.insert(p);
+                }
+            }
+        }
+        if let Ok(mut stmt) = manager
+            .conn()
+            .prepare("SELECT peer_id FROM signal_session WHERE profile_id=?1")
+        {
+            if let Ok(rows) =
+                stmt.query_map(rusqlite::params![profile_id], |r| r.get::<_, String>(0))
+            {
+                for p in rows.flatten() {
+                    peers.insert(p);
+                }
+            }
+        }
+        Ok(peers.into_iter().collect())
+    })
+    .unwrap_or_default()
+}
+
 /// Decrypt incoming E2EE payload.
 ///
 /// The custom local envelope is not an official Zalo container.

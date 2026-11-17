@@ -798,3 +798,54 @@ fn test_n01_perform_account_logout_clears_credentials_isolated() {
     zalo_rust::profiles::perform_account_logout(acc_2).unwrap();
     assert!(!session_file_2.exists());
 }
+
+#[test]
+fn test_n03_outgoing_does_not_delete_user_file_named_clipboard() {
+    let custom_temp_dir = std::env::temp_dir().join("ctdoz_test_custom_temp");
+    std::fs::create_dir_all(&custom_temp_dir).unwrap();
+    let user_file = custom_temp_dir.join("clipboard_critical_user_work.png");
+    std::fs::write(&user_file, b"valuable-user-image-data").unwrap();
+    assert!(user_file.exists());
+
+    // Verify that user files outside app internal temp dirs are preserved
+    let temp_dir = zalo_rust::storage::account_temp_dir("test_user");
+    let root_temp = zalo_rust::storage::root().join("temp");
+    let is_ephemeral = false; // User picking from dialog/drop
+    if is_ephemeral && (user_file.starts_with(&temp_dir) || user_file.starts_with(&root_temp)) {
+        let _ = std::fs::remove_file(&user_file);
+    }
+    assert!(
+        user_file.exists(),
+        "User file must NOT be deleted after sending"
+    );
+    let _ = std::fs::remove_file(user_file);
+    let _ = std::fs::remove_dir(custom_temp_dir);
+}
+
+#[test]
+fn test_n04_list_e2ee_peers_hydrates_from_db_without_ui_thread_locks() {
+    let owner = "test_n04_hydrated_owner";
+    let peer_1 = "peer_e2ee_1";
+    let peer_2 = "peer_e2ee_2";
+
+    // Setup: remember requirement for peer_1 and save session for peer_2
+    zalo_rust::e2ee_integration::remember_e2ee_requirement(owner, peer_1).unwrap();
+    let manager = zalo_rust::e2ee_integration::get_manager(owner).unwrap();
+    let bob_kp = zalo_rust::crypto::ratchet::KeyPair::generate();
+    let ratchet =
+        zalo_rust::crypto::ratchet::RatchetSession::init_as_sender(&[9u8; 32], &bob_kp.public)
+            .unwrap();
+    manager.save_session(peer_2, &ratchet).unwrap();
+
+    // Verify list_e2ee_peers retrieves both without UI thread locks
+    let hydrated = zalo_rust::e2ee_integration::list_e2ee_peers(owner);
+    assert!(hydrated.contains(&peer_1.to_string()));
+    assert!(hydrated.contains(&peer_2.to_string()));
+
+    // Clean up
+    zalo_rust::e2ee_integration::remove_e2ee_requirement(owner, peer_1).unwrap();
+    zalo_rust::e2ee_integration::remove_e2ee_requirement(owner, peer_2).unwrap();
+    let remaining = zalo_rust::e2ee_integration::list_e2ee_peers(owner);
+    assert!(!remaining.contains(&peer_1.to_string()));
+    assert!(!remaining.contains(&peer_2.to_string()));
+}

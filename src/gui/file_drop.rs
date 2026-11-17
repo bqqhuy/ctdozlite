@@ -204,6 +204,7 @@ pub struct Batch {
     pub caption: String,
     pub original: bool,
     pub files: Vec<(PathBuf, Option<crate::outgoing::FileStamp>)>,
+    pub ephemeral: bool,
 }
 
 impl ZaloGuiApp {
@@ -400,6 +401,7 @@ impl ZaloGuiApp {
                 caption: String::new(),
                 original: self.settings.send_photo_original,
                 files: paths.into_iter().map(|p| (p, None)).collect(),
+                ephemeral: false,
             };
             if WORKER_TX.get().is_none_or(|tx| {
                 tx.send(WorkerCmd::SendDroppedFiles {
@@ -481,6 +483,7 @@ impl ZaloGuiApp {
                         .map(|stamp| (i.path.clone(), Some(stamp.clone())))
                 })
                 .collect(),
+            ephemeral: false,
         };
         if WORKER_TX.get().is_some_and(|tx| {
             tx.send(WorkerCmd::SendDroppedFiles {

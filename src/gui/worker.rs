@@ -366,6 +366,9 @@ pub enum WorkerCmd {
         preset_path: Option<std::path::PathBuf>,
         /// `false` sends photos as an HD copy (long side 2560 px) like Zalo PC's default.
         photo_original: bool,
+        /// If `true`, the source is an internal ephemeral file (e.g. clipboard paste) that should
+        /// be unlinked from disk upon successful transmission if within app temp directories.
+        ephemeral: bool,
     },
     FetchChatImage {
         key: String,
@@ -2625,6 +2628,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                                 }
                                                             }
                                                         });
+                                                        hydrate_e2ee_peers(&s, &gui_tx_clone, &ctx_clone);
                                                     }
                                                 }
                                             }
@@ -3981,13 +3985,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::PickAndSendAttachment {to_id,is_group,images_only,caption,preset_path,photo_original} => {
+                        WorkerCmd::PickAndSendAttachment {to_id,is_group,images_only,caption,preset_path,photo_original,ephemeral} => {
                             let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();
                             tokio::spawn(async move {
                                 let paths=if let Some(path)=preset_path {vec![path]} else {
                                     tokio::task::spawn_blocking(move||super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default()
                                 };
-                                send_attachment_batch(s,super::file_drop::Batch {thread:to_id,group:is_group,caption,original:photo_original,files:paths.into_iter().map(|p|(p,None)).collect()},events,ctx).await;
+                                send_attachment_batch(s,super::file_drop::Batch {thread:to_id,group:is_group,caption,original:photo_original,files:paths.into_iter().map(|p|(p,None)).collect(),ephemeral},events,ctx).await;
                             });
                         }
                         WorkerCmd::StartCall {
@@ -4490,6 +4494,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 let runtime_id = candidate.runtime_id();
 
                                                 let s_clone = candidate.clone();
+                                                let s_hydrate = candidate.clone();
                                                 *s = candidate;
                                                 drop(s);
                                                 let tx_save = gui_tx_clone.clone();
@@ -4509,6 +4514,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 if let Some(tx) = commands.upgrade() {
                                                     let _ = tx.send(WorkerCmd::RefreshThreads);
                                                 }
+                                                hydrate_e2ee_peers(&s_hydrate, &gui_tx_clone, &ctx_clone);
                                             }
                                         }
                                     }
@@ -5633,6 +5639,7 @@ async fn send_attachment_batch(
         let source_stamp = expected_stamp.clone().or_else(|| current_stamp.clone());
         let original_path = path.clone();
         let copy_dir = crate::photo_quality::outgoing_dir(s.account_key());
+        let path_for_reduce = original_path.clone();
         let mut hd_copy = if invalid_source
             || batch.original
             || expected_stamp
@@ -5642,7 +5649,7 @@ async fn send_attachment_batch(
             None
         } else {
             tokio::task::spawn_blocking(move || {
-                crate::photo_quality::reduce(&original_path, &copy_dir)
+                crate::photo_quality::reduce(&path_for_reduce, &copy_dir)
             })
             .await
             .ok()
@@ -5706,10 +5713,23 @@ async fn send_attachment_batch(
         let tx = events.clone();
         let ctx = ctx.clone();
         let thread_id = batch.thread.clone();
+        let is_ephemeral = batch.ephemeral;
+        let orig_file_to_clean = original_path.clone();
         tokio::spawn(async move {
             let _queued = queued;
             match crate::outgoing::send(&s, &thread_id, &message).await {
-                Ok(sent) => message = sent,
+                Ok(sent) => {
+                    message = sent;
+                    if is_ephemeral {
+                        let temp_dir = crate::storage::account_temp_dir(&owner);
+                        let root_temp = crate::storage::root().join("temp");
+                        if orig_file_to_clean.starts_with(&temp_dir)
+                            || orig_file_to_clean.starts_with(&root_temp)
+                        {
+                            let _ = tokio::fs::remove_file(&orig_file_to_clean).await;
+                        }
+                    }
+                }
                 Err(error) => {
                     message.delivery = crate::message_model::DeliveryState::Failed;
                     if let Some(job) = message.outgoing_job.as_mut() {
@@ -5727,6 +5747,28 @@ async fn send_attachment_batch(
             ctx.request_repaint();
         });
     }
+}
+
+fn hydrate_e2ee_peers(s: &Session, tx: &Sender<GuiEvent>, ctx: &egui::Context) {
+    if !s.is_active() {
+        return;
+    }
+    let s_e2ee = s.clone();
+    let tx_e2ee = tx.clone();
+    let ctx_e2ee = ctx.clone();
+    tokio::spawn(async move {
+        let owner = s_e2ee.account_key().to_owned();
+        let owner_for_task = owner.clone();
+        let peers = tokio::task::spawn_blocking(move || {
+            crate::e2ee_integration::list_e2ee_peers(&owner_for_task)
+        })
+        .await
+        .unwrap_or_default();
+        if !peers.is_empty() {
+            let _ = tx_e2ee.send(GuiEvent::E2eePeersHydrated { owner, peers });
+            ctx_e2ee.request_repaint();
+        }
+    });
 }
 
 async fn publish_pins(s: &Session, snapshot: crate::server_pins::Snapshot, tx: &Sender<GuiEvent>) {

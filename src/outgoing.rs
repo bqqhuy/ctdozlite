@@ -336,15 +336,6 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                 // The HD copy has served its purpose; the original stays where it was.
                 let _ = tokio::fs::remove_file(&upload).await;
             }
-            // If the source was an internal temporary clipboard image, clean it up after upload.
-            let orig_path = hd_source.as_ref().map(|s| &s.path).unwrap_or(&upload);
-            if orig_path
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with("clipboard_"))
-                && orig_path.parent().is_some_and(|p| p.ends_with("temp"))
-            {
-                let _ = tokio::fs::remove_file(orig_path).await;
-            }
             sent = result;
             serde_json::Value::Null
         }

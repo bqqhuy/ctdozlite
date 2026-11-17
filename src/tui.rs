@@ -2413,7 +2413,31 @@ impl<'a> TuiApp<'a> {
     fn check_background_events(&mut self) {
         self.flush_pending_snapshot();
         while let Ok(envelope) = self.bg_rx.try_recv() {
-            if !envelope.stamp.matches(self.session) {
+            if self.logout_inflight {
+                // When logout is in flight, discard all incoming background events
+                // (polls, hydration, history loads, send outcomes, etc.) except LogoutDone.
+                if let BgEvent::LogoutDone { owner, result } = envelope.event {
+                    if owner == self.session.account_key() {
+                        self.logout_inflight = false;
+                        match result {
+                            Ok(()) => {
+                                self.session.logout();
+                                self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
+                            }
+                            Err(e) => {
+                                self.status =
+                                    format!("Không thể xóa phiên: {e}. Bấm 'q' để thoát.");
+                                crate::logger::log_error(
+                                    "tui logout",
+                                    &format!("Lỗi xóa phiên: {e}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            if !self.session.is_active() || !envelope.stamp.matches(self.session) {
                 continue;
             }
             let event = envelope.event;
@@ -2630,21 +2654,8 @@ impl<'a> TuiApp<'a> {
                         self.status = "Đã lưu lịch sử cục bộ".into();
                     }
                 }
-                BgEvent::LogoutDone { owner, result } => {
-                    if owner != self.session.account_key() {
-                        continue;
-                    }
-                    self.logout_inflight = false;
-                    match result {
-                        Ok(()) => {
-                            self.session.logout();
-                            self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
-                        }
-                        Err(e) => {
-                            self.status = format!("Không thể xóa phiên: {e}. Bấm 'q' để thoát.");
-                            crate::logger::log_error("tui logout", &format!("Lỗi xóa phiên: {e}"));
-                        }
-                    }
+                BgEvent::LogoutDone { .. } => {
+                    // Handled above when logout_inflight is true.
                 }
                 BgEvent::StickerPacks(packs) => {
                     self.sticker.loading = false;
@@ -4289,5 +4300,113 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui_draw(f, &mut app)).unwrap();
         assert!(app.msg_ranges.len() >= 2);
+    }
+
+    #[test]
+    fn test_tui_logout_inflight_discards_stale_events() {
+        let mut session = crate::session::Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: "test_owner_tui".into(),
+            ..Default::default()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = TuiApp {
+            session: &mut session,
+            threads: Vec::new(),
+            list_state: ListState::default(),
+            selected_thread: 0,
+            input_text: String::new(),
+            focus: Focus::Threads,
+            status: "Đang xóa phiên và dọn dẹp dữ liệu...".into(),
+            should_quit: false,
+            poll_state: chat::PollState::default(),
+            filtered: Vec::new(),
+            filter: FilterTab::All,
+            search: String::new(),
+            search_mode: false,
+            unread: HashMap::new(),
+            deleted_messages: HashMap::new(),
+            selected_msg: None,
+            msg_scroll: 0,
+            follow_tail: true,
+            msg_ranges: Vec::new(),
+            chat_view_h: 10,
+            threads_width: 0,
+            reply_target: None,
+            overlay: Overlay::None,
+            log_scroll: 0,
+            sticker: StickerState::default(),
+            prompt: None,
+            confirm: None,
+            poll_inflight: false,
+            delete_inflight: false,
+            logout_inflight: true,
+            critical_inflight: Arc::new(AtomicUsize::new(0)),
+            bg_rx: rx,
+            bg_tx: tx.clone(),
+            writer: StoreWriter::new(),
+            pending_snapshot: None,
+        };
+
+        // 1. Send stale PollDone while logout_inflight == true
+        let stale_thread = Thread {
+            presentation: Default::default(),
+            unread: Default::default(),
+            id: "stale_thread".into(),
+            name: "Stale Thread".into(),
+            preview: "stale".into(),
+            time: "12:00".into(),
+            avatar: None,
+            is_group: false,
+            messages: vec![ChatMessage {
+                id: "stale_m1".into(),
+                sender: "Other".into(),
+                text: "Should be dropped".into(),
+                ..Default::default()
+            }],
+        };
+        let _ = tx.send(BgEnvelope {
+            stamp: RuntimeStamp::for_session(app.session),
+            event: BgEvent::PollDone {
+                threads: vec![stale_thread],
+                state: chat::PollState::default(),
+            },
+        });
+
+        // Check events: stale PollDone must be completely discarded
+        app.check_background_events();
+        assert!(
+            app.threads.is_empty(),
+            "Stale thread must NOT be added to threads while logout is in flight"
+        );
+        assert_eq!(
+            app.status, "Đang xóa phiên và dọn dẹp dữ liệu...",
+            "Status must NOT be overwritten by stale poll"
+        );
+        assert!(
+            app.logout_inflight,
+            "logout_inflight must remain true until LogoutDone"
+        );
+
+        // 2. Now send LogoutDone
+        let _ = tx.send(BgEnvelope {
+            stamp: RuntimeStamp::for_session(app.session),
+            event: BgEvent::LogoutDone {
+                owner: "test_owner_tui".into(),
+                result: Ok(()),
+            },
+        });
+
+        app.check_background_events();
+        assert!(
+            !app.logout_inflight,
+            "logout_inflight must be cleared upon LogoutDone"
+        );
+        assert!(
+            app.session.login.is_none(),
+            "Session login credentials must be cleared"
+        );
+        assert_eq!(app.session.account_key(), "");
+        assert_eq!(app.status, "Đã đăng xuất. Bấm 'q' để thoát.");
     }
 }

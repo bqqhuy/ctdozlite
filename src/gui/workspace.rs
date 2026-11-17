@@ -3520,6 +3520,7 @@ impl ZaloGuiApp {
                                                 caption: cap,
                                                 preset_path: None,
                                                 photo_original: self.settings.send_photo_original,
+                                                ephemeral: false,
                                             });
                                         }
                                     }
@@ -3565,6 +3566,7 @@ impl ZaloGuiApp {
                                                 caption: cap,
                                                 preset_path: None,
                                                 photo_original: self.settings.send_photo_original,
+                                                ephemeral: false,
                                             });
                                         }
                                     }
@@ -4060,7 +4062,7 @@ impl ZaloGuiApp {
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
                                                     if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
-                                                    else if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original});}
+                                                    else if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original,ephemeral:false});}
                                                     ui.close_menu();
                                                 }
                                             }
@@ -4123,6 +4125,7 @@ impl ZaloGuiApp {
                                                             caption: cap,
                                                             preset_path: Some(clip_path),
                                                             photo_original: self.settings.send_photo_original,
+                                                            ephemeral: true,
                                                         },
                                                     );
                                                 }
@@ -5914,8 +5917,7 @@ impl ZaloGuiApp {
                             });
                         });
                         ui.add_space(6.0);
-                        let is_e2ee_peer = self.trial_peers.contains(d_id)
-                            || crate::e2ee_integration::is_thread_e2ee(&self.user_uin, d_id);
+                        let is_e2ee_peer = self.trial_peers.contains(d_id);
                         let (summary, is_trusted) = e2ee_security_summary(
                             d_is_group,
                             crate::e2ee_trial::enabled(),
