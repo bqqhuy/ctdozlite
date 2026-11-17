@@ -16,7 +16,7 @@ Không dùng session hoặc database thật, không đăng nhập Zalo, không g
 | `cargo check --all-targets --all-features --locked` | Exit 0 |
 | `cargo clippy --all-targets --all-features --locked -- -D warnings` | Exit 0 |
 | `cargo test --locked --no-fail-fast` | Exit 0; 932 passed, 0 failed, 13 ignored |
-| `cargo test --locked --no-fail-fast --features experimental-e2ee` | Đang chạy; chưa kết luận |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | Exit 0; 935 passed, 0 failed, 13 ignored |
 | `python -I scripts/tests/test_audit_prepush.py` | Exit 0; 4 tests OK |
 | `cargo audit --json` | Exit 0; 0 vulnerability được phân loại, 6 informational warnings |
 
@@ -47,8 +47,8 @@ Nút gửi nằm ngoài clip composer. Đây là kết quả hiện tại trên 
 CI ARM64 tại `14743b6` cũng thất bại cùng smoke, exit 3:
 [run 43913981053](https://github.com/bqqhuy/ctdozlite/actions/runs/43913981053).
 
-CI HEAD [run 43921501480](https://github.com/bqqhuy/ctdozlite/actions/runs/43921501480)
-đang chạy tại lần ghi nhận đầu; phải cập nhật trạng thái thật trước khi kết luận.
+CI snapshot e75e372 [run 43921501480](https://github.com/bqqhuy/ctdozlite/actions/runs/43921501480)
+đã kết thúc **failure**. Đây là snapshot cũ, không phải HEAD f2b5e97 sau sửa.
 Không lấy workflow của upstream `ctdoteam1110` làm bằng chứng cho fork `bqqhuy`.
 
 ## Probe texture sticker
@@ -61,3 +61,32 @@ trong subprocess thử nghiệm. Probe không khởi động app bằng tài kho
 
 Các log đầy đủ ở `local-logs/` được bỏ qua bởi Git theo quy tắc `*.log`; file thực thi,
 PDB và ảnh probe chỉ là artifact local, không dùng làm source sản phẩm.
+
+## Tái kiểm HEAD sau bản vá bên ngoài
+
+Snapshot mới: `f2b5e9736c26dd81f4ea9342eaabf7594dac124c`. Sau fetch,
+local `main...origin/main` vẫn `0 0`. Hai auditor review lại diff, không tái sử dụng
+probe panic của source cũ để nói source mới còn lỗi đó.
+
+| Kiểm tra mới | Kết quả |
+|---|---|
+| `cargo fmt --all -- --check` | Exit 0 |
+| `cargo check --all-targets --all-features --locked` | Exit 0 |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Exit 0 |
+| `cargo test --locked --no-fail-fast` lần đầu | Exit 101 trước khi chạy test: linker LNK1102 out of memory tại `desktop_backup_v2` |
+| `cargo test --locked --no-fail-fast --features experimental-e2ee` | Exit 0; 937 passed, 0 failed, 13 ignored |
+| `cargo test -j 1 --locked --no-fail-fast` retry | Exit 0; 934 passed, 0 failed, 13 ignored |
+| `cargo test -j 1 --locked --no-fail-fast --features experimental-e2ee` | Exit 0; 937 passed, 0 failed, 13 ignored |
+| Smoke local HEAD mới 480×360, scale 1.5, phone-sync | Exit 0; tạo PNG, đã xem ảnh: nút gửi nằm trong composer |
+| CI Windows ARM64 HEAD mới | **Success**, gồm tests, native PE smoke và package |
+
+CI chính xác cho fork và SHA mới:
+[run 43942850530](https://github.com/bqqhuy/ctdozlite/actions/runs/43942850530).
+Job attach release bị skip đúng vì không tạo release. Không dùng CI này để chứng nhận
+micro, Windows Hello hoặc Zalo live. Lỗi linker local là lỗi tài nguyên build;
+không tính là test assertion fail, cũng không tính suite chưa chạy thành pass.
+Ảnh smoke mới nằm ở `local-logs/f2b5-phone-sync.png`; không lấy ảnh/probe lỗi cũ làm
+bằng chứng source mới còn lỗi composer. Smoke chỉ assert điều kiện được kiểm, không
+chứng nhận mọi control hoặc mọi viewport đều hoàn hảo.
+
+Kết quả source và phản biện cuối: [FINAL_CONSENSUS_AUDIT_2026-11-17.md](FINAL_CONSENSUS_AUDIT_2026-11-17.md).
