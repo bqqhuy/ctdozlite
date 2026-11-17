@@ -1071,6 +1071,7 @@ pub struct ZaloGuiApp {
     safety_number_modal: Option<SafetyNumberModalState>,
     trusted_peers: HashSet<String>,
     trial_peers: HashSet<String>,
+    pub(super) reset_e2ee_confirm_peer: Option<String>,
     pending_reaction_actions: HashMap<(String, String), u64>,
     next_reaction_action_id: u64,
     profiles: Vec<crate::profiles::Profile>,
@@ -1383,6 +1384,7 @@ impl ZaloGuiApp {
             safety_number_modal: None,
             trusted_peers: HashSet::new(),
             trial_peers: HashSet::new(),
+            reset_e2ee_confirm_peer: None,
             pending_reaction_actions: HashMap::new(),
             next_reaction_action_id: 0,
             profiles: Vec::new(),
@@ -2052,6 +2054,7 @@ impl ZaloGuiApp {
         self.profiles_requested = false;
         self.trusted_peers.clear();
         self.trial_peers.clear();
+        self.reset_e2ee_confirm_peer = None;
         self.pending_reaction_actions.clear();
         self.safety_number_modal = None;
         self.typing_map.clear();
@@ -4328,13 +4331,16 @@ impl ZaloGuiApp {
                     drop(permit);
                 }
                 GuiEvent::E2eeRequirementResetResult {
-                    owner: _,
+                    owner,
                     peer_id,
                     success,
                 } => {
+                    if owner != self.user_uin {
+                        continue;
+                    }
                     if success {
                         self.trial_peers.remove(&peer_id);
-                        self.show_toast("Đã gỡ yêu cầu E2EE cho hội thoại này");
+                        self.show_toast("Đã gỡ yêu cầu E2EE và khôi phục gửi tin nhắn thường");
                     } else {
                         self.show_toast("Không thể gỡ yêu cầu E2EE: lỗi cập nhật cơ sở dữ liệu");
                     }

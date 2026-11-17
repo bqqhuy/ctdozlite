@@ -711,16 +711,85 @@ fn test_perf_logger_vecdeque_fifo() {
 
 #[test]
 fn test_m05_clipboard_temp_file_account_isolation() {
-    let acc_id = "audit_clipboard_acc_999";
-    let temp_dir = zalo_rust::storage::account_temp_dir(acc_id);
-    let _ = zalo_rust::storage::private_dir(&temp_dir);
-    assert!(temp_dir.exists());
+    let acc_a = "audit_clipboard_acc_aaa";
+    let acc_b = "audit_clipboard_acc_bbb";
 
-    let test_file = temp_dir.join("clipboard_123456.png");
-    std::fs::write(&test_file, b"test-clipboard-bytes").unwrap();
-    assert!(test_file.exists());
+    let temp_dir_a = zalo_rust::storage::account_temp_dir(acc_a);
+    let temp_dir_b = zalo_rust::storage::account_temp_dir(acc_b);
+    let _ = zalo_rust::storage::private_dir(&temp_dir_a);
+    let _ = zalo_rust::storage::private_dir(&temp_dir_b);
 
-    // Clearing account temp cleans up clipboard files
-    zalo_rust::storage::clear_account_temp(acc_id).unwrap();
-    assert!(!test_file.exists());
+    let file_a = temp_dir_a.join("clipboard_111.png");
+    let file_b = temp_dir_b.join("clipboard_222.png");
+    std::fs::write(&file_a, b"clip-a").unwrap();
+    std::fs::write(&file_b, b"clip-b").unwrap();
+
+    assert!(file_a.exists());
+    assert!(file_b.exists());
+
+    // Clearing account A must remove file A but preserve file B intact
+    zalo_rust::storage::clear_account_temp(acc_a).unwrap();
+    assert!(!file_a.exists());
+    assert!(file_b.exists());
+
+    // Clean up B
+    zalo_rust::storage::clear_account_temp(acc_b).unwrap();
+    assert!(!file_b.exists());
+}
+
+#[test]
+fn test_n04_e2ee_reset_drops_both_marker_and_ratchet_session() {
+    let owner = "n04_test_owner_e2ee";
+    let peer = "n04_test_peer_e2ee";
+
+    // Initially plaintext allowed
+    assert!(!zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
+
+    // 1. Remember requirement (marker in DB)
+    zalo_rust::e2ee_integration::remember_e2ee_requirement(owner, peer).unwrap();
+    assert!(zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
+
+    // 2. Also save an active ratchet session for this peer
+    let manager = zalo_rust::e2ee_integration::get_manager(owner).unwrap();
+    let secret = [7u8; 32];
+    let bob_kp = zalo_rust::crypto::ratchet::KeyPair::generate();
+    let ratchet = zalo_rust::crypto::ratchet::RatchetSession::init_as_sender(&secret, &bob_kp.public).unwrap();
+    manager.save_session(peer, &ratchet).unwrap();
+    assert!(manager.load_session(peer).unwrap().is_some());
+    assert!(zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
+
+    // 3. Reset requirement (N-04 fix): drops both marker AND ratchet session
+    zalo_rust::e2ee_integration::remove_e2ee_requirement(owner, peer).unwrap();
+
+    // 4. Verification: neither marker nor session remains; plaintext sending is permitted
+    assert!(!zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
+    assert!(manager.load_session(peer).unwrap().is_none());
+}
+
+#[test]
+fn test_n01_perform_account_logout_clears_credentials_isolated() {
+    let acc_1 = "n01_user_acc_1";
+    let acc_2 = "n01_user_acc_2";
+
+    let acc_dir_1 = zalo_rust::storage::account_dir(acc_1);
+    let acc_dir_2 = zalo_rust::storage::account_dir(acc_2);
+    let _ = zalo_rust::storage::private_dir(&acc_dir_1);
+    let _ = zalo_rust::storage::private_dir(&acc_dir_2);
+
+    let session_file_1 = zalo_rust::storage::account_file(acc_1, "session.dat");
+    let session_file_2 = zalo_rust::storage::account_file(acc_2, "session.dat");
+    std::fs::write(&session_file_1, b"session-token-1").unwrap();
+    std::fs::write(&session_file_2, b"session-token-2").unwrap();
+
+    assert!(session_file_1.exists());
+    assert!(session_file_2.exists());
+
+    // Logout account 1
+    zalo_rust::profiles::perform_account_logout(acc_1).unwrap();
+    assert!(!session_file_1.exists());
+    assert!(session_file_2.exists(), "Account 2 credentials must remain intact");
+
+    // Clean up account 2
+    zalo_rust::profiles::perform_account_logout(acc_2).unwrap();
+    assert!(!session_file_2.exists());
 }

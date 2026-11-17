@@ -98,7 +98,9 @@ pub fn remember_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> 
     })
 }
 
-/// Remove encrypted-message requirement for a direct peer (M-01 recovery path).
+/// Remove encrypted-message requirement for a direct peer (M-01 & N-04 recovery path).
+/// Drops both the `e2ee_required` marker and any active ratchet session, so that
+/// future messages will not be blocked by an existing broken or desynchronized ratchet session.
 pub fn remove_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> {
     anyhow::ensure!(
         !profile_id.is_empty() && !peer_id.is_empty(),
@@ -109,6 +111,11 @@ pub fn remove_e2ee_requirement(profile_id: &str, peer_id: &str) -> Result<()> {
             "DELETE FROM e2ee_required WHERE profile_id=?1 AND peer_id=?2",
             rusqlite::params![profile_id, peer_id],
         )?;
+        let _ = manager.delete_session(peer_id);
+        anyhow::ensure!(
+            !manager.requires_e2ee(peer_id)?,
+            "Chính sách E2EE vẫn còn hiệu lực sau khi xóa yêu cầu"
+        );
         Ok(())
     })
 }

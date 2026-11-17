@@ -5914,10 +5914,12 @@ impl ZaloGuiApp {
                             });
                         });
                         ui.add_space(6.0);
+                        let is_e2ee_peer = self.trial_peers.contains(d_id)
+                            || crate::e2ee_integration::is_thread_e2ee(&self.user_uin, d_id);
                         let (summary, is_trusted) = e2ee_security_summary(
                             d_is_group,
                             crate::e2ee_trial::enabled(),
-                            self.trial_peers.contains(d_id),
+                            is_e2ee_peer,
                             self.trusted_peers.contains(d_id),
                         );
                         ui.label(RichText::new(summary).size(11.5).color(if is_trusted {
@@ -5925,31 +5927,57 @@ impl ZaloGuiApp {
                         } else {
                             pal.text_secondary
                         }));
-                        if !d_is_group && self.trial_peers.contains(d_id) {
+                        if !d_is_group && is_e2ee_peer {
                             ui.add_space(4.0);
-                            let reset_btn = egui::Button::new(
-                                RichText::new("Gỡ yêu cầu E2EE")
-                                    .size(11.5)
-                                    .color(pal.text_primary),
-                            )
-                            .rounding(Rounding::same(4.0));
-                            if ui
-                                .add(reset_btn)
-                                .on_hover_text(
-                                    "Xóa trạng thái bắt buộc E2EE để khôi phục gửi tin nhắn thường",
-                                )
-                                .clicked()
-                            {
-                                if let Some(tx) = WORKER_TX.get() {
-                                    if tx
-                                        .send(WorkerCmd::ResetE2eeRequirement {
-                                            owner: self.user_uin.clone(),
-                                            peer_id: d_id.to_string(),
-                                        })
-                                        .is_ok()
-                                    {
-                                        self.show_toast("Đang gỡ yêu cầu E2EE…");
+                            if self.reset_e2ee_confirm_peer.as_deref() == Some(d_id) {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("Xác nhận gỡ E2EE?")
+                                            .size(11.0)
+                                            .color(pal.danger),
+                                    );
+                                    let ok_btn = egui::Button::new(
+                                        RichText::new("Đồng ý").size(11.0).color(pal.text_primary),
+                                    )
+                                    .fill(pal.danger.linear_multiply(0.2))
+                                    .rounding(Rounding::same(3.0));
+                                    if ui.add(ok_btn).clicked() {
+                                        self.reset_e2ee_confirm_peer = None;
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            if tx
+                                                .send(WorkerCmd::ResetE2eeRequirement {
+                                                    owner: self.user_uin.clone(),
+                                                    peer_id: d_id.to_string(),
+                                                })
+                                                .is_ok()
+                                            {
+                                                self.show_toast("Đang gỡ yêu cầu E2EE…");
+                                            }
+                                        }
                                     }
+                                    let cancel_btn = egui::Button::new(
+                                        RichText::new("Hủy").size(11.0).color(pal.text_secondary),
+                                    )
+                                    .rounding(Rounding::same(3.0));
+                                    if ui.add(cancel_btn).clicked() {
+                                        self.reset_e2ee_confirm_peer = None;
+                                    }
+                                });
+                            } else {
+                                let reset_btn = egui::Button::new(
+                                    RichText::new("Gỡ yêu cầu E2EE")
+                                        .size(11.5)
+                                        .color(pal.text_primary),
+                                )
+                                .rounding(Rounding::same(4.0));
+                                if ui
+                                    .add(reset_btn)
+                                    .on_hover_text(
+                                        "Xóa trạng thái bắt buộc E2EE để khôi phục gửi tin nhắn thường",
+                                    )
+                                    .clicked()
+                                {
+                                    self.reset_e2ee_confirm_peer = Some(d_id.to_string());
                                 }
                             }
                         }

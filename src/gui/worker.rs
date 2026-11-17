@@ -1570,21 +1570,24 @@ pub(super) fn spawn_session_worker(
                             let account = session.lock().await.clone();
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
-                            tokio::task::spawn_blocking(move || {
-                                let success = if account.is_active() && !owner.is_empty() && account.account_key() == owner {
-                                    let ok = crate::e2ee_integration::remove_e2ee_requirement(&owner, &peer_id).is_ok();
-                                    crate::logger::log_error("e2ee_requirement_reset", &format!("owner={owner} peer={peer_id} success={ok}"));
+                            let owner_for_task = owner.clone();
+                            let peer_for_task = peer_id.clone();
+                            let join = tokio::task::spawn_blocking(move || {
+                                if account.is_active() && !owner_for_task.is_empty() && account.account_key() == owner_for_task {
+                                    let ok = crate::e2ee_integration::remove_e2ee_requirement(&owner_for_task, &peer_for_task).is_ok();
+                                    crate::logger::log_error("e2ee_requirement_reset", &format!("owner={owner_for_task} peer={peer_for_task} success={ok}"));
                                     ok
                                 } else {
                                     false
-                                };
-                                let _ = tx.send(GuiEvent::E2eeRequirementResetResult {
-                                    owner,
-                                    peer_id,
-                                    success,
-                                });
-                                ctx.request_repaint();
-                            }).await.ok();
+                                }
+                            }).await;
+                            let success = join.unwrap_or(false);
+                            let _ = tx.send(GuiEvent::E2eeRequirementResetResult {
+                                owner,
+                                peer_id,
+                                success,
+                            });
+                            ctx.request_repaint();
                         }
                         WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
                             let account = session.lock().await.clone();

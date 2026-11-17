@@ -164,6 +164,10 @@ enum BgEvent {
     ActionFailed(String),
     StoreFailed(String),
     StoreSaved,
+    LogoutDone {
+        owner: String,
+        result: std::result::Result<(), String>,
+    },
 }
 
 enum SendDisposition {
@@ -805,6 +809,7 @@ pub struct TuiApp<'a> {
     confirm: Option<ConfirmAction>,
     poll_inflight: bool,
     delete_inflight: bool,
+    logout_inflight: bool,
     critical_inflight: Arc<AtomicUsize>,
     bg_rx: Receiver<BgEnvelope>,
     bg_tx: Sender<BgEnvelope>,
@@ -866,6 +871,7 @@ impl<'a> TuiApp<'a> {
             confirm: None,
             poll_inflight: false,
             delete_inflight: false,
+            logout_inflight: false,
             critical_inflight: Arc::new(AtomicUsize::new(0)),
             bg_rx: rx,
             bg_tx: tx,
@@ -1874,6 +1880,10 @@ impl<'a> TuiApp<'a> {
     fn run_confirm(&mut self, action: ConfirmAction) {
         match action.kind {
             ConfirmKind::Logout => {
+                if self.logout_inflight {
+                    self.status = "Đang xử lý đăng xuất; vui lòng đợi...".into();
+                    return;
+                }
                 // An acknowledged delete must commit its tombstone under this runtime;
                 // revoking it now would let the message reappear after next login.
                 if self.critical_inflight.load(Ordering::Acquire) > 0 {
@@ -1882,17 +1892,9 @@ impl<'a> TuiApp<'a> {
                     return;
                 }
                 let owner = self.session.account_key().to_owned();
-                std::thread::spawn(move || {
-                    if let Err(e) = crate::profiles::perform_account_logout(&owner) {
-                        crate::logger::log_error(
-                            "tui logout",
-                            &format!("Không thể xóa phiên: {e}"),
-                        );
-                    }
-                });
+                self.logout_inflight = true;
                 self.session.hidden.lock();
                 self.clear_private_draft();
-                self.session.logout();
                 self.pending_snapshot = None;
                 self.poll_inflight = false;
                 self.delete_inflight = false;
@@ -1902,7 +1904,16 @@ impl<'a> TuiApp<'a> {
                 self.unread.clear();
                 self.selected_thread = 0;
                 self.selected_msg = None;
-                self.status = "Da dang xuat. Bam 'q' de thoat.".into();
+                self.status = "Đang xóa phiên và dọn dẹp dữ liệu...".into();
+
+                let sender = self.bg_sender();
+                let critical = self.critical_task();
+                std::thread::spawn(move || {
+                    let _critical = critical;
+                    let result = crate::profiles::perform_account_logout(&owner)
+                        .map_err(|e| format!("{e}"));
+                    let _ = sender.send(BgEvent::LogoutDone { owner, result });
+                });
             }
             ConfirmKind::DeleteMessage => {
                 if self.delete_inflight {
@@ -2617,6 +2628,22 @@ impl<'a> TuiApp<'a> {
                 BgEvent::StoreSaved => {
                     if self.status == "Đang chờ lưu lịch sử cục bộ" {
                         self.status = "Đã lưu lịch sử cục bộ".into();
+                    }
+                }
+                BgEvent::LogoutDone { owner, result } => {
+                    if owner != self.session.account_key() {
+                        continue;
+                    }
+                    self.logout_inflight = false;
+                    match result {
+                        Ok(()) => {
+                            self.session.logout();
+                            self.status = "Đã đăng xuất. Bấm 'q' để thoát.".into();
+                        }
+                        Err(e) => {
+                            self.status = format!("Không thể xóa phiên: {e}. Bấm 'q' để thoát.");
+                            crate::logger::log_error("tui logout", &format!("Lỗi xóa phiên: {e}"));
+                        }
                     }
                 }
                 BgEvent::StickerPacks(packs) => {
@@ -4251,6 +4278,7 @@ mod tests {
             confirm: None,
             poll_inflight: false,
             delete_inflight: false,
+            logout_inflight: false,
             critical_inflight: Arc::new(AtomicUsize::new(0)),
             bg_rx: rx,
             bg_tx: tx,
