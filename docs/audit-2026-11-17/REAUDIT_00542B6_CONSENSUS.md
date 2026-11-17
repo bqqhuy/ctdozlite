@@ -4,8 +4,8 @@ Ngày 17/11/2026. Snapshot: `main` @ `00542b68272496087f505443b4c4804bc93a2b38`
 (= `origin/main`). Phạm vi diff: `f2b5e97..00542b6` (`50c1a4b`, `00542b6`).
 Nguồn: [REAUDIT_00542B6_PRO_A.md](REAUDIT_00542B6_PRO_A.md),
 [REAUDIT_00542B6_PRO_B.md](REAUDIT_00542B6_PRO_B.md). Agent chính (Claude Code,
-tiếp quản lượt Codex dang dở) đã tự đọc lại source cho mọi finding P1/P2 và chạy
-lại gate trong data root tổng hợp.
+tiếp quản lượt Codex dang dở) đã tự đọc lại source cho mọi finding P1/P2. Lượt
+gate local tại snapshot này không hợp lệ (xem mục Gate).
 
 ## Kết luận
 
@@ -58,7 +58,11 @@ gốc của người dùng. Không release từ `00542b6` cho đến khi P1 đư
 
 ## Gate tại `00542b6`
 
-Xem [VERIFICATION.md](VERIFICATION.md) mục "Tái kiểm `00542b6`".
+Gate local không hợp lệ: một agent khác sửa source trong cùng working tree lúc
+gate chạy, nên clippy/test lỗi compile trên code đang dở, không phải `00542b6`.
+CI Windows ARM64 tại `00542b6` success. Chi tiết và gate hợp lệ tại `339578e`:
+[VERIFICATION.md](VERIFICATION.md) mục "Tái kiểm `00542b6` và `339578e`".
+Kết quả sửa R01–R08: [REAUDIT_339578E.md](REAUDIT_339578E.md).
 
 ## Giới hạn
 

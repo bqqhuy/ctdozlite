@@ -90,3 +90,29 @@ bằng chứng source mới còn lỗi composer. Smoke chỉ assert điều ki�
 chứng nhận mọi control hoặc mọi viewport đều hoàn hảo.
 
 Kết quả source và phản biện cuối: [FINAL_CONSENSUS_AUDIT_2026-11-17.md](FINAL_CONSENSUS_AUDIT_2026-11-17.md).
+
+## Tái kiểm `00542b6` và `339578e`
+
+Máy Windows x64. Mỗi suite dùng `CTDOZ_DATA_DIR` tạm mới,
+`CTDOZ_ALLOW_TEST_LOOPBACK=1`, `CMAKE_POLICY_VERSION_MINIMUM=3.5`.
+
+**`00542b6`:** lượt gate local đầu tiên **không hợp lệ**. Trong lúc chạy, một agent
+khác đang sửa source trong cùng working tree (6 file, sau này thành `e7d0ed4`).
+Clippy và hai suite test lỗi compile E0382 ở `src/gui/worker.rs:5713` của code đang
+sửa dở, không phải của `00542b6`. Chỉ `cargo fmt --check` và test Python (exit 0)
+được ghi nhận. CI Windows ARM64 tại `00542b6`: **success**
+([run 43989277111](https://github.com/bqqhuy/ctdozlite/actions/runs/43989277111)).
+
+**`339578e`** (working tree sạch, `= origin/main`):
+
+| Kiểm tra | Kết quả |
+|---|---|
+| `cargo fmt --all -- --check` | Exit 0 |
+| `cargo clippy --all-targets --all-features --locked -- -D warnings` | Exit 0 |
+| `cargo test -j 2 --locked --no-fail-fast` | Exit 0; 939 passed, 0 failed, 13 ignored |
+| `cargo test -j 2 --locked --no-fail-fast --features experimental-e2ee` | Exit 0; 942 passed, 0 failed, 13 ignored |
+| `python -I scripts/tests/test_audit_prepush.py` | Exit 0; 4 tests OK |
+| CI Windows ARM64 | **Success** ([run 43996813687](https://github.com/bqqhuy/ctdozlite/actions/runs/43996813687)) |
+
+Không chạy `cargo audit` và smoke bố cục ở lượt này. Kết quả source:
+[REAUDIT_339578E.md](REAUDIT_339578E.md).
