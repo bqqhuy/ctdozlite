@@ -197,6 +197,66 @@ pub fn prune_old_temp_files(dir: &Path, max_age: std::time::Duration) -> Result<
     Ok(())
 }
 
+/// Prune `media-cache` preview directory if total size exceeds budget (e.g. 128 MiB).
+/// Evicts least recently modified files first (N-02).
+pub fn prune_preview_cache(budget_bytes: u64) -> Result<()> {
+    let dir = cache_dir();
+    if !dir.exists() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+    for entry in fs::read_dir(&dir)?.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() {
+                let len = meta.len();
+                total_bytes = total_bytes.saturating_add(len);
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                files.push((entry.path(), len, mtime));
+            }
+        }
+    }
+    if total_bytes > budget_bytes {
+        files.sort_by_key(|(_, _, mtime)| *mtime);
+        for (path, len, _) in files {
+            if total_bytes <= budget_bytes {
+                break;
+            }
+            if fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(len);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Sweep startup orphan temporary files across root temp, legacy cache, and active account temp directories (N-03).
+pub fn sweep_orphan_temp_files(active_owner: Option<&str>) {
+    let max_age = std::time::Duration::from_secs(3600); // 1 hour
+    let _ = prune_old_temp_files(&root().join("temp"), max_age);
+    if let Some(owner) = active_owner.filter(|s| !s.is_empty()) {
+        let _ = prune_old_temp_files(&account_temp_dir(owner), max_age);
+    }
+    let cache_dir = cache_dir();
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("clipboard_") && name_str.ends_with(".png") {
+                if let Ok(meta) = entry.metadata() {
+                    if let Ok(mod_time) = meta.modified() {
+                        if now.duration_since(mod_time).unwrap_or_default() > max_age {
+                            let _ = fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = prune_preview_cache(128 * 1024 * 1024);
+}
+
 pub fn session_path(path: &str) -> PathBuf {
     if path == "session.json" {
         root().join("session.dat")

@@ -245,7 +245,7 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .filter(|t| t.is_group || (!cloud.is_empty() && t.id == cloud))
         .count();
     let skipped = threads.len() - total;
-    let mut store = MessageStore::open(session.history_path())?;
+    let hist_path = session.history_path();
     let mut inserted = 0;
     let mut downloaded_pages = 0;
     let mut failed = 0;
@@ -260,14 +260,22 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
             continue;
         }
         thread.messages.clear();
-        let checkpoint: Option<String> = store
-            .conn
-            .query_row(
-                "SELECT cursor FROM history_sync WHERE thread_id=?1",
-                [&thread.id],
-                |row| row.get(0),
-            )
-            .ok();
+        let hp_read = hist_path.clone();
+        let tid_read = thread.id.clone();
+        let checkpoint: Option<String> = tokio::task::spawn_blocking(move || {
+            let store = MessageStore::open(&hp_read).ok()?;
+            store
+                .conn
+                .query_row(
+                    "SELECT cursor FROM history_sync WHERE thread_id=?1",
+                    [&tid_read],
+                    |row| row.get(0),
+                )
+                .ok()
+        })
+        .await
+        .ok()
+        .flatten();
         let mut checkpoint = HistoryCheckpoint::decode(checkpoint.as_deref());
         let (mut cursor, mut old) = checkpoint.start();
         for page in 0..200 {
@@ -299,20 +307,32 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 }
                 thread.messages.clear();
                 crate::chat::merge_group_history_with_profile(&mut thread, &response, Some(session.account_key()));
-                inserted += crate::store::persist_threads(&mut store, std::slice::from_ref(&thread))?;
                 let updated = checkpoint.advance(&metadata, &thread.messages);
                 let next = updated.as_ref().and_then(|state| state.next.clone());
-                // Persist data before progress. Completed history only needs the new prefix;
-                // unfinished history keeps both its cursor and stopping boundary on restart.
+
+                // Offload SQLite store operations to blocking threadpool to free Tokio network executor (N-05)
+                let hp_write = hist_path.clone();
+                let mut thread_to_save = thread.clone();
+                let updated_to_save = updated.clone();
+                let (count, filtered_thread) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Thread)> {
+                    let mut store = MessageStore::open(&hp_write)?;
+                    let ins = crate::store::persist_threads(&mut store, std::slice::from_ref(&thread_to_save))?;
+                    if let Some(ref upd) = updated_to_save {
+                        store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
+                            rusqlite::params![thread_to_save.id, serde_json::to_string(upd)?])?;
+                    }
+                    store.filter_deleted(std::slice::from_mut(&mut thread_to_save))?;
+                    Ok((ins, thread_to_save))
+                }).await??;
+
+                inserted += count;
+                thread = filtered_thread;
                 if let Some(updated) = updated {
-                    store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
-                        rusqlite::params![thread.id, serde_json::to_string(&updated)?])?;
                     checkpoint = updated;
                 }
                 if !metadata.filtered && memo.forget(&thread.id) {
                     memo_changed = true;
                 }
-                store.filter_deleted(std::slice::from_mut(&mut thread))?;
                 page_ready(thread.clone());
                 if metadata.filtered {
                     filtered += 1;

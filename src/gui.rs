@@ -1552,6 +1552,11 @@ impl ZaloGuiApp {
             account_switcher: account_switcher::AccountSwitcher::default(),
         };
 
+        let startup_owner = app.user_uin.clone();
+        std::thread::spawn(move || {
+            crate::storage::sweep_orphan_temp_files(Some(&startup_owner));
+        });
+
         if !bootstrap {
             return app;
         }
@@ -2505,6 +2510,11 @@ impl ZaloGuiApp {
                     image,
                 } => {
                     if owner != self.user_uin {
+                        if let Some((path, ..)) = image {
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_file(path);
+                            });
+                        }
                         continue;
                     }
                     self.clipboard_read_pending = false;
@@ -2513,6 +2523,11 @@ impl ZaloGuiApp {
                         .get(self.selected_thread_index)
                         .is_some_and(|t| t.id == thread)
                     {
+                        if let Some((path, ..)) = image {
+                            std::thread::spawn(move || {
+                                let _ = std::fs::remove_file(path);
+                            });
+                        }
                         self.clipboard_text_fallback = None;
                         continue;
                     }

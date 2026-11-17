@@ -753,7 +753,9 @@ fn test_n04_e2ee_reset_drops_both_marker_and_ratchet_session() {
     let manager = zalo_rust::e2ee_integration::get_manager(owner).unwrap();
     let secret = [7u8; 32];
     let bob_kp = zalo_rust::crypto::ratchet::KeyPair::generate();
-    let ratchet = zalo_rust::crypto::ratchet::RatchetSession::init_as_sender(&secret, &bob_kp.public).unwrap();
+    let ratchet =
+        zalo_rust::crypto::ratchet::RatchetSession::init_as_sender(&secret, &bob_kp.public)
+            .unwrap();
     manager.save_session(peer, &ratchet).unwrap();
     assert!(manager.load_session(peer).unwrap().is_some());
     assert!(zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
@@ -787,7 +789,10 @@ fn test_n01_perform_account_logout_clears_credentials_isolated() {
     // Logout account 1
     zalo_rust::profiles::perform_account_logout(acc_1).unwrap();
     assert!(!session_file_1.exists());
-    assert!(session_file_2.exists(), "Account 2 credentials must remain intact");
+    assert!(
+        session_file_2.exists(),
+        "Account 2 credentials must remain intact"
+    );
 
     // Clean up account 2
     zalo_rust::profiles::perform_account_logout(acc_2).unwrap();

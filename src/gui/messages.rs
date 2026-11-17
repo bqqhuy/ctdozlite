@@ -46,10 +46,9 @@ pub(super) fn render_sticker_widget(
         crate::endpoints::legacy_sticker_image(sid)
     };
 
-    if media_near_viewport(ui, 128.0)
-        && !sticker_textures.contains_key(&key)
-        && loading_stickers.insert(key.clone())
-    {
+    let needs_sprite =
+        !sticker_textures.contains_key(&key) || (animated && !sticker_sprites.contains_key(&key));
+    if media_near_viewport(ui, 128.0) && needs_sprite && loading_stickers.insert(key.clone()) {
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::FetchStickerImage {
                 key: key.clone(),

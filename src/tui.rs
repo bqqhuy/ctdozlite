@@ -1910,8 +1910,8 @@ impl<'a> TuiApp<'a> {
                 let critical = self.critical_task();
                 std::thread::spawn(move || {
                     let _critical = critical;
-                    let result = crate::profiles::perform_account_logout(&owner)
-                        .map_err(|e| format!("{e}"));
+                    let result =
+                        crate::profiles::perform_account_logout(&owner).map_err(|e| format!("{e}"));
                     let _ = sender.send(BgEvent::LogoutDone { owner, result });
                 });
             }

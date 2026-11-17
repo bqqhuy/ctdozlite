@@ -781,12 +781,15 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
             }
         }
 
-        // Check local disk cache first before hitting network
+        // Check local disk cache first before hitting network (N-02)
+        // Sprite atlas is disambiguated as {key}_sprite.png to avoid colliding with static {key}.png thumbnails
         let cache_dir = crate::storage::cache_dir();
-        let cache_path = cache_dir.join(format!("{key}.png"));
-        let cached_path_read = cache_path.clone();
+        let sprite_cache_path = cache_dir.join(format!("{key}_sprite.png"));
+        let thumb_cache_path = cache_dir.join(format!("{key}.png"));
+
+        let cached_sprite_read = sprite_cache_path.clone();
         if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
-            crate::limits::read_file(&cached_path_read, crate::limits::IMAGE_BYTES)
+            crate::limits::read_file(&cached_sprite_read, crate::limits::IMAGE_BYTES)
         })
         .await
         {
@@ -798,6 +801,27 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
             }
         }
 
+        let cached_thumb_read = thumb_cache_path.clone();
+        if let Ok(Ok(bytes)) = tokio::task::spawn_blocking(move || {
+            crate::limits::read_file(&cached_thumb_read, crate::limits::IMAGE_BYTES)
+        })
+        .await
+        {
+            let bytes_clone = bytes.clone();
+            if let Ok(Ok(sprite)) =
+                tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await
+            {
+                if sprite.frames > 1 {
+                    let save_path = sprite_cache_path.clone();
+                    let save_bytes = bytes.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = crate::storage::atomic_write(&save_path, &save_bytes);
+                    });
+                    return Ok(sprite);
+                }
+            }
+        }
+
         if cid == 0 && (1..=30).contains(&sid) {
             let primary = crate::endpoints::builtin_sticker_thumbnail(sid);
             if let Ok(bytes) = download_sticker_image_bytes(&primary).await {
@@ -806,7 +830,15 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
                     tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone))
                         .await
                 {
-                    let _ = crate::storage::atomic_write(&cache_path, &bytes);
+                    let save_path = if sprite.frames > 1 {
+                        sprite_cache_path.clone()
+                    } else {
+                        thumb_cache_path.clone()
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        let _ = crate::storage::atomic_write(&save_path, &bytes);
+                        let _ = crate::storage::prune_preview_cache(128 * 1024 * 1024);
+                    });
                     return Ok(sprite);
                 }
             }
@@ -820,7 +852,15 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
             let sprite =
                 tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone))
                     .await??;
-            let _ = crate::storage::atomic_write(&cache_path, &bytes);
+            let save_path = if sprite.frames > 1 {
+                sprite_cache_path.clone()
+            } else {
+                thumb_cache_path.clone()
+            };
+            tokio::task::spawn_blocking(move || {
+                let _ = crate::storage::atomic_write(&save_path, &bytes);
+                let _ = crate::storage::prune_preview_cache(128 * 1024 * 1024);
+            });
             return Ok(sprite);
         }
 
@@ -831,7 +871,11 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
             if let Ok(Ok(sprite)) =
                 tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await
             {
-                let _ = crate::storage::atomic_write(&cache_path, &bytes);
+                let save_path = sprite_cache_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ = crate::storage::atomic_write(&save_path, &bytes);
+                    let _ = crate::storage::prune_preview_cache(128 * 1024 * 1024);
+                });
                 return Ok(sprite);
             }
         }
@@ -846,7 +890,15 @@ pub(super) async fn fetch_and_decode_sticker_sprite(
         let bytes_clone = bytes.clone();
         let sprite =
             tokio::task::spawn_blocking(move || decode_sprite_from_bytes(&bytes_clone)).await??;
-        let _ = crate::storage::atomic_write(&cache_path, &bytes);
+        let save_path = if sprite.frames > 1 {
+            sprite_cache_path.clone()
+        } else {
+            thumb_cache_path.clone()
+        };
+        tokio::task::spawn_blocking(move || {
+            let _ = crate::storage::atomic_write(&save_path, &bytes);
+            let _ = crate::storage::prune_preview_cache(128 * 1024 * 1024);
+        });
         return Ok(sprite);
     }
 
@@ -2087,7 +2139,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let image = tokio::task::spawn_blocking(move || {
                                     super::messages::read_clipboard_image_to_png(Some(&owner_for_read))
                                 }).await.ok().flatten();
-                                if account.is_active(){let _ = tx.send(GuiEvent::ClipboardImageRead{owner,thread,image});ctx.request_repaint();}
+                                if account.is_active() {
+                                    let _ = tx.send(GuiEvent::ClipboardImageRead{owner,thread,image});
+                                    ctx.request_repaint();
+                                } else if let Some((path, ..)) = image {
+                                    let _ = tokio::fs::remove_file(path).await;
+                                }
                             });
                         }
                         WorkerCmd::SetConversationPreference { owner, thread_id, is_group, value } => {
@@ -2503,9 +2560,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                                 &mut s, data,
                                                             );
                                                         }
-                                                        if let Err(e) = s.save_to_file("session.json") {
-                                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
-                                                        }
+                                                        let s_save = s.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            if let Err(e) = s_save.save_to_file("session.json") {
+                                                                crate::logger::log_error("qr login", &format!("Không thể lưu phiên: {e}"));
+                                                            }
+                                                        });
 
                                                         if let Ok(info) =
                                                             crate::login::get_login_info(&s).await
@@ -2518,9 +2578,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                             }
                                                         }
                                                         let _ = s.sync_profile_me().await;
-                                                        if let Err(e) = s.save_to_file("session.json") {
-                                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!("Không thể lưu phiên: {e}")));
-                                                        }
+                                                        let s_save2 = s.clone();
+                                                        tokio::task::spawn_blocking(move || {
+                                                            if let Err(e) = s_save2.save_to_file("session.json") {
+                                                                crate::logger::log_error("qr login", &format!("Không thể lưu phiên: {e}"));
+                                                            }
+                                                        });
 
                                                         let uin = s
                                                             .login
