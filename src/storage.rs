@@ -19,6 +19,16 @@ fn default_root() -> Result<PathBuf> {
         );
         return Ok(path);
     }
+    // Safety guard: Under tests, NEVER fall back to live user data directories if CTDOZ_DATA_DIR is missing!
+    let is_test = cfg!(test)
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some()
+        || std::env::args().any(|a| a == "--test" || a.contains("test"));
+    if is_test {
+        let fallback = std::env::temp_dir().join(format!("ctdoz_test_data_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&fallback);
+        return Ok(fallback);
+    }
     #[cfg(windows)]
     return Ok(PathBuf::from(
         std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is unavailable")?,

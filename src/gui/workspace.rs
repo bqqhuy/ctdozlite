@@ -1881,6 +1881,9 @@ impl ZaloGuiApp {
                                             self.info_drawer_open = !self.info_drawer_open;
                                             self.settings.info_drawer_open=self.info_drawer_open;
                                             if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PersistInfoDrawer{owner:self.user_uin.clone(),open:self.info_drawer_open});}
+                                            if self.info_drawer_open && !is_group && !self.trial_peers.contains(&thread_id) {
+                                                if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::CheckE2eeStatus{owner:self.user_uin.clone(),peer_id:thread_id.clone()});}
+                                            }
                                         }
                                     }
 
@@ -4243,6 +4246,13 @@ impl ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchGroupPolicy {
                     group_id: tid.clone(),
+                });
+            }
+        } else if !self.trial_peers.contains(&tid) {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::CheckE2eeStatus {
+                    owner: self.user_uin.clone(),
+                    peer_id: tid.clone(),
                 });
             }
         }

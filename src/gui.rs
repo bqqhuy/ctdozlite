@@ -356,6 +356,10 @@ pub enum GuiEvent {
         owner: String,
         peers: Vec<String>,
     },
+    E2eePeerRequired {
+        owner: String,
+        peer_id: String,
+    },
     ThreadsUpdated {
         threads: Vec<Thread>,
         source: ThreadUpdateSource,
@@ -2341,6 +2345,11 @@ impl ZaloGuiApp {
                         self.trial_peers.extend(peers);
                     }
                 }
+                GuiEvent::E2eePeerRequired { owner, peer_id } => {
+                    if owner == self.user_uin {
+                        self.trial_peers.insert(peer_id);
+                    }
+                }
                 GuiEvent::SafetyNumberFailed {
                     owner,
                     peer_id,
@@ -2668,6 +2677,9 @@ impl ZaloGuiApp {
                     source,
                 } => {
                     for thread in &updates {
+                        if !thread.is_group && thread.messages.iter().any(|m| m.is_e2ee) {
+                            self.trial_peers.insert(thread.id.clone());
+                        }
                         if thread
                             .messages
                             .iter()
@@ -4329,6 +4341,12 @@ impl ZaloGuiApp {
                     self.loading_stickers.remove(&key);
                     self.image_retry_at.remove(&key);
                     self.image_failures.remove(&key);
+                    if let Some(spec) = self.sticker_sprites.get(&key) {
+                        if spec.frames > 1 {
+                            // Multi-frame atlas is already active; do not downgrade or squish
+                            continue;
+                        }
+                    }
                     self.store_texture(ctx, key, image);
                 }
                 GuiEvent::StickerSpriteReady {

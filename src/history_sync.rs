@@ -82,7 +82,7 @@ const FILTERED_LIMIT: usize = 1024 * 1024;
 /// This only avoids repeating calls that just returned nothing; it never marks history
 /// complete. A different login session, expiry or a manual retry ignores it, and a missing
 /// or damaged file reads as empty.
-#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FilteredMemo {
     /// Irreversible tag of the login session that observed the limits.
     session: u64,
@@ -224,13 +224,21 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .history_path()
         .with_extension("server-filtered.json");
     let now = now_ms();
+    let memo_path_load = memo_path.clone();
+    let tag = session_tag(session);
+    let tag_for_fallback = tag;
     let mut memo = if retry_filtered {
         FilteredMemo {
-            session: session_tag(session),
+            session: tag,
             until: Default::default(),
         }
     } else {
-        FilteredMemo::load(&memo_path, session_tag(session))
+        tokio::task::spawn_blocking(move || FilteredMemo::load(&memo_path_load, tag))
+            .await
+            .unwrap_or_else(|_| FilteredMemo {
+                session: tag_for_fallback,
+                until: Default::default(),
+            })
     };
     memo.prune(now);
     let mut memo_changed = retry_filtered;
@@ -281,7 +289,9 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         for page in 0..200 {
             if canceled.load(Ordering::Relaxed) || !session.is_active() {
                 if memo_changed && session.is_active() {
-                    let _ = memo.save(&memo_path);
+                    let path_save = memo_path.clone();
+                    let memo_copy = memo.clone();
+                    let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save)).await;
                 }
                 return Ok(format!(
                     "Đã dừng; lưu {inserted} tin mới và vị trí tiếp tục"
@@ -351,7 +361,10 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 Err(e) => {
                     if e.to_string().contains("429") {
                         if memo_changed {
-                            let _ = memo.save(&memo_path);
+                            let path_save = memo_path.clone();
+                            let memo_copy = memo.clone();
+                            let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save))
+                                .await;
                         }
                         return Ok(format!("Máy chủ giới hạn tốc độ; đã lưu {inserted} tin mới. Thử đồng bộ lại sau; vị trí tiếp tục được giữ."));
                     }
@@ -374,7 +387,9 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
     }
     if memo_changed && session.is_active() {
         // Best effort: losing the memo only means asking the server again next time.
-        let _ = memo.save(&memo_path);
+        let path_save = memo_path.clone();
+        let memo_copy = memo.clone();
+        let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save)).await;
     }
     let remembered = if remembered > 0 {
         format!(" {remembered} hội thoại vừa bị giới hạn trong 24 giờ qua được bỏ qua (bấm \"Thử lại hội thoại bị giới hạn\" để hỏi lại).")

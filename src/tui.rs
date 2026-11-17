@@ -1284,7 +1284,7 @@ impl<'a> TuiApp<'a> {
     }
 
     fn spawn_poll(&mut self) {
-        if self.poll_inflight || self.session.login.is_none() {
+        if self.poll_inflight || self.logout_inflight || self.session.login.is_none() {
             return;
         }
         self.poll_inflight = true;

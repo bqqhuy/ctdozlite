@@ -849,3 +849,29 @@ fn test_n04_list_e2ee_peers_hydrates_from_db_without_ui_thread_locks() {
     assert!(!remaining.contains(&peer_1.to_string()));
     assert!(!remaining.contains(&peer_2.to_string()));
 }
+
+#[test]
+fn test_n06_e2ee_status_detection_and_peer_requirement() {
+    let owner = "test_n06_owner";
+    let peer = "peer_n06_incoming";
+
+    // 1. Initial state: not required
+    assert!(!zalo_rust::e2ee_integration::check_thread_e2ee(owner, peer).unwrap());
+
+    // 2. Remember requirement (as happens when incoming E2EE message arrives)
+    zalo_rust::e2ee_integration::remember_e2ee_requirement(owner, peer).unwrap();
+
+    // 3. Verify is_thread_e2ee immediately detects it
+    assert!(zalo_rust::e2ee_integration::is_thread_e2ee(owner, peer));
+
+    // 4. Verify list_e2ee_peers includes it
+    let peers = zalo_rust::e2ee_integration::list_e2ee_peers(owner);
+    assert!(
+        peers.contains(&peer.to_string()),
+        "list_e2ee_peers must include newly marked peer"
+    );
+
+    // Clean up
+    zalo_rust::e2ee_integration::remove_e2ee_requirement(owner, peer).unwrap();
+    assert!(!zalo_rust::e2ee_integration::is_thread_e2ee(owner, peer));
+}

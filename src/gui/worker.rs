@@ -295,6 +295,10 @@ pub enum WorkerCmd {
         peer_id: String,
         safety_number: String,
     },
+    CheckE2eeStatus {
+        owner: String,
+        peer_id: String,
+    },
     PreviewDocument {
         url: String,
         name: String,
@@ -663,20 +667,56 @@ fn preload_disk_sticker_inner(
     let mut missing = Vec::new();
     for item in items.iter().take(limit) {
         let key = format!("stk_{}_{}", item.cate_id, item.sticker_id);
-        let cache_path = cache_dir.join(format!("{key}.png"));
-        if let Ok(disk_bytes) = crate::limits::read_file(&cache_path, crate::limits::IMAGE_BYTES) {
-            if let Ok(dyn_img) = crate::limits::decode_image(&disk_bytes) {
-                let rgba = dyn_img.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let pixels = rgba.as_flat_samples();
-                let color_img = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                let _ = gui_tx.send(GuiEvent::StickerImageReady {
-                    key,
-                    image: color_img,
-                });
-                continue;
+        let sprite_path = cache_dir.join(format!("{key}_sprite.png"));
+        let thumb_path = cache_dir.join(format!("{key}.png"));
+
+        // 1. Check sprite cache first
+        let loaded = if let Ok(disk_bytes) =
+            crate::limits::read_file(&sprite_path, crate::limits::IMAGE_BYTES)
+        {
+            if let Ok(sprite) = decode_sprite_from_bytes(&disk_bytes) {
+                if sprite.frames > 1 {
+                    let _ = gui_tx.send(GuiEvent::StickerSpriteReady {
+                        key: key.clone(),
+                        sprite,
+                        permit: None,
+                    });
+                    true
+                } else {
+                    false
+                }
             } else {
-                let _ = std::fs::remove_file(&cache_path);
+                let _ = std::fs::remove_file(&sprite_path);
+                false
+            }
+        } else {
+            false
+        };
+
+        if loaded {
+            continue;
+        }
+
+        // 2. Fall back to thumb cache; migrate legacy atlas if found
+        if let Ok(disk_bytes) = crate::limits::read_file(&thumb_path, crate::limits::IMAGE_BYTES) {
+            if let Ok(sprite) = decode_sprite_from_bytes(&disk_bytes) {
+                if sprite.frames > 1 {
+                    let _ = std::fs::copy(&thumb_path, &sprite_path);
+                    let _ = gui_tx.send(GuiEvent::StickerSpriteReady {
+                        key: key.clone(),
+                        sprite,
+                        permit: None,
+                    });
+                    continue;
+                } else {
+                    let _ = gui_tx.send(GuiEvent::StickerImageReady {
+                        key,
+                        image: sprite.image,
+                    });
+                    continue;
+                }
+            } else {
+                let _ = std::fs::remove_file(&thumb_path);
             }
         }
         let url = if item.cate_id == 0 && (1..=30).contains(&item.sticker_id) {
@@ -684,7 +724,7 @@ fn preload_disk_sticker_inner(
         } else {
             crate::endpoints::legacy_sticker_image(item.sticker_id)
         };
-        missing.push((key, url, cache_path));
+        missing.push((key, url, thumb_path));
     }
     missing
 }
@@ -1644,6 +1684,21 @@ pub(super) fn spawn_session_worker(
                                 success,
                             });
                             ctx.request_repaint();
+                        }
+                        WorkerCmd::CheckE2eeStatus { owner, peer_id } => {
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let owner_for_task = owner.clone();
+                            let peer_for_task = peer_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if crate::e2ee_integration::is_thread_e2ee(&owner_for_task, &peer_for_task) {
+                                    let _ = tx.send(GuiEvent::E2eePeerRequired {
+                                        owner: owner_for_task,
+                                        peer_id: peer_for_task,
+                                    });
+                                    ctx.request_repaint();
+                                }
+                            });
                         }
                         WorkerCmd::TrustIdentity { owner, peer_id, safety_number } => {
                             let account = session.lock().await.clone();
