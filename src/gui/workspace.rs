@@ -1441,9 +1441,9 @@ impl ZaloGuiApp {
                                 }
                                 if ui
                                     .button(if preference.muted {
-                                        "Bật thông báo (mọi thiết bị)"
+                                        "Bật thông báo (trên máy này)"
                                     } else {
-                                        "Tắt thông báo (mọi thiết bị)"
+                                        "Tắt thông báo (trên máy này)"
                                     })
                                     .clicked()
                                 {
@@ -7983,7 +7983,10 @@ impl ZaloGuiApp {
         let matches_text =
             |value: &str| query.is_empty() || crate::search::fold(value).contains(&query);
         let matches_sender = |msg: &ChatMessage| {
-            sender_query.is_empty() || crate::search::fold(&msg.sender).contains(&sender_query)
+            sender_query.is_empty()
+                || crate::search::fold(&msg.sender).contains(&sender_query)
+                || crate::chat::sidebar_sender_id(msg)
+                    .is_some_and(|sender_id| sender_id.contains(sender_query.as_str()))
         };
         let from_input = self.drawer_media_from.trim();
         let to_input = self.drawer_media_to.trim();
