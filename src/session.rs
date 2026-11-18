@@ -1300,6 +1300,10 @@ impl Session {
         // Voice-call APIs use GET for state-changing signals (for example
         // requestcall/answer/endcall). Never replay this service automatically.
         let retryable_read = m == Method::GET && service_name.as_deref() != Some("voice_call");
+        // A connect/DNS failure occurs before an HTTP request exists, so a bounded
+        // candidate switch is safe even for mutations. Timeouts and HTTP responses
+        // remain fail-closed because the server may have received the mutation.
+        let retryable_preflight_failure = m != Method::GET;
         // Keep the total read-failover wait within the ordinary request timeout.
         // Upload/multipart flows use their own explicit timeout and do not enter here.
         let request_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
@@ -1362,13 +1366,21 @@ impl Session {
                     return Ok(response);
                 }
                 Err(e) => {
-                    // An HTTP response alone does not prove a mutation was not
-                    // delivered. Only reads can automatically try another host.
-                    let retry = retryable_read
+                    // An HTTP response or timeout does not prove a mutation was not
+                    // delivered. Only a preflight connect failure may switch a
+                    // mutation to another validated host.
+                    let is_connect_failure = e.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<reqwest::Error>()
+                            .is_some_and(|error| error.is_connect())
+                    });
+                    let retry = (retryable_read
                         && (e.downcast_ref::<HttpFailure>().is_some_and(|e| e.0 == 404)
+                            || is_connect_failure
                             || e.downcast_ref::<reqwest::Error>()
-                                .is_some_and(|e| e.is_connect() || e.is_timeout())
-                            || e.downcast_ref::<RequestDeadlineElapsed>().is_some());
+                                .is_some_and(|error| error.is_timeout())
+                            || e.downcast_ref::<RequestDeadlineElapsed>().is_some()))
+                        || (retryable_preflight_failure && is_connect_failure);
                     if !retry {
                         return Err(e);
                     }
@@ -2276,6 +2288,36 @@ mod remembered_host_tests {
             s.request_attempt_timings()[0].result,
             crate::service_resolver::AttemptResult::HttpFailure
         );
+    }
+
+    #[tokio::test]
+    async fn mutation_connect_failure_uses_one_bounded_fallback_candidate() {
+        // Port 1 is expected to refuse immediately on the test host, exercising
+        // the preflight connect classification without waiting for a timeout.
+        let dead_primary = "http://127.0.0.1:1".to_owned();
+        let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.service_resolver
+            .write()
+            .unwrap()
+            .register_service("chat", vec![dead_primary, fallback]);
+        let canonical = crate::endpoints::service("chat").unwrap();
+        s.post_form(
+            &format!("{canonical}/api/fixture"),
+            "payload=fixture".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.await.unwrap(), 1);
+        let timings = s.request_attempt_timings();
+        assert_eq!(timings.len(), 2);
+        assert_eq!(timings[0].result, crate::service_resolver::AttemptResult::ConnectFailure);
+        assert_eq!(timings[1].result, crate::service_resolver::AttemptResult::Success);
     }
 
     #[tokio::test]

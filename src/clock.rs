@@ -45,6 +45,9 @@ where
 {
     let ts = normalize_ts_ms(ts);
     let now = normalize_ts_ms(now);
+    if now <= 0 {
+        return String::new();
+    }
     let Some(date) = timezone
         .timestamp_millis_opt(ts)
         .single()
@@ -190,5 +193,8 @@ mod regression_tests {
         assert_eq!(sidebar_time_in(now - 86_400_000, now, &tz), "1 ngày");
         assert_eq!(sidebar_time_in(now - 7 * 86_400_000, now, &tz), "7 ngày");
         assert_eq!(sidebar_time_in(now - 8 * 86_400_000, now, &tz), "10/11");
+        // Future or sub-minute timestamps never produce a negative relative value.
+        assert_eq!(sidebar_time_in(now + 60_000, now, &tz), "12:01");
+        assert_eq!(sidebar_time_in(now, 0, &tz), "");
     }
 }

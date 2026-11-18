@@ -315,7 +315,11 @@ pub enum FileCategory {
 }
 
 pub fn file_category(name: &str) -> FileCategory {
-    let ext = name
+    // Attachment names may be CDN URLs with query parameters or fragments.
+    // Classify the filename portion only so the shared resolver is stable across
+    // bubble, drawer, and filter renderers.
+    let clean_name = name.split(['?', '#']).next().unwrap_or(name).trim();
+    let ext = clean_name
         .rsplit_once('.')
         .map(|(_, ext)| ext.trim().to_ascii_lowercase())
         .unwrap_or_default();
@@ -1032,5 +1036,8 @@ mod media_url_tests {
         assert_eq!(file_category("budget.XLSX"), FileCategory::Excel);
         assert_eq!(file_category("plan.DWG"), FileCategory::Cad);
         assert_eq!(file_category("archive.zip"), FileCategory::Other);
+        assert_eq!(file_category("report.PDF?download=1"), FileCategory::Pdf);
+        assert_eq!(file_category("plan.dwg#preview"), FileCategory::Cad);
+        assert_eq!(file_category("no-extension"), FileCategory::Other);
     }
 }

@@ -219,18 +219,21 @@ impl ZaloGuiApp {
                 ui.add_space(10.0);
 
                 // 4 Navigation Items
+                // Use the shared icon font for navigation affordances. Emoji glyphs
+                // depend on the host font stack and rendered as tofu on some ARM64
+                // Windows installations.
                 let nav_items = [
-                    (ContactsTab::Friends, "👥", "Danh sách bạn bè", friends),
-                    (ContactsTab::Groups, "🏘️", "Danh sách nhóm", groups),
+                    (ContactsTab::Friends, lucide::USERS, "Danh sách bạn bè", friends),
+                    (ContactsTab::Groups, lucide::USERS, "Danh sách nhóm", groups),
                     (
                         ContactsTab::FriendRequests,
-                        "📩",
+                        lucide::USER_PLUS,
                         "Lời mời kết bạn",
                         friend_requests_count,
                     ),
                     (
                         ContactsTab::GroupInvitations,
-                        "📨",
+                        lucide::MESSAGE_SQUARE,
                         "Lời mời vào nhóm",
                         group_invitations_count,
                     ),
