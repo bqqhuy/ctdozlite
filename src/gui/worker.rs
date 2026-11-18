@@ -3034,7 +3034,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         WorkerCmd::ListSettingsDevices { generation, refresh } => {
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let result = tokio::task::spawn_blocking(move || crate::media::list_media_devices(refresh))
+                                let result = tokio::task::spawn_blocking(move || crate::media::list_call_devices(refresh))
                                     .await.map_err(|_| "Không đọc được danh sách thiết bị".to_string());
                                 let _ = tx.send(GuiEvent::SettingsDevicesLoaded { generation, result });
                                 ctx.request_repaint();

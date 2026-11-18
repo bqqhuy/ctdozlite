@@ -15,7 +15,7 @@ Closing/Escape saves the modal; device and account-lock changes also save explic
 | Appearance | Theme/system/density/color controls → effective palette; avatar wallpaper → existing async avatar image worker/cache → history canvas tint, with normal background when absent. |
 | Notifications | Enable → incoming alerts/desktop notice policy; sound toggle/test → notification sound preparation and playback. |
 | Messages | Quick messages → composer menu and slash expansion; incoming/outgoing typing → render/typing commands; priority split → two local tabs based on existing server/local pinned conversations; Excel mode → clipboard branch/ask; double-click reply → actual quote composer; typing-indicator toggle → visible typing label. |
-| Calls | Opens General device controls; actual device choice is consumed by capture/video modules. No unsupported codec/capability switch is presented. |
+| Calls | Async microphone/speaker/camera enumeration; persisted device choices are consumed by capture, output playback, and video modules. Incoming-call notification toggle gates the existing in-app status and OS attention request. No unsupported codec/capability switch is presented. |
 | Utilities | Sticker suggestions/search, animation, mention suggestions and local GIF filtering → respective composer/picker/render consumers. |
 
 ### Coverage additions (2026-11-18)

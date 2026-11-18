@@ -56,7 +56,7 @@ mod preview_attempt_tests {
 pub(super) struct SettingsDevices {
     pub generation: u64,
     pub pending: bool,
-    pub devices: Option<(Vec<String>, Vec<String>)>,
+    pub devices: Option<crate::media::CallDeviceLists>,
     pub error: String,
 }
 
@@ -1059,8 +1059,8 @@ impl ZaloGuiApp {
                                                         && !self.settings_devices.pending && self.settings_devices.error.is_empty() {
                                                         self.request_settings_devices(false);
                                                     }
-                                                    let (mics, cams) = if self.smoke.is_some() {
-                                                        (vec!["Fixture microphone".into()], vec!["Fixture camera".into()])
+                                                    let (mics, _speakers, cams) = if self.smoke.is_some() {
+                                                        (vec!["Fixture microphone".into()], vec!["Fixture speaker".into()], vec!["Fixture camera".into()])
                                                     } else { self.settings_devices.devices.clone().unwrap_or_default() };
                                                     if self.settings_devices.pending { ui.horizontal(|ui| { ui.spinner(); ui.label("Đang quét thiết bị…"); }); }
                                                     if !self.settings_devices.error.is_empty() { ui.label(&self.settings_devices.error); }
@@ -1683,12 +1683,115 @@ impl ZaloGuiApp {
                                         SettingsTab::Calls => {
                                             ui.label(RichText::new(crate::i18n::tr("Cuộc gọi")).color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(6.0);
-                                            ui.label(crate::i18n::tr("Thiết bị âm thanh và camera được chọn trong phần cài đặt thiết bị; kiểm tra quyền trước khi bắt đầu cuộc gọi."));
+                                            ui.label(RichText::new(crate::i18n::tr("Thiết bị được áp dụng khi bắt đầu cuộc gọi tiếp theo.")).color(pal.text_secondary).size(12.0));
                                             ui.add_space(8.0);
-                                            if ui.button(crate::i18n::tr("Mở cài đặt âm thanh và camera")).clicked() {
-                                                self.settings_tab = SettingsTab::General;
+                                            if self.smoke.is_none() && self.settings_devices.devices.is_none()
+                                                && !self.settings_devices.pending && self.settings_devices.error.is_empty() {
+                                                self.request_settings_devices(false);
                                             }
-                                            ui.label(RichText::new(crate::i18n::tr("Tùy chọn codec và quyền truy cập phải theo capability thực tế của thiết bị.")).color(pal.text_secondary).size(12.0));
+                                            let (mics, speakers, cams) = if self.smoke.is_some() {
+                                                (vec!["Fixture microphone".into()], vec!["Fixture speaker".into()], vec!["Fixture camera".into()])
+                                            } else { self.settings_devices.devices.clone().unwrap_or_default() };
+                                            if self.settings_devices.pending { ui.horizontal(|ui| { ui.spinner(); ui.label(crate::i18n::tr("Đang quét thiết bị…")); }); }
+                                            if !self.settings_devices.error.is_empty() { ui.label(&self.settings_devices.error); }
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(format!("{} Microphone", lucide::MIC)).color(pal.text_primary).size(13.0));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let selected = if self.settings.selected_mic_device.is_empty() { crate::i18n::tr("Mặc định hệ thống") } else { &self.settings.selected_mic_device };
+                                                            egui::ComboBox::from_id_salt("call_settings_mic")
+                                                                .selected_text(truncate_chars(selected, 30)).width(250.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_label(self.settings.selected_mic_device.is_empty(), crate::i18n::tr("Mặc định hệ thống")).clicked() {
+                                                                        self.settings.selected_mic_device.clear();
+                                                                        crate::media::set_selected_mic_device("");
+                                                                        self.save_settings();
+                                                                    }
+                                                                    for device in &mics {
+                                                                        if ui.selectable_label(self.settings.selected_mic_device == *device, device).clicked() {
+                                                                            self.settings.selected_mic_device = device.clone();
+                                                                            crate::media::set_selected_mic_device(device);
+                                                                            self.save_settings();
+                                                                        }
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(crate::i18n::tr("Loa")).color(pal.text_primary).size(13.0));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let selected = if self.settings.selected_speaker_device.is_empty() { crate::i18n::tr("Mặc định hệ thống") } else { &self.settings.selected_speaker_device };
+                                                            egui::ComboBox::from_id_salt("call_settings_speaker")
+                                                                .selected_text(truncate_chars(selected, 30)).width(250.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_label(self.settings.selected_speaker_device.is_empty(), crate::i18n::tr("Mặc định hệ thống")).clicked() {
+                                                                        self.settings.selected_speaker_device.clear();
+                                                                        crate::media::set_selected_speaker_device("");
+                                                                        self.save_settings();
+                                                                    }
+                                                                    for device in &speakers {
+                                                                        if ui.selectable_label(self.settings.selected_speaker_device == *device, device).clicked() {
+                                                                            self.settings.selected_speaker_device = device.clone();
+                                                                            crate::media::set_selected_speaker_device(device);
+                                                                            self.save_settings();
+                                                                        }
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(format!("{} Camera", lucide::VIDEO)).color(pal.text_primary).size(13.0));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            let selected = if self.settings.selected_camera_device.is_empty() { crate::i18n::tr("Tự động") } else { &self.settings.selected_camera_device };
+                                                            egui::ComboBox::from_id_salt("call_settings_camera")
+                                                                .selected_text(truncate_chars(selected, 30)).width(250.0)
+                                                                .show_ui(ui, |ui| {
+                                                                    if ui.selectable_label(self.settings.selected_camera_device.is_empty(), crate::i18n::tr("Tự động (Camera đầu tiên)")).clicked() {
+                                                                        self.settings.selected_camera_device.clear();
+                                                                        crate::media::set_selected_camera_device("");
+                                                                        self.save_settings();
+                                                                    }
+                                                                    for device in &cams {
+                                                                        if ui.selectable_label(self.settings.selected_camera_device == *device, device).clicked() {
+                                                                            self.settings.selected_camera_device = device.clone();
+                                                                            crate::media::set_selected_camera_device(device);
+                                                                            self.save_settings();
+                                                                        }
+                                                                    }
+                                                                });
+                                                        });
+                                                    });
+                                                    ui.add_space(6.0);
+                                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                        if ui.add_enabled(!self.settings_devices.pending, egui::Button::new(format!("{} Quét lại thiết bị", lucide::REFRESH))).clicked() {
+                                                            self.request_settings_devices(true);
+                                                        }
+                                                    });
+                                                });
+                                            ui.add_space(14.0);
+                                            egui::Frame::none()
+                                                .fill(pal.bg_elevated)
+                                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                                .rounding(Rounding::same(8.0))
+                                                .inner_margin(Margin::symmetric(14.0, 10.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new(crate::i18n::tr("Thông báo cuộc gọi đến")).color(pal.text_primary).size(13.2));
+                                                            ui.label(RichText::new(crate::i18n::tr("Hiển thị chú ý trên cửa sổ khi có cuộc gọi đến")).color(pal.text_secondary).size(12.0));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.call_notifications_enabled, pal);
+                                                        });
+                                                    });
+                                                });
                                         }
                                         SettingsTab::Utilities => {
                                             ui.label(format!("Phiên bản {} • Windows ARM64",crate::PRODUCT_VERSION));

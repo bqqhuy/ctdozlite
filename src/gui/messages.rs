@@ -802,6 +802,9 @@ pub(super) fn render_message_body(
         let key = crate::media_recovery::image_key(thread_id, &msg.id, 0, false);
         let size = thumbnail_size(&media, max_text_width);
         let (width, height) = (size.x, size.y);
+        if !file_thumbnails_enabled {
+            loading_stickers.remove(&key);
+        }
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
         if file_thumbnails_enabled
             && !thumb.is_empty()
@@ -822,17 +825,21 @@ pub(super) fn render_message_body(
         }
         ui.painter()
             .rect_filled(rect, Rounding::same(10.0), pal.bg_elevated);
-        if let Some(texture) = sticker_textures.get(&key) {
-            let size = texture.size_vec2();
-            let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
-            let target = Rect::from_center_size(rect.center(), size * scale);
-            // Image widgets clip their texture to the same rounded outline as the card.
-            ui.put(
-                target,
-                egui::Image::new(texture)
-                    .fit_to_exact_size(target.size())
-                    .rounding(10.0),
-            );
+        if file_thumbnails_enabled {
+            if let Some(texture) = sticker_textures.get(&key) {
+                let size = texture.size_vec2();
+                let scale = (rect.width() / size.x).min(rect.height() / size.y).min(1.0);
+                let target = Rect::from_center_size(rect.center(), size * scale);
+                // Image widgets clip their texture to the same rounded outline as the card.
+                ui.put(
+                    target,
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(target.size())
+                        .rounding(10.0),
+                );
+            } else {
+                draw_icon_image(ui.painter(), rect.center(), 24.0, pal.text_muted);
+            }
         } else {
             draw_icon_image(ui.painter(), rect.center(), 24.0, pal.text_muted);
         }
@@ -1055,6 +1062,8 @@ pub(super) fn render_message_body(
                 });
             }
         }
+    } else if !link_suggestions_enabled {
+        loading_stickers.remove(&format!("linkmeta_{}", crate::crypto::md5_hex(&url)));
     }
 
     // 1. Optional user comment above the link
@@ -1066,6 +1075,9 @@ pub(super) fn render_message_body(
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
+        if !file_thumbnails_enabled {
+            loading_stickers.remove(&key);
+        }
         if file_thumbnails_enabled
             && media_near_viewport(ui, 200.0)
             && !sticker_textures.contains_key(&key)
@@ -1079,28 +1091,30 @@ pub(super) fn render_message_body(
                 });
             }
         }
-        if let Some(tex) = sticker_textures.get(&key) {
-            let [tw, th] = tex.size();
-            let aspect = if tw > 0 && th > 0 {
-                (th as f32 / tw as f32).clamp(0.45, 0.85)
-            } else {
-                0.56
-            };
-            let thumb_w = max_text_width.min(260.0);
-            let img_h = (thumb_w * aspect).min(132.0);
-            let img = egui::Image::new(tex)
-                .fit_to_exact_size(Vec2::new(thumb_w, img_h))
-                .rounding(Rounding::same(6.0))
-                .sense(Sense::click());
-            if ui
-                .add(img)
-                .on_hover_cursor(CursorIcon::PointingHand)
-                .on_hover_text(&url)
-                .clicked()
-            {
-                open_external_url(&url);
+        if file_thumbnails_enabled {
+            if let Some(tex) = sticker_textures.get(&key) {
+                let [tw, th] = tex.size();
+                let aspect = if tw > 0 && th > 0 {
+                    (th as f32 / tw as f32).clamp(0.45, 0.85)
+                } else {
+                    0.56
+                };
+                let thumb_w = max_text_width.min(260.0);
+                let img_h = (thumb_w * aspect).min(132.0);
+                let img = egui::Image::new(tex)
+                    .fit_to_exact_size(Vec2::new(thumb_w, img_h))
+                    .rounding(Rounding::same(6.0))
+                    .sense(Sense::click());
+                if ui
+                    .add(img)
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .on_hover_text(&url)
+                    .clicked()
+                {
+                    open_external_url(&url);
+                }
+                ui.add_space(5.0);
             }
-            ui.add_space(5.0);
         }
     }
 

@@ -5,6 +5,28 @@ pub use crate::message_view::is_media_url;
 type SharedPhotos = Vec<(String, crate::message_view::Media, ChatMessage)>;
 type SharedFiles = Vec<(crate::message_view::Media, ChatMessage)>;
 type SharedLinks = Vec<(String, String, ChatMessage)>;
+type PhotoRef<'a> = &'a (String, crate::message_view::Media, ChatMessage);
+
+fn group_photos_by_local_date(photos: Vec<PhotoRef<'_>>) -> Vec<(String, Vec<PhotoRef<'_>>)> {
+    let mut groups: Vec<(String, Vec<_>)> = Vec::new();
+    for photo in photos {
+        let date =
+            chrono::DateTime::from_timestamp_millis(crate::clock::normalize_ts_ms(photo.2.ts))
+                .map(|date| {
+                    date.with_timezone(&chrono::Local)
+                        .format("%d/%m/%Y")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "Ngày không xác định".into());
+        if groups.last().is_none_or(|(last, _)| last != &date) {
+            groups.push((date.clone(), Vec::new()));
+        }
+        if let Some((_, items)) = groups.last_mut() {
+            items.push(photo);
+        }
+    }
+    groups
+}
 
 #[derive(Default)]
 pub(super) struct CloudUsageState {
@@ -179,7 +201,8 @@ fn render_archive_date_filter(ui: &mut egui::Ui, scope: Id, from: &mut String, t
     let initial_from = from.clone();
     let initial_to = to.clone();
     let mut committed: Option<(String, String)> = None;
-    let _response = ui.menu_button(label, |ui| {
+    let mut cancel_draft = false;
+    let response = ui.menu_button(label, |ui| {
         let mut draft = ui.ctx().data_mut(|data| {
             data.get_temp::<ArchiveDateDraft>(draft_id)
                 .unwrap_or_else(|| ArchiveDateDraft::new(&initial_from, &initial_to, today))
@@ -191,10 +214,8 @@ fn render_archive_date_filter(ui: &mut egui::Ui, scope: Id, from: &mut String, t
                 (90, "Trong vòng 3 tháng"),
             ] {
                 if ui.button(label).clicked() {
-                    // Archive ENRE overrides the reusable picker's calendar-month presets (re-notes/47).
                     let (start, end) = archive_date_preset(today, days);
-                    draft.from = start;
-                    draft.to = end;
+                    committed = Some((start, end));
                     ui.close_menu();
                 }
             }
@@ -250,6 +271,7 @@ fn render_archive_date_filter(ui: &mut egui::Ui, scope: Id, from: &mut String, t
         }
         ui.horizontal(|ui| {
             if ui.button("Hủy").clicked() {
+                cancel_draft = true;
                 ui.close_menu();
             }
             if ui
@@ -260,8 +282,14 @@ fn render_archive_date_filter(ui: &mut egui::Ui, scope: Id, from: &mut String, t
                 ui.close_menu();
             }
         });
-        ui.ctx().data_mut(|data| data.insert_temp(draft_id, draft));
+        if !cancel_draft {
+            ui.ctx().data_mut(|data| data.insert_temp(draft_id, draft));
+        }
     });
+    if cancel_draft || response.inner.is_none() {
+        ui.ctx()
+            .data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
+    }
     if let Some((next_from, next_to)) = committed {
         *from = next_from;
         *to = next_to;
@@ -5579,6 +5607,55 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod sync_and_order_tests {
     use super::*;
+
+    #[test]
+    fn archive_photo_date_groups_do_not_mix_rows_across_midnight() {
+        use chrono::TimeZone;
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.checked_sub_days(chrono::Days::new(1)).unwrap();
+        let before = chrono::Local
+            .from_local_datetime(&yesterday.and_hms_opt(23, 59, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let after = chrono::Local
+            .from_local_datetime(&today.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let photos = [
+            (
+                "a".into(),
+                Default::default(),
+                ChatMessage {
+                    ts: before,
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".into(),
+                Default::default(),
+                ChatMessage {
+                    ts: before,
+                    ..Default::default()
+                },
+            ),
+            (
+                "c".into(),
+                Default::default(),
+                ChatMessage {
+                    ts: after,
+                    ..Default::default()
+                },
+            ),
+        ];
+        let photos: Vec<_> = photos.iter().collect();
+        let groups = group_photos_by_local_date(photos);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].1.len(), 1);
+        assert_ne!(groups[0].0, groups[1].0);
+    }
     fn app_and_context() -> (ZaloGuiApp, egui::Context) {
         let ctx = egui::Context::default();
         let mut app = ZaloGuiApp::from_context(
@@ -9565,42 +9642,32 @@ impl ZaloGuiApp {
                             / columns as f32)
                             .clamp(32.0, 112.0);
                         let mut shown = 0usize;
-                        let mut last_date = String::new();
-                        for row in filtered.chunks(columns) {
-                            let date = row.first().and_then(|(_, _, msg)| {
-                                chrono::DateTime::from_timestamp_millis(
-                                    crate::clock::normalize_ts_ms(msg.ts),
-                                )
-                                .map(|date| {
-                                    date.with_timezone(&chrono::Local)
-                                        .format("%d/%m/%Y")
-                                        .to_string()
-                                })
-                            });
-                            if date.as_deref() != Some(last_date.as_str()) {
-                                if let Some(date) = date {
-                                    ui.separator();
-                                    ui.small(date.clone());
-                                    last_date = date;
-                                }
-                            }
+                        let date_groups = group_photos_by_local_date(filtered);
+                        for (date, items) in date_groups {
                             if shown >= self.drawer_media_limit {
                                 break;
                             }
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
-                                for (tkey, media, message) in row {
-                                    if shown >= self.drawer_media_limit {
-                                        break;
-                                    }
-                                    self.render_photo_cell(
-                                        ui, tkey, media, message, d_id, "", d_is_group, cell_sz,
-                                        pal,
-                                    );
-                                    shown += 1;
+                            ui.separator();
+                            ui.small(date);
+                            for row in items.chunks(columns) {
+                                if shown >= self.drawer_media_limit {
+                                    break;
                                 }
-                            });
-                            ui.add_space(gap);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                                    for (tkey, media, message) in row {
+                                        if shown >= self.drawer_media_limit {
+                                            break;
+                                        }
+                                        self.render_photo_cell(
+                                            ui, tkey, media, message, d_id, "", d_is_group,
+                                            cell_sz, pal,
+                                        );
+                                        shown += 1;
+                                    }
+                                });
+                                ui.add_space(gap);
+                            }
                         }
                     }
                 }

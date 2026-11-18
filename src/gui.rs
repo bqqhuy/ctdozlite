@@ -522,7 +522,7 @@ pub enum GuiEvent {
     NotificationSoundPrepared(bool),
     SettingsDevicesLoaded {
         generation: u64,
-        result: Result<(Vec<String>, Vec<String>), String>,
+        result: Result<crate::media::CallDeviceLists, String>,
     },
     MessagePinsLoaded {
         owner: String,
@@ -879,6 +879,7 @@ struct AppSettings {
     // 4. Thông báo
     enable_notifications: bool,
     play_notification_sound: bool,
+    call_notifications_enabled: bool,
     // 5. Tin nhắn
     quick_messages_enabled: bool,
     /// Show "đang soạn tin" from other people.
@@ -903,6 +904,7 @@ struct AppSettings {
     pub enable_animated_stickers: bool,
     // 7. Thiết bị cuộc gọi (Mic & Camera)
     selected_mic_device: String,
+    selected_speaker_device: String,
     selected_camera_device: String,
     // 8. Tính năng AI & Quyền riêng tư
     ai_translation_consent: bool,
@@ -947,6 +949,7 @@ impl Default for AppSettings {
             info_drawer_open: true,
             enable_notifications: true,
             play_notification_sound: false,
+            call_notifications_enabled: true,
             quick_messages_enabled: true,
             show_typing: true,
             send_typing: true,
@@ -963,6 +966,7 @@ impl Default for AppSettings {
             enable_sticker_keyword_search: true,
             enable_animated_stickers: true,
             selected_mic_device: String::new(),
+            selected_speaker_device: String::new(),
             selected_camera_device: String::new(),
             ai_translation_consent: false,
             enable_app_lock: false,
@@ -1548,6 +1552,7 @@ impl ZaloGuiApp {
         };
         loaded_settings.appearance.apply_context(ctx);
         crate::media::set_selected_mic_device(&loaded_settings.selected_mic_device);
+        crate::media::set_selected_speaker_device(&loaded_settings.selected_speaker_device);
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = match loaded_settings.theme_mode.as_str() {
             "light" => false,
@@ -5855,10 +5860,12 @@ impl ZaloGuiApp {
                     let resolved_name = self
                         .resolve_contact_name(&caller_id, &fallback_name)
                         .to_owned();
-                    self.status_msg = format!(
-                        "📲 Cuộc gọi {} đến từ {resolved_name}…",
-                        if is_video { "video" } else { "thoại" }
-                    );
+                    if self.settings.call_notifications_enabled {
+                        self.status_msg = format!(
+                            "📲 Cuộc gọi {} đến từ {resolved_name}…",
+                            if is_video { "video" } else { "thoại" }
+                        );
+                    }
                     self.active_call = Some(ActiveCallOverlay {
                         call_id: Some(call_id),
                         partner_id: caller_id,
@@ -5873,9 +5880,11 @@ impl ZaloGuiApp {
                         error_code: None,
                         error_reason: None,
                     });
-                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
-                        egui::UserAttentionType::Critical,
-                    ));
+                    if self.settings.call_notifications_enabled {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Critical,
+                        ));
+                    }
                 }
                 GuiEvent::CallRejected {
                     owner,
@@ -9008,6 +9017,8 @@ mod voice_draft_boundary_tests {
     #[test]
     fn app_settings_default_disables_lock_and_verifies_salted_pin() {
         let mut settings = AppSettings::default();
+        assert!(settings.call_notifications_enabled);
+        assert!(settings.selected_speaker_device.is_empty());
         assert!(!settings.enable_app_lock);
         assert!(!settings.use_windows_hello);
         assert!(settings.app_pin_hash.is_none());
@@ -9026,6 +9037,23 @@ mod voice_draft_boundary_tests {
             .is_some_and(|h| h.starts_with("pbkdf2$100000$")));
         assert!(settings.verify_pin("2580"));
         assert!(!settings.verify_pin("0000"));
+    }
+
+    #[test]
+    fn call_settings_round_trip_and_load_legacy_settings_defaults() {
+        let settings = AppSettings {
+            call_notifications_enabled: false,
+            selected_speaker_device: "USB Headset".into(),
+            ..Default::default()
+        };
+        let serialized = serde_json::to_string(&settings).unwrap();
+        let restored: AppSettings = serde_json::from_str(&serialized).unwrap();
+        assert!(!restored.call_notifications_enabled);
+        assert_eq!(restored.selected_speaker_device, "USB Headset");
+
+        let legacy: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(legacy.call_notifications_enabled);
+        assert!(legacy.selected_speaker_device.is_empty());
     }
 
     #[test]

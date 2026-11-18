@@ -165,21 +165,33 @@ impl PlaybackResampler {
 }
 
 static SELECTED_MIC_DEVICE: Mutex<String> = Mutex::new(String::new());
+static SELECTED_SPEAKER_DEVICE: Mutex<String> = Mutex::new(String::new());
 static SELECTED_CAMERA_DEVICE: Mutex<String> = Mutex::new(String::new());
-static CACHED_DEVICES: Mutex<Option<(Vec<String>, Vec<String>)>> = Mutex::new(None);
+pub type CallDeviceLists = (Vec<String>, Vec<String>, Vec<String>);
+static CACHED_DEVICES: Mutex<Option<CallDeviceLists>> = Mutex::new(None);
 
+/// Select the microphone by its current host device name; an empty name restores the default.
 pub fn set_selected_mic_device(name: &str) {
     if let Ok(mut g) = SELECTED_MIC_DEVICE.lock() {
         *g = name.trim().to_string();
     }
 }
 
+/// Select the camera by its current host device name; an empty name restores automatic choice.
 pub fn set_selected_camera_device(name: &str) {
     if let Ok(mut g) = SELECTED_CAMERA_DEVICE.lock() {
         *g = name.trim().to_string();
     }
 }
 
+/// Select the call output device by its current host device name; an empty name restores default output.
+pub fn set_selected_speaker_device(name: &str) {
+    if let Ok(mut g) = SELECTED_SPEAKER_DEVICE.lock() {
+        *g = name.trim().to_string();
+    }
+}
+
+/// Return the selected microphone name, or an empty string for the host default.
 pub fn selected_mic_device() -> String {
     SELECTED_MIC_DEVICE
         .lock()
@@ -187,6 +199,7 @@ pub fn selected_mic_device() -> String {
         .unwrap_or_default()
 }
 
+/// Return the selected camera name, or an empty string for automatic selection.
 pub fn selected_camera_device() -> String {
     SELECTED_CAMERA_DEVICE
         .lock()
@@ -194,8 +207,22 @@ pub fn selected_camera_device() -> String {
         .unwrap_or_default()
 }
 
+/// Return the selected call output name, or an empty string for the host default.
+pub fn selected_speaker_device() -> String {
+    SELECTED_SPEAKER_DEVICE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
+}
+
 /// Return immediately; slow device/driver enumeration never blocks the GUI.
 pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
+    let (mics, _, cams) = list_call_devices(refresh);
+    (mics, cams)
+}
+
+/// Return available call audio and camera devices without blocking the caller.
+pub fn list_call_devices(refresh: bool) -> CallDeviceLists {
     static SCANNING: AtomicBool = AtomicBool::new(false);
     let cached = CACHED_DEVICES.lock().ok().and_then(|g| g.clone());
     if (refresh || cached.is_none()) && !SCANNING.swap(true, Ordering::SeqCst) {
@@ -215,8 +242,23 @@ pub fn list_media_devices(refresh: bool) -> (Vec<String>, Vec<String>) {
     }
     cached.unwrap_or_default()
 }
-fn enumerate_devices() -> (Vec<String>, Vec<String>) {
+
+#[cfg(test)]
+mod call_settings_tests {
+    use super::*;
+
+    #[test]
+    fn selected_speaker_device_is_trimmed_and_resettable() {
+        set_selected_speaker_device("  USB Headset  ");
+        assert_eq!(selected_speaker_device(), "USB Headset");
+        set_selected_speaker_device("");
+        assert!(selected_speaker_device().is_empty());
+    }
+}
+
+fn enumerate_devices() -> CallDeviceLists {
     let mut mics = Vec::new();
+    let mut speakers = Vec::new();
     let host = cpal::default_host();
     if let Ok(devs) = host.input_devices() {
         for d in devs {
@@ -228,11 +270,21 @@ fn enumerate_devices() -> (Vec<String>, Vec<String>) {
             }
         }
     }
+    if let Ok(devs) = host.output_devices() {
+        for d in devs {
+            if let Ok(name) = d.name() {
+                let trimmed = name.trim().to_string();
+                if !trimmed.is_empty() && !speakers.contains(&trimmed) {
+                    speakers.push(trimmed);
+                }
+            }
+        }
+    }
     #[cfg(windows)]
     let cams = crate::windows_video::camera_names().unwrap_or_default();
     #[cfg(not(windows))]
     let cams = Vec::new();
-    (mics, cams)
+    (mics, speakers, cams)
 }
 
 pub struct MediaHandle {
@@ -1238,19 +1290,34 @@ fn run_media_loop(
             None
         }
     });
-    let output_setup =
-        host.default_output_device()
-            .and_then(|device| match device.default_output_config() {
-                Ok(config) => Some((device, config)),
-                Err(e) => {
-                    report_media_error(
-                        &gui_tx,
-                        &egui_ctx,
-                        &format!("Không đọc được cấu hình loa: {e}"),
-                    );
-                    None
-                }
-            });
+    let preferred_speaker = selected_speaker_device();
+    let output_device = host
+        .output_devices()
+        .ok()
+        .and_then(|mut devices| {
+            if preferred_speaker.is_empty() {
+                None
+            } else {
+                devices.find(|device| {
+                    device
+                        .name()
+                        .map(|name| name.trim() == preferred_speaker)
+                        .unwrap_or(false)
+                })
+            }
+        })
+        .or_else(|| host.default_output_device());
+    let output_setup = output_device.and_then(|device| match device.default_output_config() {
+        Ok(config) => Some((device, config)),
+        Err(e) => {
+            report_media_error(
+                &gui_tx,
+                &egui_ctx,
+                &format!("Không đọc được cấu hình loa: {e}"),
+            );
+            None
+        }
+    });
     if input_setup.is_none() {
         report_media_error(&gui_tx,&egui_ctx,"Microphone không khả dụng; vẫn có thể nhận âm thanh/video. Kiểm tra quyền microphone hoặc đổi thiết bị.");
     }
