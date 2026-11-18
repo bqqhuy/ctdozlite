@@ -9367,6 +9367,7 @@ impl ZaloGuiApp {
                             crate::message_view::FileCategory::PowerPoint,
                             crate::message_view::FileCategory::Excel,
                             crate::message_view::FileCategory::Cad,
+                            crate::message_view::FileCategory::Zip,
                             crate::message_view::FileCategory::Other,
                         ] {
                             ui.horizontal(|ui| {

@@ -697,15 +697,17 @@ impl WorkerMailbox {
 pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox(std::sync::Mutex::new(None));
 
 async fn forward_upload_progress(
-    receiver: &mut tokio::sync::broadcast::Receiver<(String, u64, u64)>,
+    receiver: &mut tokio::sync::broadcast::Receiver<crate::upload::UploadProgress>,
     events: &Sender<GuiEvent>,
     context: &egui::Context,
 ) {
     loop {
         match receiver.recv().await {
-            Ok((upload_id, completed, total)) => {
+            Ok((owner, runtime_id, upload_id, completed, total)) => {
                 if events
                     .send(GuiEvent::UploadProgress {
+                        owner,
+                        runtime_id,
                         upload_id,
                         completed,
                         total,
@@ -2502,7 +2504,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 })
                                 .await;
 
-                                let _ = tx.send(GuiEvent::StatusUpdate("Đã hủy tải lên".into()));
+                                let _ = tx.send(GuiEvent::StatusUpdate("Đã yêu cầu hủy tải lên".into()));
                                 ctx.request_repaint();
                             });
                         }
@@ -6823,11 +6825,17 @@ mod v0016_workflow_tests {
     #[tokio::test]
     async fn upload_progress_event_forwarding() {
         let mut progress_rx = crate::upload::subscribe_progress();
-        crate::upload::report_progress("asyncfile-progress-1", 1_048_576, 3_000_000);
+        crate::upload::report_progress(
+            "test-owner",
+            7,
+            "asyncfile-progress-1",
+            1_048_576,
+            3_000_000,
+        );
         let event = progress_rx.recv().await.unwrap();
-        assert_eq!(event.0, "asyncfile-progress-1");
-        assert_eq!(event.1, 1_048_576);
-        assert_eq!(event.2, 3_000_000);
+        assert_eq!(event.2, "asyncfile-progress-1");
+        assert_eq!(event.3, 1_048_576);
+        assert_eq!(event.4, 3_000_000);
     }
 }
 
@@ -6838,7 +6846,9 @@ mod audit_progress_tests {
     async fn lagged_upload_progress_still_delivers_later_events() {
         let (sender, mut receiver) = tokio::sync::broadcast::channel(2);
         for n in 0..10 {
-            sender.send(("upload".into(), n, 10)).unwrap();
+            sender
+                .send(("owner".into(), 7, "upload".into(), n, 10))
+                .unwrap();
         }
         drop(sender);
         let (tx, rx) = std::sync::mpsc::channel();

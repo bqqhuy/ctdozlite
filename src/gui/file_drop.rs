@@ -284,9 +284,15 @@ impl ZaloGuiApp {
                             if let Some(tex) = &item.texture {
                                 ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(40.0)));
                             } else {
-                                ui.label(
-                                    RichText::new(lucide::PAPERCLIP).color(pal.text_secondary),
+                                let category = crate::message_view::file_category(
+                                    &item.path.file_name().unwrap_or_default().to_string_lossy(),
                                 );
+                                let (rect, response) =
+                                    ui.allocate_exact_size(Vec2::new(32.0, 38.0), Sense::hover());
+                                messages::paint_file_category_icon(ui.painter(), rect, category);
+                                response.on_hover_text(crate::message_view::file_category_label(
+                                    category,
+                                ));
                             }
                             ui.vertical(|ui| {
                                 ui.set_max_width((ui.available_width() - 28.0).max(16.0));

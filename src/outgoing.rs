@@ -65,7 +65,19 @@ pub struct Job {
 }
 pub fn pending(text: String, is_group: bool, payload: Payload) -> ChatMessage {
     let id = crate::chat::next_client_message_id();
+    let attachment_name = match &payload {
+        Payload::Attachment { path, .. } => path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        _ => None,
+    };
     ChatMessage {
+        kind: if attachment_name.is_some() {
+            crate::message_model::MessageKind::File
+        } else {
+            Default::default()
+        },
+        link_title: attachment_name,
         id: format!("out_{id}"),
         client_message_id: id.to_string(),
         text,

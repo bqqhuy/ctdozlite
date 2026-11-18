@@ -712,6 +712,8 @@ pub enum GuiEvent {
     DownloadFolderFailed(String),
     CameraUnavailable(String),
     UploadProgress {
+        owner: String,
+        runtime_id: usize,
         upload_id: String,
         completed: u64,
         total: u64,
@@ -3836,10 +3838,41 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::UploadProgress {
-                    upload_id: _,
+                    owner,
+                    runtime_id,
+                    upload_id,
                     completed,
                     total,
                 } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    let client_id = upload_id
+                        .strip_prefix("asyncfile-")
+                        .or_else(|| upload_id.strip_prefix("photo-"));
+                    if let Some(client_id) = client_id {
+                        for thread in &mut self.threads {
+                            for message in &mut thread.messages {
+                                if message.is_outgoing
+                                    && message.client_message_id == client_id
+                                    && message.delivery
+                                        == crate::message_model::DeliveryState::Pending
+                                    && message.outgoing_job.as_ref().is_some_and(|job| {
+                                        matches!(
+                                            job.payload,
+                                            crate::outgoing::Payload::Attachment { .. }
+                                        )
+                                    })
+                                {
+                                    message.upload_progress =
+                                        Some((upload_id.clone(), completed.min(total), total));
+                                }
+                            }
+                        }
+                    }
                     self.status_msg = format!("Tải lên: {}/{} bytes", completed, total);
                 }
                 GuiEvent::UploadResumeAvailable { sessions } => {
@@ -8693,6 +8726,87 @@ mod audit_lock_tests {
         assert!(app.archive_mutation_confirm.is_none());
     }
     #[test]
+    fn upload_progress_targets_pending_attachment_and_rejects_stale_scope() {
+        let ctx = egui::Context::default();
+        let mut first = crate::outgoing::pending(
+            "[Tệp] one.pdf".into(),
+            false,
+            crate::outgoing::Payload::Attachment {
+                path: "one.pdf".into(),
+                caption: String::new(),
+                stamp: None,
+                hd_source: None,
+            },
+        );
+        first.client_message_id = "101".into();
+        let mut second = first.clone();
+        second.client_message_id = "102".into();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "thread-a".into(),
+                messages: vec![first, second],
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner-a".into();
+        let runtime = app.account_runtime_id;
+        for (owner, runtime_id, completed) in [
+            ("other", runtime, 10),
+            ("owner-a", runtime.wrapping_add(1), 20),
+            ("owner-a", runtime, 150),
+        ] {
+            app.event_tx
+                .send(GuiEvent::UploadProgress {
+                    owner: owner.into(),
+                    runtime_id,
+                    upload_id: "asyncfile-101".into(),
+                    completed,
+                    total: 100,
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            if owner != "owner-a" || runtime_id != runtime {
+                assert!(app.threads[0].messages[0].upload_progress.is_none());
+            }
+        }
+        assert_eq!(
+            app.threads[0].messages[0].upload_progress,
+            Some(("asyncfile-101".into(), 100, 100))
+        );
+        assert!(app.threads[0].messages[1].upload_progress.is_none());
+        assert_eq!(
+            app.threads[0].messages[0].delivery,
+            crate::message_model::DeliveryState::Pending
+        );
+        let encoded = serde_json::to_value(&app.threads[0].messages[0]).unwrap();
+        assert!(encoded.get("upload_progress").is_none());
+        app.threads[0].messages[0].delivery = crate::message_model::DeliveryState::ServerAccepted;
+        app.event_tx
+            .send(GuiEvent::UploadProgress {
+                owner: "owner-a".into(),
+                runtime_id: runtime,
+                upload_id: "asyncfile-101".into(),
+                completed: 1,
+                total: 100,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(
+            app.threads[0].messages[0]
+                .upload_progress
+                .as_ref()
+                .unwrap()
+                .1,
+            100
+        );
+    }
+
+    #[test]
     fn locked_app_updates_business_state_without_unlocking() {
         let ctx = egui::Context::default();
         let mut app = ZaloGuiApp::from_context(
@@ -8705,7 +8819,10 @@ mod audit_lock_tests {
         let (tx, rx) = channel();
         app.event_rx = rx;
         app.lock_guard.lock();
+        app.is_logged_in = true;
         tx.send(GuiEvent::UploadProgress {
+            owner: app.user_uin.clone(),
+            runtime_id: app.account_runtime_id,
             upload_id: "upload".into(),
             completed: 42,
             total: 100,

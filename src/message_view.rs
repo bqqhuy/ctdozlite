@@ -381,6 +381,7 @@ pub enum FileCategory {
     PowerPoint,
     Excel,
     Cad,
+    Zip,
     Other,
 }
 
@@ -417,6 +418,7 @@ pub fn file_category(name: &str) -> FileCategory {
         "ppt" | "pptx" => FileCategory::PowerPoint,
         "xls" | "xlsx" => FileCategory::Excel,
         "dwg" | "dxf" => FileCategory::Cad,
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => FileCategory::Zip,
         _ => FileCategory::Other,
     }
 }
@@ -428,6 +430,7 @@ pub fn file_category_label(category: FileCategory) -> &'static str {
         FileCategory::PowerPoint => "PowerPoint",
         FileCategory::Excel => "Excel",
         FileCategory::Cad => "CAD",
+        FileCategory::Zip => "Tệp nén",
         FileCategory::Other => "Tệp",
     }
 }
@@ -441,6 +444,10 @@ fn mime_file_category(mime: &str) -> FileCategory {
         .to_ascii_lowercase()
         .as_str()
     {
+        "application/zip"
+        | "application/x-zip-compressed"
+        | "application/x-7z-compressed"
+        | "application/vnd.rar" => FileCategory::Zip,
         "application/pdf" => FileCategory::Pdf,
         "application/msword"
         | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
@@ -1343,7 +1350,7 @@ mod media_url_tests {
         assert_eq!(file_category("slides.PPT"), FileCategory::PowerPoint);
         assert_eq!(file_category("budget.XLSX"), FileCategory::Excel);
         assert_eq!(file_category("plan.DWG"), FileCategory::Cad);
-        assert_eq!(file_category("archive.zip"), FileCategory::Other);
+        assert_eq!(file_category("archive.zip"), FileCategory::Zip);
         assert_eq!(file_category("report.PDF?download=1"), FileCategory::Pdf);
         assert_eq!(file_category("plan.dwg#preview"), FileCategory::Cad);
         assert_eq!(file_category("no-extension"), FileCategory::Other);
@@ -1385,7 +1392,7 @@ mod media_url_tests {
         media.original = Some("https://example.com/archive.zip".into());
         assert_eq!(
             attachment_file_category(&media, &message),
-            FileCategory::Other
+            FileCategory::Zip
         );
     }
 }

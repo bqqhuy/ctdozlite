@@ -283,9 +283,11 @@ impl Drop for ActiveUploadRegistration {
 static ACTIVE_UPLOADS: std::sync::Mutex<
     Option<std::collections::HashMap<String, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 > = std::sync::Mutex::new(None);
-static PROGRESS_CHANNEL: std::sync::Mutex<
-    Option<tokio::sync::broadcast::Sender<(String, u64, u64)>>,
-> = std::sync::Mutex::new(None);
+/// Account/runtime-scoped transfer bytes; completion does not imply message delivery.
+pub type UploadProgress = (String, usize, String, u64, u64);
+
+static PROGRESS_CHANNEL: std::sync::Mutex<Option<tokio::sync::broadcast::Sender<UploadProgress>>> =
+    std::sync::Mutex::new(None);
 
 /// Register an active upload session so it can be monitored or cancelled.
 pub fn register_active_upload(upload_id: &str) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
@@ -327,16 +329,28 @@ pub fn is_upload_cancelled(upload_id: &str) -> bool {
     false
 }
 
-/// Report upload progress (upload_id, bytes sent, total bytes).
-pub fn report_progress(upload_id: &str, completed: u64, total: u64) {
+/// Report byte progress scoped to the originating account and session runtime.
+pub fn report_progress(
+    owner: &str,
+    runtime_id: usize,
+    upload_id: &str,
+    completed: u64,
+    total: u64,
+) {
     let guard = PROGRESS_CHANNEL.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tx) = guard.as_ref() {
-        let _ = tx.send((upload_id.to_string(), completed, total));
+        let _ = tx.send((
+            owner.to_owned(),
+            runtime_id,
+            upload_id.to_string(),
+            completed,
+            total,
+        ));
     }
 }
 
 /// Subscribe to upload progress events across all active uploads.
-pub fn subscribe_progress() -> tokio::sync::broadcast::Receiver<(String, u64, u64)> {
+pub fn subscribe_progress() -> tokio::sync::broadcast::Receiver<UploadProgress> {
     let mut guard = PROGRESS_CHANNEL.lock().unwrap_or_else(|e| e.into_inner());
     let tx = guard.get_or_insert_with(|| {
         let (tx, _) = tokio::sync::broadcast::channel(256);
@@ -483,8 +497,17 @@ mod resumable_tests {
     #[tokio::test]
     async fn progress_reporting_broadcasts_to_subscribers() {
         let mut rx = subscribe_progress();
-        report_progress("test-prog-1", 1024, 4096);
+        report_progress("test-owner", 7, "test-prog-1", 1024, 4096);
         let event = rx.recv().await.unwrap();
-        assert_eq!(event, ("test-prog-1".to_string(), 1024, 4096));
+        assert_eq!(
+            event,
+            (
+                "test-owner".to_string(),
+                7,
+                "test-prog-1".to_string(),
+                1024,
+                4096
+            )
+        );
     }
 }

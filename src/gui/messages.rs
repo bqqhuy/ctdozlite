@@ -1,5 +1,31 @@
 use super::*;
 
+/// Upload bytes are not a server delivery or zCloud storage confirmation.
+fn render_upload_progress(ui: &mut egui::Ui, msg: &ChatMessage) {
+    if let Some((_id, completed, total)) = &msg.upload_progress {
+        if *total > 0 {
+            ui.add(
+                egui::ProgressBar::new((*completed as f64 / *total as f64).clamp(0.0, 1.0) as f32)
+                    .text(format!(
+                        "{} / {}",
+                        crate::chat::format_file_size(*completed),
+                        crate::chat::format_file_size(*total)
+                    )),
+            );
+        }
+        if completed >= total && *total > 0 {
+            ui.label("Đã tải dữ liệu; đang chờ xác nhận gửi…");
+        } else {
+            ui.label("Đang tải lên…");
+        }
+    } else {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(crate::i18n::tr("Đang gửi / chờ tải lên…"));
+        });
+    }
+}
+
 /// Original vector page/fold artwork, shared by attachment cards and archive filters.
 pub(super) fn paint_file_category_icon(
     painter: &egui::Painter,
@@ -12,6 +38,7 @@ pub(super) fn paint_file_category_icon(
         FileCategory::Word => Color32::from_rgb(49, 115, 214),
         FileCategory::PowerPoint => Color32::from_rgb(224, 119, 53),
         FileCategory::Excel => Color32::from_rgb(41, 151, 95),
+        FileCategory::Zip => Color32::from_rgb(184, 139, 36),
         FileCategory::Cad => Color32::from_rgb(156, 88, 202),
         FileCategory::Other => Color32::from_rgb(116, 132, 150),
     };
@@ -49,6 +76,7 @@ pub(super) fn paint_file_category_icon(
         FileCategory::PowerPoint => "P",
         FileCategory::Excel => "X",
         FileCategory::Cad => "CAD",
+        FileCategory::Zip => "ZIP",
         FileCategory::Other => "",
     };
     if label.is_empty() {
@@ -1281,10 +1309,12 @@ pub(super) fn render_chat_bubble(
         crate::message_view::media(msg).kind,
         crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
     );
-    let is_file_card = matches!(
-        msg.link_src.as_deref(),
-        Some("Tập tin Zalo") | Some("Video Zalo")
-    ) || msg.text.trim().starts_with("[Tập tin]")
+    let is_file_card = crate::message_view::media(msg).kind == crate::message_view::MediaKind::File
+        || matches!(
+            msg.link_src.as_deref(),
+            Some("Tập tin Zalo") | Some("Video Zalo")
+        )
+        || msg.text.trim().starts_with("[Tập tin]")
         || msg.text.trim().starts_with("[Video]")
         || msg.text.trim().starts_with("[Tin nhắn thoại]");
     let has_link_card = extract_message_link_view(msg).is_some();
@@ -1575,10 +1605,7 @@ pub(super) fn render_chat_bubble(
                                 } else if msg.delivery
                                     == crate::message_model::DeliveryState::Pending
                                 {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label(crate::i18n::tr("Đang gửi / chờ tải lên…"));
-                                    });
+                                    render_upload_progress(ui, msg);
                                 } else if msg.delivery
                                     == crate::message_model::DeliveryState::DeliveryUnknown
                                 {
@@ -1764,10 +1791,7 @@ pub(super) fn render_chat_bubble(
                                 } else if msg.delivery
                                     == crate::message_model::DeliveryState::Pending
                                 {
-                                    ui.horizontal(|ui| {
-                                        ui.spinner();
-                                        ui.label(crate::i18n::tr("Đang gửi / chờ tải lên…"));
-                                    });
+                                    render_upload_progress(ui, msg);
                                 } else if msg.delivery
                                     == crate::message_model::DeliveryState::DeliveryUnknown
                                 {

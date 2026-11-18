@@ -9,6 +9,9 @@ use crate::session::{obj, Session};
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
+    /// Transient byte progress; never persisted as a delivery or cloud receipt.
+    #[serde(skip)]
+    pub upload_progress: Option<(String, u64, u64)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outgoing_job: Option<Box<crate::outgoing::Job>>,
     #[serde(default)]
@@ -2181,12 +2184,24 @@ pub(crate) async fn send_attachment_with_client_id(
                 let _ = st.save_upload_state(&resumable);
             }
             let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
-            crate::upload::report_progress(&upload_id, completed_bytes, total_size);
+            crate::upload::report_progress(
+                s.account_key(),
+                s.runtime_id(),
+                &upload_id,
+                completed_bytes,
+                total_size,
+            );
         }
         if let Some(ref st) = resume_store {
             let _ = st.delete_upload_state(&upload_id);
         }
-        crate::upload::report_progress(&upload_id, total_size, total_size);
+        crate::upload::report_progress(
+            s.account_key(),
+            s.runtime_id(),
+            &upload_id,
+            total_size,
+            total_size,
+        );
         drop(upload_reg);
 
         source.verify().await?;
@@ -2442,13 +2457,25 @@ pub(crate) async fn send_attachment_with_client_id(
             let _ = st.save_upload_state(&resumable);
         }
         let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
-        crate::upload::report_progress(&upload_id, completed_bytes, total_size);
+        crate::upload::report_progress(
+            s.account_key(),
+            s.runtime_id(),
+            &upload_id,
+            completed_bytes,
+            total_size,
+        );
     }
     // Upload complete: remove the checkpoint entry.
     if let Some(ref st) = resume_store {
         let _ = st.delete_upload_state(&upload_id);
     }
-    crate::upload::report_progress(&upload_id, total_size, total_size);
+    crate::upload::report_progress(
+        s.account_key(),
+        s.runtime_id(),
+        &upload_id,
+        total_size,
+        total_size,
+    );
     drop(upload_reg);
 
     source.verify().await?;
@@ -5765,6 +5792,7 @@ pub(crate) fn message_fingerprint(message: &ChatMessage) -> Option<u64> {
         contact_avatar,
         is_e2ee,
         e2ee_identity_changed,
+        upload_progress: _,
     } = message;
     serde_json::to_writer(
         &mut writer,
