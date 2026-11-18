@@ -509,8 +509,11 @@ pub enum GuiEvent {
     PhoneLookupSuccess(crate::chat::PhoneLookupResult),
     PhoneLookupFailed(String),
     FriendStatusChecked {
+        owner: String,
+        runtime_id: usize,
+        generation: u64,
         user_id: String,
-        status: crate::chat::FriendshipStatus,
+        result: Result<crate::chat::FriendshipStatus, String>,
     },
     QuoteSent {
         client_message_id: String,
@@ -1428,7 +1431,8 @@ pub struct ZaloGuiApp {
     loading_link_previews: HashSet<String>,
     dismissed_link_preview_for: String,
     friend_status_map: HashMap<String, crate::chat::FriendshipStatus>,
-    checking_friend_status: HashSet<String>,
+    friend_requests: HashMap<String, (u64, FriendAction)>,
+    friend_check_retry: HashMap<String, std::time::Instant>,
     allow_quit: bool,
     phone_sync_running: bool,
     phone_sync_status: String,
@@ -1784,7 +1788,8 @@ impl ZaloGuiApp {
             loading_link_previews: HashSet::new(),
             dismissed_link_preview_for: String::new(),
             friend_status_map: HashMap::new(),
-            checking_friend_status: HashSet::new(),
+            friend_requests: HashMap::new(),
+            friend_check_retry: HashMap::new(),
             allow_quit: false,
             phone_sync_running: false,
             phone_sync_status: String::new(),
@@ -2354,6 +2359,44 @@ impl ZaloGuiApp {
         }
     }
 
+    fn friend_action_pending(&self, uid: &str) -> bool {
+        self.friend_requests.contains_key(uid)
+    }
+
+    fn request_friend_action(&mut self, uid: &str, action: FriendAction) {
+        if !self.is_logged_in || uid.is_empty() || self.friend_action_pending(uid) {
+            return;
+        }
+        if action == FriendAction::Check
+            && self
+                .friend_check_retry
+                .get(uid)
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(15))
+        {
+            return;
+        }
+        let generation = crate::search::generation();
+        if WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::FriendAction {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                generation,
+                user_id: uid.to_owned(),
+                action,
+            })
+            .is_ok()
+        }) {
+            self.friend_requests
+                .insert(uid.to_owned(), (generation, action));
+        } else {
+            self.friend_check_retry
+                .insert(uid.to_owned(), std::time::Instant::now());
+            if action != FriendAction::Check {
+                self.show_toast("Worker chưa sẵn sàng");
+            }
+        }
+    }
+
     fn save_settings(&mut self) {
         match serde_json::to_value(&self.settings) {
             Ok(settings) => {
@@ -2399,6 +2442,9 @@ impl ZaloGuiApp {
         self.groups_panel = Default::default();
         self.group_entry_panel = Default::default();
         self.contact_panel = Default::default();
+        self.friend_status_map.clear();
+        self.friend_requests.clear();
+        self.friend_check_retry.clear();
         self.privacy_panel = Default::default();
         self.profile_panel = Default::default();
         self.avatar_panel = Default::default();
@@ -3851,7 +3897,6 @@ impl ZaloGuiApp {
                     self.phone_lookup_result = None;
                     self.phone_modal_input.clear();
                     self.friend_status_map.clear();
-                    self.checking_friend_status.clear();
                     self.loading_link_previews.clear();
                     self.dismissed_link_preview_for.clear();
                     self.dismissed_sticker_suggest_for.clear();
@@ -3925,7 +3970,6 @@ impl ZaloGuiApp {
                     self.phone_lookup_result = None;
                     self.phone_modal_input.clear();
                     self.friend_status_map.clear();
-                    self.checking_friend_status.clear();
                     self.loading_link_previews.clear();
                     self.dismissed_link_preview_for.clear();
                     self.dismissed_sticker_suggest_for.clear();
@@ -5247,12 +5291,45 @@ impl ZaloGuiApp {
                         self.persist_threads_async();
                     }
                 }
-                GuiEvent::FriendStatusChecked { user_id, status } => {
-                    self.checking_friend_status.remove(&user_id);
-                    self.friend_status_map.insert(user_id.clone(), status);
-                    if let Some(ref mut prof) = self.phone_lookup_result {
-                        if prof.user_id == user_id {
-                            prof.friendship = status;
+                GuiEvent::FriendStatusChecked {
+                    owner,
+                    runtime_id,
+                    generation,
+                    user_id,
+                    result,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    let Some(&(active_generation, action)) = self.friend_requests.get(&user_id)
+                    else {
+                        continue;
+                    };
+                    if active_generation != generation {
+                        continue;
+                    }
+                    self.friend_requests.remove(&user_id);
+                    match result {
+                        Ok(status) => {
+                            self.friend_check_retry.remove(&user_id);
+                            self.friend_status_map.insert(user_id.clone(), status);
+                            if let Some(prof) = self
+                                .phone_lookup_result
+                                .as_mut()
+                                .filter(|prof| prof.user_id == user_id)
+                            {
+                                prof.friendship = status;
+                            }
+                        }
+                        Err(error) => {
+                            self.friend_check_retry
+                                .insert(user_id, std::time::Instant::now());
+                            if action != FriendAction::Check {
+                                self.show_toast(error);
+                            }
                         }
                     }
                 }
@@ -9291,5 +9368,78 @@ mod phase3_completion_tests {
         .unwrap();
         app.check_events(&ctx);
         assert!(!app.loading_link_previews.contains(&url));
+    }
+}
+
+#[cfg(test)]
+mod phase5_friend_event_tests {
+    use super::*;
+
+    #[test]
+    fn friend_results_release_pending_preserve_errors_and_reject_stale_scopes() {
+        use crate::chat::FriendshipStatus::{Friend, IncomingPending};
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 11;
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        app.friend_status_map.insert("peer".into(), IncomingPending);
+        app.friend_requests
+            .insert("peer".into(), (7, FriendAction::Accept));
+        for (owner, runtime_id, generation) in
+            [("other", 11, 7), ("owner", 10, 7), ("owner", 11, 6)]
+        {
+            tx.send(GuiEvent::FriendStatusChecked {
+                owner: owner.into(),
+                runtime_id,
+                generation,
+                user_id: "peer".into(),
+                result: Ok(Friend),
+            })
+            .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(app.friend_action_pending("peer"));
+        assert_eq!(app.friend_status_map["peer"], IncomingPending);
+        // A duplicate action cannot replace the active generation.
+        app.request_friend_action("peer", FriendAction::Accept);
+        assert_eq!(app.friend_requests["peer"], (7, FriendAction::Accept));
+        tx.send(GuiEvent::FriendStatusChecked {
+            owner: "owner".into(),
+            runtime_id: 11,
+            generation: 7,
+            user_id: "peer".into(),
+            result: Err("fixture refusal".into()),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.friend_action_pending("peer"));
+        assert_eq!(app.friend_status_map["peer"], IncomingPending);
+        assert!(app.friend_check_retry.contains_key("peer"));
+        app.friend_requests
+            .insert("peer".into(), (8, FriendAction::Check));
+        tx.send(GuiEvent::FriendStatusChecked {
+            owner: "owner".into(),
+            runtime_id: 11,
+            generation: 8,
+            user_id: "peer".into(),
+            result: Ok(Friend),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.friend_status_map["peer"], Friend);
+        assert!(!app.friend_action_pending("peer"));
+        assert!(!app.friend_check_retry.contains_key("peer"));
+        app.clear_presence_state();
+        assert!(app.friend_status_map.is_empty());
+        assert!(app.friend_requests.is_empty());
     }
 }

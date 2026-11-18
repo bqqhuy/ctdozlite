@@ -2679,13 +2679,8 @@ impl ZaloGuiApp {
                     if !is_group
                         && !is_cloud_thread
                         && !self.friend_status_map.contains_key(&thread_id)
-                        && self.checking_friend_status.insert(thread_id.clone())
                     {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::CheckFriendStatus {
-                                user_id: thread_id.clone(),
-                            });
-                        }
+                        self.request_friend_action(&thread_id, FriendAction::Check);
                     }
                     let cur_friendship = if is_group || is_cloud_thread {
                         crate::chat::FriendshipStatus::Friend
@@ -3086,10 +3081,11 @@ impl ZaloGuiApp {
                                         .on_hover_cursor(CursorIcon::PointingHand)
                                         .on_hover_text(crate::i18n::tr("Tìm kiếm tin nhắn trong hội thoại này (Ctrl+F)"))
                                         .clicked()
-                                        || ui.input(|i| {
-                                            (i.modifiers.ctrl || i.modifiers.command)
-                                                && i.key_pressed(Key::F)
-                                        })
+                                        || (!self.is_workspace_input_gated(ctx)
+                                            && ui.input(|i| {
+                                                (i.modifiers.ctrl || i.modifiers.command)
+                                                    && i.key_pressed(Key::F)
+                                            }))
                                     {
                                         self.info_drawer_open = true;
                                         self.drawer_view = DrawerView::SearchInThread;
@@ -3182,14 +3178,7 @@ impl ZaloGuiApp {
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .clicked()
                                                     {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(
-                                                                WorkerCmd::RejectFriend {
-                                                                    user_id: thread_id.clone(),
-                                                                    user_name: thread_name.clone(),
-                                                                },
-                                                            );
-                                                        }
+                                                        self.request_friend_action(&thread_id, FriendAction::Reject);
                                                     }
 
                                                     let acc_btn = egui::Button::new(
@@ -3209,14 +3198,7 @@ impl ZaloGuiApp {
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .clicked()
                                                     {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(
-                                                                WorkerCmd::AcceptFriend {
-                                                                    user_id: thread_id.clone(),
-                                                                    user_name: thread_name.clone(),
-                                                                },
-                                                            );
-                                                        }
+                                                        self.request_friend_action(&thread_id, FriendAction::Accept);
                                                     }
                                                 },
                                             );
@@ -3247,12 +3229,7 @@ impl ZaloGuiApp {
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .clicked()
                                                     {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(WorkerCmd::UndoFriend {
-                                                                user_id: thread_id.clone(),
-                                                                user_name: thread_name.clone(),
-                                                            });
-                                                        }
+                                                        self.request_friend_action(&thread_id, FriendAction::Undo);
                                                     }
                                                 },
                                             );
@@ -3286,16 +3263,7 @@ impl ZaloGuiApp {
                                                         .on_hover_cursor(CursorIcon::PointingHand)
                                                         .clicked()
                                                     {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(WorkerCmd::AddFriend {
-                                                                user_id: thread_id.clone(),
-                                                                user_name: thread_name.clone(),
-                                                            });
-                                                        }
-                                                        self.show_toast(format!(
-                                                            "Đã gửi lời mời kết bạn tới {}",
-                                                            thread_name
-                                                        ));
+                                                        self.request_friend_action(&thread_id, FriendAction::Add);
                                                     }
                                                 },
                                             );
@@ -5800,6 +5768,51 @@ mod sync_and_order_tests {
                 && app.selected_msg_ids.is_empty()
                 && app.timeline_selection_scope.is_none()
         );
+    }
+
+    #[test]
+    fn search_shortcut_does_not_open_a_background_drawer_behind_settings() {
+        let (mut app, ctx) = app_and_context();
+        app.user_uin = "owner".into();
+        app.hidden_panel.view.ready = true;
+        app.threads = vec![Thread {
+            id: "peer".into(),
+            name: "Fixture chat".into(),
+            ..Default::default()
+        }];
+        app.selected_thread_index = 0;
+        for modal in [true, false] {
+            app.settings_modal_open = modal;
+            app.info_drawer_open = false;
+            app.drawer_view = DrawerView::Overview;
+            let modifiers = egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            };
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                    modifiers,
+                    events: vec![egui::Event::Key {
+                        key: Key::F,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers,
+                    }],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let palette = app.palette();
+                    app.render_chat_workspace(ctx, &palette);
+                },
+            );
+            assert_eq!(app.info_drawer_open, !modal);
+            if !modal {
+                assert_eq!(app.drawer_view, DrawerView::SearchInThread);
+            }
+        }
     }
 
     #[test]

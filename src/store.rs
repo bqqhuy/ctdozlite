@@ -371,13 +371,25 @@ impl MessageStore {
             let migration = conn.unchecked_transaction()?;
             // Normalize legacy second-based epochs once so indexed keyset paging
             // has one chronological unit (the wire may use seconds or milliseconds).
+            // Updating message timestamps must not index previously unindexed history.
+            let search_trigger: String = migration.query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='search_message_update'",
+                [],
+                |row| row.get(0),
+            )?;
             migration.execute_batch(
-                "UPDATE messages SET ts=CASE WHEN ts>0 AND ts<10000000000 THEN ts*1000 ELSE ts END;
-                 UPDATE threads SET last_ts=CASE WHEN last_ts>0 AND last_ts<10000000000 THEN last_ts*1000 ELSE last_ts END;
+                "DROP TRIGGER search_message_update;
+                 UPDATE messages SET ts=ts*1000 WHERE ts>0 AND ts<10000000000;
+                 UPDATE search_entries SET ts=ts*1000 WHERE ts>0 AND ts<10000000000;
+                 UPDATE threads SET last_ts=last_ts*1000 WHERE last_ts>0 AND last_ts<10000000000;
+                 DELETE FROM phone_sync_ranges WHERE
+                    (CASE WHEN from_ts>0 AND from_ts<10000000000 THEN from_ts*1000 ELSE from_ts END) >
+                    (CASE WHEN to_ts>0 AND to_ts<10000000000 THEN to_ts*1000 ELSE to_ts END);
                  UPDATE phone_sync_ranges SET from_ts=CASE WHEN from_ts>0 AND from_ts<10000000000 THEN from_ts*1000 ELSE from_ts END,
                      to_ts=CASE WHEN to_ts>0 AND to_ts<10000000000 THEN to_ts*1000 ELSE to_ts END;
                  PRAGMA user_version=14;",
             )?;
+            migration.execute_batch(&search_trigger)?;
             migration.commit()?;
         }
         Ok(Self { conn })
@@ -416,7 +428,7 @@ impl MessageStore {
             anyhow::ensure!(
                 !range.thread_id.is_empty()
                     && range.from_ts >= 0
-                    && range.to_ts >= range.from_ts
+                    && range.to_ts >= 0
                     && normalized_to >= normalized_from,
                 "Invalid phone coverage"
             );
@@ -790,7 +802,8 @@ impl MessageStore {
         let local = |id: &str| id.starts_with("out_") || id.starts_with("local_");
         if local(id) && !local(&row.msg_id) {
             // Do not delete or merge ambiguous pre-existing duplicates from old builds.
-            self.conn.execute("UPDATE messages SET msg_id=?1,ts=CASE WHEN ?4>0 THEN ?4 ELSE ts END WHERE thread_id=?2 AND msg_id=?3 AND NOT EXISTS(SELECT 1 FROM messages WHERE thread_id=?2 AND msg_id=?1)",params![row.msg_id,row.thread_id,id,row.ts])?;
+            let ts = crate::clock::normalize_ts_ms(row.ts);
+            self.conn.execute("UPDATE messages SET msg_id=?1,ts=CASE WHEN ?4>0 THEN ?4 ELSE ts END WHERE thread_id=?2 AND msg_id=?3 AND NOT EXISTS(SELECT 1 FROM messages WHERE thread_id=?2 AND msg_id=?1)",params![row.msg_id,row.thread_id,id,ts])?;
         } else if !local(id) && local(&row.msg_id) {
             row.msg_id = id.clone();
             row.text = text.clone();
@@ -1866,7 +1879,7 @@ impl From<&ChatMessage> for StoredMessage {
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
-            ts: crate::clock::normalize_ts_ms(m.ts),
+            ts: m.ts,
             is_outgoing: m.is_outgoing,
             raw_json,
         }
@@ -1913,7 +1926,12 @@ fn persist_snapshot(
     let transaction = store.conn.unchecked_transaction()?;
     let mut counts = PersistCounts::default();
     for t in threads {
-        let last_ts = t.messages.iter().map(|m| m.ts).max().unwrap_or(0);
+        let last_ts = t
+            .messages
+            .iter()
+            .map(|m| crate::clock::normalize_ts_ms(m.ts))
+            .max()
+            .unwrap_or(0);
         let st = StoredThread {
             thread_id: t.id.clone(),
             name: t.name.clone(),
@@ -2220,7 +2238,7 @@ mod tests {
         let message = |id: &str| ChatMessage {
             id: id.into(),
             text: id.into(),
-            ts: 1000,
+            ts: 1_800_000_001_000,
             ..Default::default()
         };
         let saved = Thread {
@@ -2509,7 +2527,7 @@ mod tests {
                 .iter()
                 .map(|m| m.ts)
                 .collect::<Vec<_>>(),
-            vec![8, 9, 10]
+            vec![8000, 9000, 10000]
         );
         let mut selected = vec![Thread {
             presentation: Default::default(),
@@ -2611,11 +2629,11 @@ mod tests {
 
         let msgs = store.messages_for(thread_id, 10).unwrap();
         assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[0].ts, 100);
+        assert_eq!(msgs[0].ts, 100_000);
         assert_eq!(msgs[0].msg_id, "m2");
-        assert_eq!(msgs[1].ts, 200);
+        assert_eq!(msgs[1].ts, 200_000);
         assert_eq!(msgs[1].msg_id, "m1");
-        assert_eq!(msgs[2].ts, 300);
+        assert_eq!(msgs[2].ts, 300_000);
         assert_eq!(msgs[2].msg_id, "m3");
     }
 
@@ -2742,18 +2760,18 @@ mod identity_tests {
             thread_id: "123".into(),
             name: "Nhóm có tên".into(),
             is_group: true,
-            last_ts: 99,
+            last_ts: 1_900_000_000,
             last_read_msg_id: String::new(),
         };
         store.upsert_thread(&thread).unwrap();
         thread.name = "Nhóm 123".into();
-        thread.last_ts = 1;
+        thread.last_ts = 1_800_000_000;
         store.upsert_thread(&thread).unwrap();
         thread.name.clear();
         store.upsert_thread(&thread).unwrap();
         let saved = store.all_threads().unwrap();
         assert_eq!(saved[0].name, "Nhóm có tên");
-        assert_eq!(saved[0].last_ts, 99);
+        assert_eq!(saved[0].last_ts, 1_900_000_000_000);
     }
     #[test]
     fn migrates_legacy_database_without_losing_messages() {
@@ -3028,7 +3046,7 @@ mod conversation_menu_tests {
                     .conn
                     .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                     .unwrap(),
-                13
+                14
             );
             assert!(store.conversation_preferences().unwrap().is_empty());
             assert_eq!(store.messages_for("a", 10).unwrap()[0].text, "a");
@@ -3072,7 +3090,7 @@ mod send_identity_tests {
             let saved = store.messages_for("thread-identity", 20).unwrap();
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].msg_id, "server-1");
-            assert_eq!(saved[0].ts, 2000);
+            assert_eq!(saved[0].ts, 2_000_000);
             let mut hydrated = vec![Thread {
                 id: "thread-identity".into(),
                 ..Default::default()
@@ -3223,7 +3241,7 @@ mod phone_resume_tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, u32>(0))
                 .unwrap(),
-            13
+            14
         );
         assert_eq!(
             store.messages_for("migration-thread", 20).unwrap()[0].text,
@@ -3248,7 +3266,7 @@ mod phone_resume_tests {
         let reopened = MessageStore::open(&path).unwrap();
         assert_eq!(
             reopened.phone_sync_ranges().unwrap()["group/fake"].from_ts,
-            100
+            100_000
         );
         assert!(MessageStore::open(root.join("account-b.db"))
             .unwrap()
@@ -3657,6 +3675,80 @@ mod archive_history_paging_tests {
     use super::*;
 
     #[test]
+    fn epoch_migration_preserves_lazy_search_and_normalizes_indexed_rows_once() {
+        let fixture = tempfile::tempdir().unwrap();
+        let path = fixture.path().join("history.db");
+        {
+            let store = MessageStore::open(&path).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "INSERT INTO messages(msg_id,thread_id,text,ts,is_outgoing) VALUES
+                    ('indexed','thread','indexed content',1800000000,0),
+                    ('lazy','thread','lazy content',1800000100,0);
+                 DELETE FROM search_entries WHERE msg_id='lazy';
+                 UPDATE search_index_state SET is_complete=0;
+                 PRAGMA user_version=13;",
+                )
+                .unwrap();
+        }
+        for _ in 0..2 {
+            let store = MessageStore::open(&path).unwrap();
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM search_entries WHERE msg_id='lazy'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                store
+                    .conn
+                    .query_row(
+                        "SELECT ts FROM search_entries WHERE msg_id='indexed'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1_800_000_000_000
+            );
+            assert_eq!(
+                store.messages_for("thread", 10).unwrap()[1].ts,
+                1_800_000_100_000
+            );
+            assert!(!store
+                .conn
+                .query_row(
+                    "SELECT is_complete FROM search_index_state WHERE id=1",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap());
+        }
+        let store = MessageStore::open(&path).unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE messages SET text='updated indexed content' WHERE msg_id='indexed'",
+                [],
+            )
+            .unwrap();
+        assert!(store
+            .conn
+            .query_row(
+                "SELECT search_text FROM search_entries WHERE msg_id='indexed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .contains("updated"));
+    }
+
+    #[test]
     fn archive_history_keyset_reads_older_messages_once_and_keeps_thread_scope() {
         let store = MessageStore::open(":memory:").unwrap();
         for thread in ["thread-a", "thread-b"] {
@@ -3745,7 +3837,7 @@ mod archive_history_paging_tests {
             client_message_id: "client-older".into(),
             sender: "User".into(),
             text: "old local media".into(),
-            ts: 1000,
+            ts: 1_800_000_001_000,
             ..Default::default()
         };
         let mut row = StoredMessage::from(&message);
@@ -3753,7 +3845,7 @@ mod archive_history_paging_tests {
         store.upsert_message(&row).unwrap();
         // Mark the newest page expired without deleting it, as a concurrent expiry can do.
         row.msg_id = "msg-newer".into();
-        row.ts = 2000;
+        row.ts = 1_800_000_002_000;
         store.upsert_message(&row).unwrap();
         store
             .conn

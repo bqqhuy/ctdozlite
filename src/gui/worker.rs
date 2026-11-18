@@ -11,6 +11,65 @@ fn voice_send_session_matches(
     session_active && actual_owner == expected_owner && actual_runtime_id == expected_runtime_id
 }
 
+/// Relationship lookup or one explicitly selected friend action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FriendAction {
+    Check,
+    Add,
+    Accept,
+    Reject,
+    Undo,
+}
+
+fn friend_action_matches_status(
+    action: FriendAction,
+    status: crate::chat::FriendshipStatus,
+) -> bool {
+    use crate::chat::FriendshipStatus::{IncomingPending, OutgoingPending, Stranger};
+    matches!(
+        (action, status),
+        (FriendAction::Add, Stranger)
+            | (FriendAction::Accept | FriendAction::Reject, IncomingPending)
+            | (FriendAction::Undo, OutgoingPending)
+    )
+}
+
+async fn run_friend_action(
+    session: &Session,
+    user_id: &str,
+    action: FriendAction,
+) -> Result<crate::chat::FriendshipStatus, String> {
+    use crate::chat::{self, FriendshipStatus};
+
+    let read_status = || async {
+        match chat::check_friendship_status(session, user_id).await {
+            Ok(status) if status != FriendshipStatus::Unknown => Ok(status),
+            _ => Err("Chưa xác định được trạng thái kết bạn".to_owned()),
+        }
+    };
+    let status = read_status().await?;
+    if action == FriendAction::Check || !friend_action_matches_status(action, status) {
+        // A stale row may offer an action that the current relationship no longer permits.
+        return Ok(status);
+    }
+    let response = match action {
+        FriendAction::Check => return Ok(status),
+        FriendAction::Add => {
+            chat::send_friend_request(session, user_id, "Xin chào, kết bạn với mình nhé!").await
+        }
+        FriendAction::Accept => chat::accept_friend_request(session, user_id).await,
+        FriendAction::Reject => chat::reject_friend_request(session, user_id).await,
+        FriendAction::Undo => chat::undo_friend_request(session, user_id).await,
+    };
+    response
+        .and_then(crate::api_response::checked_data)
+        .map_err(|_| {
+            "Chưa xác nhận được thao tác kết bạn. Kiểm tra lại trạng thái trước khi thử tiếp."
+                .to_owned()
+        })?;
+    read_status().await
+}
+
 pub enum WorkerCmd {
     PrepareE2eeTrial {
         owner: String,
@@ -521,24 +580,12 @@ pub enum WorkerCmd {
     EndCall {
         call_id: Option<i64>,
     },
-    AddFriend {
+    FriendAction {
+        owner: String,
+        runtime_id: usize,
+        generation: u64,
         user_id: String,
-        user_name: String,
-    },
-    CheckFriendStatus {
-        user_id: String,
-    },
-    AcceptFriend {
-        user_id: String,
-        user_name: String,
-    },
-    RejectFriend {
-        user_id: String,
-        user_name: String,
-    },
-    UndoFriend {
-        user_id: String,
-        user_name: String,
+        action: FriendAction,
     },
     PersistThreads {
         owner: String,
@@ -4539,126 +4586,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::CheckFriendStatus { user_id } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
+                        WorkerCmd::FriendAction {
+                            owner, runtime_id, generation, user_id, action,
+                        } => {
+                            let s = session.lock().await.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                if let Ok(status) =
-                                    crate::chat::check_friendship_status(&s, &user_id).await
+                                let result = if s.login.is_some()
+                                    && s.account_key() == owner
+                                    && s.runtime_id() == runtime_id
+                                    && !user_id.is_empty()
+                                    && user_id != owner
                                 {
-                                    let _ = gui_tx_clone
-                                        .send(GuiEvent::FriendStatusChecked { user_id, status });
-                                    ctx_clone.request_repaint();
-                                }
-                            });
-                        }
-                        WorkerCmd::AcceptFriend { user_id, user_name } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                match crate::chat::accept_friend_request(&s, &user_id).await {
-                                    Ok(_) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
-                                            user_id,
-                                            status: crate::chat::FriendshipStatus::Friend,
-                                        });
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã đồng ý kết bạn với {user_name}!"
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Không thể đồng ý kết bạn với {user_name}: {e}"
-                                        )));
-                                    }
-                                }
-                                ctx_clone.request_repaint();
-                            });
-                        }
-                        WorkerCmd::RejectFriend { user_id, user_name } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                if crate::chat::reject_friend_request(&s, &user_id)
-                                    .await
-                                    .is_ok()
-                                {
-                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
-                                        user_id,
-                                        status: crate::chat::FriendshipStatus::Stranger,
-                                    });
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                        "Đã từ chối lời mời kết bạn của {user_name}."
-                                    )));
-                                    ctx_clone.request_repaint();
-                                }
-                            });
-                        }
-                        WorkerCmd::UndoFriend { user_id, user_name } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                if crate::chat::undo_friend_request(&s, &user_id).await.is_ok() {
-                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
-                                        user_id,
-                                        status: crate::chat::FriendshipStatus::Stranger,
-                                    });
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                        "Đã hủy lời mời kết bạn tới {user_name}."
-                                    )));
-                                    ctx_clone.request_repaint();
-                                }
-                            });
-                        }
-                        WorkerCmd::AddFriend { user_id, user_name } => {
-                            let session_clone = session.clone();
-                            let gui_tx_clone = gui_tx.clone();
-                            let ctx_clone = egui_ctx.clone();
-                            tokio::spawn(async move {
-                                let s = session_clone.lock().await.clone();
-                                // Check if there is an incoming request we can accept directly
-                                if crate::chat::accept_friend_request(&s, &user_id).await.is_ok() {
-                                    let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
-                                        user_id,
-                                        status: crate::chat::FriendshipStatus::Friend,
-                                    });
-                                    let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                        "Đã đồng ý kết bạn với {user_name}! Bạn có thể gọi lại ngay."
-                                    )));
-                                    ctx_clone.request_repaint();
-                                    return;
-                                }
-                                match crate::chat::send_friend_request(
-                                    &s,
-                                    &user_id,
-                                    "Xin chào, kết bạn với mình nhé!",
-                                )
-                                .await
-                                {
-                                    Ok(_) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::FriendStatusChecked {
-                                            user_id: user_id.clone(),
-                                            status: crate::chat::FriendshipStatus::OutgoingPending,
-                                        });
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã gửi lời mời kết bạn tới {user_name} ({user_id})."
-                                        )));
-                                    }
-                                    Err(e) => {
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Không thể gửi lời mời kết bạn tới {user_name}: {e}"
-                                        )));
-                                    }
-                                }
-                                ctx_clone.request_repaint();
+                                    run_friend_action(&s, &user_id, action).await
+                                } else {
+                                    Err("Phiên hoặc người dùng không còn hợp lệ".into())
+                                };
+                                let _ = events.send(GuiEvent::FriendStatusChecked {
+                                    owner, runtime_id, generation, user_id, result,
+                                });
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::LookupPhone { phone } => {
@@ -4809,6 +4757,60 @@ mod lifecycle_tests {
         task.abort();
         let _ = task.await;
         assert!(!flag.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod friend_action_tests {
+    use super::*;
+    use crate::chat::FriendshipStatus::{
+        Friend, IncomingPending, OutgoingPending, Stranger, Unknown,
+    };
+
+    #[test]
+    fn only_explicit_action_for_current_relationship_can_mutate() {
+        assert!(friend_action_matches_status(FriendAction::Add, Stranger));
+        assert!(friend_action_matches_status(
+            FriendAction::Accept,
+            IncomingPending
+        ));
+        assert!(friend_action_matches_status(
+            FriendAction::Reject,
+            IncomingPending
+        ));
+        assert!(friend_action_matches_status(
+            FriendAction::Undo,
+            OutgoingPending
+        ));
+        for status in [Unknown, Friend, IncomingPending, OutgoingPending, Stranger] {
+            assert!(!friend_action_matches_status(FriendAction::Check, status));
+            if status != Stranger {
+                assert!(!friend_action_matches_status(FriendAction::Add, status));
+            }
+            if status != IncomingPending {
+                assert!(!friend_action_matches_status(FriendAction::Accept, status));
+                assert!(!friend_action_matches_status(FriendAction::Reject, status));
+            }
+            if status != OutgoingPending {
+                assert!(!friend_action_matches_status(FriendAction::Undo, status));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn friend_action_fails_without_an_authenticated_session() {
+        let session = Session::new(false, false, false).unwrap();
+        for action in [
+            FriendAction::Check,
+            FriendAction::Add,
+            FriendAction::Accept,
+            FriendAction::Reject,
+            FriendAction::Undo,
+        ] {
+            assert!(run_friend_action(&session, "friend-fixture", action)
+                .await
+                .is_err());
+        }
     }
 }
 

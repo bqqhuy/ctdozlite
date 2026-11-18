@@ -128,8 +128,11 @@ impl ZaloGuiApp {
         let groups = count(ContactsTab::Groups);
         let friend_requests_count = self
             .friend_status_map
-            .values()
-            .filter(|s| **s == crate::chat::FriendshipStatus::IncomingPending)
+            .iter()
+            .filter(|(uid, status)| {
+                **status == crate::chat::FriendshipStatus::IncomingPending
+                    && self.private_access(uid, false)
+            })
             .count();
         let group_invitations_count = self
             .group_entry_panel
@@ -739,6 +742,7 @@ impl ZaloGuiApp {
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.is_group)
+            .filter(|(_, t)| self.private_access(&t.id, false))
             .filter(|(_, t)| {
                 self.friend_status_map.get(&t.id)
                     == Some(&crate::chat::FriendshipStatus::IncomingPending)
@@ -754,6 +758,7 @@ impl ZaloGuiApp {
 
         for (uid, &status) in &self.friend_status_map {
             if status == crate::chat::FriendshipStatus::IncomingPending
+                && self.private_access(uid, false)
                 && !incoming_requests.iter().any(|(_, tid, _)| tid == uid)
             {
                 let name = self.resolve_contact_name(uid, uid).to_owned();
@@ -767,6 +772,7 @@ impl ZaloGuiApp {
             .iter()
             .enumerate()
             .filter(|(_, t)| !t.is_group)
+            .filter(|(_, t)| self.private_access(&t.id, false))
             .filter(|(_, t)| {
                 self.friend_status_map.get(&t.id)
                     == Some(&crate::chat::FriendshipStatus::OutgoingPending)
@@ -782,6 +788,7 @@ impl ZaloGuiApp {
 
         for (uid, &status) in &self.friend_status_map {
             if status == crate::chat::FriendshipStatus::OutgoingPending
+                && self.private_access(uid, false)
                 && !outgoing_requests.iter().any(|(_, tid, _)| tid == uid)
             {
                 let name = self.resolve_contact_name(uid, uid).to_owned();
@@ -867,13 +874,11 @@ impl ZaloGuiApp {
                                         .fill(pal.accent_online)
                                         .rounding(Rounding::same(6.0))
                                         .min_size(Vec2::new(76.0, 28.0));
-                                        if ui.add(acc_btn).clicked() {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::AcceptFriend {
-                                                    user_id: uid.clone(),
-                                                    user_name: name.clone(),
-                                                });
-                                            }
+                                        if ui
+                                            .add_enabled(!self.friend_action_pending(uid), acc_btn)
+                                            .clicked()
+                                        {
+                                            self.request_friend_action(uid, FriendAction::Accept);
                                         }
 
                                         // Reject button
@@ -886,13 +891,11 @@ impl ZaloGuiApp {
                                         .stroke(Stroke::new(1.0_f32, pal.border))
                                         .rounding(Rounding::same(6.0))
                                         .min_size(Vec2::new(68.0, 28.0));
-                                        if ui.add(rej_btn).clicked() {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::RejectFriend {
-                                                    user_id: uid.clone(),
-                                                    user_name: name.clone(),
-                                                });
-                                            }
+                                        if ui
+                                            .add_enabled(!self.friend_action_pending(uid), rej_btn)
+                                            .clicked()
+                                        {
+                                            self.request_friend_action(uid, FriendAction::Reject);
                                         }
 
                                         // Optional chat button if thread exists
@@ -979,13 +982,11 @@ impl ZaloGuiApp {
                                         .stroke(Stroke::new(1.0_f32, pal.border))
                                         .rounding(Rounding::same(6.0))
                                         .min_size(Vec2::new(76.0, 28.0));
-                                        if ui.add(undo_btn).clicked() {
-                                            if let Some(tx) = WORKER_TX.get() {
-                                                let _ = tx.send(WorkerCmd::UndoFriend {
-                                                    user_id: uid.clone(),
-                                                    user_name: name.clone(),
-                                                });
-                                            }
+                                        if ui
+                                            .add_enabled(!self.friend_action_pending(uid), undo_btn)
+                                            .clicked()
+                                        {
+                                            self.request_friend_action(uid, FriendAction::Undo);
                                         }
                                     });
                                 });

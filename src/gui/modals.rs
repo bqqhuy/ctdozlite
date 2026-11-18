@@ -720,14 +720,8 @@ impl ZaloGuiApp {
             self.show_toast(format!("Đã mở cuộc trò chuyện với {opened_name}"));
         }
 
-        if let Some((uid, uname)) = add_friend_user {
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::AddFriend {
-                    user_id: uid,
-                    user_name: uname.clone(),
-                });
-            }
-            self.show_toast(format!("Đang gửi lời mời kết bạn tới {uname}…"));
+        if let Some((uid, _)) = add_friend_user {
+            self.request_friend_action(&uid, FriendAction::Add);
         }
 
         if !open {
