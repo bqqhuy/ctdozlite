@@ -84,11 +84,11 @@ fn extract_shared_media_and_links(thread: &Thread) -> (SharedPhotos, SharedFiles
                     m.clone(),
                 ));
             } else {
-                let title = if m.link_url.is_some() {
-                    m.text.clone()
-                } else {
-                    m.text.trim().to_string()
-                };
+                let title = m
+                    .link_title
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| m.text.trim().to_string());
                 links.push((url, title, m.clone()));
             }
         }
@@ -7426,7 +7426,7 @@ impl ZaloGuiApp {
                 video_state: None,
             });
         }
-        let selection_key = format!("photo:{}:{}", message.id, tkey);
+        let selection_key = format!("photo:{}:{}:{}", d_id, message.id, tkey);
         let selected = self.drawer_media_selected.contains(&selection_key);
         if self.drawer_media_selection_mode && selected {
             ui.painter().rect_stroke(
@@ -7492,7 +7492,8 @@ impl ZaloGuiApp {
         let category = crate::message_view::file_category(fname);
         let category_label = crate::message_view::file_category_label(category);
         let selection_key = format!(
-            "file:{}:{}",
+            "file:{}:{}:{}",
+            d_id,
             msg.id,
             media.original.as_deref().unwrap_or(fname)
         );
@@ -7588,7 +7589,7 @@ impl ZaloGuiApp {
         &mut self,
         ui: &mut egui::Ui,
         url: &str,
-        _title: &str,
+        title: &str,
         msg: &ChatMessage,
         d_id: &str,
         d_is_group: bool,
@@ -7607,12 +7608,24 @@ impl ZaloGuiApp {
             );
 
             ui.vertical(|ui| {
+                let display_title = if title.trim().is_empty() {
+                    truncate_chars(url, 22)
+                } else {
+                    truncate_chars(title, 42)
+                };
                 ui.label(
-                    RichText::new(truncate_chars(url, 22))
+                    RichText::new(display_title)
                         .size(11.5)
-                        .color(pal.primary_hover)
-                        .underline(),
+                        .color(pal.text_primary),
                 );
+                if !title.trim().is_empty() {
+                    ui.label(
+                        RichText::new(truncate_chars(url, 32))
+                            .size(10.0)
+                            .color(pal.primary_hover)
+                            .underline(),
+                    );
+                }
                 ui.label(
                     RichText::new(msg.display_time())
                         .size(10.0)
@@ -7631,7 +7644,7 @@ impl ZaloGuiApp {
             });
         });
         let message_for_menu = msg.clone();
-        let selection_key = format!("link:{}:{}", msg.id, url);
+        let selection_key = format!("link:{}:{}:{}", d_id, msg.id, url);
         let selection_key_for_menu = selection_key.clone();
         response.response.context_menu(|ui| {
             if ui.button("Chọn nhiều").clicked() {
@@ -9062,6 +9075,26 @@ mod tests {
             .iter()
             .any(|(_, media, msg)| msg.id == "m2"
                 && media.kind == crate::message_view::MediaKind::Photo));
+    }
+
+    #[test]
+    fn shared_links_prefer_cached_metadata_title() {
+        let mut thread = Thread {
+            id: "u-link-title".into(),
+            messages: vec![ChatMessage {
+                id: "m-title".into(),
+                text: "https://example.com/article".into(),
+                link_url: Some("https://example.com/article".into()),
+                link_title: Some("Bài viết đã lưu".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (_, _, links) = extract_shared_media_and_links(&thread);
+        assert_eq!(links[0].1, "Bài viết đã lưu");
+        thread.messages[0].link_title = Some("  ".into());
+        let (_, _, links) = extract_shared_media_and_links(&thread);
+        assert_eq!(links[0].1, "https://example.com/article");
     }
 
     #[test]

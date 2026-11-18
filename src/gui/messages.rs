@@ -1856,7 +1856,7 @@ pub(super) fn bubble_context_menu(
             && !msg.text.trim().is_empty()
             && !msg.text.trim().starts_with('[')
             && ui
-                .button(crate::i18n::tr("🌐 Dịch tin nhắn (Thử nghiệm)"))
+                .button(format!("{} Dịch tin nhắn (Thử nghiệm)", lucide::GLOBE))
                 .clicked()
         {
             action = Some(BubbleAction::TranslateMessage {
@@ -1874,7 +1874,7 @@ pub(super) fn bubble_context_menu(
             && is_voice_msg
             && !voice_url.is_empty()
             && ui
-                .button(crate::i18n::tr("🎙 Chuyển giọng nói thành văn bản"))
+                .button(format!("{} Chuyển giọng nói thành văn bản", lucide::MIC))
                 .clicked()
         {
             action = Some(BubbleAction::TranscribeVoice {

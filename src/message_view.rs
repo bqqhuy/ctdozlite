@@ -89,7 +89,13 @@ pub fn remove_call_logs(t: &mut Thread) {
 
 pub fn summary(m: &ChatMessage) -> String {
     if is_call_log(m) {
-        return String::new();
+        // Keep call history visible in previews; older builds erased these rows
+        // during merge, which made the feature appear unsupported.
+        return if m.text.trim().is_empty() {
+            "[Cuộc gọi]".into()
+        } else {
+            m.text.trim().to_owned()
+        };
     }
     if m.text == "[Tin nhắn đã thu hồi]" {
         return m.text.clone();
@@ -239,11 +245,7 @@ pub fn preview_with_resolver<'a>(
         };
         return t.sidebar_preview_with_reactor(fallback);
     }
-    let last = t
-        .messages
-        .iter()
-        .filter(|m| !is_call_log(m))
-        .max_by_key(|m| m.ts);
+    let last = t.messages.iter().max_by_key(|m| m.ts);
     let last_valid = last.filter(|m| {
         crate::clock::normalize_ts_ms(m.ts)
             >= crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
@@ -771,6 +773,20 @@ mod tests {
         remove_call_logs(&mut thread);
         assert_eq!(thread.messages.len(), 1);
         assert_eq!(thread.messages[0].id, "call_fixture");
+    }
+
+    #[test]
+    fn call_history_remains_in_sidebar_preview() {
+        let thread = Thread {
+            messages: vec![ChatMessage {
+                id: "call_fixture".into(),
+                text: "Cuộc gọi đi (12s)".into(),
+                ts: 1_800_000_000_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(preview(&thread), "Cuộc gọi đi (12s)");
     }
     #[test]
     fn group_preview_uses_sender_of_the_actual_latest_message() {
