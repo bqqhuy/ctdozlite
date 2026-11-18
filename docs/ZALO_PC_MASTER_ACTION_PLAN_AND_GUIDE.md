@@ -20,7 +20,7 @@ kiểm kê độc lập và chạy kiểm tra cục bộ, phạm vi còn lại �
 | :--- | :--- | :--- | :--- |
 | 3 | `SOURCE_AUDIT_CONSENSUS` | MAP-15 và MAP-10–12 đã triển khai; hai auditor GPT-6.1 Sol đồng thuận sau sửa lỗi | Kiểm chứng cuối xem mục 6; native/live latency chưa chạy, không gọi là nghiệm thu thiết bị hoàn tất |
 | 4 | `SOURCE_AUDIT_CONSENSUS` | MAP-13/14 và MAP-16–29 có đường xử lý, kiểm tra quyền/isolation và regression; hai auditor đồng thuận sau sửa | Archive là lịch sử SQLite phân trang, không cam kết đủ server; các fork deviation và native/live ghi trong checklist |
-| 5 | `VERIFICATION_GATE_PENDING` | Contacts/modals và account/store isolation có nền mã; kết quả kiểm chứng snapshot cuối xem checklist | Audit tích hợp Phase 1–4, target isolation, modal input gate, late responses, DNS/chat regression và native acceptance chưa hoàn tất |
+| 5 | `SOURCE_AUDIT_REPAIRED / NATIVE_PENDING` | Contacts 4 tab, centered modal, account/runtime/generation gating và friend-action fail-closed đã được rà soát; regression GUI/store có trong `be3b57d` | Native/live acceptance, audit trực tiếp Zalo PC, destructive/live mutation và binary/device verification vẫn chưa chạy |
 
 Kế hoạch thực thi tuần tự mới: (1) đóng các lỗi và fixture có thể chứng minh của
 Phase 3 nhưng giữ mutation fail-closed khi giao hàng chưa rõ; (2) hoàn thiện
@@ -514,6 +514,13 @@ Kế hoạch này là nguồn chính, khác số phase của overhaul cũ đã g
 | Audit toàn diện Phase 1–5 | CHƯA HOÀN TẤT | Không thay bằng audit hai phase hoặc tests hiện tại |
 
 Không đánh dấu phase hoàn tất hoặc push trước khi hai auditor đồng thuận và checks được ghi. Phần native/live chưa chạy phải còn ghi chưa xác minh, không thay bằng kết quả compile/unit test.
+
+### Cập nhật sau kiểm toán 18/11/2026
+
+- `bc20f73`: giới hạn upload/chunk theo Zalo PC 26.11.12, có bằng chứng E2 tại `re-notes/49-upload-limits-pc-261112.md`; đây là công việc độc lập với MAP-15.
+- `be3b57d`: friend actions đọc lại trạng thái trước mutation, chống gửi lặp, scope owner/runtime/generation và giữ trạng thái khi lỗi; thêm regression cho modal shortcut và schema-14 timestamp/lazy search.
+- Snapshot sau sửa: `cargo test --locked --lib` đạt 959 passed, 10 ignored; `cargo clippy --all-targets --locked -- -D warnings` đạt. Chưa chạy binary/release.
+- Các kiểm tra này chỉ chứng minh source/fixture. Native/live latency, ACK/echo tài khoản thật, Windows hardware, server archive completeness và mutation phá hủy vẫn `PENDING`.
 
 ### Checklist và bằng chứng hiện tại
 

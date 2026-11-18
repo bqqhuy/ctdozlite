@@ -63,6 +63,12 @@ A/B kết luận source không còn finding actionable xác nhận sau các sử
 - Full suite cuối sau sửa test-only: lib 944 passed/0 failed/10 ignored; tổng tất cả test targets 0 failed (28+7+1+9+15+1+3+19+3+1+1 qua các suite). cargo fmt --check exit 0.
 - audit-prepush vòng cuối: hard gates passed (cargo check, Clippy -D warnings, version/tag gates). Kết quả ghi từ exit code thực tế của snapshot này.
 
+## Bổ sung kiểm toán Phase 5 và tích hợp
+
+- Contacts 4 tab và centered modals đã được rà soát source. Friend actions hiện đọc lại quan hệ trước mutation, chống double-submit, phát terminal result khi request lỗi và loại bỏ phản hồi sai account/runtime/generation. Regression nằm trong `src/gui.rs`, `src/gui/contacts.rs`, `src/gui/workspace.rs` và `src/gui/worker.rs`.
+- Schema-14 timestamp migration đã được chỉnh để không làm mất lazy search indexing; fixture seconds/milliseconds chạy qua cùng boundary SQLite.
+- Native keyboard/layout, live server friend status, ACK/echo, destructive actions và binary/device acceptance vẫn chưa thực hiện.
+
 ## Trạng thái nghiệm thu tổng thể
 
 Các MAP đã triển khai trong hai phase được audit A/B đối chiếu; riêng checklist MAP-14 vẫn còn các gap source được liệt kê ở trên và trong coverage matrix. Toàn bộ checklist nghiệm thu KHÔNG được đánh dấu hoàn tất: native/live, archive server completeness, UI parity phần chưa quan sát và các fork deviation vẫn ghi rõ phía trên. Build/test binary native đang hoãn theo lệnh người dùng “chưa build”; không tự gửi/xóa nội dung account thật. Phase5/audit toàn diện Phase1–5 không được gộp nhầm thành audit này.
