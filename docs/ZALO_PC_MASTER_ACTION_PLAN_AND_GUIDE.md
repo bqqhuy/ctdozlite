@@ -10,6 +10,27 @@
 
 ## 1. MỤC TIÊU & NGUYÊN TẮC BẤT BIẾN CHO AGENT ANTIGRAVITY
 
+## 0.1. Tái-baseline phiên triển khai 18/11/2026
+
+Các trạng thái `COMPLETED_MERGED` trong ma trận GUI cũ chỉ là lịch sử của đợt
+16/11 và không thay thế nghiệm thu của phiên này. Sau khi đọc lại mã hiện tại,
+kiểm kê độc lập và chạy kiểm tra cục bộ, phạm vi còn lại được chốt như sau:
+
+| Phase | Trạng thái hiện tại | Bằng chứng đã có | Khoảng trống chặn hoàn tất |
+| :--- | :--- | :--- | :--- |
+| 3 | `PARTIAL_CODE_VERIFIED` | Resolver/candidate diagnostics, preview budget 2s, GET-only bounded failover, reactions/hover/input-gate, E2EE fail-closed; tests xanh | `tt-chat-wpa.chat.zalo.me` vẫn có thể đứng đầu candidate cho POST; chưa có reconciliation an toàn sau DNS/timeout mơ hồ, taxonomy/fixture đầy đủ và native/live latency evidence |
+| 4 | `PARTIAL_UI_FOUNDATION` | Drawer stack, media controls, selection/context-menu nền, labels worker, relative-time helper | Filter còn local trên dữ liệu đã tải; thiếu request identity/pagination, capability/community metadata, shared file icon resolver và xác minh backend/permission cho batch/menu actions |
+| 5 | `VERIFICATION_GATE_PENDING` | Contacts/modals và account/store isolation có nền mã; test hiện tại xanh | Audit tích hợp Phase 1–4, target isolation, modal input gate, late responses, DNS/chat regression và native acceptance chưa hoàn tất |
+
+Kế hoạch thực thi tuần tự mới: (1) đóng các lỗi và fixture có thể chứng minh của
+Phase 3 nhưng giữ mutation fail-closed khi giao hàng chưa rõ; (2) hoàn thiện
+Phase 4 theo thứ tự MAP-22 → MAP-21 → MAP-16 → MAP-18 → MAP-19 → MAP-20 →
+MAP-17 → MAP-23 → MAP-24 → MAP-25 → MAP-26 → MAP-27 → MAP-28 → MAP-29; (3)
+chạy Phase 5 như cổng audit toàn diện, đối chiếu lại toàn bộ Phase 1–4 và chỉ
+đánh dấu mục `native/live verified` khi có bằng chứng tương ứng. `cargo check`,
+`cargo test` và `cargo clippy` đã chạy trên working tree hiện tại; chưa build
+binary/release.
+
 ### 1.1. Mục tiêu tối thượng
 Đạt độ tương đồng tối đa với **Zalo PC gốc (bản 26.11.12)** về mặt trải nghiệm, bố cục thị giác và tương tác người dùng, đặc biệt giải quyết triệt để các lỗi gây khó chịu:
 1. Màn hình khóa cưỡng bức Windows Hello trên mọi máy.

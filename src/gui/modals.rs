@@ -719,9 +719,11 @@ impl ZaloGuiApp {
                                     (SettingsTab::AccountSecurity, lucide::SHIELD_CHECK, "Tài khoản & bảo mật"),
                                     (SettingsTab::Privacy, lucide::LOCK, "Quyền riêng tư"),
                                     (SettingsTab::Sync, lucide::REFRESH, "Đồng bộ tin nhắn"),
+                                    (SettingsTab::DataManagement, lucide::FILE_TEXT, "Quản lý dữ liệu"),
                                     (SettingsTab::Appearance, lucide::PAINTBRUSH, "Giao diện"),
                                     (SettingsTab::Notifications, lucide::BELL, "Thông báo"),
                                     (SettingsTab::Messages, lucide::MESSAGE_SQUARE, "Tin nhắn"),
+                                    (SettingsTab::Calls, lucide::PHONE_CALL, "Cuộc gọi"),
                                     (SettingsTab::Utilities, lucide::SLIDERS, "Tiện ích"),
                                 ];
 
@@ -802,9 +804,11 @@ impl ZaloGuiApp {
                                     SettingsTab::AccountSecurity => "Tài khoản & bảo mật",
                                     SettingsTab::Privacy => "Quyền riêng tư",
                                     SettingsTab::Sync => "Đồng bộ tin nhắn",
+                                    SettingsTab::DataManagement => "Quản lý dữ liệu",
                                     SettingsTab::Appearance => "Cài đặt giao diện",
                                     SettingsTab::Notifications => "Cài đặt thông báo",
                                     SettingsTab::Messages => "Cài đặt tin nhắn",
+                                    SettingsTab::Calls => "Cài đặt cuộc gọi",
                                     SettingsTab::Utilities => "Tiện ích & Gợi ý",
                                 };
                                 if compact {
@@ -817,9 +821,11 @@ impl ZaloGuiApp {
                                                 (SettingsTab::AccountSecurity,"Tài khoản & bảo mật"),
                                                 (SettingsTab::Privacy,"Quyền riêng tư"),
                                                 (SettingsTab::Sync,"Lịch sử tin nhắn"),
+                                                (SettingsTab::DataManagement,"Quản lý dữ liệu"),
                                                 (SettingsTab::Appearance,"Giao diện"),
                                                 (SettingsTab::Notifications,"Thông báo"),
                                                 (SettingsTab::Messages,"Tin nhắn"),
+                                                (SettingsTab::Calls,"Cuộc gọi"),
                                                 (SettingsTab::Utilities,"Tiện ích"),
                                             ] { ui.selectable_value(&mut self.settings_tab,tab,crate::i18n::tr(title)); }
                                         });
@@ -1288,6 +1294,23 @@ impl ZaloGuiApp {
                                                     });
                                                 });
                                         }
+                                        SettingsTab::DataManagement => {
+                                            ui.label(RichText::new(crate::i18n::tr("Quản lý dữ liệu")).color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            ui.label(crate::i18n::tr("Lịch sử trò chuyện và tệp tải xuống được lưu theo từng tài khoản trên thiết bị này."));
+                                            ui.add_space(8.0);
+                                            if ui.button(crate::i18n::tr("Mở công cụ nhập / xuất dữ liệu")).clicked() {
+                                                self.tools.open = true;
+                                                self.tools.tab = 1;
+                                                open = false;
+                                            }
+                                            if ui.button(crate::i18n::tr("Mở kho Media và zCloud")).clicked() {
+                                                self.tools.open = true;
+                                                self.tools.tab = 8;
+                                                open = false;
+                                            }
+                                            ui.label(RichText::new(crate::i18n::tr("Xóa dữ liệu cục bộ chỉ thực hiện trong luồng quản lý tài khoản và phải giữ nguyên phạm vi tài khoản hiện tại.")).color(pal.text_secondary).size(12.0));
+                                        }
                                         SettingsTab::Appearance => {
                                             self.appearance_controls(ui);
                                             ui.label(RichText::new(crate::i18n::tr("Cài đặt giao diện")).color(pal.text_primary).size(13.5).strong());
@@ -1561,6 +1584,18 @@ impl ZaloGuiApp {
                                                         });
                                                     });
                                                 });
+                                        }
+                                        SettingsTab::Calls => {
+                                            ui.label(RichText::new(crate::i18n::tr("Cuộc gọi")).color(pal.text_primary).size(13.5).strong());
+                                            ui.add_space(6.0);
+                                            ui.label(crate::i18n::tr("Thiết bị âm thanh và camera được chọn trong phần cài đặt thiết bị; kiểm tra quyền trước khi bắt đầu cuộc gọi."));
+                                            ui.add_space(8.0);
+                                            if ui.button(crate::i18n::tr("Mở cài đặt thiết bị")).clicked() {
+                                                self.tools.open = true;
+                                                self.tools.tab = 4;
+                                                open = false;
+                                            }
+                                            ui.label(RichText::new(crate::i18n::tr("Tùy chọn codec và quyền truy cập phải theo capability thực tế của thiết bị.")).color(pal.text_secondary).size(12.0));
                                         }
                                         SettingsTab::Utilities => {
                                             ui.label(format!("Phiên bản {} • Windows ARM64",crate::PRODUCT_VERSION));

@@ -109,6 +109,63 @@ pub(super) fn render_sticker_widget(
     }
 }
 
+#[cfg(test)]
+mod copy_payload_tests {
+    use super::*;
+
+    #[test]
+    fn text_messages_copy_text() {
+        let msg = ChatMessage {
+            kind: crate::message_model::MessageKind::Text,
+            text: "hello".into(),
+            link_url: Some("https://example.invalid/preview".into()),
+            ..Default::default()
+        };
+        assert_eq!(copyable_message_payload(&msg), "hello");
+    }
+
+    #[test]
+    fn links_and_media_copy_original_url() {
+        for kind in [
+            crate::message_model::MessageKind::Link,
+            crate::message_model::MessageKind::Photo,
+            crate::message_model::MessageKind::File,
+        ] {
+            let msg = ChatMessage {
+                kind,
+                text: "[placeholder]".into(),
+                link_url: Some("https://cdn.example.invalid/original".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                copyable_message_payload(&msg),
+                "https://cdn.example.invalid/original"
+            );
+        }
+    }
+
+    #[test]
+    fn media_falls_back_to_thumbnail_then_text() {
+        let msg = ChatMessage {
+            kind: crate::message_model::MessageKind::Photo,
+            text: "[Hình ảnh]".into(),
+            link_thumb: Some("https://cdn.example.invalid/thumb".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            copyable_message_payload(&msg),
+            "https://cdn.example.invalid/thumb"
+        );
+
+        let fallback = ChatMessage {
+            kind: crate::message_model::MessageKind::File,
+            text: "report.pdf".into(),
+            ..Default::default()
+        };
+        assert_eq!(copyable_message_payload(&fallback), "report.pdf");
+    }
+}
+
 // Call records are excluded from chat; active calls have their own overlay.
 
 /// Open an `http://` or `https://` URL in the user's default system browser.
@@ -711,7 +768,12 @@ pub(super) fn render_message_body(
         return body_action;
     }
     if media.kind == crate::message_view::MediaKind::File {
-        ui.add(egui::Label::new(RichText::new(&media.name).strong().color(text_col)).wrap());
+        let category = crate::message_view::file_category(&media.name);
+        let category_label = crate::message_view::file_category_label(category);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(category_label).strong().color(text_col));
+            ui.add(egui::Label::new(RichText::new(&media.name).color(text_col)).wrap());
+        });
         if let Some(url) = media.original {
             let is_text_doc = {
                 let ext = media.name.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -1587,6 +1649,7 @@ pub(super) enum BubbleAction {
     RetrySend,
     DoubleClickReply,
     Reply,
+    CopyLink(String),
     Mention,
     JumpToQuoted(String),
     Forward,
@@ -1621,6 +1684,32 @@ pub(super) enum BubbleAction {
         msg_id: String,
         voice_url: String,
     },
+}
+
+fn copyable_message_payload(msg: &ChatMessage) -> String {
+    let payload_url = msg
+        .link_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| {
+            msg.link_thumb
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+        });
+
+    match msg.kind {
+        crate::message_model::MessageKind::Link
+        | crate::message_model::MessageKind::WebContent
+        | crate::message_model::MessageKind::Photo
+        | crate::message_model::MessageKind::Video
+        | crate::message_model::MessageKind::Voice
+        | crate::message_model::MessageKind::File
+        | crate::message_model::MessageKind::Sticker
+        | crate::message_model::MessageKind::Gif => payload_url
+            .map(str::to_owned)
+            .unwrap_or_else(|| msg.text.clone()),
+        _ => msg.text.clone(),
+    }
 }
 
 /// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.
@@ -1723,6 +1812,16 @@ pub(super) fn bubble_context_menu(
             action = Some(BubbleAction::Reply);
             ui.close_menu();
         }
+        let link_for_copy = msg
+            .link_url
+            .clone()
+            .or_else(|| crate::chat::extract_first_url(&msg.text));
+        if let Some(link) = link_for_copy.as_deref() {
+            if ui.button(crate::i18n::tr("Copy link")).clicked() {
+                action = Some(BubbleAction::CopyLink(link.to_owned()));
+                ui.close_menu();
+            }
+        }
         if ui
             .add_enabled(
                 !protected && crate::chat::can_forward_message(msg),
@@ -1791,7 +1890,7 @@ pub(super) fn bubble_context_menu(
             )
             .clicked()
         {
-            ui.ctx().copy_text(msg.text.clone());
+            ui.ctx().copy_text(copyable_message_payload(msg));
             ui.close_menu();
         }
         if ui

@@ -48,6 +48,7 @@ impl ZaloGuiApp {
         if !self.labels_panel.open {
             return;
         }
+        crate::gui::modals::render_modal_backdrop(ctx, "labels_panel_backdrop");
         let mut open = true;
         let mut intent = None;
         egui::Window::new("Phân loại hội thoại")
@@ -58,6 +59,7 @@ impl ZaloGuiApp {
             .max_width((ctx.screen_rect().width() - 32.0).max(180.0))
             .max_height((ctx.screen_rect().height() - 64.0).max(100.0))
             .default_width(480.0_f32.min((ctx.screen_rect().width() - 48.0).max(160.0)))
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                 if ui

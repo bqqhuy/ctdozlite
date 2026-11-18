@@ -82,42 +82,9 @@ fn json_value(v: Value) -> Value {
 }
 
 pub fn remove_call_logs(t: &mut Thread) {
-    let removed: Vec<_> = t
-        .messages
-        .iter()
-        .filter(|m| is_call_log(m))
-        .map(|m| m.id.clone())
-        .collect();
-    if removed.is_empty() && !t.presentation.last_message_id.starts_with("call_") {
-        return;
-    }
-    let old = t.presentation.last_message_id.clone();
-    t.messages.retain(|m| !is_call_log(m));
-    for id in &removed {
-        t.unread.unread_ids.remove(id);
-        t.unread.mention_ids.remove(id);
-    }
-    if old.starts_with("call_")
-        || removed.contains(&old)
-        || t.preview.starts_with("📞")
-        || t.preview.starts_with("📹")
-    {
-        t.presentation.last_message_ts = 0;
-        t.presentation.last_message_id.clear();
-        t.presentation.last_sender.clear();
-        t.presentation.last_sender_id.clear();
-        t.preview = t
-            .messages
-            .last()
-            .map(|m| m.text.clone())
-            .unwrap_or_default();
-        t.time = t
-            .messages
-            .last()
-            .map(|m| m.display_time())
-            .unwrap_or_default();
-    }
-    t.refresh_sidebar_presentation();
+    // Call history is persisted and restored as ordinary message rows. The helper
+    // remains for source compatibility with older callers; it must not delete data.
+    let _ = t;
 }
 
 pub fn summary(m: &ChatMessage) -> String {
@@ -335,6 +302,42 @@ pub enum MediaKind {
     File,
     #[default]
     None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileCategory {
+    Pdf,
+    Word,
+    PowerPoint,
+    Excel,
+    Cad,
+    Other,
+}
+
+pub fn file_category(name: &str) -> FileCategory {
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "pdf" => FileCategory::Pdf,
+        "doc" | "docx" => FileCategory::Word,
+        "ppt" | "pptx" => FileCategory::PowerPoint,
+        "xls" | "xlsx" => FileCategory::Excel,
+        "dwg" | "dxf" => FileCategory::Cad,
+        _ => FileCategory::Other,
+    }
+}
+
+pub fn file_category_label(category: FileCategory) -> &'static str {
+    match category {
+        FileCategory::Pdf => "PDF",
+        FileCategory::Word => "Word",
+        FileCategory::PowerPoint => "PowerPoint",
+        FileCategory::Excel => "Excel",
+        FileCategory::Cad => "CAD",
+        FileCategory::Other => "Tệp",
+    }
 }
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Media {
@@ -749,6 +752,22 @@ mod tests {
         m.id = "call_fixture".into();
         assert!(is_call_log(&m));
     }
+
+    #[test]
+    fn call_history_cleanup_is_non_destructive() {
+        let call = ChatMessage {
+            id: "call_fixture".into(),
+            text: "📞 Cuộc gọi đi (0s)".into(),
+            ..Default::default()
+        };
+        let mut thread = Thread {
+            messages: vec![call],
+            ..Default::default()
+        };
+        remove_call_logs(&mut thread);
+        assert_eq!(thread.messages.len(), 1);
+        assert_eq!(thread.messages[0].id, "call_fixture");
+    }
     #[test]
     fn group_preview_uses_sender_of_the_actual_latest_message() {
         let t = Thread {
@@ -1003,5 +1022,15 @@ mod media_url_tests {
         assert!(!is_video_url("https://user:pass@video.zdn.vn/clip.mp4"));
         assert!(!is_video_url("https://file.zdn.vn/report.xlsx"));
         assert!(!is_video_url("not-a-url"));
+    }
+
+    #[test]
+    fn file_category_handles_known_extensions_case_insensitively() {
+        assert_eq!(file_category("report.PDF"), FileCategory::Pdf);
+        assert_eq!(file_category("brief.docx"), FileCategory::Word);
+        assert_eq!(file_category("slides.PPT"), FileCategory::PowerPoint);
+        assert_eq!(file_category("budget.XLSX"), FileCategory::Excel);
+        assert_eq!(file_category("plan.DWG"), FileCategory::Cad);
+        assert_eq!(file_category("archive.zip"), FileCategory::Other);
     }
 }

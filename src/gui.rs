@@ -802,9 +802,11 @@ enum SettingsTab {
     AccountSecurity,
     Privacy,
     Sync,
+    DataManagement,
     Appearance,
     Notifications,
     Messages,
+    Calls,
     Utilities,
 }
 
@@ -1226,6 +1228,9 @@ pub struct ZaloGuiApp {
     contacts_view_open: bool,
     /// An input method is composing text in the chat composer (Telex/IME preedit).
     composer_ime_active: bool,
+    /// Local rich-composer presentation mode; wire format remains unchanged until a
+    /// server-backed rich-text send contract is verified.
+    composer_format_mode: bool,
     /// Last rendered chat-list identity; a change discards one stale layout pass.
     chat_layout_key: u64,
     chat_geometry_revision: u64,
@@ -1280,6 +1285,13 @@ pub struct ZaloGuiApp {
     info_drawer_open: bool,
     pub drawer_view: DrawerView,
     pub drawer_search_query: String,
+    pub drawer_media_query: String,
+    pub drawer_media_sender: String,
+    pub drawer_media_type: Option<crate::message_view::FileCategory>,
+    pub drawer_media_from: String,
+    pub drawer_media_to: String,
+    pub drawer_media_selection_mode: bool,
+    pub drawer_media_selected: HashSet<String>,
     // Common groups cache (MAP-07)
     common_groups_cache: HashMap<String, Vec<Thread>>,
     common_groups_state: HashMap<String, Option<String>>,
@@ -1571,6 +1583,7 @@ impl ZaloGuiApp {
             unread_only: false,
             contacts_view_open: false,
             composer_ime_active: false,
+            composer_format_mode: false,
             chat_layout_key: 0,
             chat_geometry_revision: 0,
             chat_anchor: None,
@@ -1616,6 +1629,13 @@ impl ZaloGuiApp {
             info_drawer_open: loaded_settings.info_drawer_open,
             drawer_view: DrawerView::Overview,
             drawer_search_query: String::new(),
+            drawer_media_query: String::new(),
+            drawer_media_sender: String::new(),
+            drawer_media_type: None,
+            drawer_media_from: String::new(),
+            drawer_media_to: String::new(),
+            drawer_media_selection_mode: false,
+            drawer_media_selected: HashSet::new(),
             common_groups_cache: HashMap::new(),
             common_groups_state: HashMap::new(),
             common_groups_generations: HashMap::new(),
@@ -2522,7 +2542,25 @@ impl ZaloGuiApp {
                     text,
                     msg_id,
                 } => {
-                    let _ = (thread_id, text, msg_id);
+                    let mut inserted = false;
+                    if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
+                        if !thread.messages.iter().any(|m| m.id == msg_id) {
+                            thread.messages.push(ChatMessage {
+                                id: msg_id,
+                                text,
+                                ts: crate::login::unix_now() * 1000,
+                                is_outgoing: true,
+                                sender: "Bạn".into(),
+                                ..Default::default()
+                            });
+                            thread.messages.sort_by_key(|m| m.ts);
+                            thread.refresh_sidebar_presentation();
+                            inserted = true;
+                        }
+                    }
+                    if inserted {
+                        self.persist_threads_async();
+                    }
                     continue;
                 }
                 event => event,

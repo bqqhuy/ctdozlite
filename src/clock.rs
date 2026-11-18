@@ -52,8 +52,18 @@ where
     else {
         return String::new();
     };
-    if now.saturating_sub(ts) < 86_400_000 {
+    let age = now.saturating_sub(ts);
+    if age < 60_000 {
         return date.format("%H:%M").to_string();
+    }
+    if age < 3_600_000 {
+        return format!("{} phút", age / 60_000);
+    }
+    if age < 86_400_000 {
+        return format!("{} giờ", age / 3_600_000);
+    }
+    if age <= 7 * 86_400_000 {
+        return format!("{} ngày", age / 86_400_000);
     }
     let same_year = timezone
         .timestamp_millis_opt(now)
@@ -152,6 +162,7 @@ mod tests {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use chrono::TimeZone;
     #[test]
     fn vietnam_bubble_sidebar_and_divider_agree_at_1404_without_changing_epoch() {
         let tz = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
@@ -164,5 +175,20 @@ mod regression_tests {
         assert_eq!(divider_label_in(ts, ts, &tz), "Hôm nay • 14:04");
         assert_eq!(message_time_in(ts, &chrono::Utc), "07:04");
         assert_eq!(normalize_ts_ms(ts), ts);
+    }
+
+    #[test]
+    fn sidebar_time_uses_relative_minutes_hours_days_then_dates() {
+        let tz = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+        let now = tz
+            .with_ymd_and_hms(2026, 11, 18, 12, 0, 0)
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(sidebar_time_in(now - 59_000, now, &tz), "11:59");
+        assert_eq!(sidebar_time_in(now - 60_000, now, &tz), "1 phút");
+        assert_eq!(sidebar_time_in(now - 3_600_000, now, &tz), "1 giờ");
+        assert_eq!(sidebar_time_in(now - 86_400_000, now, &tz), "1 ngày");
+        assert_eq!(sidebar_time_in(now - 7 * 86_400_000, now, &tz), "7 ngày");
+        assert_eq!(sidebar_time_in(now - 8 * 86_400_000, now, &tz), "10/11");
     }
 }
