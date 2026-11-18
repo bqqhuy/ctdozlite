@@ -1451,7 +1451,9 @@ pub fn merge_thread_into(
     }
 
     target.messages.retain(|m| m.text != "sendBubbleMessage");
-    target.messages.sort_by_key(|m| m.ts);
+    target
+        .messages
+        .sort_by_key(|m| crate::clock::normalize_ts_ms(m.ts));
 
     if let Some(newest) = target.messages.last() {
         if !newest.text.is_empty() {
@@ -6381,18 +6383,19 @@ fn parse_chat_message_in_context(
             .map(|n| n == 1)
             .unwrap_or(false);
 
-    let ts = it
-        .get("ts")
-        .or_else(|| it.get("cliMsgId"))
-        .or_else(|| it.get("sendTime"))
-        .or_else(|| it.get("serverTime"))
-        .or_else(|| it.get("time"))
-        .and_then(|v| match v {
-            Value::Number(n) => n.as_i64(),
-            Value::String(s) => s.parse::<i64>().ok(),
-            _ => None,
-        })
-        .unwrap_or(0);
+    let ts = crate::clock::normalize_ts_ms(
+        it.get("ts")
+            .or_else(|| it.get("cliMsgId"))
+            .or_else(|| it.get("sendTime"))
+            .or_else(|| it.get("serverTime"))
+            .or_else(|| it.get("time"))
+            .and_then(|v| match v {
+                Value::Number(n) => n.as_i64(),
+                Value::String(s) => s.parse::<i64>().ok(),
+                _ => None,
+            })
+            .unwrap_or(0),
+    );
 
     let time = if ts > 0 {
         crate::clock::message_time(ts)
@@ -6814,7 +6817,8 @@ pub fn merge_previews_with_profile(
     }
     for t in threads.iter_mut() {
         if !t.messages.is_empty() {
-            t.messages.sort_by_key(|m| m.ts);
+            t.messages
+                .sort_by_key(|m| crate::clock::normalize_ts_ms(m.ts));
             if let Some(newest) = t.messages.last() {
                 if !newest.text.is_empty() {
                     t.preview = newest.text.replace('\n', " ");
@@ -6912,7 +6916,9 @@ pub fn merge_group_history_with_profile(
         }
     }
 
-    thread.messages.sort_by_key(|m| m.ts);
+    thread
+        .messages
+        .sort_by_key(|m| crate::clock::normalize_ts_ms(m.ts));
 
     if let Some(newest) = thread.messages.last() {
         if !newest.text.is_empty() {
@@ -7611,6 +7617,40 @@ mod tests {
         merge_thread_into(&mut target, incoming, false);
         let ids: Vec<&str> = target.messages.iter().map(|x| x.id.as_str()).collect();
         assert_eq!(ids, vec!["1", "77", "79", "78"]);
+    }
+
+    #[test]
+    fn merge_thread_into_orders_mixed_epoch_units_chronologically() {
+        let mut target = Thread {
+            id: "mixed-time".into(),
+            messages: vec![ChatMessage {
+                id: "older-millis".into(),
+                ts: 1_800_000_000_000,
+                text: "older".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let incoming = Thread {
+            id: "mixed-time".into(),
+            messages: vec![ChatMessage {
+                id: "newer-seconds".into(),
+                ts: 1_900_000_000,
+                text: "newer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        merge_thread_into(&mut target, incoming, false);
+        assert_eq!(
+            target
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["older-millis", "newer-seconds"]
+        );
+        assert_eq!(target.preview, "newer");
     }
 
     #[test]

@@ -218,7 +218,7 @@ impl MessageStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        anyhow::ensure!(schema <= 13, "Cơ sở dữ liệu cần phiên bản ứng dụng mới hơn");
+        anyhow::ensure!(schema <= 14, "Cơ sở dữ liệu cần phiên bản ứng dụng mới hơn");
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
         )?;
@@ -367,6 +367,19 @@ impl MessageStore {
         if schema <= 13 {
             migrate_thread_read_cursor(&conn, schema < 13)?;
         }
+        if schema < 14 {
+            let migration = conn.unchecked_transaction()?;
+            // Normalize legacy second-based epochs once so indexed keyset paging
+            // has one chronological unit (the wire may use seconds or milliseconds).
+            migration.execute_batch(
+                "UPDATE messages SET ts=CASE WHEN ts>0 AND ts<10000000000 THEN ts*1000 ELSE ts END;
+                 UPDATE threads SET last_ts=CASE WHEN last_ts>0 AND last_ts<10000000000 THEN last_ts*1000 ELSE last_ts END;
+                 UPDATE phone_sync_ranges SET from_ts=CASE WHEN from_ts>0 AND from_ts<10000000000 THEN from_ts*1000 ELSE from_ts END,
+                     to_ts=CASE WHEN to_ts>0 AND to_ts<10000000000 THEN to_ts*1000 ELSE to_ts END;
+                 PRAGMA user_version=14;",
+            )?;
+            migration.commit()?;
+        }
         Ok(Self { conn })
     }
 
@@ -398,8 +411,13 @@ impl MessageStore {
         use rusqlite::OptionalExtension;
         let tx = self.conn.unchecked_transaction()?;
         for (partition, range) in ranges {
+            let normalized_from = crate::clock::normalize_ts_ms(range.from_ts);
+            let normalized_to = crate::clock::normalize_ts_ms(range.to_ts);
             anyhow::ensure!(
-                !range.thread_id.is_empty() && range.from_ts >= 0 && range.to_ts >= range.from_ts,
+                !range.thread_id.is_empty()
+                    && range.from_ts >= 0
+                    && range.to_ts >= range.from_ts
+                    && normalized_to >= normalized_from,
                 "Invalid phone coverage"
             );
             let previous = tx
@@ -417,11 +435,11 @@ impl MessageStore {
                 .optional()?;
             if let Some(old) = previous.filter(|old| old.thread_id == range.thread_id) {
                 anyhow::ensure!(
-                    range.from_ts <= old.to_ts && range.to_ts >= old.from_ts,
+                    normalized_from <= old.to_ts && normalized_to >= old.from_ts,
                     "Disconnected phone coverage"
                 );
             }
-            tx.execute("INSERT INTO phone_sync_ranges(partition_id,thread_id,from_ts,to_ts) VALUES(?1,?2,?3,?4) ON CONFLICT(partition_id) DO UPDATE SET thread_id=excluded.thread_id,from_ts=excluded.from_ts,to_ts=excluded.to_ts",params![partition,range.thread_id,range.from_ts,range.to_ts])?;
+            tx.execute("INSERT INTO phone_sync_ranges(partition_id,thread_id,from_ts,to_ts) VALUES(?1,?2,?3,?4) ON CONFLICT(partition_id) DO UPDATE SET thread_id=excluded.thread_id,from_ts=excluded.from_ts,to_ts=excluded.to_ts",params![partition,range.thread_id,normalized_from,normalized_to])?;
         }
         tx.commit()?;
         Ok(())
@@ -597,6 +615,7 @@ impl MessageStore {
         if self.is_deleted_message(msg)? {
             return Ok(false);
         }
+        let normalized_ts = crate::clock::normalize_ts_ms(msg.ts);
         let rows = self.conn.prepare_cached(
             "INSERT OR IGNORE INTO messages (msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?.execute(
@@ -607,7 +626,7 @@ impl MessageStore {
                 msg.sender_name,
                 msg.text,
                 msg.msg_type,
-                msg.ts,
+                normalized_ts,
                 if msg.is_outgoing { 1 } else { 0 },
                 msg.raw_json,
             ],
@@ -1179,6 +1198,7 @@ impl MessageStore {
 
     /// Insert or update thread metadata.
     pub fn upsert_thread(&self, t: &StoredThread) -> Result<()> {
+        let normalized_last_ts = crate::clock::normalize_ts_ms(t.last_ts);
         self.conn.prepare_cached(
             "INSERT INTO threads (thread_id, name, is_group, last_ts, last_read_msg_id)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1197,7 +1217,7 @@ impl MessageStore {
                 t.thread_id,
                 t.name,
                 if t.is_group { 1 } else { 0 },
-                t.last_ts,
+                normalized_last_ts,
                 t.last_read_msg_id,
             ],
         )?;
@@ -1846,7 +1866,7 @@ impl From<&ChatMessage> for StoredMessage {
             sender_name: m.sender.clone(),
             text: m.text.clone(),
             msg_type,
-            ts: m.ts,
+            ts: crate::clock::normalize_ts_ms(m.ts),
             is_outgoing: m.is_outgoing,
             raw_json,
         }
@@ -3147,6 +3167,29 @@ mod phone_resume_tests {
         store.clear_thread_history("fake-thread").unwrap();
         assert!(store.phone_sync_ranges().unwrap().is_empty());
     }
+
+    #[test]
+    fn phone_sync_ranges_normalize_second_based_epochs_at_write_boundary() {
+        let store = MessageStore::open(":memory:").unwrap();
+        store
+            .save_phone_sync_ranges(&[(
+                "oneone/seconds".into(),
+                range(1_800_000_000, 1_800_000_100),
+            )])
+            .unwrap();
+        let saved = &store.phone_sync_ranges().unwrap()["oneone/seconds"];
+        assert_eq!(saved.from_ts, 1_800_000_000_000);
+        assert_eq!(saved.to_ts, 1_800_000_100_000);
+    }
+
+    #[test]
+    fn phone_sync_ranges_reject_negative_epochs_before_normalization() {
+        let store = MessageStore::open(":memory:").unwrap();
+        assert!(store
+            .save_phone_sync_ranges(&[("negative".into(), range(-1, -1))])
+            .is_err());
+    }
+
     #[test]
     fn schema_four_migrates_without_inventing_coverage_or_changing_messages() {
         let root = std::env::temp_dir().join(format!(
@@ -3650,6 +3693,48 @@ mod archive_history_paging_tests {
             }
         }
         assert_eq!(ids, ["msg-5", "msg-4", "msg-3", "msg-2", "msg-1"]);
+    }
+
+    #[test]
+    fn archive_history_persists_mixed_epoch_units_in_normalized_order() {
+        let store = MessageStore::open(":memory:").unwrap();
+        for (id, ts) in [
+            ("older-millis", 1_800_000_000_000),
+            ("newer-seconds", 1_900_000_000),
+        ] {
+            store
+                .upsert_message(&StoredMessage {
+                    msg_id: id.into(),
+                    thread_id: "thread-mixed".into(),
+                    sender_id: "user-1".into(),
+                    sender_name: "User".into(),
+                    text: id.into(),
+                    msg_type: "chat.text".into(),
+                    ts,
+                    is_outgoing: false,
+                    raw_json: String::new(),
+                })
+                .unwrap();
+        }
+        let page = store.history_page("thread-mixed", None, 2).unwrap();
+        assert_eq!(
+            page.messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            ["newer-seconds", "older-millis"]
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT ts FROM messages WHERE msg_id='newer-seconds'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1_900_000_000_000
+        );
     }
 
     #[test]

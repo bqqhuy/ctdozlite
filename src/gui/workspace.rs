@@ -7,6 +7,18 @@ type SharedFiles = Vec<(crate::message_view::Media, ChatMessage)>;
 type SharedLinks = Vec<(String, String, ChatMessage)>;
 type PhotoRef<'a> = &'a (String, crate::message_view::Media, ChatMessage);
 
+fn archive_message_local_date(ts: i64) -> Option<chrono::NaiveDate> {
+    chrono::DateTime::from_timestamp_millis(crate::clock::normalize_ts_ms(ts))
+        .map(|date| date.with_timezone(&chrono::Local).date_naive())
+}
+
+fn latest_message_by_time(messages: &[ChatMessage]) -> Option<ChatMessage> {
+    messages
+        .iter()
+        .max_by_key(|message| crate::clock::normalize_ts_ms(message.ts))
+        .cloned()
+}
+
 fn group_photos_by_local_date(photos: Vec<PhotoRef<'_>>) -> Vec<(String, Vec<PhotoRef<'_>>)> {
     let mut groups: Vec<(String, Vec<_>)> = Vec::new();
     for photo in photos {
@@ -2093,7 +2105,7 @@ impl ZaloGuiApp {
                             let can_offer_group_invite = !target_group && !target_is_cloud && !target_is_self
                                 && t.presentation.inbox.official_account != Some(true);
                             let target_marked_unread = t.unread.marked_unread;
-                            let target_latest = t.messages.iter().max_by_key(|message| message.ts).cloned();
+                            let target_latest = latest_message_by_time(&t.messages);
                             let is_selected = i == self.selected_thread_index;
                             let is_user_pinned = self.server_pins.rank(&t.id,t.is_group).is_some() || self
                                 .conversation_preferences
@@ -5656,6 +5668,37 @@ mod sync_and_order_tests {
         assert_eq!(groups[1].1.len(), 1);
         assert_ne!(groups[0].0, groups[1].0);
     }
+
+    #[test]
+    fn archive_date_filter_normalizes_second_and_millisecond_timestamps() {
+        let seconds = 1_800_000_000;
+        let milliseconds = seconds * 1000;
+        assert_eq!(
+            archive_message_local_date(seconds),
+            archive_message_local_date(milliseconds)
+        );
+    }
+
+    #[test]
+    fn sidebar_mark_unread_selects_latest_across_timestamp_units() {
+        let messages = [
+            ChatMessage {
+                id: "older-millis".into(),
+                ts: 1_800_000_000_000,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "newer-seconds".into(),
+                ts: 1_800_000_100,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            latest_message_by_time(&messages).map(|message| message.id),
+            Some("newer-seconds".into())
+        );
+    }
+
     fn app_and_context() -> (ZaloGuiApp, egui::Context) {
         let ctx = egui::Context::default();
         let mut app = ZaloGuiApp::from_context(
@@ -9398,9 +9441,10 @@ impl ZaloGuiApp {
                     .deleted_message_ids
                     .contains(&(d_id.to_owned(), message.id.clone()))
         });
-        archive
-            .messages
-            .sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+        archive.messages.sort_by(|a, b| {
+            (crate::clock::normalize_ts_ms(a.ts), &a.id)
+                .cmp(&(crate::clock::normalize_ts_ms(b.ts), &b.id))
+        });
         let (shared_photos, shared_files, shared_links) = extract_shared_media_and_links(&archive);
         ui.horizontal(|ui| {
             let p_sel = tab == MediaTab::Photos;
@@ -9603,9 +9647,7 @@ impl ZaloGuiApp {
             if date_filter_invalid {
                 return false;
             }
-            let Some(date) = chrono::DateTime::from_timestamp_millis(msg.ts)
-                .map(|dt| dt.with_timezone(&chrono::Local).date_naive())
-            else {
+            let Some(date) = archive_message_local_date(msg.ts) else {
                 return false;
             };
             from_date.is_none_or(|from| date >= from) && to_date.is_none_or(|to| date <= to)

@@ -27,11 +27,17 @@ Closing/Escape saves the modal; device and account-lock changes also save explic
   disabled state keeps the existing fallback icon/text and performs no worker
   request. This is a local presentation preference, not a server-side download
   policy.
-* The requested preload-under-30MB setting remains unimplemented because current
-  message projections do not carry a verified content length and the prefetch
-  worker has no authoritative size gate. No fake toggle was exposed. Video mute
-  and capture shortcut/window-scope controls remain native/source gaps pending a
-  verified existing consumer.
+* Zalo PC 26.11.12 E2 bundle evidence records file predownload disabled by
+  default, a 31,457,280-byte file cap, video predownload disabled, and a
+  104,857,600-byte video cap. Its automatic download path also requires the
+  per-account auto-download preference and excludes failed/pending E2EE. The fork
+  still has no equivalent predownload consumer, and current message projections
+  do not consistently carry authoritative content length; therefore no cosmetic
+  toggle is exposed. See `../re-notes/48-pc-261112-phase3-phase4-gap-extraction.md`.
+* The fork already has the `Ctrl+Alt+S` screen-capture action and active-call
+  camera enable/disable path. Native behavior remains unverified. Persistent
+  inline-video mute and capture-window scope are not established by the current
+  extraction and remain ambiguous pending a full PC caller trace.
 
 ## Explicit fork behavior
 

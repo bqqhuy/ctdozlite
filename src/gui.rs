@@ -6132,6 +6132,10 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.is_logged_in && !self.lock_guard.is_locked() {
+            // Sidebar relative-time labels must advance while the window is idle.
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        }
         self.cancel_voice_if_context_changed();
         self.lock_guard.poll_availability();
         // A21 fix: Check and update lock state BEFORE processing input/events/render
