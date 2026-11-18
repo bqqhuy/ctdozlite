@@ -2059,6 +2059,10 @@ pub(crate) async fn send_attachment_with_client_id(
         .await
         .map_err(|_| anyhow::anyhow!("Hàng đợi tải lên đã đóng"))?;
     let mut source = crate::upload::Source::open(file_path).await?;
+    // Zalo PC 26.11.12 upload bounds (re-notes/49-upload-limits-pc-261112.md):
+    // 1 GiB on normal threads, 50 MiB on E2EE threads.  Fail before network work.
+    let e2ee_thread = !is_group && crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id);
+    crate::upload::check_upload_size(source.size, e2ee_thread)?;
     let file_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -2090,7 +2094,7 @@ pub(crate) async fn send_attachment_with_client_id(
         to_id
     };
     let total_size = source.size;
-    let chunk_size: usize = 1_048_576; // 1 MiB chunks
+    let chunk_size: usize = crate::upload::CHUNK; // 3 MiB, khop Zalo PC 26.11.12
     let total_chunks = total_size.div_ceil(chunk_size as u64);
     let target_type = if is_group { 11 } else { 2 };
 

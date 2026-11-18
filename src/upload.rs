@@ -5,7 +5,48 @@ use std::{
     path::Path,
     time::SystemTime,
 };
-pub const CHUNK: usize = 1_048_576;
+/// Chunk size for the Zalo PC chunked uploader.  Zalo PC 26.11.12
+/// (renderer bundle offset 4,281,977, module `C8hE`) configures
+/// `multi_site_api_config.chunk_size: 3145728` (3 MiB) for the same
+/// asyncfile/video upload endpoints the fork uses.  Evidence:
+/// `re-notes/49-upload-limits-pc-261112.md`.
+pub const CHUNK: usize = 3 * 1_048_576;
+
+/// Maximum attachment size for a normal (non-E2EE) chat upload.
+/// Zalo PC 26.11.12: `zcloud_upload_file_max_size: 1073741824` (1 GiB) at
+/// offset 4,281,977 and `newFile.maxFileSize: 1*2**30` at offset 8,020,910.
+pub const MAX_UPLOAD_BYTES: u64 = 1_073_741_824;
+
+/// Maximum attachment size on an E2EE thread without WASM-accelerated crypto.
+/// Zalo PC 26.11.12: `newFile.webUploadFileE2eSizeLimit: 52428800` (50 MiB) at
+/// offset 8,020,910; enforced when `isOnE2ee(thread)` (offset 8,860,424).
+/// The fork ships native Rust crypto instead of WASM, so the conservative
+/// JS-fallback bound is used.
+pub const MAX_UPLOAD_E2EE_BYTES: u64 = 52_428_800;
+
+/// Reject attachments larger than the Zalo PC 26.11.12 upload bound before
+/// any network work.  E2EE threads use the stricter 50 MiB JS-fallback limit
+/// because the encrypted file-upload packet format is not verified yet.
+pub fn check_upload_size(total_size: u64, e2ee_thread: bool) -> Result<()> {
+    let limit = if e2ee_thread {
+        MAX_UPLOAD_E2EE_BYTES
+    } else {
+        MAX_UPLOAD_BYTES
+    };
+    if total_size <= limit {
+        return Ok(());
+    }
+    let kind = if e2ee_thread {
+        "Hội thoại E2EE"
+    } else {
+        "Tập tin"
+    };
+    Err(anyhow::anyhow!(format!(
+        "{kind} vượt giới hạn tải lên của Zalo PC 26.11.12 ({}/{}): hãy nén hoặc gửi qua My Documents.",
+        crate::chat::format_file_size(total_size),
+        crate::chat::format_file_size(limit),
+    )))
+}
 pub struct Source {
     file: tokio::fs::File,
     pub size: u64,
@@ -307,6 +348,20 @@ pub fn subscribe_progress() -> tokio::sync::broadcast::Receiver<(String, u64, u6
 #[cfg(test)]
 mod resumable_tests {
     use super::*;
+
+    #[test]
+    fn upload_size_limits_match_pc_261112_bounds() {
+        assert!(check_upload_size(MAX_UPLOAD_BYTES, false).is_ok());
+        assert!(check_upload_size(MAX_UPLOAD_BYTES + 1, false).is_err());
+        assert!(check_upload_size(MAX_UPLOAD_E2EE_BYTES, true).is_ok());
+        assert!(check_upload_size(MAX_UPLOAD_E2EE_BYTES + 1, true).is_err());
+        let big = 200 * 1_048_576;
+        assert!(check_upload_size(big, false).is_ok());
+        assert!(check_upload_size(big, true).is_err());
+        assert_eq!(CHUNK, 3_145_728);
+        assert_eq!(MAX_UPLOAD_BYTES, 1_073_741_824);
+        assert_eq!(MAX_UPLOAD_E2EE_BYTES, 52_428_800);
+    }
 
     #[test]
     fn checkpoints_are_compact_and_legacy_data_is_normalized() {
