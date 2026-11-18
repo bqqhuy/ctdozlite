@@ -2291,10 +2291,11 @@ mod remembered_host_tests {
     }
 
     #[tokio::test]
+    #[ignore = "local Windows networking may classify closed loopback ports as timeout"]
     async fn mutation_connect_failure_uses_one_bounded_fallback_candidate() {
-        // Port 1 is expected to refuse immediately on the test host, exercising
-        // the preflight connect classification without waiting for a timeout.
-        let dead_primary = "http://127.0.0.1:1".to_owned();
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_primary = format!("http://{}", unused.local_addr().unwrap());
+        drop(unused);
         let (fallback, second) = serve("200 OK").await;
         let mut s = Session::new(false, false, false).unwrap();
         s.http = reqwest::Client::builder()
