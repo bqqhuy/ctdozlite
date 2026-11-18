@@ -1,11 +1,16 @@
 //! Durable outgoing payloads; retries reuse the original client identity.
 use crate::{chat::ChatMessage, message_model::DeliveryState, session::Session};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Payload {
     Text,
+    Formatted {
+        options: crate::rich_text::SendOptions,
+        mentions: Vec<crate::mentions::Mention>,
+        quoted: Option<Box<ChatMessage>>,
+    },
     Mentioned {
         mentions: Vec<crate::mentions::Mention>,
         quoted: Option<Box<ChatMessage>>,
@@ -155,65 +160,310 @@ async fn bounded_link_preview(
 ) -> Option<crate::chat::LinkMetadata> {
     if let Some(metadata) = session.cached_link_preview(url, crate::chat::LinkOrigin::Outgoing) {
         session.record_link_preview_cache_hit();
+        crate::service_resolver::record_current_cache_status(
+            crate::service_resolver::TimingPhase::LinkPreview,
+            true,
+        );
+        crate::service_resolver::record_current_phase(
+            crate::service_resolver::TimingPhase::LinkPreview,
+            std::time::Duration::ZERO,
+            crate::service_resolver::AttemptResult::PreviewCacheHit,
+        );
         return Some(metadata);
     }
+    crate::service_resolver::record_current_cache_status(
+        crate::service_resolver::TimingPhase::LinkPreview,
+        false,
+    );
     let started = std::time::Instant::now();
     let result = match tokio::time::timeout(LINK_PREVIEW_BUDGET, preview).await {
         Ok(Ok(metadata)) => Some(metadata),
         Ok(Err(_)) | Err(_) => None,
     };
     session.record_link_preview_timing(started.elapsed(), result.is_some());
+    crate::service_resolver::record_current_phase(
+        crate::service_resolver::TimingPhase::LinkPreview,
+        started.elapsed(),
+        if result.is_some() {
+            crate::service_resolver::AttemptResult::PreviewReady
+        } else {
+            crate::service_resolver::AttemptResult::PreviewFallback
+        },
+    );
     if let Some(metadata) = &result {
         session.cache_link_preview(url, crate::chat::LinkOrigin::Outgoing, metadata.clone());
     }
     result
 }
 
+/// Record the actual command enqueue, rather than time spent editing a draft.
+/// WorkerSender calls this immediately before enqueue; duplicate commands retain
+/// the first enqueue timestamp. The bounded map stores only keyed intent tags.
+pub(crate) fn mark_queued(message: &ChatMessage) {
+    let Some(tag) = crate::service_resolver::intent_tag(&message.client_message_id) else {
+        return;
+    };
+    let mut queued = queued_intents().lock().unwrap_or_else(|e| e.into_inner());
+    if queued.len() >= 256 {
+        if let Some(oldest) = queued
+            .iter()
+            .min_by_key(|(_, at)| **at)
+            .map(|(tag, _)| tag.clone())
+        {
+            queued.remove(&oldest);
+        }
+    }
+    queued.entry(tag).or_insert_with(std::time::Instant::now);
+}
+fn queued_intents(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static QUEUED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    QUEUED.get_or_init(Default::default)
+}
+fn take_enqueued_at(message: &ChatMessage) -> std::time::Instant {
+    crate::service_resolver::intent_tag(&message.client_message_id)
+        .and_then(|tag| {
+            queued_intents()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&tag)
+        })
+        .unwrap_or_else(std::time::Instant::now)
+}
+fn record_queue_wait(
+    context: &crate::service_resolver::SendTimingContext,
+    enqueued: std::time::Instant,
+) -> Result<()> {
+    let elapsed = enqueued.elapsed();
+    crate::service_resolver::record_queue_phase(context, elapsed);
+    if elapsed > crate::service_resolver::QUEUE_BUDGET {
+        return Err(anyhow::Error::new(SendBudgetElapsed(
+            crate::service_resolver::TimingPhase::QueueWait,
+        ))
+        .context(BeforeMessageSend));
+    }
+    Ok(())
+}
+fn timing_session_scope(session: &Session) -> usize {
+    // Arc pointer addresses can be reused after logout. Include a keyed account
+    // fingerprint so the bounded diagnostic ring cannot expose another owner.
+    let identity = format!("{}:{}", session.runtime_id(), session.account_key());
+    crate::service_resolver::intent_tag(&identity)
+        .and_then(|tag| usize::from_str_radix(&tag[..std::mem::size_of::<usize>() * 2], 16).ok())
+        .unwrap_or(session.runtime_id())
+}
+pub(crate) fn send_timings(session: &Session) -> Vec<crate::service_resolver::SendPhaseTiming> {
+    crate::service_resolver::send_phase_timings(timing_session_scope(session))
+}
+fn is_text_payload(payload: &Payload) -> bool {
+    matches!(
+        payload,
+        Payload::Text | Payload::Formatted { .. } | Payload::Mentioned { .. } | Payload::Quote(_)
+    )
+}
+
+#[derive(Debug)]
+struct SendBudgetElapsed(crate::service_resolver::TimingPhase);
+impl std::fmt::Display for SendBudgetElapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hết ngân sách chờ {:?}; đối soát trạng thái tin trước khi thử lại",
+            self.0
+        )
+    }
+}
+impl std::error::Error for SendBudgetElapsed {}
+
+fn timing_outcome(result: &Result<ChatMessage>) -> crate::service_resolver::AttemptResult {
+    use crate::service_resolver::AttemptResult as R;
+    match result {
+        Ok(message) if crate::chat::server_message_id(message).is_some() => R::Success,
+        Ok(_) => R::ProtocolFailure,
+        Err(error) if error.downcast_ref::<SendBudgetElapsed>().is_some() => R::BudgetExceeded,
+        Err(error) => match send_failure_kind(error) {
+            SendFailureKind::NotSent => R::PolicyRejected,
+            SendFailureKind::ExplicitlyRejected => R::HttpFailure,
+            SendFailureKind::Unknown => R::TransportFailure,
+        },
+    }
+}
+
 pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMessage> {
+    use crate::service_resolver::{self as timing, TimingPhase};
+    let Some(job) = message.outgoing_job.as_ref() else {
+        return send_inner(s, to, message).await;
+    };
+    let text = is_text_payload(&job.payload);
+    let started = take_enqueued_at(message);
+    let context = timing::SendTimingContext::from_enqueue(
+        timing_session_scope(s),
+        &message.client_message_id,
+        job.attempt,
+        job.is_group,
+        text,
+        started,
+    );
+    let queue_result = record_queue_wait(&context, started);
+    timing::with_send_timing(context, async {
+        let result = if let Err(error) = queue_result {
+            Err(error)
+        } else if text {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(started + timing::TEXT_TOTAL_BUDGET),
+                send_inner(s, to, message),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::Error::new(SendBudgetElapsed(
+                    TimingPhase::TotalIntent,
+                )))
+            })
+        } else {
+            send_inner(s, to, message).await
+        };
+        timing::record_current_phase(
+            TimingPhase::TotalIntent,
+            started.elapsed(),
+            timing_outcome(&result),
+        );
+        result
+    })
+    .await
+}
+
+async fn send_inner(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMessage> {
     let job = message
         .outgoing_job
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("Thiếu dữ liệu gửi lại"))?;
-    anyhow::ensure!(
-        !(job.is_group && (message.is_e2ee || job.is_e2ee)),
-        "Chưa hỗ trợ E2EE thử nghiệm cho nhóm"
-    );
-    if job.is_group {
-        let snapshot = crate::group_state::snapshot(s, to, false).await?;
+        .ok_or_else(|| anyhow::anyhow!("Thiếu dữ liệu gửi lại"))
+        .context(BeforeMessageSend)?;
+    if let Payload::Attachment {
+        path,
+        stamp: Some(expected),
+        hd_source: None,
+        ..
+    } = &job.payload
+    {
+        let current = FileStamp::read(path).await.context(BeforeMessageSend)?;
+        (|| -> Result<()> {
+            anyhow::ensure!(
+                *expected == current,
+                "Tệp gốc đã thay đổi. Hãy chọn và gửi như một tệp mới"
+            );
+            Ok(())
+        })()
+        .context(BeforeMessageSend)?;
+    }
+    // These reads/validations cannot deliver a chat message. Preserve their
+    // causes, but distinguish them from a failed mutation with an unknown ACK.
+    let policy_started = std::time::Instant::now();
+    let policy = tokio::time::timeout(crate::service_resolver::POLICY_BUDGET, async {
+        anyhow::ensure!(s.is_active() && s.login.is_some(), "Chưa đăng nhập hoặc phiên đã đóng");
+        anyhow::ensure!(!to.is_empty(), "Thiếu người nhận tin nhắn");
         anyhow::ensure!(
-            snapshot.can_send(s.account_key())?,
-            "Nhóm không cho phép tài khoản này gửi tin"
+            !(job.is_group && (message.is_e2ee || job.is_e2ee)),
+            "Chưa hỗ trợ E2EE thử nghiệm cho nhóm"
         );
-    }
-    if let Payload::Forward(original) = &job.payload {
-        let (source, group) = crate::chat::forward_source(original)
-            .ok_or_else(|| anyhow::anyhow!("Thiếu nguồn chuyển tiếp để xác minh quyền chia sẻ"))?;
-        crate::conversation_policy::require_shareable(s, &source, group).await?;
-    }
-    let is_e2ee = message.is_e2ee
-        || job.is_e2ee
-        || match check_thread_e2ee(s.account_key(), to, job.is_group) {
-            Ok(b) => b,
-            Err(e) => anyhow::bail!(
-                "Không thể xác minh trạng thái E2EE ({e}). Hủy gửi để bảo vệ an toàn tin nhắn."
-            ),
-        };
+        if job.is_group {
+            let snapshot = crate::group_state::snapshot(s, to, false).await?;
+            anyhow::ensure!(
+                snapshot.can_send(s.account_key())?,
+                "Nhóm không cho phép tài khoản này gửi tin"
+            );
+        }
+        if let Payload::Forward(original) = &job.payload {
+            let (source, group) = crate::chat::forward_source(original)
+                .context("Thiếu nguồn chuyển tiếp để xác minh quyền chia sẻ")?;
+            crate::conversation_policy::require_shareable(s, &source, group).await?;
+        }
+        let is_e2ee = message.is_e2ee
+            || job.is_e2ee
+            || check_thread_e2ee(s.account_key(), to, job.is_group)
+                .context("Không thể xác minh trạng thái E2EE; đã hủy gửi để bảo vệ tin nhắn")?;
 
-    // Unverified non-text encrypted contracts must never route through ordinary upload endpoints.
-    // Encrypted contracts for non-text payloads (media/files/stickers/quotes) are not yet supported.
-    if is_e2ee && !matches!(job.payload, Payload::Text) {
-        anyhow::bail!("Hội thoại E2EE hiện chỉ hỗ trợ gửi tin nhắn văn bản đã mã hóa đầu cuối. Các loại nội dung khác (ảnh, tệp, nhãn dán, chuyển tiếp, trích dẫn) bị chặn để tránh rò rỉ dữ liệu không mã hóa.");
-    }
-
-    let id = message.client_message_id.parse()?;
+        // Unverified encrypted content never reaches ordinary upload endpoints.
+        anyhow::ensure!(
+            !is_e2ee || matches!(job.payload, Payload::Text),
+            "Hội thoại E2EE hiện chỉ hỗ trợ gửi văn bản mã hóa; đã chặn nội dung khác để tránh rò rỉ"
+        );
+        if is_e2ee {
+            #[cfg(feature = "experimental-e2ee")]
+            crate::e2ee_integration::require_verified_contract()?;
+            #[cfg(not(feature = "experimental-e2ee"))]
+            return Err(crate::e2ee_integration::unverified_contract_error());
+        }
+        let id = message.client_message_id.parse::<u64>()
+            .context("Định danh tin nhắn gửi không hợp lệ")?;
+        Ok::<_, anyhow::Error>((is_e2ee, id))
+    }).await.unwrap_or_else(|_|Err(anyhow::Error::new(SendBudgetElapsed(crate::service_resolver::TimingPhase::Policy))));
+    crate::service_resolver::record_current_phase(
+        crate::service_resolver::TimingPhase::Policy,
+        policy_started.elapsed(),
+        if policy.is_ok() {
+            crate::service_resolver::AttemptResult::Success
+        } else if policy
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<SendBudgetElapsed>().is_some())
+        {
+            crate::service_resolver::AttemptResult::BudgetExceeded
+        } else {
+            crate::service_resolver::AttemptResult::PolicyRejected
+        },
+    );
+    let (is_e2ee, id) = policy.context(BeforeMessageSend)?;
     let mut sent = message.clone();
     let response = match &job.payload {
+        Payload::Formatted {
+            options,
+            mentions,
+            quoted,
+        } => {
+            // Validate metadata before the transport can make the outcome uncertain.
+            options
+                .apply(&message.text, &mut json!({}))
+                .context(BeforeMessageSend)?;
+            crate::mentions::validate(&message.text, mentions).context(BeforeMessageSend)?;
+            (|| -> Result<()> {
+                anyhow::ensure!(
+                    job.is_group || mentions.is_empty(),
+                    "Mention chỉ hỗ trợ trong nhóm"
+                );
+                Ok(())
+            })()
+            .context(BeforeMessageSend)?;
+            sent.text_styles = options.styles.clone();
+            if let Some(quoted) = quoted {
+                crate::chat::send_quote_with_options(
+                    s,
+                    to,
+                    &message.text,
+                    quoted,
+                    job.is_group,
+                    id,
+                    mentions,
+                    options,
+                )
+                .await?
+            } else if job.is_group {
+                crate::chat::send_group_with_options(s, to, &message.text, id, mentions, options)
+                    .await?
+            } else {
+                crate::chat::send_text_with_options(s, to, &message.text, id, options).await?
+            }
+        }
         Payload::Mentioned { mentions, quoted } => {
-            anyhow::ensure!(
-                job.is_group && !mentions.is_empty(),
-                "Thiếu thông tin mention nhóm"
-            );
-            crate::mentions::validate(&message.text, mentions)?;
+            (|| -> Result<()> {
+                anyhow::ensure!(
+                    job.is_group && !mentions.is_empty(),
+                    "Thiếu thông tin mention nhóm"
+                );
+                crate::mentions::validate(&message.text, mentions)
+            })()
+            .context(BeforeMessageSend)?;
             if let Some(quoted) = quoted {
                 crate::chat::send_quote_mentions(s, to, &message.text, quoted, true, id, mentions)
                     .await?
@@ -229,7 +479,7 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                     let result =
                         crate::chat::send_e2ee_message(s, s.account_key(), to, &message.text, id)
                             .await
-                            .map_err(|e| anyhow::anyhow!("Gửi tin nhắn E2EE thất bại: {e}"))?;
+                            .context("Gửi tin nhắn E2EE thất bại")?;
                     sent.is_e2ee = true;
                     result
                 }
@@ -287,7 +537,8 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
                 job.is_group,
                 original
                     .sticker_id
-                    .ok_or_else(|| anyhow::anyhow!("Thiếu nhãn GIF"))?,
+                    .context("Thiếu nhãn GIF")
+                    .context(BeforeMessageSend)?,
                 id,
             )
             .await?;
@@ -298,6 +549,14 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             serde_json::Value::Null
         }
         Payload::Forward(original) => {
+            if let Some(meta) = crate::chat::forward_link_metadata(original) {
+                sent.kind = original.kind;
+                sent.link_url = Some(meta.url);
+                sent.link_title = Some(meta.title);
+                sent.link_desc = Some(meta.desc);
+                sent.link_thumb = Some(meta.thumb);
+                sent.link_src = Some(meta.src);
+            }
             crate::chat::forward_message_with_client_id(s, to, job.is_group, original, id).await?
         }
         Payload::Quote(quoted) => {
@@ -342,13 +601,20 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
             hd_source,
         } => {
             let upload = match hd_source {
-                Some(source) => hd_copy_for(s, path, source).await?,
+                Some(source) => hd_copy_for(s, path, source)
+                    .await
+                    .context(BeforeMessageSend)?,
                 None => {
+                    let actual = FileStamp::read(path).await.context(BeforeMessageSend)?;
                     if let Some(stamp) = stamp {
-                        anyhow::ensure!(
-                            *stamp == FileStamp::read(path).await?,
-                            "Tệp gốc đã thay đổi. Hãy chọn và gửi như một tệp mới"
-                        );
+                        (|| -> Result<()> {
+                            anyhow::ensure!(
+                                *stamp == actual,
+                                "Tệp gốc đã thay đổi. Hãy chọn và gửi như một tệp mới"
+                            );
+                            Ok(())
+                        })()
+                        .context(BeforeMessageSend)?;
                     }
                     path.clone()
                 }
@@ -436,7 +702,8 @@ async fn forward_media(
     };
     // A missing response can mean the message was delivered. Never issue a second send.
     let msg_type = crate::media_renew::forward_type(crate::message_view::media(original).kind)
-        .ok_or_else(|| anyhow::anyhow!("Loại media chưa hỗ trợ"))?;
+        .context("Loại media chưa hỗ trợ")
+        .context(BeforeMessageSend)?;
     let response =
         crate::chat::send_forward_message(s, to, group, msg_type, &info, client_id).await?;
     Ok(cloned_message(original, client_id, info, &response))
@@ -554,9 +821,9 @@ async fn forward_by_reupload(
 ) -> Result<ChatMessage> {
     let media = crate::message_view::media(original);
     let dir = crate::storage::root().join("forward-media");
-    crate::storage::private_dir(&dir)?;
+    crate::storage::private_dir(&dir).context(BeforeMessageSend)?;
     let mut random = [0u8; 8];
-    crate::random::fill(&mut random)?;
+    crate::random::fill(&mut random).context(BeforeMessageSend)?;
     let name = crate::media_download::safe_name(&crate::chat::forward_file_name(original, &media));
     let path = dir.join(format!(
         "{}-{name}",
@@ -585,7 +852,7 @@ async fn forward_by_reupload(
         let _ = tokio::fs::remove_file(&path).await;
         return Err(error.context(
             "Không chuyển tiếp được media: máy chủ không sao chép được và đường dẫn gốc đã hết hạn",
-        ));
+        ).context(BeforeMessageSend));
     }
     let sent =
         crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await;
@@ -650,7 +917,9 @@ async fn send_bundled(
     sticker: u64,
     client_id: u64,
 ) -> Result<ChatMessage> {
-    let path = crate::bundled_stickers::stage(s, sticker).await?;
+    let path = crate::bundled_stickers::stage(s, sticker)
+        .await
+        .context(BeforeMessageSend)?;
     let (_, mut sent) =
         crate::chat::send_attachment_with_client_id(s, to, group, &path, "", client_id).await?;
     sent.sticker_id = Some(sticker);
@@ -698,32 +967,214 @@ pub(crate) fn failure_message(error: &anyhow::Error) -> String {
                 else { "Kết nối bị gián đoạn. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin." }.into();
         }
     }
+    if send_failure_kind(error) == SendFailureKind::NotSent {
+        return format!("{error:#}");
+    }
     format!("{error}. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin.")
+}
+
+/// Marks a phase that cannot submit the chat-message mutation, even if it reads
+/// account policy or prepares an attachment using another service.
+#[derive(Debug)]
+struct BeforeMessageSend;
+
+impl std::fmt::Display for BeforeMessageSend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Chưa gửi tin nhắn")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SendFailureKind {
+    NotSent,
     ExplicitlyRejected,
     Unknown,
 }
 
-/// Classify only an explicit nonzero server mutation code as rejection.
-/// Transport and opaque response failures may have happened after acceptance.
+/// Preparation errors cannot deliver a message; server rejections are explicit.
+/// All other errors remain uncertain, including untyped failures below send APIs.
 pub(crate) fn send_failure_kind(error: &anyhow::Error) -> SendFailureKind {
+    if error.downcast_ref::<BeforeMessageSend>().is_some() {
+        return SendFailureKind::NotSent;
+    }
     if error.chain().any(|cause| {
         cause
             .downcast_ref::<crate::chat::ServerRejected>()
-            .is_some()
-    }) {
+            .is_some_and(|rejection| rejection.code.is_some_and(|code| code != 0))
+    }) || crate::session::is_explicit_request_rejection(error)
+    {
         SendFailureKind::ExplicitlyRejected
     } else {
         SendFailureKind::Unknown
     }
 }
 
+pub(crate) fn failure_delivery(error: &anyhow::Error) -> DeliveryState {
+    match send_failure_kind(error) {
+        SendFailureKind::NotSent | SendFailureKind::ExplicitlyRejected => DeliveryState::Failed,
+        SendFailureKind::Unknown => DeliveryState::DeliveryUnknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_command_queue_keeps_the_intent_and_fails_before_transport() {
+        let _fixture = crate::service_resolver::TIMING_FIXTURE.lock().await;
+        let session = Session::new(false, false, false).unwrap();
+        let message = pending("fixture queued payload".into(), false, Payload::Text);
+        let tag = crate::service_resolver::intent_tag(&message.client_message_id).unwrap();
+        queued_intents().lock().unwrap().insert(
+            tag,
+            std::time::Instant::now()
+                - crate::service_resolver::QUEUE_BUDGET
+                - std::time::Duration::from_millis(1),
+        );
+        let error = send(&session, "fixture-target", &message)
+            .await
+            .unwrap_err();
+        assert_eq!(send_failure_kind(&error), SendFailureKind::NotSent);
+        assert_eq!(message.text, "fixture queued payload");
+        assert!(message.outgoing_job.is_some());
+        assert!(session.request_attempt_timings().is_empty());
+        assert!(send_timings(&session).iter().any(|s| s.phase
+            == crate::service_resolver::TimingPhase::QueueWait
+            && s.result == crate::service_resolver::AttemptResult::BudgetExceeded));
+        assert!(send_timings(&session).iter().any(|s| s.phase
+            == crate::service_resolver::TimingPhase::TotalIntent
+            && s.elapsed_ms >= 5000));
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_records_policy_and_total_for_the_same_salted_intent() {
+        let _fixture = crate::service_resolver::TIMING_FIXTURE.lock().await;
+        let session = Session::new(false, false, false).unwrap();
+        let message = pending(
+            "sensitive fixture text must not enter timing".into(),
+            false,
+            Payload::Text,
+        );
+        let _ = send(&session, "sensitive-recipient", &message)
+            .await
+            .unwrap_err();
+        let samples = send_timings(&session);
+        assert!(samples
+            .iter()
+            .any(|s| s.phase == crate::service_resolver::TimingPhase::Policy));
+        assert!(samples
+            .iter()
+            .any(|s| s.phase == crate::service_resolver::TimingPhase::TotalIntent));
+        assert!(samples
+            .iter()
+            .all(|s| s.intent_tag == samples[0].intent_tag));
+        let diagnostic = format!("{samples:?}");
+        assert!(!diagnostic.contains(&message.text));
+        assert!(!diagnostic.contains("sensitive-recipient"));
+    }
+
+    #[tokio::test]
+    async fn preview_stall_is_cancelled_at_shared_send_budget() {
+        struct Cancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Cancellation {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let session = Session::new(false, false, false).unwrap();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Cancellation(cancelled.clone());
+        let preview = async move {
+            let _guard = guard;
+            std::future::pending::<Result<crate::chat::LinkMetadata>>().await
+        };
+        let result = tokio::time::timeout(
+            LINK_PREVIEW_BUDGET + std::time::Duration::from_secs(5),
+            bounded_link_preview(&session, "https://example.com/fixture", preview),
+        )
+        .await
+        .expect("a stalled preview must not hold send indefinitely");
+        assert_eq!(LINK_PREVIEW_BUDGET, std::time::Duration::from_secs(2));
+        assert!(
+            result.is_none(),
+            "the caller must choose its ordinary text route"
+        );
+        assert!(cancelled.load(std::sync::atomic::Ordering::SeqCst));
+        let timing = session.request_attempt_timings();
+        assert_eq!(timing.len(), 1);
+        assert_eq!(
+            timing[0].result,
+            crate::service_resolver::AttemptResult::PreviewFallback
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_cache_hit_does_not_start_another_preview() {
+        let session = Session::new(false, false, false).unwrap();
+        let url = "https://example.com/fixture";
+        session.cache_link_preview(
+            url,
+            crate::chat::LinkOrigin::Outgoing,
+            crate::chat::LinkMetadata {
+                url: url.into(),
+                title: "Fixture title".into(),
+                desc: String::new(),
+                thumb: String::new(),
+                src: "example.com".into(),
+            },
+        );
+        let result = bounded_link_preview(
+            &session,
+            url,
+            std::future::poll_fn(|_| panic!("cached metadata must avoid preview network work")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.title, "Fixture title");
+        assert_eq!(
+            session.request_attempt_timings()[0].result,
+            crate::service_resolver::AttemptResult::PreviewCacheHit
+        );
+    }
+
+    #[tokio::test]
+    async fn logged_out_send_is_definitely_not_sent() {
+        let session = Session::new(false, false, false).unwrap();
+        let message = pending("fixture".into(), false, Payload::Text);
+        let error = send(&session, "fixture-recipient", &message)
+            .await
+            .unwrap_err();
+        assert_eq!(send_failure_kind(&error), SendFailureKind::NotSent);
+        assert_eq!(failure_delivery(&error), DeliveryState::Failed);
+        assert!(failure_message(&error).contains("Chưa đăng nhập"));
+        assert!(message.outgoing_job.is_some());
+        assert!(session.request_attempt_timings().is_empty());
+    }
+
+    #[test]
+    fn preparation_and_e2ee_context_preserve_typed_error_causes() {
+        let preflight = anyhow::Error::new(crate::chat::ServerRejected { code: Some(600) })
+            .context(BeforeMessageSend);
+        assert_eq!(send_failure_kind(&preflight), SendFailureKind::NotSent);
+        assert!(preflight
+            .downcast_ref::<crate::chat::ServerRejected>()
+            .is_some());
+
+        let e2ee = anyhow::Error::new(crate::chat::ServerRejected { code: Some(600) })
+            .context("Gửi tin nhắn E2EE thất bại");
+        assert_eq!(
+            send_failure_kind(&e2ee),
+            SendFailureKind::ExplicitlyRejected
+        );
+        assert!(e2ee
+            .chain()
+            .any(|cause| crate::session::is_expired_error(&cause.to_string())));
+
+        let ambiguous =
+            anyhow::anyhow!("fixture reset after request").context("Gửi tin nhắn E2EE thất bại");
+        assert_eq!(failure_delivery(&ambiguous), DeliveryState::DeliveryUnknown);
+    }
 
     #[test]
     fn text_routing_reaches_link_preview_for_direct_and_group() {
@@ -793,7 +1244,7 @@ mod tests {
             ..Default::default()
         };
         restored.restore_state(&original.durable_state()).unwrap();
-        assert_eq!(restored.delivery, DeliveryState::Failed);
+        assert_eq!(restored.delivery, DeliveryState::DeliveryUnknown);
         assert!(restored.outgoing_job.is_some());
         assert_eq!(restored.client_message_id, original.client_message_id);
         let mut retry = restored.clone();
@@ -815,6 +1266,42 @@ mod tests {
 #[cfg(test)]
 mod persistence_tests {
     use super::*;
+
+    #[test]
+    fn late_echo_reconciles_delivery_unknown_without_duplicate_or_regression() {
+        let mut store = crate::store::MessageStore::open(":memory:").unwrap();
+        let mut uncertain = pending("fixture".into(), false, Payload::Text);
+        uncertain.delivery = DeliveryState::DeliveryUnknown;
+        let snapshot = |message| crate::chat::Thread {
+            id: "fixture-recipient".into(),
+            messages: vec![message],
+            ..Default::default()
+        };
+        let mut local_thread = snapshot(uncertain.clone());
+        crate::store::persist_threads(&mut store, &[local_thread.clone()]).unwrap();
+        let mut echo = uncertain.clone();
+        echo.id = "fixture-server-id".into();
+        echo.delivery = DeliveryState::Unknown;
+        echo.outgoing_job = None;
+        crate::chat::merge_thread_into(&mut local_thread, snapshot(echo.clone()), true);
+        crate::chat::merge_thread_into(&mut local_thread, snapshot(uncertain.clone()), true);
+        assert_eq!(local_thread.messages.len(), 1); // (INV-4)
+        assert_eq!(
+            local_thread.messages[0].delivery,
+            DeliveryState::ServerAccepted
+        );
+        assert!(local_thread.messages[0].outgoing_job.is_none());
+
+        crate::store::persist_threads(&mut store, &[snapshot(echo)]).unwrap();
+        crate::store::persist_threads(&mut store, &[snapshot(uncertain.clone())]).unwrap();
+        let mut restored = Vec::new();
+        store.hydrate_threads(&mut restored, 20).unwrap();
+        assert_eq!(restored[0].messages.len(), 1); // (INV-4)
+        let reconciled = &restored[0].messages[0];
+        assert_eq!(reconciled.client_message_id, uncertain.client_message_id);
+        assert_eq!(reconciled.delivery, DeliveryState::ServerAccepted);
+        assert!(reconciled.outgoing_job.is_none());
+    }
     #[test]
     fn server_echo_overrides_failed_job_and_late_local_failure() {
         let mut store = crate::store::MessageStore::open(":memory:").unwrap();
@@ -852,21 +1339,24 @@ mod persistence_tests {
         // and return an Err without falling back to plaintext.
         let result = send(&session, "non_existent_peer", &message).await;
         assert!(result.is_err(), "E2EE failure must fail-closed");
-        let err_msg = result.err().unwrap().to_string();
+        let error = result.err().unwrap();
+        assert_eq!(send_failure_kind(&error), SendFailureKind::NotSent);
         assert!(
-            err_msg.contains("E2EE") || err_msg.contains("mã hóa"),
-            "Error must clearly indicate E2EE failure: {err_msg}"
+            session.request_attempt_timings().is_empty(),
+            "a logged-out encrypted send must never reach a plaintext endpoint"
         );
     }
 
     #[test]
     fn only_explicit_server_rejection_is_classified_as_rejected() {
         let rejected = anyhow::Error::new(crate::chat::ServerRejected { code: Some(5) });
+        let missing_code = anyhow::Error::new(crate::chat::ServerRejected { code: None });
         let timeout = anyhow::anyhow!("timeout after send");
         assert_eq!(
             send_failure_kind(&rejected),
             SendFailureKind::ExplicitlyRejected
         );
+        assert_eq!(send_failure_kind(&missing_code), SendFailureKind::Unknown);
         assert_eq!(send_failure_kind(&timeout), SendFailureKind::Unknown);
     }
 }

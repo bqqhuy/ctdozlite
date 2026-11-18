@@ -446,6 +446,10 @@ impl ZaloGuiApp {
         if !self.is_logged_in || self.attachment_drafts.owner != self.user_uin {
             return;
         }
+        if self.composer_has_metadata(ctx, thread, group) {
+            self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho tệp; hãy tắt chúng hoặc gửi văn bản riêng. Tệp và nội dung vẫn được giữ.".into();
+            return;
+        }
         if self.file_drop_blocked(ctx) {
             self.status_msg = "Hãy đóng cửa sổ phụ hoặc menu trước khi gửi tệp".into();
             return;
@@ -623,7 +627,11 @@ mod tests {
         let error = crate::outgoing::send(&session, "thread-a", &message)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("đã thay đổi"));
+        assert!(crate::outgoing::failure_message(&error).contains("đã thay đổi"));
+        assert_eq!(
+            crate::outgoing::failure_delivery(&error),
+            crate::message_model::DeliveryState::Failed
+        );
     }
 }
 
@@ -651,6 +659,28 @@ mod draft_send_tests {
             .attachment_drafts
             .insert("thread-a", "file.txt".into())
             .unwrap();
+        let metadata_key = Id::new((
+            "composer_format",
+            &app.user_uin,
+            app.account_runtime_id,
+            "thread-a",
+            false,
+        ));
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                metadata_key,
+                crate::rich_text::ComposerFormat {
+                    urgency: Some(crate::rich_text::Urgency::Important),
+                    ..Default::default()
+                },
+            )
+        });
+        app.send_attachment_draft(&ctx, "thread-a", false);
+        assert!(app.status_msg.contains("Chưa hỗ trợ định dạng"));
+        assert_eq!(app.attachment_drafts.len("thread-a"), 1);
+        assert_eq!(app.input_message, "caption");
+        assert!(app.composer_has_metadata(&ctx, "thread-a", false));
+        ctx.data_mut(|data| data.remove::<crate::rich_text::ComposerFormat>(metadata_key));
         app.send_attachment_draft(&ctx, "thread-a", false);
         assert!(app.status_msg.contains("chờ đọc tệp"));
         assert_eq!(app.attachment_drafts.len("thread-a"), 1);

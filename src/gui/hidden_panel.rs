@@ -59,6 +59,9 @@ impl ZaloGuiApp {
             self.image_viewer = None;
             self.clear_forward_dialog();
             self.replying_to = None;
+            self.message_details = None;
+            self.archive_mutation_confirm = None;
+            self.message_pins = Default::default();
             self.sticker_textures.clear();
             self.sticker_sprites.clear();
             self.loading_stickers.clear();

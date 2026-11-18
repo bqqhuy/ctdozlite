@@ -8,7 +8,7 @@ use std::sync::{
     Arc,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use reqwest::cookie::Jar;
 use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER};
 use reqwest::{Client, Method};
@@ -20,6 +20,46 @@ use crate::crypto;
 /// Maximum service-map candidates examined for one read request.
 pub(crate) const MAX_SERVICE_CANDIDATES: usize = 3;
 const MAX_REQUEST_TIMING_SAMPLES: usize = 16;
+
+#[derive(Debug)]
+struct DnsPreflightFailure;
+impl std::fmt::Display for DnsPreflightFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DNS resolution failed before connection")
+    }
+}
+impl std::error::Error for DnsPreflightFailure {}
+
+#[derive(Debug)]
+struct SessionDns;
+impl reqwest::dns::Resolve for SessionDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((name.as_str(), 0))
+                .await
+                .map_err(|_| {
+                    Box::new(DnsPreflightFailure) as Box<dyn std::error::Error + Send + Sync>
+                })?;
+            let addresses: Vec<_> = addresses.collect();
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn proven_preflight_failure(error: &anyhow::Error) -> bool {
+    let connect = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() && !e.is_timeout())
+    });
+    connect
+        && error.chain().any(|cause| {
+            cause.is::<DnsPreflightFailure>()
+                || cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::ConnectionRefused)
+        })
+}
 const MAX_LINK_PREVIEW_CACHE_ENTRIES: usize = 32;
 const MAX_LINK_PREVIEW_CACHE_ENTRY_BYTES: usize = 16 * 1024;
 const LINK_PREVIEW_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
@@ -52,12 +92,15 @@ pub enum SessionStatus {
 }
 
 pub fn is_expired_error(message: &str) -> bool {
-    message.split("server error ").skip(1).any(|part| {
-        matches!(
-            part.split(|c: char| !c.is_ascii_digit() && c != '-').next(),
-            Some("600" | "-102")
-        )
-    })
+    ["server error ", "server envelope error "]
+        .iter()
+        .filter_map(|prefix| message.split_once(prefix).map(|(_, part)| part))
+        .any(|part| {
+            matches!(
+                part.split(|c: char| !c.is_ascii_digit() && c != '-').next(),
+                Some("600" | "-102")
+            )
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,7 +303,7 @@ impl std::fmt::Display for HttpFailure {
 impl std::error::Error for HttpFailure {}
 
 #[derive(Debug)]
-struct RequestDeadlineElapsed;
+pub(crate) struct RequestDeadlineElapsed;
 impl std::fmt::Display for RequestDeadlineElapsed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Request deadline elapsed")
@@ -268,9 +311,72 @@ impl std::fmt::Display for RequestDeadlineElapsed {
 }
 impl std::error::Error for RequestDeadlineElapsed {}
 
+#[derive(Debug)]
+struct EnvelopeFailure(i64);
+impl std::fmt::Display for EnvelopeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "server envelope error {}", self.0)
+    }
+}
+impl std::error::Error for EnvelopeFailure {}
+
 /// Extract a typed HTTP failure without parsing or exposing its original error text.
 pub(crate) fn http_failure_status(error: &anyhow::Error) -> Option<u16> {
     error.downcast_ref::<HttpFailure>().map(|failure| failure.0)
+}
+
+pub(crate) fn is_explicit_request_rejection(error: &anyhow::Error) -> bool {
+    http_failure_status(error).is_some_and(|status| (400..500).contains(&status))
+        || envelope_failure_code(error).is_some()
+}
+
+fn attempt_result_for_http_status(status: u16) -> crate::service_resolver::AttemptResult {
+    match status {
+        401 => crate::service_resolver::AttemptResult::AuthFailure,
+        403 => crate::service_resolver::AttemptResult::PolicyRejected,
+        429 => crate::service_resolver::AttemptResult::RateLimited,
+        _ => crate::service_resolver::AttemptResult::HttpFailure,
+    }
+}
+
+fn attempt_result_for_response(value: &Value) -> crate::service_resolver::AttemptResult {
+    let code = value
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .or_else(|| value.pointer("/data/error_code").and_then(Value::as_i64));
+    match code {
+        None | Some(0) | Some(18012) => crate::service_resolver::AttemptResult::Success,
+        Some(600 | -102) => crate::service_resolver::AttemptResult::AuthFailure,
+        Some(429) => crate::service_resolver::AttemptResult::RateLimited,
+        Some(_) => crate::service_resolver::AttemptResult::ProtocolFailure,
+    }
+}
+
+fn envelope_failure_code(error: &anyhow::Error) -> Option<i64> {
+    error
+        .downcast_ref::<EnvelopeFailure>()
+        .map(|failure| failure.0)
+}
+
+fn attempt_result_for_envelope_code(code: i64) -> crate::service_resolver::AttemptResult {
+    match code {
+        600 | -102 => crate::service_resolver::AttemptResult::AuthFailure,
+        429 => crate::service_resolver::AttemptResult::RateLimited,
+        _ => crate::service_resolver::AttemptResult::ProtocolFailure,
+    }
+}
+
+fn should_retry_candidate(
+    retryable_read: bool,
+    connect_failure: bool,
+    timeout: bool,
+    deadline: bool,
+    status: Option<u16>,
+) -> bool {
+    // The caller must prove DNS failure or a refused connection before HTTP.
+    // Opaque TLS/proxy failures never certify mutation replay safety.
+    (connect_failure && !timeout && !deadline && status.is_none())
+        || (retryable_read && (status == Some(404) || timeout || deadline))
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -421,6 +527,7 @@ impl Session {
         );
         default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         let http = crate::proxy::apply(Client::builder())?
+            .dns_resolver(Arc::new(SessionDns))
             .tcp_nodelay(true)
             .cookie_provider(Arc::clone(&jar))
             .redirect(reqwest::redirect::Policy::none())
@@ -500,13 +607,10 @@ impl Session {
         }
     }
 
-    /// Check the server without treating a transient network failure as logout.
-    /// Resolve service URL via dynamic ServiceResolver with domain rotation.
+    /// Build a logical service URL; the send path alone selects discovered candidates.
     pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
-        self.service_resolver
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .resolve_url(service, path)
+        let host = crate::endpoints::service(service).unwrap_or(crate::endpoints::WPA_CHAT);
+        format!("{host}/{}", path.trim_start_matches('/'))
     }
 
     /// Most recent bounded HTTP-attempt timings, useful for local troubleshooting.
@@ -518,6 +622,11 @@ impl Session {
             .iter()
             .copied()
             .collect()
+    }
+
+    /// Sanitized phase diagnostics for this account and runtime only.
+    pub fn send_phase_timings(&self) -> Vec<crate::service_resolver::SendPhaseTiming> {
+        crate::outgoing::send_timings(self)
     }
 
     pub(crate) fn record_link_preview_timing(&self, elapsed: std::time::Duration, ready: bool) {
@@ -746,6 +855,7 @@ impl Session {
         default_headers.insert(ORIGIN, HeaderValue::from_static(crate::endpoints::WEB_BASE));
         let builder = crate::proxy::apply(Client::builder())
             .unwrap_or_else(|_| Client::builder())
+            .dns_resolver(Arc::new(SessionDns))
             .tcp_nodelay(true)
             .cookie_provider(Arc::clone(&self.jar))
             .redirect(reqwest::redirect::Policy::none())
@@ -1126,6 +1236,19 @@ impl Session {
         self.send(Method::GET, url, None).await
     }
 
+    /// Dedicated PC cloud viewer credential, restricted to authenticated Zalo hosts.
+    pub(crate) async fn get_cloud_with_key(&self, url: &str, viewer_key: &str) -> Result<Value> {
+        anyhow::ensure!(
+            credential_target(url),
+            "Invalid cloud credential destination"
+        );
+        let mut key = reqwest::header::HeaderValue::from_str(viewer_key)
+            .context("Invalid cloud viewer credential")?;
+        key.set_sensitive(true);
+        self.send_with_cloud_key(Method::GET, url, None, Some(key))
+            .await
+    }
+
     pub async fn post_form(&self, url: &str, body: String) -> Result<Value> {
         self.send(Method::POST, url, Some(body)).await
     }
@@ -1286,6 +1409,16 @@ impl Session {
     }
 
     async fn send(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+        self.send_with_cloud_key(m, url, body, None).await
+    }
+
+    async fn send_with_cloud_key(
+        &self,
+        m: Method,
+        url: &str,
+        body: Option<String>,
+        cloud_key: Option<reqwest::header::HeaderValue>,
+    ) -> Result<Value> {
         let (service_name, mut urls) = self
             .service_resolver
             .read()
@@ -1303,10 +1436,11 @@ impl Session {
         // A connect/DNS failure occurs before an HTTP request exists, so a bounded
         // candidate switch is safe even for mutations. Timeouts and HTTP responses
         // remain fail-closed because the server may have received the mutation.
-        let retryable_preflight_failure = m != Method::GET;
         // Keep the total read-failover wait within the ordinary request timeout.
         // Upload/multipart flows use their own explicit timeout and do not enter here.
-        let request_deadline = std::time::Instant::now() + std::time::Duration::from_secs(35);
+        let request_deadline = std::time::Instant::now()
+            + crate::service_resolver::current_text_request_budget()
+                .unwrap_or(std::time::Duration::from_secs(35));
         let mut last = None;
         for (index, candidate) in urls.into_iter().enumerate() {
             let attempt_started = std::time::Instant::now();
@@ -1316,15 +1450,25 @@ impl Session {
             }
             let result = tokio::time::timeout(
                 remaining,
-                self.send_once(m.clone(), &candidate, body.clone()),
+                self.send_once_with_cloud_key(
+                    m.clone(),
+                    &candidate,
+                    body.clone(),
+                    cloud_key.clone(),
+                ),
             )
             .await
             .unwrap_or_else(|_| Err(anyhow::Error::new(RequestDeadlineElapsed)));
             let outcome = match &result {
-                Ok(_) => crate::service_resolver::AttemptResult::Success,
-                Err(error) if http_failure_status(error).is_some() => {
-                    crate::service_resolver::AttemptResult::HttpFailure
+                Ok(response) => attempt_result_for_response(response),
+                Err(error) if envelope_failure_code(error).is_some() => {
+                    attempt_result_for_envelope_code(
+                        envelope_failure_code(error).unwrap_or_default(),
+                    )
                 }
+                Err(error) if http_failure_status(error).is_some() => http_failure_status(error)
+                    .map(attempt_result_for_http_status)
+                    .unwrap_or(crate::service_resolver::AttemptResult::HttpFailure),
                 Err(error)
                     if error.chain().any(|cause| {
                         cause
@@ -1355,6 +1499,13 @@ impl Session {
                     result: outcome,
                 },
             );
+            crate::service_resolver::record_current_request(
+                crate::service_resolver::TimingPhase::HttpRequest,
+                timing_service,
+                Some(index.min(u8::MAX as usize) as u8),
+                attempt_started.elapsed(),
+                outcome,
+            );
             match result {
                 Ok(response) => {
                     if let Some(service) = &service_name {
@@ -1369,18 +1520,18 @@ impl Session {
                     // An HTTP response or timeout does not prove a mutation was not
                     // delivered. Only a preflight connect failure may switch a
                     // mutation to another validated host.
-                    let is_connect_failure = e.chain().any(|cause| {
-                        cause
-                            .downcast_ref::<reqwest::Error>()
-                            .is_some_and(|error| error.is_connect())
-                    });
-                    let retry = (retryable_read
-                        && (e.downcast_ref::<HttpFailure>().is_some_and(|e| e.0 == 404)
-                            || is_connect_failure
-                            || e.downcast_ref::<reqwest::Error>()
+                    let is_connect_failure = proven_preflight_failure(&e);
+                    let retry = should_retry_candidate(
+                        retryable_read,
+                        is_connect_failure,
+                        e.chain().any(|cause| {
+                            cause
+                                .downcast_ref::<reqwest::Error>()
                                 .is_some_and(|error| error.is_timeout())
-                            || e.downcast_ref::<RequestDeadlineElapsed>().is_some()))
-                        || (retryable_preflight_failure && is_connect_failure);
+                        }),
+                        e.downcast_ref::<RequestDeadlineElapsed>().is_some(),
+                        e.downcast_ref::<HttpFailure>().map(|failure| failure.0),
+                    );
                     if !retry {
                         return Err(e);
                     }
@@ -1391,7 +1542,13 @@ impl Session {
         Err(last.unwrap_or_else(|| anyhow::anyhow!("No service endpoint")))
     }
 
-    async fn send_once(&self, m: Method, url: &str, body: Option<String>) -> Result<Value> {
+    async fn send_once_with_cloud_key(
+        &self,
+        m: Method,
+        url: &str,
+        body: Option<String>,
+        cloud_key: Option<reqwest::header::HeaderValue>,
+    ) -> Result<Value> {
         anyhow::ensure!(self.is_active(), "This session has been logged out");
         let start = std::time::Instant::now();
         if self.verbose {
@@ -1402,6 +1559,13 @@ impl Session {
         }
         let method = m.as_str().to_string();
         let mut rb = self.http.request(m, url);
+        if let Some(key) = cloud_key {
+            anyhow::ensure!(
+                credential_target(url),
+                "Invalid cloud credential destination"
+            );
+            rb = rb.header("cloud-viewer-key", key);
+        }
         if let Some(ref sek) = self.zpw_sek {
             if !sek.is_empty() {
                 let is_zalo_host = credential_target(url);
@@ -1418,7 +1582,14 @@ impl Session {
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .body(b.clone());
         }
+        let attempt_guard =
+            crate::service_resolver::PhaseGuard::new(crate::service_resolver::TimingPhase::Attempt);
         let resp_result = rb.send().await;
+        attempt_guard.finish(if resp_result.is_ok() {
+            crate::service_resolver::AttemptResult::Success
+        } else {
+            crate::service_resolver::AttemptResult::TransportFailure
+        });
         let latency_ms = start.elapsed().as_millis();
 
         let resp = match resp_result {
@@ -1438,8 +1609,16 @@ impl Session {
         };
 
         let status = resp.status();
-        let bytes =
-            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await?;
+        let body_guard =
+            crate::service_resolver::PhaseGuard::new(crate::service_resolver::TimingPhase::BodyAck);
+        let bytes_result =
+            crate::limits::response_bytes(resp, crate::limits::INFLATED_BYTES as usize).await;
+        body_guard.finish(if bytes_result.is_ok() {
+            crate::service_resolver::AttemptResult::Success
+        } else {
+            crate::service_resolver::AttemptResult::TransportFailure
+        });
+        let bytes = bytes_result?;
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if self.verbose {
             eprintln!("← {status} response_bytes={}", text.len());
@@ -1478,7 +1657,11 @@ impl Session {
             // text back so callers can decrypt it instead of failing here.
             Value::String(text.clone())
         });
-        let code = v.get("error_code").and_then(|c| c.as_i64()).unwrap_or(0);
+        let code = v
+            .get("error_code")
+            .and_then(Value::as_i64)
+            .or_else(|| v.pointer("/data/error_code").and_then(Value::as_i64))
+            .unwrap_or(0);
         if code != 0 {
             let msg = v
                 .get("error_message")
@@ -1493,7 +1676,7 @@ impl Session {
                 Some(&text),
                 Some(&format!("server error {code}: {msg}")),
             );
-            bail!("server error {code}: {msg}");
+            return Err(EnvelopeFailure(code).into());
         }
         Ok(v)
     }
@@ -2115,7 +2298,11 @@ mod candidate_persistence_tests {
             "zpw_service_map_v3": {"chat": [first, second]}
         }));
         assert_eq!(
-            session.resolve_service_url("chat", "/api/message/sms"),
+            session
+                .service_resolver
+                .read()
+                .unwrap()
+                .resolve_url("chat", "/api/message/sms"),
             format!("{first}/api/message/sms")
         );
         session
@@ -2124,7 +2311,11 @@ mod candidate_persistence_tests {
             .unwrap()
             .record_success_for_url("chat", &format!("{second}/api/message/sms"));
         assert_eq!(
-            session.resolve_service_url("chat", "/api/message/sms"),
+            session
+                .service_resolver
+                .read()
+                .unwrap()
+                .resolve_url("chat", "/api/message/sms"),
             format!("{second}/api/message/sms")
         );
 
@@ -2132,7 +2323,11 @@ mod candidate_persistence_tests {
             "zpw_service_map_v3": {"chat": ["https://evil.invalid"]}
         }));
         assert_eq!(
-            session.resolve_service_url("chat", "/api/message/sms"),
+            session
+                .service_resolver
+                .read()
+                .unwrap()
+                .resolve_url("chat", "/api/message/sms"),
             format!("{second}/api/message/sms")
         );
 
@@ -2140,10 +2335,24 @@ mod candidate_persistence_tests {
             "zpw_service_map_v3": {"chat": [first]}
         }));
         assert_eq!(
-            session.resolve_service_url("chat", "/api/message/sms"),
+            session
+                .service_resolver
+                .read()
+                .unwrap()
+                .resolve_url("chat", "/api/message/sms"),
             format!("{first}/api/message/sms")
         );
         assert_ne!(first, canonical);
+        let logical = session.resolve_service_url("chat", "/api/message/sms");
+        assert_eq!(logical, format!("{canonical}/api/message/sms"));
+        let (service, candidates) = session
+            .service_resolver
+            .read()
+            .unwrap()
+            .candidates_for_url(&logical)
+            .unwrap();
+        assert_eq!(service, "chat");
+        assert_eq!(candidates[0], format!("{first}/api/message/sms"));
     }
 
     #[test]
@@ -2201,9 +2410,59 @@ mod candidate_persistence_tests {
 #[cfg(test)]
 mod remembered_host_tests {
     use super::*;
+
+    #[test]
+    fn candidate_retry_policy_is_fail_closed_for_ambiguous_mutations() {
+        assert!(should_retry_candidate(false, true, false, false, None));
+        assert!(!should_retry_candidate(false, false, true, false, None));
+        assert!(!should_retry_candidate(false, true, true, false, None));
+        assert!(!should_retry_candidate(false, true, false, true, None));
+        assert!(!should_retry_candidate(
+            false,
+            false,
+            false,
+            false,
+            Some(401)
+        ));
+        assert!(!should_retry_candidate(
+            false,
+            false,
+            false,
+            false,
+            Some(500)
+        ));
+        assert!(should_retry_candidate(true, false, true, false, None));
+        assert!(should_retry_candidate(true, false, false, false, Some(404)));
+    }
+
+    #[test]
+    fn response_error_codes_are_typed_without_treating_envelope_as_success() {
+        assert_eq!(
+            attempt_result_for_response(&serde_json::json!({"error_code": 600})),
+            crate::service_resolver::AttemptResult::AuthFailure
+        );
+        assert_eq!(
+            attempt_result_for_response(&serde_json::json!({"error_code": 429})),
+            crate::service_resolver::AttemptResult::RateLimited
+        );
+        assert_eq!(
+            attempt_result_for_response(&serde_json::json!({"error_code": 91})),
+            crate::service_resolver::AttemptResult::ProtocolFailure
+        );
+        assert_eq!(
+            attempt_result_for_response(&serde_json::json!({"error_code": 0})),
+            crate::service_resolver::AttemptResult::Success
+        );
+    }
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     async fn serve(status: &'static str) -> (String, tokio::task::JoinHandle<usize>) {
+        serve_with_body(status, "{\"error_code\":0,\"data\":{}}\n").await
+    }
+    async fn serve_with_body(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<usize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
@@ -2221,7 +2480,6 @@ mod remembered_host_tests {
                         break;
                     }
                 }
-                let body = "{\"error_code\":0,\"data\":{}}";
                 stream.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                 count += 1;
             }
@@ -2290,13 +2548,138 @@ mod remembered_host_tests {
         );
     }
 
+    #[derive(Debug)]
+    struct FixtureDnsFailure;
+    impl reqwest::dns::Resolve for FixtureDnsFailure {
+        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            Box::pin(async {
+                Err(Box::new(DnsPreflightFailure) as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+    }
+
     #[tokio::test]
-    #[ignore = "local Windows networking may classify closed loopback ports as timeout"]
     async fn mutation_connect_failure_uses_one_bounded_fallback_candidate() {
-        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let dead_primary = format!("http://{}", unused.local_addr().unwrap());
-        drop(unused);
+        let dead_primary = "http://fixture.invalid".to_owned();
         let (fallback, second) = serve("200 OK").await;
+        let mut s = Session::new(false, false, false).unwrap();
+        s.http = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(FixtureDnsFailure))
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        s.service_resolver
+            .write()
+            .unwrap()
+            .register_service("chat", vec![dead_primary, fallback]);
+        let logical = s.resolve_service_url("chat", "/api/fixture");
+        s.post_form(&logical, "payload=fixture".into())
+            .await
+            .unwrap();
+        assert_eq!(second.await.unwrap(), 1);
+        let timings = s.request_attempt_timings();
+        assert_eq!(timings.len(), 2);
+        assert!(timings
+            .iter()
+            .all(|timing| timing.service == crate::service_resolver::ServiceKey::Chat));
+        assert_eq!(
+            timings[0].result,
+            crate::service_resolver::AttemptResult::ConnectFailure
+        );
+        assert_eq!(
+            timings[1].result,
+            crate::service_resolver::AttemptResult::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_auth_and_rate_limit_failures_are_typed_without_replay() {
+        for (status, expected) in [
+            (
+                "401 Unauthorized",
+                crate::service_resolver::AttemptResult::AuthFailure,
+            ),
+            (
+                "403 Forbidden",
+                crate::service_resolver::AttemptResult::PolicyRejected,
+            ),
+            (
+                "429 Too Many Requests",
+                crate::service_resolver::AttemptResult::RateLimited,
+            ),
+        ] {
+            let (primary, first) = serve(status).await;
+            let (fallback, second) = serve("200 OK").await;
+            let mut s = Session::new(false, false, false).unwrap();
+            s.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            s.service_resolver
+                .write()
+                .unwrap()
+                .register_service("chat", vec![primary, fallback]);
+            let canonical = crate::endpoints::service("chat").unwrap();
+            assert!(s
+                .post_form(
+                    &format!("{canonical}/api/fixture"),
+                    "payload=fixture".into()
+                )
+                .await
+                .is_err());
+            assert_eq!(first.await.unwrap(), 1);
+            assert_eq!(second.await.unwrap(), 0);
+            assert_eq!(s.request_attempt_timings()[0].result, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_server_5xx_and_reset_after_headers_never_replay() {
+        for status in ["500 Internal Server Error", "503 Service Unavailable"] {
+            let (primary, first) = serve(status).await;
+            let (fallback, second) = serve("200 OK").await;
+            let s = fixture_session(vec![primary, fallback]);
+            let result = s
+                .post_form(
+                    &format!("{}/api/fixture", crate::endpoints::service("chat").unwrap()),
+                    "payload=fixture".into(),
+                )
+                .await;
+            assert!(result.is_err());
+            assert_eq!(first.await.unwrap(), 1);
+            assert_eq!(second.await.unwrap(), 0);
+            assert_eq!(s.request_attempt_timings().len(), 1);
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = format!("http://{}", listener.local_addr().unwrap());
+        let reset = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            // Drop after request headers: delivery is ambiguous, never a preflight failure.
+        });
+        let (fallback, second) = serve("200 OK").await;
+        let s = fixture_session(vec![primary, fallback]);
+        assert!(s
+            .post_form(
+                &format!("{}/api/fixture", crate::endpoints::service("chat").unwrap()),
+                "payload=fixture".into()
+            )
+            .await
+            .is_err());
+        reset.await.unwrap();
+        assert_eq!(second.await.unwrap(), 0);
+        assert_eq!(s.request_attempt_timings().len(), 1);
+    }
+
+    fn fixture_session(candidates: Vec<String>) -> Session {
         let mut s = Session::new(false, false, false).unwrap();
         s.http = reqwest::Client::builder()
             .no_proxy()
@@ -2306,19 +2689,50 @@ mod remembered_host_tests {
         s.service_resolver
             .write()
             .unwrap()
-            .register_service("chat", vec![dead_primary, fallback]);
-        let canonical = crate::endpoints::service("chat").unwrap();
-        s.post_form(
-            &format!("{canonical}/api/fixture"),
-            "payload=fixture".into(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.await.unwrap(), 1);
-        let timings = s.request_attempt_timings();
-        assert_eq!(timings.len(), 2);
-        assert_eq!(timings[0].result, crate::service_resolver::AttemptResult::ConnectFailure);
-        assert_eq!(timings[1].result, crate::service_resolver::AttemptResult::Success);
+            .register_service("chat", candidates);
+        s
+    }
+
+    #[tokio::test]
+    async fn mutation_http_200_error_envelope_is_typed_without_replay() {
+        for (body, expected) in [
+            (
+                "{\"error_code\":600}",
+                crate::service_resolver::AttemptResult::AuthFailure,
+            ),
+            (
+                "{\"error_code\":429}",
+                crate::service_resolver::AttemptResult::RateLimited,
+            ),
+            (
+                "{\"data\":{\"error_code\":600}}",
+                crate::service_resolver::AttemptResult::AuthFailure,
+            ),
+        ] {
+            let (primary, first) = serve_with_body("200 OK", body).await;
+            let (fallback, second) = serve("200 OK").await;
+            let mut s = Session::new(false, false, false).unwrap();
+            s.http = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .unwrap();
+            s.service_resolver
+                .write()
+                .unwrap()
+                .register_service("chat", vec![primary, fallback]);
+            let canonical = crate::endpoints::service("chat").unwrap();
+            assert!(s
+                .post_form(
+                    &format!("{canonical}/api/fixture"),
+                    "payload=fixture".into()
+                )
+                .await
+                .is_err());
+            assert_eq!(first.await.unwrap(), 1);
+            assert_eq!(second.await.unwrap(), 0);
+            assert_eq!(s.request_attempt_timings()[0].result, expected);
+        }
     }
 
     #[tokio::test]

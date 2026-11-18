@@ -1,6 +1,15 @@
 //! Server reminder editor. Acknowledged mutations are followed by an explicit list refresh.
 use super::*;
 #[derive(Default)]
+pub(super) struct MessagePins {
+    pub thread: String,
+    pub generation: u64,
+    pub pending: bool,
+    pub page: Option<crate::board::Page>,
+    pub error: String,
+}
+
+#[derive(Default)]
 pub(super) struct BoardPanel {
     pub open: bool,
     pub thread: String,
@@ -18,6 +27,45 @@ pub(super) struct BoardPanel {
     pub confirm_remove: Option<crate::board::Item>,
 }
 impl ZaloGuiApp {
+    pub(super) fn refresh_message_pins(&mut self, thread: &str, group: bool) {
+        self.message_pins = MessagePins {
+            thread: thread.to_owned(),
+            generation: crate::search::generation(),
+            pending: group,
+            ..Default::default()
+        };
+        if !group {
+            return;
+        }
+        if !WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::LoadMessagePins {
+                owner: self.user_uin.clone(),
+                thread: thread.to_owned(),
+                generation: self.message_pins.generation,
+            })
+            .is_ok()
+        }) {
+            self.message_pins.pending = false;
+            self.message_pins.error = "Worker chưa sẵn sàng".into();
+        }
+    }
+
+    pub(super) fn open_message_pins(&mut self, thread: String, group: bool) {
+        self.server_board = BoardPanel {
+            open: true,
+            thread,
+            group,
+            pins: true,
+            generation: crate::search::generation(),
+            ..Default::default()
+        };
+        self.board_command(crate::board::Action::List {
+            page: 0,
+            last: String::new(),
+            pins: true,
+        });
+    }
+
     pub(super) fn open_server_board(&mut self, thread: String, group: bool, title: String) {
         let generation = crate::search::generation();
         self.server_board = BoardPanel {

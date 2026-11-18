@@ -710,6 +710,7 @@ async fn deliver_outgoing(
             Err(error) => {
                 let text = crate::outgoing::failure_message(&error);
                 match crate::outgoing::send_failure_kind(&error) {
+                    crate::outgoing::SendFailureKind::NotSent => SendDisposition::NotSent(text),
                     crate::outgoing::SendFailureKind::ExplicitlyRejected => {
                         SendDisposition::Rejected(text)
                     }

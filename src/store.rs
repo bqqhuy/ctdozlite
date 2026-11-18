@@ -31,6 +31,146 @@ pub struct StoredThread {
     pub last_read_msg_id: String,
 }
 
+impl StoredMessage {
+    /// Decode the same persisted metadata used by timeline hydration and archive paging.
+    fn into_chat_message(self) -> ChatMessage {
+        let sm = self;
+        let time = if sm.ts > 0 {
+            crate::clock::message_time(sm.ts)
+        } else {
+            crate::ui::clock()
+        };
+        let mut sticker_id = None;
+        let mut sticker_cate_id = None;
+        let mut sticker_type = None;
+        let mut reply_to_id = None;
+        let mut reply_to_sender = None;
+        let mut reply_to_text = None;
+        let mut reactions = Vec::new();
+        let mut is_pinned = false;
+        let mut is_starred = false;
+        let mut link_url = None;
+        let mut link_title = None;
+        let mut link_desc = None;
+        let mut link_thumb = None;
+        let mut link_src = None;
+        let mut saved_state = None;
+        if !sm.raw_json.is_empty() {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
+                saved_state = val.get("message_state").cloned();
+                sticker_id = val
+                    .get("stickerId")
+                    .or_else(|| val.get("id"))
+                    .and_then(|v| v.as_u64());
+                sticker_cate_id = val
+                    .get("cateId")
+                    .or_else(|| val.get("catId"))
+                    .and_then(|v| v.as_u64());
+                sticker_type = val.get("type").and_then(|v| v.as_u64()).map(|n| n as u32);
+                reply_to_id = val
+                    .get("reply_to_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                reply_to_sender = val
+                    .get("reply_to_sender")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                reply_to_text = val
+                    .get("reply_to_text")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                if let Some(arr) = val.get("reactions").and_then(|v| v.as_array()) {
+                    reactions = arr
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                }
+                is_pinned = val
+                    .get("is_pinned")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                is_starred = val
+                    .get("is_starred")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                link_url = val
+                    .get("link_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                link_title = val
+                    .get("link_title")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                link_desc = val
+                    .get("link_desc")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                link_thumb = val
+                    .get("link_thumb")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                link_src = val
+                    .get("link_src")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+            }
+        }
+        let mut cm = ChatMessage {
+            id: sm.msg_id,
+            sender: if !sm.sender_name.is_empty() {
+                sm.sender_name
+            } else {
+                sm.sender_id
+            },
+            text: sm.text,
+            time,
+            is_outgoing: sm.is_outgoing,
+            ts: sm.ts,
+            sticker_id,
+            sticker_cate_id,
+            sticker_type,
+            reply_to_id,
+            reply_to_sender,
+            reply_to_text,
+            reactions,
+            is_pinned,
+            is_starred,
+            link_url,
+            link_title,
+            link_desc,
+            link_thumb,
+            link_src,
+
+            ..Default::default()
+        };
+        if let Some(state) = saved_state {
+            if cm.restore_state(&state).is_err() {
+                crate::logger::log_error(
+                    "history metadata",
+                    "Invalid optional message state; retained base message",
+                );
+            }
+        }
+        if cm.text == "[Tin nhắn đã thu hồi]" {
+            cm.mark_recalled();
+        }
+        cm
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub ts: i64,
+    pub id: String,
+}
+
+#[derive(Debug)]
+pub struct HistoryPage {
+    pub messages: Vec<ChatMessage>,
+    pub next: Option<HistoryCursor>,
+    pub scanned: usize,
+}
+
 /// Local-only conversation presentation controls, isolated by account database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ConversationPreference {
@@ -1134,6 +1274,74 @@ impl MessageStore {
         Ok(list)
     }
 
+    /// Read a bounded older page independently of the currently loaded timeline.
+    /// The cursor follows scanned rows, including deleted or expired rows, so a
+    /// page without visible media can still advance safely.
+    pub(crate) fn history_page(
+        &self,
+        thread: &str,
+        before: Option<&HistoryCursor>,
+        limit: usize,
+    ) -> Result<HistoryPage> {
+        anyhow::ensure!(
+            (1..=500).contains(&limit),
+            "Kích thước trang lịch sử không hợp lệ"
+        );
+        let (ts, id) = before
+            .map(|c| (c.ts, c.id.as_str()))
+            .unwrap_or((i64::MAX, ""));
+        let now = crate::login::unix_now() * 1000;
+        let mut stmt = self.conn.prepare(
+            "SELECT msg_id, thread_id, sender_id, sender_name, text, msg_type, ts, is_outgoing, raw_json,
+                EXISTS(SELECT 1 FROM message_expiry e WHERE e.thread_id=messages.thread_id AND e.msg_id=messages.msg_id AND e.expires_at<=?5)
+             FROM messages WHERE thread_id=?1 AND (ts, msg_id)<(?2,?3)
+             ORDER BY ts DESC, msg_id DESC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![thread, ts, id, (limit + 1) as i64, now], |row| {
+            Ok((
+                StoredMessage {
+                    msg_id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    sender_id: row.get(2).unwrap_or_default(),
+                    sender_name: row.get(3).unwrap_or_default(),
+                    text: row.get(4).unwrap_or_default(),
+                    msg_type: row.get(5).unwrap_or_default(),
+                    ts: row.get(6)?,
+                    is_outgoing: row.get::<_, i64>(7)? != 0,
+                    raw_json: row.get(8).unwrap_or_default(),
+                },
+                row.get::<_, bool>(9)?,
+            ))
+        })?;
+        let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        let next = more
+            .then(|| {
+                rows.last().map(|(row, _)| HistoryCursor {
+                    ts: row.ts,
+                    id: row.msg_id.clone(),
+                })
+            })
+            .flatten();
+        let scanned = rows.len();
+        let mut messages = Vec::new();
+        for (row, expired) in rows {
+            if expired || self.is_deleted_message(&row)? {
+                continue;
+            }
+            let message = row.into_chat_message();
+            if !crate::message_lifecycle::expired(&message, now) {
+                messages.push(message);
+            }
+        }
+        Ok(HistoryPage {
+            messages,
+            next,
+            scanned,
+        })
+    }
+
     /// Retrieve all persisted thread metadata ordered by `last_ts` descending.
     pub fn all_threads(&self) -> Result<Vec<StoredThread>> {
         let has_read_col = self
@@ -1271,127 +1479,9 @@ impl MessageStore {
             }
             let saved_msgs = self.messages_for(&t.id, limit_per_thread)?;
             for sm in saved_msgs {
-                let time = if sm.ts > 0 {
-                    crate::clock::message_time(sm.ts)
-                } else {
-                    crate::ui::clock()
-                };
-                let mut sticker_id = None;
-                let mut sticker_cate_id = None;
-                let mut sticker_type = None;
-                let mut reply_to_id = None;
-                let mut reply_to_sender = None;
-                let mut reply_to_text = None;
-                let mut reactions = Vec::new();
-                let mut is_pinned = false;
-                let mut is_starred = false;
-                let mut link_url = None;
-                let mut link_title = None;
-                let mut link_desc = None;
-                let mut link_thumb = None;
-                let mut link_src = None;
-                let mut saved_state = None;
-                if !sm.raw_json.is_empty() {
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&sm.raw_json) {
-                        saved_state = val.get("message_state").cloned();
-                        sticker_id = val
-                            .get("stickerId")
-                            .or_else(|| val.get("id"))
-                            .and_then(|v| v.as_u64());
-                        sticker_cate_id = val
-                            .get("cateId")
-                            .or_else(|| val.get("catId"))
-                            .and_then(|v| v.as_u64());
-                        sticker_type = val.get("type").and_then(|v| v.as_u64()).map(|n| n as u32);
-                        reply_to_id = val
-                            .get("reply_to_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        reply_to_sender = val
-                            .get("reply_to_sender")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        reply_to_text = val
-                            .get("reply_to_text")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        if let Some(arr) = val.get("reactions").and_then(|v| v.as_array()) {
-                            reactions = arr
-                                .iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect();
-                        }
-                        is_pinned = val
-                            .get("is_pinned")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        is_starred = val
-                            .get("is_starred")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        link_url = val
-                            .get("link_url")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        link_title = val
-                            .get("link_title")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        link_desc = val
-                            .get("link_desc")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        link_thumb = val
-                            .get("link_thumb")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        link_src = val
-                            .get("link_src")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                    }
-                }
-                let mut cm = ChatMessage {
-                    id: sm.msg_id,
-                    sender: if !sm.sender_name.is_empty() {
-                        sm.sender_name
-                    } else {
-                        sm.sender_id
-                    },
-                    text: sm.text,
-                    time,
-                    is_outgoing: sm.is_outgoing,
-                    ts: sm.ts,
-                    sticker_id,
-                    sticker_cate_id,
-                    sticker_type,
-                    reply_to_id,
-                    reply_to_sender,
-                    reply_to_text,
-                    reactions,
-                    is_pinned,
-                    is_starred,
-                    link_url,
-                    link_title,
-                    link_desc,
-                    link_thumb,
-                    link_src,
-
-                    ..Default::default()
-                };
-                if let Some(state) = saved_state {
-                    if cm.restore_state(&state).is_err() {
-                        crate::logger::log_error(
-                            "history metadata",
-                            "Invalid optional message state; retained base message",
-                        );
-                    }
-                }
+                let cm = sm.into_chat_message();
                 if crate::message_lifecycle::expired(&cm, crate::login::unix_now() * 1000) {
                     continue;
-                }
-                if cm.text == "[Tin nhắn đã thu hồi]" {
-                    cm.mark_recalled();
                 }
                 if let (Some(marks), Some(mark)) =
                     (marks.as_deref_mut(), crate::chat::message_fingerprint(&cm))
@@ -3516,5 +3606,130 @@ mod mention_draft_tests {
         // Explicit new read-point updates.
         store.set_thread_read("t1", "msg-200").unwrap();
         assert_eq!(store.all_threads().unwrap()[0].last_read_msg_id, "msg-200");
+    }
+}
+
+#[cfg(test)]
+mod archive_history_paging_tests {
+    use super::*;
+
+    #[test]
+    fn archive_history_keyset_reads_older_messages_once_and_keeps_thread_scope() {
+        let store = MessageStore::open(":memory:").unwrap();
+        for thread in ["thread-a", "thread-b"] {
+            for id in ["msg-1", "msg-2", "msg-3", "msg-4", "msg-5"] {
+                store
+                    .upsert_message(&StoredMessage {
+                        msg_id: id.into(),
+                        thread_id: thread.into(),
+                        sender_id: "user-1".into(),
+                        sender_name: "User".into(),
+                        text: format!("{thread}/{id}"),
+                        msg_type: "chat.text".into(),
+                        ts: 1000,
+                        is_outgoing: false,
+                        raw_json: String::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(store.messages_for("thread-a", 2).unwrap().len(), 2);
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = store.history_page("thread-a", cursor.as_ref(), 2).unwrap();
+            assert!(page.scanned <= 2);
+            assert!(page
+                .messages
+                .iter()
+                .all(|m| m.text.starts_with("thread-a/")));
+            ids.extend(page.messages.into_iter().map(|m| m.id));
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids, ["msg-5", "msg-4", "msg-3", "msg-2", "msg-1"]);
+    }
+
+    #[test]
+    fn archive_history_advances_across_expired_rows_and_restores_source_metadata() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let message = ChatMessage {
+            id: "msg-older".into(),
+            client_message_id: "client-older".into(),
+            sender: "User".into(),
+            text: "old local media".into(),
+            ts: 1000,
+            ..Default::default()
+        };
+        let mut row = StoredMessage::from(&message);
+        row.thread_id = "thread-a".into();
+        store.upsert_message(&row).unwrap();
+        // Mark the newest page expired without deleting it, as a concurrent expiry can do.
+        row.msg_id = "msg-newer".into();
+        row.ts = 2000;
+        store.upsert_message(&row).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO message_expiry(thread_id,msg_id,expires_at) VALUES(?1,?2,?3)",
+                params!["thread-a", "msg-newer", 1],
+            )
+            .unwrap();
+        let first = store.history_page("thread-a", None, 1).unwrap();
+        assert!(first.messages.is_empty());
+        assert!(first.next.is_some());
+        let second = store
+            .history_page("thread-a", first.next.as_ref(), 1)
+            .unwrap();
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.messages[0].client_message_id, "client-older");
+    }
+
+    #[test]
+    fn archive_history_paging_uses_thread_index_and_reports_bounded_read_measurements() {
+        let store = MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<10000)
+            INSERT INTO messages(msg_id,thread_id,sender_id,sender_name,text,msg_type,ts,is_outgoing,raw_json)
+            SELECT printf('msg-%05d',x),'thread-benchmark','user-1','User','fake media history','chat.text',x,0,'' FROM n;").unwrap();
+        let plan:String = store.conn.prepare("EXPLAIN QUERY PLAN SELECT msg_id,ts FROM messages WHERE thread_id=?1 AND (ts,msg_id)<(?2,?3) ORDER BY ts DESC,msg_id DESC LIMIT ?4").unwrap()
+            .query_map(params!["thread-benchmark",5000,"msg-05000",201],|r|r.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap().join(";");
+        assert!(plan.contains("idx_thread_ts"), "{plan}");
+        eprintln!("archive history benchmark: OS={}, dataset=10000 fake rows, backend=SQLite memory, host={}",std::env::consts::OS,std::env::consts::ARCH);
+        eprintln!("task,iterations,min_ms,avg_ms,p50_ms,p95_ms,p99_ms");
+        for (task, paged) in [
+            ("previous_timeline_3000", false),
+            ("archive_page_200", true),
+        ] {
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                if paged {
+                    assert!(
+                        store
+                            .history_page("thread-benchmark", None, 200)
+                            .unwrap()
+                            .scanned
+                            <= 200
+                    );
+                } else {
+                    assert_eq!(
+                        store.messages_for("thread-benchmark", 3000).unwrap().len(),
+                        3000
+                    );
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "{task},20,{:.3},{:.3},{:.3},{:.3},{:.3}",
+                samples[0],
+                samples.iter().sum::<f64>() / 20.0,
+                samples[9],
+                samples[18],
+                samples[19]
+            );
+        }
     }
 }

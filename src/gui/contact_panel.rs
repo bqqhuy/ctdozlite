@@ -5,6 +5,8 @@ pub(super) struct ContactPanel {
     pub open: bool,
     pub group_report: bool,
     pub lookup_mode: bool,
+    pub alias_only: bool,
+    pub report_only: bool,
     pub username: String,
     pub lookup: Option<crate::contact_actions::Lookup>,
     pub close_friends: Vec<crate::contact_actions::Lookup>,
@@ -37,6 +39,9 @@ impl ZaloGuiApp {
         };
     }
     pub(super) fn open_group_report(&mut self, target: String) {
+        self.open_contact_report(target, true);
+    }
+    pub(super) fn open_contact_report(&mut self, target: String, group: bool) {
         if self.contact_panel.pending {
             self.show_toast("Chờ thao tác liên hệ trước hoàn tất");
             return;
@@ -44,7 +49,8 @@ impl ZaloGuiApp {
         self.contact_panel = ContactPanel {
             open: true,
             target,
-            group_report: true,
+            group_report: group,
+            report_only: true,
             ..Default::default()
         };
     }
@@ -65,6 +71,14 @@ impl ZaloGuiApp {
             ..Default::default()
         };
         self.contact_command(crate::contact_actions::Action::Inspect);
+    }
+    pub(super) fn open_contact_alias_editor(&mut self, target: String) {
+        if self.contact_panel.pending {
+            self.show_toast("Đang xử lý liên hệ; chờ kết quả trước khi đổi tên gợi nhớ");
+            return;
+        }
+        self.open_contact_panel(target);
+        self.contact_panel.alias_only = true;
     }
     pub(super) fn open_blocklist(&mut self) {
         if self.contact_panel.pending {
@@ -112,6 +126,7 @@ impl ZaloGuiApp {
         render_modal_backdrop(ctx, "contact_panel_backdrop");
 
         let mut open = true;
+        let mut close_requested = false;
         let mut intent = None;
         let mut selected_contact = None;
         if !self.contact_panel.target.is_empty()
@@ -134,7 +149,7 @@ impl ZaloGuiApp {
         let screen = ctx.screen_rect();
         let max_w = (screen.width() - 48.0).max(180.0);
         let max_h = (screen.height() - 100.0).max(100.0);
-        egui::Window::new("Liên hệ và quyền riêng tư")
+        egui::Window::new(if self.contact_panel.report_only { "Báo xấu tới Zalo" } else if self.contact_panel.alias_only { "Đặt tên gợi nhớ" } else { "Liên hệ và quyền riêng tư" })
             .id(Id::new("contact-actions"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -153,6 +168,66 @@ impl ZaloGuiApp {
             )
             .show(ctx, |ui| {
                 ui.style_mut().wrap_mode=Some(egui::TextWrapMode::Wrap);
+            if self.contact_panel.report_only {
+                ui.label(if self.contact_panel.group_report {
+                    "Báo cáo nhóm / cộng đồng này tới Zalo. Không tự rời nhóm hay xóa lịch sử."
+                } else { "Báo cáo tài khoản này tới Zalo. Không tự chặn hay xóa cuộc trò chuyện." });
+                ui.label(format!("Đối tượng: {}", self.contact_panel.target));
+                ui.label(&self.contact_panel.status);
+                if self.contact_panel.pending { ui.spinner(); }
+                ui.add_enabled_ui(!self.contact_panel.pending && !self.contact_panel.uncertain, |ui| {
+                    ui.label("Lý do khác: mô tả nội dung báo cáo (tối đa 1000 ký tự)");
+                    if ui.add(egui::TextEdit::multiline(&mut self.contact_panel.report)
+                        .char_limit(1000).desired_width(ui.available_width())).changed() {
+                        self.contact_panel.confirm = None;
+                    }
+                    if ui.add_enabled(!self.contact_panel.report.trim().is_empty(), egui::Button::new("Xem lại báo cáo")).clicked() {
+                        self.contact_panel.confirm = Some(if self.contact_panel.group_report {
+                            crate::contact_actions::Action::ReportGroupOther { description: self.contact_panel.report.clone() }
+                        } else { crate::contact_actions::Action::ReportOther { description: self.contact_panel.report.clone() } });
+                    }
+                    if let Some(action) = self.contact_panel.confirm.clone() {
+                        ui.separator();
+                        ui.label("Gửi nội dung sau tới Zalo về đúng đối tượng ở trên?");
+                        match &action {
+                            crate::contact_actions::Action::ReportGroupOther { description }
+                            | crate::contact_actions::Action::ReportOther { description } => { ui.label(description); }
+                            _ => {}
+                        }
+                        if ui.button("Xác nhận gửi báo cáo").clicked() { intent = Some(action); self.contact_panel.confirm = None; }
+                    }
+                });
+                if self.contact_panel.uncertain { ui.label("Chưa xác nhận được kết quả; kiểm tra trước khi gửi lại báo cáo."); }
+                if ui.add_enabled(!self.contact_panel.pending, egui::Button::new("Hủy / Đóng")).clicked() { close_requested = true; }
+                return;
+            }
+            if self.contact_panel.alias_only {
+                ui.label("Tên gợi nhớ chỉ hiển thị riêng với bạn, không đổi tên Zalo của người này.");
+                ui.label("Tối đa 100 ký tự; để trống để bỏ tên gợi nhớ.");
+                ui.label(&self.contact_panel.status);
+                if self.contact_panel.pending { ui.spinner(); }
+                ui.add_enabled_ui(!self.contact_panel.pending && !self.contact_panel.uncertain, |ui| {
+                    let changed = ui.add(egui::TextEdit::singleline(&mut self.contact_panel.alias)
+                        .id_salt("contact-alias-editor")
+                        .char_limit(100).desired_width(ui.available_width())).changed();
+                    if changed { self.contact_panel.confirm = None; }
+                    if ui.button("Lưu tên gợi nhớ").clicked() {
+                        self.contact_panel.confirm = Some(crate::contact_actions::Action::Alias(self.contact_panel.alias.clone()));
+                    }
+                });
+                if let Some(crate::contact_actions::Action::Alias(alias)) = self.contact_panel.confirm.clone() {
+                    ui.label(if alias.trim().is_empty() { "Bỏ tên gợi nhớ riêng của bạn?" } else { "Lưu tên gợi nhớ này riêng cho bạn?" });
+                    if ui.add_enabled(!self.contact_panel.pending && !self.contact_panel.uncertain, egui::Button::new("Xác nhận")).clicked() {
+                        intent = Some(crate::contact_actions::Action::Alias(alias));
+                        self.contact_panel.confirm = None;
+                    }
+                }
+                if self.contact_panel.uncertain {
+                    ui.label("Chưa xác nhận được tên mới; kiểm tra trên Zalo chính thức trước khi thử lại.");
+                }
+                if ui.add_enabled(!self.contact_panel.pending, egui::Button::new("Hủy / Đóng")).clicked() { close_requested = true; }
+                return;
+            }
             if self.contact_panel.lookup_mode {
                 ui.label("Tra cứu tên đăng nhập Zalo (username), khác tên hiển thị và số điện thoại.");
                 ui.add(egui::TextEdit::singleline(&mut self.contact_panel.username).char_limit(128).desired_width(ui.available_width()));
@@ -217,7 +292,7 @@ impl ZaloGuiApp {
                 });
             }
             ui.add_enabled_ui(!self.contact_panel.pending && !self.contact_panel.uncertain,|ui| {
-                if !self.contact_panel.group_report {ui.label("Biệt danh đồng bộ máy chủ (để trống để xóa)");
+                if !self.contact_panel.group_report {ui.label("Tên gợi nhớ chỉ hiển thị riêng với bạn (để trống để xóa)");
                 ui.add(egui::TextEdit::singleline(&mut self.contact_panel.alias).desired_width(ui.available_width()));
                 if ui.button("Lưu biệt danh").clicked() { self.contact_panel.confirm=Some(crate::contact_actions::Action::Alias(self.contact_panel.alias.clone())); }}
                 ui.collapsing("Báo cáo tới Zalo",|ui| {
@@ -251,7 +326,7 @@ impl ZaloGuiApp {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) && !self.contact_panel.pending {
             open = false;
         }
-        self.contact_panel.open = open;
+        self.contact_panel.open = self.contact_panel.pending || (open && !close_requested);
         if let Some(action) = intent {
             self.contact_command(action);
         }

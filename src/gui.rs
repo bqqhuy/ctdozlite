@@ -223,6 +223,12 @@ pub enum GuiEvent {
         groups: HashSet<String>,
         all: bool,
     },
+    GroupKindLoaded {
+        revision: u64,
+        owner: String,
+        group_id: String,
+        kind: Option<crate::chat::GroupKind>,
+    },
     GroupPolicy {
         revision: u64,
         owner: String,
@@ -293,6 +299,26 @@ pub enum GuiEvent {
         owner: String,
         id: String,
         result: Result<std::path::PathBuf, String>,
+    },
+    ArchiveMutationFinished {
+        owner: String,
+        runtime_id: usize,
+        batch: u64,
+        thread: String,
+        recall: bool,
+        results: Vec<(ChatMessage, Result<(), String>)>,
+    },
+    ArchiveHistoryLoaded {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        generation: u64,
+        result: Result<crate::store::HistoryPage, String>,
+    },
+    MediaBatchFinished {
+        owner: String,
+        batch: u64,
+        results: Vec<(String, Result<std::path::PathBuf, String>)>,
     },
     Tools {
         owner: String,
@@ -372,12 +398,16 @@ pub enum GuiEvent {
         source: ThreadUpdateSource,
     },
     LocalCallRecord {
+        runtime_id: usize,
+        outgoing: bool,
+        owner: String,
         thread_id: String,
         text: String,
         msg_id: String,
     },
     OutgoingState {
         owner: String,
+        runtime_id: usize,
         thread_id: String,
         message: ChatMessage,
     },
@@ -490,6 +520,21 @@ pub enum GuiEvent {
         quoted: ChatMessage,
     },
     NotificationSoundPrepared(bool),
+    SettingsDevicesLoaded {
+        generation: u64,
+        result: Result<(Vec<String>, Vec<String>), String>,
+    },
+    MessagePinsLoaded {
+        owner: String,
+        thread: String,
+        generation: u64,
+        result: Result<crate::board::Page, String>,
+    },
+    CloudUsageLoaded {
+        owner: String,
+        generation: u64,
+        result: Result<crate::zcloud::Usage, String>,
+    },
     Board {
         owner: String,
         thread: String,
@@ -656,17 +701,12 @@ pub enum GuiEvent {
         recalled_ids: Vec<String>,
         count: usize,
     },
-    BatchForwardCompleted {
-        target_id: String,
-        count: usize,
-    },
     LoggedOut,
     LogoutFailed {
         message: String,
     },
     DownloadFolderPicked(Option<Result<std::path::PathBuf, String>>),
     DownloadFolderFailed(String),
-    DiagnosticsFolderOpened(std::result::Result<(), String>),
     CameraUnavailable(String),
     UploadProgress {
         upload_id: String,
@@ -1152,6 +1192,9 @@ pub struct ZaloGuiApp {
     history_search: search_panel::SearchPanel,
     server_pins: crate::server_pins::Snapshot,
     server_board: board_panel::BoardPanel,
+    message_pins: board_panel::MessagePins,
+    message_details: Option<(String, ChatMessage)>,
+    cloud_usage: workspace::CloudUsageState,
     groups_panel: group_panel::GroupPanel,
     group_entry_panel: group_entry_panel::GroupEntryPanel,
     contact_panel: contact_panel::ContactPanel,
@@ -1228,8 +1271,7 @@ pub struct ZaloGuiApp {
     contacts_view_open: bool,
     /// An input method is composing text in the chat composer (Telex/IME preedit).
     composer_ime_active: bool,
-    /// Local rich-composer presentation mode; wire format remains unchanged until a
-    /// server-backed rich-text send contract is verified.
+    /// Opens the composer toolbar; metadata follows the official PC contract (re-notes/46).
     composer_format_mode: bool,
     /// Last rendered chat-list identity; a change discards one stale layout pass.
     chat_layout_key: u64,
@@ -1261,6 +1303,8 @@ pub struct ZaloGuiApp {
     // Reply / forward state
     replying_to: Option<ChatMessage>,
     forward_msg: Option<ChatMessage>,
+    forward_batch: Vec<ChatMessage>,
+    forward_cloud_only: bool,
     pub(super) forward_session: Option<modals::ForwardSessionState>,
     forward_filter: String,
     forward_targets: HashSet<String>,
@@ -1290,8 +1334,19 @@ pub struct ZaloGuiApp {
     pub drawer_media_type: Option<crate::message_view::FileCategory>,
     pub drawer_media_from: String,
     pub drawer_media_to: String,
+    pub drawer_media_thread_id: String,
+    pub drawer_media_active_tab: MediaTab,
+    pub drawer_media_filter_key: String,
+    pub drawer_media_limit: usize,
     pub drawer_media_selection_mode: bool,
     pub drawer_media_selected: HashSet<String>,
+    archive_local_paths: HashMap<String, std::path::PathBuf>,
+    archive_mutation_confirm: Option<workspace::ArchiveMutation>,
+    archive_mutation_batch: Option<u64>,
+    archive_mutation_results: Vec<String>,
+    archive_history: workspace::ArchiveHistory,
+    drawer_media_batch: Option<u64>,
+    drawer_media_batch_status: String,
     // Common groups cache (MAP-07)
     common_groups_cache: HashMap<String, Vec<Thread>>,
     common_groups_state: HashMap<String, Option<String>>,
@@ -1378,12 +1433,13 @@ pub struct ZaloGuiApp {
     sync_cancel_requested: bool,
     last_sync_was_history: bool,
     settings_modal_open: bool,
+    settings_devices: modals::SettingsDevices,
     download_picker_pending: bool,
     batch_selection_mode: bool,
+    timeline_selection_scope: Option<(String, usize, String, bool)>,
     selected_msg_ids: HashSet<String>,
     send_contact_modal_open: bool,
     send_contact_query: String,
-    batch_forward_modal_open: bool,
     voice_worker: Option<crate::voice::VoiceWorker>,
     voice_start_pending: bool,
     voice_finish_pending: bool,
@@ -1526,15 +1582,8 @@ impl ZaloGuiApp {
                 thread.presentation.metadata_verified = false;
             }
         }
-        if let Some(li) = session.login.as_ref() {
-            if !li.send2me_id.is_empty() {
-                for t in threads.iter_mut() {
-                    if !t.is_group && t.name.contains("Cloud của tôi") {
-                        t.id = li.send2me_id.clone();
-                    }
-                }
-            }
-        }
+        // Self-storage identity is authoritative only when supplied by the server;
+        // never rewrite an arbitrary contact ID because its display name is editable.
         crate::chat::deduplicate_threads(&mut threads, None);
         crate::chat::deduplicate_threads(&mut threads, None);
 
@@ -1605,6 +1654,8 @@ impl ZaloGuiApp {
             deleted_message_ids: HashSet::new(),
             replying_to: None,
             forward_msg: None,
+            forward_batch: Vec::new(),
+            forward_cloud_only: false,
             forward_session: None,
             forward_filter: String::new(),
             forward_targets: HashSet::new(),
@@ -1634,8 +1685,19 @@ impl ZaloGuiApp {
             drawer_media_type: None,
             drawer_media_from: String::new(),
             drawer_media_to: String::new(),
+            drawer_media_thread_id: String::new(),
+            drawer_media_active_tab: MediaTab::Photos,
+            drawer_media_filter_key: String::new(),
+            drawer_media_limit: 100,
             drawer_media_selection_mode: false,
             drawer_media_selected: HashSet::new(),
+            archive_local_paths: HashMap::new(),
+            archive_mutation_confirm: None,
+            archive_mutation_batch: None,
+            archive_mutation_results: Vec::new(),
+            archive_history: Default::default(),
+            drawer_media_batch: None,
+            drawer_media_batch_status: String::new(),
             common_groups_cache: HashMap::new(),
             common_groups_state: HashMap::new(),
             common_groups_generations: HashMap::new(),
@@ -1726,12 +1788,13 @@ impl ZaloGuiApp {
             sync_cancel_requested: false,
             last_sync_was_history: true,
             settings_modal_open: false,
+            settings_devices: Default::default(),
             download_picker_pending: false,
             batch_selection_mode: false,
+            timeline_selection_scope: None,
             selected_msg_ids: HashSet::new(),
             send_contact_modal_open: false,
             send_contact_query: String::new(),
-            batch_forward_modal_open: false,
             voice_worker: None,
             voice_start_pending: false,
             voice_finish_pending: false,
@@ -1744,6 +1807,9 @@ impl ZaloGuiApp {
             history_search: Default::default(),
             server_pins: Default::default(),
             server_board: Default::default(),
+            message_pins: Default::default(),
+            message_details: None,
+            cloud_usage: Default::default(),
             groups_panel: Default::default(),
             group_entry_panel: Default::default(),
             contact_panel: Default::default(),
@@ -2143,7 +2209,7 @@ impl ZaloGuiApp {
                 app.input_message =
                     "Hẹn gửi báo cáo lúc 08:00. Giữ nguyên 2*3*4 và tiếng Việt.".into();
                 if args.iter().any(|a| a == "--ui-smoke-schedule") {
-                    app.open_quick_schedule();
+                    app.open_quick_schedule(ctx);
                 }
                 if args.iter().any(|a| a == "--ui-smoke-ami") {
                     app.sticker_picker_open = true;
@@ -2315,6 +2381,10 @@ impl ZaloGuiApp {
             .store(true, std::sync::atomic::Ordering::Release);
         self.backup_panel = Default::default();
         self.call_terminals = Default::default();
+        self.message_pins = Default::default();
+        self.message_details = None;
+        self.server_board = Default::default();
+        self.cloud_usage = Default::default();
         self.groups_panel = Default::default();
         self.group_entry_panel = Default::default();
         self.contact_panel = Default::default();
@@ -2367,11 +2437,24 @@ impl ZaloGuiApp {
         self.clipboard_alternative_text = None;
         self.clipboard_text_only = false;
         self.clear_forward_dialog();
+        self.clear_timeline_selection();
+        self.archive_local_paths.clear();
+        self.archive_mutation_confirm = None;
+        self.archive_mutation_batch = None;
+        self.archive_mutation_results.clear();
+        self.archive_history = Default::default();
+        self.drawer_media_filter_key.clear();
+        self.drawer_media_batch = None;
+        self.drawer_media_batch_status.clear();
+        self.drawer_media_selected.clear();
+        self.drawer_media_selection_mode = false;
     }
 
     /// Clear all state belonging to the 2-step forward/share dialog.
     pub(super) fn clear_forward_dialog(&mut self) {
         self.forward_msg = None;
+        self.forward_batch.clear();
+        self.forward_cloud_only = false;
         self.forward_session = None;
         self.forward_filter.clear();
         self.forward_targets.clear();
@@ -2393,12 +2476,13 @@ impl ZaloGuiApp {
             || self.content_protection_modal.is_some()
             || self.reset_e2ee_confirm_peer.is_some()
             || self.send_contact_modal_open
-            || self.batch_forward_modal_open
             || self.clear_history_confirmation.is_some()
             || self.quick_schedule.is_some()
             || self.tools.open
             || self.history_search.open
             || self.server_board.open
+            || self.message_details.is_some()
+            || self.archive_mutation_confirm.is_some()
             || self.groups_panel.open
             || self.group_entry_panel.open
             || self.contact_panel.open
@@ -2538,10 +2622,19 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::LocalCallRecord {
+                    outgoing,
+                    runtime_id,
+                    owner,
                     thread_id,
                     text,
                     msg_id,
                 } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
                     let mut inserted = false;
                     if let Some(thread) = self.threads.iter_mut().find(|t| t.id == thread_id) {
                         if !thread.messages.iter().any(|m| m.id == msg_id) {
@@ -2549,8 +2642,12 @@ impl ZaloGuiApp {
                                 id: msg_id,
                                 text,
                                 ts: crate::login::unix_now() * 1000,
-                                is_outgoing: true,
-                                sender: "Bạn".into(),
+                                is_outgoing: outgoing,
+                                sender: if outgoing {
+                                    "Bạn".into()
+                                } else {
+                                    thread.name.clone()
+                                },
                                 ..Default::default()
                             });
                             thread.messages.sort_by_key(|m| m.ts);
@@ -2806,6 +2903,153 @@ impl ZaloGuiApp {
                         if let Some(d) = self.downloads.get_mut(&id) {
                             d.result = Some(result);
                         }
+                    }
+                }
+                GuiEvent::ArchiveMutationFinished {
+                    owner,
+                    runtime_id,
+                    batch,
+                    thread,
+                    recall,
+                    results,
+                } => {
+                    if owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                        || !self.is_logged_in
+                        || self.archive_mutation_batch != Some(batch)
+                    {
+                        continue;
+                    }
+                    self.archive_mutation_batch = None;
+                    self.archive_mutation_results.clear();
+                    for (message, result) in results {
+                        let label = format!(
+                            "{} ({})",
+                            crate::message_view::summary(&message),
+                            message.id
+                        );
+                        match result {
+                            Ok(()) => {
+                                self.archive_mutation_results.push(format!(
+                                    "{}: {}",
+                                    if recall {
+                                        "Đã thu hồi"
+                                    } else {
+                                        "Đã xóa phía bạn"
+                                    },
+                                    label
+                                ));
+                                if recall {
+                                    if let Some(t) =
+                                        self.threads.iter_mut().find(|t| t.id == thread)
+                                    {
+                                        for current in &mut t.messages {
+                                            if crate::chat::same_message(current, &message) {
+                                                current.mark_recalled();
+                                            }
+                                        }
+                                        t.refresh_after_removal();
+                                    }
+                                    if self.archive_history.thread == thread {
+                                        for current in &mut self.archive_history.messages {
+                                            if crate::chat::same_message(current, &message) {
+                                                current.mark_recalled();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    self.deleted_message_ids
+                                        .insert((thread.clone(), message.id.clone()));
+                                    if let Some(t) =
+                                        self.threads.iter_mut().find(|t| t.id == thread)
+                                    {
+                                        t.messages.retain(|current| {
+                                            !crate::chat::same_message(current, &message)
+                                        });
+                                        t.refresh_after_removal();
+                                    }
+                                    if self.archive_history.thread == thread {
+                                        self.archive_history.messages.retain(|current| {
+                                            !crate::chat::same_message(current, &message)
+                                        });
+                                    }
+                                }
+                            }
+                            Err(error) => self
+                                .archive_mutation_results
+                                .push(format!("{label}: {error}")),
+                        }
+                    }
+                    self.chat_geometry_revision = self.chat_geometry_revision.wrapping_add(1);
+                    self.drawer_media_selected.clear();
+                    self.invalidate_history_search();
+                }
+                GuiEvent::ArchiveHistoryLoaded {
+                    owner,
+                    runtime_id,
+                    thread,
+                    generation,
+                    result,
+                } => {
+                    if owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                        || !self.is_logged_in
+                        || thread != self.archive_history.thread
+                        || generation != self.archive_history.generation
+                    {
+                        continue;
+                    }
+                    self.archive_history.loading = false;
+                    if !self
+                        .threads
+                        .iter()
+                        .find(|t| t.id == thread)
+                        .is_some_and(|t| self.private_access(&t.id, t.is_group))
+                    {
+                        self.archive_history = Default::default();
+                        self.drawer_media_filter_key.clear();
+                        continue;
+                    }
+                    match result {
+                        Ok(page) => {
+                            self.archive_history.loaded = true;
+                            self.archive_history.error.clear();
+                            self.archive_history.scanned += page.scanned;
+                            self.archive_history.cursor = page.next;
+                            for message in page.messages {
+                                if !self
+                                    .archive_history
+                                    .messages
+                                    .iter()
+                                    .any(|old| crate::chat::same_message(old, &message))
+                                {
+                                    self.archive_history.messages.push(message);
+                                }
+                            }
+                        }
+                        Err(error) => self.archive_history.error = error,
+                    }
+                }
+                GuiEvent::MediaBatchFinished {
+                    owner,
+                    batch,
+                    results,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && self.drawer_media_batch == Some(batch)
+                    {
+                        self.drawer_media_batch = None;
+                        for (key, result) in &results {
+                            if let Ok(path) = result {
+                                self.archive_local_paths.insert(key.clone(), path.clone());
+                            }
+                        }
+                        let succeeded = results.iter().filter(|(_, result)| result.is_ok()).count();
+                        self.drawer_media_batch_status = format!(
+                            "Đã lưu {succeeded}/{} mục; xem kết quả từng mục trong Tải tệp.",
+                            results.len()
+                        );
                     }
                 }
                 GuiEvent::ScreenCaptureFinished {
@@ -3391,6 +3635,7 @@ impl ZaloGuiApp {
                     for thread in &mut self.threads {
                         if thread.is_group && affects(&thread.id) {
                             thread.presentation.send_policy = None;
+                            thread.presentation.group_kind = None;
                             thread.presentation.metadata_verified = false;
                             self.group_members.remove(&thread.id);
                         }
@@ -3408,6 +3653,25 @@ impl ZaloGuiApp {
                             let _ = tx.send(WorkerCmd::FetchGroupPolicy {
                                 group_id: thread.id.clone(),
                             });
+                        }
+                    }
+                }
+                GuiEvent::GroupKindLoaded {
+                    revision,
+                    owner,
+                    group_id,
+                    kind,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && revision >= self.group_policy_revision
+                    {
+                        if let Some(thread) = self
+                            .threads
+                            .iter_mut()
+                            .find(|thread| thread.is_group && thread.id == group_id)
+                        {
+                            thread.presentation.group_kind = kind;
                         }
                     }
                 }
@@ -3502,16 +3766,6 @@ impl ZaloGuiApp {
                     self.show_toast(reason);
                 }
                 GuiEvent::DownloadFolderFailed(message) => self.show_toast(message),
-                GuiEvent::DiagnosticsFolderOpened(result) => {
-                    self.tools.diagnostics_opening = false;
-                    match result {
-                        Ok(()) => self.status_msg = "Đã mở thư mục chẩn đoán".into(),
-                        Err(message) => {
-                            self.status_msg = message.clone();
-                            self.show_toast(message);
-                        }
-                    }
-                }
                 GuiEvent::DownloadFolderPicked(result) => {
                     self.download_picker_pending = false;
                     match result {
@@ -3940,10 +4194,14 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::OutgoingState {
                     owner,
+                    runtime_id,
                     thread_id,
                     message,
                 } => {
-                    if !self.is_logged_in || owner != self.user_uin {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
                         continue;
                     }
                     apply_outgoing_state(self, thread_id, message);
@@ -4423,6 +4681,53 @@ impl ZaloGuiApp {
                         }
                     }
                 }
+                GuiEvent::CloudUsageLoaded {
+                    owner,
+                    generation,
+                    result,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && owner == self.cloud_usage.owner
+                        && generation == self.cloud_usage.generation
+                    {
+                        self.cloud_usage.pending = false;
+                        self.cloud_usage.result = Some(result);
+                    }
+                }
+                GuiEvent::MessagePinsLoaded {
+                    owner,
+                    thread,
+                    generation,
+                    result,
+                } => {
+                    if owner != self.user_uin
+                        || !self.is_logged_in
+                        || thread != self.message_pins.thread
+                        || generation != self.message_pins.generation
+                    {
+                        continue;
+                    }
+                    self.message_pins.pending = false;
+                    match result {
+                        Ok(mut page) => {
+                            let mut seen = std::collections::HashSet::new();
+                            page.items.retain(|item| {
+                                seen.insert(if item.message_id.is_empty() {
+                                    item.id.clone()
+                                } else {
+                                    item.message_id.clone()
+                                })
+                            });
+                            self.message_pins.page = Some(page);
+                            self.message_pins.error.clear();
+                        }
+                        Err(error) => {
+                            self.message_pins.page = None;
+                            self.message_pins.error = error;
+                        }
+                    }
+                }
                 GuiEvent::Board {
                     owner,
                     thread,
@@ -4442,6 +4747,10 @@ impl ZaloGuiApp {
                     self.server_board.pending = false;
                     if mutation {
                         self.server_board.needs_refresh = true;
+                        if self.server_board.pins {
+                            let target = self.server_board.thread.clone();
+                            self.refresh_message_pins(&target, self.server_board.group);
+                        }
                     }
                     match result {
                         Ok(page) => {
@@ -4475,6 +4784,19 @@ impl ZaloGuiApp {
                 GuiEvent::ServerPins { owner, snapshot } => {
                     if owner == self.user_uin && self.is_logged_in {
                         self.server_pins = snapshot;
+                    }
+                }
+                GuiEvent::SettingsDevicesLoaded { generation, result } => {
+                    if generation != self.settings_devices.generation {
+                        continue;
+                    }
+                    self.settings_devices.pending = false;
+                    match result {
+                        Ok(devices) => {
+                            self.settings_devices.devices = Some(devices);
+                            self.settings_devices.error.clear();
+                        }
+                        Err(error) => self.settings_devices.error = error,
                     }
                 }
                 GuiEvent::NotificationSoundPrepared(ready) => {
@@ -4579,6 +4901,12 @@ impl ZaloGuiApp {
                         t.refresh_after_removal();
                         self.persist_threads_async();
                     }
+                    if self.archive_history.thread == thread_id {
+                        self.archive_history.messages.retain(|m| {
+                            !((!msg_id.is_empty() && m.id == msg_id)
+                                || (msg_id.is_empty() && m.ts == ts))
+                        });
+                    }
                     self.status_msg = "Đã xóa tin nhắn ở phía bạn".into();
                 }
                 GuiEvent::MessageRecalled {
@@ -4603,6 +4931,15 @@ impl ZaloGuiApp {
                             t.preview = last.text.clone();
                         }
                         self.persist_threads_async();
+                    }
+                    if self.archive_history.thread == thread_id {
+                        for m in &mut self.archive_history.messages {
+                            if (!msg_id.is_empty() && m.id == msg_id)
+                                || (msg_id.is_empty() && m.ts == ts)
+                            {
+                                m.mark_recalled();
+                            }
+                        }
                     }
                     self.status_msg = "Đã thu hồi tin nhắn với mọi người".into();
                 }
@@ -5571,6 +5908,9 @@ impl ZaloGuiApp {
                     success,
                     message,
                 } => {
+                    if running && !self.refresh_sync_running {
+                        self.sync_notice_dismissed = false;
+                    }
                     self.sync_success_until = if !running && success {
                         Some(std::time::Instant::now() + Duration::from_secs(3))
                     } else {
@@ -5583,13 +5923,15 @@ impl ZaloGuiApp {
                     self.refresh_sync_status = message.clone();
                     self.status_msg = message;
                     self.last_sync_was_history = false;
-                    self.sync_notice_dismissed = false;
                 }
                 GuiEvent::PhoneSyncStatus {
                     running,
                     success,
                     message,
                 } => {
+                    if running && !self.phone_sync_running {
+                        self.sync_notice_dismissed = false;
+                    }
                     self.sync_success_until = if !running && success {
                         Some(std::time::Instant::now() + Duration::from_secs(3))
                     } else {
@@ -5613,13 +5955,15 @@ impl ZaloGuiApp {
                     self.phone_sync_running = running;
                     self.phone_sync_status = message.clone();
                     self.status_msg = message;
-                    self.sync_notice_dismissed = false;
                 }
                 GuiEvent::HistorySyncStatus {
                     running,
                     success,
                     message,
                 } => {
+                    if running && !self.history_sync_running {
+                        self.sync_notice_dismissed = false;
+                    }
                     self.sync_success_until = if !running && success {
                         Some(std::time::Instant::now() + Duration::from_secs(3))
                     } else {
@@ -5632,7 +5976,7 @@ impl ZaloGuiApp {
                         self.sync_cancel_requested = false;
                     }
                     self.last_sync_was_history = true;
-                    self.sync_notice_dismissed = false;
+
                     self.history_sync_running = running;
                     self.status_msg = message.clone();
                     self.history_sync_status = message;
@@ -5758,14 +6102,6 @@ impl ZaloGuiApp {
                     self.selected_msg_ids.clear();
                     self.status_msg = format!("Đã thu hồi {count} tin nhắn cho mọi người");
                 }
-                GuiEvent::BatchForwardCompleted {
-                    target_id: _,
-                    count,
-                } => {
-                    self.batch_selection_mode = false;
-                    self.selected_msg_ids.clear();
-                    self.status_msg = format!("Đã chuyển tiếp {count} tin nhắn");
-                }
             }
         }
     }
@@ -5797,7 +6133,7 @@ impl eframe::App for ZaloGuiApp {
         if self.lock_guard.is_locked() && self.voice_binding.is_some() {
             self.cancel_voice_recording();
         }
-        self.poll_voice_events();
+        self.poll_voice_events(ctx);
 
         // Update lock guard on user interaction (WP16-4) — but only if not locked
         // A21: Input after idle should not reset deadline if we're already locked
@@ -6152,6 +6488,8 @@ impl eframe::App for ZaloGuiApp {
         } else {
             self.render_chat_workspace(ctx, &pal);
             self.render_reactor_details(ctx);
+            self.render_message_details(ctx);
+            self.render_archive_confirmation(ctx, &pal);
         }
         self.sync_composer_draft(ctx);
         self.preserve_draft_before_close(ctx);
@@ -7260,6 +7598,36 @@ mod audit_unread_tests {
 mod outgoing_ui_tests {
     use super::*;
     #[test]
+    fn stale_ordinary_send_cannot_update_relogged_same_account() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "recipient".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.event_tx
+            .send(GuiEvent::OutgoingState {
+                owner: "owner".into(),
+                runtime_id: app.account_runtime_id.wrapping_add(1),
+                thread_id: "recipient".into(),
+                message: crate::outgoing::pending(
+                    "stale".into(),
+                    false,
+                    crate::outgoing::Payload::Text,
+                ),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.threads[0].messages.is_empty());
+    }
+    #[test]
     fn failed_bubble_stays_in_its_thread_and_success_removes_retry() {
         let ctx = egui::Context::default();
         let mut app = ZaloGuiApp::from_context(
@@ -7289,6 +7657,7 @@ mod outgoing_ui_tests {
         failed.delivery = crate::message_model::DeliveryState::Failed;
         app.event_tx
             .send(GuiEvent::OutgoingState {
+                runtime_id: app.account_runtime_id,
                 owner: "owner".into(),
                 thread_id: "recipient".into(),
                 message: failed.clone(),
@@ -7303,6 +7672,7 @@ mod outgoing_ui_tests {
         failed.outgoing_job = None;
         app.event_tx
             .send(GuiEvent::OutgoingState {
+                runtime_id: app.account_runtime_id,
                 owner: "owner".into(),
                 thread_id: "recipient".into(),
                 message: failed,
@@ -7916,6 +8286,89 @@ mod v008_account_boundary_tests {
         );
     }
     #[test]
+    fn local_call_records_reject_logged_out_and_other_accounts() {
+        let (ctx, mut app) = app();
+        let thread_id = app.threads[0].id.clone();
+        let initial = app.threads[0].messages.len();
+        for (logged_in, owner) in [(true, "88"), (false, "99")] {
+            app.is_logged_in = logged_in;
+            app.event_tx
+                .send(GuiEvent::LocalCallRecord {
+                    runtime_id: app.account_runtime_id,
+                    outgoing: true,
+                    owner: owner.into(),
+                    thread_id: thread_id.clone(),
+                    text: "Cuộc gọi".into(),
+                    msg_id: "call_fixture".into(),
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert_eq!(app.threads[0].messages.len(), initial);
+        }
+    }
+
+    #[test]
+    fn message_pin_snapshots_reject_stale_thread_generation_and_account() {
+        let (ctx, mut app) = app();
+        app.message_pins = board_panel::MessagePins {
+            thread: "group_34".into(),
+            generation: 20,
+            pending: true,
+            ..Default::default()
+        };
+        for (owner, thread, generation) in [
+            ("88", "group_34", 20),
+            ("99", "group_35", 20),
+            ("99", "group_34", 19),
+        ] {
+            app.event_tx
+                .send(GuiEvent::MessagePinsLoaded {
+                    owner: owner.into(),
+                    thread: thread.into(),
+                    generation,
+                    result: Ok(Default::default()),
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert!(app.message_pins.pending);
+            assert!(app.message_pins.page.is_none());
+        }
+        app.event_tx
+            .send(GuiEvent::MessagePinsLoaded {
+                owner: "99".into(),
+                thread: "group_34".into(),
+                generation: 20,
+                result: Ok(crate::board::Page {
+                    items: vec![
+                        crate::board::Item {
+                            id: "topic1".into(),
+                            title: "One".into(),
+                            start: 0,
+                            creator: String::new(),
+                            raw: serde_json::json!({}),
+                            message_id: "msg1".into(),
+                            repeating: false,
+                        },
+                        crate::board::Item {
+                            id: "topic2".into(),
+                            title: "Duplicate".into(),
+                            start: 0,
+                            creator: String::new(),
+                            raw: serde_json::json!({}),
+                            message_id: "msg1".into(),
+                            repeating: false,
+                        },
+                    ],
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.message_pins.pending);
+        assert_eq!(app.message_pins.page.as_ref().unwrap().items.len(), 1);
+    }
+
+    #[test]
     fn alias_updates_and_removal_restore_the_original_name_without_changing_identity() {
         let (_, mut app) = app();
         app.server_aliases_ready = true;
@@ -8107,6 +8560,42 @@ mod v008_relock_regression_tests {
 #[cfg(test)]
 mod audit_lock_tests {
     use super::*;
+    #[test]
+    fn hidden_relock_drops_message_details_and_destructive_snapshot() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.hidden_panel.view = crate::hidden_chat::Snapshot {
+            ready: true,
+            unlocked: true,
+            ..Default::default()
+        };
+        app.message_details = Some((
+            "12".into(),
+            ChatMessage {
+                text: "private".into(),
+                ..Default::default()
+            },
+        ));
+        app.archive_mutation_confirm = Some(workspace::ArchiveMutation {
+            thread: "12".into(),
+            group: false,
+            recall: false,
+            messages: vec![],
+        });
+        app.apply_hidden_view(crate::hidden_chat::Snapshot {
+            ready: true,
+            unlocked: false,
+            ..Default::default()
+        });
+        assert!(app.message_details.is_none());
+        assert!(app.archive_mutation_confirm.is_none());
+    }
     #[test]
     fn locked_app_updates_business_state_without_unlocking() {
         let ctx = egui::Context::default();
@@ -8415,7 +8904,7 @@ mod voice_draft_boundary_tests {
             16_000,
             Duration::from_secs(1),
         ));
-        app.send_voice_recording("thread-y", false);
+        app.send_voice_recording(&egui::Context::default(), "thread-y", false);
 
         assert!(app.recorded_voice_samples.is_none());
         assert!(app.voice_binding.is_none());

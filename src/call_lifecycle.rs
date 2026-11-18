@@ -1,4 +1,16 @@
 //! Receiver-side terminal transitions never start local media or create chat rows.
+/// Local rows deduplicate terminal updates by call identity, not wall-clock seconds.
+pub fn local_record_id(call_id: i64) -> String {
+    if call_id > 0 {
+        format!("call_{call_id}")
+    } else {
+        format!(
+            "call_local_{}_{}",
+            crate::login::unix_now(),
+            crate::search::generation()
+        )
+    }
+}
 pub fn answered_elsewhere(
     call_id: i64,
     event_id: i64,
@@ -12,6 +24,12 @@ pub fn answered_elsewhere(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn call_record_identity_deduplicates_replays_without_colliding_same_second() {
+        assert_eq!(local_record_id(42), local_record_id(42));
+        assert_ne!(local_record_id(42), local_record_id(43));
+        assert_ne!(local_record_id(0), local_record_id(0));
+    }
     #[test]
     fn only_the_pending_matching_receiver_with_explicit_self_actor_is_dismissed() {
         assert!(answered_elsewhere(12, 12, false, false, true, 0));

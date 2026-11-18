@@ -155,7 +155,7 @@ impl ChatMessage {
             && self.delivery == crate::message_model::DeliveryState::Pending
             && !crate::outgoing::is_active(&self.client_message_id)
         {
-            self.delivery = crate::message_model::DeliveryState::Failed;
+            self.delivery = crate::message_model::DeliveryState::DeliveryUnknown;
             if let Some(job) = self.outgoing_job.as_mut() {
                 job.error = "Lần gửi trước bị gián đoạn; kiểm tra cuộc trò chuyện trước khi gửi lại để tránh trùng tin".into();
             }
@@ -628,6 +628,10 @@ fn direct_zalo_photo(text: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SidebarPresentation {
+    /// Explicit getmg-v2 `type`; absent/unknown values never imply a community.
+    pub group_kind: Option<GroupKind>,
+    #[serde(skip)]
+    pub group_kind_fresh: bool,
     pub inbox: crate::inbox::Metadata,
     pub server_alias: Option<String>,
     pub base_name: Option<String>,
@@ -650,6 +654,27 @@ pub struct SidebarPresentation {
     pub last_sender: String,
     pub last_sender_id: String,
     pub last_outgoing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GroupKind {
+    Group,
+    Community,
+}
+impl GroupKind {
+    pub fn from_metadata(info: &Value) -> Option<Self> {
+        match info.get("type").and_then(Value::as_i64) {
+            Some(1) => Some(Self::Group),
+            Some(2) => Some(Self::Community),
+            _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Group => "Nhóm",
+            Self::Community => "Cộng đồng",
+        }
+    }
 }
 
 /// Server group lock policy; role decisions use account UID, never display names.
@@ -900,6 +925,10 @@ impl Thread {
     /// Parse only group roster metadata observed in the original getmg-v2 consumer.
     pub fn apply_group_sidebar_metadata(&mut self, info: &Value) {
         self.presentation.metadata_verified = true;
+        if info.get("type").is_some() {
+            self.presentation.group_kind = GroupKind::from_metadata(info);
+            self.presentation.group_kind_fresh = true;
+        }
         if let Some(policy) = GroupSendPolicy::parse(info) {
             self.presentation.send_policy = Some(policy);
         }
@@ -1333,6 +1362,10 @@ pub fn merge_thread_into(
     if incoming.presentation.send_policy.is_some() {
         target.presentation.send_policy = incoming.presentation.send_policy.clone();
     }
+    if incoming.presentation.group_kind_fresh || incoming.presentation.group_kind.is_some() {
+        target.presentation.group_kind = incoming.presentation.group_kind;
+        target.presentation.group_kind_fresh = incoming.presentation.group_kind_fresh;
+    }
     if incoming.presentation.reaction_preview_fresh
         || incoming
             .presentation
@@ -1498,7 +1531,7 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
                         && message.outgoing_job.is_some()
                         && !crate::outgoing::is_active(&message.client_message_id)
                     {
-                        message.delivery = crate::message_model::DeliveryState::Failed;
+                        message.delivery = crate::message_model::DeliveryState::DeliveryUnknown;
                         if let Some(job) = message.outgoing_job.as_mut() {
                             job.error = "Lần gửi trước bị gián đoạn; kiểm tra trước khi gửi lại để tránh trùng tin".into();
                         }
@@ -1830,6 +1863,24 @@ pub(crate) async fn send_message_with_client_id(
     text: &str,
     now: u64,
 ) -> Result<Value> {
+    send_text_with_options(
+        s,
+        to_id,
+        text,
+        now,
+        &crate::rich_text::SendOptions::default(),
+    )
+    .await
+}
+
+/// Send text with the official PC's formatting and urgency metadata (re-notes/46).
+pub(crate) async fn send_text_with_options(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    now: u64,
+    options: &crate::rich_text::SendOptions,
+) -> Result<Value> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1846,12 +1897,13 @@ pub(crate) async fn send_message_with_client_id(
             anyhow::bail!("Không kiểm tra được chính sách mã hóa đầu cuối (E2EE): {e}");
         }
     }
-    let body = obj(&[
+    let mut body = obj(&[
         ("toid", json!(to_id)),
         ("message", json!(text)),
         ("clientId", json!(now)),
         ("imei", json!(s.imei)),
     ]);
+    options.apply(text, &mut body)?;
     let params = s.encoded_params(&body)?;
 
     let host = if s.domains.chat.contains("-msg-chat.")
@@ -1897,6 +1949,26 @@ pub(crate) async fn send_group_mentions(
     now: u64,
     mentions: &[crate::mentions::Mention],
 ) -> Result<Value> {
+    send_group_with_options(
+        s,
+        grid,
+        text,
+        now,
+        mentions,
+        &crate::rich_text::SendOptions::default(),
+    )
+    .await
+}
+
+/// Retain mentions alongside rich-text and urgency metadata.
+pub(crate) async fn send_group_with_options(
+    s: &Session,
+    grid: &str,
+    text: &str,
+    now: u64,
+    mentions: &[crate::mentions::Mention],
+    options: &crate::rich_text::SendOptions,
+) -> Result<Value> {
     crate::mentions::validate(text, mentions)?;
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
@@ -1921,6 +1993,7 @@ pub(crate) async fn send_group_mentions(
         body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
         body["language"] = json!("vi");
     }
+    options.apply(text, &mut body)?;
     let params = s.encoded_params(&body)?;
     let url = format!(
         "{}/api/group/{endpoint}?{}",
@@ -3997,6 +4070,31 @@ pub(crate) async fn send_quote_mentions(
     now: u64,
     mentions: &[crate::mentions::Mention],
 ) -> Result<Value> {
+    send_quote_with_options(
+        s,
+        to_id,
+        text,
+        quoted,
+        is_group,
+        now,
+        mentions,
+        &crate::rich_text::SendOptions::default(),
+    )
+    .await
+}
+
+/// Preserve quote identity, mentions and the official PC's composer metadata.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_quote_with_options(
+    s: &Session,
+    to_id: &str,
+    text: &str,
+    quoted: &ChatMessage,
+    is_group: bool,
+    now: u64,
+    mentions: &[crate::mentions::Mention],
+    options: &crate::rich_text::SendOptions,
+) -> Result<Value> {
     require_plaintext_send(s, to_id, is_group)?;
     crate::mentions::validate(text, mentions)?;
     anyhow::ensure!(
@@ -4064,6 +4162,7 @@ pub(crate) async fn send_quote_mentions(
             if !mentions.is_empty() {
                 body["mentionInfo"] = json!(serde_json::to_string(mentions)?);
             }
+            options.apply(text, &mut body)?;
             let params = s.encoded_params(&body)?;
             let url = format!("{}/api/group/quote?{}", s.domains.group, s.common_params());
             let resp = s.post_form(&url, format!("params={params}")).await?;
@@ -4083,7 +4182,7 @@ pub(crate) async fn send_quote_mentions(
             } else {
                 &s.domains.chat
             };
-            let body = obj(&[
+            let mut body = obj(&[
                 ("toid", json!(to_id)),
                 ("message", json!(text)),
                 ("clientId", json!(now)),
@@ -4097,6 +4196,7 @@ pub(crate) async fn send_quote_mentions(
                 ("ttl", json!(0)),
                 ("zsource", json!(101)),
             ]);
+            options.apply(text, &mut body)?;
             let params = s.encoded_params(&body)?;
             let url = format!("{host}/api/message/quote?{}", s.common_params());
             let resp = s.post_form(&url, format!("params={params}")).await?;
@@ -4115,6 +4215,9 @@ pub(crate) async fn send_quote_mentions(
 
 /// Whether the verified forwarding paths can preserve this message's content.
 pub fn can_forward_message(msg: &ChatMessage) -> bool {
+    if crate::message_view::is_call_log(msg) {
+        return false;
+    }
     if msg.kind == crate::message_model::MessageKind::Recall || msg.text == "[Tin nhắn đã thu hồi]"
     {
         return false;
@@ -4123,6 +4226,9 @@ pub fn can_forward_message(msg: &ChatMessage) -> bool {
         return true;
     }
     if msg.sticker_id.is_some_and(|id| id > 0) {
+        return true;
+    }
+    if forward_link_metadata(msg).is_some() {
         return true;
     }
     matches!(
@@ -4134,6 +4240,37 @@ pub fn can_forward_message(msg: &ChatMessage) -> bool {
         && !["[Tập tin]", "[Video]", "[Hình ảnh]", "[Tin nhắn thoại]"]
             .iter()
             .any(|label| msg.text.starts_with(label))
+}
+
+/// Project an ordinary link card onto the existing verified link-send contract.
+/// Opaque web content, media and malformed destinations remain unsupported.
+pub(crate) fn forward_link_metadata(msg: &ChatMessage) -> Option<LinkMetadata> {
+    use crate::message_model::MessageKind;
+    if !matches!(
+        msg.kind,
+        MessageKind::Link | MessageKind::WebContent | MessageKind::Text | MessageKind::Unknown
+    ) || crate::message_view::is_call_log(msg)
+        || crate::message_view::media(msg).kind != crate::message_view::MediaKind::None
+        || msg.sticker_id.is_some()
+    {
+        return None;
+    }
+    let url = msg.link_url.as_deref()?.trim();
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "https" | "http")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    Some(LinkMetadata {
+        url: url.to_owned(),
+        title: msg.link_title.clone().unwrap_or_default(),
+        desc: msg.link_desc.clone().unwrap_or_default(),
+        thumb: msg.link_thumb.clone().unwrap_or_default(),
+        src: msg.link_src.clone().unwrap_or_default(),
+    })
 }
 
 /// Photos, videos and files with a downloadable URL are forwarded by re-upload.
@@ -4332,6 +4469,17 @@ pub(crate) async fn forward_message_with_client_id(
             )
             .await;
         }
+    }
+    if let Some(meta) = forward_link_metadata(msg) {
+        return send_link_message_with_client_id(
+            s,
+            target_id,
+            &msg.text,
+            &meta,
+            target_is_group,
+            now,
+        )
+        .await;
     }
     if target_is_group {
         send_group_message_with_client_id(s, target_id, &msg.text, now).await
@@ -7267,6 +7415,40 @@ pub async fn submit_voice_to_text(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn group_kind_requires_explicit_native_metadata() {
+        use super::{GroupKind, Thread};
+        use serde_json::json;
+        assert_eq!(
+            GroupKind::from_metadata(&json!({"type":1})),
+            Some(GroupKind::Group)
+        );
+        assert_eq!(
+            GroupKind::from_metadata(&json!({"type":2})),
+            Some(GroupKind::Community)
+        );
+        for metadata in [
+            json!({"type":3}),
+            json!({"type":"2"}),
+            json!({"totalMember":10000,"name":"Cộng đồng"}),
+        ] {
+            assert_eq!(GroupKind::from_metadata(&metadata), None);
+        }
+        let mut thread = Thread::default();
+        thread.apply_group_sidebar_metadata(&json!({"type":2}));
+        thread.apply_group_sidebar_metadata(&json!({"totalMember":3}));
+        assert_eq!(thread.presentation.group_kind, Some(GroupKind::Community));
+        thread.apply_group_sidebar_metadata(&json!({"type":99}));
+        assert_eq!(thread.presentation.group_kind, None);
+        assert_eq!(thread.presentation.send_policy, None);
+        let mut existing = Thread {
+            is_group: true,
+            ..Default::default()
+        };
+        existing.apply_group_sidebar_metadata(&json!({"type":2}));
+        super::merge_thread_into(&mut existing, thread, true);
+        assert_eq!(existing.presentation.group_kind, None);
+    }
     use super::*;
 
     #[test]
@@ -8388,6 +8570,43 @@ mod forward_media_tests {
         assert!(!forwardable_media(&text));
         assert!(can_forward_message(&text));
     }
+
+    #[test]
+    fn ordinary_link_forward_preserves_card_and_rejects_opaque_webcontent() {
+        let link = ChatMessage {
+            kind: crate::message_model::MessageKind::WebContent,
+            text: "Bài viết kèm lời nhắn".into(),
+            link_url: Some("https://example.invalid/article".into()),
+            link_title: Some("Tiêu đề".into()),
+            link_desc: Some("Mô tả".into()),
+            link_thumb: Some("https://example.invalid/thumb.jpg".into()),
+            link_src: Some("Example".into()),
+            ..Default::default()
+        };
+        assert!(can_forward_message(&link));
+        let meta = forward_link_metadata(&link).unwrap();
+        assert_eq!(meta.url, link.link_url.as_deref().unwrap());
+        assert_eq!(meta.title, "Tiêu đề");
+        assert_eq!(meta.desc, "Mô tả");
+        assert_eq!(meta.thumb, link.link_thumb.as_deref().unwrap());
+        assert_eq!(meta.src, "Example");
+        for bad_url in [
+            None,
+            Some("javascript:alert(1)"),
+            Some("https://user:secret@example.invalid/"),
+        ] {
+            let bad = ChatMessage {
+                link_url: bad_url.map(str::to_owned),
+                ..link.clone()
+            };
+            assert!(!can_forward_message(&bad));
+        }
+        let recalled = ChatMessage {
+            kind: crate::message_model::MessageKind::Recall,
+            ..link
+        };
+        assert!(!can_forward_message(&recalled));
+    }
 }
 
 #[cfg(test)]
@@ -8425,7 +8644,7 @@ mod send_identity_tests {
         let host = format!("http://{}", listener.local_addr().unwrap());
         let fixture = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for _ in 0..9 {
+            for _ in 0..15 {
                 let (mut stream, _) = listener.accept().unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
@@ -8593,11 +8812,103 @@ mod send_identity_tests {
         )
         .await
         .unwrap();
+        let options = crate::rich_text::ComposerFormat {
+            bold: true,
+            underline: true,
+            urgency: Some(crate::rich_text::Urgency::Urgent),
+            ..Default::default()
+        }
+        .options(&draft.text);
+        send_text_with_options(&session, "contact-1", &draft.text, client_id, &options)
+            .await
+            .unwrap();
+        send_group_with_options(
+            &session,
+            "group_12",
+            &draft.text,
+            client_id,
+            &draft.mentions,
+            &options,
+        )
+        .await
+        .unwrap();
+        send_quote_with_options(
+            &session,
+            "contact-1",
+            &draft.text,
+            &quoted,
+            false,
+            client_id,
+            &[],
+            &options,
+        )
+        .await
+        .unwrap();
+        send_quote_with_options(
+            &session,
+            "group_12",
+            &draft.text,
+            &quoted,
+            true,
+            client_id,
+            &draft.mentions,
+            &options,
+        )
+        .await
+        .unwrap();
+        for group in [false, true] {
+            forward_message_with_client_id(
+                &session,
+                "12",
+                group,
+                &ChatMessage {
+                    kind: crate::message_model::MessageKind::Link,
+                    text: "Lời nhắn".into(),
+                    link_url: Some("https://example.invalid/article".into()),
+                    link_title: Some("Tiêu đề".into()),
+                    link_desc: Some("Mô tả".into()),
+                    link_thumb: Some("https://example.invalid/thumb.jpg".into()),
+                    link_src: Some("Example".into()),
+                    ..Default::default()
+                },
+                client_id,
+            )
+            .await
+            .unwrap();
+        }
         let requests = fixture.join().unwrap();
-        assert_eq!(requests.len(), 9);
+        assert_eq!(requests.len(), 15);
+        for (_, body) in &requests[13..] {
+            assert_eq!(body["msg"], "Lời nhắn");
+            assert_eq!(body["href"], "https://example.invalid/article");
+            assert_eq!(body["title"], "Tiêu đề");
+            assert_eq!(body["desc"], "Mô tả");
+            assert_eq!(body["thumb"], "https://example.invalid/thumb.jpg");
+            assert_eq!(body["src"], "Example");
+        }
+        assert!(requests[13].0.starts_with("/api/message/link?"));
+        assert!(requests[14].0.starts_with("/api/group/sendlink?"));
+        for (_, body) in &requests[9..13] {
+            assert_eq!(body["message"], draft.text);
+            assert_eq!(body["metaData"], json!({"urgency":2}));
+            let properties: Value =
+                serde_json::from_str(body["textProperties"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                properties,
+                json!({"styles":[{"start":0,"len":draft.text.encode_utf16().count(),"st":"b,u"}],"ver":0})
+            );
+        }
+        assert!(requests[9].0.starts_with("/api/message/sms?"));
+        assert!(requests[10].0.starts_with("/api/group/mention?"));
+        assert!(requests[11].0.starts_with("/api/message/quote?"));
+        assert!(requests[12].0.starts_with("/api/group/quote?"));
+        assert_eq!(
+            requests[12].1["mentionInfo"],
+            serde_json::to_string(&draft.mentions).unwrap()
+        );
         assert!(requests[7].0.starts_with("/api/group/mention?"));
         assert!(requests[8].0.starts_with("/api/group/quote?"));
-        for (_, body) in &requests[7..] {
+        for (_, body) in &requests[7..9] {
             assert_eq!(body["grid"], json!("12"));
             let mentions: Value =
                 serde_json::from_str(body["mentionInfo"].as_str().unwrap()).unwrap();

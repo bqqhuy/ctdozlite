@@ -7,6 +7,8 @@ pub(super) struct GroupPanel {
     pub target: String,
     pub group: bool,
     pub create: bool,
+    pub edit_name: bool,
+    pub invite_contact: Option<String>,
     pub generation: u64,
     pub pending: bool,
     pub needs_refresh: bool,
@@ -28,6 +30,10 @@ pub(super) struct GroupPanel {
 }
 impl ZaloGuiApp {
     pub(super) fn open_group_panel(&mut self, target: String, group: bool, create: bool) {
+        if self.groups_panel.pending {
+            self.show_toast("Chờ thao tác nhóm trước hoàn tất trước khi chuyển");
+            return;
+        }
         self.groups_panel = GroupPanel {
             open: true,
             target,
@@ -43,6 +49,27 @@ impl ZaloGuiApp {
                 crate::groups::Action::Related
             });
         }
+    }
+    pub(super) fn open_group_name_editor(&mut self, target: String, name: String) {
+        if self.groups_panel.pending {
+            self.show_toast("Chờ thao tác nhóm trước hoàn tất trước khi đổi tên");
+            return;
+        }
+        self.open_group_panel(target, true, false);
+        self.groups_panel.edit_name = true;
+        self.groups_panel.name = name;
+    }
+    pub(super) fn open_invite_to_group_picker(&mut self, contact: String) {
+        if self.groups_panel.pending {
+            self.show_toast("Chờ thao tác nhóm trước hoàn tất trước khi mời");
+            return;
+        }
+        self.groups_panel = GroupPanel {
+            open: true,
+            group: true,
+            invite_contact: Some(contact),
+            ..Default::default()
+        };
     }
     fn group_command(&mut self, action: crate::groups::Action) {
         if self.groups_panel.pending {
@@ -76,7 +103,7 @@ impl ZaloGuiApp {
         if !self.groups_panel.open {
             return;
         }
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && !self.groups_panel.pending {
             self.groups_panel.open = false;
             return;
         }
@@ -84,12 +111,17 @@ impl ZaloGuiApp {
         render_modal_backdrop(ctx, "group_panel_backdrop");
 
         let mut open = true;
+        let mut close_requested = false;
         let mut intent = None;
         let mut selected_group = None;
         let screen = ctx.screen_rect();
         let max_w = (screen.width() - 48.0).max(180.0);
         let max_h = (screen.height() - 100.0).max(100.0);
-        egui::Window::new(if self.groups_panel.create {
+        egui::Window::new(if self.groups_panel.invite_contact.is_some() {
+            "Thêm liên hệ vào nhóm / cộng đồng"
+        } else if self.groups_panel.edit_name {
+            "Đổi tên nhóm / cộng đồng"
+        } else if self.groups_panel.create {
             "👥 Tạo nhóm"
         } else if self.groups_panel.group {
             "⚙️ Quản lý nhóm"
@@ -118,6 +150,54 @@ impl ZaloGuiApp {
                 ui.spinner();
             }
             ui.label(&self.groups_panel.status);
+            if let Some(contact) = self.groups_panel.invite_contact.clone() {
+                let contact_name = self.threads.iter().find(|thread| !thread.is_group && thread.id == contact)
+                    .map(|thread| self.resolve_thread_name(thread).to_owned()).unwrap_or_else(|| contact.clone());
+                ui.label(format!("Mời {contact_name} vào nhóm / cộng đồng bạn chọn."));
+                ui.label("Chọn nhóm chỉ tải quyền; chưa gửi lời mời. Máy chủ có thể yêu cầu duyệt thành viên.");
+                let groups: Vec<_> = self.threads.iter()
+                    .filter(|thread| thread.is_group && self.private_access(&thread.id, true))
+                    .map(|thread| (thread.id.clone(), self.resolve_thread_name(thread).to_owned()))
+                    .collect();
+                if groups.is_empty() { ui.label("Chưa có nhóm / cộng đồng trong danh sách đã đồng bộ."); }
+                ui.add_enabled_ui(!self.groups_panel.pending, |ui| {
+                    egui::ScrollArea::vertical().id_salt("invite-group-picker").max_height(200.0).show(ui, |ui| {
+                        for (id, name) in &groups {
+                            if ui.selectable_label(self.groups_panel.target == *id, name).clicked() {
+                                self.groups_panel.target = id.clone();
+                                self.groups_panel.info = None;
+                                self.groups_panel.confirm = None;
+                                intent = Some(crate::groups::Action::Inspect);
+                            }
+                        }
+                    });
+                });
+                let state = self.groups_panel.info.clone().map(|info| crate::group_state::Snapshot {info, removed: false});
+                let can_invite = state.as_ref().is_some_and(|state| !state.removed
+                    && crate::groups::can_invite(&state.info, state.manager(&self.user_uin)));
+                if !self.groups_panel.target.is_empty() {
+                    if ui.add_enabled(!self.groups_panel.pending, egui::Button::new("Kiểm tra lại quyền nhóm")).clicked() {
+                        intent = Some(crate::groups::Action::Inspect);
+                    }
+                    if state.is_some() && !can_invite { ui.label("Chưa xác minh được quyền thêm thành viên; nhờ quản trị viên mời."); }
+                    if ui.add_enabled(!self.groups_panel.pending && !self.groups_panel.needs_refresh && can_invite,
+                        egui::Button::new("Xem lại lời mời")).clicked() {
+                        self.groups_panel.confirm = Some(crate::groups::Action::Invite {members: vec![contact.clone()]});
+                    }
+                }
+                if let Some(action @ crate::groups::Action::Invite { .. }) = self.groups_panel.confirm.clone() {
+                    let group_name = groups.iter().find(|(id, _)| id == &self.groups_panel.target)
+                        .map(|(_, name)| name.as_str()).unwrap_or(self.groups_panel.target.as_str());
+                    ui.label(format!("Gửi lời mời {contact_name} vào “{group_name}”? Không tự chuyển hội thoại hiện tại."));
+                    if ui.add_enabled(!self.groups_panel.pending && !self.groups_panel.needs_refresh && can_invite,
+                        egui::Button::new("Xác nhận gửi lời mời")).clicked() {
+                        intent = Some(action);
+                        self.groups_panel.confirm = None;
+                    }
+                }
+                if ui.add_enabled(!self.groups_panel.pending, egui::Button::new("Hủy / Đóng")).clicked() { close_requested = true; }
+                return;
+            }
             if !self.groups_panel.create
                 && ui
                     .add_enabled(!self.groups_panel.pending, egui::Button::new("Tải lại"))
@@ -144,7 +224,7 @@ impl ZaloGuiApp {
                 }
                 return;
             }
-            if !self.groups_panel.create && ui.button("Báo cáo nhóm…").clicked(){self.open_group_report(self.groups_panel.target.clone());}
+            if !self.groups_panel.create && !self.groups_panel.edit_name && ui.button("Báo cáo nhóm…").clicked(){self.open_group_report(self.groups_panel.target.clone());}
             let state = self
                 .groups_panel
                 .info
@@ -159,6 +239,24 @@ impl ZaloGuiApp {
             let owner = state
                 .as_ref()
                 .is_some_and(|state| state.creator_is(&self.user_uin));
+            let can_rename = state.as_ref().is_some_and(|state| {
+                !state.removed && (state.manager(&self.user_uin)
+                    || state.info.pointer("/setting/blockName").and_then(crate::api_response::integer) == Some(0))
+            });
+            if self.groups_panel.edit_name {
+                ui.label("Tên mới sẽ hiển thị cho mọi thành viên, không phải tên gợi nhớ riêng.");
+                ui.label("Tên có từ 1 đến 100 ký tự. Quyền được kiểm tra lại trên máy chủ khi lưu.");
+                if state.is_some() && !can_rename { ui.label("Bạn chưa có quyền đổi tên nhóm / cộng đồng này."); }
+                ui.add_enabled_ui(!self.groups_panel.pending && !self.groups_panel.needs_refresh && can_rename, |ui| {
+                    let changed = ui.add(egui::TextEdit::singleline(&mut self.groups_panel.name)
+                        .id_salt("group-name-editor").char_limit(100).desired_width(ui.available_width())).changed();
+                    if changed { self.groups_panel.confirm = None; }
+                    if ui.add_enabled(!self.groups_panel.name.trim().is_empty(), egui::Button::new("Lưu tên mới")).clicked() {
+                        self.groups_panel.confirm = Some(crate::groups::Action::Rename { name: self.groups_panel.name.clone() });
+                    }
+                });
+                if ui.add_enabled(!self.groups_panel.pending, egui::Button::new("Hủy / Đóng")).clicked() { close_requested = true; }
+            } else {
             ui.add_enabled_ui(
                 !self.groups_panel.pending && !self.groups_panel.needs_refresh,
                 |ui| {
@@ -186,7 +284,7 @@ impl ZaloGuiApp {
                         ui.collapsing("Thông tin và thiết lập nhóm", |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.add(egui::TextEdit::singleline(&mut self.groups_panel.name).desired_width((ui.available_width()-120.0).max(64.0)));
-                                if ui.button("Đổi tên nhóm").clicked() {
+                                if ui.add_enabled(can_rename, egui::Button::new("Đổi tên nhóm")).clicked() {
                                     self.groups_panel.confirm =
                                         Some(crate::groups::Action::Rename {
                                             name: self.groups_panel.name.clone(),
@@ -466,12 +564,13 @@ impl ZaloGuiApp {
                     }
                 },
             );
+            }
             if let Some(action) = self.groups_panel.confirm.clone() {
                 ui.separator();
                 let text = match &action {
                     crate::groups::Action::UpgradeCommunity=>"Nâng cấp nhóm thành cộng đồng? Fork không có thao tác hoàn tác về nhóm thường.".into(),
                     crate::groups::Action::Rename { name } => {
-                        format!("Đổi tên nhóm thành “{name}”?")
+                        format!("Đổi tên thành “{name}” cho mọi thành viên nhóm / cộng đồng?")
                     }
                     crate::groups::Action::Setting { .. } => {
                         "Thay đổi thiết lập nhóm cho mọi thành viên?".into()
@@ -528,7 +627,7 @@ impl ZaloGuiApp {
                 });
             }
         });
-        self.groups_panel.open = open;
+        self.groups_panel.open = self.groups_panel.pending || (open && !close_requested);
         if let Some(action) = intent {
             self.group_command(action);
         }

@@ -62,7 +62,42 @@ impl Draft {
     }
 }
 impl ZaloGuiApp {
-    pub(super) fn open_quick_schedule(&mut self) {
+    pub(super) fn composer_has_metadata(
+        &self,
+        ctx: &egui::Context,
+        thread: &str,
+        group: bool,
+    ) -> bool {
+        let key = Id::new((
+            "composer_format",
+            &self.user_uin,
+            self.account_runtime_id,
+            thread,
+            group,
+        ));
+        ctx.data(|data| data.get_temp::<crate::rich_text::ComposerFormat>(key))
+            .is_some_and(|format| {
+                format.bold
+                    || format.italic
+                    || format.underline
+                    || format.strike
+                    || format.urgency.is_some()
+            })
+    }
+
+    pub(super) fn open_quick_schedule(&mut self, ctx: &egui::Context) {
+        if self
+            .threads
+            .get(self.selected_thread_index)
+            .is_some_and(|thread| self.composer_has_metadata(ctx, &thread.id, thread.is_group))
+        {
+            self.status_msg="Chưa hỗ trợ hẹn giờ tin có định dạng hoặc mức Quan trọng/Khẩn cấp; hãy tắt chúng hoặc gửi trực tiếp. Nội dung vẫn được giữ.".into();
+            return;
+        }
+        if self.pending_clipboard_image.is_some() || self.replying_to.is_some() {
+            self.status_msg="Chưa hỗ trợ hẹn giờ ảnh clipboard hoặc tin trích dẫn; hãy gửi trực tiếp. Nội dung vẫn được giữ.".into();
+            return;
+        }
         if self
             .threads
             .get(self.selected_thread_index)
@@ -196,6 +231,41 @@ impl ZaloGuiApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_guard_keeps_draft_and_rejects_schedule_without_losing_options() {
+        let ctx = egui::Context::default();
+        let mut app = app_with_pending_draft(&ctx);
+        app.quick_schedule = None;
+        let key = Id::new((
+            "composer_format",
+            &app.user_uin,
+            app.account_runtime_id,
+            "thread-a",
+            true,
+        ));
+        for format in [
+            crate::rich_text::ComposerFormat {
+                bold: true,
+                ..Default::default()
+            },
+            crate::rich_text::ComposerFormat {
+                urgency: Some(crate::rich_text::Urgency::Urgent),
+                ..Default::default()
+            },
+        ] {
+            ctx.data_mut(|data| data.insert_temp(key, format));
+            assert!(app.composer_has_metadata(&ctx, "thread-a", true));
+            assert!(!app.composer_has_metadata(&ctx, "other-thread", true));
+            app.open_quick_schedule(&ctx);
+            assert!(app.quick_schedule.is_none());
+            assert!(app.status_msg.contains("Chưa hỗ trợ hẹn giờ"));
+            assert_eq!(app.input_message, "Keep literal 2*3*4");
+            assert!(app.composer_has_metadata(&ctx, "thread-a", true));
+        }
+        ctx.data_mut(|data| data.remove::<crate::rich_text::ComposerFormat>(key));
+        app.open_quick_schedule(&ctx);
+        assert!(app.quick_schedule.is_some());
+    }
     fn sample() -> Draft {
         Draft {
             owner: "owner-a".into(),
@@ -264,7 +334,7 @@ mod tests {
             false,
         );
         app.input_message = "Keep literal 2*3*4".into();
-        app.open_quick_schedule();
+        app.open_quick_schedule(ctx);
         app.quick_schedule.as_mut().unwrap().pending_at = Some(1_000_900);
         app
     }

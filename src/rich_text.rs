@@ -1,4 +1,4 @@
-//! Display-only styling for Zalo rich-text (`action: "rtf"`) messages.
+//! Styling for Zalo rich-text messages and outbound textProperties metadata.
 //!
 //! The message text stays exactly as sent; styles are side metadata with UTF-16 offsets
 //! (`params.styles[].start/len/st`), matching official Zalo clients.
@@ -7,6 +7,98 @@ use serde_json::Value;
 
 /// Upper bound on spans kept per message; remote payloads are untrusted.
 const MAX_STYLES: usize = 256;
+
+/// Official PC urgency enum (E2: re-notes/46-outgoing-composer-metadata.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Urgency {
+    Important,
+    Urgent,
+}
+
+/// Durable metadata sent together with the message, never as a text prefix.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SendOptions {
+    pub styles: Vec<TextStyle>,
+    pub urgency: Option<Urgency>,
+}
+
+impl SendOptions {
+    /// Validate UTF-16 ranges and attach the PC's textProperties/metaData fields.
+    pub fn apply(&self, text: &str, body: &mut Value) -> anyhow::Result<()> {
+        anyhow::ensure!(self.styles.len() <= MAX_STYLES, "Quá nhiều vùng định dạng");
+        let mut boundaries = std::collections::HashSet::from([0u32]);
+        let mut end = 0u32;
+        for ch in text.chars() {
+            end += ch.len_utf16() as u32;
+            boundaries.insert(end);
+        }
+        let mut styles = Vec::new();
+        for style in &self.styles {
+            let stop = style.start.checked_add(style.len);
+            anyhow::ensure!(
+                style.len > 0
+                    && boundaries.contains(&style.start)
+                    && stop.is_some_and(|stop| boundaries.contains(&stop))
+                    && !style.mention,
+                "Vùng định dạng không hợp lệ"
+            );
+            let tags = [
+                (style.bold, "b"),
+                (style.italic, "i"),
+                (style.underline, "u"),
+                (style.strike, "s"),
+            ]
+            .into_iter()
+            .filter_map(|(on, tag)| on.then_some(tag))
+            .collect::<Vec<_>>();
+            anyhow::ensure!(!tags.is_empty(), "Vùng định dạng chưa có kiểu chữ");
+            styles
+                .push(serde_json::json!({"start":style.start,"len":style.len,"st":tags.join(",")}));
+        }
+        if !styles.is_empty() {
+            body["textProperties"] = Value::String(serde_json::to_string(
+                &serde_json::json!({"styles":styles,"ver":0}),
+            )?);
+        }
+        if let Some(urgency) = self.urgency {
+            body["metaData"] = serde_json::json!({"urgency":match urgency {Urgency::Important=>1,Urgency::Urgent=>2}});
+        }
+        Ok(())
+    }
+}
+
+/// Composer formatting applies to the complete draft; each conversation keeps its own choice.
+#[derive(Debug, Clone, Default)]
+pub struct ComposerFormat {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+    pub urgency: Option<Urgency>,
+}
+
+impl ComposerFormat {
+    pub fn options(&self, text: &str) -> SendOptions {
+        let len = text.encode_utf16().count() as u32;
+        let styled = self.bold || self.italic || self.underline || self.strike;
+        SendOptions {
+            styles: if styled && len > 0 {
+                vec![TextStyle {
+                    start: 0,
+                    len,
+                    bold: self.bold,
+                    italic: self.italic,
+                    underline: self.underline,
+                    strike: self.strike,
+                    mention: false,
+                }]
+            } else {
+                vec![]
+            },
+            urgency: self.urgency,
+        }
+    }
+}
 
 /// One styled UTF-16 range of a message text.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -193,6 +285,47 @@ pub fn segments(text: &str, styles: &[TextStyle]) -> Vec<(std::ops::Range<usize>
             (w[0]..w[1], combined)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod send_options_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn metadata_round_trips_through_incoming_rtf_without_rewriting_text() {
+        let text = "😀 chào Việt Nam";
+        let options = ComposerFormat {
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            urgency: Some(Urgency::Important),
+        }
+        .options(text);
+        let mut body = json!({"message":text});
+        options.apply(text, &mut body).unwrap();
+        assert_eq!(body["message"], text);
+        assert_eq!(body["metaData"], json!({"urgency":1}));
+        let content = json!({"action":"rtf","params":body["textProperties"]});
+        assert_eq!(parse_rtf_styles(&content, text), options.styles);
+        assert_eq!(options.styles[0].len, text.encode_utf16().count() as u32);
+    }
+
+    #[test]
+    fn rejects_ranges_inside_surrogate_pairs_and_leaves_plain_requests_plain() {
+        let mut options = ComposerFormat {
+            bold: true,
+            ..Default::default()
+        }
+        .options("😀x");
+        options.styles[0].start = 1;
+        options.styles[0].len = 1;
+        assert!(options.apply("😀x", &mut json!({})).is_err());
+        let mut plain = json!({"message":"hello"});
+        SendOptions::default().apply("hello", &mut plain).unwrap();
+        assert_eq!(plain, json!({"message":"hello"}));
+    }
 }
 
 #[cfg(test)]

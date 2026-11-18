@@ -105,6 +105,7 @@ impl ZaloGuiApp {
                 let thread = &self.threads[*index];
                 self.private_access(&thread.id, thread.is_group)
                     && (thread.is_group
+                        || self.settings.show_all_contacts
                         || self
                             .inbox_policy
                             .friends
@@ -223,7 +224,12 @@ impl ZaloGuiApp {
                 // depend on the host font stack and rendered as tofu on some ARM64
                 // Windows installations.
                 let nav_items = [
-                    (ContactsTab::Friends, lucide::USERS, "Danh sách bạn bè", friends),
+                    (
+                        ContactsTab::Friends,
+                        lucide::USERS,
+                        "Danh sách bạn bè",
+                        friends,
+                    ),
                     (ContactsTab::Groups, lucide::USERS, "Danh sách nhóm", groups),
                     (
                         ContactsTab::FriendRequests,
@@ -371,10 +377,17 @@ impl ZaloGuiApp {
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(format!("Danh sách bạn bè ({total})"))
-                    .size(16.0)
-                    .strong()
-                    .color(pal.text_primary),
+                RichText::new(format!(
+                    "{} ({total})",
+                    if self.settings.show_all_contacts {
+                        "Danh bạ đã liên hệ"
+                    } else {
+                        "Danh sách bạn bè"
+                    }
+                ))
+                .size(16.0)
+                .strong()
+                .color(pal.text_primary),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(

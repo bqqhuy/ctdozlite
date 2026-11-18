@@ -19,6 +19,9 @@ fn sensitive(key: &str) -> bool {
     .any(|part| key.contains(part))
         || [
             "key",
+            "viewer_key",
+            "cloud-viewer-key",
+            "enk",
             "params",
             "message",
             "msg",
@@ -151,5 +154,15 @@ mod tests {
         assert!(!preview("params=fixture-secret&status=0").contains("fixture-secret"));
         assert!(!trace("relay token=fixture-secret").contains("fixture-secret"));
         assert_eq!(trace("rtp packets=10"), "rtp packets=10");
+    }
+    #[test]
+    fn cloud_viewer_credentials_are_redacted_in_nested_key_response() {
+        let output = preview(
+            r#"{"error_code":0,"data":{"viewer_key":"fixture-viewer","enk":"fixture-cloud-key","quota":1024}}"#,
+        );
+        assert!(!output.contains("fixture-viewer"));
+        assert!(!output.contains("fixture-cloud-key"));
+        assert!(output.contains("1024"));
+        assert!(!preview("cloud-viewer-key=fixture-header&status=0").contains("fixture-header"));
     }
 }

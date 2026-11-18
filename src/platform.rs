@@ -60,6 +60,98 @@ pub fn open_folder(path: &std::path::Path) -> bool {
     }
 }
 
+/// Register only this application's current executable in the per-user Windows Run key.
+/// Call from the worker because registry access may block.
+pub fn set_autostart(enabled: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "advapi32")]
+        extern "system" {
+            fn RegCreateKeyExW(
+                key: isize,
+                subkey: *const u16,
+                reserved: u32,
+                class: *mut u16,
+                options: u32,
+                access: u32,
+                security: *const std::ffi::c_void,
+                result: *mut isize,
+                disposition: *mut u32,
+            ) -> i32;
+            fn RegSetValueExW(
+                key: isize,
+                name: *const u16,
+                reserved: u32,
+                kind: u32,
+                data: *const u8,
+                size: u32,
+            ) -> i32;
+            fn RegDeleteValueW(key: isize, name: *const u16) -> i32;
+            fn RegCloseKey(key: isize) -> i32;
+        }
+        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Run\0"
+            .encode_utf16()
+            .collect();
+        let name: Vec<u16> = "ctdozlite\0".encode_utf16().collect();
+        let mut key = 0isize;
+        let status = unsafe {
+            RegCreateKeyExW(
+                0x80000001u32 as i32 as isize,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                0x0002,
+                std::ptr::null(),
+                &mut key,
+                std::ptr::null_mut(),
+            )
+        };
+        anyhow::ensure!(
+            status == 0,
+            "Không mở được cài đặt khởi động Windows ({status})"
+        );
+        struct RegistryKey(isize);
+        impl Drop for RegistryKey {
+            fn drop(&mut self) {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+        let key = RegistryKey(key);
+        let status = if enabled {
+            let exe = std::env::current_exe()?;
+            let mut command = vec![b'"' as u16];
+            command.extend(exe.as_os_str().encode_wide());
+            command.extend("\" --gui\0".encode_utf16());
+            unsafe {
+                RegSetValueExW(
+                    key.0,
+                    name.as_ptr(),
+                    0,
+                    1,
+                    command.as_ptr().cast(),
+                    (command.len() * 2) as u32,
+                )
+            }
+        } else {
+            unsafe { RegDeleteValueW(key.0, name.as_ptr()) }
+        };
+        anyhow::ensure!(
+            status == 0 || (!enabled && status == 2),
+            "Không cập nhật được khởi động Windows ({status})"
+        );
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::ensure!(!enabled, "Tự khởi động chỉ hỗ trợ trên Windows");
+        Ok(())
+    }
+}
+
 pub fn startup_error(message: &str) {
     let path = crate::storage::root().join("diagnostics/startup-error.txt");
     let _ = crate::storage::atomic_write(&path, message.as_bytes());

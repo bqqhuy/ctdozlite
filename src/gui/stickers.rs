@@ -6,6 +6,8 @@ use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StickerTab {
+    Emoji,
+    Gif,
     Popular,
     Onion,
     Pack(u64),
@@ -1107,7 +1109,10 @@ impl ZaloGuiApp {
         pal: &ThemePalette,
     ) {
         // Trigger background store catalog load once when drawer opens
-        if self.sticker_store_packs.is_empty() && !self.sticker_store_loading {
+        if !matches!(self.sticker_tab, StickerTab::Emoji | StickerTab::Gif)
+            && self.sticker_store_packs.is_empty()
+            && !self.sticker_store_loading
+        {
             self.sticker_store_loading = true;
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchStickerStore);
@@ -1120,6 +1125,56 @@ impl ZaloGuiApp {
             .inner_margin(Margin::symmetric(14.0, 8.0))
             .show(ui, |ui| {
                 ui.set_height(248.0);
+
+                ui.horizontal(|ui| {
+                    let stickers = !matches!(self.sticker_tab, StickerTab::Emoji | StickerTab::Gif);
+                    if ui.selectable_label(stickers, "Sticker").clicked() {
+                        self.sticker_tab = StickerTab::Popular;
+                    }
+                    ui.selectable_value(&mut self.sticker_tab, StickerTab::Emoji, "Emoji");
+                    ui.selectable_value(&mut self.sticker_tab, StickerTab::Gif, "GIF");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button(lucide::X).on_hover_text("Đóng bộ chọn").clicked() {
+                            self.sticker_picker_open = false;
+                        }
+                    });
+                });
+                ui.separator();
+                if self.sticker_tab == StickerTab::Emoji {
+                    ui.horizontal_wrapped(|ui| {
+                        for (key, text, label) in [
+                            ("like", "👍", "Thích"), ("heart", "❤️", "Yêu thích"),
+                            ("smile", "😆", "Vui"), ("surprised", "😮", "Ngạc nhiên"),
+                            ("cry", "😢", "Buồn"), ("rage", "😠", "Giận"),
+                        ] {
+                            let response = if let Some(texture) = self.emoji_textures.get(key) {
+                                ui.add(egui::ImageButton::new((texture.id(), Vec2::splat(34.0))))
+                            } else {
+                                ui.button(text)
+                            };
+                            if response.on_hover_text(label).clicked() {
+                                self.input_message.push_str(text);
+                                self.composer_mentions.edit(&self.input_message);
+                                self.composer_focus_pending = true;
+                            }
+                        }
+                    });
+                    return;
+                }
+                if self.sticker_tab == StickerTab::Gif {
+                    // These bundled assets already use the verified attachment upload flow.
+                    // This is a local collection, not an invented remote GIF search service.
+                    ui.label("Bộ GIF có sẵn");
+                    let mut items = builtin_pack_stickers(crate::bundled_stickers::CATEGORY).unwrap_or_default();
+                    if self.settings.enable_gif_search {
+                        ui.add(egui::TextEdit::singleline(&mut self.sticker_search_query)
+                            .hint_text("Tìm trong bộ GIF có sẵn"));
+                        let query = crate::search::fold(self.sticker_search_query.trim());
+                        items.retain(|item| crate::search::fold(&item.label).contains(&query));
+                    }
+                    self.render_sticker_items_grid(ui, &items, thread_id, is_group, pal);
+                    return;
+                }
 
                 // 0. Quick Vietnamese Keyword Search Bar
                 ui.horizontal(|ui| {
@@ -1251,6 +1306,7 @@ impl ZaloGuiApp {
 
                 // 2. Tab Body
                 match self.sticker_tab {
+                    StickerTab::Emoji | StickerTab::Gif => {}
                     StickerTab::Store => {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1658,6 +1714,10 @@ impl ZaloGuiApp {
                             ))
                             .clicked()
                         {
+                            if self.composer_has_metadata(ui.ctx(),thread_id,is_group) {
+                                self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho nhãn dán/GIF; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();
+                                continue;
+                            }
                             self.sticker_picker_open = false;
                             if let Some(tx) = WORKER_TX.get() {
                                 let _ = tx.send(WorkerCmd::SendSticker {
@@ -2097,6 +2157,10 @@ impl ZaloGuiApp {
             self.composer_focus_pending = true;
         }
         if let Some(chosen) = send_item {
+            if self.composer_has_metadata(ctx, thread_id, is_group) {
+                self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho nhãn dán; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();
+                return;
+            }
             self.input_message.clear();
             self.dismissed_sticker_suggest_for.clear();
             self.composer_sticker_selected = None;
@@ -2115,6 +2179,8 @@ impl ZaloGuiApp {
 
     pub(super) fn sticker_tab_salt(&self) -> u64 {
         match self.sticker_tab {
+            StickerTab::Emoji => 5,
+            StickerTab::Gif => 6,
             StickerTab::Popular => 1,
             StickerTab::Onion => 2,
             StickerTab::Search => 3,

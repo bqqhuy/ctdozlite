@@ -4,7 +4,7 @@
 > **Phiên bản Zalo PC tham chiếu:** 26.11.12 (đang chạy trực tiếp trên máy người dùng, đã đăng nhập tài khoản thực tế)  
 > **Mã nguồn cơ sở:** `9339a75` (`v0.016-arm`, branch `main`)  
 > **Tài liệu phối hợp:** `docs/ZALO_PC_UI_UX_ANTIGRAVITY_HANDOFF_2026-11-17.md`, [hướng dẫn sửa gửi chậm/lỗi mạng](SEND_LATENCY_NETWORK_ANTIGRAVITY_GUIDE_2026-11-18.md), `AGENTS.md`, `docs/ZALO_REFERENCE_ANALYSIS.md`  
-> **Bổ sung 18/11/2026:** Đưa **MAP-15: gửi chậm/lỗi mạng** vào **Phase 3**, ưu tiên thực hiện trước MAP-10–12 trong phase này. Trạng thái: **chưa triển khai**, mới có bằng chứng khảo sát và phương án; không tự đánh dấu đã sửa hoặc đã nghiệm thu.
+> **Bổ sung 18/11/2026:** Đưa **MAP-15: gửi chậm/lỗi mạng** vào **Phase 3**, ưu tiên trước MAP-10–12. Trạng thái cập nhật xem mục 6 và [checklist thực thi](PHASE_3_4_EXECUTION_2026-11-18.md). Các câu “chưa triển khai/chưa sửa mã” trong phần khảo sát bên dưới là baseline lịch sử, không phải trạng thái hiện tại.
 
 ---
 
@@ -18,18 +18,18 @@ kiểm kê độc lập và chạy kiểm tra cục bộ, phạm vi còn lại �
 
 | Phase | Trạng thái hiện tại | Bằng chứng đã có | Khoảng trống chặn hoàn tất |
 | :--- | :--- | :--- | :--- |
-| 3 | `PARTIAL_CODE_VERIFIED` | Resolver/candidate diagnostics, preview budget 2s, GET-only bounded failover, reactions/hover/input-gate, E2EE fail-closed; tests xanh | `tt-chat-wpa.chat.zalo.me` vẫn có thể đứng đầu candidate cho POST; chưa có reconciliation an toàn sau DNS/timeout mơ hồ, taxonomy/fixture đầy đủ và native/live latency evidence |
-| 4 | `PARTIAL_UI_FOUNDATION` | Drawer stack, media controls, selection/context-menu nền, labels worker, relative-time helper | Filter còn local trên dữ liệu đã tải; thiếu request identity/pagination, capability/community metadata, shared file icon resolver và xác minh backend/permission cho batch/menu actions |
-| 5 | `VERIFICATION_GATE_PENDING` | Contacts/modals và account/store isolation có nền mã; test hiện tại xanh | Audit tích hợp Phase 1–4, target isolation, modal input gate, late responses, DNS/chat regression và native acceptance chưa hoàn tất |
+| 3 | `SOURCE_AUDIT_CONSENSUS` | MAP-15 và MAP-10–12 đã triển khai; hai auditor GPT-6.1 Sol đồng thuận sau sửa lỗi | Kiểm chứng cuối xem mục 6; native/live latency chưa chạy, không gọi là nghiệm thu thiết bị hoàn tất |
+| 4 | `SOURCE_AUDIT_CONSENSUS` | MAP-13/14 và MAP-16–29 có đường xử lý, kiểm tra quyền/isolation và regression; hai auditor đồng thuận sau sửa | Archive là lịch sử SQLite phân trang, không cam kết đủ server; các fork deviation và native/live ghi trong checklist |
+| 5 | `VERIFICATION_GATE_PENDING` | Contacts/modals và account/store isolation có nền mã; kết quả kiểm chứng snapshot cuối xem checklist | Audit tích hợp Phase 1–4, target isolation, modal input gate, late responses, DNS/chat regression và native acceptance chưa hoàn tất |
 
 Kế hoạch thực thi tuần tự mới: (1) đóng các lỗi và fixture có thể chứng minh của
 Phase 3 nhưng giữ mutation fail-closed khi giao hàng chưa rõ; (2) hoàn thiện
 Phase 4 theo thứ tự MAP-22 → MAP-21 → MAP-16 → MAP-18 → MAP-19 → MAP-20 →
 MAP-17 → MAP-23 → MAP-24 → MAP-25 → MAP-26 → MAP-27 → MAP-28 → MAP-29; (3)
 chạy Phase 5 như cổng audit toàn diện, đối chiếu lại toàn bộ Phase 1–4 và chỉ
-đánh dấu mục `native/live verified` khi có bằng chứng tương ứng. `cargo check`,
-`cargo test` và `cargo clippy` đã chạy trên working tree hiện tại; chưa build
-binary/release.
+đánh dấu mục `native/live verified` khi có bằng chứng tương ứng. Kết quả
+`cargo check/test/clippy` của snapshot cuối ghi tại
+[checklist thực thi](PHASE_3_4_EXECUTION_2026-11-18.md); chưa build binary/release.
 
 ### 1.1. Mục tiêu tối thượng
 Đạt độ tương đồng tối đa với **Zalo PC gốc (bản 26.11.12)** về mặt trải nghiệm, bố cục thị giác và tương tác người dùng, đặc biệt giải quyết triệt để các lỗi gây khó chịu:
@@ -283,7 +283,7 @@ binary/release.
   - PC có Domain Manager và retry queue có điều kiện; rotation cooldown 5s, revert main khi lấy active domain sau 5 phút; nhánh switch rõ đã đọc là HTTP 4xx/5xx. Không suy DNS fail chắc chắn kích hoạt switch hoặc copy retry mutation mù.
   - Lần test live bị PC crash; chưa xác nhận tin test text đã giao, chưa gửi test link. Chưa có active host/config effective hoặc benchmark live PC/fork.
 
-**Các task Phase 3, thực hiện theo thứ tự (tất cả đang chờ):**
+**Các task Phase 3, thực hiện theo thứ tự (điều kiện yêu cầu; trạng thái hiện tại xem mục 6):**
 
 | Task | Công việc / file neo | Điều kiện hoàn tất và bằng chứng |
 | :--- | :--- | :--- |
@@ -299,7 +299,7 @@ binary/release.
 
 ## 3.1. PHASE 4 — MAP-16–29: HOÀN THIỆN TÍNH NĂNG VÀ UI HỘI THOẠI
 
-Hướng dẫn chi tiết, bằng chứng và điều kiện nghiệm thu: [Khoảng trống UI/UX bổ sung](ZALO_PC_UI_GAPS_FOLLOWUP_2026-11-18.md). Người dùng đã duyệt chuyển MAP-16–23 và bổ sung MAP-24 vào **Phase 4**. Tất cả **chờ triển khai/nghiệm thu**; không suy từ sự tồn tại của code rằng tính năng đã hoạt động.
+Hướng dẫn chi tiết, bằng chứng và điều kiện nghiệm thu: [Khoảng trống UI/UX bổ sung](ZALO_PC_UI_GAPS_FOLLOWUP_2026-11-18.md). Người dùng đã duyệt chuyển MAP-16–23 và bổ sung MAP-24 vào **Phase 4**. Đây là yêu cầu/baseline khảo sát; trạng thái triển khai và giới hạn kiểm chứng hiện tại xem mục 6, không suy native/live từ sự tồn tại của code.
 
 | ID | Hạng mục | Phase đã duyệt | Điểm bắt buộc |
 | :--- | :--- | :--- | :--- |
@@ -318,7 +318,7 @@ Hướng dẫn chi tiết, bằng chứng và điều kiện nghiệm thu: [Kho�
 | MAP-28 | Menu chuột phải bubble tin nhắn | 4 / P1 | Reply/forward/copy theo loại, ghim, đánh dấu, chọn nhiều, chi tiết, submenu và xóa/thu hồi theo quyền. |
 | MAP-29 | Menu chuột phải dòng preview hội thoại | 4 / P1 | Ghim hội thoại, phân loại, chưa đọc, thêm vào nhóm khi phù hợp, mute, ẩn, xóa hội thoại, báo xấu. |
 
-**Thứ tự Phase 4:** MAP-22 → MAP-21 → MAP-16 → MAP-18 → MAP-19 → MAP-20 → MAP-17 → MAP-23 → MAP-24 → MAP-25 → MAP-26 → MAP-27 → MAP-28 → MAP-29 → nghiệm thu tổng thể. MAP-13/14 vẫn thuộc Phase 4; MAP-17 mở rộng MAP-13. MAP-22 cung cấp loại/quyền cho các luồng còn lại; kế thừa input gate/glyph đã xử lý ở phase trước. MAP-15 giữ nguyên Phase 3. Không thay đổi trạng thái hoàn tất của phase nào; chỉ cập nhật tài liệu, chưa sửa mã sản phẩm.
+**Thứ tự Phase 4:** MAP-22 → MAP-21 → MAP-16 → MAP-18 → MAP-19 → MAP-20 → MAP-17 → MAP-23 → MAP-24 → MAP-25 → MAP-26 → MAP-27 → MAP-28 → MAP-29 → nghiệm thu tổng thể. MAP-13/14 vẫn thuộc Phase 4; MAP-17 mở rộng MAP-13. MAP-22 cung cấp loại/quyền cho các luồng còn lại; MAP-15 giữ nguyên Phase 3. Trạng thái hiện tại xem mục 6.
 
 ### [MAP-24] Thời gian tương đối trong danh sách hội thoại bên trái (P1 — Phase 4)
 
@@ -486,7 +486,7 @@ Bất kỳ Agent Antigravity nào triển khai gói việc phải thực hiện 
    cargo test --locked
    cargo clippy --all-targets -- -D warnings
    ```
-2. **Build Binary kiểm thử thực tế:**
+2. **Build Binary kiểm thử thực tế (KHÔNG thực hiện trong phiên này theo yêu cầu “chưa build” của người dùng):**
    ```powershell
    cargo build --bin ctdozlite
    ```
@@ -507,14 +507,14 @@ Kế hoạch này là nguồn chính, khác số phase của overhaul cũ đã g
 
 | Giai đoạn | Trạng thái phiên tiếp quản | Bằng chứng |
 | :--- | :--- | :--- |
-| Phase 1–2 | Người dùng báo Antigravity đã làm; working tree chưa commit | Giữ nguyên thay đổi; sẽ kiểm tra tích hợp trong audit cuối |
-| Phase 3: MAP-15, MAP-10–12 | ĐANG THỰC HIỆN | Baseline cargo check --locked pass trước tiếp quản; network/UI chia quyền sửa riêng |
-| Phase 4: MAP-13/14, MAP-16–29 | CHỜ | Theo thứ tự phụ thuộc trong mục 3.1 |
-| Phase 5: Danh bạ/modal + tích hợp | CHỜ | Kiểm tra lại scope cũ với working tree mới |
-| Audit toàn diện Phase 1–5 | CHỜ | Truy vết routing/discovery/restore/DNS/fallback/timeout/ACK và UI-worker-store; fixture và native/live ghi riêng |
+| Phase 1–2 | Giữ baseline main; không chứng nhận lại native trong phiên này | Không dùng trạng thái lịch sử để chứng nhận phiên hiện tại |
+| Phase 3: MAP-15, MAP-10–12 | SOURCE AUDIT: A/B ĐỒNG THUẬN | Đã bổ sung routing/DNS, timeout từng pha, preview, identity/ACK/echo, UI; kết quả checks cuối và từng mục trong checklist liên kết dưới |
+| Phase 4: MAP-13/14, MAP-16–29 | SOURCE AUDIT: A/B ĐỒNG THUẬN | Đã sửa toàn bộ finding xác nhận qua nhiều vòng; ghi rõ fork deviation/settings/archive/format và giới hạn native/live |
+| Phase 5: Danh bạ/modal + tích hợp | CHƯA chứng nhận lại toàn bộ | Có kiểm tra tích hợp liên quan Phase 3/4; chưa phải audit toàn bộ Phase 1–5 |
+| Audit toàn diện Phase 1–5 | CHƯA HOÀN TẤT | Không thay bằng audit hai phase hoặc tests hiện tại |
 
 Không đánh dấu phase hoàn tất hoặc push trước khi hai auditor đồng thuận và checks được ghi. Phần native/live chưa chạy phải còn ghi chưa xác minh, không thay bằng kết quả compile/unit test.
 
-### Tiến độ tiếp quản và xung đột working tree
+### Checklist và bằng chứng hiện tại
 
-Phase 3 đang thực hiện, chưa audit chính thức/commit/push. Subagent network sửa candidate order/cache/preview deadline và diagnostics; subagent UI sửa sync banner/responsive/quote/reaction và debounce. Root nối typed completion và scope tài khoản/runtime của link preview. Checks ban đầu đã thấy source gui.rs thay đổi ngoài root/subagent UI: PIN APIs biến mất rồi phục hồi; GroupMemberPopover/common-group/sync fields trùng và tiếp tục thay đổi trong lúc compile. Đã hỏi người dùng dừng Antigravity để có snapshot ổn định. Không gắn các lỗi snapshot đang thay đổi thành kết luận audit cuối và không push trạng thái chưa qua kiểm tra. Baseline cargo check trước phiên pass; các lần check/test sau chưa pass do source chưa ổn định. Chưa build binary hoặc thực hiện live mutation.
+[PHASE_3_4_EXECUTION_2026-11-18.md](PHASE_3_4_EXECUTION_2026-11-18.md) là checklist theo từng MAP, kết quả kiểm chứng cuối, finding đã sửa và phần nghiệm thu còn lại. Không có binary/release build hoặc live mutation. Source audit đồng thuận không chứng nhận native/live hay toàn bộ Phase 1–5.

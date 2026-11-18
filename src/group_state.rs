@@ -129,6 +129,10 @@ pub async fn snapshot(session: &Session, group: &str, refresh: bool) -> Result<S
             .value
             .clone()
     };
+    crate::service_resolver::record_current_cache_status(
+        crate::service_resolver::TimingPhase::Policy,
+        cell.get().is_some(),
+    );
     let result = cell
         .get_or_init(|| async {
             let result = async {

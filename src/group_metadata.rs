@@ -52,6 +52,7 @@ pub(crate) async fn refresh(
             group.presentation.members = cached.presentation.members.clone();
             group.presentation.member_count = cached.presentation.member_count;
             group.presentation.global_id = cached.presentation.global_id.clone();
+            group.presentation.group_kind = cached.presentation.group_kind;
             // Membership versions authorize display caching, not current send permissions.
             group.presentation.send_policy = None;
         } else {

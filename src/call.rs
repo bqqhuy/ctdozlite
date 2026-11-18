@@ -2771,6 +2771,9 @@ impl CallBridge {
                                     reason: last_err_reason.clone(),
                                 });
                                 let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
+                                    runtime_id:s_snap.runtime_id(),
+                                    outgoing: true,
+                                    owner: gui_owner.clone(),
                                     thread_id: partner_id,
                                     text: if is_video {
                                         format!(
@@ -2781,7 +2784,7 @@ impl CallBridge {
                                             "📞 Cuộc gọi đi (0s) — {last_err_reason} (Mã {last_err_code})"
                                         )
                                     },
-                                    msg_id: format!("call_{}", crate::login::unix_now()),
+                                    msg_id: crate::call_lifecycle::local_record_id(0),
                                 });
                                 ctx_clone.request_repaint();
                                 return;
@@ -2942,13 +2945,16 @@ impl CallBridge {
                                         state: "free".into(),
                                     });
                                     let _ = gui_tx_clone.send(GuiEvent::LocalCallRecord {
+                                        runtime_id: s_snap.runtime_id(),
+                                        outgoing: false,
+                                        owner: gui_owner.clone(),
                                         thread_id: partner_id,
                                         text: if was_video {
                                             "📹 Cuộc gọi video đến (Đã từ chối)".into()
                                         } else {
                                             "📞 Cuộc gọi đến (Đã từ chối)".into()
                                         },
-                                        msg_id: format!("call_{}", crate::login::unix_now()),
+                                        msg_id: crate::call_lifecycle::local_record_id(call_id),
                                     });
                                 }
                                 drop(guard);
@@ -3130,9 +3136,12 @@ impl CallBridge {
                                     (false, false) => format!("📞 Cuộc gọi đến ({duration_sec}s)"),
                                 };
                                 let _ = gui_tx.send(GuiEvent::LocalCallRecord {
+                                    runtime_id: s_snap.runtime_id(),
+                                    outgoing: is_caller,
+                                    owner: s_snap.account_key().to_owned(),
                                     thread_id: thread_id.clone(),
                                     text: label,
-                                    msg_id: format!("call_{}", crate::login::unix_now()),
+                                    msg_id: crate::call_lifecycle::local_record_id(call_id),
                                 });
                             }
                             let _ = gui_tx.send(GuiEvent::CallStateChanged {
@@ -3773,13 +3782,18 @@ impl CallBridge {
                                     });
                                     if let Some(st) = taken {
                                         let _ = gui_tx.send(GuiEvent::LocalCallRecord {
+                                            runtime_id: s_snap.runtime_id(),
+                                            outgoing: st.is_caller,
+                                            owner: gui_owner.clone(),
                                             thread_id: st.thread_id.clone(),
                                             text: if st.is_video {
                                                 format!("📹 Cuộc gọi video đi (0s) — {reason}")
                                             } else {
                                                 format!("📞 Cuộc gọi đi (0s) — {reason}")
                                             },
-                                            msg_id: format!("call_{}", crate::login::unix_now()),
+                                            msg_id: crate::call_lifecycle::local_record_id(
+                                                ev_call_id,
+                                            ),
                                         });
                                     }
                                 }
@@ -3943,9 +3957,12 @@ impl CallBridge {
                                         (false, false, false) => "📞 Cuộc gọi nhỡ".to_string(),
                                     };
                                     let _ = gui_tx.send(GuiEvent::LocalCallRecord {
+                                        runtime_id: s_snap.runtime_id(),
+                                        outgoing: st.is_caller,
+                                        owner: gui_owner.clone(),
                                         thread_id: st.thread_id.clone(),
                                         text: label,
-                                        msg_id: format!("call_{}", crate::login::unix_now()),
+                                        msg_id: crate::call_lifecycle::local_record_id(ev_call_id),
                                     });
                                 }
                                 let _ = gui_tx.send(GuiEvent::CallStateChanged {

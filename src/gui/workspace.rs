@@ -6,38 +6,299 @@ type SharedPhotos = Vec<(String, crate::message_view::Media, ChatMessage)>;
 type SharedFiles = Vec<(crate::message_view::Media, ChatMessage)>;
 type SharedLinks = Vec<(String, String, ChatMessage)>;
 
+#[derive(Default)]
+pub(super) struct CloudUsageState {
+    pub owner: String,
+    pub generation: u64,
+    pub pending: bool,
+    pub result: Option<Result<crate::zcloud::Usage, String>>,
+}
+
+pub(super) struct ArchiveMutation {
+    pub thread: String,
+    pub group: bool,
+    pub recall: bool,
+    pub messages: Vec<ChatMessage>,
+}
+
+#[derive(Default)]
+pub(super) struct ArchiveHistory {
+    pub thread: String,
+    pub generation: u64,
+    pub messages: Vec<ChatMessage>,
+    pub cursor: Option<crate::store::HistoryCursor>,
+    pub scanned: usize,
+    pub loading: bool,
+    pub loaded: bool,
+    pub error: String,
+}
+
+#[derive(Clone)]
+struct ArchiveDateDraft {
+    from: String,
+    to: String,
+    month: chrono::NaiveDate,
+    editing_end: bool,
+    calendar_open: bool,
+}
+
+impl ArchiveDateDraft {
+    fn new(from: &str, to: &str, today: chrono::NaiveDate) -> Self {
+        use chrono::Datelike;
+        let date = chrono::NaiveDate::parse_from_str(from, "%Y-%m-%d")
+            .unwrap_or(today)
+            .min(today);
+        Self {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            month: date.with_day(1).unwrap_or(date),
+            editing_end: false,
+            calendar_open: false,
+        }
+    }
+
+    fn error(&self, today: chrono::NaiveDate) -> Option<&'static str> {
+        let parse = |value: &str| chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d");
+        let from = parse(&self.from).ok();
+        let to = parse(&self.to).ok();
+        if (!self.from.trim().is_empty() && from.is_none())
+            || (!self.to.trim().is_empty() && to.is_none())
+        {
+            Some("Ngày phải có định dạng YYYY-MM-DD.")
+        } else if from.is_some_and(|date| date > today) || to.is_some_and(|date| date > today) {
+            Some("Không thể chọn ngày trong tương lai.")
+        } else if from.zip(to).is_some_and(|(from, to)| from > to) {
+            Some("Ngày bắt đầu phải trước hoặc bằng ngày kết thúc.")
+        } else {
+            None
+        }
+    }
+}
+
+fn archive_date_preset(today: chrono::NaiveDate, days: u64) -> (String, String) {
+    let start = today
+        .checked_sub_days(chrono::Days::new(days))
+        .unwrap_or(today);
+    (start.to_string(), today.to_string())
+}
+
+fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, today: chrono::NaiveDate) {
+    use chrono::Datelike;
+    ui.horizontal(|ui| {
+        if ui.small_button("◀").on_hover_text("Tháng trước").clicked() {
+            if let Some(month) = draft.month.checked_sub_months(chrono::Months::new(1)) {
+                draft.month = month;
+            }
+        }
+        ui.label(format!("Tháng {} / {}", draft.month.month(), draft.month.year()));
+        if ui
+            .add_enabled(
+                draft.month.year() < today.year()
+                    || (draft.month.year() == today.year() && draft.month.month() < today.month()),
+                egui::Button::new("▶").small(),
+            )
+            .on_hover_text("Tháng sau")
+            .clicked()
+        {
+            if let Some(month) = draft.month.checked_add_months(chrono::Months::new(1)) {
+                draft.month = month;
+            }
+        }
+    });
+    let selected = if draft.editing_end { &draft.to } else { &draft.from };
+    let selected = chrono::NaiveDate::parse_from_str(selected, "%Y-%m-%d").ok();
+    egui::Grid::new("archive-date-calendar")
+        .spacing(Vec2::new(3.0, 3.0))
+        .show(ui, |ui| {
+            for name in ["T2", "T3", "T4", "T5", "T6", "T7", "CN"] {
+                ui.label(name);
+            }
+            ui.end_row();
+            let offset = draft.month.weekday().num_days_from_monday();
+            for cell in 0..42 {
+                let day = cell - offset as i32 + 1;
+                let date = u32::try_from(day).ok().and_then(|day| draft.month.with_day(day));
+                if let Some(date) = date {
+                    if ui
+                        .add_enabled(
+                            date <= today,
+                            egui::Button::new(date.day().to_string())
+                                .selected(selected == Some(date))
+                                .min_size(Vec2::splat(25.0)),
+                        )
+                        .clicked()
+                    {
+                        if draft.editing_end {
+                            draft.to = date.to_string();
+                            draft.calendar_open = false;
+                        } else {
+                            draft.from = date.to_string();
+                            draft.editing_end = true;
+                        }
+                    }
+                } else {
+                    ui.allocate_space(Vec2::splat(25.0));
+                }
+                if cell % 7 == 6 {
+                    ui.end_row();
+                }
+            }
+        });
+}
+
+fn render_archive_date_filter(
+    ui: &mut egui::Ui,
+    scope: Id,
+    from: &mut String,
+    to: &mut String,
+) {
+    let today = chrono::Local::now().date_naive();
+    let draft_id = scope.with("archive-date-draft");
+    let label = if from.is_empty() && to.is_empty() {
+        "Ngày gửi ▾".to_owned()
+    } else {
+        format!("{} → {} ▾", if from.is_empty() { "…" } else { from }, if to.is_empty() { "…" } else { to })
+    };
+    let response = ui.menu_button(label, |ui| {
+        let mut draft = ui.ctx().data_mut(|data| {
+            data.get_temp::<ArchiveDateDraft>(draft_id)
+                .unwrap_or_else(|| ArchiveDateDraft::new(from, to, today))
+        });
+        ui.menu_button("Gợi ý thời gian", |ui| {
+            for (days, label) in [(7, "Trong vòng 1 tuần"), (30, "Trong vòng 1 tháng"), (90, "Trong vòng 3 tháng")] {
+                if ui.button(label).clicked() {
+                    // Archive ENRE overrides the reusable picker's calendar-month presets (re-notes/47).
+                    (*from, *to) = archive_date_preset(today, days);
+                    ui.close_menu();
+                }
+            }
+        });
+        ui.separator();
+        ui.label("Chọn khoảng thời gian");
+        for editing_end in [false, true] {
+            ui.horizontal(|ui| {
+                ui.label(if editing_end { "Đến ngày" } else { "Từ ngày" });
+                let value = if editing_end { &mut draft.to } else { &mut draft.from };
+                let input = ui.add(egui::TextEdit::singleline(value).hint_text("YYYY-MM-DD").desired_width(105.0));
+                if ui.small_button("📅").on_hover_text("Chọn ngày trên lịch").clicked() || input.gained_focus() {
+                    draft.editing_end = editing_end;
+                    draft.calendar_open = true;
+                    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+                        use chrono::Datelike;
+                        draft.month = date.min(today).with_day(1).unwrap_or(today);
+                    }
+                }
+                if ui.small_button("×").on_hover_text("Xóa ngày").clicked() {
+                    value.clear();
+                }
+            });
+        }
+        if draft.calendar_open {
+            ui.small(if draft.editing_end { "Chọn ngày kết thúc" } else { "Chọn ngày bắt đầu" });
+            render_archive_calendar(ui, &mut draft, today);
+        }
+        let error = draft.error(today);
+        if let Some(error) = error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Hủy").clicked() {
+                ui.close_menu();
+            }
+            if ui.add_enabled(error.is_none(), egui::Button::new("Xác nhận")).clicked() {
+                *from = draft.from.trim().to_owned();
+                *to = draft.to.trim().to_owned();
+                ui.close_menu();
+            }
+        });
+        ui.ctx().data_mut(|data| data.insert_temp(draft_id, draft));
+    });
+    // Closed popovers discard unconfirmed edits, including clicks outside the menu.
+    if response.inner.is_none() || !ui.memory(|memory| memory.is_popup_open(response.response.id)) {
+        ui.ctx().data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
+    }
+    if (!from.is_empty() || !to.is_empty())
+        && ui.small_button("×").on_hover_text("Xóa bộ lọc ngày").clicked()
+    {
+        from.clear();
+        to.clear();
+        ui.ctx().data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
+    }
+}
+
+fn archive_selection_key(
+    kind: &str,
+    thread: &str,
+    message: &ChatMessage,
+    attachment: &str,
+) -> String {
+    // Length-independent JSON components cannot alias through ':' in IDs or URLs.
+    serde_json::json!([
+        kind,
+        thread,
+        message.id,
+        message.client_message_id,
+        attachment
+    ])
+    .to_string()
+}
+
+fn media_sender_matches(msg: &ChatMessage, query: &str) -> bool {
+    if let Some(id) = query.strip_prefix("id:") {
+        return crate::chat::sidebar_sender_id(msg).as_deref() == Some(id);
+    }
+    let query = crate::search::fold(query.trim());
+    if query.is_empty() {
+        return true;
+    }
+    if query.chars().all(|ch| ch.is_ascii_digit()) {
+        return crate::chat::sidebar_sender_id(msg).is_some_and(|sender_id| sender_id == query);
+    }
+    crate::search::fold(&msg.sender).contains(&query)
+}
+
 fn extract_shared_media_and_links(thread: &Thread) -> (SharedPhotos, SharedFiles, SharedLinks) {
     let mut photos = Vec::new();
     let mut files = Vec::new();
     let mut links = Vec::new();
 
     for m in thread.messages.iter().rev() {
-        let mut media = crate::message_view::media(m);
-        if matches!(
-            media.kind,
-            crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
-        ) {
-            if media.thumbnail.as_deref().is_none_or(str::is_empty) {
-                media.thumbnail = media
-                    .preview
-                    .clone()
-                    .filter(|u| !u.is_empty())
-                    .or_else(|| media.original.clone().filter(|u| !u.is_empty()))
-                    .or_else(|| m.link_url.clone().filter(|u| !u.is_empty()));
+        let mut found_attachment = false;
+        for (index, mut media) in crate::message_view::archive_media_items(m)
+            .into_iter()
+            .enumerate()
+        {
+            if matches!(
+                media.kind,
+                crate::message_view::MediaKind::Photo | crate::message_view::MediaKind::Video
+            ) {
+                if media.thumbnail.as_deref().is_none_or(str::is_empty) {
+                    media.thumbnail = media
+                        .preview
+                        .clone()
+                        .filter(|u| !u.is_empty())
+                        .or_else(|| media.original.clone().filter(|u| !u.is_empty()))
+                        .or_else(|| m.link_url.clone().filter(|u| !u.is_empty()));
+                }
+                if media.thumbnail.as_deref().is_some_and(|u| !u.is_empty())
+                    || media.original.as_deref().is_some_and(|u| !u.is_empty())
+                {
+                    photos.push((
+                        crate::media_recovery::image_key(&thread.id, &m.id, index, false),
+                        media,
+                        m.clone(),
+                    ));
+                }
+                found_attachment = true;
+                continue;
             }
-            if media.thumbnail.as_deref().is_some_and(|u| !u.is_empty())
-                || media.original.as_deref().is_some_and(|u| !u.is_empty())
-            {
-                photos.push((
-                    crate::media_recovery::image_key(&thread.id, &m.id, 0, false),
-                    media,
-                    m.clone(),
-                ));
+            if media.kind == crate::message_view::MediaKind::File {
+                files.push((media, m.clone()));
+                found_attachment = true;
+                continue;
             }
-            continue;
         }
-        if media.kind == crate::message_view::MediaKind::File {
-            files.push((media, m.clone()));
+        if found_attachment {
             continue;
         }
 
@@ -109,6 +370,326 @@ fn format_auto_delete_ttl(ttl_ms: i64) -> String {
 }
 
 impl ZaloGuiApp {
+    fn confirm_archive_mutation(
+        &mut self,
+        thread: &str,
+        group: bool,
+        recall: bool,
+        messages: &[ChatMessage],
+    ) {
+        let mut seen = HashSet::new();
+        let messages: Vec<_> = messages
+            .iter()
+            .filter(|message| seen.insert((message.id.clone(), message.client_message_id.clone())))
+            .cloned()
+            .collect();
+        if messages.is_empty() || messages.len() > 100 {
+            return;
+        }
+        self.archive_mutation_confirm = Some(ArchiveMutation {
+            thread: thread.to_owned(),
+            group,
+            recall,
+            messages,
+        });
+        self.drawer_view = DrawerView::MediaStorage {
+            tab: self.drawer_media_active_tab,
+        };
+    }
+
+    fn request_archive_page(&mut self, thread: &str, group: bool) {
+        if self.archive_history.loading || !self.private_access(thread, group) {
+            return;
+        }
+        let queued = WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::LoadArchiveHistory {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                thread: thread.to_owned(),
+                group,
+                generation: self.archive_history.generation,
+                before: self.archive_history.cursor.clone(),
+            })
+            .is_ok()
+        });
+        self.archive_history.loading = queued;
+        self.archive_history.error = if queued {
+            String::new()
+        } else {
+            "Không gửi được yêu cầu đọc lịch sử tới worker.".into()
+        };
+    }
+
+    fn request_attachment_picker(&mut self, thread: &str, group: bool, images_only: bool) {
+        // Opening/cancelling the native picker is not acceptance of this draft.
+        // Retain the composer even after enqueue; attachment delivery owns its
+        // independent caption snapshot and can fail after the picker closes.
+        let queued = WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::PickAndSendAttachment {
+                to_id: thread.to_owned(),
+                is_group: group,
+                images_only,
+                caption: self.input_message.trim().to_owned(),
+                preset_path: None,
+                photo_original: self.settings.send_photo_original,
+                ephemeral: false,
+            })
+            .is_ok()
+        });
+        if !queued {
+            self.status_msg =
+                "Không gửi được yêu cầu chọn tệp; nội dung soạn thảo vẫn được giữ.".into();
+        }
+    }
+
+    pub(super) fn clear_timeline_selection(&mut self) {
+        self.batch_selection_mode = false;
+        self.selected_msg_ids.clear();
+        self.timeline_selection_scope = None;
+    }
+
+    fn bind_timeline_selection(&mut self, thread: &str, group: bool) {
+        let scope = (
+            self.user_uin.clone(),
+            self.account_runtime_id,
+            thread.to_owned(),
+            group,
+        );
+        if self.timeline_selection_scope.as_ref() != Some(&scope) {
+            self.clear_timeline_selection();
+        }
+        self.timeline_selection_scope = Some(scope);
+        self.batch_selection_mode = true;
+    }
+
+    fn timeline_selection_matches(&self, thread: &str, group: bool) -> bool {
+        self.timeline_selection_scope
+            .as_ref()
+            .is_some_and(|(owner, runtime, target, is_group)| {
+                owner == &self.user_uin
+                    && *runtime == self.account_runtime_id
+                    && target == thread
+                    && *is_group == group
+            })
+    }
+
+    fn share_timeline_selection(&mut self, thread: &str, group: bool) {
+        if !self.timeline_selection_matches(thread, group) {
+            self.clear_timeline_selection();
+            return;
+        }
+        let selected = self
+            .threads
+            .iter()
+            .find(|t| t.id == thread && t.is_group == group)
+            .map(|t| {
+                t.messages
+                    .iter()
+                    .filter(|m| self.selected_msg_ids.contains(&m.id))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.share_archive_messages(thread, group, selected);
+        if self.forward_msg.is_some() {
+            self.clear_timeline_selection();
+        }
+    }
+
+    fn share_archive_messages(&mut self, thread: &str, group: bool, messages: Vec<ChatMessage>) {
+        let mut seen = HashSet::new();
+        let mut messages: Vec<_> = messages
+            .into_iter()
+            .filter(|message| seen.insert((message.id.clone(), message.client_message_id.clone())))
+            .collect();
+        if self.content_protected(thread, group)
+            || messages.is_empty()
+            || messages.len() > 100
+            || messages
+                .iter()
+                .any(|message| !crate::chat::can_forward_message(message))
+        {
+            self.drawer_media_batch_status =
+                "Có tin nhắn chưa hỗ trợ chia sẻ; hãy bỏ chọn mục đó rồi thử lại.".into();
+            return;
+        }
+        for message in &mut messages {
+            crate::chat::set_forward_source(message, thread, group);
+        }
+        self.clear_forward_dialog();
+        self.forward_msg = messages.first().cloned();
+        self.forward_batch = messages;
+    }
+
+    fn save_archive_to_documents(&mut self, thread: &str, group: bool, messages: Vec<ChatMessage>) {
+        if self.own_cloud_id.is_empty()
+            || !self.threads.iter().any(|t| {
+                t.id == self.own_cloud_id && !t.is_group && self.private_access(&t.id, false)
+            })
+        {
+            self.drawer_media_batch_status =
+                "My Documents chưa có định danh máy chủ hoặc đang khóa; hãy đồng bộ rồi thử lại."
+                    .into();
+            return;
+        }
+        self.share_archive_messages(thread, group, messages);
+        if self.forward_msg.is_some() {
+            self.forward_targets.insert(self.own_cloud_id.clone());
+            self.forward_cloud_only = true;
+        }
+    }
+
+    fn archive_item_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        thread: &str,
+        group: bool,
+        message: &ChatMessage,
+        media: Option<&crate::message_view::Media>,
+        link: Option<&str>,
+    ) {
+        let shareable = !self.content_protected(thread, group);
+        if ui
+            .add_enabled(
+                shareable && crate::chat::can_forward_message(message),
+                egui::Button::new("Chia sẻ tin nhắn gốc…"),
+            )
+            .clicked()
+        {
+            self.share_archive_messages(thread, group, vec![message.clone()]);
+            ui.close_menu();
+        }
+        if ui
+            .add_enabled(
+                shareable
+                    && !self.own_cloud_id.is_empty()
+                    && crate::chat::can_forward_message(message),
+                egui::Button::new("Lưu vào My Documents…"),
+            )
+            .clicked()
+        {
+            self.save_archive_to_documents(thread, group, vec![message.clone()]);
+            ui.close_menu();
+        }
+        if !message.id.is_empty() && ui.button("Xem tin nhắn gốc").clicked() {
+            self.tools_command(super::tools_panel::ToolsCommand::OpenHit {
+                thread: thread.to_owned(),
+                id: message.id.clone(),
+            });
+            ui.close_menu();
+        }
+        if let Some(media) = media {
+            if media.kind == crate::message_view::MediaKind::Photo
+                && ui
+                    .add_enabled(shareable, egui::Button::new("Sao chép ảnh"))
+                    .clicked()
+            {
+                let queued = WORKER_TX.get().is_some_and(|tx| {
+                    tx.send(WorkerCmd::CopyArchiveImage {
+                        owner: self.user_uin.clone(),
+                        media: media.clone(),
+                        context: super::worker::ChatImage {
+                            thread: thread.to_owned(),
+                            group,
+                            message: message.clone(),
+                            preview: true,
+                        },
+                    })
+                    .is_ok()
+                });
+                if !queued {
+                    self.drawer_media_batch_status =
+                        "Không gửi được yêu cầu sao chép tới worker.".into();
+                }
+                ui.close_menu();
+            }
+            let kind = if media.kind == crate::message_view::MediaKind::File {
+                "file"
+            } else {
+                "photo"
+            };
+            let attachment = media.original.as_deref().unwrap_or(&media.name);
+            let key = archive_selection_key(kind, thread, message, attachment);
+            if let Some(path) = self.archive_local_paths.get(&key).cloned() {
+                if ui
+                    .add_enabled(shareable, egui::Button::new("Hiển thị trong thư mục"))
+                    .clicked()
+                {
+                    let queued = WORKER_TX.get().is_some_and(|tx| {
+                        tx.send(WorkerCmd::RevealArchiveMedia {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            path,
+                            context: super::worker::ChatImage {
+                                thread: thread.to_owned(),
+                                group,
+                                message: message.clone(),
+                                preview: false,
+                            },
+                        })
+                        .is_ok()
+                    });
+                    if !queued {
+                        self.drawer_media_batch_status =
+                            "Không gửi được yêu cầu mở thư mục tới worker.".into();
+                    }
+                    ui.close_menu();
+                }
+            }
+            if let Some(url) = media.original.as_ref() {
+                if ui
+                    .add_enabled(shareable, egui::Button::new("Lưu về máy…"))
+                    .clicked()
+                {
+                    let batch = crate::search::generation();
+                    let queued = WORKER_TX.get().is_some_and(|tx| {
+                        tx.send(WorkerCmd::DownloadMediaBatch {
+                            owner: self.user_uin.clone(),
+                            batch,
+                            items: vec![super::worker::MediaBatchItem {
+                                key: key.clone(),
+                                url: url.clone(),
+                                name: media.name.clone(),
+                                context: super::worker::ChatImage {
+                                    thread: thread.to_owned(),
+                                    group,
+                                    message: message.clone(),
+                                    preview: false,
+                                },
+                            }],
+                        })
+                        .is_ok()
+                    });
+                    if queued {
+                        self.drawer_media_batch = Some(batch);
+                    }
+                    if !queued {
+                        self.drawer_media_batch_status =
+                            "Không gửi được yêu cầu tải tới worker.".into();
+                    }
+                    ui.close_menu();
+                }
+            }
+        }
+        if let Some(link) = link {
+            if ui
+                .add_enabled(shareable, egui::Button::new("Sao chép liên kết"))
+                .clicked()
+            {
+                ui.ctx().copy_text(link.to_owned());
+                ui.close_menu();
+            }
+            if ui.button("Mở bằng trình duyệt").clicked() {
+                ui.ctx().open_url(egui::OpenUrl::same_tab(link));
+                ui.close_menu();
+            }
+        }
+    }
+
+    fn is_cloud_thread(&self, thread: &Thread) -> bool {
+        !self.own_cloud_id.is_empty() && thread.id == self.own_cloud_id && !thread.is_group
+    }
+
     fn sort_conversation_indices(&mut self, indices: &mut [usize]) {
         let keys: Vec<_> = indices
             .iter()
@@ -153,6 +734,7 @@ impl ZaloGuiApp {
         self.quote_jump = None;
         self.server_pins = Default::default();
         self.server_board = Default::default();
+        self.message_pins = Default::default();
         self.history_search = Default::default();
         self.chat_anchor = None;
         self.phone_sync_running = false;
@@ -196,6 +778,7 @@ impl ZaloGuiApp {
             return;
         }
         if !self.is_logged_in
+            || self.sync_notice_dismissed
             || (!running
                 && (self.sync_notice_dismissed
                     || (self.sync_status_message().is_empty() && !success_completed)))
@@ -282,12 +865,10 @@ impl ZaloGuiApp {
                         self.settings_tab = SettingsTab::Sync;
                         self.settings_modal_open = true;
                     }
-                    if success_visible
-                        && !running
-                        && ui
-                            .small_button(lucide::X)
-                            .on_hover_text(crate::i18n::tr("Ẩn thông báo"))
-                            .clicked()
+                    if ui
+                        .small_button(lucide::X)
+                        .on_hover_text(crate::i18n::tr("Ẩn thông báo"))
+                        .clicked()
                     {
                         self.sync_notice_dismissed = true;
                     }
@@ -307,6 +888,14 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if self.batch_selection_mode
+            && !self
+                .threads
+                .get(self.selected_thread_index)
+                .is_some_and(|thread| self.timeline_selection_matches(&thread.id, thread.is_group))
+        {
+            self.clear_timeline_selection();
+        }
         self.render_hidden_panel(ctx);
         if self.policy_panel.snapshot.is_none()
             && !self.policy_panel.pending
@@ -335,11 +924,18 @@ impl ZaloGuiApp {
             data.get_temp::<bool>(Id::new("narrow_chat_open"))
                 .unwrap_or(false)
         });
+        let entering_compact =
+            ctx.data(|data| data.get_temp::<bool>(Id::new("drawer_was_compact"))) == Some(false)
+                && is_compact_w;
+        ctx.data_mut(|data| data.insert_temp(Id::new("drawer_was_compact"), is_compact_w));
+        if entering_compact && self.info_drawer_open {
+            ctx.data_mut(|data| data.insert_temp(Id::new("narrow_drawer_open"), true));
+        }
         let narrow_drawer_open = ctx.data(|data| {
             data.get_temp::<bool>(Id::new("narrow_drawer_open"))
                 .unwrap_or(false)
         });
-        if !is_narrow_w && (narrow_chat_open || narrow_drawer_open) {
+        if !is_compact_w && (narrow_chat_open || narrow_drawer_open) {
             ctx.data_mut(|data| {
                 data.insert_temp(Id::new("narrow_chat_open"), false);
                 data.insert_temp(Id::new("narrow_drawer_open"), false);
@@ -564,8 +1160,7 @@ impl ZaloGuiApp {
                         && self
                             .threads
                             .get(self.selected_thread_index)
-                            .map(|t| t.name.contains("Cloud của tôi"))
-                            .unwrap_or(false);
+                            .is_some_and(|t| self.is_cloud_thread(t));
                     let (nav3_rect, nav3_resp) =
                         ui.allocate_exact_size(Vec2::new(42.0, 42.0), Sense::click());
                     if is_cloud_selected {
@@ -600,7 +1195,7 @@ impl ZaloGuiApp {
                             .threads
                             .iter()
                             .enumerate()
-                            .find(|(_, t)| t.name.contains("Cloud của tôi"))
+                            .find(|(_, t)| self.is_cloud_thread(t))
                         {
                             let cid = cthread.id.clone();
                             self.contacts_view_open = false;
@@ -1366,6 +1961,22 @@ impl ZaloGuiApp {
                     .collect();
 
                 self.sort_conversation_indices(&mut filtered_indices);
+                if self.settings.split_priority_inbox {
+                    let key=Id::new(("local_priority_inbox",&self.user_uin,self.account_runtime_id));
+                    let mut priority=ctx.data(|data|data.get_temp::<bool>(key)).unwrap_or(true);
+                    ui.horizontal_wrapped(|ui|{
+                        ui.selectable_value(&mut priority,true,"Ưu tiên (đã ghim)");
+                        ui.selectable_value(&mut priority,false,"Khác");
+                    });
+                    ctx.data_mut(|data|data.insert_temp(key,priority));
+                    filtered_indices.retain(|index|{
+                        let thread=&self.threads[*index];
+                        let pinned=self.server_pins.rank(&thread.id,thread.is_group).is_some()
+                            || self.conversation_preferences.get(&thread.id).is_some_and(|preference|preference.pinned);
+                        pinned==priority
+                    });
+                    if filtered_indices.is_empty() {ui.label("Không có hội thoại trong mục này.");}
+                }
 
                 // Also search message contents across all conversations when `query` is non-empty!
                 if query.len() >= 2
@@ -1381,6 +1992,8 @@ impl ZaloGuiApp {
                 let mut read_action = None;
                 let mut manual_mark_action = None;
                 let mut label_target: Option<(String, bool)> = None;
+                let mut invite_contact_target = None;
+                let mut report_target = None;
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut mention_target: Option<(String, String)> = None;
 
@@ -1394,6 +2007,10 @@ impl ZaloGuiApp {
                             let t = &self.threads[i];
                             let target_id = t.id.clone();
                             let target_group = t.is_group;
+                            let target_is_cloud = !self.own_cloud_id.is_empty() && target_id == self.own_cloud_id;
+                            let target_is_self = !target_group && target_id == self.user_uin;
+                            let can_offer_group_invite = !target_group && !target_is_cloud && !target_is_self
+                                && t.presentation.inbox.official_account != Some(true);
                             let target_marked_unread = t.unread.marked_unread;
                             let target_latest = t.messages.iter().max_by_key(|message| message.ts).cloned();
                             let is_selected = i == self.selected_thread_index;
@@ -1403,17 +2020,17 @@ impl ZaloGuiApp {
                                 .is_some_and(|p| p.pinned);
 
                             let row_width = (ui.available_width() - 8.0).max(44.0);
-                            let (row_rect, row_resp) = ui.allocate_exact_size(
-                                Vec2::new(row_width, row_height),
-                                Sense::click(),
-                            );
+                            let (row_rect, row_resp) = ui.push_id(("conversation-row", &target_id, target_group), |ui| {
+                                ui.allocate_exact_size(Vec2::new(row_width, row_height),
+                                    if modal_open { Sense::hover() } else { Sense::click() })
+                            }).inner;
                             let row_rect = row_rect.translate(Vec2::new(4.0, 0.0));
                             let preference = self
                                 .conversation_preferences
                                 .get(&t.id)
                                 .copied()
                                 .unwrap_or_default();
-                            row_resp.context_menu(|ui| {
+                            if !modal_open { row_resp.context_menu(|ui| {
                                 let remote_pinned=self.server_pins.rank(&target_id,target_group).is_some();
                                 if ui.button(crate::i18n::tr(if remote_pinned{"Bỏ ghim trên mọi thiết bị"}else{"Ghim trên mọi thiết bị"})).clicked(){
                                     if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::SetServerPin{owner:self.user_uin.clone(),thread:target_id.clone(),group:target_group,pinned:!remote_pinned});}
@@ -1492,13 +2109,21 @@ impl ZaloGuiApp {
                                     label_target = Some((target_id.clone(), target_group));
                                     ui.close_menu();
                                 }
+                                if can_offer_group_invite && ui.button("Thêm vào nhóm / cộng đồng…").clicked() {
+                                    invite_contact_target = Some(target_id.clone());
+                                    ui.close_menu();
+                                }
                                 ui.separator();
                                 if ui.button(crate::i18n::tr("Xóa cuộc trò chuyện…")).clicked(){clear_history_action=Some((target_id.clone(),true));ui.close_menu();}
                                 if ui.button(crate::i18n::tr("Xóa lịch sử trên máy này…")).clicked() {
                                     clear_history_action = Some((target_id.clone(),false));
                                     ui.close_menu();
                                 }
-                            });
+                                if !target_is_cloud && !target_is_self && ui.button("Báo xấu…").clicked() {
+                                    report_target = Some((target_id.clone(), target_group));
+                                    ui.close_menu();
+                                }
+                            }); }
 
                             if !ui.is_rect_visible(row_rect) {
                                 continue;
@@ -1667,7 +2292,7 @@ impl ZaloGuiApp {
                             } else {
                                 row_resp
                             };
-                            if row_resp.clicked() {
+                            if !modal_open && row_resp.clicked() {
                                 clicked_thread = Some((i, t.id.clone(), t.is_group));
                             }
                         }
@@ -1699,6 +2324,12 @@ impl ZaloGuiApp {
                 if let Some((target,group,action))=manual_mark_action {self.manual_mark_command(target,group,action);}
                 if let Some(target) = label_target {
                     self.open_labels(Some(target));
+                }
+                if let Some(contact) = invite_contact_target {
+                    self.open_invite_to_group_picker(contact);
+                }
+                if let Some((target, group)) = report_target {
+                    self.open_contact_report(target, group);
                 }
                 if let Some(id) = read_action {
                     if let Some(thread) = self.threads.iter_mut().find(|t| t.id == id) {
@@ -1838,7 +2469,7 @@ impl ZaloGuiApp {
             }
         }
 
-        if is_narrow_w && narrow_drawer_open {
+        if is_compact_w && narrow_drawer_open && !modal_open {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
                 let (shared_photos, shared_files, shared_links) = self
                     .threads
@@ -1948,7 +2579,10 @@ impl ZaloGuiApp {
                 if let Some((thread_id, thread_name, thread_avatar, is_group, _msg_count)) =
                     thread_meta
                 {
-                    let is_cloud_thread = thread_name.contains("Cloud của tôi");
+                    let is_cloud_thread = self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .is_some_and(|thread| self.is_cloud_thread(thread));
                     if !is_group
                         && !is_cloud_thread
                         && !self.friend_status_map.contains_key(&thread_id)
@@ -1976,8 +2610,10 @@ impl ZaloGuiApp {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 // Header Avatar (40x40) with Cutout Online Dot
-                                let (av_rect, _) =
-                                    ui.allocate_exact_size(Vec2::new(40.0, 40.0), Sense::hover());
+                                let (av_rect, av_response) = ui.allocate_exact_size(
+                                    Vec2::new(40.0, 40.0),
+                                    if is_group && !modal_open { Sense::click() } else { Sense::hover() },
+                                );
                                 paint_user_avatar(
                                     ui.painter(),
                                     av_rect.center(),
@@ -1988,6 +2624,9 @@ impl ZaloGuiApp {
                                     &self.sticker_textures,
                                     &mut self.loading_stickers,
                                 );
+                                if is_group && !modal_open && group_avatar_affordance(ui, av_response, pal) {
+                                    self.open_conversation_avatar_editor(&thread_id);
+                                }
                                 ui.add_space(6.0);
                                 // Reserve room for the right-hand action cluster so the name/tag
                                 // block can never be overlapped by the call buttons.
@@ -2001,7 +2640,7 @@ impl ZaloGuiApp {
                                         ui.spacing_mut().item_spacing.y = 2.0;
                                         ui.horizontal(|ui| {
                                             let name_max = if is_compact_w { 12 } else { 22 };
-                                            ui.add(
+                                            let name_response = ui.add(
                                                 egui::Label::new(
                                                     RichText::new(truncate_chars(
                                                         &thread_name,
@@ -2013,6 +2652,27 @@ impl ZaloGuiApp {
                                                 )
                                                 .truncate(),
                                             );
+                                            if !is_cloud_thread && thread_id != self.user_uin
+                                                && name_edit_affordance(ui, name_response.hovered(), !modal_open, is_group, pal)
+                                            {
+                                                self.open_conversation_name_editor(&thread_id, &thread_name, is_group);
+                                            }
+                                            let label_identity = crate::server_pins::identity(&thread_id, is_group).ok();
+                                            let active_label = label_identity.as_deref().and_then(|identity| {
+                                                self.labels_panel.snapshot.as_ref().and_then(|snapshot| {
+                                                    snapshot.labels.iter().find(|label| label.contains(identity))
+                                                })
+                                            });
+                                            let label_text = active_label
+                                                .map(|label| format!("{} {}", "Phân loại", label.text))
+                                                .unwrap_or_else(|| "Phân loại".to_owned());
+                                            if ui
+                                                .small_button(label_text)
+                                                .on_hover_text(crate::i18n::tr("Mở phân loại hội thoại"))
+                                                .clicked()
+                                            {
+                                                self.open_labels(Some((thread_id.clone(), is_group)));
+                                            }
                                             if !is_compact_w && left_info_w > 170.0 {
                                                 let (tag_lbl, tag_fg, tag_bg) =
                                                     if is_cloud_thread {
@@ -2022,7 +2682,10 @@ impl ZaloGuiApp {
                                                             pal.primary.linear_multiply(0.14),
                                                         )
                                                     } else if is_group {
-                                                        ("Nhóm", pal.text_secondary, pal.bg_elevated)
+                                                        (self.threads.iter().find(|thread| thread.id == thread_id && thread.is_group)
+                                                            .and_then(|thread| thread.presentation.group_kind)
+                                                            .map(crate::chat::GroupKind::label).unwrap_or("Hội thoại nhóm"),
+                                                        pal.text_secondary, pal.bg_elevated)
                                                     } else {
                                                         match cur_friendship {
                                                             crate::chat::FriendshipStatus::Friend => (
@@ -2102,9 +2765,9 @@ impl ZaloGuiApp {
                                 );
 
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    // Info Drawer Toggle Button (hidden on compact widths: auto-collapsed)
-                                    if !is_compact_w || is_narrow_w {
-                                        let drawer_open = if is_narrow_w {
+                                    // Compact layouts use an overlay without shrinking the chat.
+                                    {
+                                        let drawer_open = if is_compact_w {
                                             narrow_drawer_open
                                         } else {
                                             self.info_drawer_open
@@ -2141,7 +2804,7 @@ impl ZaloGuiApp {
                                             .on_hover_text(crate::i18n::tr("Thông tin hội thoại"))
                                             .clicked()
                                         {
-                                            if is_narrow_w {
+                                            if is_compact_w {
                                                 ctx.data_mut(|data| {
                                                     data.insert_temp(
                                                         Id::new("narrow_drawer_open"),
@@ -2549,81 +3212,6 @@ impl ZaloGuiApp {
                                 });
                             });
                     }
-                    // 1b. Pinned Message Banner (if any message is pinned in this thread)
-                    let pinned_msg_info = self
-                        .threads
-                        .get(self.selected_thread_index)
-                        .and_then(|t| {
-                            t.messages
-                                .iter()
-                                .enumerate()
-                                .find(|(_, m)| m.is_pinned)
-                                .map(|(idx, m)| {
-                                    (
-                                        idx,
-                                        if m.is_outgoing {
-                                            "Tôi".to_string()
-                                        } else {
-                                            self.resolve_message_sender_name(
-                                                m,
-                                                &t.id,
-                                                t.is_group,
-                                                &thread_name,
-                                            )
-                                            .to_owned()
-                                        },
-                                        if m.sticker_id.is_some() {
-                                            "[Nhãn dán]".to_string()
-                                        } else {
-                                            truncate_chars(&m.text, 80).into_owned()
-                                        },
-                                    )
-                                })
-                        });
-
-                    let mut unpin_idx: Option<usize> = None;
-                    if let Some((pidx, psender, ptext)) = pinned_msg_info {
-                        egui::Frame::none()
-                            .fill(pal.bg_elevated)
-                            .stroke(Stroke::new(1.0_f32, pal.primary.linear_multiply(0.4)))
-                            .inner_margin(Margin::symmetric(14.0, 7.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new(format!("{} Tin ghim:", lucide::PIN))
-                                            .size(12.5)
-                                            .color(pal.primary)
-                                            .strong(),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!("{psender}: {ptext}"))
-                                            .size(12.5)
-                                            .color(pal.text_primary),
-                                    );
-                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                        if ui
-                                            .small_button(format!("Bỏ ghim {}", lucide::X))
-                                            .on_hover_cursor(CursorIcon::PointingHand)
-                                            .clicked()
-                                        {
-                                            unpin_idx = Some(pidx);
-                                        }
-                                    });
-                                });
-                            });
-                    }
-                    if let Some(uidx) = unpin_idx {
-                        if let Some(real) = self
-                            .threads
-                            .get_mut(self.selected_thread_index)
-                            .and_then(|t| t.messages.get_mut(uidx))
-                        {
-                            real.is_pinned = false;
-                        }
-                        self.persist_threads_async();
-                        self.status_msg = "Đã bỏ ghim tin nhắn".into();
-                    }
-
                     // 1c. Starred filter active banner
                     if self.filter_starred_only {
                         egui::Frame::none()
@@ -2651,38 +3239,37 @@ impl ZaloGuiApp {
                             });
                     }
 
-                    // 1b. Pinned Messages Banner (Checks local pinned messages and server board)
-                    let (latest_pin_id, preview_text, total_pins) = {
-                        let pinned_messages: Vec<&ChatMessage> = self
-                            .threads
-                            .get(self.selected_thread_index)
-                            .map(|t| t.messages.iter().filter(|m| m.is_pinned).collect())
-                            .unwrap_or_default();
-                        let server_pins_count = if self.server_board.thread == thread_id && self.server_board.pins {
-                            self.server_board.page.items.len()
+                    // Message pins use their own thread/generation-scoped server snapshot.
+                    if self.message_pins.thread != thread_id {
+                        self.refresh_message_pins(&thread_id, is_group);
+                    }
+                    let (latest_pin_id, preview_text, total_pins, pin_count_label) = {
+                        let page = (self.message_pins.thread == thread_id)
+                            .then_some(self.message_pins.page.as_ref()).flatten();
+                        if let Some(page) = page {
+                            let latest_server = page.items.first();
+                            let latest_pin_id = latest_server
+                                .map(|item| item.message_id.clone())
+                                .filter(|id| !id.is_empty());
+                            let preview_text = latest_server
+                                .map(|item| truncate_chars(&item.title, 50).into_owned())
+                                .unwrap_or_else(|| "[Tin nhắn đã ghim]".to_string());
+                            let total_pins = page.items.len();
+                            let suffix = if page.next.is_some() { "+" } else { "" };
+                            let count_label = format!("Danh sách {total_pins}{suffix} ghim ▾");
+                            (latest_pin_id, preview_text, total_pins, count_label)
                         } else {
-                            0
-                        };
-                        let total_pins = pinned_messages.len().max(server_pins_count);
-                        let latest_pin = pinned_messages.last().copied();
-                        let latest_pin_id = latest_pin.map(|p| p.id.clone());
-                        let preview_text = if let Some(p) = latest_pin {
-                            if p.text.trim().is_empty() {
-                                if p.sticker_id.is_some() {
-                                    "[Nhãn dán]".to_string()
-                                } else {
-                                    "[Hình ảnh / Tệp đính kèm]".to_string()
-                                }
-                            } else {
-                                truncate_chars(&p.text, 50).into_owned()
-                            }
-                        } else if let Some(first_server) = self.server_board.page.items.first() {
-                            truncate_chars(&first_server.title, 50).into_owned()
-                        } else {
-                            "[Tin nhắn đã ghim]".to_string()
-                        };
-                        (latest_pin_id, preview_text, total_pins)
+                            (None, "[Tin nhắn đã ghim]".to_string(), 0, String::new())
+                        }
                     };
+                    if self.message_pins.thread == thread_id && self.message_pins.pending {
+                        ui.horizontal(|ui| { ui.spinner(); ui.label("Đang tải tin ghim…"); });
+                    } else if self.message_pins.thread == thread_id && !self.message_pins.error.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("Chưa tải được tin ghim").on_hover_text(&self.message_pins.error);
+                            if ui.small_button("Tải lại").clicked() { self.refresh_message_pins(&thread_id, is_group); }
+                        });
+                    }
                     if total_pins > 0 {
                         egui::Frame::none()
                             .fill(pal.bg_elevated)
@@ -2717,19 +3304,14 @@ impl ZaloGuiApp {
                                     {
                                         if let Some(pin_id) = &latest_pin_id {
                                             self.filter_starred_only = false;
-                                            self.quote_jump = Some(QuoteJump {
-                                                thread_id: thread_id.clone(),
-                                                reference: pin_id.clone(),
-                                                highlight_until: std::time::Instant::now() + std::time::Duration::from_secs(3),
-                                                scroll_pending: true,
-                                            });
+                                            self.tools_command(super::tools_panel::ToolsCommand::OpenHit { thread: thread_id.clone(), id: pin_id.clone() });
                                             ctx.request_repaint();
                                         }
                                     }
 
                                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                         let list_btn = egui::Button::new(
-                                            RichText::new(format!("Danh sách {} ghim ▾", total_pins))
+                                            RichText::new(&pin_count_label)
                                                 .size(11.5)
                                                 .color(pal.primary_hover),
                                         )
@@ -2742,7 +3324,7 @@ impl ZaloGuiApp {
                                             .on_hover_text(crate::i18n::tr("Xem toàn bộ tin nhắn đã ghim & nhắc hẹn"))
                                             .clicked()
                                         {
-                                            self.open_server_board(thread_id.clone(), is_group, String::new());
+                                            self.open_message_pins(thread_id.clone(), is_group);
                                         }
                                     });
                                 });
@@ -2750,15 +3332,17 @@ impl ZaloGuiApp {
                     }
 
                     // 2. Scrollable Messages Area
+                    let composer_format_key = Id::new(("composer_format", &self.user_uin, self.account_runtime_id, &thread_id, is_group));
+                    let mut composer_format = ctx.data(|data| data.get_temp::<crate::rich_text::ComposerFormat>(composer_format_key)).unwrap_or_default();
                     let contextual_stickers = if self.attachment_drafts.len(&thread_id)>0 {Vec::new()} else {self.resolve_contextual_sticker_suggestions(ctx)};
                     let composer_link_preview =
-                        self.resolve_composer_link_preview(ctx, &thread_id);
+                        self.resolve_composer_link_preview(ctx, &thread_id, is_group);
                     // Do NOT subtract `contextual_stickers` height from `picker_reserve`!
                     // The sticker strip is a true floating overlay (`egui::Area`) above the composer bar
                     // (matching Zalo PC's `PopoverIdentitiesDefine.STICKER_SUGGESTION`), so the message scroll
                     // area and composer input box never shift or lose IME focus while typing.
                     let attachment_count = self.attachment_drafts.len(&thread_id);
-                    let picker_reserve = (if attachment_count > 0 {152.0} else {0.0}) + (if self.sticker_picker_open { 268.0 } else { 0.0 })
+                    let picker_reserve = (if attachment_count > 0 {152.0} else {0.0})
                         + (if self.replying_to.is_some() { 48.0 } else { 0.0 })
                         + (if self.pending_clipboard_image.is_some() {
                             64.0
@@ -2839,6 +3423,21 @@ impl ZaloGuiApp {
 
                     let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
                     let content_protected=self.content_protected(&thread_id,is_group);
+                    if self.settings.use_avatar_as_wallpaper {
+                        if let Some(url) = thread_avatar.as_deref().map(str::trim).filter(|url| !url.is_empty()) {
+                            let key = format!("ava_{}",crate::crypto::md5_hex(url));
+                            if let Some(texture) = self.sticker_textures.get(&key) {
+                                let canvas = Rect::from_min_size(ui.cursor().min,Vec2::new(ui.available_width(),msg_area_height));
+                                ui.painter().image(texture.id(),canvas,Rect::from_min_max(Pos2::ZERO,Pos2::new(1.0,1.0)),Color32::WHITE.linear_multiply(0.12));
+                            } else if self.loading_stickers.insert(key.clone()) {
+                                if let Some(tx)=WORKER_TX.get() {
+                                    if tx.send(WorkerCmd::FetchStickerImage {key:key.clone(),url:url.to_owned()}).is_err() {
+                                        self.loading_stickers.remove(&key);
+                                    }
+                                } else {self.loading_stickers.remove(&key);}
+                            }
+                        }
+                    }
                     if modal_open {
                         ctx.data_mut(|d| {
                             d.remove::<(String, i64, egui::Rect)>(Id::new(("hover_message", &thread_id)));
@@ -3223,7 +3822,8 @@ impl ZaloGuiApp {
                     self.chat_anchor=if away_from_bottom {
                         if restore&&anchor_delta.is_some(){previous_anchor}else{next_anchor.map(|(id,offset)|(thread_id.clone(),id,offset))}
                     }else{None};
-                    if self.batch_selection_mode {
+                    if self.batch_selection_mode && !self.timeline_selection_matches(&thread_id,is_group) {self.clear_timeline_selection();}
+                    if self.batch_selection_mode && !modal_open {
                         egui::Area::new(Id::new(("batch_action_bar", &thread_id)))
                             .order(egui::Order::Foreground)
                             .fixed_pos(message_scroll.inner_rect.left_bottom() + Vec2::new(16.0, -44.0))
@@ -3239,7 +3839,7 @@ impl ZaloGuiApp {
                                             ui.separator();
                                             let can_act = !self.selected_msg_ids.is_empty();
                                             if ui.add_enabled(can_act, egui::Button::new(crate::i18n::tr("Chuyển tiếp"))).clicked() {
-                                                self.batch_forward_modal_open = true;
+                                                self.share_timeline_selection(&thread_id,is_group);
                                             }
                                             let all_outgoing = if let Some(t) = self.threads.get(self.selected_thread_index) {
                                                 t.messages.iter()
@@ -3247,19 +3847,12 @@ impl ZaloGuiApp {
                                                     .all(|m| m.is_outgoing && m.text.trim() != "[Tin nhắn đã thu hồi]")
                                             } else { false };
                                             if ui.add_enabled(can_act && all_outgoing, egui::Button::new(crate::i18n::tr("Thu hồi cho mọi người"))).clicked() {
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    if let Some(t) = self.threads.get(self.selected_thread_index) {
-                                                        let to_recall: Vec<ChatMessage> = t.messages.iter()
-                                                            .filter(|m| self.selected_msg_ids.contains(&m.id))
-                                                            .cloned()
-                                                            .collect();
-                                                        let _ = tx.send(WorkerCmd::BatchRecall {
-                                                            to_id: thread_id.clone(),
-                                                            is_group,
-                                                            messages: to_recall,
-                                                        });
-                                                    }
-                                                }
+                                                let selected: Vec<_> = self.threads.get(self.selected_thread_index).into_iter().flat_map(|t| &t.messages).filter(|m| self.selected_msg_ids.contains(&m.id)).cloned().collect();
+                                                self.confirm_archive_mutation(&thread_id, is_group, true, &selected);
+                                            }
+                                            if ui.add_enabled(can_act, egui::Button::new("Xóa phía tôi…")).clicked() {
+                                                let selected: Vec<_> = self.threads.get(self.selected_thread_index).into_iter().flat_map(|t| &t.messages).filter(|m| self.selected_msg_ids.contains(&m.id)).cloned().collect();
+                                                self.confirm_archive_mutation(&thread_id, is_group, false, &selected);
                                             }
                                             if ui.button(crate::i18n::tr("Hủy")).clicked() {
                                                 self.batch_selection_mode = false;
@@ -3482,30 +4075,25 @@ impl ZaloGuiApp {
                                         });
                                     }
                                 }
+                                BubbleAction::Details => {
+                                    self.message_details = Some((thread_id.clone(), m));
+                                }
+                                BubbleAction::SaveToDocuments => {
+                                    self.save_archive_to_documents(&thread_id, is_group, vec![m]);
+                                }
                                 BubbleAction::DeleteForMe => {
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::DeleteForMe {
-                                            to_id: thread_id.clone(),
-                                            is_group,
-                                            msg: m,
-                                        });
-                                    }
+                                    self.confirm_archive_mutation(&thread_id, is_group, false, &[m]);
                                 }
                                 BubbleAction::RecallForEveryone => {
-                                    if let Some(tx) = WORKER_TX.get() {
-                                        let _ = tx.send(WorkerCmd::RecallMessage {
-                                            to_id: thread_id.clone(),
-                                            is_group,
-                                            msg: m,
-                                        });
-                                    }
+                                    self.confirm_archive_mutation(&thread_id, is_group, true, &[m]);
                                 }
                                 BubbleAction::EnterSelectionMode => {
-                                    self.batch_selection_mode = true;
+                                    self.bind_timeline_selection(&thread_id,is_group);
                                     self.selected_msg_ids.clear();
                                     self.selected_msg_ids.insert(m.id.clone());
                                 }
                                 BubbleAction::ToggleSelect(id) => {
+                                    self.bind_timeline_selection(&thread_id,is_group);
                                     if self.selected_msg_ids.contains(&id) {
                                         self.selected_msg_ids.remove(&id);
                                     } else {
@@ -3611,7 +4199,8 @@ impl ZaloGuiApp {
                         }
                     }
 
-                    if let Some(who) = self.typing_label(&thread_id, is_group) {
+                    if let Some(who) = self.settings.show_typing_indicator
+                        .then(|| self.typing_label(&thread_id, is_group)).flatten() {
                         ui.horizontal(|ui| {
                             ui.add_space(16.0);
                             ui.label(
@@ -3623,9 +4212,25 @@ impl ZaloGuiApp {
                         });
                     }
 
-                    // 3. Optional Sticker Picker Drawer
-                    if self.sticker_picker_open {
-                        self.render_sticker_picker(ui, &thread_id, is_group, pal);
+                    // The picker floats above its trigger without shrinking the timeline.
+                    if self.sticker_picker_open && !modal_open {
+                        let anchor = ctx.data(|data| data.get_temp::<Rect>(Id::new(("composer_picker_anchor", &thread_id))));
+                        if let Some(anchor) = anchor {
+                            egui::Area::new(Id::new(("composer_unified_picker", &thread_id)))
+                                .order(egui::Order::Foreground)
+                                .pivot(egui::Align2::RIGHT_BOTTOM)
+                                .fixed_pos(anchor.right_top() - Vec2::new(0.0, 4.0))
+                                .constrain_to(ctx.screen_rect())
+                                .show(ctx, |ui| {
+                                    ui.set_width((ctx.screen_rect().width() - 24.0).clamp(160.0, 460.0));
+                                    ui.add_enabled_ui(group_send_allowed, |ui| {
+                                        self.render_sticker_picker(ui, &thread_id, is_group, pal);
+                                    });
+                                });
+                        }
+                        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, Key::Escape)) {
+                            self.sticker_picker_open = false;
+                        }
                     }
 
                     // 3b. Reply banner (quoted message preview above the composer)
@@ -3846,6 +4451,9 @@ impl ZaloGuiApp {
                                     Vec2::new(32.0, 32.0),
                                     Sense::click(),
                                 );
+                                if stk_resp.hovered() || !self.sticker_picker_open {
+                                    ctx.data_mut(|data| data.insert_temp(Id::new(("composer_picker_anchor", &thread_id)), stk_rect));
+                                }
                                 if self.sticker_picker_open || stk_resp.hovered() {
                                     ui.painter().rect_filled(
                                         stk_rect,
@@ -3898,22 +4506,12 @@ impl ZaloGuiApp {
                                     .on_hover_text(crate::i18n::tr("Gửi hình ảnh"))
                                     .clicked()
                                 {
-                                    if !self.composer_mentions.mentions.is_empty() {
+                                    if self.composer_has_metadata(ctx,&thread_id,is_group) {
+                                        self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho ảnh; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();
+                                    } else if !self.composer_mentions.mentions.is_empty() {
                                         self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();
                                     } else {
-                                        let cap = self.input_message.trim().to_string();
-                                        self.input_message.clear();
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                to_id: thread_id.clone(),
-                                                is_group,
-                                                images_only: true,
-                                                caption: cap,
-                                                preset_path: None,
-                                                photo_original: self.settings.send_photo_original,
-                                                ephemeral: false,
-                                            });
-                                        }
+                                        self.request_attachment_picker(&thread_id,is_group,true);
                                     }
                                 }
 
@@ -3944,22 +4542,12 @@ impl ZaloGuiApp {
                                     .on_hover_text(crate::i18n::tr("Đính kèm File / Video"))
                                     .clicked()
                                 {
-                                    if !self.composer_mentions.mentions.is_empty() {
+                                    if self.composer_has_metadata(ctx,&thread_id,is_group) {
+                                        self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho tệp; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();
+                                    } else if !self.composer_mentions.mentions.is_empty() {
                                         self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();
                                     } else {
-                                        let cap = self.input_message.trim().to_string();
-                                        self.input_message.clear();
-                                        if let Some(tx) = WORKER_TX.get() {
-                                            let _ = tx.send(WorkerCmd::PickAndSendAttachment {
-                                                to_id: thread_id.clone(),
-                                                is_group,
-                                                images_only: false,
-                                                caption: cap,
-                                                preset_path: None,
-                                                photo_original: self.settings.send_photo_original,
-                                                ephemeral: false,
-                                            });
-                                        }
+                                        self.request_attachment_picker(&thread_id,is_group,false);
                                     }
                                 }
 
@@ -4050,7 +4638,7 @@ impl ZaloGuiApp {
                                     .on_hover_text(crate::i18n::tr("Hẹn giờ gửi tin nhắn"))
                                     .clicked()
                                 {
-                                    self.open_quick_schedule();
+                                    self.open_quick_schedule(ctx);
                                 }
 
                                 // 7. Quick Message Button
@@ -4080,6 +4668,7 @@ impl ZaloGuiApp {
                                     .on_hover_cursor(CursorIcon::PointingHand)
                                     .on_hover_text(crate::i18n::tr("Tin nhắn nhanh…"))
                                     .clicked()
+                                    && self.settings.quick_messages_enabled
                                 {
                                     self.tools.open = true;
                                     self.tools.tab = 6;
@@ -4124,24 +4713,31 @@ impl ZaloGuiApp {
                                 )
                             }) {
                                 self.composer_format_mode = !self.composer_format_mode;
+                                if !self.composer_format_mode {
+                                    composer_format = Default::default();
+                                    ctx.data_mut(|data|data.insert_temp(composer_format_key,composer_format.clone()));
+                                }
                             }
-                            if self.composer_format_mode {
+                            if self.composer_format_mode || composer_format.urgency.is_some() {
                                 ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Định dạng").strong().color(pal.text_primary));
-                                    ui.label(
-                                        RichText::new("B I ̶S̶").color(pal.text_secondary),
-                                    )
-                                    .on_hover_text(crate::i18n::tr(
-                                        "Chế độ định dạng đang bật; kiểu chữ được giữ ở lớp soạn thảo",
-                                    ));
+                                    ui.label(RichText::new("Toàn bộ tin nhắn").color(pal.text_secondary));
+                                    for (flag, label) in [(&mut composer_format.bold, "B"), (&mut composer_format.italic, "I"),
+                                        (&mut composer_format.underline, "U"), (&mut composer_format.strike, "S̶")] {
+                                        if ui.selectable_label(*flag, label).clicked() {*flag = !*flag;}
+                                    }
+                                    if let Some(urgency) = composer_format.urgency {
+                                        ui.label(match urgency {crate::rich_text::Urgency::Important=>"Quan trọng",crate::rich_text::Urgency::Urgent=>"Khẩn cấp"});
+                                    }
                                     if ui
                                         .small_button(crate::i18n::tr("Tắt"))
                                         .on_hover_text(crate::i18n::tr("Tắt chế độ định dạng (Ctrl+Shift+X)"))
                                         .clicked()
                                     {
                                         self.composer_format_mode = false;
+                                        composer_format = Default::default();
                                     }
                                 });
+                                ctx.data_mut(|data| data.insert_temp(composer_format_key, composer_format.clone()));
                             }
 
                             // Tier 2: Multiline Editor Area (Spacious input + Emoji + Send/Like button)
@@ -4359,6 +4955,9 @@ impl ZaloGuiApp {
                                             Vec2::new(32.0, 34.0),
                                             Sense::click(),
                                         );
+                                        if emo_resp.hovered() || !self.sticker_picker_open {
+                                            ctx.data_mut(|data| data.insert_temp(Id::new(("composer_picker_anchor", &thread_id)), emo_rect));
+                                        }
                                         if self.sticker_picker_open || emo_resp.hovered() {
                                             ui.painter().rect_filled(
                                                 emo_rect,
@@ -4464,13 +5063,29 @@ impl ZaloGuiApp {
 
 
                                         send_resp.context_menu(|ui|{
+                                            if ui.button(crate::i18n::tr("Định dạng văn bản (Ctrl+Shift+X)")).clicked() {
+                                                self.composer_format_mode = true;
+                                                ui.close_menu();
+                                            }
+                                            for (mode,label) in [(Some(crate::rich_text::Urgency::Important),"Đánh dấu Quan trọng"),
+                                                (Some(crate::rich_text::Urgency::Urgent),"Đánh dấu Khẩn cấp"),(None,"Gửi bình thường")] {
+                                                if ui.selectable_label(composer_format.urgency == mode,label).clicked() {
+                                                    composer_format.urgency = mode;
+                                                    ctx.data_mut(|data|data.insert_temp(composer_format_key,composer_format.clone()));
+                                                    ui.close_menu();
+                                                }
+                                            }
                                             if ui.button(crate::i18n::tr("Nhãn dán…")).clicked(){self.sticker_picker_open = !self.sticker_picker_open;ui.close_menu();}
+                                            if ui.button(crate::i18n::tr("Tạo nhắc hẹn…")).clicked() {
+                                                self.open_server_board(thread_id.clone(), is_group, self.input_message.clone());
+                                                ui.close_menu();
+                                            }
                                             if ui.button(crate::i18n::tr("Gửi danh thiếp…")).clicked() {
                                                 self.send_contact_modal_open = true;
                                                 self.send_contact_query.clear();
                                                 ui.close_menu();
                                             }
-                                            if ui.button(crate::i18n::tr("Tin nhắn nhanh…")).clicked() {
+                                            if ui.add_enabled(self.settings.quick_messages_enabled, egui::Button::new(crate::i18n::tr("Tin nhắn nhanh…"))).clicked() {
                                                 self.tools.open = true;
                                                 self.tools.tab = 6;
                                                 ui.close_menu();
@@ -4482,12 +5097,13 @@ impl ZaloGuiApp {
                                             }
                                             for (images_only,label) in [(true,"Gửi ảnh…"),(false,"Gửi tệp…")] {
                                                 if ui.button(label).clicked(){
-                                                    if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
-                                                    else if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::PickAndSendAttachment{to_id:thread_id.clone(),is_group,images_only,caption:self.input_message.trim().to_owned(),preset_path:None,photo_original:self.settings.send_photo_original,ephemeral:false});}
+                                                    if self.composer_has_metadata(ctx,&thread_id,is_group) {self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho tệp; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();}
+                                                    else if !self.composer_mentions.mentions.is_empty() {self.status_msg="Hãy gửi mention bằng tin nhắn riêng trước khi gửi tệp".into();}
+                                                    else {self.request_attachment_picker(&thread_id,is_group,images_only);}
                                                     ui.close_menu();
                                                 }
                                             }
-                                            if ui.button(crate::i18n::tr("Hẹn giờ gửi…")).clicked(){self.open_quick_schedule();ui.close_menu();}
+                                            if ui.button(crate::i18n::tr("Hẹn giờ gửi…")).clicked(){self.open_quick_schedule(ctx);ui.close_menu();}
                                             if ui.button(crate::i18n::tr("Quản lý lịch gửi")).clicked(){self.tools.open=true;self.tools.tab=3;ui.close_menu();}
                                         });
                                         let send_resp = if can_send {
@@ -4499,8 +5115,13 @@ impl ZaloGuiApp {
                                             .on_hover_cursor(CursorIcon::PointingHand)
                                             .clicked();
 
-                                        if (send_clicked || enter_pressed) && is_voice_active {
-                                            self.send_voice_recording(&thread_id, is_group);
+                                        let unsupported_metadata = self.composer_has_metadata(ctx,&thread_id,is_group)
+                                            && (is_voice_active || self.attachment_drafts.len(&thread_id)>0
+                                                || self.pending_clipboard_image.is_some() || send_selected_sticker.is_some());
+                                        if ((send_clicked || enter_pressed) || send_selected_sticker.is_some()) && unsupported_metadata {
+                                            self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho ảnh, tệp, giọng nói hay nhãn dán; hãy tắt chúng hoặc gửi văn bản riêng. Nội dung vẫn được giữ.".into();
+                                        } else if (send_clicked || enter_pressed) && is_voice_active {
+                                            self.send_voice_recording(ctx,&thread_id, is_group);
                                             response.request_focus();
                                         } else if (send_clicked || enter_pressed) && self.attachment_drafts.len(&thread_id) > 0 {
                                             self.send_attachment_draft(ctx,&thread_id,is_group);
@@ -4528,31 +5149,20 @@ impl ZaloGuiApp {
                                         } else if (send_clicked || enter_pressed)
                                             && self.pending_clipboard_image.is_some()
                                         {
-                                            if let Some((clip_path, _, _, _)) =
-                                                self.pending_clipboard_image.take()
-                                            {
-                                                let cap =
-                                                    self.input_message.trim().to_string();
-                                                self.input_message.clear();
-                                                self.dismissed_sticker_suggest_for.clear();
-                                                self.composer_sticker_selected = None;
+                                            if let Some((clip_path, _, _, _)) = self.pending_clipboard_image.as_ref() {
+                                                let queued=WORKER_TX.get().is_some_and(|tx|tx.send(WorkerCmd::PickAndSendAttachment {
+                                                    to_id:thread_id.clone(),is_group,images_only:true,
+                                                    caption:self.input_message.trim().to_owned(),preset_path:Some(clip_path.clone()),
+                                                    photo_original:self.settings.send_photo_original,ephemeral:true,
+                                                }).is_ok());
+                                                if queued {
+                                                    self.pending_clipboard_image=None;
+                                                    self.dismissed_sticker_suggest_for.clear();self.composer_sticker_selected=None;
+                                                } else {self.status_msg="Không gửi được ảnh; ảnh và nội dung soạn thảo vẫn được giữ.".into();}
                                                 response.request_focus();
-                                                if let Some(tx) = WORKER_TX.get() {
-                                                    let _ = tx.send(
-                                                        WorkerCmd::PickAndSendAttachment {
-                                                            to_id: thread_id.clone(),
-                                                            is_group,
-                                                            images_only: true,
-                                                            caption: cap,
-                                                            preset_path: Some(clip_path),
-                                                            photo_original: self.settings.send_photo_original,
-                                                            ephemeral: true,
-                                                        },
-                                                    );
-                                                }
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
-                                            if self.input_message.starts_with('/') {
+                                            if self.settings.quick_messages_enabled && self.input_message.starts_with('/') {
                                                 if let Some(expanded) = self.tools.config.quick_messages.expand(&self.input_message) {
                                                     self.input_message = expanded.to_string();
                                                 }
@@ -4560,29 +5170,41 @@ impl ZaloGuiApp {
                                             self.composer_mentions.edit(&self.input_message);
                                             let draft = self.composer_mentions.trimmed();
                                             let text = draft.text.clone();
-                                            self.input_message.clear();
-                                            self.composer_mentions.clear();
-                                            self.dismissed_sticker_suggest_for.clear();
-                                            self.composer_sticker_selected = None;
                                             response.request_focus();
-                                            let quoted = self.replying_to.take();
+                                            let quoted = self.replying_to.clone();
+                                            let options = composer_format.options(&text);
                                             if let Some(tx) = WORKER_TX.get() {
-                                                if is_group && !draft.mentions.is_empty() {
-                                                    let _ = tx.send(WorkerCmd::SendMentioned {to_id: thread_id.clone(), draft, quoted});
+                                                let command = if !options.styles.is_empty() || options.urgency.is_some() {
+                                                    WorkerCmd::SendFormatted {to_id:thread_id.clone(), text, is_group,
+                                                        options, mentions:draft.mentions, quoted}
+                                                } else if is_group && !draft.mentions.is_empty() {
+                                                    WorkerCmd::SendMentioned {to_id: thread_id.clone(), draft, quoted}
                                                 } else if let Some(quoted) = quoted {
-                                                    let _ = tx.send(WorkerCmd::SendQuote {
+                                                    WorkerCmd::SendQuote {
                                                         to_id: thread_id.clone(),
                                                         text,
                                                         quoted,
                                                         is_group,
-                                                    });
+                                                    }
                                                 } else {
-                                                    let _ = tx.send(WorkerCmd::SendMessage {
+                                                    WorkerCmd::SendMessage {
                                                         to_id: thread_id.clone(),
                                                         text,
                                                         is_group,
-                                                    });
+                                                    }
+                                                };
+                                                if tx.send(command).is_ok() {
+                                                    self.input_message.clear();
+                                                    self.composer_mentions.clear();
+                                                    self.replying_to = None;
+                                                    self.dismissed_sticker_suggest_for.clear();
+                                                    self.composer_sticker_selected = None;
+                                                    ctx.data_mut(|data|data.remove::<crate::rich_text::ComposerFormat>(composer_format_key));
+                                                } else {
+                                                    self.status_msg = "Không thể gửi; nội dung vẫn được giữ trong ô soạn thảo".into();
                                                 }
+                                            } else {
+                                                self.status_msg = "Chưa kết nối bộ xử lý; nội dung vẫn được giữ".into();
                                             }
                                         } else if send_clicked && !can_send {
                                             // Send Zalo PC Like "👍" via WorkerCmd::SendMessage
@@ -4656,6 +5278,7 @@ impl ZaloGuiApp {
         if self.selected_thread_index != idx
             || self.threads.get(self.selected_thread_index).map(|t| &t.id) != Some(&tid)
         {
+            self.clear_timeline_selection();
             self.replying_to = None;
             self.filter_starred_only = false;
             self.drawer_view = DrawerView::Overview;
@@ -4665,6 +5288,12 @@ impl ZaloGuiApp {
             self.drawer_media_from.clear();
             self.drawer_media_to.clear();
             self.drawer_media_type = None;
+            self.archive_history = Default::default();
+            self.archive_mutation_confirm = None;
+            self.drawer_media_filter_key.clear();
+            self.drawer_media_thread_id = tid.clone();
+            self.drawer_media_active_tab = MediaTab::Photos;
+            self.drawer_media_limit = 100;
             self.drawer_media_selection_mode = false;
             self.drawer_media_selected.clear();
             self.group_member_search.clear();
@@ -4672,6 +5301,7 @@ impl ZaloGuiApp {
             self.common_groups_expanded = false;
         }
         self.selected_thread_index = idx;
+        self.refresh_message_pins(&tid, is_group);
         if is_group {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::FetchGroupPolicy {
@@ -4714,8 +5344,7 @@ impl ZaloGuiApp {
         let is_cloud = self
             .threads
             .get(idx)
-            .map(|t| t.name.contains("Cloud của tôi"))
-            .unwrap_or(false);
+            .is_some_and(|t| self.is_cloud_thread(t));
         if is_group || is_cloud {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::LoadGroupHistory {
@@ -4801,7 +5430,6 @@ impl ZaloGuiApp {
         self.render_downloads(ctx);
         self.render_quick_schedule(ctx, pal);
         self.render_send_contact_modal(ctx, pal);
-        self.render_batch_forward_modal(ctx, pal);
     }
 
     fn render_send_contact_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
@@ -4891,69 +5519,6 @@ impl ZaloGuiApp {
             }
         }
     }
-
-    fn render_batch_forward_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
-        if !self.batch_forward_modal_open {
-            return;
-        }
-        let mut open = self.batch_forward_modal_open;
-        let mut chosen_target = None;
-        let mut close_modal = false;
-        egui::Window::new("Chuyển tiếp tin nhắn")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(320.0)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "Chuyển tiếp {} tin nhắn đã chọn đến:",
-                        self.selected_msg_ids.len()
-                    ))
-                    .color(pal.text_primary),
-                );
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        for t in &self.threads {
-                            if ui.button(&t.name).clicked() {
-                                chosen_target = Some((t.id.clone(), t.is_group));
-                            }
-                            ui.add_space(2.0);
-                        }
-                    });
-                ui.separator();
-                if ui.button("Hủy").clicked() {
-                    close_modal = true;
-                }
-            });
-        if close_modal {
-            open = false;
-        }
-        self.batch_forward_modal_open = open;
-        if let Some((target_id, is_group)) = chosen_target {
-            self.batch_forward_modal_open = false;
-            if let Some(t) = self.threads.get(self.selected_thread_index) {
-                let selected: Vec<ChatMessage> = t
-                    .messages
-                    .iter()
-                    .filter(|m| self.selected_msg_ids.contains(&m.id))
-                    .cloned()
-                    .collect();
-                if !selected.is_empty() {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::BatchForward {
-                            to_id: target_id,
-                            is_group,
-                            messages: selected,
-                        });
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4970,6 +5535,304 @@ mod sync_and_order_tests {
         );
         app.is_logged_in = true;
         (app, ctx)
+    }
+    #[test]
+    fn timeline_batch_forward_opens_preview_with_original_scoped_sources_before_dispatch() {
+        let (mut app, _) = app_and_context();
+        app.user_uin = "owner-one".into();
+        app.hidden_panel.view.ready = true;
+        app.policy_panel.snapshot = Some(Default::default());
+        app.threads = vec![
+            Thread {
+                id: "thread-a".into(),
+                messages: vec![
+                    ChatMessage {
+                        id: "same-id".into(),
+                        text: "source A".into(),
+                        ..Default::default()
+                    },
+                    ChatMessage {
+                        id: "second-id".into(),
+                        text: "second source A".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            Thread {
+                id: "thread-b".into(),
+                messages: vec![ChatMessage {
+                    id: "same-id".into(),
+                    text: "source B".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        app.bind_timeline_selection("thread-a", false);
+        app.selected_msg_ids
+            .extend(["same-id".into(), "second-id".into()]);
+        app.share_timeline_selection("thread-a", false);
+        assert!(app.forward_msg.is_some());
+        assert_eq!(app.forward_batch.len(), 2);
+        assert!(
+            app.forward_session.is_none(),
+            "recipient selection and final confirmation must precede dispatch"
+        );
+        assert!(app.forward_targets.is_empty());
+        assert_eq!(app.forward_batch[0].text, "source A");
+        assert_eq!(
+            crate::chat::forward_source(&app.forward_batch[0]),
+            Some(("thread-a".into(), false))
+        );
+        assert!(!app.batch_selection_mode && app.selected_msg_ids.is_empty());
+    }
+
+    #[test]
+    fn timeline_selection_cannot_alias_reused_ids_after_thread_or_account_switch() {
+        let (mut app, ctx) = app_and_context();
+        app.user_uin = "owner-one".into();
+        app.hidden_panel.view.ready = true;
+        app.threads = vec![
+            Thread {
+                id: "thread-a".into(),
+                ..Default::default()
+            },
+            Thread {
+                id: "thread-b".into(),
+                ..Default::default()
+            },
+        ];
+        app.bind_timeline_selection("thread-a", false);
+        app.selected_msg_ids.insert("reused-id".into());
+        app.open_thread(&ctx, 1, "thread-b".into(), false);
+        assert!(
+            !app.batch_selection_mode
+                && app.selected_msg_ids.is_empty()
+                && app.timeline_selection_scope.is_none()
+        );
+        app.bind_timeline_selection("thread-b", false);
+        app.selected_msg_ids.insert("reused-id".into());
+        app.user_uin = "owner-two".into();
+        app.share_timeline_selection("thread-b", false);
+        assert!(app.forward_msg.is_none());
+        assert!(app.selected_msg_ids.is_empty());
+        app.bind_timeline_selection("thread-b", false);
+        app.selected_msg_ids.insert("reused-id".into());
+        app.clear_presence_state();
+        assert!(
+            !app.batch_selection_mode
+                && app.selected_msg_ids.is_empty()
+                && app.timeline_selection_scope.is_none()
+        );
+    }
+
+    #[test]
+    fn modal_hides_independent_narrow_drawer_and_timeline_action_areas() {
+        let (mut app, ctx) = app_and_context();
+        app.user_uin = "owner".into();
+        app.hidden_panel.view.ready = true;
+        app.policy_panel.snapshot = Some(Default::default());
+        app.threads = vec![Thread {
+            id: "100".into(),
+            name: "Fixture chat".into(),
+            messages: vec![ChatMessage {
+                id: "message-one".into(),
+                text: "Fixture message".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.selected_thread_index = 0;
+        app.bind_timeline_selection("100", false);
+        app.selected_msg_ids.insert("message-one".into());
+        ctx.data_mut(|data| data.insert_temp(Id::new("narrow_drawer_open"), true));
+        ctx.data_mut(|data| data.insert_temp(Id::new("narrow_chat_open"), true));
+        let mut text = String::new();
+        for gated in [false, true] {
+            app.settings_modal_open = gated;
+            for _ in 0..2 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 800.0))),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        let palette = app.palette();
+                        app.render_chat_workspace(ctx, &palette);
+                    },
+                );
+                text = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.text().to_owned()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            if gated {
+                assert!(
+                    !text.contains("Thông tin hội thoại"),
+                    "narrow Area must not remain interactive above a modal"
+                );
+                assert!(
+                    !text.contains("Đã chọn:"),
+                    "timeline Area must not remain interactive above a modal"
+                );
+            } else {
+                assert!(text.contains("Thông tin hội thoại"));
+                assert!(text.contains("Đã chọn:"));
+            }
+        }
+    }
+
+    #[test]
+    fn archive_link_row_renders_cached_thumbnail_and_blocks_inline_copy_for_unknown_policy() {
+        let (mut app, ctx) = app_and_context();
+        app.hidden_panel.view.ready = true;
+        let thumb = "http://127.0.0.1:1/fixture-thumbnail";
+        let message = ChatMessage {
+            id: "link-one".into(),
+            client_message_id: "link-client".into(),
+            link_thumb: Some(thumb.into()),
+            ..Default::default()
+        };
+        let key = format!(
+            "archive-link-{}",
+            crate::crypto::md5_hex(
+                &serde_json::json!(["100", message.id, message.client_message_id, thumb])
+                    .to_string()
+            )
+        );
+        let texture = ctx.load_texture(
+            "fixture cached thumbnail",
+            egui::ColorImage::new([2, 2], Color32::RED),
+            Default::default(),
+        );
+        let texture_id = texture.id();
+        app.sticker_textures.insert(key, texture);
+        let mut copy_position = None;
+        for _ in 0..2 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 200.0))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    let palette = app.palette();
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.render_link_row(
+                            ui,
+                            "https://example.invalid/fixture",
+                            "Fixture link",
+                            &message,
+                            "100",
+                            false,
+                            &palette,
+                        )
+                    });
+                },
+            );
+            assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Mesh(mesh) if mesh.texture_id==texture_id)),"cached link preview must render its real thumbnail");
+            copy_position = output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == "📋" => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            });
+        }
+        let position = copy_position.expect("inline copy control must be present");
+        for pressed in [true, false] {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 200.0))),
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ctx| {
+                    let palette = app.palette();
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.render_link_row(
+                            ui,
+                            "https://example.invalid/fixture",
+                            "Fixture link",
+                            &message,
+                            "100",
+                            false,
+                            &palette,
+                        )
+                    });
+                },
+            );
+            assert!(
+                output.platform_output.copied_text.is_empty(),
+                "unknown protection policy must block inline copying"
+            );
+        }
+    }
+
+    #[test]
+    fn opening_attachment_picker_retains_composer_draft_and_rich_context() {
+        let (mut app, _) = app_and_context();
+        app.input_message = "  Chú thích đang soạn  ".into();
+        app.composer_mentions = crate::mentions::Draft::from(app.input_message.as_str());
+        app.replying_to = Some(ChatMessage {
+            id: "quoted-source".into(),
+            ..Default::default()
+        });
+        for images_only in [true, false] {
+            app.request_attachment_picker("thread-fixture", false, images_only);
+            assert_eq!(app.input_message, "  Chú thích đang soạn  ");
+            assert_eq!(app.composer_mentions.text, app.input_message);
+            assert_eq!(app.replying_to.as_ref().unwrap().id, "quoted-source");
+        }
+    }
+
+    #[test]
+    fn name_edit_routes_keep_scope_and_cannot_edit_self_storage() {
+        let (mut app, _) = app_and_context();
+        app.user_uin = "100".into();
+        app.own_cloud_id = "900".into();
+        app.hidden_panel.view.ready = true;
+        app.open_conversation_name_editor("900", "Cloud renamed by user", false);
+        app.open_conversation_name_editor("100", "Me", false);
+        assert!(!app.contact_panel.open && !app.groups_panel.open);
+
+        app.open_conversation_name_editor("200", "Peer", false);
+        assert!(app.contact_panel.alias_only);
+        assert_eq!(app.contact_panel.target, "200");
+        assert!(app.contact_panel.confirm.is_none());
+        app.contact_panel = Default::default();
+
+        app.open_conversation_name_editor("g300", "Shared group", true);
+        assert!(app.groups_panel.edit_name);
+        assert_eq!(app.groups_panel.target, "g300");
+        assert_eq!(app.groups_panel.name, "Shared group");
+        assert!(app.groups_panel.confirm.is_none());
+    }
+
+    #[test]
+    fn row_report_and_invite_open_forms_for_explicit_target_without_mutation() {
+        let (mut app, _) = app_and_context();
+        app.open_contact_report("222".into(), false);
+        assert!(app.contact_panel.report_only);
+        assert!(!app.contact_panel.group_report);
+        assert_eq!(app.contact_panel.target, "222");
+        assert!(!app.contact_panel.pending && app.contact_panel.confirm.is_none());
+        app.open_invite_to_group_picker("333".into());
+        assert_eq!(app.groups_panel.invite_contact.as_deref(), Some("333"));
+        assert!(app.groups_panel.target.is_empty());
+        assert!(!app.groups_panel.pending && app.groups_panel.confirm.is_none());
     }
     fn thread(id: &str, group: bool, metadata: i64, times: &[i64]) -> Thread {
         Thread {
@@ -5474,7 +6337,162 @@ mod chat_layout_key_tests {
     }
 }
 
+fn group_avatar_affordance(
+    ui: &mut egui::Ui,
+    response: egui::Response,
+    pal: &ThemePalette,
+) -> bool {
+    let tooltip = "Quản lý ảnh nhóm / cộng đồng; kiểm tra quyền trước khi thay đổi";
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+    });
+    if response.hovered() || response.has_focus() {
+        let center = response.rect.right_bottom() - Vec2::splat(7.0);
+        ui.painter().circle_filled(center, 10.0, pal.bg_elevated);
+        draw_lucide_icon(ui.painter(), center, lucide::CAMERA, 13.0, pal.primary);
+    }
+    response
+        .on_hover_text(tooltip)
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .clicked()
+}
+
+fn name_edit_affordance(
+    ui: &mut egui::Ui,
+    name_hovered: bool,
+    enabled: bool,
+    is_group: bool,
+    pal: &ThemePalette,
+) -> bool {
+    let tooltip = if is_group {
+        "Đổi tên nhóm / cộng đồng cho mọi thành viên"
+    } else {
+        "Đặt tên gợi nhớ chỉ hiển thị riêng với bạn"
+    };
+    ui.add_enabled_ui(enabled, |ui| {
+        // Reserve a stable keyboard-focusable hit area even while the pencil is hidden.
+        let response = ui.allocate_response(Vec2::splat(20.0), Sense::click());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), tooltip)
+        });
+        if ui.is_enabled() && (name_hovered || response.hovered() || response.has_focus()) {
+            let c = response.rect.center();
+            let color = if response.hovered() || response.has_focus() {
+                pal.primary
+            } else {
+                pal.text_secondary
+            };
+            let stroke = Stroke::new(1.4_f32, color);
+            let points = vec![
+                c + Vec2::new(-5.0, 5.0),
+                c + Vec2::new(-4.0, 1.0),
+                c + Vec2::new(3.0, -6.0),
+                c + Vec2::new(6.0, -3.0),
+                c + Vec2::new(-1.0, 4.0),
+                c + Vec2::new(-5.0, 5.0),
+            ];
+            ui.painter().add(egui::Shape::line(points, stroke));
+            ui.painter()
+                .line_segment([c + Vec2::new(1.0, -4.0), c + Vec2::new(4.0, -1.0)], stroke);
+        }
+        response
+            .on_hover_text(tooltip)
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .clicked()
+    })
+    .inner
+}
+
 impl ZaloGuiApp {
+    fn open_conversation_avatar_editor(&mut self, thread_id: &str) {
+        if !self.is_logged_in || !self.private_access(thread_id, true) {
+            return;
+        }
+        if self.groups_panel.pending {
+            self.show_toast("Chờ thao tác nhóm trước hoàn tất trước khi đổi ảnh");
+            return;
+        }
+        // Inspect permissions first; the group panel enables its real avatar editor only after ACK.
+        self.open_group_panel(thread_id.to_owned(), true, false);
+    }
+
+    fn open_conversation_name_editor(&mut self, thread_id: &str, name: &str, is_group: bool) {
+        if !self.is_logged_in
+            || thread_id == self.user_uin
+            || (!self.own_cloud_id.is_empty() && thread_id == self.own_cloud_id)
+            || !self.private_access(thread_id, is_group)
+        {
+            return;
+        }
+        if is_group {
+            self.open_group_name_editor(thread_id.to_owned(), name.to_owned());
+        } else {
+            self.open_contact_alias_editor(thread_id.to_owned());
+        }
+    }
+
+    fn request_my_documents_usage(&mut self) {
+        if !self.is_logged_in || self.cloud_usage.pending {
+            return;
+        }
+        self.cloud_usage.owner = self.user_uin.clone();
+        self.cloud_usage.generation = crate::search::generation();
+        self.cloud_usage.pending = true;
+        if !WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::LoadCloudUsage {
+                owner: self.user_uin.clone(),
+                generation: self.cloud_usage.generation,
+            })
+            .is_ok()
+        }) {
+            self.cloud_usage.pending = false;
+            self.cloud_usage.result = Some(Err("Worker chưa sẵn sàng".into()));
+        }
+    }
+
+    fn render_my_documents_overview(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
+        egui::Frame::none().inner_margin(Margin::symmetric(16.0, 14.0)).show(ui, |ui| {
+            ui.label(RichText::new("My Documents").strong().color(pal.text_primary));
+            ui.label("Lưu và tìm lại tài liệu, ảnh, video và liên kết của riêng bạn trên tài khoản Zalo.");
+            ui.add_space(8.0);
+            ui.label(RichText::new("Dung lượng lưu trữ").strong());
+            if self.cloud_usage.pending {
+                ui.horizontal(|ui| { ui.spinner(); ui.label("Đang tải dung lượng từ máy chủ…"); });
+            }
+            match self.cloud_usage.result.as_ref() {
+                Some(Ok(usage)) => {
+                    let used = crate::chat::format_file_size(usage.usage);
+                    let quota = crate::chat::format_file_size(usage.quota);
+                    ui.label(format!("Đã dùng {used} / {quota}"));
+                    ui.add(egui::ProgressBar::new((usage.usage as f64 / usage.quota as f64).clamp(0.0,1.0) as f32));
+                    if usage.usage >= usage.quota { ui.label(RichText::new("Dung lượng đã đạt hạn mức; xem lại nội dung trước khi thêm tệp.").color(pal.warning)); }
+                }
+                Some(Err(error)) => { ui.label(RichText::new(format!("Chưa tải được dung lượng: {error}")).color(pal.warning)); }
+                None => { ui.label("Chưa có dữ liệu dung lượng từ máy chủ."); }
+            }
+            if ui.add_enabled(!self.cloud_usage.pending, egui::Button::new("Tải lại dung lượng")).clicked() {
+                self.request_my_documents_usage();
+            }
+            ui.add_space(8.0);
+            if ui.button("Xem lại và dọn dẹp My Documents…").clicked() {
+                self.drawer_media_selected.clear();
+                self.drawer_media_selection_mode = true;
+                self.drawer_view = DrawerView::MediaStorage {tab: MediaTab::Files};
+            }
+            ui.label("Chọn nội dung trong kho để xem lại; thao tác xóa luôn có xác nhận riêng.");
+            ui.separator();
+            ui.label(RichText::new("Kho nội dung").strong());
+            for (label, tab) in [("Ảnh / Video", MediaTab::Photos), ("Tệp", MediaTab::Files), ("Liên kết", MediaTab::Links)] {
+                if ui.button(label).clicked() {
+                    self.drawer_media_selection_mode = false;
+                    self.drawer_media_selected.clear();
+                    self.drawer_view = DrawerView::MediaStorage {tab};
+                }
+            }
+            if ui.button("Tìm trong My Documents…").clicked() { self.drawer_view = DrawerView::SearchInThread; }
+        });
+    }
+
     /// Who is typing in this conversation, while the indicator is still fresh.
     fn typing_label(&mut self, thread_id: &str, is_group: bool) -> Option<String> {
         if !self.settings.show_typing
@@ -6528,7 +7546,15 @@ impl ZaloGuiApp {
         shared_links: &[(String, String, ChatMessage)],
         pal: &ThemePalette,
     ) {
-        let d_is_cloud = d_name.contains("Cloud của tôi") || d_id == self.user_uin;
+        // Cloud storage is identified by the server-provided self-storage ID;
+        // display names are editable and must not grant cloud capabilities.
+        let d_is_cloud = !self.own_cloud_id.is_empty() && d_id == self.own_cloud_id;
+        if d_is_cloud
+            && (self.cloud_usage.owner != self.user_uin
+                || (!self.cloud_usage.pending && self.cloud_usage.result.is_none()))
+        {
+            self.request_my_documents_usage();
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("drawer_overview_scroll")
@@ -6539,8 +7565,15 @@ impl ZaloGuiApp {
                     .inner_margin(Margin::symmetric(16.0, 16.0))
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            let (av_rect, _) =
-                                ui.allocate_exact_size(Vec2::new(64.0, 64.0), Sense::hover());
+                            let blocked = self.is_workspace_input_gated(ui.ctx());
+                            let (av_rect, av_response) = ui.allocate_exact_size(
+                                Vec2::new(64.0, 64.0),
+                                if d_is_group && !blocked {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                },
+                            );
                             paint_user_avatar(
                                 ui.painter(),
                                 av_rect.center(),
@@ -6551,13 +7584,47 @@ impl ZaloGuiApp {
                                 &self.sticker_textures,
                                 &mut self.loading_stickers,
                             );
+                            if d_is_group
+                                && !blocked
+                                && group_avatar_affordance(ui, av_response, pal)
+                            {
+                                self.open_conversation_avatar_editor(d_id);
+                            }
                             ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(d_name)
-                                    .size(14.5)
-                                    .color(pal.text_primary)
-                                    .strong(),
-                            );
+                            let can_edit_name = !d_is_cloud && d_id != self.user_uin;
+                            let name_width = ui
+                                .painter()
+                                .layout_no_wrap(
+                                    d_name.to_owned(),
+                                    FontId::proportional(14.5),
+                                    pal.text_primary,
+                                )
+                                .size()
+                                .x;
+                            ui.horizontal(|ui| {
+                                let row_width = name_width + if can_edit_name { 24.0 } else { 0.0 };
+                                ui.add_space(((ui.available_width() - row_width) / 2.0).max(0.0));
+                                let name_response = ui.add(
+                                    egui::Label::new(
+                                        RichText::new(d_name)
+                                            .size(14.5)
+                                            .color(pal.text_primary)
+                                            .strong(),
+                                    )
+                                    .truncate(),
+                                );
+                                if can_edit_name
+                                    && name_edit_affordance(
+                                        ui,
+                                        name_response.hovered(),
+                                        !blocked,
+                                        d_is_group,
+                                        pal,
+                                    )
+                                {
+                                    self.open_conversation_name_editor(d_id, d_name, d_is_group);
+                                }
+                            });
                             if !d_is_group && !d_is_cloud {
                                 let zalo_sub =
                                     self.threads.get(self.selected_thread_index).and_then(|t| {
@@ -6585,15 +7652,21 @@ impl ZaloGuiApp {
                             }
                             ui.add_space(2.0);
                             let sub_txt = if d_is_group {
-                                let member_count = self
+                                let thread = self
                                     .threads
-                                    .get(self.selected_thread_index)
+                                    .iter()
+                                    .find(|thread| thread.id == d_id && thread.is_group);
+                                let member_count = thread
                                     .and_then(|t| t.presentation.member_count)
                                     .unwrap_or(0);
+                                let kind = thread
+                                    .and_then(|t| t.presentation.group_kind)
+                                    .map(crate::chat::GroupKind::label)
+                                    .unwrap_or("Hội thoại nhóm");
                                 if member_count > 0 {
-                                    format!("Nhóm · {member_count} thành viên")
+                                    format!("{kind} · {member_count} thành viên")
                                 } else {
-                                    "Nhóm trò chuyện".to_string()
+                                    kind.to_owned()
                                 }
                             } else if d_is_cloud {
                                 "Lưu trữ đám mây cá nhân".to_string()
@@ -6626,6 +7699,11 @@ impl ZaloGuiApp {
                     });
 
                 ui.add(egui::Separator::default().spacing(1.0));
+
+                if d_is_cloud {
+                    self.render_my_documents_overview(ui, pal);
+                    return;
+                }
 
                 // 2. 4 Circular Quick Action Buttons
                 let is_muted = self
@@ -7292,6 +8370,12 @@ impl ZaloGuiApp {
         cell_sz: f32,
         pal: &ThemePalette,
     ) {
+        let selection_key = archive_selection_key(
+            "photo",
+            d_id,
+            message,
+            media.original.as_deref().unwrap_or(tkey),
+        );
         let (cell_r, cell_resp) = ui.allocate_exact_size(Vec2::splat(cell_sz), Sense::click());
         let thumb_u = media.thumbnail.as_deref().unwrap_or_default();
         let full_u = media.preview.as_deref().unwrap_or_default();
@@ -7362,6 +8446,7 @@ impl ZaloGuiApp {
             ),
         );
         if cell_resp
+            .clone()
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(if media.kind == crate::message_view::MediaKind::Video {
                 "Phát video"
@@ -7370,6 +8455,12 @@ impl ZaloGuiApp {
             })
             .clicked()
         {
+            if self.drawer_media_selection_mode {
+                if !self.drawer_media_selected.remove(&selection_key) {
+                    self.drawer_media_selected.insert(selection_key.clone());
+                }
+                return;
+            }
             if media.kind == crate::message_view::MediaKind::Video {
                 if let (Some(tx), Some(url)) = (WORKER_TX.get(), media.original.clone()) {
                     let _ = tx.send(WorkerCmd::DownloadMedia {
@@ -7387,7 +8478,7 @@ impl ZaloGuiApp {
                 }
                 return;
             }
-            let full_key = crate::media_recovery::image_key(d_id, &message.id, 0, true);
+            let full_key = format!("{tkey}:full");
             if !full_u.is_empty()
                 && !self.sticker_textures.contains_key(&full_key)
                 && self.loading_stickers.insert(full_key.clone())
@@ -7426,53 +8517,62 @@ impl ZaloGuiApp {
                 video_state: None,
             });
         }
-        let selection_key = format!("photo:{}:{}:{}", d_id, message.id, tkey);
         let selected = self.drawer_media_selected.contains(&selection_key);
-        if self.drawer_media_selection_mode && selected {
+        if self.drawer_media_selection_mode {
             ui.painter().rect_stroke(
                 cell_r.shrink(2.0),
                 Rounding::same(5.0),
-                Stroke::new(2.0_f32, pal.primary),
+                Stroke::new(2.0_f32, if selected { pal.primary } else { pal.border }),
             );
+            ui.painter().circle_filled(
+                cell_r.left_top() + Vec2::splat(12.0),
+                8.0,
+                if selected {
+                    pal.primary
+                } else {
+                    pal.bg_elevated
+                },
+            );
+            if selected {
+                ui.painter().text(
+                    cell_r.left_top() + Vec2::splat(12.0),
+                    egui::Align2::CENTER_CENTER,
+                    "✓",
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
         }
-        let menu_resp = ui.interact(
-            cell_r,
-            ui.id().with(("archive_photo_menu", d_id, &selection_key)),
-            Sense::click(),
-        );
         let message_for_menu = message.clone();
         let selection_key_for_menu = selection_key.clone();
-        if menu_resp.secondary_clicked() {
-            menu_resp.context_menu(|ui| {
-                if ui.button("Chọn nhiều").clicked() {
-                    self.drawer_media_selection_mode = true;
-                    self.drawer_media_selected
-                        .insert(selection_key_for_menu.clone());
-                    ui.close_menu();
-                }
-                if ui.button("Xóa chỉ ở phía tôi").clicked() {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::DeleteForMe {
-                            to_id: d_id.to_owned(),
-                            is_group: d_is_group,
-                            msg: message_for_menu.clone(),
-                        });
-                    }
-                    ui.close_menu();
-                }
-                if message_for_menu.is_outgoing && ui.button("Thu hồi với mọi người").clicked()
-                {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::RecallMessage {
-                            to_id: d_id.to_owned(),
-                            is_group: d_is_group,
-                            msg: message_for_menu.clone(),
-                        });
-                    }
-                    ui.close_menu();
-                }
-            });
-        }
+        cell_resp.context_menu(|ui| {
+            self.archive_item_actions(ui, d_id, d_is_group, &message_for_menu, Some(media), None);
+            if ui.button("Chọn nhiều").clicked() {
+                self.drawer_media_selection_mode = true;
+                self.drawer_media_selected
+                    .insert(selection_key_for_menu.clone());
+                ui.close_menu();
+            }
+            if ui.button("Xóa chỉ ở phía tôi").clicked() {
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    false,
+                    std::slice::from_ref(&message_for_menu),
+                );
+                ui.close_menu();
+            }
+            if message_for_menu.is_outgoing && ui.button("Thu hồi với mọi người").clicked()
+            {
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    true,
+                    std::slice::from_ref(&message_for_menu),
+                );
+                ui.close_menu();
+            }
+        });
     }
 
     fn render_file_row(
@@ -7489,13 +8589,12 @@ impl ZaloGuiApp {
         } else {
             &media.name
         };
-        let category = crate::message_view::file_category(fname);
-        let category_label = crate::message_view::file_category_label(category);
-        let selection_key = format!(
-            "file:{}:{}:{}",
+        let category = crate::message_view::attachment_file_category(media, msg);
+        let selection_key = archive_selection_key(
+            "file",
             d_id,
-            msg.id,
-            media.original.as_deref().unwrap_or(fname)
+            msg,
+            media.original.as_deref().unwrap_or(fname),
         );
         let selected = self.drawer_media_selected.contains(&selection_key);
         let row = ui.horizontal(|ui| {
@@ -7510,15 +8609,7 @@ impl ZaloGuiApp {
                 }
             }
             let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
-            ui.painter()
-                .rect_filled(icon_r, Rounding::same(6.0), pal.bg_elevated);
-            ui.painter().text(
-                icon_r.center(),
-                egui::Align2::CENTER_CENTER,
-                category_label,
-                FontId::proportional(14.0),
-                pal.text_primary,
-            );
+            paint_file_category_icon(ui.painter(), icon_r, category);
 
             ui.vertical(|ui| {
                 ui.label(
@@ -7543,7 +8634,12 @@ impl ZaloGuiApp {
                                 name: fname.to_string(),
                                 play: false,
                                 open: false,
-                                context: None,
+                                context: Some(super::worker::ChatImage {
+                                    thread: d_id.to_owned(),
+                                    group: d_is_group,
+                                    message: msg.clone(),
+                                    preview: false,
+                                }),
                             });
                         }
                         self.show_toast(format!("Bắt đầu tải {fname}…"));
@@ -7555,6 +8651,7 @@ impl ZaloGuiApp {
         let msg_for_delete = msg.clone();
         let is_outgoing = msg.is_outgoing;
         row.response.context_menu(|ui| {
+            self.archive_item_actions(ui, d_id, d_is_group, &msg_for_delete, Some(media), None);
             if ui.button("Chọn nhiều").clicked() {
                 self.drawer_media_selection_mode = true;
                 self.drawer_media_selected
@@ -7562,23 +8659,21 @@ impl ZaloGuiApp {
                 ui.close_menu();
             }
             if ui.button("Xóa chỉ ở phía tôi").clicked() {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::DeleteForMe {
-                        to_id: d_id.to_owned(),
-                        is_group: d_is_group,
-                        msg: msg_for_delete.clone(),
-                    });
-                }
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    false,
+                    std::slice::from_ref(&msg_for_delete),
+                );
                 ui.close_menu();
             }
             if is_outgoing && ui.button("Thu hồi với mọi người").clicked() {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::RecallMessage {
-                        to_id: d_id.to_owned(),
-                        is_group: d_is_group,
-                        msg: msg_for_delete.clone(),
-                    });
-                }
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    true,
+                    std::slice::from_ref(&msg_for_delete),
+                );
                 ui.close_menu();
             }
         });
@@ -7595,17 +8690,74 @@ impl ZaloGuiApp {
         d_is_group: bool,
         pal: &ThemePalette,
     ) {
+        let selection_key = archive_selection_key("link", d_id, msg, url);
+        let shareable = !self.content_protected(d_id, d_is_group);
         let response = ui.horizontal(|ui| {
-            let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+            if self.drawer_media_selection_mode {
+                let mut checked = self.drawer_media_selected.contains(&selection_key);
+                if ui.checkbox(&mut checked, "").changed() {
+                    if checked {
+                        self.drawer_media_selected.insert(selection_key.clone());
+                    } else {
+                        self.drawer_media_selected.remove(&selection_key);
+                    }
+                }
+            }
+            let (icon_r, _) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::hover());
+            let thumbnail = msg.link_thumb.as_deref().filter(|value| {
+                reqwest::Url::parse(value).is_ok_and(|url| crate::media_download::allowed(&url))
+            });
+            let key = thumbnail.map(|thumb| {
+                format!(
+                    "archive-link-{}",
+                    crate::crypto::md5_hex(
+                        &serde_json::json!([d_id, msg.id, msg.client_message_id, thumb])
+                            .to_string()
+                    )
+                )
+            });
+            if let (Some(thumb), Some(key)) = (thumbnail, key.as_ref()) {
+                if ui.is_rect_visible(icon_r)
+                    && self.private_access(d_id, d_is_group)
+                    && !crate::message_lifecycle::expired(msg, crate::login::unix_now() * 1000)
+                    && !self.sticker_textures.contains_key(key)
+                    && !self.image_failures.contains_key(key)
+                    && self.loading_stickers.insert(key.clone())
+                {
+                    let queued = WORKER_TX.get().is_some_and(|tx| {
+                        tx.send(WorkerCmd::FetchChatImage {
+                            key: key.clone(),
+                            url: thumb.to_owned(),
+                            thread: d_id.to_owned(),
+                            group: d_is_group,
+                            message: Box::new(msg.clone()),
+                            preview: false,
+                        })
+                        .is_ok()
+                    });
+                    if !queued {
+                        self.loading_stickers.remove(key);
+                    }
+                }
+            }
             ui.painter()
                 .rect_filled(icon_r, Rounding::same(6.0), pal.bg_elevated);
-            ui.painter().text(
-                icon_r.center(),
-                egui::Align2::CENTER_CENTER,
-                "🔗",
-                FontId::proportional(14.0),
-                pal.primary_hover,
-            );
+            if let Some(texture) = key.as_ref().and_then(|key| self.sticker_textures.get(key)) {
+                ui.painter().image(
+                    texture.id(),
+                    icon_r,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+            } else {
+                ui.painter().text(
+                    icon_r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "🔗",
+                    FontId::proportional(14.0),
+                    pal.primary_hover,
+                );
+            }
 
             ui.vertical(|ui| {
                 let display_title = if title.trim().is_empty() {
@@ -7637,16 +8789,22 @@ impl ZaloGuiApp {
                 if ui.button("Mở").clicked() {
                     ui.ctx().open_url(egui::OpenUrl::same_tab(url));
                 }
-                if ui.button("📋").clicked() {
+                if ui
+                    .add_enabled(shareable, egui::Button::new("📋"))
+                    .on_disabled_hover_text(
+                        "Chưa xác minh quyền sao chép hoặc hội thoại đang chặn chia sẻ",
+                    )
+                    .clicked()
+                {
                     ui.ctx().copy_text(url.to_string());
                     self.show_toast("Đã sao chép liên kết");
                 }
             });
         });
         let message_for_menu = msg.clone();
-        let selection_key = format!("link:{}:{}:{}", d_id, msg.id, url);
         let selection_key_for_menu = selection_key.clone();
         response.response.context_menu(|ui| {
+            self.archive_item_actions(ui, d_id, d_is_group, &message_for_menu, None, Some(url));
             if ui.button("Chọn nhiều").clicked() {
                 self.drawer_media_selection_mode = true;
                 self.drawer_media_selected
@@ -7654,24 +8812,22 @@ impl ZaloGuiApp {
                 ui.close_menu();
             }
             if ui.button("Xóa chỉ ở phía tôi").clicked() {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::DeleteForMe {
-                        to_id: d_id.to_owned(),
-                        is_group: d_is_group,
-                        msg: message_for_menu.clone(),
-                    });
-                }
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    false,
+                    std::slice::from_ref(&message_for_menu),
+                );
                 ui.close_menu();
             }
             if message_for_menu.is_outgoing && ui.button("Thu hồi với mọi người").clicked()
             {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::RecallMessage {
-                        to_id: d_id.to_owned(),
-                        is_group: d_is_group,
-                        msg: message_for_menu.clone(),
-                    });
-                }
+                self.confirm_archive_mutation(
+                    d_id,
+                    d_is_group,
+                    true,
+                    std::slice::from_ref(&message_for_menu),
+                );
                 ui.close_menu();
             }
         });
@@ -7862,12 +9018,9 @@ impl ZaloGuiApp {
                 }
                 if let Some(id) = jump {
                     self.filter_starred_only = false;
-                    self.quote_jump = Some(QuoteJump {
-                        thread_id: thread_id.to_string(),
-                        reference: id,
-                        highlight_until: std::time::Instant::now()
-                            + std::time::Duration::from_secs(3),
-                        scroll_pending: true,
+                    self.tools_command(super::tools_panel::ToolsCommand::OpenHit {
+                        thread: thread_id.to_string(),
+                        id,
                     });
                     ui.ctx().request_repaint();
                 }
@@ -7885,33 +9038,131 @@ impl ZaloGuiApp {
         d_id: &str,
         d_is_group: bool,
         tab: MediaTab,
-        shared_photos: &[(String, crate::message_view::Media, ChatMessage)],
-        shared_files: &[(crate::message_view::Media, ChatMessage)],
-        shared_links: &[(String, String, ChatMessage)],
+        _shared_photos: &[(String, crate::message_view::Media, ChatMessage)],
+        _shared_files: &[(crate::message_view::Media, ChatMessage)],
+        _shared_links: &[(String, String, ChatMessage)],
         pal: &ThemePalette,
     ) {
         self.render_drawer_subview_header(ui, "Kho lưu trữ", pal);
 
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.drawer_media_query)
-                    .hint_text("Tìm trong kho…")
-                    .desired_width(150.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.drawer_media_sender)
-                    .hint_text("Người gửi")
-                    .desired_width(110.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.drawer_media_from)
-                    .hint_text("Từ ngày YYYY-MM-DD")
-                    .desired_width(130.0),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.drawer_media_to)
-                    .hint_text("Đến ngày YYYY-MM-DD")
-                    .desired_width(130.0),
+        let mut sender_entries = std::collections::BTreeMap::new();
+        for message in self.archive_history.messages.iter().chain(
+            self.threads
+                .iter()
+                .find(|thread| thread.id == d_id)
+                .into_iter()
+                .flat_map(|thread| thread.messages.iter()),
+        ) {
+            if let Some(id) = crate::chat::sidebar_sender_id(message) {
+                let name = if id == self.user_uin {
+                    "Bạn".to_owned()
+                } else {
+                    resolve_contact_name_from(&self.server_aliases, &id, &message.sender).to_owned()
+                };
+                let avatar = self
+                    .threads
+                    .iter()
+                    .find(|thread| !thread.is_group && thread.id == id)
+                    .and_then(|thread| thread.avatar.clone());
+                sender_entries.entry(id).or_insert((name, avatar));
+            }
+        }
+        if let Some(thread) = self.threads.iter().find(|thread| thread.id == d_id) {
+            for member in &thread.presentation.members {
+                sender_entries.insert(
+                    member.id.clone(),
+                    (
+                        resolve_contact_name_from(&self.server_aliases, &member.id, &member.name)
+                            .to_owned(),
+                        member.avatar.clone(),
+                    ),
+                );
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            if tab != MediaTab::Photos {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.drawer_media_query)
+                        .hint_text("Tìm trong kho…")
+                        .desired_width(150.0_f32.min(ui.available_width())),
+                );
+            }
+            let selected_sender = self
+                .drawer_media_sender
+                .strip_prefix("id:")
+                .and_then(|id| {
+                    sender_entries
+                        .get(id)
+                        .map(|(name, _)| format!("Người gửi: {name}"))
+                })
+                .unwrap_or_else(|| "Người gửi: Tất cả".into());
+            ui.menu_button(selected_sender, |ui| {
+                let search_id = Id::new(("archive-sender-query", d_id, format!("{tab:?}")));
+                let mut search = ui
+                    .ctx()
+                    .data_mut(|data| data.get_temp::<String>(search_id).unwrap_or_default());
+                ui.add(
+                    egui::TextEdit::singleline(&mut search)
+                        .hint_text("Tìm người gửi…")
+                        .desired_width(180.0),
+                );
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(search_id, search.clone()));
+                if ui
+                    .selectable_label(self.drawer_media_sender.is_empty(), "Tất cả người gửi")
+                    .clicked()
+                {
+                    self.drawer_media_sender.clear();
+                    ui.close_menu();
+                }
+                let search = crate::search::fold(&search);
+                egui::ScrollArea::vertical()
+                    .id_salt("archive-sender-list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for (id, (name, avatar)) in &sender_entries {
+                            if !search.is_empty()
+                                && !crate::search::fold(name).contains(&search)
+                                && !id.contains(&search)
+                            {
+                                continue;
+                            }
+                            ui.horizontal(|ui| {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                                paint_user_avatar(
+                                    ui.painter(),
+                                    rect.center(),
+                                    12.0,
+                                    name,
+                                    false,
+                                    avatar.as_deref(),
+                                    &self.sticker_textures,
+                                    &mut self.loading_stickers,
+                                );
+                                let key = format!("id:{id}");
+                                if ui
+                                    .selectable_label(
+                                        self.drawer_media_sender == key,
+                                        format!("{name} · {id}"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.drawer_media_sender = key;
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                        if sender_entries.is_empty() {
+                            ui.label("Chưa có người gửi trong dữ liệu đã tải.");
+                        }
+                    });
+            });
+            render_archive_date_filter(
+                ui,
+                Id::new(("archive-date-filter", d_id, format!("{tab:?}"))),
+                &mut self.drawer_media_from,
+                &mut self.drawer_media_to,
             );
             if tab == MediaTab::Files {
                 egui::ComboBox::from_id_salt("drawer_file_type")
@@ -7930,11 +9181,16 @@ impl ZaloGuiApp {
                             crate::message_view::FileCategory::Cad,
                             crate::message_view::FileCategory::Other,
                         ] {
-                            ui.selectable_value(
-                                &mut self.drawer_media_type,
-                                Some(category),
-                                crate::message_view::file_category_label(category),
-                            );
+                            ui.horizontal(|ui| {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(20.0, 23.0), Sense::hover());
+                                paint_file_category_icon(ui.painter(), rect, category);
+                                ui.selectable_value(
+                                    &mut self.drawer_media_type,
+                                    Some(category),
+                                    crate::message_view::file_category_label(category),
+                                );
+                            });
                         }
                     });
             }
@@ -7961,12 +9217,66 @@ impl ZaloGuiApp {
             }
         });
 
+        let filter_key = serde_json::json!([
+            self.user_uin,
+            self.account_runtime_id,
+            d_id,
+            format!("{tab:?}"),
+            self.drawer_media_query,
+            self.drawer_media_sender,
+            self.drawer_media_from,
+            self.drawer_media_to,
+            format!("{:?}", self.drawer_media_type),
+        ])
+        .to_string();
+        if self.drawer_media_filter_key != filter_key {
+            self.drawer_media_filter_key = filter_key;
+            self.drawer_media_limit = 100;
+            self.drawer_media_selected.clear();
+            self.archive_history = ArchiveHistory {
+                thread: d_id.to_owned(),
+                generation: crate::search::generation(),
+                ..Default::default()
+            };
+            self.request_archive_page(d_id, d_is_group);
+        }
+        let mut archive = Thread {
+            id: d_id.to_owned(),
+            is_group: d_is_group,
+            messages: self.archive_history.messages.clone(),
+            ..Default::default()
+        };
+        // Live timeline metadata wins when a persisted row has an older projection.
+        if let Some(live) = self.threads.iter().find(|thread| thread.id == d_id) {
+            for message in &live.messages {
+                if let Some(previous) = archive
+                    .messages
+                    .iter_mut()
+                    .find(|old| crate::chat::same_message(old, message))
+                {
+                    *previous = message.clone();
+                } else {
+                    archive.messages.push(message.clone());
+                }
+            }
+        }
+        archive.messages.retain(|message| {
+            !crate::message_lifecycle::expired(message, crate::login::unix_now() * 1000)
+                && !self
+                    .deleted_message_ids
+                    .contains(&(d_id.to_owned(), message.id.clone()))
+        });
+        archive
+            .messages
+            .sort_by(|a, b| (a.ts, &a.id).cmp(&(b.ts, &b.id)));
+        let (shared_photos, shared_files, shared_links) = extract_shared_media_and_links(&archive);
         ui.horizontal(|ui| {
             let p_sel = tab == MediaTab::Photos;
             if ui
                 .selectable_label(p_sel, format!("🖼️ Ảnh/Video ({})", shared_photos.len()))
                 .clicked()
             {
+                self.drawer_media_active_tab = MediaTab::Photos;
                 self.drawer_view = DrawerView::MediaStorage {
                     tab: MediaTab::Photos,
                 };
@@ -7976,6 +9286,7 @@ impl ZaloGuiApp {
                 .selectable_label(f_sel, format!("📄 File ({})", shared_files.len()))
                 .clicked()
             {
+                self.drawer_media_active_tab = MediaTab::Files;
                 self.drawer_view = DrawerView::MediaStorage {
                     tab: MediaTab::Files,
                 };
@@ -7985,22 +9296,158 @@ impl ZaloGuiApp {
                 .selectable_label(l_sel, format!("🔗 Link ({})", shared_links.len()))
                 .clicked()
             {
+                self.drawer_media_active_tab = MediaTab::Links;
                 self.drawer_view = DrawerView::MediaStorage {
                     tab: MediaTab::Links,
                 };
             }
         });
 
-        let query = crate::search::fold(self.drawer_media_query.trim());
-        let sender_query = crate::search::fold(self.drawer_media_sender.trim());
+        let mut selected_messages = Vec::new();
+        let mut selected_downloads = Vec::new();
+        let mut selected_links = Vec::new();
+        let mut live_keys = HashSet::new();
+        match tab {
+            MediaTab::Photos => {
+                for (key, media, message) in &shared_photos {
+                    let key = archive_selection_key(
+                        "photo",
+                        d_id,
+                        message,
+                        media.original.as_deref().unwrap_or(key),
+                    );
+                    live_keys.insert(key.clone());
+                    if self.drawer_media_selected.contains(&key) {
+                        selected_messages.push(message.clone());
+                        if let Some(url) = media.original.as_ref() {
+                            selected_downloads.push(super::worker::MediaBatchItem {
+                                key: key.clone(),
+                                context: super::worker::ChatImage {
+                                    thread: d_id.to_owned(),
+                                    group: d_is_group,
+                                    message: message.clone(),
+                                    preview: false,
+                                },
+                                url: url.clone(),
+                                name: media.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            MediaTab::Files => {
+                for (media, message) in &shared_files {
+                    let name = if media.name.is_empty() {
+                        "Tập tin"
+                    } else {
+                        &media.name
+                    };
+                    let key = archive_selection_key(
+                        "file",
+                        d_id,
+                        message,
+                        media.original.as_deref().unwrap_or(name),
+                    );
+                    live_keys.insert(key.clone());
+                    if self.drawer_media_selected.contains(&key) {
+                        selected_messages.push(message.clone());
+                        if let Some(url) = media.original.as_ref() {
+                            selected_downloads.push(super::worker::MediaBatchItem {
+                                key: key.clone(),
+                                context: super::worker::ChatImage {
+                                    thread: d_id.to_owned(),
+                                    group: d_is_group,
+                                    message: message.clone(),
+                                    preview: false,
+                                },
+                                url: url.clone(),
+                                name: name.to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
+            MediaTab::Links => {
+                for (url, _, message) in &shared_links {
+                    let key = archive_selection_key("link", d_id, message, url);
+                    live_keys.insert(key.clone());
+                    if self.drawer_media_selected.contains(&key) {
+                        selected_messages.push(message.clone());
+                        selected_links.push(url.clone());
+                    }
+                }
+            }
+        }
+        self.drawer_media_selected
+            .retain(|key| live_keys.contains(key));
+        if self.drawer_media_selection_mode {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label(format!("Đã chọn {} mục", self.drawer_media_selected.len()));
+                ui.horizontal_wrapped(|ui| {
+                    let shareable = !self.content_protected(d_id, d_is_group);
+                    let can_share = shareable && !selected_messages.is_empty() && selected_messages.len() <= 100
+                        && selected_messages.iter().all(crate::chat::can_forward_message);
+                    if ui.add_enabled(can_share, egui::Button::new("Chia sẻ tin gốc…")).clicked() {
+                        self.share_archive_messages(d_id, d_is_group, selected_messages.clone());
+                    }
+                    if ui.add_enabled(can_share && !self.own_cloud_id.is_empty(),egui::Button::new("Lưu vào My Documents…")).clicked() {
+                        self.save_archive_to_documents(d_id,d_is_group,selected_messages.clone());
+                    }
+                    if tab != MediaTab::Links {
+                        let can_download = shareable && !selected_downloads.is_empty()
+                            && selected_downloads.len() == self.drawer_media_selected.len()
+                            && selected_downloads.len() <= 100 && self.drawer_media_batch.is_none();
+                        if ui.add_enabled(can_download, egui::Button::new("Lưu về máy…"))
+                            .on_disabled_hover_text("Chọn tối đa 100 mục có tệp gốc và chờ lượt tải trước hoàn tất.")
+                            .clicked() {
+                            let batch = crate::search::generation();
+                            let queued = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::DownloadMediaBatch {
+                                owner: self.user_uin.clone(), batch, items: selected_downloads.clone(),
+                            }).is_ok());
+                            if queued {
+                                self.drawer_media_batch = Some(batch);
+                                self.drawer_media_batch_status = "Đang chờ chọn thư mục và tải các mục đã chọn…".into();
+                            } else { self.drawer_media_batch_status = "Không gửi được yêu cầu tải tới worker.".into(); }
+                        }
+                    } else if ui.add_enabled(shareable && !selected_links.is_empty(), egui::Button::new("Sao chép liên kết")).clicked() {
+                        ui.ctx().copy_text(selected_links.join("\n"));
+                    }
+                    if ui.add_enabled(!selected_messages.is_empty() && self.archive_mutation_batch.is_none(), egui::Button::new("Xóa phía tôi…")).clicked() {
+                        self.confirm_archive_mutation(d_id,d_is_group,false,&selected_messages);
+                    }
+                    if ui.add_enabled(!selected_messages.is_empty() && selected_messages.iter().all(|m| m.is_outgoing && crate::chat::server_message_id(m).is_some()) && self.archive_mutation_batch.is_none(), egui::Button::new("Thu hồi…")).clicked() {
+                        self.confirm_archive_mutation(d_id,d_is_group,true,&selected_messages);
+                    }
+                    if ui.button("Hủy").clicked() {
+                        self.drawer_media_selection_mode = false;
+                        self.drawer_media_selected.clear();
+                    }
+                });
+                ui.small("Chia sẻ toàn bộ tin nhắn gốc; nhiều mục cùng một tin chỉ được chia sẻ một lần.");
+            });
+        }
+        if !self.archive_mutation_results.is_empty() {
+            egui::CollapsingHeader::new("Kết quả từng tin nhắn")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for result in &self.archive_mutation_results {
+                        ui.small(result);
+                    }
+                });
+        }
+        if !self.drawer_media_batch_status.is_empty() {
+            ui.small(&self.drawer_media_batch_status);
+        }
+
+        let query = if tab == MediaTab::Photos {
+            String::new()
+        } else {
+            crate::search::fold(self.drawer_media_query.trim())
+        };
+        let sender_query = self.drawer_media_sender.trim().to_owned();
         let matches_text =
             |value: &str| query.is_empty() || crate::search::fold(value).contains(&query);
-        let matches_sender = |msg: &ChatMessage| {
-            sender_query.is_empty()
-                || crate::search::fold(&msg.sender).contains(&sender_query)
-                || crate::chat::sidebar_sender_id(msg)
-                    .is_some_and(|sender_id| sender_id.contains(sender_query.as_str()))
-        };
+        let matches_sender = |msg: &ChatMessage| media_sender_matches(msg, &sender_query);
         let from_input = self.drawer_media_from.trim();
         let to_input = self.drawer_media_to.trim();
         let from_date = chrono::NaiveDate::parse_from_str(from_input, "%Y-%m-%d").ok();
@@ -8032,6 +9479,7 @@ impl ZaloGuiApp {
             from_date.is_none_or(|from| date >= from) && to_date.is_none_or(|to| date <= to)
         };
 
+        let mut filtered_count = 0usize;
         egui::ScrollArea::vertical()
             .id_salt("drawer_media_storage_scroll")
             .max_height((ui.available_height() - 20.0).max(120.0))
@@ -8046,6 +9494,7 @@ impl ZaloGuiApp {
                                     || matches_text(media.original.as_deref().unwrap_or("")))
                         })
                         .collect();
+                    filtered_count = filtered.len();
                     if filtered.is_empty() {
                         ui.label(
                             RichText::new("Chưa có ảnh hoặc video nào.")
@@ -8054,9 +9503,14 @@ impl ZaloGuiApp {
                         );
                     } else {
                         let gap = 6.0;
-                        let cell_sz =
-                            ((ui.available_width() - 2.0 * gap - 8.0) / 3.0).clamp(64.0, 112.0);
-                        for row in filtered.chunks(3) {
+                        let columns = ((ui.available_width() + gap) / (64.0 + gap))
+                            .floor()
+                            .clamp(1.0, 3.0) as usize;
+                        let cell_sz = ((ui.available_width() - (columns - 1) as f32 * gap)
+                            / columns as f32)
+                            .clamp(32.0, 112.0);
+                        let visible = filtered.len().min(self.drawer_media_limit);
+                        for row in filtered[..visible].chunks(columns) {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
                                 for (tkey, media, message) in row {
@@ -8079,10 +9533,12 @@ impl ZaloGuiApp {
                                 && (matches_text(media.name.as_str())
                                     || matches_text(media.original.as_deref().unwrap_or("")))
                                 && self.drawer_media_type.is_none_or(|kind| {
-                                    crate::message_view::file_category(media.name.as_str()) == kind
+                                    crate::message_view::attachment_file_category(media, msg)
+                                        == kind
                                 })
                         })
                         .collect();
+                    filtered_count = filtered.len();
                     if filtered.is_empty() {
                         ui.label(
                             RichText::new("Chưa có tập tin nào.")
@@ -8090,7 +9546,22 @@ impl ZaloGuiApp {
                                 .color(pal.text_muted),
                         );
                     } else {
-                        for (media, msg) in filtered {
+                        let mut last_date = String::new();
+                        for (media, msg) in filtered.iter().take(self.drawer_media_limit) {
+                            let date = chrono::DateTime::from_timestamp_millis(
+                                crate::clock::normalize_ts_ms(msg.ts),
+                            )
+                            .map(|date| {
+                                date.with_timezone(&chrono::Local)
+                                    .format("%d/%m/%Y")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "Chưa rõ ngày gửi".into());
+                            if last_date != date {
+                                ui.separator();
+                                ui.small(&date);
+                                last_date = date;
+                            }
                             self.render_file_row(ui, media, msg, d_id, d_is_group, pal);
                             ui.add_space(4.0);
                         }
@@ -8105,6 +9576,7 @@ impl ZaloGuiApp {
                                 && (matches_text(url) || matches_text(title))
                         })
                         .collect();
+                    filtered_count = filtered.len();
                     if filtered.is_empty() {
                         ui.label(
                             RichText::new("Chưa có liên kết nào.")
@@ -8112,13 +9584,65 @@ impl ZaloGuiApp {
                                 .color(pal.text_muted),
                         );
                     } else {
-                        for (url, title, msg) in filtered {
+                        let mut last_date = String::new();
+                        for (url, title, msg) in filtered.iter().take(self.drawer_media_limit) {
+                            let date = chrono::DateTime::from_timestamp_millis(
+                                crate::clock::normalize_ts_ms(msg.ts),
+                            )
+                            .map(|date| {
+                                date.with_timezone(&chrono::Local)
+                                    .format("%d/%m/%Y")
+                                    .to_string()
+                            })
+                            .unwrap_or_else(|| "Chưa rõ ngày gửi".into());
+                            if last_date != date {
+                                ui.separator();
+                                ui.small(&date);
+                                last_date = date;
+                            }
                             self.render_link_row(ui, url, title, msg, d_id, d_is_group, pal);
                             ui.add_space(4.0);
                         }
                     }
                 }
             });
+
+        if filtered_count > 0 {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "Hiển thị {} / {} mục trong dữ liệu đã tải",
+                    filtered_count.min(self.drawer_media_limit),
+                    filtered_count
+                ));
+                if self.drawer_media_limit < filtered_count
+                    && ui.button("Hiện thêm kết quả đã đọc").clicked()
+                {
+                    self.drawer_media_limit = self.drawer_media_limit.saturating_add(100);
+                }
+            });
+        }
+        ui.small(format!(
+            "Đã đọc {} tin trong lịch sử cục bộ; chưa xác nhận kho server đầy đủ.",
+            self.archive_history.scanned
+        ));
+        if !self.archive_history.error.is_empty() {
+            ui.colored_label(pal.danger, &self.archive_history.error);
+        }
+        if self.archive_history.loading {
+            ui.spinner();
+            ui.small("Đang đọc trang lịch sử cục bộ…");
+        } else if ((!self.archive_history.loaded || !self.archive_history.error.is_empty())
+            || self.archive_history.cursor.is_some())
+            && ui
+                .button(if self.archive_history.error.is_empty() {
+                    "Đọc lịch sử cũ hơn"
+                } else {
+                    "Thử đọc lại lịch sử"
+                })
+                .clicked()
+        {
+            self.request_archive_page(d_id, d_is_group);
+        }
     }
 
     fn render_drawer_search_view(
@@ -8430,6 +9954,129 @@ fn capture_anchor(
 }
 
 impl ZaloGuiApp {
+    pub(super) fn render_archive_confirmation(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if self.archive_mutation_confirm.is_none() {
+            return;
+        }
+        egui::Window::new("Xác nhận thao tác tin nhắn")
+            .id(Id::new("archive-confirmation-modal"))
+            .anchor(egui::Align2::CENTER_CENTER,Vec2::ZERO)
+            .order(egui::Order::Foreground).collapsible(false).resizable(false)
+            .max_width((ctx.screen_rect().width()-48.0).max(160.0))
+            .show(ctx, |ui| {
+        if let Some(pending) = &self.archive_mutation_confirm {
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.colored_label(pal.danger, if pending.recall { "Thu hồi các tin nhắn gốc với mọi người?" } else { "Xóa các tin nhắn gốc chỉ ở phía bạn?" });
+                ui.small("Thao tác áp dụng cho toàn bộ tin gốc, gồm tất cả tệp đính kèm của tin. Không tự thử lại khi chưa rõ kết quả.");
+                egui::ScrollArea::vertical().id_salt("archive_mutation_confirmation").max_height(100.0).show(ui,|ui| {
+                    for message in &pending.messages { ui.label(format!("{}: {}", message.sender,crate::message_view::summary(message))); }
+                });
+                ui.horizontal(|ui| { confirm=ui.button("Xác nhận thực hiện").clicked(); cancel=ui.button("Hủy thao tác").clicked(); });
+            });
+            if confirm {
+                if let Some(pending) = self.archive_mutation_confirm.take() {
+                    let batch = crate::search::generation();
+                    let queued = WORKER_TX.get().is_some_and(|tx| {
+                        tx.send(WorkerCmd::MutateArchiveBatch {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            batch,
+                            thread: pending.thread,
+                            group: pending.group,
+                            recall: pending.recall,
+                            messages: pending.messages,
+                        })
+                        .is_ok()
+                    });
+                    if queued {
+                        self.archive_mutation_batch = Some(batch);
+                        self.archive_mutation_results.clear();
+                    } else {
+                        self.drawer_media_batch_status =
+                            "Không gửi được yêu cầu tới worker.".into();
+                    }
+                }
+            } else if cancel {
+                self.archive_mutation_confirm = None;
+            }
+        }
+            });
+    }
+
+    pub(super) fn render_message_details(&mut self, ctx: &egui::Context) {
+        let Some((thread, snapshot)) = self.message_details.clone() else {
+            return;
+        };
+        let current = self
+            .threads
+            .iter()
+            .find(|candidate| candidate.id == thread)
+            .filter(|candidate| self.private_access(&thread, candidate.is_group))
+            .and_then(|candidate| {
+                candidate.messages.iter().find(|message| {
+                    message.id == snapshot.id
+                        && message.client_message_id == snapshot.client_message_id
+                })
+            })
+            .filter(|message| {
+                !crate::message_lifecycle::expired(message, crate::login::unix_now() * 1000)
+            })
+            .cloned();
+        let Some(message) = current else {
+            self.message_details = None;
+            return;
+        };
+        let mut open = true;
+        egui::Window::new("Chi tiết tin nhắn")
+            .id(Id::new("message-details"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .max_width((ctx.screen_rect().width() - 48.0).max(160.0))
+            .show(ctx, |ui| {
+                ui.label(format!("Hội thoại: {thread}"));
+                ui.label(format!(
+                    "ID tin nhắn: {}",
+                    if message.id.is_empty() {
+                        "Chưa có"
+                    } else {
+                        &message.id
+                    }
+                ));
+                ui.label(format!(
+                    "Người gửi: {}",
+                    if message.is_outgoing {
+                        "Bạn"
+                    } else {
+                        &message.sender
+                    }
+                ));
+                ui.label(format!("Thời gian: {}", message.display_time()));
+                let delivery = match message.delivery {
+                    crate::message_model::DeliveryState::Unknown => "Chưa có dữ liệu xác nhận",
+                    crate::message_model::DeliveryState::Pending => "Đang gửi",
+                    crate::message_model::DeliveryState::ServerAccepted => "Máy chủ đã nhận",
+                    crate::message_model::DeliveryState::Delivered => "Đã giao",
+                    crate::message_model::DeliveryState::Read => "Đã đọc",
+                    crate::message_model::DeliveryState::Failed => "Gửi thất bại",
+                    crate::message_model::DeliveryState::DeliveryUnknown => {
+                        "Chưa xác định kết quả gửi"
+                    }
+                };
+                ui.label(format!("Trạng thái: {delivery}"));
+                ui.label("Danh sách người đã nhận/đọc: chưa có dữ liệu xác nhận.");
+                ui.separator();
+                ui.label(crate::message_view::summary(&message));
+            });
+        if !open {
+            self.message_details = None;
+        }
+    }
+
     pub(super) fn render_reactor_details(&mut self, ctx: &egui::Context) {
         let key = Id::new("reaction_details");
         let Some((owner, thread_id, original)) =
@@ -8694,7 +10341,7 @@ impl ZaloGuiApp {
         self.voice_send_after_finish = false;
     }
 
-    pub(super) fn poll_voice_events(&mut self) {
+    pub(super) fn poll_voice_events(&mut self, ctx: &egui::Context) {
         let events = self
             .voice_worker
             .as_ref()
@@ -8741,7 +10388,7 @@ impl ZaloGuiApp {
                             self.voice_binding = None;
                             self.show_toast("Bản ghi quá ngắn để gửi");
                         } else {
-                            self.send_voice_samples(samples, sample_rate, duration);
+                            self.send_voice_samples(ctx, samples, sample_rate, duration);
                         }
                     } else if !samples.is_empty() && duration.as_secs_f32() >= 0.3 {
                         self.recorded_voice_samples = Some((samples, sample_rate, duration));
@@ -8783,7 +10430,16 @@ impl ZaloGuiApp {
         }
     }
 
-    pub(super) fn send_voice_recording(&mut self, thread_id: &str, is_group: bool) {
+    pub(super) fn send_voice_recording(
+        &mut self,
+        ctx: &egui::Context,
+        thread_id: &str,
+        is_group: bool,
+    ) {
+        if self.composer_has_metadata(ctx, thread_id, is_group) {
+            self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho giọng nói; bản ghi và nội dung vẫn được giữ.".into();
+            return;
+        }
         if !self.voice_draft_matches(&self.user_uin, self.account_runtime_id, thread_id, is_group) {
             self.cancel_voice_recording();
             self.status_msg = "Bản ghi âm đã bị hủy do tài khoản hoặc hội thoại thay đổi".into();
@@ -8806,11 +10462,12 @@ impl ZaloGuiApp {
             return;
         }
         let (samples, rate, dur) = self.recorded_voice_samples.take().unwrap();
-        self.send_voice_samples(samples, rate, dur);
+        self.send_voice_samples(ctx, samples, rate, dur);
     }
 
     fn send_voice_samples(
         &mut self,
+        ctx: &egui::Context,
         samples: std::sync::Arc<[f32]>,
         rate: u32,
         dur: std::time::Duration,
@@ -8833,6 +10490,11 @@ impl ZaloGuiApp {
         let Some(binding) = binding else {
             return;
         };
+        if self.composer_has_metadata(ctx, &binding.thread_id, binding.is_group) {
+            self.recorded_voice_samples = Some((samples, rate, dur));
+            self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho giọng nói; bản ghi và nội dung vẫn được giữ.".into();
+            return;
+        }
         let Some(tx) = WORKER_TX.get() else {
             self.show_toast("Không kết nối được bộ xử lý tin nhắn thoại");
             self.recorded_voice_samples = Some((samples, rate, dur));
@@ -8974,6 +10636,67 @@ fn reaction_toggle_intent(message: &ChatMessage, owner: &str, emoji: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn archive_selection_scopes_thread_message_and_attachment_without_delimiter_aliases() {
+        let message = ChatMessage {
+            id: "message:one".into(),
+            client_message_id: "client-one".into(),
+            ..Default::default()
+        };
+        let key = archive_selection_key("photo", "thread:one", &message, "attachment:one");
+        assert_ne!(
+            key,
+            archive_selection_key("photo", "thread:two", &message, "attachment:one")
+        );
+        assert_ne!(
+            key,
+            archive_selection_key("photo", "thread:one", &message, "attachment:two")
+        );
+        let other_message = ChatMessage {
+            id: "one".into(),
+            ..message.clone()
+        };
+        assert_ne!(
+            key,
+            archive_selection_key(
+                "photo",
+                "thread:one:message",
+                &other_message,
+                "attachment:one"
+            )
+        );
+        assert_ne!(
+            key,
+            archive_selection_key("link", "thread:one", &message, "attachment:one")
+        );
+    }
+
+    #[test]
+    fn media_sender_filter_uses_exact_id_and_display_name_search() {
+        let alice = ChatMessage {
+            sender: "Alice Nguyen".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("12345")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let same_name_other_id = ChatMessage {
+            sender: "Alice Nguyen".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("67890")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(media_sender_matches(&alice, "12345"));
+        assert!(media_sender_matches(&alice, "id:12345"));
+        assert!(!media_sender_matches(&same_name_other_id, "id:12345"));
+        assert!(!media_sender_matches(&same_name_other_id, "12345"));
+        assert!(media_sender_matches(&same_name_other_id, "alice"));
+    }
 
     #[test]
     fn test_measured_height_cache_insertion_and_separation() {
@@ -9191,3 +10914,4 @@ mod tests {
         assert!(app.threads[0].unread.mention_ids.contains("m-mention-2"));
     }
 }
+                                                                                                                                                                                                                                         

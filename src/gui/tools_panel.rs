@@ -5,7 +5,6 @@ use super::*;
 pub(super) struct ToolsPanel {
     pub open: bool,
     /// One diagnostics-folder open at a time; cleared by its completion event.
-    pub diagnostics_opening: bool,
     pub loaded_for: String,
     pub config: crate::tools::Preferences,
     pub tasks: Vec<crate::tools::Scheduled>,
@@ -1217,39 +1216,10 @@ impl ZaloGuiApp {
                 });
             }
         }
-
-        ui.separator();
-        ui.label(RichText::new("🔐 Nhật ký & Chẩn đoán E2EE (Thử nghiệm)").strong());
-        ui.label("Xem hoặc xuất nhật ký chẩn đoán giao thức mã hóa đầu cuối (E2EE) đã che thông tin nhạy cảm.");
-        let diag_dir = crate::storage::root().join("diagnostics");
-        ui.horizontal(|ui| {
-            let opening = self.tools.diagnostics_opening;
-            let label = if opening {
-                "⏳ Đang mở thư mục…"
-            } else {
-                "📁 Mở thư mục nhật ký"
-            };
-            if ui.add_enabled(!opening, egui::Button::new(label)).clicked() {
-                // Disk and shell work never runs on the render/input path.
-                self.tools.diagnostics_opening = true;
-                self.status_msg = "Đang mở thư mục chẩn đoán…".into();
-                let dir = diag_dir.clone();
-                let tx = self.event_tx.clone();
-                let context = ui.ctx().clone();
-                std::thread::spawn(move || {
-                    let result = open_diagnostics_dir(&dir, crate::platform::open_folder);
-                    let _ = tx.send(GuiEvent::DiagnosticsFolderOpened(result));
-                    context.request_repaint();
-                });
-            }
-            if ui.button("📋 Sao chép đường dẫn").clicked() {
-                ui.output_mut(|o| o.copied_text = diag_dir.display().to_string());
-                self.status_msg = "Đã sao chép đường dẫn thư mục chẩn đoán".into();
-            }
-        });
     }
 }
 /// Background body of "open diagnostics folder"; every path ends in an explicit outcome.
+#[cfg(test)]
 fn open_diagnostics_dir(
     dir: &std::path::Path,
     open: impl FnOnce(&std::path::Path) -> bool,

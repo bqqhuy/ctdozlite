@@ -1,5 +1,81 @@
 use super::*;
 
+/// Original vector page/fold artwork, shared by attachment cards and archive filters.
+pub(super) fn paint_file_category_icon(
+    painter: &egui::Painter,
+    rect: Rect,
+    category: crate::message_view::FileCategory,
+) {
+    use crate::message_view::FileCategory;
+    let color = match category {
+        FileCategory::Pdf => Color32::from_rgb(226, 65, 63),
+        FileCategory::Word => Color32::from_rgb(49, 115, 214),
+        FileCategory::PowerPoint => Color32::from_rgb(224, 119, 53),
+        FileCategory::Excel => Color32::from_rgb(41, 151, 95),
+        FileCategory::Cad => Color32::from_rgb(156, 88, 202),
+        FileCategory::Other => Color32::from_rgb(116, 132, 150),
+    };
+    let r = rect.shrink(rect.width() * 0.08);
+    let fold = r.width() * 0.28;
+    let points = vec![
+        r.left_top(),
+        Pos2::new(r.right() - fold, r.top()),
+        Pos2::new(r.right(), r.top() + fold),
+        r.right_bottom(),
+        r.left_bottom(),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        points,
+        color.linear_multiply(0.12),
+        Stroke::new(1.4_f32, color),
+    ));
+    painter.line_segment(
+        [
+            Pos2::new(r.right() - fold, r.top()),
+            Pos2::new(r.right() - fold, r.top() + fold),
+        ],
+        Stroke::new(1.2_f32, color),
+    );
+    painter.line_segment(
+        [
+            Pos2::new(r.right() - fold, r.top() + fold),
+            Pos2::new(r.right(), r.top() + fold),
+        ],
+        Stroke::new(1.2_f32, color),
+    );
+    let label = match category {
+        FileCategory::Pdf => "PDF",
+        FileCategory::Word => "W",
+        FileCategory::PowerPoint => "P",
+        FileCategory::Excel => "X",
+        FileCategory::Cad => "CAD",
+        FileCategory::Other => "",
+    };
+    if label.is_empty() {
+        for y in [0.48, 0.65, 0.82] {
+            painter.line_segment(
+                [
+                    Pos2::new(r.left() + r.width() * 0.2, r.top() + r.height() * y),
+                    Pos2::new(r.right() - r.width() * 0.2, r.top() + r.height() * y),
+                ],
+                Stroke::new(1.3_f32, color),
+            );
+        }
+    } else {
+        painter.text(
+            Pos2::new(r.center().x, r.center().y + r.height() * 0.13),
+            egui::Align2::CENTER_CENTER,
+            label,
+            FontId::proportional(if label.len() > 1 {
+                r.width() * 0.31
+            } else {
+                r.width() * 0.48
+            }),
+            color,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat Bubble & Sticker Widget Rendering
 // ---------------------------------------------------------------------------
@@ -627,6 +703,23 @@ pub(super) fn render_message_body(
     };
 
     let trimmed_text = msg.text.trim();
+    if trimmed_text != "[Tin nhắn đã thu hồi]" {
+        if let Some(urgency) = msg
+            .wire_ref
+            .fields
+            .get("specialMsgType")
+            .and_then(serde_json::Value::as_i64)
+        {
+            let label = match urgency {
+                1 => Some("Quan trọng"),
+                2 => Some("Khẩn cấp"),
+                _ => None,
+            };
+            if let Some(label) = label {
+                ui.label(RichText::new(label).strong().color(pal.danger));
+            }
+        }
+    }
     if trimmed_text == "[Tin nhắn đã thu hồi]" {
         ui.label(
             RichText::new(format!("{} Tin nhắn đã được thu hồi", lucide::BAN))
@@ -635,6 +728,56 @@ pub(super) fn render_message_body(
                 .size(13.8),
         );
         return None;
+    }
+
+    if crate::message_view::is_call_log(msg) {
+        let video = crate::message_view::call_log_is_video(msg);
+        let is_missed = trimmed_text.to_ascii_lowercase().contains("nhỡ")
+            || trimmed_text.to_ascii_lowercase().contains("missed")
+            || trimmed_text.to_ascii_lowercase().contains("từ chối");
+        egui::Frame::group(ui.style())
+            .fill(if pal.is_dark {
+                Color32::from_rgb(37, 43, 52)
+            } else {
+                Color32::from_rgb(242, 245, 249)
+            })
+            .rounding(Rounding::same(8.0))
+            .inner_margin(Margin::symmetric(10.0, 8.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if is_missed {
+                            lucide::PHONE_OFF
+                        } else if video {
+                            lucide::VIDEO
+                        } else {
+                            lucide::PHONE_CALL
+                        })
+                        .size(18.0)
+                        .color(if is_missed {
+                            pal.danger
+                        } else {
+                            pal.primary
+                        }),
+                    );
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(crate::message_view::call_label(msg))
+                                .color(text_col)
+                                .strong(),
+                        );
+                        ui.label(RichText::new(msg.display_time()).size(10.5).color(meta_col));
+                    });
+                    if !is_group
+                        && ui
+                            .button(format!("{} Gọi lại", lucide::PHONE_CALL))
+                            .clicked()
+                    {
+                        body_action = Some(BubbleAction::CallAgain { is_video: video });
+                    }
+                });
+            });
+        return body_action;
     }
 
     let sender_label = if msg.is_outgoing {
@@ -768,10 +911,11 @@ pub(super) fn render_message_body(
         return body_action;
     }
     if media.kind == crate::message_view::MediaKind::File {
-        let category = crate::message_view::file_category(&media.name);
-        let category_label = crate::message_view::file_category_label(category);
+        let category = crate::message_view::attachment_file_category(&media, msg);
         ui.horizontal(|ui| {
-            ui.label(RichText::new(category_label).strong().color(text_col));
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 32.0), Sense::hover());
+            paint_file_category_icon(ui.painter(), rect, category);
+            response.on_hover_text(crate::message_view::file_category_label(category));
             ui.add(egui::Label::new(RichText::new(&media.name).color(text_col)).wrap());
         });
         if let Some(url) = media.original {
@@ -904,6 +1048,7 @@ pub(super) fn render_message_body(
                 let _ = tx.send(WorkerCmd::ParseLinkPreview {
                     url: url.clone(),
                     origin: crate::chat::LinkOrigin::Incoming,
+                    thread: None,
                 });
             }
         }
@@ -1412,6 +1557,13 @@ pub(super) fn render_chat_bubble(
                                         ui.spinner();
                                         ui.label(crate::i18n::tr("Đang gửi / chờ tải lên…"));
                                     });
+                                } else if msg.delivery
+                                    == crate::message_model::DeliveryState::DeliveryUnknown
+                                {
+                                    ui.colored_label(
+                                        Color32::from_rgb(190, 120, 20),
+                                        crate::i18n::tr("Chưa xác nhận được trạng thái gửi; kiểm tra hội thoại trước khi gửi lại."),
+                                    ).on_hover_text(&job.error);
                                 }
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
@@ -1592,6 +1744,13 @@ pub(super) fn render_chat_bubble(
                                         ui.spinner();
                                         ui.label(crate::i18n::tr("Đang gửi / chờ tải lên…"));
                                     });
+                                } else if msg.delivery
+                                    == crate::message_model::DeliveryState::DeliveryUnknown
+                                {
+                                    ui.colored_label(
+                                        Color32::from_rgb(190, 120, 20),
+                                        crate::i18n::tr("Chưa xác nhận được trạng thái gửi; kiểm tra hội thoại trước khi gửi lại."),
+                                    ).on_hover_text(&job.error);
                                 }
                             }
                             if show_timestamp && !has_sticker && !is_frameless_photo {
@@ -1659,6 +1818,8 @@ pub(super) enum BubbleAction {
     PinOnServer,
     TogglePin,
     ToggleStar,
+    Details,
+    SaveToDocuments,
     DeleteForMe,
     RecallForEveryone,
     #[allow(dead_code)]
@@ -1712,6 +1873,69 @@ fn copyable_message_payload(msg: &ChatMessage) -> String {
     }
 }
 
+fn message_server_actions_allowed(msg: &ChatMessage) -> bool {
+    !is_system_notice_message(msg)
+        && !crate::message_view::is_call_log(msg)
+        && msg.kind != crate::message_model::MessageKind::Recall
+        && msg.text.trim() != "[Tin nhắn đã thu hồi]"
+        && !matches!(
+            msg.delivery,
+            crate::message_model::DeliveryState::Pending
+                | crate::message_model::DeliveryState::Failed
+                | crate::message_model::DeliveryState::DeliveryUnknown
+        )
+        && crate::chat::server_message_id(msg).is_some()
+}
+
+fn bubble_menu_item(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    enabled: bool,
+    destructive: bool,
+) -> egui::Response {
+    let text = RichText::new(format!("{icon}  {label}"));
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(if destructive {
+            text.color(Color32::from_rgb(220, 60, 60))
+        } else {
+            text
+        }),
+    )
+}
+
+#[cfg(test)]
+mod bubble_capability_tests {
+    use super::*;
+    #[test]
+    fn local_call_recalled_pending_and_failed_rows_have_no_server_actions() {
+        let mut message = ChatMessage {
+            id: "42".into(),
+            text: "Hello".into(),
+            ..Default::default()
+        };
+        assert!(message_server_actions_allowed(&message));
+        for delivery in [
+            crate::message_model::DeliveryState::Pending,
+            crate::message_model::DeliveryState::Failed,
+            crate::message_model::DeliveryState::DeliveryUnknown,
+        ] {
+            message.delivery = delivery;
+            assert!(!message_server_actions_allowed(&message));
+        }
+        message.delivery = Default::default();
+        message.kind = crate::message_model::MessageKind::Recall;
+        assert!(!message_server_actions_allowed(&message));
+        message.kind = Default::default();
+        message.id = "call_42".into();
+        message.history_source = Some(serde_json::json!({"type":"call_log","video":false}));
+        assert!(!message_server_actions_allowed(&message));
+        message.id = "sys_42".into();
+        assert!(!message_server_actions_allowed(&message));
+    }
+}
+
 /// Right-click menu on a chat bubble: reactions, reply, forward, copy, delete-for-me.
 pub(super) fn bubble_context_menu(
     ui: &mut egui::Ui,
@@ -1737,210 +1961,234 @@ pub(super) fn bubble_context_menu(
     let mut action = None;
 
     resp.context_menu(|ui| {
-        ui.set_min_width(210.0);
-        if is_group
-            && !msg.is_outgoing
-            && msg.wire_ref.sender.as_ref().is_some_and(|v| {
-                v.as_u64().is_some()
-                    || v.as_str()
-                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            })
-            && ui
-                .button(crate::i18n::tr("@ Nhắc đến người gửi (trong nhóm)"))
-                .clicked()
-        {
-            action = Some(BubbleAction::Mention);
-            ui.close_menu();
-        }
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(4.0, 0.0);
-            for &(code, key, tooltip) in &REACTION_LIST {
-                if let Some(tex) = emoji_textures.get(key) {
-                    let img = egui::Image::new(tex).fit_to_exact_size(Vec2::splat(24.0));
-                    let btn = egui::ImageButton::new(img).rounding(Rounding::same(6.0));
-                    if ui.add(btn).on_hover_text(tooltip).clicked() {
-                        action = Some(BubbleAction::React(code));
-                        ui.close_menu();
-                    }
-                } else if ui.button(RichText::new(code).size(18.0)).clicked() {
-                    action = Some(BubbleAction::React(code));
-                    ui.close_menu();
-                }
-            }
-        });
-        ui.separator();
-        if (msg.link_src.as_deref() == Some("Hình ảnh Zalo")
-            || msg.text.trim() == "[Hình ảnh]"
-            || msg.text.trim().starts_with("[Hình ảnh] "))
-            && msg
-                .link_thumb
-                .as_deref()
-                .or(msg.link_url.as_deref())
-                .map(|u| !u.is_empty())
-                .unwrap_or(false)
-        {
-            let thumb_url = msg
-                .link_thumb
-                .as_deref()
-                .or(msg.link_url.as_deref())
-                .unwrap_or_default();
-            if ui
-                .button(format!("{} Xem ảnh phóng to", lucide::SEARCH))
-                .clicked()
-            {
-                action = Some(BubbleAction::OpenImagePopup {
-                    tex_key: format!("thumb_{}", crate::crypto::md5_hex(thumb_url)),
-                    full_url: msg
-                        .link_url
-                        .clone()
-                        .unwrap_or_else(|| thumb_url.to_string()),
-                    title: msg
-                        .link_title
-                        .clone()
-                        .unwrap_or_else(|| "Hình ảnh".to_string()),
-                    sender: if msg.is_outgoing {
-                        "Bạn".to_string()
-                    } else {
-                        msg.sender.clone()
-                    },
-                    time: msg.display_time(),
-                });
-                ui.close_menu();
-            }
-        }
-        if ui.button(crate::i18n::tr("Trả lời")).clicked() {
-            action = Some(BubbleAction::Reply);
-            ui.close_menu();
-        }
+        ui.set_min_width(210.0_f32.min(ui.ctx().screen_rect().width() - 24.0));
+        let server_actions = message_server_actions_allowed(msg);
+        let call = crate::message_view::is_call_log(msg);
+        let share = !protected && !call && server_actions && crate::chat::can_forward_message(msg);
         let link_for_copy = msg
             .link_url
             .clone()
             .or_else(|| crate::chat::extract_first_url(&msg.text));
-        if let Some(link) = link_for_copy.as_deref() {
-            if ui.button(crate::i18n::tr("Copy link")).clicked() {
-                action = Some(BubbleAction::CopyLink(link.to_owned()));
-                ui.close_menu();
-            }
+        if bubble_menu_item(ui, lucide::MESSAGE_SQUARE, "Trả lời", server_actions, false).clicked()
+        {
+            action = Some(BubbleAction::Reply);
+            ui.close_menu();
         }
-        if ui
-            .add_enabled(
-                !protected && crate::chat::can_forward_message(msg),
-                egui::Button::new(crate::i18n::tr("Chuyển tiếp")),
-            )
+        if bubble_menu_item(ui, lucide::SEND, "Chia sẻ…", share, false)
             .on_disabled_hover_text(
-                "Chưa hỗ trợ chuyển tiếp loại tin này; hãy tải và gửi lại tệp gốc",
+                "Nội dung chưa được máy chủ xác nhận, đã thu hồi hoặc không cho phép chia sẻ.",
             )
             .clicked()
         {
             action = Some(BubbleAction::Forward);
             ui.close_menu();
         }
-        if is_group
-            && ui
-                .button(crate::i18n::tr("Ghim trên mọi thiết bị"))
-                .clicked()
-        {
-            action = Some(BubbleAction::PinOnServer);
-            ui.close_menu();
-        }
-        if ui
-            .button(crate::i18n::tr("Tạo nhắc hẹn trên Zalo…"))
-            .clicked()
-        {
-            action = Some(BubbleAction::Reminder);
-            ui.close_menu();
-        }
-        if !protected
-            && !msg.is_e2ee
-            && msg.kind != crate::message_model::MessageKind::Recall
-            && !msg.text.trim().is_empty()
-            && !msg.text.trim().starts_with('[')
-            && ui
-                .button(format!("{} Dịch tin nhắn (Thử nghiệm)", lucide::GLOBE))
-                .clicked()
-        {
-            action = Some(BubbleAction::TranslateMessage {
-                msg_id: msg.id.clone(),
-                text: msg.text.clone(),
-            });
-            ui.close_menu();
-        }
-        let voice_url = msg.link_url.as_deref().unwrap_or_default();
-        let is_voice_msg = msg.kind == crate::message_model::MessageKind::Voice
-            || msg.text.starts_with("[Tin nhắn thoại]");
-        if !protected
-            && !msg.is_e2ee
-            && msg.kind != crate::message_model::MessageKind::Recall
-            && is_voice_msg
-            && !voice_url.is_empty()
-            && ui
-                .button(format!("{} Chuyển giọng nói thành văn bản", lucide::MIC))
-                .clicked()
-        {
-            action = Some(BubbleAction::TranscribeVoice {
-                msg_id: msg.id.clone(),
-                voice_url: voice_url.to_string(),
-            });
-            ui.close_menu();
-        }
-        if ui
-            .add_enabled(
-                !protected,
-                egui::Button::new(crate::i18n::tr("Copy tin nhắn")),
-            )
-            .clicked()
+        if let Some(link) = link_for_copy.as_ref() {
+            if bubble_menu_item(ui, lucide::LINK, "Copy link", !protected && !call, false).clicked()
+            {
+                action = Some(BubbleAction::CopyLink(link.clone()));
+                ui.close_menu();
+            }
+        } else if bubble_menu_item(
+            ui,
+            lucide::COPY,
+            "Copy nội dung",
+            !protected && !call,
+            false,
+        )
+        .clicked()
         {
             ui.ctx().copy_text(copyable_message_payload(msg));
             ui.close_menu();
         }
-        if ui
-            .button(if msg.is_pinned {
-                "Bỏ ghim trên máy này"
-            } else {
-                "Ghim trên máy này"
-            })
+        if is_group {
+            if bubble_menu_item(
+                ui,
+                lucide::PIN,
+                "Ghim tin nhắn trên máy chủ…",
+                server_actions,
+                false,
+            )
             .clicked()
+            {
+                action = Some(BubbleAction::PinOnServer);
+                ui.close_menu();
+            }
+        } else if bubble_menu_item(
+            ui,
+            lucide::PIN,
+            if msg.is_pinned {
+                "Bỏ ghim tin trên máy này"
+            } else {
+                "Ghim tin trên máy này"
+            },
+            !is_system_notice_message(msg),
+            false,
+        )
+        .clicked()
         {
             action = Some(BubbleAction::TogglePin);
             ui.close_menu();
         }
-        if ui
-            .button(if msg.is_starred {
+        if bubble_menu_item(
+            ui,
+            lucide::STAR,
+            if msg.is_starred {
                 "Bỏ đánh dấu tin nhắn"
             } else {
                 "Đánh dấu tin nhắn"
-            })
-            .clicked()
+            },
+            true,
+            false,
+        )
+        .clicked()
         {
             action = Some(BubbleAction::ToggleStar);
             ui.close_menu();
         }
-        ui.separator();
-        if msg.is_outgoing
-            && msg.text.trim() != "[Tin nhắn đã thu hồi]"
-            && ui
-                .button(
-                    RichText::new(crate::i18n::tr("Thu hồi với mọi người"))
-                        .color(Color32::from_rgb(249, 115, 22)),
-                )
-                .clicked()
+        if bubble_menu_item(ui, lucide::CHECK_CHECK, "Chọn nhiều tin nhắn", true, false).clicked()
         {
-            action = Some(BubbleAction::RecallForEveryone);
+            action = Some(BubbleAction::EnterSelectionMode);
             ui.close_menu();
         }
-        if ui
-            .button(
-                RichText::new(crate::i18n::tr("Xóa chỉ ở phía tôi"))
-                    .color(Color32::from_rgb(220, 60, 60)),
+        if bubble_menu_item(ui, lucide::FILE_TEXT, "Xem chi tiết", true, false).clicked() {
+            action = Some(BubbleAction::Details);
+            ui.close_menu();
+        }
+        ui.menu_button(format!("{}  Tùy chọn khác", lucide::SETTINGS), |ui| {
+            if bubble_menu_item(ui, lucide::CLOUD, "Lưu vào My Documents…", share, false).clicked()
+            {
+                action = Some(BubbleAction::SaveToDocuments);
+                ui.close_menu();
+            }
+            if call && bubble_menu_item(ui, lucide::PHONE_CALL, "Gọi lại", true, false).clicked()
+            {
+                action = Some(BubbleAction::CallAgain {
+                    is_video: crate::message_view::call_log_is_video(msg),
+                });
+                ui.close_menu();
+            }
+            if is_group
+                && !msg.is_outgoing
+                && server_actions
+                && crate::chat::sidebar_sender_id(msg).is_some()
+                && bubble_menu_item(ui, lucide::USER, "Nhắc đến người gửi", true, false).clicked()
+            {
+                action = Some(BubbleAction::Mention);
+                ui.close_menu();
+            }
+            if bubble_menu_item(
+                ui,
+                lucide::BELL,
+                "Tạo nhắc hẹn trên Zalo…",
+                server_actions,
+                false,
             )
             .clicked()
+            {
+                action = Some(BubbleAction::Reminder);
+                ui.close_menu();
+            }
+            if !protected
+                && !msg.is_e2ee
+                && server_actions
+                && !msg.text.trim().is_empty()
+                && !msg.text.starts_with('[')
+                && bubble_menu_item(ui, lucide::GLOBE, "Dịch tin nhắn (Thử nghiệm)", true, false)
+                    .clicked()
+            {
+                action = Some(BubbleAction::TranslateMessage {
+                    msg_id: msg.id.clone(),
+                    text: msg.text.clone(),
+                });
+                ui.close_menu();
+            }
+            if !protected
+                && !msg.is_e2ee
+                && server_actions
+                && msg.kind == crate::message_model::MessageKind::Voice
+            {
+                if let Some(url) = msg.link_url.as_ref() {
+                    if bubble_menu_item(
+                        ui,
+                        lucide::MIC,
+                        "Chuyển giọng nói thành văn bản",
+                        true,
+                        false,
+                    )
+                    .clicked()
+                    {
+                        action = Some(BubbleAction::TranscribeVoice {
+                            msg_id: msg.id.clone(),
+                            voice_url: url.clone(),
+                        });
+                        ui.close_menu();
+                    }
+                }
+            }
+            if is_group
+                && bubble_menu_item(
+                    ui,
+                    lucide::PIN,
+                    if msg.is_pinned {
+                        "Bỏ ghim trên máy này"
+                    } else {
+                        "Ghim trên máy này"
+                    },
+                    !is_system_notice_message(msg),
+                    false,
+                )
+                .clicked()
+            {
+                action = Some(BubbleAction::TogglePin);
+                ui.close_menu();
+            }
+            if !call && server_actions {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    for &(code, key, tooltip) in &REACTION_LIST {
+                        if let Some(texture) = emoji_textures.get(key) {
+                            if ui
+                                .add(egui::ImageButton::new(
+                                    egui::Image::new(texture).fit_to_exact_size(Vec2::splat(22.0)),
+                                ))
+                                .on_hover_text(tooltip)
+                                .clicked()
+                            {
+                                action = Some(BubbleAction::React(code));
+                                ui.close_menu();
+                            }
+                        } else if ui.button(code).on_hover_text(tooltip).clicked() {
+                            action = Some(BubbleAction::React(code));
+                            ui.close_menu();
+                        }
+                    }
+                });
+            }
+            if msg.is_outgoing
+                && server_actions
+                && bubble_menu_item(ui, lucide::LOG_OUT, "Thu hồi với mọi người…", true, true)
+                    .clicked()
+            {
+                action = Some(BubbleAction::RecallForEveryone);
+                ui.close_menu();
+            }
+        });
+        ui.separator();
+        if bubble_menu_item(
+            ui,
+            lucide::X,
+            if call && msg.id.starts_with("call_") {
+                "Xóa bản ghi cuộc gọi trên máy này…"
+            } else {
+                "Xóa chỉ ở phía tôi…"
+            },
+            true,
+            true,
+        )
+        .clicked()
         {
             action = Some(BubbleAction::DeleteForMe);
-            ui.close_menu();
-        }
-        ui.separator();
-        if ui.button(crate::i18n::tr("Chọn nhiều tin")).clicked() {
-            action = Some(BubbleAction::EnterSelectionMode);
             ui.close_menu();
         }
     });

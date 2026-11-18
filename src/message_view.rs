@@ -2,6 +2,60 @@
 use crate::chat::{ChatMessage, Thread};
 use serde_json::Value;
 
+/// Native PC recommended-call cards carry seconds, not signalling milliseconds.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CallDetails {
+    pub outgoing: bool,
+    pub duration_seconds: u64,
+}
+pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
+    fn parse(value: &Value, depth: usize) -> Option<CallDetails> {
+        if depth > 5 {
+            return None;
+        }
+        let decoded = json_value(value.clone());
+        let outgoing = match decoded.get("action").and_then(Value::as_str) {
+            Some("recommened.calling") => Some(true),
+            Some("recommened.receivecall") => Some(false),
+            _ => None,
+        };
+        if let Some(outgoing) = outgoing {
+            return Some(CallDetails {
+                outgoing,
+                duration_seconds: decoded.get("duration").and_then(Value::as_u64).unwrap_or(0),
+            });
+        }
+        decoded
+            .get("content")
+            .and_then(|content| parse(content, depth + 1))
+    }
+    m.history_source
+        .as_ref()
+        .and_then(|v| parse(v, 0))
+        .or_else(|| m.wire_ref.fields.get("content").and_then(|v| parse(v, 0)))
+}
+
+pub fn call_label(m: &ChatMessage) -> String {
+    if let Some(details) = call_details(m) {
+        let direction = if details.outgoing {
+            "Cuộc gọi đi"
+        } else {
+            "Cuộc gọi đến"
+        };
+        let seconds = details.duration_seconds;
+        return if seconds > 0 {
+            format!("{direction} ({}:{:02})", seconds / 60, seconds % 60)
+        } else {
+            direction.into()
+        };
+    }
+    if m.text.trim().is_empty() {
+        "Cuộc gọi".into()
+    } else {
+        m.text.trim().into()
+    }
+}
+
 fn call_type(s: &str) -> bool {
     matches!(
         s.to_ascii_lowercase().as_str(),
@@ -9,6 +63,15 @@ fn call_type(s: &str) -> bool {
     )
 }
 pub fn is_call_log(m: &ChatMessage) -> bool {
+    let is_plain_text = m
+        .wire_ref
+        .original_type
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "chat.text" | "text"));
+    if !is_plain_text && call_details(m).is_some() {
+        return true;
+    }
     if m.id.starts_with("call_")
         || m.wire_ref
             .original_type
@@ -70,6 +133,15 @@ pub fn is_call_log(m: &ChatMessage) -> bool {
             .is_some_and(|v| contains_call(v, 0))
 }
 
+pub fn call_log_is_video(m: &ChatMessage) -> bool {
+    m.text.to_ascii_lowercase().contains("video")
+        || m.history_source
+            .as_ref()
+            .and_then(|value| value.get("video"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn json_value(v: Value) -> Value {
     if let Some(s) = v
         .as_str()
@@ -91,11 +163,7 @@ pub fn summary(m: &ChatMessage) -> String {
     if is_call_log(m) {
         // Keep call history visible in previews; older builds erased these rows
         // during merge, which made the feature appear unsupported.
-        return if m.text.trim().is_empty() {
-            "[Cuộc gọi]".into()
-        } else {
-            m.text.trim().to_owned()
-        };
+        return call_label(m);
     }
     if m.text == "[Tin nhắn đã thu hồi]" {
         return m.text.clone();
@@ -320,7 +388,25 @@ pub fn file_category(name: &str) -> FileCategory {
     // Attachment names may be CDN URLs with query parameters or fragments.
     // Classify the filename portion only so the shared resolver is stable across
     // bubble, drawer, and filter renderers.
-    let clean_name = name.split(['?', '#']).next().unwrap_or(name).trim();
+    let parsed = reqwest::Url::parse(name).ok();
+    let decoded_path = parsed.as_ref().map(|url| {
+        let encoded = format!("filename={}", url.path().replace('+', "%2B"));
+        reqwest::Url::parse(&format!("https://classification.invalid/?{encoded}"))
+            .ok()
+            .and_then(|url| {
+                url.query_pairs()
+                    .next()
+                    .map(|(_, value)| value.into_owned())
+            })
+            .unwrap_or_default()
+    });
+    let clean_name = decoded_path
+        .as_deref()
+        .unwrap_or(name)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(name)
+        .trim();
     let ext = clean_name
         .rsplit_once('.')
         .map(|(_, ext)| ext.trim().to_ascii_lowercase())
@@ -344,6 +430,104 @@ pub fn file_category_label(category: FileCategory) -> &'static str {
         FileCategory::Cad => "CAD",
         FileCategory::Other => "Tệp",
     }
+}
+
+fn mime_file_category(mime: &str) -> FileCategory {
+    match mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "application/pdf" => FileCategory::Pdf,
+        "application/msword"
+        | "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            FileCategory::Word
+        }
+        "application/vnd.ms-powerpoint"
+        | "application/vnd.openxmlformats-officedocument.presentationml.presentation" => {
+            FileCategory::PowerPoint
+        }
+        "application/vnd.ms-excel"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            FileCategory::Excel
+        }
+        "application/acad" | "application/x-acad" | "application/dwg" | "image/vnd.dwg"
+        | "image/vnd.dxf" | "application/dxf" => FileCategory::Cad,
+        _ => FileCategory::Other,
+    }
+}
+
+/// One UI resolver: explicit recognized filename, metadata filename/MIME, then URL path.
+/// Conflicts prefer a recognized filename; this classification never validates file contents.
+pub fn attachment_file_category(media: &Media, message: &ChatMessage) -> FileCategory {
+    let named = file_category(&media.name);
+    if named != FileCategory::Other {
+        return named;
+    }
+    fn metadata(value: &Value, depth: u8) -> FileCategory {
+        if depth > 4 {
+            return FileCategory::Other;
+        }
+        if let Some(text) = value
+            .as_str()
+            .filter(|text| text.len() <= 65536 && text.trim_start().starts_with('{'))
+        {
+            return serde_json::from_str::<Value>(text)
+                .ok()
+                .map(|value| metadata(&value, depth + 1))
+                .unwrap_or(FileCategory::Other);
+        }
+        for name in ["fileName", "filename", "name", "title"] {
+            if let Some(name) = value.get(name).and_then(Value::as_str) {
+                let category = file_category(name);
+                if category != FileCategory::Other {
+                    return category;
+                }
+            }
+        }
+        for name in [
+            "mimeType",
+            "mimetype",
+            "mime",
+            "contentType",
+            "content_type",
+        ] {
+            if let Some(mime) = value.get(name).and_then(Value::as_str) {
+                let category = mime_file_category(mime);
+                if category != FileCategory::Other {
+                    return category;
+                }
+            }
+        }
+        for key in ["params", "content", "data", "msgInfo", "attachment", "meta"] {
+            if let Some(child) = value.get(key) {
+                let category = metadata(child, depth + 1);
+                if category != FileCategory::Other {
+                    return category;
+                }
+            }
+        }
+        FileCategory::Other
+    }
+    for source in message
+        .history_source
+        .iter()
+        .chain(message.wire_ref.fields.get("content"))
+        .chain(message.wire_ref.fields.get("msgInfo"))
+    {
+        let category = metadata(source, 0);
+        if category != FileCategory::Other {
+            return category;
+        }
+    }
+    media
+        .original
+        .as_deref()
+        .map(file_category)
+        .unwrap_or(FileCategory::Other)
 }
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Media {
@@ -721,9 +905,78 @@ pub fn media(m: &ChatMessage) -> Media {
     out
 }
 
+/// Project each retained attachment without replacing the original parent message.
+/// Phone-history `meta.attachsList` is already retained by chat hydration; this
+/// expands that existing payload and does not infer a new server contract.
+pub(crate) fn archive_media_items(message: &ChatMessage) -> Vec<Media> {
+    let attachments = message
+        .history_source
+        .as_ref()
+        .and_then(|v| v.pointer("/meta/attachsList"))
+        .and_then(Value::as_array);
+    let Some(attachments) = attachments.filter(|a| a.len() > 1) else {
+        return vec![media(message)];
+    };
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for attachment in attachments.iter().take(100) {
+        let mut projected = message.clone();
+        projected.history_source = Some(attachment.clone());
+        projected.wire_ref.fields.remove("renewed_media");
+        projected
+            .wire_ref
+            .fields
+            .insert("content".into(), attachment.clone());
+        projected.wire_ref.fields.remove("msgInfo");
+        projected.link_url = None;
+        projected.link_thumb = None;
+        projected.link_title = None;
+        let item = media(&projected);
+        if item
+            .original
+            .as_ref()
+            .is_some_and(|url| seen.insert(url.clone()))
+        {
+            items.push(item);
+        }
+    }
+    if items.is_empty() {
+        vec![media(message)]
+    } else {
+        items
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_multiple_attachments_keep_each_url_name_and_original_parent() {
+        let message = ChatMessage {
+            id: "parent-one".into(),
+            kind: crate::message_model::MessageKind::File,
+            history_source: Some(serde_json::json!({"meta":{"attachsList":[
+                {"fileUrl":"https://example.invalid/a.pdf","fileName":"Báo cáo.pdf"},
+                {"fileUrl":"https://example.invalid/b.docx","fileName":"Hợp đồng.docx"}
+            ]}})),
+            ..Default::default()
+        };
+        let snapshot = serde_json::to_value(&message).unwrap();
+        let items = archive_media_items(&message);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "Báo cáo.pdf");
+        assert_eq!(items[1].name, "Hợp đồng.docx");
+        assert_eq!(
+            items[0].original.as_deref(),
+            Some("https://example.invalid/a.pdf")
+        );
+        assert_eq!(
+            items[1].original.as_deref(),
+            Some("https://example.invalid/b.docx")
+        );
+        assert_eq!(serde_json::to_value(&message).unwrap(), snapshot);
+    }
+
     #[test]
     fn reaction_activity_replaces_preview_until_a_newer_message_arrives() {
         let mut thread = Thread {
@@ -749,6 +1002,29 @@ mod tests {
         assert!(preview(&thread).contains("Tin mới"));
     }
     #[test]
+    fn native_recommended_call_metadata_preserves_direction_and_seconds() {
+        let mut message = ChatMessage {
+            history_source: Some(
+                serde_json::json!({"msgType":"chat.recommended", "content": {
+                    "action":"recommened.receivecall", "duration":125, "title":"Cuộc gọi đến"
+                }}),
+            ),
+            ..Default::default()
+        };
+        assert!(is_call_log(&message));
+        assert_eq!(
+            call_details(&message),
+            Some(CallDetails {
+                outgoing: false,
+                duration_seconds: 125
+            })
+        );
+        assert_eq!(call_label(&message), "Cuộc gọi đến (2:05)");
+        message.wire_ref.original_type = Some(serde_json::json!("chat.text"));
+        assert!(!is_call_log(&message));
+    }
+
+    #[test]
     fn call_provenance_is_hidden_but_ordinary_text_is_preserved() {
         let mut m = ChatMessage {
             text: "Cuộc gọi".into(),
@@ -757,6 +1033,22 @@ mod tests {
         assert!(!is_call_log(&m));
         m.id = "call_fixture".into();
         assert!(is_call_log(&m));
+    }
+
+    #[test]
+    fn call_log_video_flag_uses_text_or_wire_metadata() {
+        let text_video = ChatMessage {
+            id: "call_video".into(),
+            text: "📹 Cuộc gọi video đi (12s)".into(),
+            ..Default::default()
+        };
+        assert!(call_log_is_video(&text_video));
+        let voice = ChatMessage {
+            id: "call_voice".into(),
+            text: "📞 Cuộc gọi đi (12s)".into(),
+            ..Default::default()
+        };
+        assert!(!call_log_is_video(&voice));
     }
 
     #[test]
@@ -1055,5 +1347,45 @@ mod media_url_tests {
         assert_eq!(file_category("report.PDF?download=1"), FileCategory::Pdf);
         assert_eq!(file_category("plan.dwg#preview"), FileCategory::Cad);
         assert_eq!(file_category("no-extension"), FileCategory::Other);
+    }
+
+    #[test]
+    fn attachment_category_uses_filename_then_metadata_then_url_without_io() {
+        let mut media = Media {
+            name: "Bản vẽ.DWG".into(),
+            original: Some("https://example.com/file.pdf?token=fake".into()),
+            ..Default::default()
+        };
+        let mut message = ChatMessage {
+            history_source: Some(serde_json::json!({"params":{"mimeType":"application/pdf"}})),
+            ..Default::default()
+        };
+        assert_eq!(
+            attachment_file_category(&media, &message),
+            FileCategory::Cad
+        );
+        media.name = "Không có đuôi".into();
+        assert_eq!(
+            attachment_file_category(&media, &message),
+            FileCategory::Pdf
+        );
+        message.history_source = Some(
+            serde_json::json!({"params":{"fileName":"báo cáo.DOCX","mimeType":"application/pdf"}}),
+        );
+        assert_eq!(
+            attachment_file_category(&media, &message),
+            FileCategory::Word
+        );
+        message.history_source = None;
+        media.original = Some("https://example.com/report%2EXLSX?download=1".into());
+        assert_eq!(
+            attachment_file_category(&media, &message),
+            FileCategory::Excel
+        );
+        media.original = Some("https://example.com/archive.zip".into());
+        assert_eq!(
+            attachment_file_category(&media, &message),
+            FileCategory::Other
+        );
     }
 }

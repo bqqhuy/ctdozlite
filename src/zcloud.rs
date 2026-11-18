@@ -6,8 +6,131 @@
 
 use crate::session::Session;
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+
+/// Server-reported usage for the account's My Documents storage, in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    pub usage: u64,
+    pub quota: u64,
+}
+
+fn decode_usage_response(key: &[u8], encoded: &str) -> Result<String> {
+    let mut bytes = zeroize::Zeroizing::new(
+        B64.decode(encoded)
+            .context("Mã dung lượng My Documents không hợp lệ")?,
+    );
+    anyhow::ensure!(
+        bytes.len() >= 32 && bytes.len() % 16 == 0,
+        "Dữ liệu dung lượng My Documents bị thiếu"
+    );
+    let (iv, ciphertext) = bytes.split_at_mut(16);
+    let plaintext = match key.len() {
+        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)?
+            .decrypt_padded_mut::<Pkcs7>(ciphertext),
+        32 => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)?
+            .decrypt_padded_mut::<Pkcs7>(ciphertext),
+        _ => anyhow::bail!("Khóa dung lượng My Documents không hợp lệ"),
+    }
+    .map_err(|_| anyhow::anyhow!("Không giải mã được dung lượng My Documents"))?;
+    Ok(std::str::from_utf8(plaintext)
+        .context("Dữ liệu dung lượng My Documents không phải UTF-8")?
+        .to_owned())
+}
+
+/// Parse only explicit nonnegative byte counts; unknown quota is never displayed as zero.
+pub fn parse_my_documents_usage(value: &Value) -> Result<Usage> {
+    let bytes = |field: &Value| {
+        field
+            .as_u64()
+            .or_else(|| field.as_str()?.parse::<u64>().ok())
+    };
+    let quota = value
+        .get("quota")
+        .and_then(bytes)
+        .context("Máy chủ chưa cung cấp hạn mức My Documents hợp lệ")?;
+    anyhow::ensure!(
+        quota > 0,
+        "Máy chủ chưa cung cấp hạn mức My Documents hợp lệ"
+    );
+    let usage = value
+        .pointer("/service_usage/my_cloud")
+        .or_else(|| value.get("usage"))
+        .and_then(bytes)
+        .context("Máy chủ chưa cung cấp dung lượng đã dùng My Documents hợp lệ")?;
+    Ok(Usage { usage, quota })
+}
+
+/// Read the PC My Documents quota using its dedicated viewer credential and encryption key.
+/// Parity: PC 26.11.12 `tP1L.getUsageMyCloud`, evidence in re-notes/45-map19-21-29.md.
+pub async fn fetch_my_documents_usage(s: &Session) -> Result<Usage> {
+    anyhow::ensure!(
+        s.is_active() && s.login.is_some(),
+        "Cần đăng nhập để xem My Documents"
+    );
+    let auth_url = format!(
+        "{}/api/getCloudViewerKey?{}",
+        s.domains.auth,
+        s.common_params()
+    );
+    let auth_response = s.get(&auth_url).await?;
+    let auth_response = s.maybe_decrypt(auth_response, s.session_key_bytes()).await;
+    let mut credentials = crate::api_response::checked_data(auth_response)?;
+    let take_secret = |value: &mut Value, name: &str| -> Result<zeroize::Zeroizing<String>> {
+        match value.as_object_mut().and_then(|fields| fields.remove(name)) {
+            Some(Value::String(secret)) if !secret.is_empty() && secret.len() <= 4096 => {
+                Ok(zeroize::Zeroizing::new(secret))
+            }
+            _ => anyhow::bail!("Máy chủ chưa cấp khóa dung lượng My Documents hợp lệ"),
+        }
+    };
+    let viewer_key = take_secret(&mut credentials, "viewer_key")?;
+    let enk = take_secret(&mut credentials, "enk")?;
+    let key = zeroize::Zeroizing::new(
+        B64.decode(enk.as_bytes())
+            .context("Khóa dung lượng My Documents không hợp lệ")?,
+    );
+    anyhow::ensure!(
+        matches!(key.len(), 16 | 32),
+        "Khóa dung lượng My Documents không hợp lệ"
+    );
+    let mut usage_url = s.resolve_service_url("zcloud", "/cloudmedia/info/pc/v1/usage-mycloud");
+    usage_url.push('?');
+    usage_url.push_str(&s.common_params());
+    let response = s.get_cloud_with_key(&usage_url, &viewer_key).await?;
+    let code = response
+        .get("error_code")
+        .and_then(crate::api_response::integer)
+        .context("Thiếu xác nhận dung lượng My Documents")?;
+    anyhow::ensure!(
+        code == 0,
+        "Máy chủ từ chối xem dung lượng My Documents ({code})"
+    );
+    let data = response
+        .get("data")
+        .context("Thiếu dữ liệu dung lượng My Documents")?;
+    // The PC decrypts this envelope with the cloud-specific `enk`, never the login key.
+    let decoded = if let Some(ciphertext) = data.as_str() {
+        anyhow::ensure!(
+            ciphertext.len() <= 1024 * 1024,
+            "Dữ liệu dung lượng My Documents vượt giới hạn"
+        );
+        let plaintext = zeroize::Zeroizing::new(
+            decode_usage_response(&key, ciphertext)
+                .context("Không giải mã được dung lượng My Documents")?,
+        );
+        serde_json::from_str::<Value>(&plaintext)
+            .context("Không đọc được dung lượng My Documents")?
+    } else {
+        data.clone()
+    };
+    let data = crate::api_response::data(decoded, 1024 * 1024, false)?;
+    anyhow::ensure!(s.is_active(), "Phiên làm việc đã đóng");
+    parse_my_documents_usage(&data)
+}
 
 /// Status of a media file on zCloud.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +324,56 @@ pub async fn get_cloud_download_urls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn my_documents_usage_never_fabricates_missing_or_invalid_quota() {
+        assert_eq!(
+            parse_my_documents_usage(
+                &json!({"quota":100,"usage":80,"service_usage":{"my_cloud":37}})
+            )
+            .unwrap(),
+            Usage {
+                usage: 37,
+                quota: 100
+            }
+        );
+        assert_eq!(
+            parse_my_documents_usage(&json!({"quota":"100","usage":"0"})).unwrap(),
+            Usage {
+                usage: 0,
+                quota: 100
+            }
+        );
+        assert_eq!(
+            parse_my_documents_usage(&json!({"quota":100,"usage":130}))
+                .unwrap()
+                .usage,
+            130
+        );
+        for invalid in [
+            json!({"usage":0}),
+            json!({"quota":0,"usage":0}),
+            json!({"quota":100}),
+            json!({"quota":100,"usage":-1}),
+            json!({"quota":100,"usage":1.5}),
+            json!({"quota":100,"usage":80,"service_usage":{"my_cloud":"bad"}}),
+        ] {
+            assert!(parse_my_documents_usage(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn cloud_usage_decrypts_iv_prefixed_cbc_with_cloud_key() {
+        // Independent Windows .NET AES-CBC/PKCS7 vector: key 00..1f, IV 10..1f.
+        let encoded = "EBESExQVFhcYGRobHB0eH+j923ZM45Jlv4kMkXXg49E5eckD6b2sc9FQE8FVW4ke";
+        let key: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            decode_usage_response(&key, encoded).unwrap(),
+            r#"{"usage":37,"quota":100}"#
+        );
+        assert!(decode_usage_response(&[0; 32], encoded).is_err());
+        assert!(decode_usage_response(&key, "AQID").is_err());
+    }
 
     #[test]
     fn test_parse_cloud_viewer_key() {

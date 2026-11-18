@@ -1,5 +1,86 @@
 use super::*;
 
+fn mark_preview_attempt(ctx: &egui::Context, key: Id, url: &str, edit: std::time::Instant) -> bool {
+    ctx.data_mut(|data| {
+        if data
+            .get_temp::<(String, std::time::Instant)>(key)
+            .is_some_and(|(previous, at)| previous == url && at == edit)
+        {
+            return false;
+        }
+        data.insert_temp(key, (url.to_owned(), edit));
+        true
+    })
+}
+
+#[cfg(test)]
+mod preview_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_failed_draft_only_attempts_once_until_edited_or_url_changes() {
+        let ctx = egui::Context::default();
+        let key = Id::new("fixture-preview");
+        let edit = std::time::Instant::now();
+        assert!(mark_preview_attempt(
+            &ctx,
+            key,
+            "https://example.invalid/one",
+            edit
+        ));
+        // A failed worker response clears the loading set, but not this draft attempt.
+        for _ in 0..20 {
+            assert!(!mark_preview_attempt(
+                &ctx,
+                key,
+                "https://example.invalid/one",
+                edit
+            ));
+        }
+        assert!(mark_preview_attempt(
+            &ctx,
+            key,
+            "https://example.invalid/one",
+            edit + Duration::from_millis(1)
+        ));
+        assert!(mark_preview_attempt(
+            &ctx,
+            key,
+            "https://example.invalid/two",
+            edit + Duration::from_millis(1)
+        ));
+    }
+}
+
+#[derive(Default)]
+pub(super) struct SettingsDevices {
+    pub generation: u64,
+    pub pending: bool,
+    pub devices: Option<(Vec<String>, Vec<String>)>,
+    pub error: String,
+}
+
+impl ZaloGuiApp {
+    fn request_settings_devices(&mut self, refresh: bool) {
+        if self.settings_devices.pending {
+            return;
+        }
+        self.settings_devices.generation = crate::search::generation();
+        self.settings_devices.pending = true;
+        self.settings_devices.error.clear();
+        if !WORKER_TX.get().is_some_and(|tx| {
+            tx.send(WorkerCmd::ListSettingsDevices {
+                generation: self.settings_devices.generation,
+                refresh,
+            })
+            .is_ok()
+        }) {
+            self.settings_devices.pending = false;
+            self.settings_devices.error = "Worker chưa sẵn sàng".into();
+        }
+    }
+}
+
 /// Paint a standard dimmed backdrop behind centered modals.
 pub fn render_modal_backdrop(ctx: &egui::Context, id: &str) {
     let screen = ctx.screen_rect();
@@ -883,7 +964,7 @@ impl ZaloGuiApp {
                                         SettingsTab::General => {
                                             ui.label(RichText::new(crate::i18n::tr("Danh bạ")).color(pal.text_primary).size(13.5).strong());
                                             ui.add_space(2.0);
-                                            ui.label(RichText::new(crate::i18n::tr("Hiển thị danh bạ trong Zalo, bạn có thể chọn hiển thị tất cả danh bạ hoặc chỉ những bạn bè đang sử dụng Zalo")).color(pal.text_secondary).size(12.0));
+                                            ui.label(RichText::new(crate::i18n::tr("Chọn hiển thị bạn bè Zalo hoặc cả những người đã có hội thoại trên thiết bị này")).color(pal.text_secondary).size(12.0));
                                             ui.add_space(6.0);
                                             egui::Frame::none()
                                                 .fill(pal.bg_elevated)
@@ -892,9 +973,10 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
                                                     ui.set_min_width(ui.available_width());
-                                                    ui.radio_value(&mut self.settings.show_all_contacts, true, "Hiển thị tất cả danh bạ");
-                                                    ui.add_space(4.0);
-                                                    ui.radio_value(&mut self.settings.show_all_contacts, false, "Chỉ hiển thị bạn bè đang sử dụng Zalo");
+                                                    ui.radio_value(&mut self.settings.show_all_contacts, true, "Bạn bè và người đã liên hệ");
+                                                        ui.add_space(4.0);
+                                                        ui.radio_value(&mut self.settings.show_all_contacts, false, "Chỉ hiển thị bạn bè đang sử dụng Zalo");
+                                                    ui.label("Danh bạ điện thoại chưa dùng Zalo chưa được nhập vào ứng dụng.");
                                                 });
                                             ui.add_space(14.0);
 
@@ -932,7 +1014,7 @@ impl ZaloGuiApp {
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(crate::i18n::tr("Khởi động Zalo khi mở máy")).color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            ui.add_enabled_ui(false, |ui| { render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal); }).response.on_hover_text(crate::i18n::tr("Chưa hỗ trợ tự khởi động"));
+                                                            ui.add_enabled_ui(cfg!(windows), |ui| { render_toggle_switch(ui, &mut self.settings.autostart_on_boot, pal); });
                                                         });
                                                     });
                                                     ui.add_space(8.0);
@@ -973,9 +1055,15 @@ impl ZaloGuiApp {
                                                 .rounding(Rounding::same(8.0))
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
+                                                    if self.smoke.is_none() && self.settings_devices.devices.is_none()
+                                                        && !self.settings_devices.pending && self.settings_devices.error.is_empty() {
+                                                        self.request_settings_devices(false);
+                                                    }
                                                     let (mics, cams) = if self.smoke.is_some() {
                                                         (vec!["Fixture microphone".into()], vec!["Fixture camera".into()])
-                                                    } else { crate::media::list_media_devices(false) };
+                                                    } else { self.settings_devices.devices.clone().unwrap_or_default() };
+                                                    if self.settings_devices.pending { ui.horizontal(|ui| { ui.spinner(); ui.label("Đang quét thiết bị…"); }); }
+                                                    if !self.settings_devices.error.is_empty() { ui.label(&self.settings_devices.error); }
                                                     ui.horizontal(|ui| {
                                                         ui.label(RichText::new(format!("{} Đầu vào Mic:", lucide::MIC)).color(pal.text_primary).size(13.0));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1034,8 +1122,8 @@ impl ZaloGuiApp {
                                                     ui.add_space(6.0);
                                                     ui.horizontal(|ui| {
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                            if ui.small_button(format!("{} Quét lại thiết bị", lucide::REFRESH)).clicked() {
-                                                                let _ = crate::media::list_media_devices(true);
+                                                            if ui.add_enabled(!self.settings_devices.pending, egui::Button::new(format!("{} Quét lại thiết bị", lucide::REFRESH))).clicked() {
+                                                                self.request_settings_devices(true);
                                                             }
                                                         });
                                                     });
@@ -1532,7 +1620,7 @@ impl ZaloGuiApp {
                                                 .inner_margin(Margin::symmetric(14.0, 10.0))
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
-                                                        ui.label(RichText::new(crate::i18n::tr("Chia mục Ưu tiên")).color(pal.text_primary).size(13.2));
+                                                        ui.label(RichText::new(crate::i18n::tr("Chia mục Ưu tiên theo hội thoại đã ghim")).color(pal.text_primary).size(13.2));
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             render_toggle_switch(ui, &mut self.settings.split_priority_inbox, pal);
                                                         });
@@ -1590,10 +1678,8 @@ impl ZaloGuiApp {
                                             ui.add_space(6.0);
                                             ui.label(crate::i18n::tr("Thiết bị âm thanh và camera được chọn trong phần cài đặt thiết bị; kiểm tra quyền trước khi bắt đầu cuộc gọi."));
                                             ui.add_space(8.0);
-                                            if ui.button(crate::i18n::tr("Mở cài đặt thiết bị")).clicked() {
-                                                self.tools.open = true;
-                                                self.tools.tab = 4;
-                                                open = false;
+                                            if ui.button(crate::i18n::tr("Mở cài đặt âm thanh và camera")).clicked() {
+                                                self.settings_tab = SettingsTab::General;
                                             }
                                             ui.label(RichText::new(crate::i18n::tr("Tùy chọn codec và quyền truy cập phải theo capability thực tế của thiết bị.")).color(pal.text_secondary).size(12.0));
                                         }
@@ -1686,7 +1772,7 @@ impl ZaloGuiApp {
                                                         ui.painter().text(b_rect.center(), egui::Align2::CENTER_CENTER, "AI", FontId::proportional(11.0), Color32::WHITE);
                                                         ui.vertical(|ui| {
                                                             ui.label(RichText::new(crate::i18n::tr("Đồng ý dịch tin nhắn bằng AI")).color(pal.text_primary).size(13.2).strong());
-                                                            ui.label(RichText::new(crate::i18n::tr("Cho phép gửi văn bản cần dịch lên máy chủ AI Zalo (không áp dụng cho tin E2EE)")).color(pal.text_secondary).size(11.8));
+                                                            ui.label(RichText::new(crate::i18n::tr("Cho phép gửi văn bản cần dịch lên máy chủ AI Zalo (không áp dụng cho tin nhắn mã hóa)")).color(pal.text_secondary).size(11.8));
                                                         });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             render_toggle_switch(ui, &mut self.settings.ai_translation_consent, pal);
@@ -2959,48 +3045,77 @@ impl ZaloGuiApp {
         if self.forward_targets.is_empty() {
             return None;
         }
+        if self.forward_cloud_only {
+            if self.own_cloud_id.is_empty() {
+                return None;
+            }
+            self.forward_targets.clear();
+            self.forward_targets.insert(self.own_cloud_id.clone());
+        }
         let note = self.forward_note.trim().to_string();
         let mut target_deliveries = Vec::new();
+        let originals = if self.forward_batch.is_empty() {
+            vec![msg.clone()]
+        } else {
+            self.forward_batch.clone()
+        };
+        if originals.len() > 100
+            || originals
+                .iter()
+                .any(|message| !crate::chat::can_forward_message(message))
+        {
+            return None;
+        }
 
         for t in &self.threads {
             if !self.forward_targets.contains(&t.id) || !self.private_access(&t.id, t.is_group) {
                 continue;
             }
-            let mut original = msg.clone();
-            original.outgoing_job = None;
-            let mut forward_msg = crate::outgoing::pending(
-                msg.text.clone(),
-                t.is_group,
-                crate::outgoing::Payload::Forward(Box::new(original)),
-            );
-            forward_msg.sticker_id = msg.sticker_id;
-            forward_msg.sticker_cate_id = msg.sticker_cate_id;
-            forward_msg.sticker_type = msg.sticker_type;
-
-            let note_msg = if !note.is_empty() {
-                Some(crate::outgoing::pending(
-                    note.clone(),
+            for (index, source) in originals.iter().enumerate() {
+                let mut original = source.clone();
+                original.outgoing_job = None;
+                let mut forward_msg = crate::outgoing::pending(
+                    source.text.clone(),
                     t.is_group,
-                    crate::outgoing::Payload::Text,
-                ))
-            } else {
-                None
-            };
+                    crate::outgoing::Payload::Forward(Box::new(original)),
+                );
+                forward_msg.sticker_id = source.sticker_id;
+                forward_msg.sticker_cate_id = source.sticker_cate_id;
+                forward_msg.sticker_type = source.sticker_type;
 
-            target_deliveries.push(ForwardTargetDelivery {
-                target_id: t.id.clone(),
-                target_name: self.resolve_thread_name(t).to_string(),
-                is_group: t.is_group,
-                avatar: t.avatar.clone(),
-                forward_msg,
-                forward_status: ForwardItemStatus::Queued,
-                note_msg,
-                note_status: if !note.is_empty() {
-                    Some(ForwardItemStatus::Queued)
+                let note_msg = if !note.is_empty() && index == 0 {
+                    Some(crate::outgoing::pending(
+                        note.clone(),
+                        t.is_group,
+                        crate::outgoing::Payload::Text,
+                    ))
                 } else {
                     None
-                },
-            });
+                };
+
+                target_deliveries.push(ForwardTargetDelivery {
+                    target_id: t.id.clone(),
+                    target_name: if originals.len() > 1 {
+                        format!(
+                            "{} · {}",
+                            self.resolve_thread_name(t),
+                            truncate_chars(&crate::message_view::summary(source), 50)
+                        )
+                    } else {
+                        self.resolve_thread_name(t).to_string()
+                    },
+                    is_group: t.is_group,
+                    avatar: t.avatar.clone(),
+                    forward_msg,
+                    forward_status: ForwardItemStatus::Queued,
+                    note_msg,
+                    note_status: if !note.is_empty() && index == 0 {
+                        Some(ForwardItemStatus::Queued)
+                    } else {
+                        None
+                    },
+                });
+            }
         }
 
         if target_deliveries.is_empty() {
@@ -3051,6 +3166,7 @@ impl ZaloGuiApp {
             targets: target_deliveries,
         });
         self.forward_msg = None;
+        self.forward_batch.clear();
         self.forward_targets.clear();
         self.forward_note.clear();
         self.forward_filter.clear();
@@ -3151,12 +3267,12 @@ impl ZaloGuiApp {
                 let (status_text, status_color) = if all_done {
                     if failed == 0 {
                         (
-                            format!("✓ Đã chia sẻ thành công tới {succeeded}/{total} hội thoại"),
+                            format!("✓ Đã xác nhận {succeeded}/{total} lượt chia sẻ"),
                             pal.accent_online,
                         )
                     } else if succeeded == 0 {
                         (
-                            format!("✗ Chia sẻ thất bại cho tất cả {failed} hội thoại"),
+                            format!("✗ Thất bại ở tất cả {failed} lượt chia sẻ"),
                             pal.danger,
                         )
                     } else {
@@ -3220,7 +3336,7 @@ impl ZaloGuiApp {
 
                 ui.add_space(8.0);
                 ui.label(
-                    RichText::new(format!("Chi tiết các đích nhận ({total}):"))
+                    RichText::new(format!("Chi tiết từng lượt chia sẻ ({total}):"))
                         .size(12.0)
                         .color(pal.text_secondary)
                         .strong(),
@@ -3466,12 +3582,21 @@ impl ZaloGuiApp {
             .as_ref()
             .map(|m| truncate_chars(&crate::message_view::summary(m), 120).into_owned())
             .unwrap_or_default();
+        let preview = if self.forward_batch.len() > 1 {
+            format!(
+                "{} tin nhắn gốc đã chọn. Mục đầu: {preview}",
+                self.forward_batch.len()
+            )
+        } else {
+            preview
+        };
         let query = crate::search::fold(self.forward_filter.trim());
         let candidates: Vec<(String, String, bool, Option<String>)> = self
             .threads
             .iter()
             .filter(|t| {
-                self.private_access(&t.id, t.is_group)
+                (!self.forward_cloud_only || (t.id == self.own_cloud_id && !t.is_group))
+                    && self.private_access(&t.id, t.is_group)
                     && !self
                         .conversation_preferences
                         .get(&t.id)
@@ -3663,6 +3788,23 @@ impl ZaloGuiApp {
                         );
                         ui.add_space(2.0);
                         ui.label(RichText::new(&preview).size(12.5).color(pal.text_primary));
+                        if self.forward_batch.len() > 1 {
+                            egui::ScrollArea::vertical()
+                                .id_salt("archive_share_preview")
+                                .max_height(90.0)
+                                .show(ui, |ui| {
+                                    for (index, message) in self.forward_batch.iter().enumerate() {
+                                        ui.small(format!(
+                                            "{}. {}",
+                                            index + 1,
+                                            truncate_chars(
+                                                &crate::message_view::summary(message),
+                                                100
+                                            )
+                                        ));
+                                    }
+                                });
+                        }
                     });
 
                 ui.add_space(8.0);
@@ -3680,14 +3822,18 @@ impl ZaloGuiApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let can_send = !self.forward_targets.is_empty();
                         let share_btn = egui::Button::new(
-                            RichText::new(crate::i18n::tr("Chia sẻ"))
-                                .size(13.0)
-                                .color(if can_send {
-                                    Color32::WHITE
-                                } else {
-                                    pal.text_muted
-                                })
-                                .strong(),
+                            RichText::new(if self.forward_cloud_only {
+                                "Lưu vào My Documents"
+                            } else {
+                                crate::i18n::tr("Chia sẻ")
+                            })
+                            .size(13.0)
+                            .color(if can_send {
+                                Color32::WHITE
+                            } else {
+                                pal.text_muted
+                            })
+                            .strong(),
                         )
                         .fill(if can_send { pal.primary } else { pal.bg_input })
                         .rounding(Rounding::same(6.0))
@@ -3719,6 +3865,10 @@ impl ZaloGuiApp {
                 });
             });
 
+        if self.forward_cloud_only {
+            clear_selection = false;
+            toggled_id = None;
+        }
         if clear_selection {
             self.forward_targets.clear();
         }
@@ -3842,8 +3992,12 @@ impl ZaloGuiApp {
             // Ctrl+C: Copy image
             if !self.content_protected(&viewer.source.thread, viewer.source.group) {
                 if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::CopyViewerImage {
+                    let _ = tx.send(WorkerCmd::CopyArchiveImage {
                         owner: self.user_uin.clone(),
+                        media: crate::message_view::Media {
+                            original: Some(viewer.original_url.clone()),
+                            ..Default::default()
+                        },
                         context: viewer.source.clone(),
                     });
                 }
@@ -4265,8 +4419,12 @@ impl ZaloGuiApp {
                                     .clicked()
                             {
                                 if let Some(tx) = WORKER_TX.get() {
-                                    let _ = tx.send(WorkerCmd::CopyViewerImage {
+                                    let _ = tx.send(WorkerCmd::CopyArchiveImage {
                                         owner: self.user_uin.clone(),
+                                        media: crate::message_view::Media {
+                                            original: Some(viewer.original_url.clone()),
+                                            ..Default::default()
+                                        },
                                         context: viewer.source.clone(),
                                     });
                                 }
@@ -4758,15 +4916,27 @@ impl ZaloGuiApp {
         &mut self,
         ctx: &egui::Context,
         thread_id: &str,
+        is_group: bool,
     ) -> Option<crate::chat::LinkMetadata> {
+        if !is_group && self.trial_peers.contains(thread_id) {
+            return None;
+        }
         let debounce_key = Id::new((
             "composer_link_preview_debounce",
             self.user_uin.as_str(),
             thread_id,
         ));
+        let attempt_key = Id::new((
+            "composer_preview_attempt",
+            &self.user_uin,
+            self.account_runtime_id,
+            thread_id,
+            is_group,
+        ));
         let Some(url) = crate::chat::extract_first_url(&self.input_message) else {
             self.dismissed_link_preview_for.clear();
             ctx.data_mut(|data| {
+                data.remove::<(String, std::time::Instant)>(attempt_key);
                 data.remove::<(
                     String,
                     String,
@@ -4824,7 +4994,7 @@ impl ZaloGuiApp {
         }
 
         let debounce = Duration::from_millis(350);
-        let elapsed = scheduled_at.elapsed().max(last_edit.elapsed());
+        let elapsed = scheduled_at.elapsed().min(last_edit.elapsed());
         if elapsed < debounce {
             ctx.request_repaint_after(debounce - elapsed + Duration::from_millis(15));
             return self.link_metadata_cache.get(&url).cloned();
@@ -4832,12 +5002,22 @@ impl ZaloGuiApp {
         if let Some(cached) = self.link_metadata_cache.get(&url).cloned() {
             return Some(cached);
         }
-        if self.loading_link_previews.insert(url.clone()) {
-            if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::ParseLinkPreview {
-                    url: url.clone(),
-                    origin: crate::chat::LinkOrigin::Outgoing,
-                });
+        if !self.loading_link_previews.contains(&url) {
+            if let Some(tx) = WORKER_TX
+                .get()
+                .filter(|_| mark_preview_attempt(ctx, attempt_key, &url, last_edit))
+            {
+                self.loading_link_previews.insert(url.clone());
+                if tx
+                    .send(WorkerCmd::ParseLinkPreview {
+                        url: url.clone(),
+                        origin: crate::chat::LinkOrigin::Outgoing,
+                        thread: Some((thread_id.to_owned(), is_group)),
+                    })
+                    .is_err()
+                {
+                    self.loading_link_previews.remove(&url);
+                }
             }
         }
         let domain = url
@@ -4846,9 +5026,15 @@ impl ZaloGuiApp {
             .and_then(|r| r.split('/').next())
             .unwrap_or("Liên kết")
             .to_string();
+        let title = if self.loading_link_previews.contains(&url) {
+            "Đang tải thông tin liên kết…"
+        } else {
+            "Không tải được liên kết; sửa nội dung để thử lại"
+        }
+        .to_owned();
         Some(crate::chat::LinkMetadata {
             url,
-            title: "Đang tải thông tin liên kết…".into(),
+            title,
             desc: String::new(),
             thumb: String::new(),
             src: domain,
@@ -5481,6 +5667,80 @@ mod forward_dialog_tests {
             .toast_notice
             .as_ref()
             .is_some_and(|(msg, _)| msg.contains("7 ngày")));
+    }
+
+    #[test]
+    fn my_documents_save_binds_exact_server_self_target_and_keeps_source_payload() {
+        let (mut app, _) = test_app();
+        app.own_cloud_id = "self-documents".into();
+        app.threads.push(Thread {
+            id: "self-documents".into(),
+            name: "My Documents".into(),
+            ..Default::default()
+        });
+        let source = ChatMessage {
+            id: "source-one".into(),
+            text: "Original saved payload".into(),
+            ..Default::default()
+        };
+        app.forward_msg = Some(source.clone());
+        app.forward_batch = vec![source];
+        app.forward_cloud_only = true;
+        app.forward_targets.insert("u1".into());
+        assert_eq!(app.start_forward_session(), Some(1));
+        let session = app.forward_session.as_ref().unwrap();
+        assert_eq!(session.targets[0].target_id, "self-documents");
+        assert!(!session.targets[0].is_group);
+        assert!(
+            matches!(&session.targets[0].forward_msg.outgoing_job.as_ref().unwrap().payload,
+            crate::outgoing::Payload::Forward(original) if original.id=="source-one" && original.text=="Original saved payload")
+        );
+    }
+
+    #[test]
+    fn archive_batch_share_tracks_each_source_and_sends_note_once_per_recipient() {
+        let (mut app, _) = test_app();
+        let first = ChatMessage {
+            id: "source-one".into(),
+            text: "First source".into(),
+            ..Default::default()
+        };
+        let second = ChatMessage {
+            id: "source-two".into(),
+            text: "Second source".into(),
+            ..Default::default()
+        };
+        app.forward_msg = Some(first.clone());
+        app.forward_batch = vec![first, second];
+        app.forward_note = "One note".into();
+        app.forward_targets.insert("u1".into());
+        assert_eq!(app.start_forward_session(), Some(2));
+        let session = app.forward_session.as_ref().unwrap();
+        assert_eq!(session.targets.len(), 2);
+        assert_ne!(
+            session.targets[0].forward_msg.client_message_id,
+            session.targets[1].forward_msg.client_message_id
+        );
+        assert_eq!(
+            session
+                .targets
+                .iter()
+                .filter(|target| target.note_msg.is_some())
+                .count(),
+            1
+        );
+        let source_ids: Vec<_> = session
+            .targets
+            .iter()
+            .map(
+                |target| match &target.forward_msg.outgoing_job.as_ref().unwrap().payload {
+                    crate::outgoing::Payload::Forward(source) => source.id.as_str(),
+                    _ => panic!("Selected source payload must be retained"),
+                },
+            )
+            .collect();
+        assert_eq!(source_ids, vec!["source-one", "source-two"]);
+        assert!(app.forward_batch.is_empty());
     }
 
     #[test]
