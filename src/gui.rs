@@ -891,6 +891,10 @@ struct AppSettings {
     excel_paste_mode: String, // "image" | "text" | "ask"
     double_click_to_reply: bool,
     show_typing_indicator: bool,
+    /// Fetch and render link cards while a message is visible.
+    link_suggestions_enabled: bool,
+    /// Fetch media thumbnails instead of showing the type fallback icon.
+    file_thumbnails_enabled: bool,
     // 6. Tiện ích
     suggest_stickers_while_typing: bool,
     suggest_mentions: bool,
@@ -951,6 +955,8 @@ impl Default for AppSettings {
             excel_paste_mode: "image".into(),
             double_click_to_reply: true,
             show_typing_indicator: true,
+            link_suggestions_enabled: true,
+            file_thumbnails_enabled: true,
             suggest_stickers_while_typing: true,
             suggest_mentions: true,
             enable_gif_search: true,

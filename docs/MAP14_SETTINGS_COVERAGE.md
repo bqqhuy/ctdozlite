@@ -18,6 +18,21 @@ Closing/Escape saves the modal; device and account-lock changes also save explic
 | Calls | Opens General device controls; actual device choice is consumed by capture/video modules. No unsupported codec/capability switch is presented. |
 | Utilities | Sticker suggestions/search, animation, mention suggestions and local GIF filtering → respective composer/picker/render consumers. |
 
+### Coverage additions (2026-11-18)
+
+* Link suggestions now have a persisted `link_suggestions_enabled` control. The
+  existing viewport-bounded link metadata worker request is skipped when disabled;
+  the already stored card remains renderable.
+* `file_thumbnails_enabled` gates media thumbnail fetches in the bubble renderer;
+  disabled state keeps the existing fallback icon/text and performs no worker
+  request. This is a local presentation preference, not a server-side download
+  policy.
+* The requested preload-under-30MB setting remains unimplemented because current
+  message projections do not carry a verified content length and the prefetch
+  worker has no authoritative size gate. No fake toggle was exposed. Video mute
+  and capture shortcut/window-scope controls remain native/source gaps pending a
+  verified existing consumer.
+
 ## Explicit fork behavior
 
 * “Bạn bè và người đã liên hệ” includes known local conversations, while the

@@ -694,6 +694,8 @@ pub(super) fn render_message_body(
     loading_stickers: &mut HashSet<String>,
     resolved_sender: Option<&str>,
     server_aliases: &HashMap<String, String>,
+    link_suggestions_enabled: bool,
+    file_thumbnails_enabled: bool,
 ) -> Option<BubbleAction> {
     let mut body_action = None;
     let (text_col, meta_col) = if outgoing {
@@ -801,7 +803,8 @@ pub(super) fn render_message_body(
         let size = thumbnail_size(&media, max_text_width);
         let (width, height) = (size.x, size.y);
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
-        if !thumb.is_empty()
+        if file_thumbnails_enabled
+            && !thumb.is_empty()
             && rect.intersects(ui.clip_rect().expand(160.0))
             && !sticker_textures.contains_key(&key)
             && loading_stickers.insert(key.clone())
@@ -1041,7 +1044,7 @@ pub(super) fn render_message_body(
                         .contains_key(&format!("thumb_{}", crate::crypto::md5_hex(th)))
             })
             .unwrap_or(false);
-    if needs_meta_enrich && media_near_viewport(ui, 300.0) {
+    if link_suggestions_enabled && needs_meta_enrich && media_near_viewport(ui, 300.0) {
         let meta_key = format!("linkmeta_{}", crate::crypto::md5_hex(&url));
         if loading_stickers.insert(meta_key) {
             if let Some(tx) = WORKER_TX.get() {
@@ -1063,7 +1066,8 @@ pub(super) fn render_message_body(
     // 2. Optional compact thumbnail directly inside the bubble (no nested card box)
     if let Some(thumb_url) = msg.link_thumb.as_deref().filter(|u| !u.is_empty()) {
         let key = format!("thumb_{}", crate::crypto::md5_hex(thumb_url));
-        if media_near_viewport(ui, 200.0)
+        if file_thumbnails_enabled
+            && media_near_viewport(ui, 200.0)
             && !sticker_textures.contains_key(&key)
             && (thumb_url.starts_with("http://") || thumb_url.starts_with("https://"))
             && loading_stickers.insert(key.clone())
@@ -1252,6 +1256,8 @@ pub(super) fn render_chat_bubble(
     resolved_sender: Option<&str>,
     resolved_quote_sender: Option<&str>,
     server_aliases: &HashMap<String, String>,
+    link_suggestions_enabled: bool,
+    file_thumbnails_enabled: bool,
 ) -> Option<BubbleAction> {
     let avail_w = ui.available_width();
     let max_bubble_width = (avail_w * 0.72).clamp(140.0, 520.0);
@@ -1535,6 +1541,8 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                     resolved_sender,
                                     server_aliases,
+                                link_suggestions_enabled,
+                                file_thumbnails_enabled,
                                 );
                             }
                             if let Some(job) = &msg.outgoing_job {
@@ -1722,6 +1730,8 @@ pub(super) fn render_chat_bubble(
                                     loading_stickers,
                                     resolved_sender,
                                     server_aliases,
+                                link_suggestions_enabled,
+                                file_thumbnails_enabled,
                                 );
                             }
                             if let Some(job) = &msg.outgoing_job {
@@ -2689,6 +2699,8 @@ mod quote_navigation_tests {
                                 None,
                                 None,
                                 &HashMap::new(),
+                                true,
+                                true,
                             );
                         });
                     },
@@ -2857,6 +2869,8 @@ mod photo_viewer_tests {
                                 &mut HashSet::new(),
                                 None,
                                 &HashMap::new(),
+                                true,
+                                true,
                             );
                         });
                     },

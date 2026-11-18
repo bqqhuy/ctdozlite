@@ -82,7 +82,11 @@ fn archive_date_preset(today: chrono::NaiveDate, days: u64) -> (String, String) 
     (start.to_string(), today.to_string())
 }
 
-fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, today: chrono::NaiveDate) {
+fn render_archive_calendar(
+    ui: &mut egui::Ui,
+    draft: &mut ArchiveDateDraft,
+    today: chrono::NaiveDate,
+) {
     use chrono::Datelike;
     ui.horizontal(|ui| {
         if ui.small_button("◀").on_hover_text("Tháng trước").clicked() {
@@ -90,7 +94,11 @@ fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, toda
                 draft.month = month;
             }
         }
-        ui.label(format!("Tháng {} / {}", draft.month.month(), draft.month.year()));
+        ui.label(format!(
+            "Tháng {} / {}",
+            draft.month.month(),
+            draft.month.year()
+        ));
         if ui
             .add_enabled(
                 draft.month.year() < today.year()
@@ -105,7 +113,11 @@ fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, toda
             }
         }
     });
-    let selected = if draft.editing_end { &draft.to } else { &draft.from };
+    let selected = if draft.editing_end {
+        &draft.to
+    } else {
+        &draft.from
+    };
     let selected = chrono::NaiveDate::parse_from_str(selected, "%Y-%m-%d").ok();
     egui::Grid::new("archive-date-calendar")
         .spacing(Vec2::new(3.0, 3.0))
@@ -117,7 +129,9 @@ fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, toda
             let offset = draft.month.weekday().num_days_from_monday();
             for cell in 0..42 {
                 let day = cell - offset as i32 + 1;
-                let date = u32::try_from(day).ok().and_then(|day| draft.month.with_day(day));
+                let date = u32::try_from(day)
+                    .ok()
+                    .and_then(|day| draft.month.with_day(day));
                 if let Some(date) = date {
                     if ui
                         .add_enabled(
@@ -146,29 +160,41 @@ fn render_archive_calendar(ui: &mut egui::Ui, draft: &mut ArchiveDateDraft, toda
         });
 }
 
-fn render_archive_date_filter(
-    ui: &mut egui::Ui,
-    scope: Id,
-    from: &mut String,
-    to: &mut String,
-) {
+fn render_archive_date_filter(ui: &mut egui::Ui, scope: Id, from: &mut String, to: &mut String) {
     let today = chrono::Local::now().date_naive();
     let draft_id = scope.with("archive-date-draft");
     let label = if from.is_empty() && to.is_empty() {
         "Ngày gửi ▾".to_owned()
     } else {
-        format!("{} → {} ▾", if from.is_empty() { "…" } else { from }, if to.is_empty() { "…" } else { to })
+        format!(
+            "{} → {} ▾",
+            if from.is_empty() {
+                "…"
+            } else {
+                from.as_str()
+            },
+            if to.is_empty() { "…" } else { to.as_str() }
+        )
     };
-    let response = ui.menu_button(label, |ui| {
+    let initial_from = from.clone();
+    let initial_to = to.clone();
+    let mut committed: Option<(String, String)> = None;
+    let _response = ui.menu_button(label, |ui| {
         let mut draft = ui.ctx().data_mut(|data| {
             data.get_temp::<ArchiveDateDraft>(draft_id)
-                .unwrap_or_else(|| ArchiveDateDraft::new(from, to, today))
+                .unwrap_or_else(|| ArchiveDateDraft::new(&initial_from, &initial_to, today))
         });
         ui.menu_button("Gợi ý thời gian", |ui| {
-            for (days, label) in [(7, "Trong vòng 1 tuần"), (30, "Trong vòng 1 tháng"), (90, "Trong vòng 3 tháng")] {
+            for (days, label) in [
+                (7, "Trong vòng 1 tuần"),
+                (30, "Trong vòng 1 tháng"),
+                (90, "Trong vòng 3 tháng"),
+            ] {
                 if ui.button(label).clicked() {
                     // Archive ENRE overrides the reusable picker's calendar-month presets (re-notes/47).
-                    (*from, *to) = archive_date_preset(today, days);
+                    let (start, end) = archive_date_preset(today, days);
+                    draft.from = start;
+                    draft.to = end;
                     ui.close_menu();
                 }
             }
@@ -177,10 +203,27 @@ fn render_archive_date_filter(
         ui.label("Chọn khoảng thời gian");
         for editing_end in [false, true] {
             ui.horizontal(|ui| {
-                ui.label(if editing_end { "Đến ngày" } else { "Từ ngày" });
-                let value = if editing_end { &mut draft.to } else { &mut draft.from };
-                let input = ui.add(egui::TextEdit::singleline(value).hint_text("YYYY-MM-DD").desired_width(105.0));
-                if ui.small_button("📅").on_hover_text("Chọn ngày trên lịch").clicked() || input.gained_focus() {
+                ui.label(if editing_end {
+                    "Đến ngày"
+                } else {
+                    "Từ ngày"
+                });
+                let value = if editing_end {
+                    &mut draft.to
+                } else {
+                    &mut draft.from
+                };
+                let input = ui.add(
+                    egui::TextEdit::singleline(value)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(105.0),
+                );
+                if ui
+                    .small_button("📅")
+                    .on_hover_text("Chọn ngày trên lịch")
+                    .clicked()
+                    || input.gained_focus()
+                {
                     draft.editing_end = editing_end;
                     draft.calendar_open = true;
                     if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
@@ -194,7 +237,11 @@ fn render_archive_date_filter(
             });
         }
         if draft.calendar_open {
-            ui.small(if draft.editing_end { "Chọn ngày kết thúc" } else { "Chọn ngày bắt đầu" });
+            ui.small(if draft.editing_end {
+                "Chọn ngày kết thúc"
+            } else {
+                "Chọn ngày bắt đầu"
+            });
             render_archive_calendar(ui, &mut draft, today);
         }
         let error = draft.error(today);
@@ -205,24 +252,30 @@ fn render_archive_date_filter(
             if ui.button("Hủy").clicked() {
                 ui.close_menu();
             }
-            if ui.add_enabled(error.is_none(), egui::Button::new("Xác nhận")).clicked() {
-                *from = draft.from.trim().to_owned();
-                *to = draft.to.trim().to_owned();
+            if ui
+                .add_enabled(error.is_none(), egui::Button::new("Xác nhận"))
+                .clicked()
+            {
+                committed = Some((draft.from.trim().to_owned(), draft.to.trim().to_owned()));
                 ui.close_menu();
             }
         });
         ui.ctx().data_mut(|data| data.insert_temp(draft_id, draft));
     });
-    // Closed popovers discard unconfirmed edits, including clicks outside the menu.
-    if response.inner.is_none() || !ui.memory(|memory| memory.is_popup_open(response.response.id)) {
-        ui.ctx().data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
+    if let Some((next_from, next_to)) = committed {
+        *from = next_from;
+        *to = next_to;
     }
     if (!from.is_empty() || !to.is_empty())
-        && ui.small_button("×").on_hover_text("Xóa bộ lọc ngày").clicked()
+        && ui
+            .small_button("×")
+            .on_hover_text("Xóa bộ lọc ngày")
+            .clicked()
     {
         from.clear();
         to.clear();
-        ui.ctx().data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
+        ui.ctx()
+            .data_mut(|data| data.remove::<ArchiveDateDraft>(draft_id));
     }
 }
 
@@ -3558,7 +3611,7 @@ impl ZaloGuiApp {
                                                                         let item=&thread.messages[index];
                                                                         let item_sender = resolve_message_sender_name_from(&self.server_aliases,&self.threads,&self.group_members,item,&thread_id,is_group,&thread_name);
                                                                         let cell=ui.allocate_ui_with_layout(Vec2::new(cell_width,0.0),Layout::top_down(Align::LEFT),|ui|{
-                                                                            if let Some(action)=render_message_body(ui,item,&thread_name,&thread_id,is_group,&self.image_failures,pal,item.is_outgoing,cell_width,&self.sticker_textures,&mut self.loading_stickers,(!item.is_outgoing).then_some(item_sender),&self.server_aliases){pending_action=Some((index,action));}
+                                                                            if let Some(action)=render_message_body(ui,item,&thread_name,&thread_id,is_group,&self.image_failures,pal,item.is_outgoing,cell_width,&self.sticker_textures,&mut self.loading_stickers,(!item.is_outgoing).then_some(item_sender),&self.server_aliases,self.settings.link_suggestions_enabled,self.settings.file_thumbnails_enabled){pending_action=Some((index,action));}
                                                                         });
                                                                         capture_anchor(ui,cell.response.rect,&item.id,previous_anchor.as_ref(),&mut next_anchor,&mut anchor_delta);
                                                                         if !modal_open {
@@ -3693,6 +3746,8 @@ impl ZaloGuiApp {
                                                         resolved_sender,
                                                         resolved_quote_sender,
                                                         &self.server_aliases,
+                                                        self.settings.link_suggestions_enabled,
+                                                        self.settings.file_thumbnails_enabled,
                                                     ) {
                                                         pending_action = Some((idx, action));
                                                     }
@@ -9509,15 +9564,40 @@ impl ZaloGuiApp {
                         let cell_sz = ((ui.available_width() - (columns - 1) as f32 * gap)
                             / columns as f32)
                             .clamp(32.0, 112.0);
-                        let visible = filtered.len().min(self.drawer_media_limit);
-                        for row in filtered[..visible].chunks(columns) {
+                        let mut shown = 0usize;
+                        let mut last_date = String::new();
+                        for row in filtered.chunks(columns) {
+                            let date = row.first().and_then(|(_, _, msg)| {
+                                chrono::DateTime::from_timestamp_millis(
+                                    crate::clock::normalize_ts_ms(msg.ts),
+                                )
+                                .map(|date| {
+                                    date.with_timezone(&chrono::Local)
+                                        .format("%d/%m/%Y")
+                                        .to_string()
+                                })
+                            });
+                            if date.as_deref() != Some(last_date.as_str()) {
+                                if let Some(date) = date {
+                                    ui.separator();
+                                    ui.small(date.clone());
+                                    last_date = date;
+                                }
+                            }
+                            if shown >= self.drawer_media_limit {
+                                break;
+                            }
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
                                 for (tkey, media, message) in row {
+                                    if shown >= self.drawer_media_limit {
+                                        break;
+                                    }
                                     self.render_photo_cell(
                                         ui, tkey, media, message, d_id, "", d_is_group, cell_sz,
                                         pal,
                                     );
+                                    shown += 1;
                                 }
                             });
                             ui.add_space(gap);
@@ -10914,4 +10994,3 @@ mod tests {
         assert!(app.threads[0].unread.mention_ids.contains("m-mention-2"));
     }
 }
-                                                                                                                                                                                                                                         

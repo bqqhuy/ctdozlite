@@ -1587,6 +1587,13 @@ impl ZaloGuiApp {
                                                             render_toggle_switch(ui, &mut self.settings.send_photo_original, pal);
                                                         });
                                                     });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(RichText::new(crate::i18n::tr("Hiển thị thumbnail tệp và media")).color(pal.text_primary).size(13.2));
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.file_thumbnails_enabled, pal);
+                                                        });
+                                                    });
                                                 });
                                             ui.add_space(14.0);
 
@@ -1762,6 +1769,19 @@ impl ZaloGuiApp {
                                                         });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             render_toggle_switch(ui, &mut self.settings.enable_sticker_keyword_search, pal);
+                                                        });
+                                                    });
+                                                    ui.add_space(10.0);
+                                                    ui.horizontal(|ui| {
+                                                        let (b_rect, _) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::hover());
+                                                        ui.painter().circle_filled(b_rect.center(), 15.0, Color32::from_rgb(42, 156, 143));
+                                                        draw_lucide_icon(ui.painter(), b_rect.center(), lucide::LINK, 15.0, Color32::WHITE);
+                                                        ui.vertical(|ui| {
+                                                            ui.label(RichText::new(crate::i18n::tr("Gợi ý liên kết")).color(pal.text_primary).size(13.2).strong());
+                                                            ui.label(RichText::new(crate::i18n::tr("Tải tiêu đề và ảnh xem trước của liên kết khi cần")).color(pal.text_secondary).size(11.8));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.link_suggestions_enabled, pal);
                                                         });
                                                     });
                                                     ui.add_space(10.0);
