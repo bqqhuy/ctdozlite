@@ -4270,7 +4270,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();
                             tokio::spawn(async move {
                                 let paths=if let Some(path)=preset_path {vec![path]} else {
-                                    tokio::task::spawn_blocking(move||super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default()
+                                    let picker_owner=s.account_key().to_owned();
+                                    let paths=tokio::task::spawn_blocking(move||super::messages::pick_native_files_dialog(images_only)).await.ok().flatten().unwrap_or_default();
+                                    let _=events.send(GuiEvent::AttachmentPickerClosed { owner: picker_owner });
+                                    ctx.request_repaint();
+                                    paths
                                 };
                                 send_attachment_batch(s,super::file_drop::Batch {thread:to_id,group:is_group,caption,original:photo_original,files:paths.into_iter().map(|p|(p,None)).collect(),ephemeral},events,ctx).await;
                             });

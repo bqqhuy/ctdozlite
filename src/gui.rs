@@ -338,6 +338,9 @@ pub enum GuiEvent {
         thread: String,
         image: Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>,
     },
+    AttachmentPickerClosed {
+        owner: String,
+    },
     /// A region capture ready to preview, or why there is none.
     ScreenCaptureFinished {
         owner: String,
@@ -1443,6 +1446,7 @@ pub struct ZaloGuiApp {
     composer_sticker_selected: Option<usize>,
     composer_focus_pending: bool,
     clipboard_read_pending: bool,
+    attachment_picker_pending: bool,
     clipboard_text_fallback: Option<String>,
     clipboard_text_only: bool,
     clipboard_alternative_text: Option<String>,
@@ -1795,6 +1799,7 @@ impl ZaloGuiApp {
             composer_sticker_selected: None,
             composer_focus_pending: false,
             clipboard_read_pending: false,
+            attachment_picker_pending: false,
             clipboard_text_fallback: None,
             clipboard_text_only: false,
             clipboard_alternative_text: None,
@@ -3303,6 +3308,11 @@ impl ZaloGuiApp {
                         );
                     }
                 }
+                GuiEvent::AttachmentPickerClosed { owner } => {
+                    if owner == self.user_uin {
+                        self.attachment_picker_pending = false;
+                    }
+                }
                 GuiEvent::LiveThreadsReady(_) => {
                     unreachable!("live mailbox normalized before dispatch")
                 }
@@ -3996,6 +4006,7 @@ impl ZaloGuiApp {
                     self.replying_to = None;
                     self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
+                    self.attachment_picker_pending = false;
                     if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
                         std::thread::spawn(move || {
                             let _ = std::fs::remove_file(old_path);
@@ -4073,6 +4084,7 @@ impl ZaloGuiApp {
                     self.replying_to = None;
                     self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
+                    self.attachment_picker_pending = false;
                     if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
                         std::thread::spawn(move || {
                             let _ = std::fs::remove_file(old_path);

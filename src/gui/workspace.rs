@@ -514,6 +514,10 @@ impl ZaloGuiApp {
     }
 
     fn request_attachment_picker(&mut self, thread: &str, group: bool, images_only: bool) {
+        if self.attachment_picker_pending {
+            self.show_toast("Hộp chọn tệp đang mở");
+            return;
+        }
         // Opening/cancelling the native picker is not acceptance of this draft.
         // Retain the composer even after enqueue; attachment delivery owns its
         // independent caption snapshot and can fail after the picker closes.
@@ -529,6 +533,7 @@ impl ZaloGuiApp {
             })
             .is_ok()
         });
+        self.attachment_picker_pending = queued;
         if !queued {
             self.status_msg =
                 "Không gửi được yêu cầu chọn tệp; nội dung soạn thảo vẫn được giữ.".into();
@@ -1022,8 +1027,9 @@ impl ZaloGuiApp {
             ctx.data(|data| data.get_temp::<bool>(Id::new("drawer_was_compact"))) == Some(false)
                 && is_compact_w;
         ctx.data_mut(|data| data.insert_temp(Id::new("drawer_was_compact"), is_compact_w));
-        if entering_compact && self.info_drawer_open {
-            ctx.data_mut(|data| data.insert_temp(Id::new("narrow_drawer_open"), true));
+        if entering_compact {
+            // Compact mode overlays the drawer only after an explicit user action.
+            ctx.data_mut(|data| data.insert_temp(Id::new("narrow_drawer_open"), false));
         }
         let narrow_drawer_open = ctx.data(|data| {
             data.get_temp::<bool>(Id::new("narrow_drawer_open"))
@@ -5829,6 +5835,49 @@ mod sync_and_order_tests {
     }
 
     #[test]
+    fn switching_to_compact_viewport_keeps_drawer_closed_until_clicked() {
+        let (mut app, ctx) = app_and_context();
+        app.user_uin = "owner".into();
+        app.hidden_panel.view.ready = true;
+        app.policy_panel.snapshot = Some(Default::default());
+        app.threads = vec![Thread {
+            id: "peer".into(),
+            name: "Fixture chat".into(),
+            ..Default::default()
+        }];
+        app.selected_thread_index = 0;
+        app.info_drawer_open = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                let palette = app.palette();
+                app.render_chat_workspace(ctx, &palette);
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                let palette = app.palette();
+                app.render_chat_workspace(ctx, &palette);
+            },
+        );
+        let drawer_open = ctx.data(|data| {
+            data.get_temp::<bool>(Id::new("narrow_drawer_open"))
+                .unwrap_or(false)
+        });
+        assert!(
+            !drawer_open,
+            "entering compact mode must not open the overlay drawer"
+        );
+    }
+
+    #[test]
     fn modal_hides_independent_narrow_drawer_and_timeline_action_areas() {
         let (mut app, ctx) = app_and_context();
         app.user_uin = "owner".into();
@@ -5997,6 +6046,15 @@ mod sync_and_order_tests {
             assert_eq!(app.composer_mentions.text, app.input_message);
             assert_eq!(app.replying_to.as_ref().unwrap().id, "quoted-source");
         }
+    }
+
+    #[test]
+    fn attachment_picker_ignores_repeated_clicks_while_native_dialog_is_open() {
+        let (mut app, _) = app_and_context();
+        app.attachment_picker_pending = true;
+        app.request_attachment_picker("thread-fixture", false, false);
+        assert!(app.attachment_picker_pending);
+        assert_eq!(app.status_msg, "Hộp chọn tệp đang mở");
     }
 
     #[test]
