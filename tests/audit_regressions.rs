@@ -64,9 +64,15 @@ async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<Str
     let body = body.map(str::to_owned);
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
             let accepted =
-                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+                tokio::time::timeout(remaining.min(Duration::from_secs(2)), listener.accept())
+                    .await;
             let Ok(Ok((mut stream, _))) = accepted else {
                 break;
             };
