@@ -7,6 +7,8 @@ use serde_json::Value;
 pub struct CallDetails {
     pub outgoing: bool,
     pub duration_seconds: u64,
+    pub is_video: bool,
+    pub reason: Option<i64>,
 }
 pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
     fn parse(value: &Value, depth: usize) -> Option<CallDetails> {
@@ -14,15 +16,47 @@ pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
             return None;
         }
         let decoded = json_value(value.clone());
-        let outgoing = match decoded.get("action").and_then(Value::as_str) {
+        let action = decoded.get("action").and_then(Value::as_str);
+        let params_value = decoded.get("params").unwrap_or(&decoded);
+        let params_storage;
+        let params = if let Some(raw) = params_value.as_str() {
+            params_storage = serde_json::from_str::<Value>(raw).unwrap_or(Value::Null);
+            &params_storage
+        } else {
+            params_value
+        };
+        let outgoing = match action {
             Some("recommened.calling") => Some(true),
             Some("recommened.receivecall") => Some(false),
+            Some("recommened.misscall") => Some(
+                params
+                    .get("isCaller")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
             _ => None,
         };
         if let Some(outgoing) = outgoing {
+            let calltype = params
+                .get("calltype")
+                .or_else(|| params.get("callType"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let is_video = calltype == 1
+                || params.get("isVideo").and_then(Value::as_bool) == Some(true)
+                || params.get("video").is_some();
             return Some(CallDetails {
                 outgoing,
-                duration_seconds: decoded.get("duration").and_then(Value::as_u64).unwrap_or(0),
+                duration_seconds: decoded
+                    .get("duration")
+                    .or_else(|| params.get("duration"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                is_video,
+                reason: params
+                    .get("reason")
+                    .or_else(|| decoded.get("reason"))
+                    .and_then(Value::as_i64),
             });
         }
         decoded
@@ -37,16 +71,27 @@ pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
 
 pub fn call_label(m: &ChatMessage) -> String {
     if let Some(details) = call_details(m) {
-        let direction = if details.outgoing {
+        let direction = if details.is_video {
+            if details.outgoing {
+                "Cuộc gọi video đi"
+            } else {
+                "Cuộc gọi video đến"
+            }
+        } else if details.outgoing {
             "Cuộc gọi đi"
         } else {
             "Cuộc gọi đến"
         };
         let seconds = details.duration_seconds;
-        return if seconds > 0 {
+        let base = if seconds > 0 {
             format!("{direction} ({}:{:02})", seconds / 60, seconds % 60)
         } else {
             direction.into()
+        };
+        return match details.reason {
+            Some(2) if seconds == 0 => format!("{base} — Không trả lời"),
+            Some(3..=5) if seconds == 0 => format!("{base} — Đã từ chối"),
+            _ => base,
         };
     }
     if m.text.trim().is_empty() {
@@ -1023,12 +1068,42 @@ mod tests {
             call_details(&message),
             Some(CallDetails {
                 outgoing: false,
-                duration_seconds: 125
+                duration_seconds: 125,
+                is_video: false,
+                reason: None,
             })
         );
         assert_eq!(call_label(&message), "Cuộc gọi đến (2:05)");
         message.wire_ref.original_type = Some(serde_json::json!("chat.text"));
         assert!(!is_call_log(&message));
+    }
+
+    #[test]
+    fn native_recommended_call_metadata_renders_video_and_terminal_reason() {
+        let message = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "msgType": "chat.recommended",
+                "content": {
+                    "action": "recommened.misscall",
+                    "params": { "calltype": 1, "reason": 2, "isCaller": false },
+                    "duration": 0
+                }
+            })),
+            ..Default::default()
+        };
+        assert_eq!(call_label(&message), "Cuộc gọi video đến — Không trả lời");
+    }
+
+    #[test]
+    fn native_recommended_call_metadata_parses_pc_params_json_string() {
+        let message = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "action": "recommened.misscall",
+                "params": "{\"calltype\":1,\"reason\":3,\"isCaller\":true,\"duration\":70}"
+            })),
+            ..Default::default()
+        };
+        assert_eq!(call_label(&message), "Cuộc gọi video đi (1:10)");
     }
 
     #[test]

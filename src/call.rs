@@ -3994,20 +3994,24 @@ impl CallBridge {
                                         }
                                     }
                                 }
-                                // Reject historical replays (> 90 seconds old), tolerating PC/phone clock skew
+                                // Zalo PC drops call controls older than 60 seconds. Keep the same
+                                // boundary so a replayed invite cannot recreate a ringing popup.
                                 if let Some(ev_ts) = data.get("ts").and_then(|v| {
                                     v.as_i64()
                                         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                                 }) {
                                     let now_ms = crate::login::unix_now() * 1000;
-                                    let ev_ms = if ev_ts < 10_000_000_000 {
-                                        ev_ts * 1000
-                                    } else {
-                                        ev_ts
-                                    };
-                                    if now_ms.saturating_sub(ev_ms) > 90_000 {
+                                    if !crate::call_lifecycle::is_fresh_control_timestamp(
+                                        ev_ts, now_ms,
+                                    ) {
                                         continue;
                                     }
+                                }
+                                // A call can be answered or ended on another device while this
+                                // client is processing a duplicate invite from another transport.
+                                // Recheck the shared account-scoped terminal set at the UI boundary.
+                                if terminal_calls.contains(owner, ev_call_id, now) {
+                                    continue;
                                 }
                                 let call_id = ev_call_id;
                                 let media = event_media_params(&data);

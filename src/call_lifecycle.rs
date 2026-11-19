@@ -21,6 +21,20 @@ pub fn answered_elsewhere(
 ) -> bool {
     call_id > 0 && event_id == call_id && !is_caller && !connected && status == 0 && actor_is_self
 }
+
+/// Zalo PC drops call controls older than one minute before they can recreate UI state.
+/// Accept seconds or milliseconds because both shapes occur in replayed payloads.
+pub fn is_fresh_control_timestamp(event_ts: i64, now_ms: i64) -> bool {
+    if event_ts <= 0 || now_ms <= 0 {
+        return true;
+    }
+    let event_ms = if event_ts < 10_000_000_000 {
+        event_ts.saturating_mul(1000)
+    } else {
+        event_ts
+    };
+    now_ms.saturating_sub(event_ms) <= 60_000
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +52,15 @@ mod tests {
         assert!(!answered_elsewhere(12, 12, true, false, true, 0));
         assert!(!answered_elsewhere(12, 12, false, false, false, 0));
         assert!(!answered_elsewhere(12, 12, false, false, true, -1));
+    }
+
+    #[test]
+    fn stale_call_controls_match_pc_one_minute_window() {
+        let now = 1_800_000_000_000i64;
+        assert!(is_fresh_control_timestamp(now - 60_000, now));
+        assert!(!is_fresh_control_timestamp(now - 60_001, now));
+        assert!(is_fresh_control_timestamp((now / 1000) - 60, now));
+        assert!(is_fresh_control_timestamp(0, now));
     }
 }
 
@@ -91,6 +114,19 @@ mod replay_tests {
         }
         assert!(!calls.contains("account-a", 12, now));
         assert_eq!(calls.entries.len(), 128);
+    }
+
+    #[test]
+    fn terminal_control_suppresses_replayed_request_on_both_transports() {
+        let now = std::time::Instant::now();
+        let mut calls = TerminalCalls::default();
+        assert!(!calls.contains("account-a", 42, now));
+        calls.remember("account-a", 42, now);
+        // WS and HTTP long-poll share this engine-owned set, so duplicate delivery is idempotent.
+        assert!(calls.contains("account-a", 42, now));
+        calls.remember("account-a", 42, now);
+        assert!(calls.contains("account-a", 42, now));
+        assert!(!calls.contains("account-b", 42, now));
     }
     #[test]
     fn missing_or_invalid_status_is_not_success() {
