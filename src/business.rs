@@ -1,12 +1,14 @@
-//! Business, Official Account & Product Catalog (Zalo Parity C01).
+//! Unverified business API models and fail-closed network gates.
 //!
-//! Provides data structures and API helpers to manage business profiles,
-//! OA badges, and product catalogs (`/api/prodcatalog/list`, `/api/prodcatalog/item/create`).
+//! Native PC evidence does not establish the previous request contract; see
+//! `re-notes/55-unverified-feature-gates.md`. Parsers remain offline research helpers.
 
 use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 /// An item in a business product catalog.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,41 +104,28 @@ pub fn try_parse_product_catalog(val: &Value) -> Result<Vec<ProductCatalogItem>>
     parse_product_catalog(val)
 }
 
-/// Call `/api/prodcatalog/product/list` (cmd 12039) to fetch the account's product catalog.
-pub async fn fetch_product_catalog(s: &Session) -> Result<Vec<ProductCatalogItem>> {
-    let url = s.resolve_service_url("profile", "/api/prodcatalog/product/list");
-    let payload = json!({
-        "page": 1,
-        "count": 50,
-        "imei": s.imei,
-    });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số lấy danh mục sản phẩm thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    parse_product_catalog(&decrypted)
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn fetch_product_catalog(_s: &Session) -> Result<Vec<ProductCatalogItem>> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Danh mục sản phẩm chưa khả dụng: chưa xác minh dịch vụ và schema Zalo PC.")
 }
 
-/// Call `/api/prodcatalog/catalog/list` (cmd 12038) to fetch the account's catalog categories.
-pub async fn fetch_catalog_list(s: &Session) -> Result<Value> {
-    let url = s.resolve_service_url("profile", "/api/prodcatalog/catalog/list");
-    let payload = json!({
-        "page": 1,
-        "count": 50,
-        "imei": s.imei,
-    });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số lấy danh sách catalog thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    crate::api_response::checked_data(decrypted)
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn fetch_catalog_list(_s: &Session) -> Result<Value> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Danh mục sản phẩm chưa khả dụng: chưa xác minh dịch vụ và schema Zalo PC.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unverified_contracts_fail_before_using_session_credentials() {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(fetch_product_catalog(&session).await.is_err());
+        assert!(fetch_catalog_list(&session).await.is_err());
+    }
 
     #[test]
     fn test_parse_product_catalog() {

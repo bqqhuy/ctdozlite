@@ -7,6 +7,9 @@ use eframe::egui;
 
 #[derive(Clone)]
 pub struct DocViewerModal {
+    pub owner: String,
+    pub runtime_id: usize,
+    pub context: super::worker::ChatImage,
     pub content: String,
     pub file_name: String,
     pub search_query: String,
@@ -15,8 +18,17 @@ pub struct DocViewerModal {
 }
 
 impl DocViewerModal {
-    pub fn new(content: String, file_name: String) -> Self {
+    pub fn new(
+        content: String,
+        file_name: String,
+        owner: String,
+        runtime_id: usize,
+        context: super::worker::ChatImage,
+    ) -> Self {
         Self {
+            owner,
+            runtime_id,
+            context,
             content,
             file_name,
             search_query: String::new(),
@@ -77,6 +89,12 @@ impl super::ZaloGuiApp {
         ctx: &egui::Context,
         pal: &super::ThemePalette,
     ) {
+        if self.doc_viewer.as_ref().is_some_and(|viewer| {
+            !self.document_context_alive(&viewer.owner, viewer.runtime_id, &viewer.context)
+        }) {
+            self.doc_viewer = None;
+            return;
+        }
         // Escape to close
         let should_close = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if should_close {

@@ -17,6 +17,7 @@ pub enum ServiceKey {
     Reaction,
     VoiceCall,
     Sticker,
+    MediaStore,
     Other,
 }
 
@@ -32,6 +33,7 @@ impl ServiceKey {
             "reaction" => Self::Reaction,
             "voice_call" => Self::VoiceCall,
             "sticker" => Self::Sticker,
+            "media_store" | "media_store_send2me" => Self::MediaStore,
             _ => Self::Other,
         }
     }
@@ -467,12 +469,31 @@ impl ServiceResolver {
                 self.register_service(key, candidates);
             }
         }
+        for key in ["media_store", "media_store_send2me"] {
+            let mut candidates = domains
+                .service_fallbacks
+                .get(key)
+                .into_iter()
+                .flatten()
+                .filter(|host| crate::session::trusted_service_url(host))
+                .cloned()
+                .collect::<Vec<_>>();
+            candidates.truncate(crate::session::MAX_SERVICE_CANDIDATES);
+            if !candidates.is_empty()
+                && (reset || self.service_endpoints.get(key) != Some(&candidates))
+            {
+                self.register_service(key, candidates);
+            }
+        }
     }
 
     pub(crate) fn candidates_for_url(&self, url: &str) -> Option<(String, Vec<String>)> {
         for (key, hosts) in &self.service_endpoints {
-            let canonical = crate::endpoints::service(key)?;
-            let Some(path) = url.strip_prefix(canonical) else {
+            let canonical_path =
+                crate::endpoints::service(key).and_then(|canonical| url.strip_prefix(canonical));
+            let path =
+                canonical_path.or_else(|| hosts.iter().find_map(|host| url.strip_prefix(host)));
+            let Some(path) = path else {
                 continue;
             };
             if !path.starts_with('/') {

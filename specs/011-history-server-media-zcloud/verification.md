@@ -7,7 +7,7 @@
 - [x] `test_parse_server_media_list_photos`: Bóc tách danh sách ảnh/video từ kho lưu trữ server.
 - [x] `test_parse_server_media_list_files`: Bóc tách danh sách tệp đính kèm kèm kích thước và tên file.
 - [x] `test_parse_server_media_list_links`: Bóc tách danh sách liên kết web từ kho lưu trữ.
-- [x] `test_atomic_backup_rollback`: Kiểm tra tính năng rollback an toàn khi huỷ bỏ import backup.
+- [x] Desktop V2 regression qua `dry_run_import_replay_delete_and_account_binding`: giữ live WAL/committed batch/media khi lô sau lỗi, xóa current batch/media, pre-cancel và retry idempotent. Thay test byte-file `test_atomic_backup_rollback` đã gỡ; `cargo test --locked --test desktop_backup_v2 -j 1 -- --test-threads=1` đạt, exit 0 ngày 19/11/2026. Không thay thế nghiệm thu thiết bị.
 - [x] `test_binnet_unknown_preservation`: Kiểm tra bảo toàn dữ liệu `Unknown` trong frame BinNet.
 
 ## 2. Tiêu chí Kiểm thử trên Thiết bị Thật (Windows 11 ARM64 Native)

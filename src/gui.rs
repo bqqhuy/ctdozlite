@@ -165,6 +165,9 @@ pub enum GuiEvent {
         message: String,
     },
     DocPreviewLoaded {
+        owner: String,
+        runtime_id: usize,
+        context: worker::ChatImage,
         file_name: String,
         content: String,
     },
@@ -396,6 +399,11 @@ pub enum GuiEvent {
     ThreadsUpdated {
         threads: Vec<Thread>,
         source: ThreadUpdateSource,
+    },
+    ConversationHistoryLoaded {
+        runtime_id: usize,
+        threads: Vec<Thread>,
+        status: String,
     },
     LocalCallRecord {
         runtime_id: usize,
@@ -681,6 +689,7 @@ pub enum GuiEvent {
     },
     StatusUpdate(String),
     ServerMediaLoaded {
+        runtime_id: usize,
         thread_id: String,
         media_type: u8,
         page_num: u32,
@@ -688,6 +697,7 @@ pub enum GuiEvent {
         generation: u64,
     },
     ServerMediaLoadFailed {
+        runtime_id: usize,
         thread_id: String,
         media_type: u8,
         generation: u64,
@@ -697,8 +707,16 @@ pub enum GuiEvent {
     BusinessCatalogLoaded(Vec<crate::business::ProductCatalogItem>),
     DevicesLoaded(Vec<crate::device::DeviceSession>),
     TwoFactorStatusLoaded(crate::account_recovery::TwoFactorStatus),
-    GroupTodosLoaded(Vec<crate::todo::TodoItem>),
-    GroupPollsLoaded(Vec<crate::poll::PollItem>),
+    GroupTodosLoaded {
+        runtime_id: usize,
+        thread_id: String,
+        todos: Vec<crate::todo::TodoItem>,
+    },
+    GroupPollsLoaded {
+        runtime_id: usize,
+        thread_id: String,
+        polls: Vec<crate::poll::PollItem>,
+    },
     BatchRecallCompleted {
         thread_id: String,
         recalled_ids: Vec<String>,
@@ -991,6 +1009,10 @@ impl AppSettings {
 
     pub fn has_pin(&self) -> bool {
         self.app_pin_hash.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    fn lock_configured(&self) -> bool {
+        self.enable_app_lock && (self.has_pin() || self.use_windows_hello)
     }
 
     /// Slow KDF iteration count for PIN hashing (PBKDF2-HMAC-SHA256).
@@ -1602,7 +1624,6 @@ impl ZaloGuiApp {
         // Self-storage identity is authoritative only when supplied by the server;
         // never rewrite an arbitrary contact ID because its display name is editable.
         crate::chat::deduplicate_threads(&mut threads, None);
-        crate::chat::deduplicate_threads(&mut threads, None);
 
         let selected_thread_index = threads
             .iter()
@@ -1616,14 +1637,10 @@ impl ZaloGuiApp {
             .filter(|t| t.unread.count() > 0)
             .map(|t| (t.id.clone(), t.unread.count()))
             .collect();
-        let mut lock_guard = auth_guard::AppLockGuard::new();
-        if is_logged_in
-            && loaded_settings.enable_app_lock
-            && (loaded_settings.app_pin_hash.is_some()
-                || (loaded_settings.use_windows_hello && lock_guard.is_biometric_available()))
-        {
-            lock_guard.lock();
-        }
+        // Availability is asynchronous and must not weaken a restored lock policy.
+        let lock_guard = auth_guard::AppLockGuard::with_initial_lock(
+            is_logged_in && loaded_settings.lock_configured(),
+        );
         let mut app = Self {
             #[cfg(windows)]
             tray: None,
@@ -2332,9 +2349,7 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn can_lock_app(&self) -> bool {
-        self.settings.enable_app_lock
-            && (self.settings.has_pin()
-                || (self.settings.use_windows_hello && self.lock_guard.is_biometric_available()))
+        self.settings.lock_configured()
     }
 
     pub(super) fn lock_app(&mut self) {
@@ -2661,6 +2676,19 @@ impl ZaloGuiApp {
         }
     }
 
+    fn document_context_alive(
+        &self,
+        owner: &str,
+        runtime_id: usize,
+        context: &worker::ChatImage,
+    ) -> bool {
+        self.is_logged_in
+            && owner == self.user_uin
+            && runtime_id == self.account_runtime_id
+            && self.private_access(&context.thread, context.group)
+            && !crate::message_lifecycle::expired(&context.message, crate::login::unix_now() * 1000)
+    }
+
     fn check_events(&mut self, ctx: &egui::Context) {
         for index in 0..64 {
             let Ok(event) = self.event_rx.try_recv() else {
@@ -2672,7 +2700,29 @@ impl ZaloGuiApp {
 
             // Keep business state current while locked; rendering and input remain gated.
             let server_ack = matches!(&event, GuiEvent::MessageSent { .. });
+            let history_status = match &event {
+                GuiEvent::ConversationHistoryLoaded { status, .. } => Some(status.clone()),
+                _ => None,
+            };
             let event = match event {
+                GuiEvent::ConversationHistoryLoaded {
+                    runtime_id,
+                    threads,
+                    status,
+                } => {
+                    if !self.is_logged_in || runtime_id != self.account_runtime_id {
+                        continue;
+                    }
+                    if threads.is_empty() {
+                        GuiEvent::StatusUpdate(status)
+                    } else {
+                        self.status_msg = status;
+                        GuiEvent::ThreadsUpdated {
+                            threads,
+                            source: ThreadUpdateSource::History,
+                        }
+                    }
+                }
                 GuiEvent::LiveThreadsReady(updates) => {
                     self.live_mailbox = Some(updates.clone());
                     GuiEvent::ThreadsUpdated {
@@ -2883,10 +2933,24 @@ impl ZaloGuiApp {
                         self.show_toast(message);
                     }
                 }
-                GuiEvent::DocPreviewLoaded { file_name, content } => {
-                    self.doc_viewer = Some(doc_viewer::DocViewerModal::new(content, file_name));
+                GuiEvent::DocPreviewLoaded {
+                    owner,
+                    runtime_id,
+                    context,
+                    file_name,
+                    content,
+                } => {
+                    if !self.document_context_alive(&owner, runtime_id, &context) {
+                        continue;
+                    }
+                    self.doc_viewer = Some(doc_viewer::DocViewerModal::new(
+                        content, file_name, owner, runtime_id, context,
+                    ));
                     ctx.request_repaint();
                 }
+                GuiEvent::BusinessCatalogLoaded(_) => continue,
+                GuiEvent::DevicesLoaded(_) => continue,
+                GuiEvent::TwoFactorStatusLoaded(_) => continue,
                 GuiEvent::DroppedFilePrepared {
                     owner,
                     thread,
@@ -3260,6 +3324,12 @@ impl ZaloGuiApp {
                 } => {
                     self.profiles_requested = false;
                     self.profiles.clear();
+                    if self.account_runtime_id != runtime_id {
+                        self.doc_viewer = None;
+                        self.tools.devices.clear();
+                        self.tools.two_factor_status = None;
+                        self.tools.catalog_items.clear();
+                    }
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
                         self.cancel_voice_recording();
                         self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
@@ -3551,7 +3621,8 @@ impl ZaloGuiApp {
                         self.trim_resident_history();
                     }
                     self.refresh_unread_title(ctx);
-                    self.status_msg = format!("Đã cập nhật {}", crate::ui::clock());
+                    self.status_msg = history_status
+                        .unwrap_or_else(|| format!("Đã cập nhật {}", crate::ui::clock()));
                 }
                 GuiEvent::AccountMetadataInvalidated {
                     owner,
@@ -3800,6 +3871,9 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.is_logged_in = false;
                     self.account_runtime_id = 0;
+                    self.tools.devices.clear();
+                    self.tools.two_factor_status = None;
+                    self.tools.catalog_items.clear();
                     self.threads.clear();
                     self.user_uin.clear();
                     self.user_name.clear();
@@ -3914,6 +3988,7 @@ impl ZaloGuiApp {
                     self.status_msg = "Đã đăng xuất".into();
                     self.active_call = None;
                     self.image_viewer = None;
+                    self.doc_viewer = None;
                     self.user_avatar = None;
                     self.input_message.clear();
                     self.password_input.clear();
@@ -3971,6 +4046,9 @@ impl ZaloGuiApp {
                 GuiEvent::ProfileSwitched { session } => {
                     let uid = session.account_key().to_owned();
                     let runtime_id = session.runtime_id();
+                    self.tools.devices.clear();
+                    self.tools.two_factor_status = None;
+                    self.tools.catalog_items.clear();
                     self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                     self.auth_in_progress = false;
                     // A20: Profile switched; thoroughly isolate and reset UI state for new profile
@@ -3989,6 +4067,7 @@ impl ZaloGuiApp {
                     self.selected_thread_index = 0;
                     self.active_call = None;
                     self.image_viewer = None;
+                    self.doc_viewer = None;
                     self.user_avatar = None;
                     self.input_message.clear();
                     self.replying_to = None;
@@ -4587,6 +4666,11 @@ impl ZaloGuiApp {
                             viewer.thread_id == *thread && viewer.message_id == *id
                         }) {
                             self.image_viewer = None;
+                        }
+                        if self.doc_viewer.as_ref().is_some_and(|viewer| {
+                            viewer.context.thread == *thread && viewer.context.message.id == *id
+                        }) {
+                            self.doc_viewer = None;
                         }
                         for attachment in 0..32 {
                             for preview in [false, true] {
@@ -6109,6 +6193,9 @@ impl ZaloGuiApp {
                 GuiEvent::LocalCallRecord { .. } => {
                     unreachable!("local call record normalized before dispatch")
                 }
+                GuiEvent::ConversationHistoryLoaded { .. } => {
+                    unreachable!("conversation history normalized before dispatch")
+                }
                 GuiEvent::StatusUpdate(msg) => {
                     if is_status_error(&msg) {
                         self.show_toast(msg);
@@ -6117,6 +6204,7 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ServerMediaLoaded {
+                    runtime_id,
                     thread_id,
                     media_type,
                     page_num,
@@ -6124,7 +6212,13 @@ impl ZaloGuiApp {
                     generation,
                 } => {
                     // Only update if generation matches and thread/media_type match current tools state
-                    if generation == self.tools.server_media_generation
+                    if self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                        && self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .is_some_and(|thread| thread.id == thread_id)
+                        && generation == self.tools.server_media_generation
                         && thread_id == self.tools.server_media_thread_id
                         && media_type == self.tools.server_media_type
                     {
@@ -6156,16 +6250,24 @@ impl ZaloGuiApp {
                     }
                 }
                 GuiEvent::ServerMediaLoadFailed {
+                    runtime_id,
                     thread_id,
                     media_type,
                     generation,
-                    error: _,
+                    error,
                 } => {
-                    if generation == self.tools.server_media_generation
+                    if self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                        && self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .is_some_and(|thread| thread.id == thread_id)
+                        && generation == self.tools.server_media_generation
                         && thread_id == self.tools.server_media_thread_id
                         && media_type == self.tools.server_media_type
                     {
                         self.tools.server_media_loading = false;
+                        self.status_msg = error;
                     }
                 }
                 GuiEvent::CloudViewerKeyLoaded(key) => {
@@ -6175,38 +6277,48 @@ impl ZaloGuiApp {
                         .cloud_viewer_keys
                         .insert(key.file_id.clone(), key);
                 }
-                GuiEvent::BusinessCatalogLoaded(items) => {
-                    self.tools.catalog_items = items;
-                    self.status_msg = format!(
-                        "Đã tải {} sản phẩm doanh nghiệp",
-                        self.tools.catalog_items.len()
-                    );
-                }
-                GuiEvent::DevicesLoaded(devices) => {
-                    self.tools.devices = devices;
-                    self.status_msg = format!(
-                        "Đã cập nhật {} thiết bị đăng nhập",
-                        self.tools.devices.len()
-                    );
-                }
-                GuiEvent::TwoFactorStatusLoaded(status) => {
-                    let st_str = if status.is_enabled {
-                        "Đã kích hoạt"
-                    } else {
-                        "Chưa kích hoạt"
-                    };
-                    self.status_msg =
-                        format!("Xác thực 2FA: {} (SĐT: {})", st_str, status.phone_masked);
-                    self.tools.two_factor_status = Some(status);
-                }
-                GuiEvent::GroupTodosLoaded(todos) => {
+                GuiEvent::GroupTodosLoaded {
+                    runtime_id,
+                    thread_id,
+                    todos,
+                } => {
+                    if !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                        || !self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .is_some_and(|thread| thread.is_group && thread.id == thread_id)
+                    {
+                        continue;
+                    }
+                    if self.tools.todo_poll_thread_id != thread_id {
+                        self.tools.group_polls.clear();
+                    }
+                    self.tools.todo_poll_thread_id = thread_id;
                     self.tools.group_todos = todos;
                     self.status_msg = format!(
                         "Đã tải {} việc cần làm từ nhóm",
                         self.tools.group_todos.len()
                     );
                 }
-                GuiEvent::GroupPollsLoaded(polls) => {
+                GuiEvent::GroupPollsLoaded {
+                    runtime_id,
+                    thread_id,
+                    polls,
+                } => {
+                    if !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                        || !self
+                            .threads
+                            .get(self.selected_thread_index)
+                            .is_some_and(|thread| thread.is_group && thread.id == thread_id)
+                    {
+                        continue;
+                    }
+                    if self.tools.todo_poll_thread_id != thread_id {
+                        self.tools.group_todos.clear();
+                    }
+                    self.tools.todo_poll_thread_id = thread_id;
                     self.tools.group_polls = polls;
                     self.status_msg =
                         format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
@@ -7002,6 +7114,8 @@ impl ZaloGuiApp {
                         "Nhập mã PIN 4 số để mở khóa Zalo"
                     } else if show_hello {
                         "Xác thực bằng Windows Hello để tiếp tục"
+                    } else if self.settings.use_windows_hello {
+                        "Windows Hello chưa sẵn sàng. Bạn có thể đăng xuất và đăng nhập lại để tiếp tục"
                     } else {
                         "Ứng dụng đang bị khóa"
                     };
@@ -7248,6 +7362,57 @@ mod settings_layout_tests {
 #[cfg(test)]
 mod history_residency_tests {
     use super::*;
+    #[test]
+    fn conversation_history_requires_the_current_logged_in_runtime() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("selected", 1, 1)],
+            false,
+        );
+        app.is_logged_in = true;
+        let runtime = app.account_runtime_id;
+        app.status_msg = "current session".into();
+        for threads in [vec![thread("stale", 1, 1)], Vec::new()] {
+            app.event_tx
+                .send(GuiEvent::ConversationHistoryLoaded {
+                    runtime_id: runtime.wrapping_add(1),
+                    threads,
+                    status: "stale status".into(),
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(app.threads.iter().all(|t| t.id != "stale"));
+        assert_eq!(app.status_msg, "current session");
+
+        app.is_logged_in = false;
+        app.event_tx
+            .send(GuiEvent::ConversationHistoryLoaded {
+                runtime_id: runtime,
+                threads: vec![thread("logged-out", 1, 1)],
+                status: "logged-out status".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.threads.iter().all(|t| t.id != "logged-out"));
+        assert_eq!(app.status_msg, "current session");
+
+        app.is_logged_in = true;
+        app.event_tx
+            .send(GuiEvent::ConversationHistoryLoaded {
+                runtime_id: runtime,
+                threads: vec![thread("current", 1, 1)],
+                status: "current history".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.threads.iter().any(|t| t.id == "current"));
+        assert_eq!(app.status_msg, "current history");
+    }
+
     fn thread(id: &str, start: i64, count: usize) -> Thread {
         Thread {
             id: id.into(),
@@ -9221,6 +9386,7 @@ mod voice_draft_boundary_tests {
         assert!(!settings.use_windows_hello);
         assert!(settings.app_pin_hash.is_none());
         assert!(!settings.has_pin());
+        assert!(!settings.lock_configured());
         assert!(!settings.verify_pin("1234"));
 
         assert!(settings.set_pin("12a4").is_err());
@@ -9235,6 +9401,21 @@ mod voice_draft_boundary_tests {
             .is_some_and(|h| h.starts_with("pbkdf2$100000$")));
         assert!(settings.verify_pin("2580"));
         assert!(!settings.verify_pin("0000"));
+    }
+
+    #[test]
+    fn legacy_hello_only_settings_keep_the_restored_session_locked() {
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"enable_app_lock":true,"use_windows_hello":true,"app_pin_hash":null}"#,
+        )
+        .unwrap();
+        assert!(settings.lock_configured());
+        let mut guard = auth_guard::AppLockGuard::with_initial_lock(settings.lock_configured());
+        assert!(!guard.is_biometric_available());
+        assert!(guard.is_locked());
+        guard.poll_availability();
+        assert!(!guard.is_biometric_available());
+        assert!(guard.is_locked());
     }
 
     #[test]
@@ -9439,6 +9620,54 @@ mod phase3_completion_tests {
         let (tx, rx) = channel();
         app.event_rx = rx;
         (ctx, app, tx)
+    }
+    #[test]
+    fn group_tool_results_reject_old_runtime_and_other_conversation() {
+        let (ctx, mut app, tx) = app();
+        app.threads = vec![Thread {
+            id: "group-b".into(),
+            is_group: true,
+            ..Default::default()
+        }];
+        app.selected_thread_index = 0;
+        app.status_msg = "unchanged".into();
+        for (runtime_id, thread_id) in [
+            (app.account_runtime_id.wrapping_add(1), "group-b"),
+            (app.account_runtime_id, "group-a"),
+        ] {
+            tx.send(GuiEvent::GroupTodosLoaded {
+                runtime_id,
+                thread_id: thread_id.into(),
+                todos: Vec::new(),
+            })
+            .unwrap();
+            tx.send(GuiEvent::GroupPollsLoaded {
+                runtime_id,
+                thread_id: thread_id.into(),
+                polls: Vec::new(),
+            })
+            .unwrap();
+        }
+        app.check_events(&ctx);
+        assert_eq!(app.status_msg, "unchanged");
+        assert!(app.tools.todo_poll_thread_id.is_empty());
+        tx.send(GuiEvent::GroupTodosLoaded {
+            runtime_id: app.account_runtime_id,
+            thread_id: "group-b".into(),
+            todos: Vec::new(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.tools.todo_poll_thread_id, "group-b");
+        assert!(app.status_msg.contains("0"));
+        tx.send(GuiEvent::GroupPollsLoaded {
+            runtime_id: app.account_runtime_id,
+            thread_id: "group-b".into(),
+            polls: Vec::new(),
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert!(app.status_msg.contains("bình chọn"));
     }
     #[test]
     fn only_typed_success_starts_sync_banner_expiry() {

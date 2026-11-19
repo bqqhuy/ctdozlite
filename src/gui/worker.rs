@@ -542,8 +542,8 @@ pub enum WorkerCmd {
         before: Option<crate::store::HistoryCursor>,
     },
     FetchServerMedia {
+        runtime_id: usize,
         thread_id: String,
-        is_group: bool,
         media_type: u8,
         page: u32,
         count: u32,
@@ -2155,7 +2155,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 match result {
                                     Ok(bytes) => {
                                         let content = String::from_utf8_lossy(&bytes).into_owned();
-                                        let _ = tx.send(GuiEvent::DocPreviewLoaded { file_name: name, content });
+                                        let _ = tx.send(GuiEvent::DocPreviewLoaded {
+                                            owner: account.account_key().to_owned(),
+                                            runtime_id: account.runtime_id(),
+                                            context,
+                                            file_name: name,
+                                            content,
+                                        });
                                     }
                                     Err(_) => {
                                         let _ = tx.send(GuiEvent::StatusUpdate("Không tải được nội dung xem trước tài liệu".into()));
@@ -3439,25 +3445,64 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     let mut t = match loaded {
                                         Ok(Ok(mut list)) => list.remove(0),
                                         _ => {
-                                            let _ = gui_tx_clone.send(GuiEvent::StatusUpdate("Không thể đọc lịch sử cục bộ".into()));
+                                            let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                                runtime_id: s.runtime_id(),
+                                                threads: Vec::new(),
+                                                status: "Không thể đọc lịch sử cục bộ".into(),
+                                            });
                                             ctx_clone.request_repaint(); return;
                                         }
                                     };
+                                    let mut head_fetch_failed = false;
                                     let head=if is_group||is_send2me {
-                                        crate::history_open::fetch(&s,&group_id,is_group).await.unwrap_or_default()
+                                        match crate::history_open::fetch(&s,&group_id,is_group).await {
+                                            Ok(head) => head,
+                                            Err(error) => {
+                                                head_fetch_failed = true;
+                                                crate::logger::log_error("history head", &format!("Server history fetch failed: {error}"));
+                                                None
+                                            }
+                                        }
                                     }else{None};
+                                    {
+                                        let current = session_clone.lock().await;
+                                        if !current.is_active() || current.runtime_id() != s.runtime_id() || current.account_key() != s.account_key() {
+                                            return;
+                                        }
+                                    }
                                     if let Some(head)=&head{crate::chat::merge_group_history_with_profile(&mut t,&head.response,Some(s.account_key()));}
                                     if !t.messages.is_empty() {
                                         let cnt = t.messages.len();
                                         let mut filtered=vec![t];
                                         let stored=persist_received(&s, &mut filtered).await;
                                         if stored{if let Some(head)=head{if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist head freshness");}}}
-                                        let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:filtered,source:ThreadUpdateSource::History});
-                                        let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(format!(
-                                            "Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ"
-                                        )));
+                                        {
+                                            let current = session_clone.lock().await;
+                                            if !current.is_active() || current.runtime_id() != s.runtime_id() || current.account_key() != s.account_key() {
+                                                return;
+                                            }
+                                        }
+                                        let status = if head_fetch_failed {
+                                            format!("Đã đọc {cnt} tin cục bộ; không tải được lịch sử máy chủ")
+                                        } else {
+                                            format!("Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ")
+                                        };
+                                        let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            runtime_id: s.runtime_id(),
+                                            threads: filtered,
+                                            status,
+                                        });
                                         ctx_clone.request_repaint();
-                                    } else if let Some(head)=head {if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist empty head freshness");}}
+                                    } else if let Some(head)=head {
+                                        if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist empty head freshness");}
+                                    } else if head_fetch_failed {
+                                        let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            runtime_id: s.runtime_id(),
+                                            threads: Vec::new(),
+                                            status: "Không thể tải lịch sử máy chủ".into(),
+                                        });
+                                        ctx_clone.request_repaint();
+                                    }
                                 }
                             });
                         }
@@ -4360,8 +4405,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::FetchServerMedia {
+                            runtime_id,
                             thread_id,
-                            is_group,
                             media_type,
                             page,
                             count,
@@ -4373,36 +4418,39 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || !s.is_active() {
+                                    return;
+                                }
                                 let kind = match media_type {
                                     1 => crate::server_media::ServerMediaType::Photo,
                                     2 => crate::server_media::ServerMediaType::Video,
                                     3 => crate::server_media::ServerMediaType::File,
-                                    _ => crate::server_media::ServerMediaType::Link,
+                                    4 => crate::server_media::ServerMediaType::Link,
+                                    _ => {
+                                        let _ = events.send(GuiEvent::ServerMediaLoadFailed {
+                                            runtime_id,
+                                            thread_id,
+                                            media_type,
+                                            generation,
+                                            error: "Loại kho media không hợp lệ".into(),
+                                        });
+                                        ctx.request_repaint();
+                                        return;
+                                    }
                                 };
-                                let res = if is_group {
-                                    crate::server_media::fetch_group_media_store_paged(
-                                        &s,
-                                        &thread_id,
-                                        kind,
-                                        page,
-                                        count,
-                                        cursor.as_deref(),
-                                    )
-                                    .await
-                                } else {
-                                    crate::server_media::fetch_direct_media_store_paged(
-                                        &s,
-                                        &thread_id,
-                                        kind,
-                                        page,
-                                        count,
-                                        cursor.as_deref(),
-                                    )
-                                    .await
-                                };
+                                let _ = page;
+                                let res = crate::server_media::fetch_conversation_media_store(
+                                    &s,
+                                    &thread_id,
+                                    kind,
+                                    count,
+                                    cursor.as_deref(),
+                                )
+                                .await;
                                 match res {
                                     Ok(media_page) => {
                                         let _ = events.send(GuiEvent::ServerMediaLoaded {
+                                            runtime_id,
                                             thread_id,
                                             media_type,
                                             page_num: page,
@@ -4412,8 +4460,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                     Err(e) => {
                                         let err_msg = e.to_string();
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải kho media server: {err_msg}")));
                                         let _ = events.send(GuiEvent::ServerMediaLoadFailed {
+                                            runtime_id,
                                             thread_id,
                                             media_type,
                                             generation,
@@ -4480,7 +4528,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Ok(_) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo việc thành công: {content}")));
                                         if let Ok(todos) = crate::todo::list_group_todos(&s, &thread_id).await {
-                                            let _ = events.send(GuiEvent::GroupTodosLoaded(todos));
+                                            let _ = events.send(GuiEvent::GroupTodosLoaded {
+                                                runtime_id: s.runtime_id(), thread_id: thread_id.clone(), todos,
+                                            });
                                         }
                                     }
                                     Err(e) => {
@@ -4498,7 +4548,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let s = s_clone.lock().await.clone();
                                 match crate::todo::list_group_todos(&s, &thread_id).await {
                                     Ok(todos) => {
-                                        let _ = events.send(GuiEvent::GroupTodosLoaded(todos));
+                                        let _ = events.send(GuiEvent::GroupTodosLoaded {
+                                            runtime_id: s.runtime_id(), thread_id: thread_id.clone(), todos,
+                                        });
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách to-do: {e}")));
@@ -4521,7 +4573,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             for p in &mut poll_items {
                                                 p.grid = thread_id.clone();
                                             }
-                                            let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
+                                            let _ = events.send(GuiEvent::GroupPollsLoaded {
+                                                runtime_id: s.runtime_id(), thread_id: thread_id.clone(), polls: poll_items,
+                                            });
                                         }
                                     }
                                     Err(e) => {
@@ -4543,9 +4597,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         for p in &mut poll_items {
                                             p.grid = thread_id.clone();
                                         }
-                                        let count = poll_items.len();
-                                        let _ = events.send(GuiEvent::GroupPollsLoaded(poll_items));
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tải {count} cuộc bình chọn")));
+                                        let _ = events.send(GuiEvent::GroupPollsLoaded {
+                                            runtime_id: s.runtime_id(), thread_id: thread_id.clone(), polls: poll_items,
+                                        });
                                     }
                                     Err(e) => {
                                         let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách bình chọn: {e}")));

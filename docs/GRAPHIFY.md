@@ -1,9 +1,9 @@
 # Graphify cho rà soát mã
 
-Graphify là công cụ phát triển: lập đồ thị cấu trúc Rust để tra cứu module, symbol,
-call và vùng chịu ảnh hưởng khi sửa. Không thêm dependency Cargo hoặc thành phần vào
-bản cài Windows ARM64. Đồ thị hỗ trợ tìm đường đọc mã; không chứng minh quyền truy cập,
-độ đúng giao thức, luồng runtime hoặc thay thế test/capture Zalo thật.
+Graphify là công cụ phát triển: lập đồ thị cấu trúc cho toàn repository để tra cứu
+module, symbol, call và liên kết tài liệu trực tiếp. Không thêm dependency Cargo hoặc
+thành phần vào bản cài Windows ARM64. Đồ thị hỗ trợ tìm đường đọc mã; không chứng minh
+quyền truy cập, độ đúng giao thức, luồng runtime hoặc thay thế test/capture Zalo thật.
 
 ## Cài và chạy
 
@@ -17,8 +17,11 @@ python3 -m venv /tmp/ctdozlite-graphify-venv
 GRAPHIFY_BIN=/tmp/ctdozlite-graphify-venv/bin/graphify ./scripts/graphify.sh
 ```
 
-Script chỉ chạy AST/Cargo cục bộ (`--code-only`), không gọi LLM hoặc gửi source lên
-API. Không tự cài git hook, MCP server hoặc sửa cấu hình agent toàn máy.
+Script chạy AST/Cargo cục bộ (`--code-only`), không gọi LLM hoặc gửi source lên API.
+Lớp toàn repository cũng lập node cho tài liệu/config đã phát hiện và chỉ tạo cạnh
+`references` khi đường dẫn/tên file khớp chính xác nguồn trong corpus. Đây không
+phải trích xuất ngữ nghĩa: nội dung, ảnh và ý nghĩa chưa được phân tích ngữ nghĩa.
+Không tự cài git hook, MCP server hoặc sửa cấu hình agent toàn máy.
 `.graphifyignore` loại dữ liệu runtime, session, log, dump, vendor và build products.
 Không thêm `--no-gitignore` để lấy dữ liệu bị bỏ qua vào đồ thị.
 
@@ -41,6 +44,25 @@ Nếu binary không có trên PATH, thay `graphify` bằng đường dẫn venv.
 để xem cấu trúc; truy vấn có thể yêu cầu chọn symbol khi tên trùng. Các cạnh AST là
 bằng chứng tĩnh, không coi cạnh suy diễn hoặc kết quả không tìm thấy là kết luận lỗi.
 Không bật trích xuất ngữ nghĩa bằng LLM cho tài liệu/ảnh; roadmap được nhập có nguồn theo mục dưới.
+
+## Graph toàn repository
+
+Lượt toàn repository ngày 2026-11-19 phát hiện 576 file (~789.422 từ): 224 code,
+303 tài liệu/config và 49 ảnh. Graph AST+tham chiếu trực tiếp có 7.000 node,
+18.618 cạnh và 305 cộng đồng; HTML được gom thành 305 node cộng đồng và 1.732 cạnh
+chéo cộng đồng vì graph vượt 5.000 node. 352 file tài liệu/ảnh được đọc đầy đủ để
+tạo file nodes; 2.107 cạnh tham chiếu chỉ được thêm khi đường dẫn/tên file được xác
+nhận chính xác. Không chạy semantic extraction/LLM và không phân tích nội dung ảnh.
+Các cạnh AST inferred do extractor tạo không phải bằng chứng runtime. Chẩn đoán raw extraction ghi nhận 1.182 cạnh AST có endpoint không có node; chúng có thể là symbol/type bên ngoài chưa được trích xuất và đồ thị không đầy đủ ở các liên kết đó.
+
+Graph lưu tại `graphify-out/full-repository/graph.json`, report tại
+`graphify-out/full-repository/GRAPH_REPORT.md`, HTML tại
+`graphify-out/full-repository/graph.html`. Detector loại các log/diagnostic/config
+bị ignore theo chính sách và đánh dấu `tests/fixtures/v1-test-only-spki.der` là
+sensitive; không có dữ liệu session/DB/cookie/capture được ingest. Artefact chunk
+semantic cũ ở `graphify-out/` không được tin cậy hoặc hợp nhất; một số đường dẫn
+không tồn tại/coverage bằng 0 nên giữ nguyên như lịch sử để tránh xóa dữ liệu do
+worker khác tạo.
 
 ## Kết quả áp dụng trên working tree v0.008
 

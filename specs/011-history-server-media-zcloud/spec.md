@@ -24,6 +24,6 @@ Mã phạm vi Parity: **A20, B05, B11**
 
 ### 1.3. B11 — V1/BinNet và Khôi phục an toàn Desktop V2
 - **Zalo gốc**: Sao lưu và khôi phục định dạng Desktop V2 (SQLite nén + assets) và giao thức đồng bộ điện thoại qua BinNet/V1.
-  - An toàn giao dịch: Kiểm tra tính toàn vẹn (integrity check), tạo snapshot dự phòng và tự động rollback nếu gặp lỗi hoặc người dùng bấm Huỷ (`Cancel`).
+  - An toàn giao dịch của fork theo ADR-0031: kiểm tra cấu trúc trước khi nhập, dùng giao dịch SQLite ngắn; lỗi/Huỷ rollback lô hiện tại, giữ các lô đã commit để chạy lại idempotent. Không ghi đè tệp DB đang mở bằng snapshot main-file thiếu WAL. Đây là chính sách local của fork, không phải khẳng định hợp đồng Zalo PC.
   - Bảo toàn định dạng: Giữ nguyên `raw/Unknown` khi gặp opcode chưa hỗ trợ, không đoán mò UID.
-- **ctdozlite**: Cải tiến `src/phone_sync/import.rs` và `src/phone_sync/codec.rs` hỗ trợ snapshot rollback an toàn và parser BinNet giữ nguyên raw bytes.
+- **ctdozlite**: `src/desktop_backup.rs` và `src/phone_sync/import.rs` dùng giao dịch SQLite; `src/phone_sync/codec.rs` giữ nguyên raw bytes của BinNet.

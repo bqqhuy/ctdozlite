@@ -228,10 +228,13 @@ impl Domains {
                 "reaction",
                 "alias",
                 "label",
+                "media_store",
+                "media_store_send2me",
             ]
             .iter()
-            .filter_map(|key| crate::endpoints::service(key))
-            .any(|host| host == key);
+            .filter_map(|service| crate::endpoints::service(service))
+            .any(|host| host == key)
+                || matches!(key.as_str(), "media_store" | "media_store_send2me");
             if !known {
                 return false;
             }
@@ -611,6 +614,22 @@ impl Session {
     pub fn resolve_service_url(&self, service: &str, path: &str) -> String {
         let host = crate::endpoints::service(service).unwrap_or(crate::endpoints::WPA_CHAT);
         format!("{host}/{}", path.trim_start_matches('/'))
+    }
+
+    pub(crate) fn resolve_discovered_service_url(
+        &self,
+        service: &str,
+        path: &str,
+    ) -> Result<String> {
+        let host = self
+            .domains
+            .service_fallbacks
+            .get(service)
+            .into_iter()
+            .flatten()
+            .find(|host| trusted_service_url(host))
+            .context("Dịch vụ kho media không có endpoint đã xác thực")?;
+        Ok(format!("{host}/{}", path.trim_start_matches('/')))
     }
 
     /// Most recent bounded HTTP-attempt timings, useful for local troubleshooting.
@@ -1139,7 +1158,7 @@ impl Session {
                 .iter()
                 .filter_map(|x| x.as_str())
                 .map(|s| s.trim_end_matches('/').to_string())
-                .filter(|s| s.starts_with("wss://") || s.starts_with("ws://"))
+                .filter(|s| s.starts_with("wss://"))
                 .collect();
             if !list.is_empty() {
                 self.domains.ws = list;
@@ -1162,9 +1181,13 @@ impl Session {
                 "reaction",
                 "alias",
                 "label",
+                "media_store",
+                "media_store_send2me",
             ] {
-                if let Some(verified) = crate::endpoints::service(key) {
-                    let Some(value) = map.get(key) else { continue };
+                let Some(value) = map.get(key) else { continue };
+                if let Some(verified) = crate::endpoints::service(key)
+                    .or_else(|| matches!(key, "media_store" | "media_store_send2me").then_some(key))
+                {
                     let mut discovered = Vec::new();
                     let mut has_valid_host = false;
                     let values = value
@@ -1963,6 +1986,19 @@ fn random_imei() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_discovery_ignores_plaintext_endpoints() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let original = session.domains.ws.clone();
+        let insecure = crate::endpoints::WS_PRIMARY.replacen("wss://", "ws://", 1);
+        session.apply_server_info(&serde_json::json!({"zpw_ws": [insecure]}));
+        assert_eq!(session.domains.ws, original);
+        session.apply_server_info(&serde_json::json!({
+            "zpw_ws": [insecure, crate::endpoints::WS_PRIMARY]
+        }));
+        assert_eq!(session.domains.ws, vec![crate::endpoints::WS_PRIMARY]);
+    }
 
     #[test]
     fn session_new_initializes_zpw_sek_and_headers() {

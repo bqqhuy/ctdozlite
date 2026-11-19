@@ -1,12 +1,14 @@
-//! Device Management and Remote Kick (Zalo Parity C02).
+//! Unverified device API models and fail-closed network gates.
 //!
-//! Provides models and API helpers for listing logged-in device sessions and
-//! kicking unauthorized sessions remotely (`/api/login/getdevicelist`, `/api/login/kickdevice`).
+//! Native PC evidence does not establish the previous request contract; see
+//! `re-notes/55-unverified-feature-gates.md`. Parsers remain offline research helpers.
 
 use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 /// An active logged-in device session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,37 +83,28 @@ pub fn parse_device_list(val: &Value, current_imei: Option<&str>) -> Result<Vec<
         .collect()
 }
 
-/// Call `/api/login/getdevicelist` to retrieve active devices.
-pub async fn get_logged_in_devices(s: &Session) -> Result<Vec<DeviceSession>> {
-    let url = format!("{}/api/login/getdevicelist", s.domains.chat);
-    let payload = json!({
-        "imei": s.imei,
-    });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số lấy danh sách thiết bị thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    parse_device_list(&decrypted, Some(&s.imei))
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn get_logged_in_devices(_s: &Session) -> Result<Vec<DeviceSession>> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Danh sách thiết bị chưa khả dụng: chưa xác minh giao thức Zalo PC.")
 }
 
-/// Call `/api/login/kickdevice` to remotely log out a device.
-pub async fn kick_remote_device(s: &Session, target_device_id: &str) -> Result<Value> {
-    let url = format!("{}/api/login/kickdevice", s.domains.chat);
-    let payload = json!({
-        "target_device_id": target_device_id,
-        "imei": s.imei,
-    });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số đăng xuất thiết bị thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn kick_remote_device(_s: &Session, _target_device_id: &str) -> Result<Value> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Đăng xuất từ xa chưa khả dụng: chưa xác minh giao thức Zalo PC.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unverified_contracts_fail_before_using_session_credentials() {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(get_logged_in_devices(&session).await.is_err());
+        assert!(kick_remote_device(&session, "target").await.is_err());
+    }
 
     #[test]
     fn test_parse_device_list() {

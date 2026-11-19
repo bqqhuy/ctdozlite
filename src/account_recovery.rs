@@ -1,12 +1,14 @@
-//! Account Security & Recovery Management (Zalo Parity C02).
+//! Unverified account recovery API models and fail-closed network gates.
 //!
-//! Provides data structures and API helpers to inspect 2-step verification (2FA) status
-//! and manage account authentication security (`/api/login/check2fa`, `/api/login/change_pwd`).
+//! Native PC evidence does not establish the previous request contract; see
+//! `re-notes/55-unverified-feature-gates.md`. Parsers remain offline research helpers.
 
 use crate::session::Session;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+#[cfg(test)]
+use serde_json::json;
+use serde_json::Value;
 
 /// Status of Two-Factor Authentication (2FA) on the account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -56,23 +58,21 @@ fn boolean(value: &Value) -> Option<bool> {
         })
 }
 
-/// Call `/api/login/check2fa` to check whether 2FA is active on the account.
-pub async fn check_two_factor_status(s: &Session) -> Result<TwoFactorStatus> {
-    let url = format!("{}/api/login/check2fa", s.domains.chat);
-    let payload = json!({
-        "imei": s.imei,
-    });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số kiểm tra 2FA thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    parse_two_factor_status(&decrypted)
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn check_two_factor_status(_s: &Session) -> Result<TwoFactorStatus> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Trạng thái 2FA chưa xác định: chưa xác minh giao thức Zalo PC.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unverified_contracts_fail_before_using_session_credentials() {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(check_two_factor_status(&session).await.is_err());
+    }
 
     #[test]
     fn test_parse_two_factor_status() {

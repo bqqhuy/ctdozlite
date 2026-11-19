@@ -317,6 +317,31 @@ mod tests {
     }
 
     #[test]
+    fn hello_probe_pending_failure_and_timeout_never_unlock_a_restored_session() {
+        for mode in 0..3 {
+            let mut guard = AppLockGuard::with_initial_lock(true);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let start = if mode == 2 {
+                Instant::now() - Duration::from_secs(6)
+            } else {
+                Instant::now()
+            };
+            guard.availability = Some((receiver, start));
+            if mode == 1 {
+                sender.send(false).unwrap();
+            }
+            guard.poll_availability();
+            assert!(guard.is_locked());
+            assert!(!guard.is_biometric_available());
+        }
+        let mut guard = AppLockGuard::new();
+        guard.biometric_available = true;
+        guard.last_interaction = Instant::now() - Duration::from_secs(301);
+        assert!(guard.should_auto_lock(true, false, true));
+        assert!(!guard.should_auto_lock(false, false, true));
+    }
+
+    #[test]
     fn touch_updates_interaction_time() {
         let mut guard = AppLockGuard::new();
         let initial = guard.last_interaction;
@@ -442,6 +467,7 @@ mod tests {
         // Enabled app lock with PIN works even without biometric hardware.
         guard.biometric_available = false;
         assert!(guard.should_auto_lock(true, true, false));
+        // Hello cannot auto-lock until the biometric probe succeeds.
         assert!(!guard.should_auto_lock(true, false, true));
         // Enabled app lock with Windows Hello works when biometric is available.
         guard.biometric_available = true;

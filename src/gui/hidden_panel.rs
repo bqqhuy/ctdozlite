@@ -57,6 +57,7 @@ impl ZaloGuiApp {
             self.history_search.open = false;
             self.tools.hits.clear();
             self.image_viewer = None;
+            self.doc_viewer = None;
             self.clear_forward_dialog();
             self.replying_to = None;
             self.message_details = None;

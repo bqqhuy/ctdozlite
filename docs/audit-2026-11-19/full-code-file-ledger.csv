@@ -1,0 +1,160 @@
+file,lines,read_ranges_in_this_pass,status,remaining
+src/account_controls.rs,231,1-200,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/account_metadata.rs,387,1-230;221-386,targeted source read; overlap reflects prior partial pass,full semantic/path review and native acceptance pending
+src/account_recovery.rs,104,1-104,targeted full-file read; API evidence/parity remains unknown,full semantic/path review and native acceptance pending
+src/api_response.rs,79,1-79,targeted full-file read; consumer semantics pending,full semantic/path review and native acceptance pending
+src/archive.rs,160,1-159,targeted full-file read; callers/fixture provenance pending,full semantic/path review and native acceptance pending
+src/attachment_cache.rs,208,1-208,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/avatar.rs,200,1-200,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/avatar_history.rs,237,1-237,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/board.rs,477,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/bundled_stickers.rs,304,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/business.rs,204,1-204,targeted full-file read; endpoint/schema provenance and callers pending,full semantic/path review and native acceptance pending
+src/call.rs,4781,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/call_lifecycle.rs,137,1-131,targeted full-file read; call event caller integration pending,full semantic/path review and native acceptance pending
+src/chat.rs,9739,1046-1080;1140-1590;1825-1865;2000-2170;2638-2690;3160-3200;3290-3330;4110-4140;4784-4815;9380-9500;9620-9720,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/clipboard_image.rs,574,1-340,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/clock.rs,200,1-185,targeted full-file read,full semantic/path review and native acceptance pending
+src/contact_actions.rs,528,1-528,targeted full-file read; trace caller policy and evidence per action,full semantic/path review and native acceptance pending
+src/conversation_policy.rs,281,1-281,targeted full-file read; verify caller/runtime integration,full semantic/path review and native acceptance pending
+src/crash_report.rs,141,1-141,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/crypto/keystore.rs,564,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/crypto/prekey.rs,389,1-389,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/crypto/ratchet.rs,1009,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/crypto/safety.rs,212,1-212,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/crypto/session.rs,1110,1-260;315-550;550-730,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/crypto/store.rs,979,1-190;170-420,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/crypto/wire.rs,747,1-747,targeted full-file read; E3 custom/Signal envelope remains unverified live,full semantic/path review and native acceptance pending
+src/crypto.rs,157,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/desktop_backup.rs,589,1-170;294-540,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/desktop_backup_format.rs,288,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/desktop_notice.rs,344,1-260,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/desktop_notice_windows.rs,497,1-420,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/device.rs,150,1-150,targeted full-file read; device API contract unsupported by fresh bundle scan,full semantic/path review and native acceptance pending
+src/diagnostics.rs,168,1-168,targeted full-file read; candidate gaps for device/location/identity aliases in dev preview,full semantic/path review and native acceptance pending
+src/doh_resolver.rs,315,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/drop_cursor_windows.rs,20,1-20,targeted full-file read,full semantic/path review and native acceptance pending
+src/e2ee_integration.rs,412,60-170;243-325,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/e2ee_trial.rs,610,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/endpoints.rs,402,1-285,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/group_content.rs,639,1-290;291-636,targeted source read; protocol parity review remains,full semantic/path review and native acceptance pending
+src/group_entry.rs,321,1-321,targeted full-file read; route/schema source evidence pending,full semantic/path review and native acceptance pending
+src/group_metadata.rs,116,1-115,targeted full-file read,full semantic/path review and native acceptance pending
+src/group_state.rs,224,1-218,targeted full-file read; callers/runtime races pending,full semantic/path review and native acceptance pending
+src/groups.rs,860,1-300;301-580;581-854,targeted source read; protocol parity review remains,full semantic/path review and native acceptance pending
+src/gui/account_state.rs,240,1-240,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/account_switcher.rs,167,1-167,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/auth_guard.rs,450,1-200;390-465,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/gui/avatar_panel.rs,165,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/backup_panel.rs,82,1-82,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/board_panel.rs,214,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/composer_drafts.rs,488,1-488,targeted full-file read,full semantic/path review and native acceptance pending
+src/gui/contact_panel.rs,390,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/contacts.rs,1530,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/content_panel.rs,131,1-131,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/doc_viewer.rs,188,1-188,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/download_panel.rs,96,1-96,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/file_drop.rs,785,1-785,targeted full-file read; native drop/UI acceptance pending,full semantic/path review and native acceptance pending
+src/gui/group_entry_panel.rs,130,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/group_panel.rs,678,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/hidden_panel.rs,141,1-141,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/labels_panel.rs,193,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/mention_composer.rs,264,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/messages.rs,3960,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/modals.rs,6146,1158-1320;4340-4390,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/gui/policy_panel.rs,73,1-73,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/privacy_panel.rs,132,1-132,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/gui/profile_panel.rs,187,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/schedule_modal.rs,381,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/search_panel.rs,646,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/stickers.rs,2191,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/theme.rs,1414,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/gui/tools_panel.rs,1318,1-190,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/gui/worker.rs,6929,1760-1885;3030-3090;4400-4475;1888-1891;2138-2207;2881-2983;5102-5140;5892-5906;6336-6370;2208-2327,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/gui/workspace.rs,11119,4470-4510,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/gui.rs,9733,80-145;1540-1650;2328-2373;6310-6350;6890-6965;9320-9380;163-180;2916-2934;3927-4038;4533-4607;4662-4741;5480-5531;5721-5780,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/hidden_chat.rs,524,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/history_open.rs,100,1-100,targeted full-file read; verify caller lifecycle,full semantic/path review and native acceptance pending
+src/history_sync.rs,542,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/i18n.rs,43,1-43,targeted full-file read,full semantic/path review and native acceptance pending
+src/inbox.rs,271,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/labels.rs,337,1-337,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/last_activity.rs,89,1-89,targeted full-file read; caller/privacy parity pending,full semantic/path review and native acceptance pending
+src/lib.rs,182,1-182,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/limits.rs,245,1-280,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/live_updates.rs,554,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/logger.rs,338,1-338,targeted full-file read; response-body caller paths traced,full semantic/path review and native acceptance pending
+src/login.rs,512,1-280,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/main.rs,404,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/media.rs,2969,1-280,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/media_download.rs,1100,1-280;794-920,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/media_recovery.rs,197,1-120,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/media_renew.rs,707,1-110,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/media_resources.rs,453,1-453,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/mentions.rs,259,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/message_lifecycle.rs,376,1-376,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/message_model.rs,329,1-329,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/message_navigation.rs,142,1-128,targeted full-file read; verify all navigation callers,full semantic/path review and native acceptance pending
+src/message_view.rs,1561,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/mute_sync.rs,396,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/notification_sound.rs,109,1-109,targeted full-file read,full semantic/path review and native acceptance pending
+src/ocr_windows.rs,259,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/outgoing.rs,1374,80-190;750-880,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/param_cipher.rs,218,1-218,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/phone_sync/assets.rs,248,1-260,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/phone_sync/codec.rs,650,1-100,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/phone_sync/import.rs,317,1-470,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/phone_sync/legacy.rs,608,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/phone_sync/mod.rs,14,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/phone_sync/pipeline.rs,270,1-270,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/phone_sync/plan.rs,607,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/phone_sync/policy.rs,154,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/phone_sync/transfer.rs,2310,1-240;1900-2140,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/phone_sync/wire.rs,260,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/photo_quality.rs,232,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/platform.rs,403,1-250,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/poll.rs,335,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/presence.rs,322,1-322,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/preview_dns.rs,74,1-74,targeted full-file read,full semantic/path review and native acceptance pending
+src/privacy.rs,154,1-154,targeted full-file read; complete GUI and worker lifecycle pending,full semantic/path review and native acceptance pending
+src/profile.rs,203,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/profiles.rs,200,1-190,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/proxy.rs,438,181-330,targeted source read; CONNECT parser finding cross-reviewed,full semantic/path review and native acceptance pending
+src/qr.rs,531,1-280,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/queue_catchup.rs,104,1-104,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/queue_cursors.rs,434,1-434,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/quick_message.rs,123,1-123,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/random.rs,34,1-34,targeted full-file read,full semantic/path review and native acceptance pending
+src/reaction_pipeline.rs,252,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/reactions.rs,717,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/rich_text.rs,459,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/screen_capture.rs,94,1-94,targeted full-file read,full semantic/path review and native acceptance pending
+src/search.rs,866,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/server_media.rs,423,1-290,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/server_pins.rs,131,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/service_resolver.rs,773,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/session.rs,2798,1-280;420-550;680-820;820-1030;990-1380;1680-1780,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/socket/queue_receiver.rs,541,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/socket.rs,1608,145-205;430-850;1510-1570,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/storage.rs,606,1-400,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/store.rs,3912,1-200;206-390,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/todo.rs,268,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/tools.rs,1429,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/transfer_diagnostics.rs,634,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/tray.rs,422,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/tui.rs,4413,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/ui.rs,116,1-116,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/unread.rs,718,1-718,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/updater.rs,738,1-738,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/upload.rs,513,1-80,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/upload_events.rs,299,1-299,targeted full-file source read; caller/native/live acceptance pending,full semantic/path review and native acceptance pending
+src/video.rs,11,1-11,targeted full-file read,full semantic/path review and native acceptance pending
+src/video_frame.rs,172,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/video_meta.rs,275,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/video_player.rs,405,1-240,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/video_player_windows.rs,783,1-200;490-670,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/video_preview.rs,92,1-92,targeted full-file read,full semantic/path review and native acceptance pending
+src/voice.rs,908,,inventory / structural scan only,full semantic/path review and native acceptance pending
+src/voip_log.rs,747,1-708,targeted source read; final lines/tests unverified,full semantic/path review and native acceptance pending
+src/windows_video.rs,793,1-150;450-605,targeted source read; not full certification,full semantic/path review and native acceptance pending
+src/zcloud.rs,436,1-160,targeted source read; not full certification,full semantic/path review and native acceptance pending

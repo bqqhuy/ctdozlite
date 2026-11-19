@@ -10,6 +10,53 @@ use zalo_rust::{
     session::{LoginInfo, Session},
 };
 
+/// Run each fixture with its storage root fixed before any library initialization.
+fn isolated_fixture(name: &str) -> bool {
+    if std::env::var("CTDOZ_AUDIT_FIXTURE").as_deref() == Ok(name) {
+        let configured = std::path::PathBuf::from(
+            std::env::var_os("CTDOZ_DATA_DIR").expect("isolated child requires a storage root"),
+        );
+        assert_eq!(zalo_rust::storage::root(), configured);
+        return false;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env("CTDOZ_AUDIT_FIXTURE", name)
+        .env("CTDOZ_DATA_DIR", root.path())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "Isolated fixture {name} failed:\n{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    true
+}
+
+#[tokio::test]
+async fn link_send_rejects_unreadable_encryption_policy_before_network() {
+    if isolated_fixture("link_send_rejects_unreadable_encryption_policy_before_network") {
+        return;
+    }
+    std::fs::create_dir(zalo_rust::storage::root().join("e2ee.db")).unwrap();
+    let (host, server) = fixture(Some(r#"{"error_code":0,"data":{"msgId":"42"}}"#)).await;
+    let s = session(&host);
+    let meta = chat::LinkMetadata {
+        url: "https://example.invalid/fixture".into(),
+        title: "Fixture".into(),
+        desc: String::new(),
+        thumb: String::new(),
+        src: String::new(),
+    };
+    let error = chat::send_link_message(&s, "peer", "Fixture", &meta, false)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("E2EE"));
+    assert!(server.await.unwrap().is_empty());
+}
+
 async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
     std::env::set_var("CTDOZ_ALLOW_TEST_LOOPBACK", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -107,6 +154,9 @@ fn params(request: &str) -> serde_json::Value {
 }
 #[tokio::test]
 async fn unicode_html_comment_does_not_abort_link_scraping() {
+    if isolated_fixture("unicode_html_comment_does_not_abort_link_scraping") {
+        return;
+    }
     let (url, task) = fixture(Some("<!--你好--><title>Tiếng Việt</title>")).await;
     let metadata = chat::scrape_opengraph_metadata(&url).await.unwrap();
     assert_eq!(metadata.title, "Tiếng Việt");
@@ -114,6 +164,9 @@ async fn unicode_html_comment_does_not_abort_link_scraping() {
 }
 #[tokio::test]
 async fn m07_incoming_link_never_scrapes_directly_from_client_ip() {
+    if isolated_fixture("m07_incoming_link_never_scrapes_directly_from_client_ip") {
+        return;
+    }
     let (url, task) = fixture(Some("<title>Rogue Tracker Title</title>")).await;
     let s = Session::new(false, false, false).unwrap();
     let meta = chat::parse_link_metadata(&s, &url, chat::LinkOrigin::Incoming)
@@ -129,6 +182,9 @@ async fn m07_incoming_link_never_scrapes_directly_from_client_ip() {
 }
 #[tokio::test]
 async fn m07_outgoing_link_scrapes_with_sanitized_user_agent_not_discord() {
+    if isolated_fixture("m07_outgoing_link_scrapes_with_sanitized_user_agent_not_discord") {
+        return;
+    }
     let (url, task) = fixture(Some("<title>Legitimate Webpage</title>")).await;
     let s = Session::new(false, false, false).unwrap();
     let meta = chat::parse_link_metadata(&s, &url, chat::LinkOrigin::Outgoing)
@@ -149,6 +205,9 @@ async fn m07_outgoing_link_scrapes_with_sanitized_user_agent_not_discord() {
 }
 #[tokio::test]
 async fn uncertain_quote_delivery_never_issues_a_second_mutation() {
+    if isolated_fixture("uncertain_quote_delivery_never_issues_a_second_mutation") {
+        return;
+    }
     let (url, task) = fixture(None).await;
     assert!(
         chat::send_quote_message(&session(&url), "789", "reply", &quote(), true)
@@ -161,6 +220,9 @@ async fn uncertain_quote_delivery_never_issues_a_second_mutation() {
 }
 #[tokio::test]
 async fn uncertain_link_delivery_never_falls_back_to_sms() {
+    if isolated_fixture("uncertain_link_delivery_never_falls_back_to_sms") {
+        return;
+    }
     let (url, task) = fixture(None).await;
     assert!(chat::send_link_message(
         &session(&url),
@@ -180,6 +242,11 @@ async fn uncertain_link_delivery_never_falls_back_to_sms() {
 }
 #[tokio::test]
 async fn quote_request_preserves_sender_and_client_identity_instead_of_display_or_time() {
+    if isolated_fixture(
+        "quote_request_preserves_sender_and_client_identity_instead_of_display_or_time",
+    ) {
+        return;
+    }
     let (url, task) = fixture(Some(r#"{"error_code":0,"data":{"msgId":"99"}}"#)).await;
     chat::send_quote_message(&session(&url), "789", "reply", &quote(), true)
         .await
@@ -191,6 +258,9 @@ async fn quote_request_preserves_sender_and_client_identity_instead_of_display_o
 }
 #[tokio::test]
 async fn missing_or_opaque_receipts_never_confirm_quote_or_recall() {
+    if isolated_fixture("missing_or_opaque_receipts_never_confirm_quote_or_recall") {
+        return;
+    }
     for body in [
         r#"{}"#,
         r#"{"error_code":0,"data":null}"#,
@@ -216,6 +286,9 @@ async fn missing_or_opaque_receipts_never_confirm_quote_or_recall() {
 }
 #[tokio::test]
 async fn direct_media_forward_is_rejected_before_contacting_a_server() {
+    if isolated_fixture("direct_media_forward_is_rejected_before_contacting_a_server") {
+        return;
+    }
     // Media is forwarded only through the outgoing queue, which re-uploads the file.
     let s = session("http://127.0.0.1:1");
     let msg = ChatMessage {
@@ -233,6 +306,9 @@ async fn direct_media_forward_is_rejected_before_contacting_a_server() {
 }
 #[test]
 fn read_cursor_and_policy_survive_ingestion_and_thread_merge() {
+    if isolated_fixture("read_cursor_and_policy_survive_ingestion_and_thread_merge") {
+        return;
+    }
     let mut threads = vec![Thread {
         id: "456".into(),
         ..Default::default()
@@ -262,6 +338,9 @@ fn read_cursor_and_policy_survive_ingestion_and_thread_merge() {
 }
 #[tokio::test]
 async fn original_above_64_mib_is_read_in_bounded_chunks() {
+    if isolated_fixture("original_above_64_mib_is_read_in_bounded_chunks") {
+        return;
+    }
     let path = std::env::temp_dir().join(format!(
         "ctdoz-upload-limit-{}",
         zalo_rust::param_cipher::random_hex(12)
@@ -286,6 +365,9 @@ async fn original_above_64_mib_is_read_in_bounded_chunks() {
 
 #[tokio::test]
 async fn photo_upload_with_no_ack_does_not_send_or_report_success() {
+    if isolated_fixture("photo_upload_with_no_ack_does_not_send_or_report_success") {
+        return;
+    }
     let path = std::env::temp_dir().join(format!(
         "ctdoz-photo-{}.png",
         zalo_rust::param_cipher::random_hex(12)
@@ -302,6 +384,9 @@ async fn photo_upload_with_no_ack_does_not_send_or_report_success() {
 
 #[tokio::test]
 async fn retry_keeps_client_identity_and_clears_job_only_after_ack() {
+    if isolated_fixture("retry_keeps_client_identity_and_clears_job_only_after_ack") {
+        return;
+    }
     use zalo_rust::outgoing::{self, Payload};
     let message = outgoing::pending("retry fixture".into(), false, Payload::Text);
     let id = message.client_message_id.clone();
@@ -334,6 +419,9 @@ async fn retry_keeps_client_identity_and_clears_job_only_after_ack() {
 
 #[tokio::test]
 async fn changed_file_is_detected_before_send() {
+    if isolated_fixture("changed_file_is_detected_before_send") {
+        return;
+    }
     let path = std::env::temp_dir().join(format!(
         "stream-change-{}",
         zalo_rust::param_cipher::random_hex(12)
@@ -348,6 +436,9 @@ async fn changed_file_is_detected_before_send() {
 
 #[tokio::test]
 async fn streaming_upload_preserves_chunk_order_checksum_and_final_ack() {
+    if isolated_fixture("streaming_upload_preserves_chunk_order_checksum_and_final_ack") {
+        return;
+    }
     let path = std::env::temp_dir().join(format!(
         "stream-fixture-{}.bin",
         zalo_rust::param_cipher::random_hex(12)
@@ -402,6 +493,9 @@ async fn streaming_upload_preserves_chunk_order_checksum_and_final_ack() {
 }
 #[tokio::test]
 async fn forward_message_body_matches_zalo_pc_forward_message() {
+    if isolated_fixture("forward_message_body_matches_zalo_pc_forward_message") {
+        return;
+    }
     let ok = r#"{"error_code":0,"data":{"msgId":"9"}}"#;
     let info =
         serde_json::json!({"videoUrl":"https://video.zdn.vn/v.mp4","thumbUrl":"","duration":1});
@@ -433,6 +527,9 @@ async fn forward_message_body_matches_zalo_pc_forward_message() {
 
 #[tokio::test]
 async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
+    if isolated_fixture("uncertain_cloned_media_delivery_never_reuploads_or_sends_twice") {
+        return;
+    }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -520,6 +617,9 @@ async fn uncertain_cloned_media_delivery_never_reuploads_or_sends_twice() {
 
 #[test]
 fn audit_a16_websocket_queue_backpressure_and_flow_control() {
+    if isolated_fixture("audit_a16_websocket_queue_backpressure_and_flow_control") {
+        return;
+    }
     use serde_json::json;
     use std::time::Instant;
 
@@ -563,6 +663,9 @@ fn audit_a16_websocket_queue_backpressure_and_flow_control() {
 
 #[test]
 fn audit_a20_multi_account_profile_isolation_and_rollback_preservation() {
+    if isolated_fixture("audit_a20_multi_account_profile_isolation_and_rollback_preservation") {
+        return;
+    }
     use zalo_rust::account_controls::Impact;
 
     // 1. Account switch impact must invalidate all per-account state
@@ -607,6 +710,9 @@ fn audit_a20_multi_account_profile_isolation_and_rollback_preservation() {
 
 #[test]
 fn audit_a33_http2_header_injection_prevention() {
+    if isolated_fixture("audit_a33_http2_header_injection_prevention") {
+        return;
+    }
     use zalo_rust::endpoints::{has_header_injection, sanitize_header_value};
 
     // CRLF and null byte detection
@@ -631,6 +737,9 @@ fn audit_a33_http2_header_injection_prevention() {
 
 #[test]
 fn audit_a35_ipv6_link_local_and_site_local_guards() {
+    if isolated_fixture("audit_a35_ipv6_link_local_and_site_local_guards") {
+        return;
+    }
     use std::net::IpAddr;
     use zalo_rust::chat::is_safe_opengraph_url;
     use zalo_rust::endpoints::is_private_or_loopback_ip;
@@ -664,6 +773,9 @@ fn audit_a35_ipv6_link_local_and_site_local_guards() {
 
 #[test]
 fn test_m04_status_update_error_classification() {
+    if isolated_fixture("test_m04_status_update_error_classification") {
+        return;
+    }
     assert!(zalo_rust::gui::is_status_error(
         "Không thể kết nối đến máy chủ"
     ));
@@ -683,6 +795,9 @@ fn test_m04_status_update_error_classification() {
 
 #[test]
 fn test_perf_logger_vecdeque_fifo() {
+    if isolated_fixture("test_perf_logger_vecdeque_fifo") {
+        return;
+    }
     zalo_rust::logger::init(true);
     zalo_rust::logger::clear_entries();
 
@@ -712,6 +827,9 @@ fn test_perf_logger_vecdeque_fifo() {
 
 #[test]
 fn test_m05_clipboard_temp_file_account_isolation() {
+    if isolated_fixture("test_m05_clipboard_temp_file_account_isolation") {
+        return;
+    }
     let acc_a = "audit_clipboard_acc_aaa";
     let acc_b = "audit_clipboard_acc_bbb";
 
@@ -740,6 +858,9 @@ fn test_m05_clipboard_temp_file_account_isolation() {
 
 #[test]
 fn test_n04_e2ee_reset_drops_both_marker_and_ratchet_session() {
+    if isolated_fixture("test_n04_e2ee_reset_drops_both_marker_and_ratchet_session") {
+        return;
+    }
     let owner = "n04_test_owner_e2ee";
     let peer = "n04_test_peer_e2ee";
 
@@ -771,8 +892,13 @@ fn test_n04_e2ee_reset_drops_both_marker_and_ratchet_session() {
 
 #[test]
 fn test_n01_perform_account_logout_clears_credentials_isolated() {
+    if isolated_fixture("test_n01_perform_account_logout_clears_credentials_isolated") {
+        return;
+    }
     let acc_1 = "n01_user_acc_1";
     let acc_2 = "n01_user_acc_2";
+    let global_session = zalo_rust::storage::root().join("session.dat");
+    std::fs::write(&global_session, b"isolated-global-session").unwrap();
 
     let acc_dir_1 = zalo_rust::storage::account_dir(acc_1);
     let acc_dir_2 = zalo_rust::storage::account_dir(acc_2);
@@ -789,6 +915,10 @@ fn test_n01_perform_account_logout_clears_credentials_isolated() {
 
     // Logout account 1
     zalo_rust::profiles::perform_account_logout(acc_1).unwrap();
+    assert!(
+        !global_session.exists(),
+        "Logout removes only the isolated global credential"
+    );
     assert!(!session_file_1.exists());
     assert!(
         session_file_2.exists(),
@@ -802,6 +932,9 @@ fn test_n01_perform_account_logout_clears_credentials_isolated() {
 
 #[test]
 fn test_n03_outgoing_does_not_delete_user_file_named_clipboard() {
+    if isolated_fixture("test_n03_outgoing_does_not_delete_user_file_named_clipboard") {
+        return;
+    }
     let custom_temp_dir = std::env::temp_dir().join("ctdoz_test_custom_temp");
     std::fs::create_dir_all(&custom_temp_dir).unwrap();
     let user_file = custom_temp_dir.join("clipboard_critical_user_work.png");
@@ -825,6 +958,9 @@ fn test_n03_outgoing_does_not_delete_user_file_named_clipboard() {
 
 #[test]
 fn test_n04_list_e2ee_peers_hydrates_from_db_without_ui_thread_locks() {
+    if isolated_fixture("test_n04_list_e2ee_peers_hydrates_from_db_without_ui_thread_locks") {
+        return;
+    }
     let owner = "test_n04_hydrated_owner";
     let peer_1 = "peer_e2ee_1";
     let peer_2 = "peer_e2ee_2";
@@ -853,6 +989,9 @@ fn test_n04_list_e2ee_peers_hydrates_from_db_without_ui_thread_locks() {
 
 #[test]
 fn test_n06_e2ee_status_detection_and_peer_requirement() {
+    if isolated_fixture("test_n06_e2ee_status_detection_and_peer_requirement") {
+        return;
+    }
     let owner = "test_n06_owner";
     let peer = "peer_n06_incoming";
 

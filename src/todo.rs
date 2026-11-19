@@ -1,10 +1,10 @@
-//! Group To-Do and Task Assignment (Zalo Parity A18).
+//! Unverified todo API models and fail-closed network gates.
 //!
-//! Provides data structures and API helpers for creating, updating, and querying
-//! tasks/todos in groups (`/api/group/todo/create`, `/api/group/todo/update`, `/api/group/todo/list`).
+//! Native PC evidence does not establish the previous request contract; see
+//! `re-notes/55-unverified-feature-gates.md`. Parsers remain offline research helpers.
 
 use crate::session::Session;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -151,56 +151,54 @@ pub fn build_update_todo_params(
     payload
 }
 
-/// Call `/api/group/todo/create`.
+/// Return an unavailable error until this request contract has native evidence.
 pub async fn create_group_todo(
-    s: &Session,
-    grid: &str,
-    content: &str,
-    assignee_id: &str,
-    deadline_ts: i64,
+    _s: &Session,
+    _grid: &str,
+    _content: &str,
+    _assignee_id: &str,
+    _deadline_ts: i64,
 ) -> Result<Value> {
-    let url = s.resolve_service_url("group", "/api/group/todo/create");
-    let payload = build_create_todo_params(grid, content, assignee_id, deadline_ts);
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số tạo to-do thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Giao việc chưa khả dụng: chưa xác minh giao thức Zalo PC.")
 }
 
-/// Call `/api/group/todo/update`.
+/// Return an unavailable error until this request contract has native evidence.
 pub async fn update_group_todo(
-    s: &Session,
-    todo_id: &str,
-    grid: &str,
-    status: TodoStatus,
-    assignee_id: Option<&str>,
-    deadline_ts: Option<i64>,
+    _s: &Session,
+    _todo_id: &str,
+    _grid: &str,
+    _status: TodoStatus,
+    _assignee_id: Option<&str>,
+    _deadline_ts: Option<i64>,
 ) -> Result<Value> {
-    let url = s.resolve_service_url("group", "/api/group/todo/update");
-    let payload = build_update_todo_params(todo_id, grid, status, assignee_id, deadline_ts);
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số cập nhật to-do thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Giao việc chưa khả dụng: chưa xác minh giao thức Zalo PC.")
 }
 
-/// Call `/api/group/todo/list`.
-pub async fn list_group_todos(s: &Session, grid: &str) -> Result<Vec<TodoItem>> {
-    let url = s.resolve_service_url("group", "/api/group/todo/list");
-    let payload = json!({ "grid": grid });
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số lấy danh sách to-do thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
-    Ok(parse_todo_list(&decrypted))
+/// Return an unavailable error until this request contract has native evidence.
+pub async fn list_group_todos(_s: &Session, _grid: &str) -> Result<Vec<TodoItem>> {
+    // Fail closed until native protocol evidence establishes this contract.
+    anyhow::bail!("Giao việc chưa khả dụng: chưa xác minh giao thức Zalo PC.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unverified_contracts_fail_before_using_session_credentials() {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(create_group_todo(&session, "g1", "test", "1", 0)
+            .await
+            .is_err());
+        assert!(
+            update_group_todo(&session, "1", "g1", TodoStatus::Done, None, None)
+                .await
+                .is_err()
+        );
+        assert!(list_group_todos(&session, "g1").await.is_err());
+    }
 
     #[test]
     fn test_parse_todo_list() {

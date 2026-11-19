@@ -732,6 +732,16 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
     (rx, transport)
 }
 
+fn secure_ws_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
+    let req = url.into_client_request()?;
+    // Discovery, restored sessions and ZCALL_WS all meet this guard before credentials
+    // or DNS. Official endpoint evidence uses WSS (re-notes/02_chat_data.md §6).
+    if req.uri().scheme_str() != Some("wss") {
+        bail!("Kết nối WebSocket yêu cầu TLS (wss)");
+    }
+    Ok(req)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_once(
     sess: &Session,
@@ -746,14 +756,10 @@ async fn run_once(
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {}", crate::session::redact_url(&url)));
 
-    let mut req = url.clone().into_client_request()?;
+    let mut req = secure_ws_request(&url)?;
     let uri = req.uri();
     let host = uri.host().unwrap_or_default().to_string();
-    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
-        80
-    } else {
-        443
-    });
+    let port = uri.port_u16().unwrap_or(443);
     validate_ws_host(&host)?;
     verify_ws_dns(&host, port).await?;
     {
@@ -779,11 +785,7 @@ async fn run_once(
             Some(proxy) => {
                 let uri = req.uri();
                 let host = uri.host().unwrap_or_default().to_owned();
-                let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("ws") {
-                    80
-                } else {
-                    443
-                });
+                let port = uri.port_u16().unwrap_or(443);
                 let stream = crate::proxy::connect_via(proxy, &host, port)
                     .await
                     .map_err(|e| {
@@ -1127,6 +1129,22 @@ pub fn parse_voice_to_text_push(val: &Value) -> Option<crate::chat::VoiceToTextP
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_request_rejects_plaintext_before_credentials() {
+        let insecure = crate::endpoints::WS_PRIMARY.replacen("wss://", "ws://", 1);
+        let error = secure_ws_request(&insecure).unwrap_err().to_string();
+        assert!(error.contains("TLS (wss)"));
+
+        let secure = format!("{}/control?fixture=1", crate::endpoints::WS_PRIMARY);
+        let request = secure_ws_request(&secure).unwrap();
+        assert_eq!(
+            request.uri().path_and_query().unwrap().as_str(),
+            "/control?fixture=1"
+        );
+        assert!(!request.headers().contains_key(COOKIE));
+        assert!(!request.headers().contains_key("zpw_sek"));
+    }
 
     #[test]
     fn test_parse_voice_to_text_push_outcomes() {

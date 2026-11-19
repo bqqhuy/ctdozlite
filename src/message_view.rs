@@ -9,9 +9,20 @@ pub struct CallDetails {
     pub duration_seconds: u64,
     pub is_video: bool,
     pub reason: Option<i64>,
+    pub missed: bool,
 }
 pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
     fn parse(value: &Value, depth: usize) -> Option<CallDetails> {
+        fn integer(value: Option<&Value>) -> Option<i64> {
+            value.and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+                    .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+            })
+        }
+        fn boolean(value: Option<&Value>) -> Option<bool> {
+            value.and_then(|v| v.as_bool().or_else(|| integer(Some(v)).map(|n| n != 0)))
+        }
         if depth > 5 {
             return None;
         }
@@ -28,35 +39,29 @@ pub fn call_details(m: &ChatMessage) -> Option<CallDetails> {
         let outgoing = match action {
             Some("recommened.calling") => Some(true),
             Some("recommened.receivecall") => Some(false),
-            Some("recommened.misscall") => Some(
-                params
-                    .get("isCaller")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
+            Some("recommened.misscall" | "recommened.calltime") => {
+                Some(boolean(params.get("isCaller")).unwrap_or(false))
+            }
             _ => None,
         };
         if let Some(outgoing) = outgoing {
-            let calltype = params
-                .get("calltype")
-                .or_else(|| params.get("callType"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
+            let calltype =
+                integer(params.get("calltype").or_else(|| params.get("callType"))).unwrap_or(0);
             let is_video = calltype == 1
-                || params.get("isVideo").and_then(Value::as_bool) == Some(true)
-                || params.get("video").is_some();
+                || boolean(params.get("isVideo")) == Some(true)
+                || boolean(params.get("video")) == Some(true);
             return Some(CallDetails {
-                outgoing,
-                duration_seconds: decoded
-                    .get("duration")
-                    .or_else(|| params.get("duration"))
-                    .and_then(Value::as_u64)
+                outgoing: boolean(params.get("isCaller")).unwrap_or(outgoing),
+                duration_seconds: integer(params.get("duration"))
+                    .or_else(|| integer(decoded.get("duration")))
+                    .and_then(|n| u64::try_from(n).ok())
                     .unwrap_or(0),
                 is_video,
                 reason: params
                     .get("reason")
                     .or_else(|| decoded.get("reason"))
-                    .and_then(Value::as_i64),
+                    .and_then(|v| integer(Some(v))),
+                missed: action == Some("recommened.misscall"),
             });
         }
         decoded
@@ -88,11 +93,17 @@ pub fn call_label(m: &ChatMessage) -> String {
         } else {
             direction.into()
         };
-        return match details.reason {
-            Some(2) if seconds == 0 => format!("{base} — Không trả lời"),
-            Some(3..=5) if seconds == 0 => format!("{base} — Đã từ chối"),
-            _ => base,
-        };
+        if details.missed {
+            let base = direction;
+            return match details.reason {
+                Some(1) if details.outgoing => format!("{base} — Người nhận bận"),
+                Some(2) if details.outgoing => base.into(),
+                Some(3) => format!("{base} — Đã từ chối"),
+                Some(4 | 5) if details.outgoing => format!("{base} — Đã hủy"),
+                _ => format!("{base} — Cuộc gọi nhỡ"),
+            };
+        }
+        return base;
     }
     if m.text.trim().is_empty() {
         "Cuộc gọi".into()
@@ -179,6 +190,9 @@ pub fn is_call_log(m: &ChatMessage) -> bool {
 }
 
 pub fn call_log_is_video(m: &ChatMessage) -> bool {
+    if let Some(details) = call_details(m) {
+        return details.is_video;
+    }
     m.text.to_ascii_lowercase().contains("video")
         || m.history_source
             .as_ref()
@@ -1071,6 +1085,7 @@ mod tests {
                 duration_seconds: 125,
                 is_video: false,
                 reason: None,
+                missed: false,
             })
         );
         assert_eq!(call_label(&message), "Cuộc gọi đến (2:05)");
@@ -1091,19 +1106,92 @@ mod tests {
             })),
             ..Default::default()
         };
-        assert_eq!(call_label(&message), "Cuộc gọi video đến — Không trả lời");
+        assert_eq!(call_label(&message), "Cuộc gọi video đến — Cuộc gọi nhỡ");
+    }
+
+    #[test]
+    fn native_missed_call_action_takes_precedence_over_duration() {
+        let message = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "action": "recommened.misscall",
+                "params": { "calltype": 1, "reason": 3, "isCaller": true },
+                "duration": 70
+            })),
+            ..Default::default()
+        };
+        assert_eq!(call_label(&message), "Cuộc gọi video đi — Đã từ chối");
     }
 
     #[test]
     fn native_recommended_call_metadata_parses_pc_params_json_string() {
         let message = ChatMessage {
             history_source: Some(serde_json::json!({
-                "action": "recommened.misscall",
+                "action": "recommened.receivecall",
+                "duration": 99,
                 "params": "{\"calltype\":1,\"reason\":3,\"isCaller\":true,\"duration\":70}"
             })),
             ..Default::default()
         };
         assert_eq!(call_label(&message), "Cuộc gọi video đi (1:10)");
+    }
+
+    #[test]
+    fn native_recommended_calltime_accepts_string_fields() {
+        let message = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "action": "recommened.calltime",
+                "params": "{\"calltype\":\"1\",\"reason\":\"0\",\"isCaller\":\"1\",\"duration\":\"12\"}"
+            })),
+            ..Default::default()
+        };
+        assert_eq!(call_label(&message), "Cuộc gọi video đi (0:12)");
+    }
+
+    #[test]
+    fn native_call_params_override_direction_and_preserve_zero_duration() {
+        let message = ChatMessage {
+            history_source: Some(serde_json::json!({
+                "action": "recommened.receivecall",
+                "duration": 25,
+                "params": { "isCaller": true, "duration": 0, "calltype": 0, "video": false }
+            })),
+            ..Default::default()
+        };
+        let details = call_details(&message).unwrap();
+        assert!(details.outgoing);
+        assert_eq!(details.duration_seconds, 0);
+        assert!(!call_log_is_video(&message));
+    }
+
+    #[test]
+    fn native_misscall_preserves_busy_and_caller_cancel_reasons() {
+        let make_message = |reason: i64, is_caller: bool| ChatMessage {
+            history_source: Some(serde_json::json!({
+                "action": "recommened.misscall",
+                "params": { "calltype": 0, "reason": reason, "isCaller": is_caller },
+                "duration": 0
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            call_label(&make_message(1, false)),
+            "Cuộc gọi đến — Cuộc gọi nhỡ"
+        );
+        assert_eq!(
+            call_label(&make_message(1, true)),
+            "Cuộc gọi đi — Người nhận bận"
+        );
+        assert_eq!(
+            call_label(&make_message(2, false)),
+            "Cuộc gọi đến — Cuộc gọi nhỡ"
+        );
+        assert_eq!(call_label(&make_message(2, true)), "Cuộc gọi đi");
+        assert_eq!(
+            call_label(&make_message(3, false)),
+            "Cuộc gọi đến — Đã từ chối"
+        );
+        assert_eq!(call_label(&make_message(4, true)), "Cuộc gọi đi — Đã hủy");
+        assert_eq!(call_label(&make_message(5, true)), "Cuộc gọi đi — Đã hủy");
     }
 
     #[test]

@@ -3167,12 +3167,7 @@ pub(crate) async fn send_link_message_with_client_id(
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    // Audit A01: fail-closed if E2EE is required for this direct peer.
-    if !is_group && crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id) {
-        anyhow::bail!(
-            "Hội thoại yêu cầu mã hóa đầu cuối (E2EE); không được gửi liên kết qua endpoint thường"
-        );
-    }
+    require_plaintext_send(s, to_id, is_group)?;
     let msg_str = if text.trim().is_empty() {
         meta.url.as_str()
     } else {

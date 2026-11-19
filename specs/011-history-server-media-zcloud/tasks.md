@@ -11,7 +11,7 @@
 - [x] [R14-T06] [B05] Bộ phân giải JSON phản hồi và unit tests kiểm tra phân trang và lọc theo loại media.
 
 ## 3. Khối B11: V1/BinNet và Khôi phục dữ liệu an toàn
-- [x] [R14-T07] [B11] Cơ chế Atomic Snapshot & Rollback cho Desktop V2 import trong `src/phone_sync/import.rs`.
+- [x] [R14-T07] [B11] Desktop V2 import dùng rollback giao dịch SQLite theo lô (ADR-0031); giữ lô đã commit. Helper snapshot main-file đã được gỡ vì không an toàn với WAL. Bằng chứng chạy regression xem verification.md.
 - [x] [R14-T08] [B11] Parser BinNet frame descriptor bảo toàn nguyên vẹn `raw/Unknown` bytes trong `src/phone_sync/codec.rs`.
 
 ## 4. Tích hợp UI & Worker Command

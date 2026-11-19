@@ -70,9 +70,98 @@ pub(crate) struct CachedVideo(
     std::sync::atomic::AtomicU64,
     std::sync::atomic::AtomicU64,
 );
-pub static CACHE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static PENDING_RESERVATIONS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+#[derive(Default)]
+struct BudgetState {
+    admitted: u64,
+    pending: u64,
+}
+
+#[derive(Default)]
+struct PlaybackBudget(std::sync::Mutex<BudgetState>);
+
+impl PlaybackBudget {
+    fn reserve(&self, pending: &std::sync::atomic::AtomicU64, bytes: u64) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cache video không khả dụng"))?;
+        Self::check_capacity(&state, bytes)?;
+        state.pending += bytes;
+        pending.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn admit(
+        &self,
+        admitted: &std::sync::atomic::AtomicU64,
+        pending: &std::sync::atomic::AtomicU64,
+        bytes: u64,
+    ) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let mut state = self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Cache video không khả dụng"))?;
+        let transfer = pending.load(Ordering::Relaxed).min(bytes);
+        // Validate the entire request before consuming any existing reservation.
+        Self::check_capacity(&state, bytes - transfer)?;
+        state.pending -= transfer;
+        state.admitted += bytes;
+        pending.fetch_sub(transfer, Ordering::Relaxed);
+        admitted.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn check_capacity(state: &BudgetState, extra: u64) -> Result<()> {
+        anyhow::ensure!(
+            state
+                .admitted
+                .checked_add(state.pending)
+                .and_then(|total| total.checked_add(extra))
+                .is_some_and(|total| total <= MAX_CACHE_BYTES),
+            "Cache video đã đạt 512 MiB; hãy đóng viewer khác hoặc lưu tệp về máy"
+        );
+        Ok(())
+    }
+
+    fn release(
+        &self,
+        admitted: &std::sync::atomic::AtomicU64,
+        pending: &std::sync::atomic::AtomicU64,
+    ) {
+        use std::sync::atomic::Ordering;
+        // A dropped lease must release its units even if an earlier holder panicked.
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let next_admitted = state
+            .admitted
+            .checked_sub(admitted.swap(0, Ordering::Relaxed));
+        let next_pending = state
+            .pending
+            .checked_sub(pending.swap(0, Ordering::Relaxed));
+        if let (Some(admitted), Some(pending)) = (next_admitted, next_pending) {
+            state.admitted = admitted;
+            state.pending = pending;
+        } else {
+            drop(state);
+            crate::logger::log_error("video cache", "Playback budget ownership mismatch");
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (u64, u64) {
+        let state = self.0.lock().unwrap();
+        (state.admitted, state.pending)
+    }
+}
+
+static PLAYBACK_BUDGET: PlaybackBudget = PlaybackBudget(std::sync::Mutex::new(BudgetState {
+    admitted: 0,
+    pending: 0,
+}));
 static ACTIVE_CACHE: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
 impl CachedVideo {
     /// Remove stale private video files and reserve the new playback path.
@@ -123,88 +212,15 @@ impl CachedVideo {
         Ok(lease)
     }
 
-    /// Reserve an upfront capacity budget before starting to download.
-    /// Atomically ensures CACHE_BYTES + PENDING_RESERVATIONS + bytes <= MAX_CACHE_BYTES.
+    /// Reserve upfront capacity against the combined pending and admitted budget.
     pub(crate) fn reserve_capacity(&self, bytes: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        if bytes == 0 {
-            return Ok(());
-        }
-        PENDING_RESERVATIONS
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                let current = CACHE_BYTES.load(Ordering::Acquire);
-                let total = current.checked_add(pending)?.checked_add(bytes)?;
-                if total <= MAX_CACHE_BYTES {
-                    Some(pending + bytes)
-                } else {
-                    None
-                }
-            })
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Cache video đã đạt 512 MiB; hãy đóng viewer khác hoặc lưu tệp về máy"
-                )
-            })?;
-        self.2.fetch_add(bytes, Ordering::AcqRel);
-        Ok(())
+        PLAYBACK_BUDGET.reserve(&self.2, bytes)
     }
 
-    /// Admit bytes against the shared 512 MiB playback budget before writing.
-    /// If this lease has reserved capacity, transfers bytes from pending to admitted.
-    /// Otherwise, atomically checks that CACHE_BYTES + PENDING_RESERVATIONS + bytes <= MAX_CACHE_BYTES.
+    /// Admit bytes before writing, consuming this lease's reserved capacity first.
+    /// Pending-to-admitted transfers and other admissions share one budget lock.
     pub(crate) fn admit(&self, bytes: usize) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        let bytes = bytes as u64;
-        if bytes == 0 {
-            return Ok(());
-        }
-
-        // Deduct from this lease's pending reservation if available
-        let mut reserved = self.2.load(Ordering::Acquire);
-        while reserved > 0 {
-            let to_transfer = reserved.min(bytes);
-            match self.2.compare_exchange_weak(
-                reserved,
-                reserved - to_transfer,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    PENDING_RESERVATIONS.fetch_sub(to_transfer, Ordering::AcqRel);
-                    CACHE_BYTES.fetch_add(to_transfer, Ordering::AcqRel);
-                    self.1.fetch_add(to_transfer, Ordering::AcqRel);
-                    let remainder = bytes - to_transfer;
-                    if remainder == 0 {
-                        return Ok(());
-                    }
-                    return self.admit_unreserved(remainder);
-                }
-                Err(actual) => reserved = actual,
-            }
-        }
-
-        self.admit_unreserved(bytes)
-    }
-
-    fn admit_unreserved(&self, bytes: u64) -> Result<()> {
-        use std::sync::atomic::Ordering;
-        CACHE_BYTES
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                let pending = PENDING_RESERVATIONS.load(Ordering::Acquire);
-                let total = n.checked_add(bytes)?.checked_add(pending)?;
-                if total <= MAX_CACHE_BYTES {
-                    Some(n + bytes)
-                } else {
-                    None
-                }
-            })
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Cache video đã đạt 512 MiB; hãy đóng viewer khác hoặc lưu tệp về máy"
-                )
-            })?;
-        self.1.fetch_add(bytes, Ordering::AcqRel);
-        Ok(())
+        PLAYBACK_BUDGET.admit(&self.1, &self.2, bytes as u64)
     }
 
     /// Playback destination reserved for this lease only.
@@ -224,12 +240,7 @@ impl CachedVideo {
 }
 impl Drop for CachedVideo {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        CACHE_BYTES.fetch_sub(self.1.load(Ordering::Acquire), Ordering::AcqRel);
-        let remaining_reserved = self.2.load(Ordering::Acquire);
-        if remaining_reserved > 0 {
-            PENDING_RESERVATIONS.fetch_sub(remaining_reserved, Ordering::AcqRel);
-        }
+        PLAYBACK_BUDGET.release(&self.1, &self.2);
         if let Ok(mut active) = ACTIVE_CACHE.lock() {
             active.retain(|p| p != &self.0);
         }
@@ -245,6 +256,76 @@ impl Drop for CachedVideo {
 mod cache_tests {
     use super::*;
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn isolated_budget_serializes_competing_reserve_and_admit() {
+        use std::sync::{atomic::AtomicU64, Arc, Barrier};
+        let budget = Arc::new(PlaybackBudget::default());
+        let reserved = Arc::new(AtomicU64::new(0));
+        let admitted = Arc::new(AtomicU64::new(0));
+        let pending = Arc::new(AtomicU64::new(0));
+        let start = Arc::new(Barrier::new(3));
+        let reserve = {
+            let (budget, reserved, start) = (budget.clone(), reserved.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                budget.reserve(&reserved, 400 * 1024 * 1024).is_ok()
+            })
+        };
+        let admit = {
+            let (budget, admitted, pending, start) = (
+                budget.clone(),
+                admitted.clone(),
+                pending.clone(),
+                start.clone(),
+            );
+            std::thread::spawn(move || {
+                start.wait();
+                budget.admit(&admitted, &pending, 400 * 1024 * 1024).is_ok()
+            })
+        };
+        start.wait();
+        assert_ne!(reserve.join().unwrap(), admit.join().unwrap());
+        let (cached, waiting) = budget.snapshot();
+        assert_eq!(cached + waiting, 400 * 1024 * 1024);
+        budget.release(&admitted, &pending);
+        budget.release(&AtomicU64::new(0), &reserved);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
+
+    #[test]
+    fn reservation_transfer_never_exposes_capacity_or_partially_admits() {
+        use std::sync::{atomic::AtomicU64, Arc, Barrier};
+        let budget = Arc::new(PlaybackBudget::default());
+        let pending = Arc::new(AtomicU64::new(0));
+        let admitted = Arc::new(AtomicU64::new(0));
+        budget.reserve(&pending, MAX_CACHE_BYTES).unwrap();
+        assert!(budget
+            .admit(&admitted, &pending, MAX_CACHE_BYTES + 1)
+            .is_err());
+        assert_eq!(budget.snapshot(), (0, MAX_CACHE_BYTES));
+        let start = Arc::new(Barrier::new(2));
+        let transfer = {
+            let (budget, pending, admitted, start) = (
+                budget.clone(),
+                pending.clone(),
+                admitted.clone(),
+                start.clone(),
+            );
+            std::thread::spawn(move || {
+                start.wait();
+                budget.admit(&admitted, &pending, MAX_CACHE_BYTES).unwrap();
+            })
+        };
+        start.wait();
+        assert!(budget
+            .admit(&AtomicU64::new(0), &AtomicU64::new(0), 1)
+            .is_err());
+        transfer.join().unwrap();
+        assert_eq!(budget.snapshot(), (MAX_CACHE_BYTES, 0));
+        budget.release(&admitted, &pending);
+        assert_eq!(budget.snapshot(), (0, 0));
+    }
 
     #[test]
     fn active_videos_survive_pruning_and_budget_is_released_on_close() {
@@ -265,7 +346,7 @@ mod cache_tests {
         assert!(!root.join("first.mp4").exists());
         second.admit(2).unwrap();
         drop(second);
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -295,10 +376,7 @@ mod cache_tests {
 
         first.reserve_capacity(300 * 1024 * 1024).unwrap();
         assert_eq!(first.reserved_bytes(), 300 * 1024 * 1024);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            300 * 1024 * 1024
-        );
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 300 * 1024 * 1024);
 
         // 300MB + 250MB = 550MB > 512MB MAX_CACHE_BYTES -> must fail
         assert!(second.reserve_capacity(250 * 1024 * 1024).is_err());
@@ -307,18 +385,12 @@ mod cache_tests {
 
         // Drop first -> pending reservation released
         drop(first);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 0);
 
         // Now second can reserve
         second.reserve_capacity(250 * 1024 * 1024).unwrap();
         drop(second);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -332,38 +404,26 @@ mod cache_tests {
         let lease = CachedVideo::reserve(&root, "trans.mp4").unwrap();
         lease.reserve_capacity(1000).unwrap();
         assert_eq!(lease.reserved_bytes(), 1000);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            1000
-        );
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 1000);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 0);
 
         // Admit 400 bytes -> transferred from reserved to admitted
         lease.admit(400).unwrap();
         assert_eq!(lease.reserved_bytes(), 600);
         assert_eq!(lease.admitted_bytes(), 400);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            600
-        );
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 400);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 600);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 400);
 
         // Admit 600 bytes -> remaining reservation consumed
         lease.admit(600).unwrap();
         assert_eq!(lease.reserved_bytes(), 0);
         assert_eq!(lease.admitted_bytes(), 1000);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 1000);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 1000);
 
         drop(lease);
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -395,11 +455,8 @@ mod cache_tests {
             h.join().unwrap();
         }
 
-        assert_eq!(
-            PENDING_RESERVATIONS.load(std::sync::atomic::Ordering::Acquire),
-            0
-        );
-        assert_eq!(CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().1, 0);
+        assert_eq!(PLAYBACK_BUDGET.snapshot().0, 0);
         let _ = std::fs::remove_dir_all(&*root);
     }
 }

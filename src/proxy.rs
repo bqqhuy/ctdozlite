@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 static PROXY: OnceLock<Option<ProxyConfig>> = OnceLock::new();
@@ -255,19 +255,16 @@ async fn http_connect(
     stream.write_all(request.as_bytes()).await?;
 
     let mut reader = BufReader::new(stream);
-    let mut status = String::new();
-    let mut total = reader.read_line(&mut status).await?;
+    let mut remaining = MAX_CONNECT_RESPONSE;
+    let status = connect_line(&mut reader, &mut remaining).await?;
     let code = status
         .split_whitespace()
         .nth(1)
         .and_then(|c| c.parse::<u16>().ok())
         .context("Proxy trả phản hồi không hợp lệ")?;
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await?;
-        total += n;
-        anyhow::ensure!(total <= MAX_CONNECT_RESPONSE, "Proxy trả phản hồi quá dài");
-        if n == 0 || line == "\r\n" || line == "\n" {
+        let line = connect_line(&mut reader, &mut remaining).await?;
+        if line == "\r\n" || line == "\n" {
             break;
         }
     }
@@ -281,6 +278,25 @@ async fn http_connect(
         407 => anyhow::bail!("Proxy yêu cầu đăng nhập hoặc sai thông tin đăng nhập (407)"),
         code => anyhow::bail!("Proxy từ chối mở kết nối (HTTP {code})"),
     }
+}
+
+async fn connect_line(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    remaining: &mut usize,
+) -> Result<String> {
+    let mut line = String::new();
+    // Bound allocation before read_line can consume an unterminated proxy response.
+    let n = reader
+        .take((*remaining + 1) as u64)
+        .read_line(&mut line)
+        .await?;
+    anyhow::ensure!(n <= *remaining, "Proxy trả phản hồi quá dài");
+    anyhow::ensure!(
+        n > 0 && line.ends_with('\n'),
+        "Proxy trả phản hồi chưa đầy đủ"
+    );
+    *remaining -= n;
+    Ok(line)
 }
 
 #[cfg(test)]
@@ -408,6 +424,37 @@ mod tests {
             .to_string();
         assert!(error.contains("407"));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_headers_are_bounded_before_newline_and_require_completion() {
+        for prefix in ["", "HTTP/1.1 200 OK\r\nX-Large: "] {
+            let (mut writer, mut reader) = tokio::io::duplex(MAX_CONNECT_RESPONSE * 2);
+            let oversized = format!("{prefix}{}", "x".repeat(MAX_CONNECT_RESPONSE + 1));
+            // Keep the writer open: rejection must not depend on a newline or EOF.
+            writer.write_all(oversized.as_bytes()).await.unwrap();
+            let mut reader = BufReader::new(&mut reader);
+            let mut remaining = MAX_CONNECT_RESPONSE;
+            if !prefix.is_empty() {
+                connect_line(&mut reader, &mut remaining).await.unwrap();
+            }
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                connect_line(&mut reader, &mut remaining),
+            )
+            .await
+            .expect("oversized unterminated response must fail promptly");
+            assert!(result.is_err());
+        }
+        for reply in [
+            &b"HTTP/1.1 200 OK\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nX-Test: incomplete"[..],
+        ] {
+            let (port, server) = fake_http_proxy(reply).await;
+            let config = ProxyConfig::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+            assert!(connect_via(&config, "ws.example", 443).await.is_err());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
