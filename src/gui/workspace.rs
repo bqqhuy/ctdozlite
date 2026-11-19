@@ -1010,8 +1010,9 @@ impl ZaloGuiApp {
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
-        let screen_w = screen_rect.width();
-        let is_compact_w = screen_w < 780.0;
+        let screen_w = screen_rect.width() / ctx.pixels_per_point();
+        // Keep enough room for the navigation rail, conversation list, chat, and info drawer.
+        let is_compact_w = screen_w < 1120.0;
         let is_narrow_w = screen_w < 620.0;
         let narrow_chat_open = ctx.data(|data| {
             data.get_temp::<bool>(Id::new("narrow_chat_open"))
@@ -3458,13 +3459,24 @@ impl ZaloGuiApp {
                         self.chat_layout_key = layout_key;
                         ctx.request_discard("chat message list changed");
                     }
-                    // Measure visual wrapping, not only explicit newlines: the info drawer
-                    // can leave a narrow editor even on a wide desktop window.
-                    let composer_compact = (ui.available_width() - 44.0) < 360.0;
+                    // Measure visual wrapping, not only explicit newlines: clipping and DPI
+                    // can leave a narrow editor even when its parent has a wider layout.
+                    let composer_layout_width = ui.available_width().min(ui.clip_rect().width());
+                    let composer_compact = composer_layout_width < 272.0;
                     let composer_send_width = if composer_compact { 48.0 } else { 72.0 };
                     let composer_emoji_width = 34.0;
-                    let composer_spacing = 16.0;
-                    let composer_input_width = (ui.available_width() - 44.0 - composer_emoji_width - composer_send_width - composer_spacing).max(32.0);
+                    let composer_input_width = (composer_layout_width
+                        - 30.0
+                        - 18.0
+                        - composer_emoji_width
+                        - composer_send_width
+                        - 8.0
+                        - if composer_compact { 48.0 } else { 0.0 })
+                        .max(32.0);
+                    let toolbar_button_count = 7 + usize::from(cfg!(windows));
+                    let toolbar_inner_width = (composer_layout_width - 30.0).max(1.0);
+                    let toolbar_per_row = ((toolbar_inner_width + 2.0) / 34.0).floor().max(1.0) as usize;
+                    let toolbar_rows = toolbar_button_count.div_ceil(toolbar_per_row);
                     self.sync_composer_draft(ctx);
                     let editor_height = composer_editor_height(ui, &self.input_message, composer_input_width);
                     let group_send_allowed = !is_group || self.threads[self.selected_thread_index]
@@ -3478,7 +3490,7 @@ impl ZaloGuiApp {
                     // Reserve the same wrapped galley that is rendered below the history.
                     // A permission notice must not push the composer outside the viewport.
                     let notice_height = group_notice.as_ref().map(|galley| galley.size().y + ui.spacing().item_spacing.y).unwrap_or(0.0);
-                    let toolbar_height = 36.0;
+                    let toolbar_height = 36.0 + (toolbar_rows.saturating_sub(1) as f32 * 36.0);
                     let msg_area_height =
                         (ui.available_height() - 56.0 - toolbar_height - picker_reserve - editor_height - notice_height).max(0.0);
 
@@ -4498,6 +4510,7 @@ impl ZaloGuiApp {
 
                     // 4. Bottom Message Composer Bar (Two-Tier Composer: Tier 1 Toolbar + Tier 2 Multiline Editor)
                     if let Some(notice) = group_notice { ui.label(notice); }
+                    ui.set_max_width(composer_layout_width);
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(14.0, 8.0))
@@ -4506,7 +4519,7 @@ impl ZaloGuiApp {
                             if !group_send_allowed { ui.disable(); }
 
                             // Tier 1: Utility Toolbar 36px (Flat Icon Buttons)
-                            ui.horizontal(|ui| {
+                            ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
 
                                 // 1. Sticker Icon Button
@@ -4810,7 +4823,7 @@ impl ZaloGuiApp {
                                 .stroke(Stroke::new(1.0_f32, pal.border))
                                 .inner_margin(Margin::symmetric(8.0, 4.0))
                                 .show(ui, |ui| {
-                                    ui.horizontal_top(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.spacing_mut().item_spacing.x = 4.0;
                                         // Keep a usable editor and send action even at high DPI.
                                         let send_btn_w = composer_send_width;
@@ -6418,6 +6431,7 @@ mod composer_tests {
             );
             app.settings_modal_open = false;
             app.history_sync_running = false;
+            app.info_drawer_open = true;
             app.threads = vec![Thread {
                 id: "blocked-fixture".into(),
                 name: "Nhóm chưa xác minh quyền".into(),
