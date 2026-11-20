@@ -513,23 +513,18 @@ impl ZaloGuiApp {
         };
     }
 
-    fn request_attachment_picker(&mut self, thread: &str, group: bool, images_only: bool) {
+    fn request_attachment_picker(&mut self, thread: &str, _group: bool, images_only: bool) {
         if self.attachment_picker_pending {
             self.show_toast("Hộp chọn tệp đang mở");
             return;
         }
-        // Opening/cancelling the native picker is not acceptance of this draft.
-        // Retain the composer even after enqueue; attachment delivery owns its
-        // independent caption snapshot and can fail after the picker closes.
+        // Selection only prepares a draft. Sending requires a separate user intent.
         let queued = WORKER_TX.get().is_some_and(|tx| {
-            tx.send(WorkerCmd::PickAndSendAttachment {
-                to_id: thread.to_owned(),
-                is_group: group,
+            tx.send(WorkerCmd::PickAttachmentDraft {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                thread: thread.to_owned(),
                 images_only,
-                caption: self.input_message.trim().to_owned(),
-                preset_path: None,
-                photo_original: self.settings.send_photo_original,
-                ephemeral: false,
             })
             .is_ok()
         });

@@ -442,6 +442,12 @@ pub enum WorkerCmd {
         sticker_type: u32,
         is_group: bool,
     },
+    PickAttachmentDraft {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        images_only: bool,
+    },
     PickAndSendAttachment {
         to_id: String,
         is_group: bool,
@@ -4263,6 +4269,22 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     thread_id: to_id,
                                     message,
                                 });
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::PickAttachmentDraft { owner, runtime_id, thread, images_only } => {
+                            let s = session.lock().await.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let paths = if s.is_active() && s.account_key() == owner && s.runtime_id() == runtime_id {
+                                    tokio::task::spawn_blocking(move || super::messages::pick_native_files_dialog(images_only))
+                                        .await.map_err(|_| "Không mở được hộp chọn tệp".to_owned())
+                                        .map(|paths| paths.unwrap_or_default())
+                                } else {
+                                    Err("Phiên làm việc đã thay đổi".to_owned())
+                                };
+                                let _ = events.send(GuiEvent::AttachmentDraftPicked { owner, runtime_id, thread, paths });
                                 ctx.request_repaint();
                             });
                         }

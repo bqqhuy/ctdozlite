@@ -419,33 +419,42 @@ impl ZaloGuiApp {
                 self.status_msg = "Không gửi được tệp: bộ xử lý đã dừng".into();
             }
         } else {
-            for path in paths {
-                let Some(id) = self.attachment_drafts.insert(thread, path.clone()) else {
-                    self.status_msg =
-                        "Tệp trùng hoặc danh sách chờ đã đầy (16 tệp/hội thoại, 64 tệp tổng)"
-                            .into();
-                    continue;
-                };
-                if WORKER_TX.get().is_none_or(|tx| {
-                    tx.send(WorkerCmd::PrepareDroppedFile {
-                        owner: self.user_uin.clone(),
-                        thread: thread.into(),
-                        id,
-                        path,
-                    })
-                    .is_err()
-                }) {
-                    self.attachment_drafts.complete(
-                        ctx,
-                        &self.user_uin,
-                        thread,
-                        id,
-                        Err("Bộ xử lý đã dừng; bỏ tệp và thả lại để thử".into()),
-                    );
-                }
-            }
-            self.composer_focus_pending = true;
+            self.add_attachment_draft_paths(ctx, thread, paths);
         }
+    }
+
+    pub(super) fn add_attachment_draft_paths(
+        &mut self,
+        ctx: &egui::Context,
+        thread: &str,
+        paths: Vec<PathBuf>,
+    ) {
+        self.attachment_drafts.sync_owner(&self.user_uin);
+        for path in paths {
+            let Some(id) = self.attachment_drafts.insert(thread, path.clone()) else {
+                self.status_msg =
+                    "Tệp trùng hoặc danh sách chờ đã đầy (16 tệp/hội thoại, 64 tệp tổng)".into();
+                continue;
+            };
+            if WORKER_TX.get().is_none_or(|tx| {
+                tx.send(WorkerCmd::PrepareDroppedFile {
+                    owner: self.user_uin.clone(),
+                    thread: thread.into(),
+                    id,
+                    path,
+                })
+                .is_err()
+            }) {
+                self.attachment_drafts.complete(
+                    ctx,
+                    &self.user_uin,
+                    thread,
+                    id,
+                    Err("Bộ xử lý đã dừng; bỏ tệp và thả lại để thử".into()),
+                );
+            }
+        }
+        self.composer_focus_pending = true;
     }
 
     pub(super) fn send_attachment_draft(&mut self, ctx: &egui::Context, thread: &str, group: bool) {

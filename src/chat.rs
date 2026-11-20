@@ -1757,12 +1757,20 @@ pub(crate) fn confirmed_send(response: Value) -> Result<Value> {
 
 fn confirmed_upload(response: Value) -> Result<Value> {
     let response = confirmed_mutation(response)?;
-    anyhow::ensure!(
-        response
-            .get("data")
-            .is_some_and(|v| v.is_object() || v.is_array()),
-        "Máy chủ chưa xác nhận dữ liệu gửi; kiểm tra hội thoại trước khi gửi lại"
-    );
+    if !response
+        .get("data")
+        .is_some_and(|v| v.is_object() || v.is_array())
+    {
+        let failure = if response.get("_empty_body").and_then(Value::as_bool) == Some(true) {
+            crate::transfer_diagnostics::SendFailure::EmptyBody
+        } else {
+            crate::transfer_diagnostics::SendFailure::UnknownAck
+        };
+        crate::transfer_diagnostics::send_failure(failure, None, None);
+        return Err(anyhow::anyhow!(
+            "Máy chủ chưa xác nhận dữ liệu gửi; kiểm tra hội thoại trước khi gửi lại"
+        ));
+    }
     Ok(response)
 }
 
@@ -1775,6 +1783,11 @@ pub(crate) fn confirmed_mutation(mut response: Value) -> Result<Value> {
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         .context("Máy chủ chưa xác nhận thao tác; kiểm tra hội thoại trước khi thử lại")?;
     if code != 0 {
+        crate::transfer_diagnostics::send_failure(
+            crate::transfer_diagnostics::SendFailure::ServerRejected,
+            Some(code),
+            None,
+        );
         return Err(ServerRejected { code: Some(code) }.into());
     }
     if let Some(text) = response.get("data").and_then(Value::as_str) {
@@ -2487,6 +2500,13 @@ pub(crate) async fn send_attachment_with_client_id(
             .is_none_or(crate::upload_events::valid_id),
         "Máy chủ trả mã tệp không hợp lệ"
     );
+    if file_id.is_none() {
+        crate::transfer_diagnostics::send_failure(
+            crate::transfer_diagnostics::SendFailure::MissingFileId,
+            None,
+            None,
+        );
+    }
     let mut file_url = pick_str(data_node, &["fileUrl", "url", "normalUrl"]).unwrap_or_default();
     // Zalo processes the upload asynchronously and announces the CDN URL with a `file_done` /
     // `video_done` control; Zalo PC sends `asyncfile/msg` only after receiving it.
@@ -2494,7 +2514,14 @@ pub(crate) async fn send_attachment_with_client_id(
         if let Some(fid) = file_id.as_deref() {
             match crate::upload_events::wait(s.account_key(), fid, ASYNC_FILE_URL_WAIT).await {
                 Some(url) => file_url = url,
-                None => anyhow::bail!("Chưa nhận được đường dẫn tệp đã xử lý; tệp chưa được gửi"),
+                None => {
+                    crate::transfer_diagnostics::send_failure(
+                        crate::transfer_diagnostics::SendFailure::MissingAsyncUrl,
+                        None,
+                        None,
+                    );
+                    anyhow::bail!("Chưa nhận được đường dẫn tệp đã xử lý; tệp chưa được gửi")
+                }
             }
         }
     }
@@ -2736,6 +2763,11 @@ async fn send_video_message(
         }
     }
     if video_url.is_empty() {
+        crate::transfer_diagnostics::send_failure(
+            crate::transfer_diagnostics::SendFailure::MissingAsyncUrl,
+            None,
+            None,
+        );
         anyhow::bail!("Máy chủ chưa xử lý xong video; video chưa được gửi");
     }
     let mut thumb_url = String::new();
@@ -8402,6 +8434,22 @@ mod send_ack_tests {
                 .unwrap_err()
                 .to_string()
         ));
+    }
+
+    #[test]
+    fn server_error_204_is_kept_distinct_from_empty_success_body() {
+        let rejected = confirmed_mutation(json!({"error_code": 204, "data": {}})).unwrap_err();
+        assert_eq!(
+            rejected.downcast_ref::<ServerRejected>().unwrap().code,
+            Some(204)
+        );
+        let empty = confirmed_send(json!({
+            "error_code": 0,
+            "data": null,
+            "_empty_body": true
+        }))
+        .unwrap_err();
+        assert!(empty.to_string().contains("chưa xác nhận"));
     }
     #[test]
     fn persisted_metadata_cannot_change_message_routing_identity() {

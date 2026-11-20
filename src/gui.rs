@@ -341,6 +341,12 @@ pub enum GuiEvent {
     AttachmentPickerClosed {
         owner: String,
     },
+    AttachmentDraftPicked {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        paths: Result<Vec<std::path::PathBuf>, String>,
+    },
     /// A region capture ready to preview, or why there is none.
     ScreenCaptureFinished {
         owner: String,
@@ -3311,6 +3317,23 @@ impl ZaloGuiApp {
                 GuiEvent::AttachmentPickerClosed { owner } => {
                     if owner == self.user_uin {
                         self.attachment_picker_pending = false;
+                    }
+                }
+                GuiEvent::AttachmentDraftPicked {
+                    owner,
+                    runtime_id,
+                    thread,
+                    paths,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.attachment_picker_pending = false;
+                        match paths {
+                            Ok(paths) if self.is_logged_in => {
+                                self.add_attachment_draft_paths(ctx, &thread, paths)
+                            }
+                            Ok(_) => {}
+                            Err(error) => self.status_msg = error,
+                        }
                     }
                 }
                 GuiEvent::LiveThreadsReady(_) => {

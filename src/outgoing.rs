@@ -251,6 +251,11 @@ fn record_queue_wait(
     let elapsed = enqueued.elapsed();
     crate::service_resolver::record_queue_phase(context, elapsed);
     if elapsed > crate::service_resolver::QUEUE_BUDGET {
+        crate::transfer_diagnostics::send_failure(
+            crate::transfer_diagnostics::SendFailure::QueueBudget,
+            None,
+            None,
+        );
         return Err(anyhow::Error::new(SendBudgetElapsed(
             crate::service_resolver::TimingPhase::QueueWait,
         ))

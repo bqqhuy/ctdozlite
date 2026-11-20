@@ -127,6 +127,19 @@ pub(crate) enum RenewFailure {
     UrlBlocked,
     ServerRejected,
 }
+/// Classified send/upload failures. Values are intentionally coarse and contain no payloads.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SendFailure {
+    QueueBudget,
+    Offline,
+    HttpStatus,
+    ServerRejected,
+    EmptyBody,
+    MissingFileId,
+    MissingAsyncUrl,
+    UnknownAck,
+}
 /// Why one socket generation ended; never carries the close reason text.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -235,6 +248,11 @@ enum Event {
     PhonePhase {
         phase: Phase,
     },
+    SendFailure {
+        failure: SendFailure,
+        server_code: Option<i64>,
+        http_status: Option<u16>,
+    },
 }
 /// Correlate diagnostic events without retaining the underlying identifier.
 pub(crate) fn tag(id: &str) -> u64 {
@@ -264,6 +282,18 @@ pub(crate) fn phone(id: &str, control: PhoneControl) {
 pub(crate) fn media(failure: &crate::media_recovery::Failure) {
     record(Event::MediaFailure {
         failure: failure.clone(),
+    });
+}
+/// Record a bounded send/upload failure classification without the original error text.
+pub(crate) fn send_failure(
+    failure: SendFailure,
+    server_code: Option<i64>,
+    http_status: Option<u16>,
+) {
+    record(Event::SendFailure {
+        failure,
+        server_code,
+        http_status,
     });
 }
 

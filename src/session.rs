@@ -1401,7 +1401,17 @@ impl Session {
         if let Some(length) = length {
             rb = rb.header("Content-Length", length);
         }
-        let resp = rb.body(body).send().await?;
+        let resp = match rb.body(body).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                crate::transfer_diagnostics::send_failure(
+                    crate::transfer_diagnostics::SendFailure::Offline,
+                    None,
+                    None,
+                );
+                return Err(error.into());
+            }
+        };
         let latency_ms = start.elapsed().as_millis();
         let status = resp.status();
         let bytes =
@@ -1421,10 +1431,20 @@ impl Session {
             },
         );
         if !status.is_success() {
+            crate::transfer_diagnostics::send_failure(
+                crate::transfer_diagnostics::SendFailure::HttpStatus,
+                None,
+                Some(status.as_u16()),
+            );
             return Err(HttpFailure(status.as_u16()).into());
         }
         if text.trim().is_empty() {
-            return Ok(serde_json::json!({ "error_code": 0, "data": null }));
+            crate::transfer_diagnostics::send_failure(
+                crate::transfer_diagnostics::SendFailure::EmptyBody,
+                None,
+                Some(status.as_u16()),
+            );
+            return Ok(serde_json::json!({ "error_code": 0, "data": null, "_empty_body": true }));
         }
         let v: Value = serde_json::from_str(&text)
             .unwrap_or_else(|_| serde_json::json!({ "data": text.trim() }));
