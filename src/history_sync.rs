@@ -262,7 +262,6 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         .filter(|t| t.is_group || (!cloud.is_empty() && t.id == cloud))
         .count();
     let skipped = threads.len() - total;
-    let hist_path = session.history_path();
     let mut inserted = 0;
     let mut downloaded_pages = 0;
     let mut failed = 0;
@@ -277,10 +276,11 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
             continue;
         }
         thread.messages.clear();
-        let hp_read = hist_path.clone();
+        let read_session = session.clone();
         let tid_read = thread.id.clone();
         let checkpoint: Option<String> = tokio::task::spawn_blocking(move || {
-            let store = MessageStore::open(&hp_read).ok()?;
+            let (store, _write_permit) =
+                MessageStore::open_for_account_write(&read_session).ok()?;
             store
                 .conn
                 .query_row(
@@ -300,7 +300,12 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 if memo_changed && session.is_active() {
                     let path_save = memo_path.clone();
                     let memo_copy = memo.clone();
-                    let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save)).await;
+                    let account = session.clone();
+                    let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                        let _write_permit = account.begin_account_write_blocking()?;
+                        memo_copy.save(&path_save)
+                    })
+                    .await;
                 }
                 return Ok(SyncReport {
                     complete: false,
@@ -331,11 +336,11 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                 let next = updated.as_ref().and_then(|state| state.next.clone());
 
                 // Offload SQLite store operations to blocking threadpool to free Tokio network executor (N-05)
-                let hp_write = hist_path.clone();
                 let mut thread_to_save = thread.clone();
                 let updated_to_save = updated.clone();
+                let write_session = session.clone();
                 let (count, filtered_thread) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Thread)> {
-                    let mut store = MessageStore::open(&hp_write)?;
+                    let (mut store, _write_permit) = MessageStore::open_for_account_write(&write_session)?;
                     let ins = crate::store::persist_threads(&mut store, std::slice::from_ref(&thread_to_save))?;
                     if let Some(ref upd) = updated_to_save {
                         store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
@@ -373,8 +378,12 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
                         if memo_changed {
                             let path_save = memo_path.clone();
                             let memo_copy = memo.clone();
-                            let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save))
-                                .await;
+                            let account = session.clone();
+                            let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+                                let _write_permit = account.begin_account_write_blocking()?;
+                                memo_copy.save(&path_save)
+                            })
+                            .await;
                         }
                         return Ok(SyncReport { complete: false, message: format!("Máy chủ giới hạn tốc độ; đã lưu {inserted} tin mới. Thử đồng bộ lại sau; vị trí tiếp tục được giữ.") });
                     }
@@ -399,7 +408,12 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         // Best effort: losing the memo only means asking the server again next time.
         let path_save = memo_path.clone();
         let memo_copy = memo.clone();
-        let _ = tokio::task::spawn_blocking(move || memo_copy.save(&path_save)).await;
+        let account = session.clone();
+        let _ = tokio::task::spawn_blocking(move || -> Result<()> {
+            let _write_permit = account.begin_account_write_blocking()?;
+            memo_copy.save(&path_save)
+        })
+        .await;
     }
     let remembered = if remembered > 0 {
         format!(" {remembered} hội thoại vừa bị giới hạn trong 24 giờ qua được bỏ qua (bấm \"Thử lại hội thoại bị giới hạn\" để hỏi lại).")

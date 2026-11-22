@@ -108,7 +108,7 @@ async fn persist(s: &Session, snapshot: &Snapshot) -> Result<()> {
     let s = s.clone();
     let value = snapshot.clone();
     tokio::task::spawn_blocking(move||->Result<()>{
-        ensure!(s.is_active(),"Phiên đã đóng");let store=crate::store::MessageStore::open(s.history_path())?;
+        ensure!(s.is_active(),"Phiên đã đóng");let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&s)?;
         let tx=store.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM conversation_policies",[])?;
         let keys=value.ttls.keys().chain(value.protected.iter()).collect::<BTreeSet<_>>();
@@ -163,7 +163,7 @@ pub(crate) async fn cached(s: &Session) -> Result<Option<Snapshot>> {
     let account = s.clone();
     tokio::task::spawn_blocking(move || -> Result<_> {
         use rusqlite::OptionalExtension;
-        let store = crate::store::MessageStore::open(account.history_path())?;
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
         let raw = store
             .conn
             .query_row(

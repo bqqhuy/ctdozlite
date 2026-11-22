@@ -131,7 +131,6 @@ pub(crate) enum RenewFailure {
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SendFailure {
-    QueueBudget,
     Offline,
     HttpStatus,
     ServerRejected,
@@ -139,6 +138,46 @@ pub(crate) enum SendFailure {
     MissingFileId,
     MissingAsyncUrl,
     UnknownAck,
+}
+/// Attachment stages are allowlisted; filenames, paths and URLs never enter this event.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttachmentStage {
+    PhotoUpload,
+    PhotoSend,
+    FileUpload,
+    FileSend,
+}
+impl std::fmt::Display for AttachmentStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::PhotoUpload => "Tải ảnh lên",
+            Self::PhotoSend => "Gửi tin ảnh",
+            Self::FileUpload => "Tải tệp lên",
+            Self::FileSend => "Gửi tin tệp",
+        })
+    }
+}
+impl std::error::Error for AttachmentStage {}
+
+/// Preserve typed failures while recording which attachment request was rejected.
+pub(crate) fn attachment_result<T>(
+    stage: AttachmentStage,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    result.map_err(|error| {
+        let server_code = error
+            .downcast_ref::<crate::chat::ServerRejected>()
+            .and_then(|e| e.code)
+            .or_else(|| crate::session::envelope_failure_code(&error))
+            .or_else(|| crate::api_response::server_code(&error));
+        record(Event::AttachmentFailure {
+            stage,
+            server_code,
+            http_status: crate::session::http_failure_status(&error),
+        });
+        error.context(stage)
+    })
 }
 /// Why one socket generation ended; never carries the close reason text.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -164,6 +203,9 @@ pub(crate) enum RoundOutcome {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event {
+    RuntimePerformance {
+        summaries: Vec<crate::runtime_metrics::Summary>,
+    },
     E2ee {
         diagnostic: crate::e2ee_trial::Diagnostic,
     },
@@ -250,6 +292,11 @@ enum Event {
     },
     SendFailure {
         failure: SendFailure,
+        server_code: Option<i64>,
+        http_status: Option<u16>,
+    },
+    AttachmentFailure {
+        stage: AttachmentStage,
         server_code: Option<i64>,
         http_status: Option<u16>,
     },
@@ -544,6 +591,11 @@ fn record(event: Event) {
 #[cfg(test)]
 fn record(_event: Event) {}
 
+/// Export numeric runtime summaries via the existing bounded diagnostics writer.
+pub(crate) fn runtime_performance(summaries: Vec<crate::runtime_metrics::Summary>) {
+    record(Event::RuntimePerformance { summaries });
+}
+
 /// Whether the most recent diagnostic append succeeded; never performs filesystem I/O.
 pub(crate) fn healthy() -> bool {
     #[cfg(test)]
@@ -613,6 +665,35 @@ fn append(root: &Path, event: &Event) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachment_failure_preserves_server_code_and_serializes_only_the_stage() {
+        let error = attachment_result::<()>(
+            AttachmentStage::FileUpload,
+            Err(crate::chat::ServerRejected { code: Some(204) }.into()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::chat::ServerRejected>()
+                .unwrap()
+                .code,
+            Some(204)
+        );
+        assert_eq!(
+            crate::outgoing::failure_delivery(&error),
+            crate::message_model::DeliveryState::Failed
+        );
+        assert!(crate::outgoing::failure_message(&error).contains("ZIP"));
+        let value = serde_json::to_value(Event::AttachmentFailure {
+            stage: AttachmentStage::FileUpload,
+            server_code: Some(204),
+            http_status: None,
+        })
+        .unwrap();
+        assert_eq!(value["stage"], "file_upload");
+        assert_eq!(value["server_code"], 204);
+        assert_eq!(value.as_object().unwrap().len(), 4);
+    }
     #[test]
     fn production_log_contains_typed_counts_without_raw_session_or_keys_and_rotates() {
         assert!(

@@ -196,6 +196,14 @@ Trước khi commit tính năng mới, tự hỏi theo thứ tự:
 
 ## Phần IV — Bảo trì tài liệu này
 
+### Sync và cấu hình server (2026-11-22)
+
+[Báo cáo kiểm chứng](research/2026-11-22-sync-config-verification.json) ghi nguồn E2, quan sát UI, test offline và giới hạn E1, gồm cơ chế giữ màn hình đăng nhập trong lúc preload. [Hướng dẫn Gemini](research/2026-11-22-sync-config-gemini-handoff.md) là kế hoạch triển khai tiếp: DB, vòng đời config, startup, sync và banner. Audit config phải truy tới mọi consumer và hành vi thực tế; tải/parse/cache chưa đủ. Các phần tái cấu trúc mới chưa được coi là đã triển khai hoặc xác nhận trên thiết bị.
+
+### Baseline PC 26.11.12 (2026-11-21)
+
+Audit trực tiếp trên Windows ARM đã xác nhận lại bằng chứng E2 cho bundle PC 26.11.12: các worker sync-v2 riêng, WebSocket command lớp push/pull/control, cursor lastId/preIds, route E2EE /api/e2ee/pc/* và plugin capture/OCR/native media. Chi tiết artifact hash, process model, giới hạn E1 và đối chiếu với fork nằm trong docs/research/2026-11-21-zalopc-arm64-deep-audit.md. Bằng chứng này không chốt framing bytes, heartbeat interval, entitlement hoặc payload schema; các mục đó vẫn giữ trạng thái cần E1.
+
 - Khi một mục E3 được nâng cấp thành E1/E2 (qua capture mới hoặc đọc bundle mới),
   cập nhật bảng ở Phần III và ghi re-notes/NN tương ứng.
 - Khi một fork deviation được chấp nhận, phải có ADR mới hoặc tham chiếu ADR cũ.

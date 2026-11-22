@@ -476,6 +476,7 @@ async fn save_membership(s: &Session, view: &Snapshot) {
     let path = cache_path(s);
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         ensure!(account.is_active(), "Phiên đã đóng");
+        let _write_permit = account.begin_account_write_blocking()?;
         let bytes = serde_json::to_vec(&cache)?;
         if crate::limits::read_file(&path, 4 * 1024 * 1024).is_ok_and(|old| old == bytes) {
             return Ok(());

@@ -9,3 +9,4 @@
 - [x] [R11-T07] [M-05] Tìm kiếm Sticker theo từ khóa tiếng Việt trong Sticker Picker.
 - [x] [R11-T08] [M-06] Kiểm tra tín hiệu chia sẻ màn hình trong cuộc gọi.
 - [ ] [R11-T09] Nghiệm thu tổng hợp trên Windows 11 ARM64 (checklist trong `verification.md`).
+- [ ] [R11-T10] [M-07] Công bố bubble tệp trước I/O/hàng đợi, giữ identity khi cập nhật tiến trình/kết quả; mã và kiểm chứng IPC/renderer đã qua, còn nghiệm thu thời điểm hiển thị trên bản mới (22/11/2026).

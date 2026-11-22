@@ -479,7 +479,7 @@ async fn run<F: FnMut(String), G: FnMut(Thread)>(
     let token = cancel.clone();
     progress("V1: nhập lịch sử theo định danh đã ánh xạ…".into());
     let (inserted,unmapped,previews)=tokio::task::spawn_blocking(move||->Result<_>{
-        let mut store=crate::store::MessageStore::open(account.history_path())?;
+        let (mut store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
         let mut added=0;let mut missing=0;let mut previews=HashMap::new();
         for entry in &archive.entries {
             check(&account,&token)?;

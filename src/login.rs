@@ -306,6 +306,9 @@ pub async fn get_login_info(s: &Session) -> Result<Value> {
 /// Pull `dkey` / `zpw_enk` / domains out of a login response payload.
 /// Preserves already established session credentials if the new payload only contains partial fields.
 pub fn apply_login_config(s: &mut Session, cfg: &Value) {
+    if let Some(config) = crate::composer_config::ComposerConfig::from_login_config(cfg) {
+        s.composer_config = Some(config);
+    }
     let new_dkey = cfg
         .get("uid")
         .or_else(|| cfg.get("userId"))

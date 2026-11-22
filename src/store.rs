@@ -202,6 +202,17 @@ pub fn db_path_for_account(uin: &str) -> std::path::PathBuf {
 impl MessageStore {
     /// Initial history window; deeper reads occur when opening a thread.
     pub const PRELOAD_MSGS: usize = 20;
+
+    /// Open an account store under a session-generation write permit.
+    /// Keep the returned permit alive for the complete blocking write closure.
+    pub(crate) fn open_for_account_write(
+        session: &crate::session::Session,
+    ) -> Result<(Self, crate::session::AccountWritePermit)> {
+        let permit = session.begin_account_write_blocking()?;
+        let store = Self::open(session.history_path())?;
+        Ok((store, permit))
+    }
+
     /// Open SQLite database at `path` and initialize table schemas and indices if absent.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -1218,6 +1229,7 @@ impl MessageStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  name = CASE WHEN excluded.name = '' OR excluded.name = 'Nhóm ' || excluded.thread_id
                     OR excluded.name = 'Người dùng ' || excluded.thread_id
+                    OR excluded.name = excluded.thread_id
                     THEN threads.name ELSE excluded.name END,
                  is_group = excluded.is_group,
                  last_ts = MAX(threads.last_ts, excluded.last_ts),
@@ -1499,6 +1511,19 @@ impl MessageStore {
         let mut loaded_count = 0;
         for t in threads.iter_mut() {
             use rusqlite::OptionalExtension;
+            if !t.is_group
+                && self
+                    .conn
+                    .query_row(
+                        "SELECT value='1' FROM tool_config WHERE key=?1",
+                        [format!("inbox.responded_by_me:{}", t.id)],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false)
+            {
+                t.presentation.inbox.responded_by_me = Some(true);
+            }
             if let Some(raw) = self
                 .conn
                 .query_row(
@@ -1521,12 +1546,33 @@ impl MessageStore {
                 {
                     marks.insert((t.id.clone(), cm.id.clone()), mark);
                 }
+                if !t.is_group
+                    && cm.is_outgoing
+                    && matches!(
+                        cm.delivery,
+                        crate::message_model::DeliveryState::ServerAccepted
+                            | crate::message_model::DeliveryState::Delivered
+                            | crate::message_model::DeliveryState::Read
+                    )
+                {
+                    // A successful local reply survives restart even when the JSON
+                    // sidebar cache predates the send; failed intents are not replies.
+                    t.presentation.inbox.responded_by_me = Some(true);
+                }
                 if let Some(existing) = t
                     .messages
                     .iter_mut()
                     .find(|existing| crate::chat::same_message(existing, &cm))
                 {
+                    let promote_local_id = existing.is_outgoing
+                        && crate::chat::server_message_id(existing).is_none()
+                        && crate::chat::server_message_id(&cm).is_some();
                     existing.merge_reaction_metadata(&cm);
+                    if promote_local_id {
+                        existing.id = cm.id.clone();
+                        existing.ts = cm.ts;
+                        existing.time = cm.time.clone();
+                    }
                     if existing.sticker_id.is_none() && cm.sticker_id.is_some() {
                         existing.sticker_id = cm.sticker_id;
                         existing.sticker_cate_id = cm.sticker_cate_id;
@@ -1567,6 +1613,7 @@ impl MessageStore {
                     }
                 }
             }
+            t.refresh_sidebar_presentation();
         }
         crate::chat::deduplicate_threads(threads, None);
         Ok(loaded_count)
@@ -1940,6 +1987,25 @@ fn persist_snapshot(
             last_read_msg_id: t.unread.last_seen_id.clone().unwrap_or_default(),
         };
         store.upsert_thread(&st)?;
+        if !t.is_group
+            && t.messages.iter().any(|message| {
+                message.is_outgoing
+                    && (crate::chat::server_message_id(message).is_some()
+                        || matches!(
+                            message.delivery,
+                            crate::message_model::DeliveryState::ServerAccepted
+                                | crate::message_model::DeliveryState::Delivered
+                                | crate::message_model::DeliveryState::Read
+                        ))
+            })
+        {
+            // The local acknowledged-reply fact must outlive the bounded startup
+            // history window; older negative sidebar snapshots cannot revoke it.
+            store.conn.execute(
+                "INSERT INTO tool_config(key,value) VALUES(?1,'1') ON CONFLICT(key) DO NOTHING",
+                [format!("inbox.responded_by_me:{}", t.id)],
+            )?;
+        }
 
         for m in &t.messages {
             let mut sm = StoredMessage::from(m);
@@ -3053,6 +3119,265 @@ mod conversation_menu_tests {
             assert_eq!(store.messages_for("b", 10).unwrap()[0].text, "b");
         }
         std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod outgoing_persistence_tests {
+    use super::*;
+
+    fn fixture_thread(id: &str) -> Thread {
+        Thread {
+            id: id.into(),
+            name: "Fixture contact".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn targeted_name_metadata_survives_fallback_message_write_in_either_order() {
+        for metadata_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("history.db");
+            let human_name = "Người nhận từ bộ nhớ giao diện";
+            {
+                let mut store = MessageStore::open(&path).unwrap();
+                assert!(store.thread_meta("recipient").unwrap().is_none());
+                let metadata = StoredThread {
+                    thread_id: "recipient".into(),
+                    name: human_name.into(),
+                    is_group: false,
+                    last_ts: 0,
+                    last_read_msg_id: String::new(),
+                };
+                if metadata_first {
+                    store.upsert_thread(&metadata).unwrap();
+                }
+                // The send task may have read missing metadata before the targeted
+                // metadata command committed, so it still holds a raw-ID fallback.
+                let sent = Thread {
+                    id: "recipient".into(),
+                    name: "recipient".into(),
+                    messages: vec![ChatMessage {
+                        id: "server-message".into(),
+                        text: "sent reply".into(),
+                        is_outgoing: true,
+                        delivery: crate::message_model::DeliveryState::ServerAccepted,
+                        ts: 1_900_000_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                };
+                persist_local_threads(&mut store, &[sent]).unwrap();
+                if !metadata_first {
+                    store.upsert_thread(&metadata).unwrap();
+                }
+            }
+            let store = MessageStore::open(&path).unwrap();
+            let mut restored = Vec::new();
+            store.hydrate_threads(&mut restored, 20).unwrap();
+            assert_eq!(restored.len(), 1);
+            assert_eq!(restored[0].name, human_name);
+            assert_eq!(restored[0].preview, "sent reply");
+            assert_eq!(restored[0].presentation.inbox.responded_by_me, Some(true));
+            assert_eq!(store.all_threads().unwrap()[0].last_ts, 1_900_000_000_000);
+        }
+    }
+
+    #[test]
+    fn stale_sidebar_cache_hydrates_authoritative_send_without_a_new_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut cached = fixture_thread("recipient");
+        cached.presentation.inbox.responded_by_me = Some(false);
+        cached.unread.last_seen_id = Some("read-before-send".into());
+        let mut pending = crate::outgoing::pending(
+            "durable reply".into(),
+            false,
+            crate::outgoing::Payload::Text,
+        );
+        pending.ts = 1_900_000_000_000;
+        cached.messages.push(pending.clone());
+        let cache_before_ack = serde_json::to_vec(&vec![cached.clone()]).unwrap();
+        {
+            let mut store = MessageStore::open(&path).unwrap();
+            persist_local_threads(&mut store, &[cached]).unwrap();
+            let mut ack = pending;
+            ack.id = "server-ack".into();
+            ack.ts += 20;
+            ack.delivery = crate::message_model::DeliveryState::ServerAccepted;
+            ack.outgoing_job = None;
+            let mut sent = fixture_thread("recipient");
+            sent.messages.push(ack);
+            persist_local_threads(&mut store, &[sent]).unwrap();
+        }
+        let store = MessageStore::open(&path).unwrap();
+        let mut restored: Vec<Thread> = serde_json::from_slice(&cache_before_ack).unwrap();
+        store
+            .hydrate_threads(&mut restored, MessageStore::PRELOAD_MSGS)
+            .unwrap();
+        let thread = &restored[0];
+        assert_eq!(thread.name, "Fixture contact");
+        assert_eq!(thread.messages.len(), 1); // (INV-4)
+        assert_eq!(thread.messages[0].id, "server-ack");
+        assert_eq!(
+            thread.messages[0].delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+        );
+        assert!(thread.messages[0].outgoing_job.is_none());
+        assert_eq!(thread.preview, "durable reply");
+        assert_eq!(thread.presentation.inbox.responded_by_me, Some(true));
+        assert_eq!(thread.presentation.last_message_id, "server-ack");
+        assert_eq!(
+            thread.unread.last_seen_id.as_deref(),
+            Some("read-before-send")
+        );
+        assert_eq!(store.all_threads().unwrap()[0].last_ts, 1_900_000_000_020);
+    }
+
+    #[test]
+    fn a_failed_local_send_does_not_restore_an_acknowledged_reply() {
+        for delivery in [
+            crate::message_model::DeliveryState::Failed,
+            crate::message_model::DeliveryState::DeliveryUnknown,
+            crate::message_model::DeliveryState::Pending,
+        ] {
+            let mut store = MessageStore::open(":memory:").unwrap();
+            let mut failed = fixture_thread("recipient");
+            let mut message = crate::outgoing::pending(
+                "unconfirmed".into(),
+                false,
+                crate::outgoing::Payload::Text,
+            );
+            message.delivery = delivery;
+            failed.messages.push(message);
+            persist_local_threads(&mut store, &[failed]).unwrap();
+            let mut restored = Vec::new();
+            store.hydrate_threads(&mut restored, 20).unwrap();
+            assert_ne!(restored[0].presentation.inbox.responded_by_me, Some(true));
+            // A persisted Pending intent with no running sender is uncertain after
+            // reload; it still must not become an acknowledged reply.
+            let expected = if delivery == crate::message_model::DeliveryState::Pending {
+                crate::message_model::DeliveryState::DeliveryUnknown
+            } else {
+                delivery
+            };
+            assert_eq!(restored[0].messages[0].delivery, expected);
+            assert!(restored[0].messages[0].outgoing_job.is_some());
+        }
+    }
+
+    #[test]
+    fn acknowledged_reply_outlives_preload_window_and_stale_negative_metadata() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let mut sent = fixture_thread("recipient");
+        sent.messages.push(ChatMessage {
+            id: "server-ack".into(),
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::ServerAccepted,
+            ts: 1_900_000_000_000,
+            ..Default::default()
+        });
+        persist_local_threads(&mut store, &[sent]).unwrap();
+        let mut stale = fixture_thread("recipient");
+        stale.presentation.inbox.responded_by_me = Some(false);
+        stale.messages = (1..=30)
+            .map(|index| ChatMessage {
+                id: format!("received-{index}"),
+                text: format!("received {index}"),
+                ts: 1_900_000_000_000 + index,
+                ..Default::default()
+            })
+            .collect();
+        persist_local_threads(&mut store, &[stale]).unwrap();
+        let mut restored = vec![fixture_thread("recipient"), fixture_thread("other")];
+        restored[0].presentation.inbox.responded_by_me = Some(false);
+        store
+            .hydrate_selected_threads(&mut restored, MessageStore::PRELOAD_MSGS)
+            .unwrap();
+        assert!(restored[0]
+            .messages
+            .iter()
+            .all(|message| !message.is_outgoing));
+        assert_eq!(restored[0].presentation.inbox.responded_by_me, Some(true));
+        assert_eq!(restored[0].preview, "received 30");
+        assert_ne!(restored[1].presentation.inbox.responded_by_me, Some(true));
+        store.clear_thread_history("recipient").unwrap();
+        let mut after_clear = vec![fixture_thread("recipient")];
+        store
+            .hydrate_selected_threads(&mut after_clear, 20)
+            .unwrap();
+        assert!(after_clear[0].messages.is_empty());
+        // Clearing local history does not undo a reply accepted by the server.
+        assert_eq!(
+            after_clear[0].presentation.inbox.responded_by_me,
+            Some(true)
+        );
+    }
+
+    #[test]
+    #[ignore = "Opt-in fixture benchmark: compare full-sidebar work with one outgoing row"]
+    fn benchmark_full_snapshot_versus_single_outgoing_row() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        let threads: Vec<_> = (0..300)
+            .map(|thread| {
+                let mut value = fixture_thread(&format!("thread-{thread}"));
+                value.messages = (0..20)
+                    .map(|message| ChatMessage {
+                        id: format!("message-{message}"),
+                        text: "Synthetic text for sidebar persistence measurement.".repeat(4),
+                        ts: 1_900_000_000_000 + message,
+                        ..Default::default()
+                    })
+                    .collect();
+                value
+            })
+            .collect();
+        persist_local_threads(&mut store, &threads).unwrap();
+        let mut scoped = fixture_thread("thread-0");
+        scoped.messages.push(ChatMessage {
+            id: "server-outgoing".into(),
+            client_message_id: "client-outgoing".into(),
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::ServerAccepted,
+            text: "Synthetic outgoing".into(),
+            ts: 1_900_000_001_000,
+            ..Default::default()
+        });
+        let mut full = threads;
+        full[0].messages.push(scoped.messages[0].clone());
+        let mut full_samples = Vec::new();
+        let mut scoped_samples = Vec::new();
+        for _ in 0..10 {
+            let started = std::time::Instant::now();
+            let snapshot = full.clone();
+            persist_local_threads(&mut store, &snapshot).unwrap();
+            std::hint::black_box(serde_json::to_vec(&snapshot).unwrap());
+            full_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            let snapshot = scoped.clone();
+            persist_local_threads(&mut store, &[snapshot]).unwrap();
+            scoped_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        for (task, mut samples) in [
+            ("full_snapshot_clone_sql_json", full_samples),
+            ("single_outgoing_row_sql", scoped_samples),
+        ] {
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "task":task, "iterations":samples.len(),
+                    "fixture_threads":300, "fixture_messages":6001, "sqlite":"memory",
+                    "min_ms":samples[0], "avg_ms":samples.iter().sum::<f64>() / samples.len() as f64,
+                    "p50_ms":samples[4], "p95_ms":samples[9], "p99_ms":samples[9],
+                    "os":std::env::consts::OS, "arch":std::env::consts::ARCH,
+                    "excludes":"DB open, busy wait and disk cache flush"
+                })
+            );
+        }
+        assert_eq!(store.messages_for("thread-0", 30).unwrap().len(), 21);
+        assert_eq!(store.messages_for("thread-299", 30).unwrap().len(), 20);
     }
 }
 

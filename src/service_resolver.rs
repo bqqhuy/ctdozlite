@@ -154,7 +154,7 @@ impl SendTimingContext {
         group: bool,
         text: bool,
     ) -> Self {
-        Self::from_enqueue(
+        Self::from_start(
             runtime,
             client_id,
             attempt,
@@ -163,13 +163,13 @@ impl SendTimingContext {
             std::time::Instant::now(),
         )
     }
-    pub(crate) fn from_enqueue(
+    pub(crate) fn from_start(
         runtime: usize,
         client_id: &str,
         attempt: u32,
         group: bool,
         text: bool,
-        enqueued: std::time::Instant,
+        started: std::time::Instant,
     ) -> Self {
         Self {
             runtime,
@@ -180,7 +180,7 @@ impl SendTimingContext {
             } else {
                 ServiceKey::Chat
             },
-            text_deadline: text.then(|| enqueued + TEXT_TOTAL_BUDGET),
+            text_deadline: text.then(|| started + TEXT_TOTAL_BUDGET),
         }
     }
 }
@@ -233,6 +233,16 @@ fn store_phase(
     let Some(tag) = &context.tag else {
         return;
     };
+    let metric = match phase {
+        TimingPhase::QueueWait => Some(crate::runtime_metrics::Metric::QueueWait),
+        TimingPhase::HttpRequest => Some(crate::runtime_metrics::Metric::HttpRequest),
+        TimingPhase::BodyAck => Some(crate::runtime_metrics::Metric::BodyAck),
+        TimingPhase::TotalIntent => Some(crate::runtime_metrics::Metric::SendTotal),
+        _ => None,
+    };
+    if let Some(metric) = metric {
+        crate::runtime_metrics::sample(metric, elapsed.as_secs_f64() * 1000.0);
+    }
     let sample = SendPhaseTiming {
         intent_tag: tag.clone(),
         retry_count: context.retries,
@@ -616,22 +626,22 @@ mod send_phase_timing_tests {
     }
 
     #[tokio::test]
-    async fn text_total_deadline_includes_time_already_spent_in_command_queue() {
+    async fn text_total_deadline_starts_when_worker_begins_sending() {
         let _fixture = TIMING_FIXTURE.lock().await;
         let enqueued = Instant::now() - Duration::from_secs(4);
-        let context = SendTimingContext::from_enqueue(
+        let context = SendTimingContext::from_start(
             usize::MAX - 746,
             "fixture-queued",
             1,
             false,
             true,
-            enqueued,
+            Instant::now(),
         );
         let remaining = context
             .text_deadline
             .unwrap()
             .saturating_duration_since(Instant::now());
-        assert!(remaining <= Duration::from_secs(16) && remaining > Duration::from_secs(15));
+        assert!(remaining <= Duration::from_secs(20) && remaining > Duration::from_secs(19));
         with_send_timing(context, async {
             record_current_phase(
                 TimingPhase::TotalIntent,

@@ -12,6 +12,7 @@ Phạm vi: R11 trong roadmap v0.009-arm (`A16, A17, B06, B08, B09, B12`).
 | **M-04 (A16)** | Ghi âm và gửi tin nhắn thoại (Voice Recorder): Ghi âm qua `cpal`/WASAPI trên Windows 11 ARM64, đo mức âm lượng thời gian thực (waveform preview), cho phép nghe thử hoặc hủy; upload và gửi qua FILE 11148 `/api/message/voicemp3` và 11169 `/api/group/sendmp3`. |
 | **M-05 (B08)** | Tìm kiếm và gợi ý Sticker / GIF: Hỗ trợ tìm kiếm kho sticker theo từ khóa tiếng Việt qua 11747 `/api/message/sticker/search`, tải bất đồng bộ không chặn luồng vẽ UI. |
 | **M-06 (B09)** | Tín hiệu chia sẻ màn hình trong cuộc gọi: Tiếp tục hoàn thiện signaling `requestsharescreen` và bộ thu nhận khung hình chia sẻ màn hình. |
+| **M-07** | Gửi tệp hiện bubble có tên/icon ngay khi worker nhận lô gửi; không chờ SQLite, lượt upload hoặc chuẩn bị media. Tiến trình và kết quả cập nhật cùng client ID; chưa có URL upload không hiện cảnh báo mất đường dẫn. Đối chiếu trải nghiệm PC do người dùng xác nhận 22/11/2026, [re-notes/72](../../re-notes/72-restricted-extensions-and-native-executable-zip.md). |
 
 ## Ranh giới và Invariants
 

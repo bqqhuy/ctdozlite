@@ -81,6 +81,7 @@ impl ZaloGuiApp {
                     || format.italic
                     || format.underline
                     || format.strike
+                    || !format.ranges.is_empty()
                     || format.urgency.is_some()
             })
     }

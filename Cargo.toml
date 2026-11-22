@@ -46,6 +46,7 @@ hex = "0.4"
 unicode-segmentation = "1.13"
 tar = { version = "0.4", default-features = false }
 tempfile = "3"
+zip = { version = "=2.4.2", default-features = false }
 jxl-oxide = { version = "0.12.6", default-features = false }
 lzma-rust2 = { version = "0.25.0", default-features = false, features = ["std", "xz"] }
 aws-lc-rs = "1.19.0"

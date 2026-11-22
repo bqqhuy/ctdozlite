@@ -745,7 +745,9 @@ impl RunningRound {
         {
             let path = session.history_path().with_extension("sync-limits.json");
             let delay = rate.0;
+            let account = session.clone();
             tokio::task::spawn_blocking(move || -> Result<()> {
+                let _write_permit = account.begin_account_write_blocking()?;
                 let mut limits = policy::Limits::load(&path);
                 limits.cooldown_until = (crate::login::unix_now() as u64).saturating_add(delay);
                 crate::storage::atomic_write(&path, &serde_json::to_vec(&limits)?)
@@ -785,8 +787,10 @@ fn read_journal(path: &std::path::Path) -> Result<Vec<String>> {
 async fn journal(session: &Session, add: Option<&str>, remove: Option<&str>) -> Result<()> {
     let _guard = JOURNAL.lock().await;
     let path = journal_path(session);
+    let account = session.clone();
     let (add, remove) = (add.map(str::to_owned), remove.map(str::to_owned));
     tokio::task::spawn_blocking(move || -> Result<()> {
+        let _write_permit = account.begin_account_write_blocking()?;
         let mut ids = read_journal(&path).unwrap_or_default();
         if let Some(id) = remove {
             ids.retain(|known| *known != id);
@@ -1051,7 +1055,8 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     let mut coverage = tokio::task::spawn_blocking(
         move || -> Result<HashMap<String, crate::store::PhoneSyncRange>> {
             ensure!(account.is_active(), "Đã đăng xuất; dừng đồng bộ");
-            let store = crate::store::MessageStore::open(account.history_path())?;
+            let (store, _write_permit) =
+                crate::store::MessageStore::open_for_account_write(&account)?;
             if full_rescan {
                 store.reset_phone_sync_ranges()?;
             }
@@ -1265,6 +1270,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     let account = session.clone();
                     tokio::task::spawn_blocking(move || -> Result<()> {
                         ensure!(account.is_active(), "Đã đăng xuất");
+                        let _write_permit = account.begin_account_write_blocking()?;
                         snapshot.save(&path)
                     })
                     .await??;
@@ -1285,8 +1291,9 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     let account = session.clone();
                     tokio::task::spawn_blocking(move || -> Result<()> {
                         ensure!(account.is_active(), "Đã đăng xuất");
-                        crate::store::MessageStore::open(account.history_path())?
-                            .save_phone_sync_ranges(&ranges)
+                        let (store, _write_permit) =
+                            crate::store::MessageStore::open_for_account_write(&account)?;
+                        store.save_phone_sync_ranges(&ranges)
                     })
                     .await??;
                 }
@@ -1361,7 +1368,9 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                         }
                         let path = limit_path.clone();
                         let data = serde_json::to_vec(&limits)?;
-                        tokio::task::spawn_blocking(move || {
+                        let account = session.clone();
+                        tokio::task::spawn_blocking(move || -> Result<()> {
+                            let _write_permit = account.begin_account_write_blocking()?;
                             crate::storage::atomic_write(&path, &data)
                         })
                         .await??;

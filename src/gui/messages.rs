@@ -293,30 +293,50 @@ pub(super) fn pick_native_folder_dialog() -> Option<std::path::PathBuf> {
 pub(super) fn pick_native_files_dialog(images_only: bool) -> Option<Vec<std::path::PathBuf>> {
     #[cfg(target_os = "windows")]
     {
-        // Native Win32 IFileOpenDialog (via `rfd`): opens instantly, no PowerShell /
-        // .NET cold start, and runs natively on ARM64. Called from a worker thread,
-        // so the blocking API does not freeze the egui event loop.
-        let title = if images_only {
-            "Chọn hình ảnh để gửi qua Zalo"
-        } else {
-            "Chọn video hoặc tập tin đính kèm để gửi qua Zalo"
-        };
-        let mut dlg = rfd::FileDialog::new().set_title(title);
-        dlg = if images_only {
-            dlg.add_filter("Hình ảnh", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
-                .add_filter("Tất cả tập tin", &["*"])
-        } else {
-            dlg.add_filter("Tất cả tập tin", &["*"])
-                .add_filter("Video & âm thanh", &["mp4", "mov", "mkv", "mp3", "wav"])
-                .add_filter("Tài liệu", &["pdf", "zip", "docx", "xlsx", "txt"])
-        };
-        dlg.pick_files()
+        // Tokio reuses blocking threads that may already belong to an MTA (audio/video).
+        // rfd initializes an STA and silently returns None on RPC_E_CHANGED_MODE, so
+        // give each dialog a fresh apartment instead of depending on pool history.
+        let picker = std::thread::Builder::new()
+            .name("zalo-file-picker".into())
+            .spawn(move || pick_native_files_on_fresh_thread(images_only));
+        match picker {
+            Ok(thread) => match thread.join() {
+                Ok(paths) => paths,
+                Err(_) => {
+                    crate::logger::log_error("file picker", "Native dialog thread failed");
+                    None
+                }
+            },
+            Err(_) => {
+                crate::logger::log_error("file picker", "Cannot start native dialog thread");
+                None
+            }
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = images_only;
         None
     }
+}
+
+#[cfg(windows)]
+fn pick_native_files_on_fresh_thread(images_only: bool) -> Option<Vec<std::path::PathBuf>> {
+    let title = if images_only {
+        "Chọn hình ảnh để gửi qua Zalo"
+    } else {
+        "Chọn video hoặc tập tin đính kèm để gửi qua Zalo"
+    };
+    let mut dlg = rfd::FileDialog::new().set_title(title);
+    dlg = if images_only {
+        dlg.add_filter("Hình ảnh", &["png", "jpg", "jpeg", "webp", "gif", "bmp"])
+            .add_filter("Tất cả tập tin", &["*"])
+    } else {
+        dlg.add_filter("Tất cả tập tin", &["*"])
+            .add_filter("Video & âm thanh", &["mp4", "mov", "mkv", "mp3", "wav"])
+            .add_filter("Tài liệu", &["pdf", "zip", "docx", "xlsx", "txt"])
+    };
+    dlg.pick_files()
 }
 
 /// Detect `Ctrl+V` or `Shift+Insert` reliably on Windows even when `egui-winit` swallows `Key::V`
@@ -790,22 +810,22 @@ pub(super) fn render_message_body(
                             pal.primary
                         }),
                     );
-                    ui.vertical(|ui| {
-                        ui.label(
-                            RichText::new(crate::message_view::call_label(msg))
-                                .color(text_col)
-                                .strong(),
-                        );
-                        ui.label(RichText::new(msg.display_time()).size(10.5).color(meta_col));
-                    });
-                    if !is_group
-                        && ui
+                    ui.label(
+                        RichText::new(crate::message_view::call_label(msg))
+                            .color(text_col)
+                            .strong(),
+                    );
+                });
+                if !is_group {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
                             .button(format!("{} Gọi lại", lucide::PHONE_CALL))
                             .clicked()
-                    {
-                        body_action = Some(BubbleAction::CallAgain { is_video: video });
-                    }
-                });
+                        {
+                            body_action = Some(BubbleAction::CallAgain { is_video: video });
+                        }
+                    });
+                }
             });
         return body_action;
     }
@@ -1008,7 +1028,11 @@ pub(super) fn render_message_body(
                     name: media.name,
                 });
             }
-        } else {
+        } else if !msg
+            .outgoing_job
+            .as_ref()
+            .is_some_and(|job| matches!(job.payload, crate::outgoing::Payload::Attachment { .. }))
+        {
             ui.label(
                 RichText::new(crate::i18n::tr("Không còn đường dẫn tải tệp")).color(pal.text_muted),
             );
@@ -1344,7 +1368,9 @@ pub(super) fn render_chat_bubble(
 
     // Pre-measure exact content width for both outgoing and incoming bubbles so every bubble,
     // photo, and card hugs its content tightly without horizontal overflow or inner/outer frame mismatch.
-    let content_width = if has_sticker {
+    let content_width = if crate::message_view::is_call_log(msg) {
+        max_text_width.min(260.0)
+    } else if has_sticker {
         116.0_f32
     } else if is_photo_card {
         let media = crate::message_view::media(msg);
@@ -1591,7 +1617,7 @@ pub(super) fn render_chat_bubble(
                             }
                             if let Some(job) = &msg.outgoing_job {
                                 if msg.delivery == crate::message_model::DeliveryState::Failed {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.colored_label(
                                             Color32::from_rgb(220, 60, 60),
                                             "⚠ Gửi lỗi",
@@ -1599,6 +1625,12 @@ pub(super) fn render_chat_bubble(
                                         .on_hover_text(&job.error);
                                         if ui.button(crate::i18n::tr("Gửi lại")).clicked() {
                                             card_action = Some(BubbleAction::RetrySend);
+                                        }
+                                        if matches!(job.payload, crate::outgoing::Payload::Attachment { .. })
+                                            && ui.small_button("Tạo ZIP…")
+                                                .on_hover_text("Đóng gói tệp gốc vào ZIP và thêm vào bản nháp để bạn kiểm tra trước khi gửi")
+                                                .clicked() {
+                                            card_action = Some(BubbleAction::ArchiveAttachmentDraft);
                                         }
                                     });
                                     ui.label(RichText::new(&job.error).size(11.0));
@@ -1777,7 +1809,7 @@ pub(super) fn render_chat_bubble(
                             }
                             if let Some(job) = &msg.outgoing_job {
                                 if msg.delivery == crate::message_model::DeliveryState::Failed {
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         ui.colored_label(
                                             Color32::from_rgb(220, 60, 60),
                                             "⚠ Gửi lỗi",
@@ -1785,6 +1817,12 @@ pub(super) fn render_chat_bubble(
                                         .on_hover_text(&job.error);
                                         if ui.button(crate::i18n::tr("Gửi lại")).clicked() {
                                             card_action = Some(BubbleAction::RetrySend);
+                                        }
+                                        if matches!(job.payload, crate::outgoing::Payload::Attachment { .. })
+                                            && ui.small_button("Tạo ZIP…")
+                                                .on_hover_text("Đóng gói tệp gốc vào ZIP và thêm vào bản nháp để bạn kiểm tra trước khi gửi")
+                                                .clicked() {
+                                            card_action = Some(BubbleAction::ArchiveAttachmentDraft);
                                         }
                                     });
                                     ui.label(RichText::new(&job.error).size(11.0));
@@ -1854,6 +1892,7 @@ pub(super) enum BubbleAction {
     },
     MediaUnavailable,
     RetrySend,
+    ArchiveAttachmentDraft,
     DoubleClickReply,
     Reply,
     CopyLink(String),
@@ -1889,6 +1928,7 @@ pub(super) enum BubbleAction {
         msg_id: String,
         text: String,
     },
+    ToggleVoice,
     TranscribeVoice {
         msg_id: String,
         voice_url: String,
@@ -2250,54 +2290,80 @@ pub(super) fn render_voice_message_widget(
     outgoing: bool,
     max_text_width: f32,
 ) -> Option<BubbleAction> {
-    let card_w = max_text_width.clamp(180.0, 260.0);
+    let card_w = max_text_width.min(ui.available_width()).clamp(80.0, 260.0);
     let (_text_col, meta_col) = if outgoing {
         (pal.bubble_out_text, pal.bubble_out_meta)
     } else {
         (pal.bubble_in_text, pal.bubble_in_meta)
     };
 
+    let mut action = None;
+    let snapshot = ui
+        .ctx()
+        .data(|data| {
+            data.get_temp::<super::inline_voice::Snapshot>(super::inline_voice::view_key(&msg.id))
+        })
+        .unwrap_or_default();
     ui.allocate_ui_with_layout(
         Vec2::new(card_w, 36.0),
         Layout::left_to_right(Align::Center),
         |ui| {
-            let btn_resp = ui.button("▶");
-            if btn_resp.clicked() {
-                if let Some(ref url) = msg.link_url {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::DownloadMedia {
-                            url: url.clone(),
-                            name: "voice.wav".into(),
-                            play: true,
-                            open: false,
-                            context: None,
-                        });
-                    }
-                }
-            }
-
-            let bar_count = 18;
-            let available_w = (card_w - 90.0).max(40.0);
-            let bar_w = (available_w / bar_count as f32).max(2.0);
-            for i in 0..bar_count {
-                let h = 6.0 + ((i as f32 * 1.7 + (msg.ts % 10) as f32).sin().abs() * 16.0);
-                let (rect, _) =
-                    ui.allocate_exact_size(Vec2::new(bar_w - 1.0, 24.0), Sense::hover());
-                let bar_rect = Rect::from_center_size(rect.center(), Vec2::new(bar_w - 1.5, h));
-                ui.painter()
-                    .rect_filled(bar_rect, Rounding::same(1.0), pal.primary);
-            }
-
-            let dur_label = if let Some(stripped) = msg.text.strip_prefix("[Tin nhắn thoại] (")
-            {
-                stripped.trim_end_matches(')').trim()
+            let label = if snapshot.finished {
+                "↻"
+            } else if snapshot.duration > 0.0 && !snapshot.paused {
+                "Ⅱ"
             } else {
-                "0:05"
+                "▶"
+            };
+            let btn_resp = ui.add_enabled(!snapshot.loading, egui::Button::new(label));
+            if btn_resp.clicked() {
+                action = Some(BubbleAction::ToggleVoice);
+            }
+            if snapshot.loading {
+                ui.spinner();
+            }
+            let progress = if snapshot.duration > 0.0 {
+                snapshot.position / snapshot.duration
+            } else {
+                0.0
+            };
+            ui.add(
+                egui::ProgressBar::new(progress)
+                    .desired_width((card_w - 140.0).max(30.0))
+                    .desired_height(5.0),
+            );
+            let dur_label = if snapshot.duration > 0.0 {
+                let seconds = snapshot.position.max(0.0) as u32;
+                let total = snapshot.duration.max(0.0) as u32;
+                format!(
+                    "{}:{:02}/{}:{:02}",
+                    seconds / 60,
+                    seconds % 60,
+                    total / 60,
+                    total % 60
+                )
+            } else {
+                "Âm thanh".to_owned()
             };
             ui.label(RichText::new(dur_label).size(12.0).color(meta_col));
+            if let Some(url) = msg.link_url.as_ref() {
+                if ui
+                    .small_button("AI")
+                    .on_hover_text(crate::i18n::tr("Chuyển giọng nói thành văn bản"))
+                    .clicked()
+                {
+                    action = Some(BubbleAction::TranscribeVoice {
+                        msg_id: msg.id.clone(),
+                        voice_url: url.clone(),
+                    });
+                }
+            }
         },
     );
-    None
+    if let Some(error) = snapshot.error {
+        ui.add(egui::Label::new(RichText::new(error).small().color(pal.danger)).wrap());
+    }
+    action
 }
 
 pub(super) fn render_todo_widget(
@@ -2679,6 +2745,73 @@ pub(super) fn render_reactions(
 #[cfg(test)]
 mod quote_navigation_tests {
     use super::*;
+
+    #[test]
+    fn call_card_reserves_text_width_and_shows_timestamp_once() {
+        let ctx = egui::Context::default();
+        let message = ChatMessage {
+            id: "call_fixture".into(),
+            text: "Cuộc gọi đến (0:11)".into(),
+            time: "22:31".into(),
+            ..Default::default()
+        };
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 500.0))),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    render_chat_bubble(
+                        ui,
+                        &message,
+                        false,
+                        false,
+                        false,
+                        false,
+                        "Fixture",
+                        "thread-fixture",
+                        &HashMap::new(),
+                        None,
+                        &ThemePalette::light(),
+                        &HashMap::new(),
+                        &HashMap::new(),
+                        &mut HashSet::new(),
+                        &HashMap::new(),
+                        true,
+                        0,
+                        None,
+                        None,
+                        &HashMap::new(),
+                        true,
+                        true,
+                    );
+                });
+            },
+        );
+        let text: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        let label = text
+            .iter()
+            .find(|text| text.galley.job.text == "Cuộc gọi đến (0:11)")
+            .expect("Call label must render");
+        assert!(
+            label.galley.size().y < 45.0,
+            "Call text must not collapse into a vertical column"
+        );
+        assert_eq!(
+            text.iter()
+                .filter(|text| text.galley.job.text == "22:31")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn quote_navigation_bubble_propagates_action_for_both_directions() {

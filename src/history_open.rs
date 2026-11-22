@@ -33,7 +33,7 @@ impl Head {
         let thread = self.thread.clone();
         let group = self.group;
         tokio::task::spawn_blocking(move||->Result<()>{
-            anyhow::ensure!(account.is_active(),"Phiên đã đóng");let store=crate::store::MessageStore::open(account.history_path())?;
+            anyhow::ensure!(account.is_active(),"Phiên đã đóng");let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
             store.conn.execute("INSERT INTO history_heads(thread_id,is_group,fetched_at) VALUES(?1,?2,?3) ON CONFLICT(thread_id,is_group) DO UPDATE SET fetched_at=excluded.fetched_at",rusqlite::params![thread,group,crate::login::unix_now()])?;Ok(())
         }).await?
     }
@@ -61,7 +61,7 @@ pub(crate) async fn fetch(session: &Session, thread: &str, group: bool) -> Resul
     let id = thread.to_owned();
     let at = tokio::task::spawn_blocking(move || -> Result<i64> {
         use rusqlite::OptionalExtension;
-        let store = crate::store::MessageStore::open(account.history_path())?;
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
         Ok(store
             .conn
             .query_row(

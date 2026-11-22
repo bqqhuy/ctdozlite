@@ -9,6 +9,57 @@ use sha2::{Digest, Sha256};
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
 pub(crate) static SESSION_IO: Mutex<()> = Mutex::new(());
+static SESSION_FILE_RUNTIME: Mutex<Option<usize>> = Mutex::new(None);
+
+pub(crate) fn mark_session_file_runtime(runtime_id: usize) {
+    *SESSION_FILE_RUNTIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(runtime_id);
+}
+
+pub(crate) fn mark_session_file_runtime_if_unclaimed(runtime_id: usize) -> Result<()> {
+    let _lock = SESSION_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Session persistence lock poisoned"))?;
+    let mut owner = SESSION_FILE_RUNTIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claim_session_file_runtime_if_unclaimed(&mut owner, runtime_id);
+    Ok(())
+}
+
+fn claim_session_file_runtime_if_unclaimed(owner: &mut Option<usize>, runtime_id: usize) {
+    if owner.is_none() {
+        *owner = Some(runtime_id);
+    }
+}
+
+pub(crate) fn remove_session_for_runtime(runtime_id: usize) -> Result<bool> {
+    let _lock = SESSION_IO
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Session persistence lock poisoned"))?;
+    let mut owner = SESSION_FILE_RUNTIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    remove_owned_session_file(&session_path("session.json"), runtime_id, &mut owner)
+}
+
+fn remove_owned_session_file(
+    path: &Path,
+    runtime_id: usize,
+    owner: &mut Option<usize>,
+) -> Result<bool> {
+    if *owner != Some(runtime_id) {
+        return Ok(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    *owner = None;
+    Ok(true)
+}
 
 fn default_root() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("CTDOZ_DATA_DIR") {
@@ -317,7 +368,11 @@ pub fn remove_session() -> Result<()> {
     let _lock = SESSION_IO
         .lock()
         .map_err(|_| anyhow::anyhow!("Session persistence lock poisoned"))?;
-    remove_session_unlocked()
+    remove_session_unlocked()?;
+    *SESSION_FILE_RUNTIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(())
 }
 
 pub fn lock_instance() -> Result<File> {
@@ -523,6 +578,35 @@ mod tests {
         }
         assert!(validate_profile(&"x".repeat(33)).is_err());
         assert!(validate_profile("COM").is_ok());
+    }
+
+    #[test]
+    fn expired_runtime_cannot_remove_newer_session_file() {
+        let directory = std::env::temp_dir().join(format!(
+            "ctdoz-session-owner-{}",
+            crate::param_cipher::random_hex(16)
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.json");
+        fs::write(&path, b"new runtime").unwrap();
+        let mut owner = Some(22);
+        assert!(!remove_owned_session_file(&path, 11, &mut owner).unwrap()); // (INV-P1-SESSION-FILE)
+        assert_eq!(fs::read(&path).unwrap(), b"new runtime");
+        assert_eq!(owner, Some(22));
+        assert!(remove_owned_session_file(&path, 22, &mut owner).unwrap());
+        assert!(!path.exists());
+        assert_eq!(owner, None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn loading_older_profile_does_not_claim_newer_session_file() {
+        let mut owner = Some(22);
+        claim_session_file_runtime_if_unclaimed(&mut owner, 11);
+        assert_eq!(owner, Some(22)); // (INV-P1-SESSION-FILE)
+        let mut startup_owner = None;
+        claim_session_file_runtime_if_unclaimed(&mut startup_owner, 33);
+        assert_eq!(startup_owner, Some(33));
     }
     #[test]
     fn profile_root_is_nested_under_profiles_when_selected() {

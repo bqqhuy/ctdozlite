@@ -75,6 +75,7 @@ fn valid_boundary_id(id: &Value) -> bool {
 }
 
 struct Entry {
+    owner: Option<Session>,
     saved: Saved,
     attempted: Option<Instant>,
     dirty: bool,
@@ -82,7 +83,7 @@ struct Entry {
     blocked_socket: HashSet<String>,
 }
 
-static CACHE: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+static CACHE: Mutex<Option<HashMap<(PathBuf, usize), Entry>>> = Mutex::new(None);
 
 fn path(s: &Session) -> Option<PathBuf> {
     (!s.account_key().is_empty() && s.is_active())
@@ -93,16 +94,19 @@ fn with<R>(s: &Session, f: impl FnOnce(&mut Entry) -> R) -> Option<(R, PathBuf)>
     let path = path(s)?;
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let cache = guard.get_or_insert_with(HashMap::new);
-    let entry = cache.entry(path.clone()).or_insert_with(|| Entry {
-        saved: crate::limits::read_file(&path, FILE_LIMIT)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
-            .map(Saved::validated)
-            .unwrap_or_default(),
-        attempted: None,
-        dirty: false,
-        blocked_socket: HashSet::new(),
-    });
+    let entry = cache
+        .entry((path.clone(), s.runtime_id()))
+        .or_insert_with(|| Entry {
+            owner: Some(s.clone()),
+            saved: crate::limits::read_file(&path, FILE_LIMIT)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Saved>(&b).ok())
+                .map(Saved::validated)
+                .unwrap_or_default(),
+            attempted: None,
+            dirty: false,
+            blocked_socket: HashSet::new(),
+        });
     Some((f(entry), path))
 }
 
@@ -151,6 +155,9 @@ fn socket_start_inner(s: &Session, cmd: u16, sub: u8) -> Option<(Value, Value)> 
 
 /// Record a socket queue page as processed. Call only after its messages were stored.
 fn commit_socket_inner(s: &Session, cmd: u16, sub: u8, payload: &Value, stored: bool) {
+    let Ok(_write_permit) = s.begin_account_write_blocking() else {
+        return;
+    };
     if !MESSAGE_QUEUES.contains(&cmd) {
         return;
     }
@@ -187,7 +194,10 @@ fn commit_socket_inner(s: &Session, cmd: u16, sub: u8, payload: &Value, stored: 
     })
     .map(|(done, path)| {
         let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.as_mut().and_then(|c| c.get_mut(&path)) {
+        if let Some(entry) = guard
+            .as_mut()
+            .and_then(|c| c.get_mut(&(path.clone(), s.runtime_id())))
+        {
             flush(entry, &path, done);
         }
     });
@@ -233,6 +243,9 @@ fn poll_start_inner(s: &Session) -> Option<crate::chat::PollState> {
 
 /// Record `lp_chat` cursors after the polled messages were stored.
 fn commit_poll_inner(s: &Session, state: &crate::chat::PollState) {
+    let Ok(_write_permit) = s.begin_account_write_blocking() else {
+        return;
+    };
     let snapshot = state.clone();
     if let Some((_, path)) = with(s, |entry| {
         if entry.saved.poll.as_ref() != Some(&snapshot) {
@@ -241,17 +254,30 @@ fn commit_poll_inner(s: &Session, state: &crate::chat::PollState) {
         }
     }) {
         let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.as_mut().and_then(|c| c.get_mut(&path)) {
+        if let Some(entry) = guard
+            .as_mut()
+            .and_then(|c| c.get_mut(&(path.clone(), s.runtime_id())))
+        {
             flush(entry, &path, false);
         }
     }
 }
 
 /// Write any pending cursors now (logout, shutdown).
+fn flush_owned(entry: &mut Entry, path: &std::path::Path) {
+    let Some(owner) = entry.owner.clone() else {
+        return;
+    };
+    let Ok(_write_permit) = owner.begin_account_write_blocking() else {
+        return;
+    };
+    flush(entry, path, true);
+}
+
 fn flush_all_inner() {
     let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    for (path, entry) in guard.iter_mut().flat_map(|c| c.iter_mut()) {
-        flush(entry, path, true);
+    for ((path, _), entry) in guard.iter_mut().flat_map(|c| c.iter_mut()) {
+        flush_owned(entry, path);
     }
 }
 
@@ -341,6 +367,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let path = root.join("a.queue-cursors.json");
         let mut entry = Entry {
+            owner: None,
             saved: Saved::default(),
             attempted: None,
             dirty: false,
@@ -371,11 +398,25 @@ mod tests {
     }
     fn entry() -> Entry {
         Entry {
+            owner: None,
             saved: Saved::default(),
             attempted: None,
             dirty: false,
             blocked_socket: HashSet::new(),
         }
+    }
+    #[test]
+    fn revoked_cursor_owner_cannot_flush_dirty_state_after_account_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("queue-cursors.json");
+        let owner = Session::new(false, false, false).unwrap();
+        let mut entry = entry();
+        entry.owner = Some(owner.clone());
+        record_socket(&mut entry, "510_0", json!(100), json!([]));
+        owner.revoke_runtime();
+        flush_owned(&mut entry, &path);
+        assert!(!path.exists()); // (INV-P1-WRITE)
+        assert!(entry.dirty, "unflushed progress must remain replayable");
     }
     #[test]
     fn boundary_ids_advance_even_when_last_id_is_equal() {

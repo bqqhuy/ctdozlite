@@ -513,17 +513,27 @@ impl ZaloGuiApp {
         };
     }
 
-    fn request_attachment_picker(&mut self, thread: &str, _group: bool, images_only: bool) {
+    pub(crate) fn request_attachment_picker(
+        &mut self,
+        thread: &str,
+        group: bool,
+        images_only: bool,
+    ) {
         if self.attachment_picker_pending {
             self.show_toast("Hộp chọn tệp đang mở");
             return;
         }
-        // Selection only prepares a draft. Sending requires a separate user intent.
+        // Toolbar pickers send immediately; the draft's add tile uses PickAttachmentDraft.
         let queued = WORKER_TX.get().is_some_and(|tx| {
-            tx.send(WorkerCmd::PickAttachmentDraft {
+            tx.send(WorkerCmd::PickAndSendAttachment {
                 owner: self.user_uin.clone(),
                 runtime_id: self.account_runtime_id,
-                thread: thread.to_owned(),
+                to_id: thread.to_owned(),
+                is_group: group,
+                caption: self.input_message.trim().to_owned(),
+                preset_path: None,
+                photo_original: self.settings.send_photo_original,
+                ephemeral: false,
                 images_only,
             })
             .is_ok()
@@ -902,17 +912,18 @@ impl ZaloGuiApp {
             (Color32::from_rgb(255, 241, 222), detail)
         };
 
+        // Use an opaque palette surface so the status remains legible in dark mode.
+        let banner_fill = if pal.is_dark { pal.bg_elevated } else { fill };
         egui::Frame::none()
-            .fill(if pal.is_dark {
-                fill.linear_multiply(0.22)
-            } else {
-                fill
-            })
+            .fill(banner_fill)
             .rounding(Rounding::same(6.0))
             .inner_margin(Margin::symmetric(8.0, 5.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
+                    let show_cancel = self.phone_sync_running || self.history_sync_running;
+                    let action_width = 56.0 + 24.0 + if show_cancel { 76.0 } else { 0.0 };
+                    let label_width = (ui.available_width() - action_width - 36.0).max(1.0);
                     if running {
                         ui.spinner();
                     } else if success_visible {
@@ -920,13 +931,14 @@ impl ZaloGuiApp {
                     } else {
                         ui.label("⚠");
                     }
-                    let label = ui.add(
+                    let label = ui.add_sized(
+                        Vec2::new(label_width, 20.0),
                         egui::Label::new(RichText::new(&status).size(11.5).color(pal.text_primary))
                             .truncate(),
                     );
                     label.on_hover_text(status.as_str());
 
-                    if (self.phone_sync_running || self.history_sync_running)
+                    if show_cancel
                         && ui
                             .add_enabled(
                                 !self.sync_cancel_requested,
@@ -1005,12 +1017,25 @@ impl ZaloGuiApp {
         ctx.data_mut(|data| data.insert_temp(Id::new("protected_threads"), protected));
         let drop_blocked_at_start = self.file_drop_blocked(ctx);
         let modal_open = self.is_workspace_input_gated(ctx);
+        let focused_composer_scope =
+            self.threads
+                .get(self.selected_thread_index)
+                .and_then(|thread| {
+                    let composer = Id::new(("chat_composer_input", &thread.id));
+                    (!modal_open
+                        && !self.contacts_view_open
+                        && ctx.memory(|memory| memory.has_focus(composer)))
+                    .then_some(composer.with((&self.user_uin, self.account_runtime_id)))
+                });
+        if cancel_interrupted_composer_events(ctx, focused_composer_scope) {
+            self.status_msg = "Đã dừng phần nhập chờ khi đổi vùng thao tác; chữ còn lại được giữ trong bản nháp, chưa gửi.".into();
+        }
         let file_drag_active = self.attachment_drafts.has_deferred()
             || ctx.input(|i| !i.raw.hovered_files.is_empty() || !i.raw.dropped_files.is_empty());
         // Responsive breakpoints based on live viewport width
         // -------------------------------------------------------------------
         let screen_rect = ctx.screen_rect();
-        let screen_w = screen_rect.width() / ctx.pixels_per_point();
+        let screen_w = screen_rect.width();
         // Keep enough room for the navigation rail, conversation list, chat, and info drawer.
         let is_compact_w = screen_w < 1120.0;
         let is_narrow_w = screen_w < 620.0;
@@ -1452,7 +1477,7 @@ impl ZaloGuiApp {
         };
 
         if !is_narrow_w || !narrow_chat_open {
-            egui::SidePanel::left(sidebar_id)
+            let sidebar_response = egui::SidePanel::left(sidebar_id)
             .resizable(!is_narrow_w)
             .default_width(sidebar_default_w)
             .width_range(sidebar_min_w..=sidebar_max_w)
@@ -1462,13 +1487,34 @@ impl ZaloGuiApp {
                     .stroke(Stroke::new(1.0_f32, pal.border)),
             )
             .show(ctx, |ui| {
+                // SidePanel clips to its planned rectangle but reserves the content's final
+                // minimum rectangle. Isolate content so a wide label cannot reserve an unpainted
+                // gutter or persist a wider panel after search/banner state changes.
+                let bounds = ui.max_rect();
+                ui.set_min_width(bounds.width());
+                let mut content_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("conversation_sidebar_content")
+                        .max_rect(bounds),
+                );
+                content_ui.set_clip_rect(bounds.intersect(ui.clip_rect()));
+                let ui = &mut content_ui;
                 if modal_open {
                     ui.style_mut().interaction.tooltip_delay = 86_400.0;
                 }
                 if !is_narrow_w {
-                    self.render_sync_banner(ui, ctx, pal);
+                    let top = ui.next_widget_position();
+                    let mut banner_ui = ui.new_child(egui::UiBuilder::new()
+                        .id_salt("sidebar_sync_section")
+                        .max_rect(Rect::from_min_max(top, Pos2::new(bounds.right(), bounds.bottom()))));
+                    self.render_sync_banner(&mut banner_ui, ctx, pal);
+                    ui.advance_cursor_after_rect(Rect::from_min_size(top, Vec2::new(bounds.width(), banner_ui.min_rect().height())));
                     ui.add_space(6.0);
                 }
+                let header_top = ui.next_widget_position();
+                let mut header_ui = ui.new_child(egui::UiBuilder::new()
+                    .id_salt("sidebar_search_section")
+                    .max_rect(Rect::from_min_max(header_top, Pos2::new(bounds.right(), bounds.bottom()))));
                 egui::Frame::none()
                     .inner_margin(Margin {
                         left: if is_narrow_w { 4.0 } else { 14.0 },
@@ -1476,7 +1522,7 @@ impl ZaloGuiApp {
                         top: 12.0,
                         bottom: 0.0,
                     })
-                    .show(ui, |ui| {
+                    .show(&mut header_ui, |ui| {
                         if is_narrow_w {
                             // Compact mode: icon-only search / lookup button
                             ui.vertical_centered(|ui| {
@@ -1510,7 +1556,7 @@ impl ZaloGuiApp {
                             let mut trigger_phone_lookup: Option<String> = None;
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                let search_box_w = (avail_row_w - 76.0).max(110.0);
+                                let search_box_w = (avail_row_w - 78.0).max(1.0);
                                 let has_q = !self.search_query.is_empty();
                                 egui::Frame::none()
                                     .fill(pal.bg_input)
@@ -1525,7 +1571,7 @@ impl ZaloGuiApp {
                                     ))
                                     .inner_margin(Margin::symmetric(9.0, 6.0))
                                     .show(ui, |ui| {
-                                        let inner_w = (search_box_w - 18.0).max(80.0);
+                                        let inner_w = (search_box_w - 20.0).max(1.0);
                                         ui.set_width(inner_w);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
@@ -1544,14 +1590,15 @@ impl ZaloGuiApp {
                                                 },
                                             );
                                             let edit_w = if has_q {
-                                                (inner_w - 42.0).max(48.0)
+                                                (inner_w - 43.0).max(1.0)
                                             } else {
-                                                (inner_w - 22.0).max(60.0)
+                                                (inner_w - 21.0).max(1.0)
                                             };
                                             let s_resp = ui.add(
                                                 egui::TextEdit::singleline(&mut self.search_query)
                                                     .id(Id::new("sidebar_search_input"))
                                                     .frame(false)
+                                                    .margin(Vec2::ZERO)
                                                     .hint_text(crate::i18n::tr("Tìm kiếm..."))
                                                     .desired_width(edit_w),
                                             );
@@ -1711,12 +1758,12 @@ impl ZaloGuiApp {
 
                             // Clean Zalo PC Filter Strip: [Tất cả] | [Chưa đọc] ... [Phân loại ▾] [⋯]
                             ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 12.0;
+                                ui.spacing_mut().item_spacing.x = 4.0;
 
                                 // Tab 1: Tất cả
                                 let is_all = !self.unread_only && self.thread_filter == ThreadFilter::All;
                                 let (tab_all_rect, tab_all_resp) =
-                                    ui.allocate_exact_size(Vec2::new(48.0, 26.0), Sense::click());
+                                    ui.allocate_exact_size(Vec2::new(44.0, 26.0), Sense::click());
                                 let fg_all = if is_all {
                                     pal.primary_hover
                                 } else if tab_all_resp.hovered() {
@@ -1725,7 +1772,7 @@ impl ZaloGuiApp {
                                     pal.text_secondary
                                 };
                                 ui.painter().text(
-                                    Pos2::new(tab_all_rect.center().x, tab_all_rect.top() + 7.0),
+                                    tab_all_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     crate::i18n::tr("Tất cả"),
                                     FontId::proportional(13.0),
@@ -1749,7 +1796,7 @@ impl ZaloGuiApp {
                                 // Tab 2: Chưa đọc
                                 let is_unread = self.unread_only;
                                 let (tab_unr_rect, tab_unr_resp) =
-                                    ui.allocate_exact_size(Vec2::new(60.0, 26.0), Sense::click());
+                                    ui.allocate_exact_size(Vec2::new(56.0, 26.0), Sense::click());
                                 let fg_unr = if is_unread {
                                     pal.primary_hover
                                 } else if tab_unr_resp.hovered() {
@@ -1758,7 +1805,7 @@ impl ZaloGuiApp {
                                     pal.text_secondary
                                 };
                                 ui.painter().text(
-                                    Pos2::new(tab_unr_rect.center().x, tab_unr_rect.top() + 7.0),
+                                    tab_unr_rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     crate::i18n::tr("Chưa đọc"),
                                     FontId::proportional(13.0),
@@ -1811,7 +1858,10 @@ impl ZaloGuiApp {
 
                                     // Phân loại ▾ Button
                                     let (lbl_rect, lbl_resp) =
-                                        ui.allocate_exact_size(Vec2::new(76.0, 24.0), Sense::click());
+                                        ui.allocate_exact_size(Vec2::new(72.0, 24.0), Sense::click());
+                                    #[cfg(test)]
+                                    ctx.data_mut(|data| data.insert_temp(Id::new("sidebar-filter-bounds"),
+                                        (tab_all_rect, tab_unr_rect, lbl_rect, more_rect)));
                                     if lbl_resp.hovered() {
                                         ui.painter().rect_filled(
                                             lbl_rect,
@@ -1902,6 +1952,9 @@ impl ZaloGuiApp {
                             }
                         }
                     });
+                // Header widgets own their intrinsic minimum width. Reserve only
+                // their height so that they cannot move the list's right edge.
+                ui.advance_cursor_after_rect(Rect::from_min_size(header_top, Vec2::new(bounds.width(), header_ui.min_rect().height())));
 
                 ui.add(egui::Separator::default().spacing(1.0));
 
@@ -2114,12 +2167,16 @@ impl ZaloGuiApp {
                                 .get(&t.id)
                                 .is_some_and(|p| p.pinned);
 
-                            let row_width = (ui.available_width() - 8.0).max(44.0);
+                            // egui available_width grows with earlier intrinsic
+                            // minimums; row geometry follows the actual viewport.
+                            let row_width = (bounds.right().min(ui.max_rect().right()) - ui.next_widget_position().x - 8.0).max(44.0);
                             let (row_rect, row_resp) = ui.push_id(("conversation-row", &target_id, target_group), |ui| {
                                 ui.allocate_exact_size(Vec2::new(row_width, row_height),
                                     if modal_open { Sense::hover() } else { Sense::click() })
                             }).inner;
                             let row_rect = row_rect.translate(Vec2::new(4.0, 0.0));
+                            #[cfg(test)]
+                            ctx.data_mut(|data| data.insert_temp(Id::new(("sidebar-row-rect", &target_id)), row_rect));
                             let preference = self
                                 .conversation_preferences
                                 .get(&t.id)
@@ -2286,19 +2343,18 @@ impl ZaloGuiApp {
                                 } else {
                                     pal.text_primary
                                 };
-                                let max_name_chars = if is_compact_w { 15 } else { 21 };
-                                let display_name = truncate_chars(thread_display, max_name_chars);
-                                ui.painter().text(
-                                    Pos2::new(text_left, row_rect.top() + 12.0),
-                                    egui::Align2::LEFT_TOP,
-                                    display_name,
-                                    FontId::proportional(13.6),
-                                    name_color,
-                                );
-
-                                // Pin icon + Timestamp (top-right)
                                 let row_time = t.sidebar_timestamp(crate::login::unix_now() * 1000);
                                 let time_right = row_rect.right() - 9.0;
+                                let time_width = ui.fonts(|f| f.layout_no_wrap(row_time.clone(), FontId::proportional(11.0), pal.text_muted).size().x);
+                                let name_right = time_right - time_width - if is_user_pinned { 23.0 } else { 8.0 };
+                                let mut name_job = egui::text::LayoutJob::simple_singleline(thread_display.to_owned(), FontId::proportional(13.6), name_color);
+                                name_job.wrap.max_width = (name_right - text_left).max(1.0);
+                                name_job.wrap.max_rows = 1;
+                                name_job.wrap.break_anywhere = true;
+                                let name_galley = ui.fonts(|f| f.layout_job(name_job));
+                                ui.painter().galley(Pos2::new(text_left, row_rect.top() + 12.0), name_galley, name_color);
+
+                                // Pin icon + Timestamp (top-right)
                                 if !row_time.is_empty() {
                                     let tw = ui.fonts(|f| {
                                         f.layout_no_wrap(
@@ -2327,31 +2383,24 @@ impl ZaloGuiApp {
                                 }
 
                                 let reactor_name = t.presentation.reaction_preview.as_ref()
-                                    .and_then(|reaction| self.reactor_profiles.get(&reaction.reactor))
-                                    .map(|profile| profile.name.as_str()).filter(|name| !name.is_empty());
-                                let raw_preview = crate::message_view::preview_with_reactor(t, reactor_name);
+                                    .and_then(|reaction| self.server_aliases.get(&reaction.reactor)
+                                        .map(String::as_str)
+                                        .or_else(|| self.reactor_profiles.get(&reaction.reactor)
+                                            .map(|profile| profile.name.as_str())))
+                                    .filter(|name| !name.is_empty());
+                                let raw_preview = crate::message_view::preview_with_resolver(t, reactor_name,
+                                    |uid| self.server_aliases.get(uid).map(String::as_str));
                                 let unread_n = self.unread_counts.get(&t.id).copied().unwrap_or(0);
-                                let max_snip_chars = if is_compact_w {
-                                    16
-                                } else if t.unread.has_unread_mentions() {
-                                    19
-                                } else if unread_n > 0 {
-                                    23
-                                } else {
-                                    28
-                                };
-                                let snippet = truncate_chars(&raw_preview, max_snip_chars);
-                                ui.painter().text(
-                                    Pos2::new(text_left, row_rect.top() + 33.5),
-                                    egui::Align2::LEFT_TOP,
-                                    snippet,
-                                    FontId::proportional(12.0),
-                                    if unread_n > 0 {
-                                        pal.text_primary
-                                    } else {
-                                        pal.text_secondary
-                                    },
-                                );
+                                let snippet_right = row_rect.right() - 9.0
+                                    - if unread_n > 0 { 30.0 } else { 0.0 }
+                                    - if t.unread.has_unread_mentions() { 38.0 } else { 0.0 };
+                                let snippet_color = if unread_n > 0 { pal.text_primary } else { pal.text_secondary };
+                                let mut snippet_job = egui::text::LayoutJob::simple_singleline(raw_preview, FontId::proportional(12.0), snippet_color);
+                                snippet_job.wrap.max_width = (snippet_right - text_left).max(1.0);
+                                snippet_job.wrap.max_rows = 1;
+                                snippet_job.wrap.break_anywhere = true;
+                                let snippet_galley = ui.fonts(|f| f.layout_job(snippet_job));
+                                ui.painter().galley(Pos2::new(text_left, row_rect.top() + 33.5), snippet_galley, snippet_color);
                                 if unread_n > 0 {
                                     let badge_txt = if unread_n > 99 {
                                         "99+".to_string()
@@ -2476,6 +2525,15 @@ impl ZaloGuiApp {
                     self.open_thread(ctx, idx, tid, is_group);
                 }
             });
+            #[cfg(test)]
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    Id::new("sidebar-panel-rect"),
+                    sidebar_response.response.rect,
+                )
+            });
+            #[cfg(not(test))]
+            let _ = sidebar_response;
         }
 
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
@@ -3395,8 +3453,29 @@ impl ZaloGuiApp {
                     }
 
                     // 2. Scrollable Messages Area
+                    let composer_id = Id::new(("chat_composer_input", &thread_id));
+                    let composer_scope = composer_id.with((&self.user_uin, self.account_runtime_id));
+                    if let Some(recovered) = ctx.data_mut(|data| data.remove_temp::<String>(composer_scope.with("cancelled_draft"))) {
+                        self.input_message.push_str(&recovered);
+                    }
+                    if !modal_open && ctx.memory(|memory| memory.has_focus(composer_id)) {
+                        stage_composer_events(ctx, composer_scope, self.composer_ime_active);
+                    }
                     let composer_format_key = Id::new(("composer_format", &self.user_uin, self.account_runtime_id, &thread_id, is_group));
                     let mut composer_format = ctx.data(|data| data.get_temp::<crate::rich_text::ComposerFormat>(composer_format_key)).unwrap_or_default();
+                    composer_format.edit(&self.input_message);
+                    if !modal_open && ctx.memory(|memory| memory.has_focus(composer_id))
+                        && ctx.input_mut(|input| consume_composer_format_shortcut(&mut input.events))
+                    {
+                        self.composer_format_mode = !self.composer_format_mode;
+                        if !self.composer_format_mode {
+                            composer_format.clear_text_styles();
+                            ctx.data_mut(|data|data.insert_temp(composer_format_key,composer_format.clone()));
+                        }
+                    }
+                    let expanded_key = composer_scope.with("expanded");
+                    let mut composer_expanded = self.composer_format_mode
+                        && ctx.data(|data| data.get_temp::<bool>(expanded_key).unwrap_or(false));
                     let contextual_stickers = if self.attachment_drafts.len(&thread_id)>0 {Vec::new()} else {self.resolve_contextual_sticker_suggestions(ctx)};
                     let composer_link_preview =
                         self.resolve_composer_link_preview(ctx, &thread_id, is_group);
@@ -3474,26 +3553,47 @@ impl ZaloGuiApp {
                         - 8.0
                         - if composer_compact { 48.0 } else { 0.0 })
                         .max(32.0);
-                    let toolbar_button_count = 7 + usize::from(cfg!(windows));
+                    let toolbar_button_count = 9 + usize::from(cfg!(windows));
                     let toolbar_inner_width = (composer_layout_width - 30.0).max(1.0);
                     let toolbar_per_row = ((toolbar_inner_width + 2.0) / 34.0).floor().max(1.0) as usize;
                     let toolbar_rows = toolbar_button_count.div_ceil(toolbar_per_row);
                     self.sync_composer_draft(ctx);
-                    let editor_height = composer_editor_height(ui, &self.input_message, composer_input_width);
-                    let group_send_allowed = !is_group || self.threads[self.selected_thread_index]
-                        .presentation.send_policy.as_ref().is_some_and(|policy| policy.allows(&self.user_uin));
+                    let composer_line_height = if self.composer_format_mode {self.composer_config.line_height} else {22.0};
+                    let measured_editor_height = ui.fonts(|fonts| fonts.layout_job(composer_layout_job(
+                        &self.input_message,&self.composer_mentions,&composer_format,composer_input_width-12.0,
+                        composer_line_height,pal)).size().y).max(composer_line_height)+6.0;
+                    let editor_height = if composer_expanded {
+                        (ui.available_height() * 0.5 - 88.0).max(60.0)
+                    } else if self.composer_format_mode {
+                        measured_editor_height.max(140.0)
+                            .min(self.composer_config.rich_max_lines*composer_line_height+6.0)
+                    } else {
+                        measured_editor_height.min(COMPOSER_MAX_ROWS as f32*composer_line_height+6.0)
+                    };
+                    let send_policy = self.threads[self.selected_thread_index].presentation.send_policy.as_ref();
+                    // The worker revalidates group permission before sending. Keep the composer
+                    // usable while its first snapshot is loading; a missing snapshot is not a denial.
+                    let group_send_allowed = !is_group || send_policy.is_none_or(|policy| policy.allows(&self.user_uin));
                     let group_notice = (!group_send_allowed).then(|| {
-                        let text = if self.threads[self.selected_thread_index].presentation.send_policy.is_none() {
-                            "Chưa xác minh được quyền gửi. Mở lại hội thoại để thử tải quyền nhóm."
-                        } else { "Nhóm đang khóa gửi tin hoặc bạn không còn quyền gửi." };
+                        let text = "Nhóm đang khóa gửi tin hoặc bạn không còn quyền gửi.";
                         ui.fonts(|fonts| fonts.layout(text.into(), egui::TextStyle::Body.resolve(ui.style()), pal.text_primary, ui.available_width()))
                     });
                     // Reserve the same wrapped galley that is rendered below the history.
                     // A permission notice must not push the composer outside the viewport.
                     let notice_height = group_notice.as_ref().map(|galley| galley.size().y + ui.spacing().item_spacing.y).unwrap_or(0.0);
                     let toolbar_height = 36.0 + (toolbar_rows.saturating_sub(1) as f32 * 36.0);
-                    let msg_area_height =
-                        (ui.available_height() - 56.0 - toolbar_height - picker_reserve - editor_height - notice_height).max(0.0);
+                    let format_toolbar_height = if self.composer_format_mode || composer_format.urgency.is_some() { 30.0 } else { 0.0 };
+                    // Reserve the measured composer, not an unrelated fixed bottom spacer.
+                    // A discard pass converges after wrapping, mode switches or viewport changes.
+                    let composer_bottom = ui.max_rect().bottom();
+                    let composer_height_key = composer_scope.with("measured_height");
+                    let estimated_height = toolbar_height + editor_height.max(34.0)
+                        + format_toolbar_height + 25.0;
+                    let reserved_composer_height = ctx.data(|data|
+                        data.get_temp::<f32>(composer_height_key).unwrap_or(estimated_height));
+                    let msg_area_height = (ui.available_height() - picker_reserve
+                        - reserved_composer_height - notice_height - ui.spacing().item_spacing.y)
+                        .max(0.0);
 
                     let newest_requested = ctx.data_mut(|d| d.remove_temp::<bool>(Id::new(("jump_newest", &thread_id)))).unwrap_or(false);
                     let content_protected=self.content_protected(&thread_id,is_group);
@@ -3816,13 +3916,16 @@ impl ZaloGuiApp {
                                                     // Render Voice-to-text transcript box below voice message if present
                                                     let is_transcribing = self.transcribing_voices.contains(&trans_key);
                                                     let cached_transcript = self.voice_transcripts.get(&trans_key);
-                                                    if is_transcribing {
+                                                    let transcript_visible = msg.kind == crate::message_model::MessageKind::Voice
+                                                        && !msg.is_e2ee && !content_protected
+                                                        && !crate::message_lifecycle::expired(msg, crate::login::unix_now()*1000);
+                                                    if is_transcribing && transcript_visible {
                                                         ui.horizontal(|ui| {
                                                             if msg.is_outgoing { ui.add_space((ui.available_width() - 240.0).max(0.0)); }
                                                             ui.spinner();
                                                             ui.label(RichText::new("🎙 Đang chuyển giọng nói thành văn bản…").size(12.0).color(pal.text_muted));
                                                         });
-                                                    } else if let Some(transcript) = cached_transcript {
+                                                    } else if let Some(transcript) = cached_transcript.filter(|_|transcript_visible) {
                                                         let trans_w = (ui.available_width() * 0.72).clamp(160.0, 480.0);
                                                         ui.horizontal(|ui| {
                                                             if msg.is_outgoing { ui.add_space((ui.available_width() - trans_w - 6.0).max(0.0)); }
@@ -3989,6 +4092,7 @@ impl ZaloGuiApp {
                                     ctx.data_mut(|data| data.insert_temp(Id::new("reaction_details"),
                                         (self.user_uin.clone(), self.threads[self.selected_thread_index].id.clone(), m.clone())));
                                 }
+                                BubbleAction::ToggleVoice => self.toggle_inline_voice(ctx, &thread_id, is_group, m.clone()),
 
                                 BubbleAction::RetryMedia{key}=>{let preview=crate::media_recovery::image_key(&self.threads[self.selected_thread_index].id,&m.id,0,true);for key in [key,preview]{self.loading_stickers.remove(&key);self.image_failures.remove(&key);self.image_retry_at.remove(&key);}}
                                 BubbleAction::MediaUnavailable=>{self.status_msg="Thiếu thông tin tải ảnh/video; chưa thể mở tệp".into();}
@@ -4012,6 +4116,17 @@ impl ZaloGuiApp {
                                     let source=&self.threads[self.selected_thread_index];let id=source.id.clone();let group=source.is_group;
                                     self.open_media_viewer(&id,&m);
                                     if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::DownloadMedia{url,name,play:true,open:false,context:Some(super::worker::ChatImage{thread:id,group,message:m.clone(),preview:false})});}
+                                }
+                                BubbleAction::ArchiveAttachmentDraft => {
+                                    if let Some(job) = m.outgoing_job.as_ref() {
+                                        if let crate::outgoing::Payload::Attachment { path, stamp, .. } = &job.payload {
+                                            let queued = WORKER_TX.get().is_some_and(|tx| tx.send(WorkerCmd::PrepareAttachmentArchive {
+                                                owner:self.user_uin.clone(), runtime_id:self.account_runtime_id,
+                                                thread:thread_id.clone(), path:path.clone(),stamp:stamp.clone(),
+                                            }).is_ok());
+                                            if !queued {self.show_toast("Worker chưa sẵn sàng để tạo ZIP");}
+                                        }
+                                    }
                                 }
                                 BubbleAction::RetrySend => {
                                     if let Some(tx) = WORKER_TX.get() {
@@ -4228,7 +4343,9 @@ impl ZaloGuiApp {
                                 BubbleAction::TranslateMessage { msg_id, text } => {
                                     if !self.settings.ai_translation_consent {
                                         self.show_toast("Vui lòng kích hoạt 'Đồng ý dịch tin nhắn bằng AI' trong Cài đặt");
-                                    } else if m.is_e2ee || m.kind == crate::message_model::MessageKind::Recall {
+                                    } else if m.is_e2ee || m.kind == crate::message_model::MessageKind::Recall
+                                        || self.content_protected(&thread_id, is_group)
+                                        || crate::message_lifecycle::expired(&m, crate::login::unix_now() * 1000) {
                                         self.show_toast("Không thể dịch tin nhắn mã hóa đầu cuối hoặc tin đã thu hồi");
                                     } else {
                                         let key = (thread_id.clone(), msg_id.clone());
@@ -4265,7 +4382,10 @@ impl ZaloGuiApp {
                                                     thread_id: thread_id.clone(),
                                                     msg_id: msg_id.clone(),
                                                     voice_url,
-                                                    generation: 0,
+                                                    generation: self.account_runtime_id as u64,
+                                                    context: super::worker::ChatImage {
+                                                        thread: thread_id.clone(), group: is_group, message: m.clone(), preview: false,
+                                                    },
                                                 });
                                             }
                                         }
@@ -4292,13 +4412,14 @@ impl ZaloGuiApp {
                     if self.sticker_picker_open && !modal_open {
                         let anchor = ctx.data(|data| data.get_temp::<Rect>(Id::new(("composer_picker_anchor", &thread_id))));
                         if let Some(anchor) = anchor {
+                            let picker_width = ui.max_rect().width().min(ctx.screen_rect().width() - 24.0).clamp(160.0, 460.0);
                             egui::Area::new(Id::new(("composer_unified_picker", &thread_id)))
                                 .order(egui::Order::Foreground)
-                                .pivot(egui::Align2::RIGHT_BOTTOM)
-                                .fixed_pos(anchor.right_top() - Vec2::new(0.0, 4.0))
+                                .pivot(egui::Align2::LEFT_BOTTOM)
+                                .fixed_pos(composer_picker_position(anchor, ui.max_rect(), ctx.screen_rect(), picker_width))
                                 .constrain_to(ctx.screen_rect())
                                 .show(ctx, |ui| {
-                                    ui.set_width((ctx.screen_rect().width() - 24.0).clamp(160.0, 460.0));
+                                    ui.set_width(picker_width);
                                     ui.add_enabled_ui(group_send_allowed, |ui| {
                                         self.render_sticker_picker(ui, &thread_id, is_group, pal);
                                     });
@@ -4500,7 +4621,7 @@ impl ZaloGuiApp {
                             });
                         }
                         if clear_clip {
-                            if let Some((path, _, _, _)) = self.pending_clipboard_image.take() {
+                            if let Some((path, _, _, _)) = self.retire_pending_clipboard_image() {
                                 std::thread::spawn(move || {
                                     let _ = std::fs::remove_file(path);
                                 });
@@ -4512,16 +4633,82 @@ impl ZaloGuiApp {
                     // 4. Bottom Message Composer Bar (Two-Tier Composer: Tier 1 Toolbar + Tier 2 Multiline Editor)
                     if let Some(notice) = group_notice { ui.label(notice); }
                     ui.set_max_width(composer_layout_width);
+                    let composer_bounds = Rect::from_min_max(
+                        Pos2::new(ui.max_rect().left(), composer_bottom - reserved_composer_height),
+                        Pos2::new(ui.max_rect().left() + composer_layout_width, composer_bottom),
+                    );
+                    let mut composer_ui = ui.new_child(egui::UiBuilder::new()
+                        .id_salt("bottom_anchored_composer").max_rect(composer_bounds));
+                    let mut composer_send_bounds = None;
                     let composer_frame = egui::Frame::none()
                         .fill(pal.bg_sidebar)
                         .inner_margin(Margin::symmetric(14.0, 8.0))
                         .stroke(Stroke::new(1.0_f32, pal.border))
-                        .show(ui, |ui| {
+                        .show(&mut composer_ui, |ui| {
                             if !group_send_allowed { ui.disable(); }
 
                             // Tier 1: Utility Toolbar 36px (Flat Icon Buttons)
                             ui.horizontal_wrapped(|ui| {
                                 ui.spacing_mut().item_spacing.x = 2.0;
+
+                                // Zalo PC keeps the rich-text toggle visible in the composer
+                                // toolbar.  The keyboard shortcuts remain aliases, rather than
+                                // the only discoverable entry point.
+                                if ui
+                                    .add_sized([32.0,32.0], egui::Button::new(RichText::new("Aa").size(17.0)
+                                        .color(if self.composer_format_mode {pal.primary} else {pal.text_secondary}))
+                                        .frame(false))
+                                    .on_hover_text(crate::i18n::tr("Định dạng văn bản (Ctrl+Shift+S hoặc Ctrl+Shift+X)"))
+                                    .clicked()
+                                {
+                                    self.composer_format_mode = !self.composer_format_mode;
+                                    if !self.composer_format_mode {
+                                        composer_format.clear_text_styles();
+                                        ctx.data_mut(|data|data.insert_temp(composer_format_key,composer_format.clone()));
+                                    }
+                                }
+
+                                // Keep Important/Urgent and the existing connected actions in a
+                                // discoverable overflow menu, matching the desktop More menu.
+                                ui.menu_button(RichText::new("⋯").size(22.0).color(pal.text_secondary), |ui| {
+                                    ui.set_min_width(220.0);
+                                    ui.spacing_mut().button_padding = Vec2::new(12.0,8.0);
+                                    if ui
+                                        .button(crate::i18n::tr("Định dạng văn bản"))
+                                        .clicked()
+                                    {
+                                        self.composer_format_mode = true;
+                                        ui.close_menu();
+                                    }
+                                    for (mode, label) in [
+                                        (Some(crate::rich_text::Urgency::Important), "Đánh dấu Quan trọng"),
+                                        (Some(crate::rich_text::Urgency::Urgent), "Đánh dấu Khẩn cấp"),
+                                        (None, "Gửi bình thường"),
+                                    ] {
+                                        if ui
+                                            .selectable_label(composer_format.urgency == mode, label)
+                                            .clicked()
+                                        {
+                                            composer_format.urgency = mode;
+                                            self.composer_format_mode = true;
+                                            ctx.data_mut(|data| {
+                                                data.insert_temp(composer_format_key, composer_format.clone())
+                                            });
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.button(crate::i18n::tr("Tạo nhắc hẹn…")).clicked() {
+                                        self.open_server_board(thread_id.clone(), is_group, self.input_message.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button(crate::i18n::tr("Giao việc & Bình chọn…")).clicked() {
+                                        self.tools.open = true;
+                                        self.tools.tab = 5;
+                                        ui.close_menu();
+                                    }
+                                });
+                                ui.separator();
 
                                 // 1. Sticker Icon Button
                                 let (stk_rect, stk_resp) = ui.allocate_exact_size(
@@ -4783,40 +4970,6 @@ impl ZaloGuiApp {
 
                             ui.add_space(3.0);
 
-                            if ui.input_mut(|i| {
-                                i.consume_key(
-                                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                                    Key::X,
-                                )
-                            }) {
-                                self.composer_format_mode = !self.composer_format_mode;
-                                if !self.composer_format_mode {
-                                    composer_format = Default::default();
-                                    ctx.data_mut(|data|data.insert_temp(composer_format_key,composer_format.clone()));
-                                }
-                            }
-                            if self.composer_format_mode || composer_format.urgency.is_some() {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new("Toàn bộ tin nhắn").color(pal.text_secondary));
-                                    for (flag, label) in [(&mut composer_format.bold, "B"), (&mut composer_format.italic, "I"),
-                                        (&mut composer_format.underline, "U"), (&mut composer_format.strike, "S̶")] {
-                                        if ui.selectable_label(*flag, label).clicked() {*flag = !*flag;}
-                                    }
-                                    if let Some(urgency) = composer_format.urgency {
-                                        ui.label(match urgency {crate::rich_text::Urgency::Important=>"Quan trọng",crate::rich_text::Urgency::Urgent=>"Khẩn cấp"});
-                                    }
-                                    if ui
-                                        .small_button(crate::i18n::tr("Tắt"))
-                                        .on_hover_text(crate::i18n::tr("Tắt chế độ định dạng (Ctrl+Shift+X)"))
-                                        .clicked()
-                                    {
-                                        self.composer_format_mode = false;
-                                        composer_format = Default::default();
-                                    }
-                                });
-                                ctx.data_mut(|data| data.insert_temp(composer_format_key, composer_format.clone()));
-                            }
-
                             // Tier 2: Multiline Editor Area (Spacious input + Emoji + Send/Like button)
                             egui::Frame::none()
                                 .fill(pal.bg_input)
@@ -4829,15 +4982,16 @@ impl ZaloGuiApp {
                                         // Keep a usable editor and send action even at high DPI.
                                         let send_btn_w = composer_send_width;
                                         let input_w = composer_input_width;
-                                        let composer_id = Id::new(("chat_composer_input", &thread_id));
                                         // Enter sends; Shift+Enter is left to the editor as a newline.
                                         // Only consumed while the composer owns focus, so other fields keep Enter.
                                         // An IME uses Enter to commit the word being composed; that Enter
                                         // must not also send the message.
                                         let (ime_active, ime_blocks_enter) = ui.input(|i| ime_state(&i.events, self.composer_ime_active));
                                         self.composer_ime_active = ime_active;
-                                        let mut enter_send = self.quick_schedule.is_none() && !ime_blocks_enter && ui.memory(|m| m.has_focus(composer_id))
-                                            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+                                        let mut enter_send = self.quick_schedule.is_none()
+                                            && !ime_blocks_enter
+                                            && ui.memory(|m| m.has_focus(composer_id))
+                                            && ui.input_mut(|i| consume_composer_enter(&mut i.events));
                                         let voice_snapshot = self.voice_worker.as_ref().map(crate::voice::VoiceWorker::snapshot).unwrap_or_default();
                                         let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
                                         let (response, cursor) = if is_voice_active {
@@ -4901,13 +5055,18 @@ impl ZaloGuiApp {
                                             let (_, resp) = ui.allocate_exact_size(Vec2::ZERO, Sense::hover());
                                             (resp, 0)
                                         } else {
-                                            let rows = composer_rows(&self.input_message);
+                                            // ScrollArea owns the viewport height; TextEdit must not
+                                            // add a second explicit-row height on top of the galley.
+                                            let rows = 1;
                                             let mention_draft = self.composer_mentions.clone();
+                                            let format_preview = composer_format.clone();
                                             let mut mention_layouter = |ui: &egui::Ui, text: &str, width: f32| {
-                                                ui.fonts(|fonts|fonts.layout_job(super::mention_composer::mention_layout(text, &mention_draft, width, pal)))
+                                                ui.fonts(|fonts| fonts.layout_job(composer_layout_job(
+                                                    text,&mention_draft,&format_preview,width,composer_line_height,pal)))
                                             };
                                             let text_edit =
                                                 egui::TextEdit::multiline(&mut self.input_message)
+                                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
                                                     .layouter(&mut mention_layouter)
                                                     .font(FontId::proportional(14.0))
                                                     .id(composer_id)
@@ -4916,7 +5075,7 @@ impl ZaloGuiApp {
                                                         "Nhập tin nhắn tới {}...",
                                                         truncate_chars(&thread_name, 16)
                                                     )})
-                                                    .margin(Margin::symmetric(6.0, 7.0))
+                                                    .margin(Margin::symmetric(6.0, 3.0))
                                                     .desired_rows(rows)
                                                     .desired_width(input_w);
 
@@ -4924,13 +5083,18 @@ impl ZaloGuiApp {
                                                 .id_salt(("chat_composer_scroll", &thread_id))
                                                 .max_width(input_w)
                                                 .min_scrolled_width(input_w)
-                                                .auto_shrink([false, true])
-                                                .min_scrolled_height(0.0)
+                                                .auto_shrink([false, false])
+                                                .min_scrolled_height(editor_height)
                                                 .max_height(editor_height)
                                                 .stick_to_bottom(true)
                                                 .show(ui, |ui| text_edit.show(ui))
                                                 .inner;
                                             let cursor = output.cursor_range.map(|r| r.primary.ccursor.index).unwrap_or_else(|| self.input_message.chars().count());
+                                            if let Some(range) = output.cursor_range {
+                                                let [start,end] = range.sorted_cursors();
+                                                ctx.data_mut(|data| data.insert_temp(composer_scope.with("selection"),
+                                                    (start.ccursor.index,end.ccursor.index)));
+                                            }
                                             (output.response, cursor)
                                         };
                                         if !file_drag_active {self.mention_suggestions(ui, &thread_id, cursor, &response, &mut enter_send, ime_blocks_enter);}
@@ -5070,9 +5234,7 @@ impl ZaloGuiApp {
                                         );
                                         #[cfg(test)]
                                         ctx.data_mut(|data| data.insert_temp(Id::new("composer-send-bounds"), (send_rect, ui.clip_rect())));
-                                        if self.smoke.is_some() && !ui.clip_rect().expand(1.0).contains_rect(send_rect) {
-                                            eprintln!("UI smoke failed: send button outside composer viewport: send={send_rect:?}, clip={:?}",ui.clip_rect());std::process::exit(3);
-                                        }
+                                        composer_send_bounds = Some((send_rect, ui.clip_rect()));
                                         if can_send {
                                             let send_bg = if send_resp.hovered() {
                                                 pal.primary_hover
@@ -5140,7 +5302,7 @@ impl ZaloGuiApp {
 
 
                                         send_resp.context_menu(|ui|{
-                                            if ui.button(crate::i18n::tr("Định dạng văn bản (Ctrl+Shift+X)")).clicked() {
+                                            if ui.button(crate::i18n::tr("Định dạng văn bản (Ctrl+Shift+S / Ctrl+Shift+X)")).clicked() {
                                                 self.composer_format_mode = true;
                                                 ui.close_menu();
                                             }
@@ -5228,12 +5390,13 @@ impl ZaloGuiApp {
                                         {
                                             if let Some((clip_path, _, _, _)) = self.pending_clipboard_image.as_ref() {
                                                 let queued=WORKER_TX.get().is_some_and(|tx|tx.send(WorkerCmd::PickAndSendAttachment {
+                                                    owner:self.user_uin.clone(), runtime_id:self.account_runtime_id,
                                                     to_id:thread_id.clone(),is_group,images_only:true,
                                                     caption:self.input_message.trim().to_owned(),preset_path:Some(clip_path.clone()),
                                                     photo_original:self.settings.send_photo_original,ephemeral:true,
                                                 }).is_ok());
                                                 if queued {
-                                                    self.pending_clipboard_image=None;
+                                                    let _ = self.retire_pending_clipboard_image();
                                                     self.dismissed_sticker_suggest_for.clear();self.composer_sticker_selected=None;
                                                 } else {self.status_msg="Không gửi được ảnh; ảnh và nội dung soạn thảo vẫn được giữ.".into();}
                                                 response.request_focus();
@@ -5297,10 +5460,66 @@ impl ZaloGuiApp {
                                             response.request_focus();
                                         }
                                     });
+                            if self.composer_format_mode || composer_format.urgency.is_some() {
+                                ui.add_space(4.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    for (index, active, label) in [
+                                        (0, composer_format.bold, RichText::new("B").strong()),
+                                        (1, composer_format.italic, RichText::new("I").italics()),
+                                        (2, composer_format.underline, RichText::new("U").underline()),
+                                        (3, composer_format.strike, RichText::new("S").strikethrough()),
+                                    ] {
+                                        if ui.add_sized([28.0,26.0], egui::SelectableLabel::new(active,label)).clicked() {
+                                            let (start,end) = ctx.data(|data| data.get_temp::<(usize,usize)>(composer_scope.with("selection")))
+                                                .unwrap_or_default();
+                                            composer_format.toggle_selection(&self.input_message,start,end,index);
+                                            self.composer_focus_pending = true;
+                                        }
+                                    }
+                                    if let Some(urgency) = composer_format.urgency {
+                                        ui.label(match urgency {
+                                            crate::rich_text::Urgency::Important => "Quan trọng",
+                                            crate::rich_text::Urgency::Urgent => "Khẩn cấp",
+                                        });
+                                    }
+                                    if ui.add_sized([28.0,26.0],egui::Button::new(
+                                        RichText::new(if composer_expanded {"↙"} else {"↗"}).size(18.0)).frame(false))
+                                        .on_hover_text(if composer_expanded {"Thu gọn vùng soạn thảo"} else {"Mở rộng vùng soạn thảo"}).clicked() {
+                                        composer_expanded = !composer_expanded;
+                                        ctx.data_mut(|data| data.insert_temp(expanded_key, composer_expanded));
+                                        ctx.request_repaint();
+                                    }
+                                    if ui.add_sized([28.0,26.0],egui::Button::new("×").frame(false))
+                                        .on_hover_text("Tắt định dạng (Ctrl+Shift+X)").clicked() {
+                                        self.composer_format_mode = false;
+                                        composer_format = Default::default();
+                                    }
+                                });
+                                ctx.data_mut(|data| data.insert_temp(composer_format_key, composer_format.clone()));
+                            }
                                 });
                         });
 
                     let mut compose_drop_rect = composer_frame.response.rect;
+                    let actual_height = composer_frame.response.rect.height();
+                    if (actual_height - reserved_composer_height).abs() > 0.5 {
+                        ctx.data_mut(|data| data.insert_temp(composer_height_key, actual_height));
+                        ctx.request_discard("anchor measured composer to the window bottom");
+                    }
+                    // The measurement pass can overflow before its new height is applied.
+                    // Smoke validates the final layout that egui will actually paint.
+                    if self.smoke.is_some() && !ctx.will_discard() {
+                        if let Some((send, clip)) = composer_send_bounds {
+                            if !clip.expand(1.0).contains_rect(send) {
+                                eprintln!("UI smoke failed: send button outside composer viewport: send={send:?}, clip={clip:?}");
+                                std::process::exit(3);
+                            }
+                        }
+                    }
+                    #[cfg(test)]
+                    ctx.data_mut(|data| data.insert_temp(Id::new("composer-layout-bounds"),
+                        (composer_frame.response.rect, composer_bottom, editor_height)));
                     compose_drop_rect.min.y = compose_top;
                     self.handle_file_drop(ctx, &thread_id, is_group, message_scroll.inner_rect, compose_drop_rect, drop_blocked_at_start, pal);
 
@@ -6282,9 +6501,214 @@ mod sync_and_order_tests {
 /// Maximum explicit rows before the composer scrolls.
 const COMPOSER_MAX_ROWS: usize = 5;
 /// Approximate laid-out height of one 14px composer row.
+#[cfg(test)]
 const COMPOSER_ROW_HEIGHT: f32 = 20.0;
-/// Height of five rows plus the editor margin.
+/// Maximum scroll viewport for five rows plus the compact editor margin.
+#[cfg(test)]
 const COMPOSER_MAX_HEIGHT: f32 = 114.0;
+
+fn plain_composer_enter(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
+        if !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
+}
+
+fn consume_composer_enter(events: &mut Vec<egui::Event>) -> bool {
+    if let Some(index) = events.iter().position(plain_composer_enter) {
+        events.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+fn consume_composer_format_shortcut(events: &mut Vec<egui::Event>) -> bool {
+    if let Some(index) = events.iter().position(|event| {
+        matches!(event,
+        egui::Event::Key { key: Key::S | Key::X, pressed: true, modifiers, .. }
+        if modifiers.ctrl && modifiers.shift && !modifiers.alt)
+    }) {
+        events.remove(index);
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Clone)]
+struct DeferredComposerEvents {
+    scope: Id,
+    events: Vec<egui::Event>,
+}
+impl Default for DeferredComposerEvents {
+    fn default() -> Self {
+        Self {
+            scope: Id::new("empty_composer_scope"),
+            events: Vec::new(),
+        }
+    }
+}
+
+fn composer_input_fragment(events: &[egui::Event]) -> String {
+    let mut text = String::new();
+    for event in events {
+        match event {
+            egui::Event::Text(value) | egui::Event::Paste(value) => text.push_str(value),
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                modifiers,
+                ..
+            } if modifiers.shift => text.push('\n'),
+            egui::Event::Ime(egui::ImeEvent::Commit(value)) => text.push_str(value),
+            _ => {}
+        }
+    }
+    text
+}
+
+fn cancel_interrupted_composer_events(ctx: &egui::Context, active_scope: Option<Id>) -> bool {
+    let key = Id::new("deferred_composer_events");
+    let Some(pending) = ctx.data_mut(|data| data.remove_temp::<DeferredComposerEvents>(key)) else {
+        return false;
+    };
+    let interrupted = ctx.input(|input| {
+        !input.focused
+            || input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton { pressed: true, .. }
+                        | egui::Event::WindowFocused(false)
+                        | egui::Event::Key {
+                            key: Key::Tab,
+                            pressed: true,
+                            ..
+                        }
+                )
+            })
+    });
+    if active_scope == Some(pending.scope) && !interrupted {
+        ctx.data_mut(|data| data.insert_temp(key, pending));
+        return false;
+    }
+    let draft = composer_input_fragment(&pending.events);
+    if !draft.is_empty() {
+        let draft_key = pending.scope.with("cancelled_draft");
+        ctx.data_mut(|data| {
+            let previous = data.remove_temp::<String>(draft_key).unwrap_or_default();
+            data.insert_temp(draft_key, previous + &draft);
+        });
+    }
+    true
+}
+
+fn stage_composer_events(ctx: &egui::Context, composer: Id, composing: bool) {
+    let deferred_key = Id::new("deferred_composer_events");
+    let deferred = ctx
+        .data_mut(|data| data.remove_temp::<DeferredComposerEvents>(deferred_key))
+        .filter(|pending| pending.scope == composer)
+        .map(|pending| pending.events)
+        .unwrap_or_default();
+    let scope = composer;
+    let tail = ctx.input_mut(|input| {
+        let mut events = deferred;
+        events.append(&mut input.events);
+        let split = if ime_state(&events, composing).1 {
+            None
+        } else {
+            events
+                .iter()
+                .position(plain_composer_enter)
+                .map(|index| index + 1)
+        };
+        let tail = split
+            .map(|index| events.split_off(index))
+            .unwrap_or_default();
+        input.events = events;
+        tail
+    });
+    if !tail.is_empty() {
+        let only_keyboard = tail.iter().all(|event| {
+            matches!(
+                event,
+                egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Ime(_)
+                    | egui::Event::Key { .. }
+            )
+        });
+        if only_keyboard {
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    deferred_key,
+                    DeferredComposerEvents {
+                        scope,
+                        events: tail,
+                    },
+                )
+            });
+            ctx.request_repaint();
+        } else {
+            let fragment = composer_input_fragment(&tail);
+            let remainder = tail
+                .into_iter()
+                .filter(|event| {
+                    !matches!(
+                        event,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Ime(_)
+                            | egui::Event::Key { .. }
+                    )
+                })
+                .collect::<Vec<_>>();
+            ctx.input_mut(|input| input.events.extend(remainder));
+            if !fragment.is_empty() {
+                let draft_key = scope.with("cancelled_draft");
+                ctx.data_mut(|data| {
+                    let previous = data.remove_temp::<String>(draft_key).unwrap_or_default();
+                    data.insert_temp(draft_key, previous + &fragment);
+                });
+            }
+        }
+    }
+}
+
+fn composer_layout_job(
+    text: &str,
+    mentions: &crate::mentions::Draft,
+    format: &crate::rich_text::ComposerFormat,
+    width: f32,
+    line_height: f32,
+    pal: &ThemePalette,
+) -> egui::text::LayoutJob {
+    let mut options = format.options(text);
+    let mut job = if options.styles.is_empty() {
+        super::mention_composer::mention_layout(text, mentions, width, pal)
+    } else {
+        options.styles.extend(crate::rich_text::mention_styles(
+            Some(&serde_json::to_value(&mentions.mentions).unwrap_or_default()),
+            text,
+        ));
+        super::messages::styled_text_job_with_mentions(
+            text,
+            &options.styles,
+            pal.text_primary,
+            pal.primary,
+            14.0,
+        )
+    };
+    job.wrap.max_width = width.max(1.0);
+    for section in &mut job.sections {
+        section.format.line_height = Some(line_height);
+    }
+    job
+}
+
+fn composer_picker_position(anchor: Rect, chat: Rect, screen: Rect, width: f32) -> Pos2 {
+    let left = chat.left().max(screen.left() + 8.0);
+    let right = (chat.right().min(screen.right()) - width - 8.0).max(left);
+    Pos2::new(anchor.left().clamp(left, right), anchor.top() - 4.0)
+}
 
 /// Track IME composition across frames: returns `(composing_after, block_enter_now)`.
 ///
@@ -6324,12 +6748,23 @@ fn chat_layout_key(thread_id: &str, messages: &[ChatMessage], render_limit: usiz
     hasher.finish()
 }
 
+#[cfg(test)]
 fn composer_rows(text: &str) -> usize {
     text.split('\n').count().clamp(1, COMPOSER_MAX_ROWS)
 }
 
 /// Reserve visual wrapping too; explicit newline counts miss narrow editors.
+#[cfg(test)]
 fn composer_editor_height(ui: &egui::Ui, text: &str, width: f32) -> f32 {
+    let measured = composer_editor_height_unclamped(ui, text, width);
+    let row_height = ui.fonts(|fonts| fonts.row_height(&FontId::proportional(14.0)));
+    measured
+        .min(row_height * COMPOSER_MAX_ROWS as f32 + 6.0)
+        .min(COMPOSER_MAX_HEIGHT)
+}
+
+#[cfg(test)]
+fn composer_editor_height_unclamped(ui: &egui::Ui, text: &str, width: f32) -> f32 {
     let measured = ui.fonts(|f| {
         f.layout(
             if text.is_empty() {
@@ -6344,7 +6779,7 @@ fn composer_editor_height(ui: &egui::Ui, text: &str, width: f32) -> f32 {
         .size()
         .y
     });
-    (measured.max(COMPOSER_ROW_HEIGHT) + 14.0).min(COMPOSER_MAX_HEIGHT)
+    measured.max(COMPOSER_ROW_HEIGHT) + 6.0
 }
 
 fn render_quote_target(ui: &egui::Ui, rect: egui::Rect, scroll_pending: bool, color: Color32) {
@@ -6466,6 +6901,331 @@ mod quote_navigation_tests {
 mod composer_tests {
     use super::*;
 
+    fn key(key: Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    fn render_input_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        draft: &mut String,
+        sent: &mut Vec<String>,
+    ) {
+        let id = Id::new("burst-editor");
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    stage_composer_events(ctx, id, false);
+                    let enter = ui.input_mut(|input| consume_composer_enter(&mut input.events));
+                    egui::TextEdit::multiline(draft).id(id).show(ui);
+                    if enter && !draft.trim().is_empty() {
+                        sent.push(std::mem::take(draft));
+                    }
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn enter_bursts_keep_each_draft_boundary_in_one_native_frame() {
+        let ctx = egui::Context::default();
+        let id = Id::new("burst-editor");
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut draft = String::new();
+        let mut sent = Vec::new();
+        render_input_frame(
+            &ctx,
+            vec![
+                egui::Event::Text("k1".into()),
+                key(Key::Enter, egui::Modifiers::NONE),
+                egui::Event::Text("k2".into()),
+                key(Key::Enter, egui::Modifiers::NONE),
+                egui::Event::Text("k3".into()),
+                key(Key::Enter, egui::Modifiers::NONE),
+            ],
+            &mut draft,
+            &mut sent,
+        );
+        for _ in 0..3 {
+            render_input_frame(&ctx, Vec::new(), &mut draft, &mut sent);
+        }
+        assert_eq!(sent, ["k1", "k2", "k3"]); // (INV-4)
+        assert!(draft.is_empty());
+    }
+
+    #[test]
+    fn released_shift_in_same_frame_keeps_newline_and_format_shortcut() {
+        let ctx = egui::Context::default();
+        ctx.memory_mut(|memory| memory.request_focus(Id::new("burst-editor")));
+        let mut draft = String::new();
+        let mut sent = Vec::new();
+        render_input_frame(
+            &ctx,
+            vec![
+                egui::Event::Text("one".into()),
+                key(Key::Enter, egui::Modifiers::SHIFT),
+                egui::Event::Text("two".into()),
+            ],
+            &mut draft,
+            &mut sent,
+        );
+        assert_eq!(draft, "one\ntwo");
+        assert!(sent.is_empty());
+        let mut events = vec![key(Key::S, egui::Modifiers::CTRL | egui::Modifiers::SHIFT)];
+        assert!(consume_composer_format_shortcut(&mut events));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn pointer_event_after_send_boundary_is_never_replayed_with_deferred_text() {
+        let ctx = egui::Context::default();
+        let scope = Id::new("composer-owner-thread");
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                Id::new("deferred_composer_events"),
+                DeferredComposerEvents {
+                    scope,
+                    events: vec![
+                        egui::Event::Text("one".into()),
+                        key(Key::Enter, egui::Modifiers::NONE),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: Vec2::new(0.0, -120.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        egui::Event::Text("two".into()),
+                        key(Key::Enter, egui::Modifiers::NONE),
+                    ],
+                },
+            )
+        });
+        let mut events = vec![];
+        let cancelled = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0))),
+                events: vec![egui::Event::PointerButton {
+                    pos: Pos2::new(30.0, 30.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                let cancelled = cancel_interrupted_composer_events(ctx, None);
+                assert!(cancelled);
+                let draft = ctx
+                    .data_mut(|data| data.remove_temp::<String>(scope.with("cancelled_draft")))
+                    .unwrap();
+                assert_eq!(draft, "onetwo");
+                events = ctx.input(|input| input.events.clone());
+            },
+        );
+        let _ = cancelled;
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerButton { pressed: true, .. })));
+        assert!(ctx.data(|data| data
+            .get_temp::<DeferredComposerEvents>(Id::new("deferred_composer_events"))
+            .is_none()));
+    }
+
+    #[test]
+    fn changing_composer_scope_cancels_pending_keys_as_unsent_draft() {
+        let ctx = egui::Context::default();
+        let old_scope = Id::new("composer-old-account-thread");
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                Id::new("deferred_composer_events"),
+                DeferredComposerEvents {
+                    scope: old_scope,
+                    events: vec![
+                        egui::Event::Text("draft".into()),
+                        key(Key::Enter, egui::Modifiers::NONE),
+                    ],
+                },
+            )
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(cancel_interrupted_composer_events(
+                ctx,
+                Some(Id::new("composer-new-account-thread"))
+            ));
+            assert_eq!(
+                ctx.data_mut(|data| data.remove_temp::<String>(old_scope.with("cancelled_draft"))),
+                Some("draft".into())
+            );
+        });
+    }
+
+    #[test]
+    fn composer_picker_stays_over_chat_instead_of_sidebar() {
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1707.0, 1019.0));
+        let chat = Rect::from_min_max(Pos2::new(580.0, 24.0), Pos2::new(1380.0, 1019.0));
+        for anchor in [
+            Rect::from_min_size(Pos2::new(620.0, 920.0), Vec2::splat(32.0)),
+            Rect::from_min_size(Pos2::new(1310.0, 960.0), Vec2::splat(32.0)),
+        ] {
+            let pos = composer_picker_position(anchor, chat, screen, 460.0);
+            assert!(pos.x >= chat.left());
+            assert!(pos.x + 460.0 <= chat.right());
+        }
+    }
+
+    #[test]
+    fn long_sync_banner_and_search_never_expand_sidebar_content() {
+        fn text_rects(shape: &egui::Shape, rects: &mut Vec<Rect>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    rects.push(Rect::from_min_size(text.pos, text.galley.size()))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        text_rects(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (width, scale) in [(800.0, 1.0), (1020.0, 1.0), (1020.0, 1.5), (1707.0, 2.0)] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            let mut app = ZaloGuiApp::from_context(
+                &ctx,
+                Session::new(false, false, false).unwrap(),
+                false,
+                Vec::new(),
+                false,
+            );
+            app.is_logged_in = true;
+            app.hidden_panel.view.ready = true;
+            app.policy_panel.snapshot = Some(Default::default());
+            let search = "Một từ khóa rất dài trong ô tìm kiếm".repeat(20);
+            let mut thread = Thread {
+                id: "sidebar-bounds-fixture".into(),
+                name: search.clone(),
+                messages: vec![ChatMessage {
+                    id: "sidebar-message".into(),
+                    text: "Nội dung xem trước dài WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW".into(),
+                    ts: crate::login::unix_now() * 1000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            thread.refresh_sidebar_presentation();
+            app.threads.push(thread);
+            app.unread_counts
+                .insert("sidebar-bounds-fixture".into(), 125);
+            let mut baseline = None;
+            let mut baseline_row_width = None;
+            for phase in 0..3 {
+                if phase == 1 {
+                    app.refresh_sync_running = true;
+                    app.refresh_sync_status =
+                        "Đang cập nhật hội thoại và tin nhắn rất dài".repeat(20);
+                    app.search_query = search.clone();
+                } else if phase == 2 {
+                    app.refresh_sync_running = false;
+                    app.refresh_sync_status.clear();
+                    app.search_query.clear();
+                }
+                let mut output = None;
+                for _ in 0..4 {
+                    output = Some(ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(width, 700.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            app.render_chat_workspace(ctx, &app.palette());
+                        },
+                    ));
+                }
+                let panel = ctx
+                    .data(|data| data.get_temp::<Rect>(Id::new("sidebar-panel-rect")))
+                    .unwrap();
+                let (all, unread, labels, more) = ctx
+                    .data(|data| {
+                        data.get_temp::<(Rect, Rect, Rect, Rect)>(Id::new("sidebar-filter-bounds"))
+                    })
+                    .unwrap();
+                assert!(
+                    all.right() <= unread.left()
+                        && unread.right() <= labels.left()
+                        && labels.right() <= more.left(),
+                    "{width}@{scale} phase {phase}: sidebar filter controls overlap"
+                );
+                assert!(panel.contains_rect(all) && panel.contains_rect(more));
+                if let Some(expected) = baseline {
+                    assert_eq!(
+                        panel, expected,
+                        "{width}@{scale}: phase {phase} changed the panel rectangle"
+                    );
+                } else {
+                    baseline = Some(panel);
+                }
+                let row = ctx
+                    .data(|data| {
+                        data.get_temp::<Rect>(Id::new((
+                            "sidebar-row-rect",
+                            "sidebar-bounds-fixture",
+                        )))
+                    })
+                    .expect("matching conversation row must be rendered");
+                assert!(
+                    panel.contains_rect(row),
+                    "{width}@{scale} phase {phase}: row {row:?} outside {panel:?}"
+                );
+                if let Some(expected) = baseline_row_width {
+                    assert_eq!(
+                        row.width(),
+                        expected,
+                        "row width changed after banner/search transition"
+                    );
+                } else {
+                    baseline_row_width = Some(row.width());
+                }
+                let mut rects = Vec::new();
+                for shape in &output.unwrap().shapes {
+                    text_rects(&shape.shape, &mut rects);
+                }
+                let row_text = rects
+                    .into_iter()
+                    .filter(|r| {
+                        r.top() >= row.top()
+                            && r.top() < row.bottom()
+                            && r.left() >= row.left()
+                            && r.left() < panel.right()
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    row_text.len() >= 4,
+                    "name, preview, time and unread badge must all be painted"
+                );
+                for rect in row_text {
+                    assert!(
+                        row.expand(1.0).contains_rect(rect),
+                        "{width}@{scale} phase {phase}: painted text {rect:?} outside row {row:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn blocked_group_notice_keeps_send_inside_viewport() {
         for (width, height, scale) in [
@@ -6530,9 +7290,94 @@ mod composer_tests {
                     80.0,
                 );
                 assert!(wrapped > short);
-                assert_eq!(wrapped, COMPOSER_MAX_HEIGHT);
+                let row_height = ui.fonts(|fonts| fonts.row_height(&FontId::proportional(14.0)));
+                assert_eq!(wrapped, (row_height * 5.0 + 6.0).min(COMPOSER_MAX_HEIGHT));
             });
         });
+    }
+
+    #[test]
+    fn composer_bottom_stays_fixed_while_visual_lines_grow_and_rich_mode_expands() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "composer-owner".into();
+        app.hidden_panel.view.ready = true;
+        app.policy_panel.snapshot = Some(Default::default());
+        app.threads = vec![Thread {
+            id: "composer-fixture".into(),
+            name: "Composer".into(),
+            ..Default::default()
+        }];
+        app.selected_thread_index = 0;
+        let scope = Id::new(("chat_composer_input", "composer-fixture"))
+            .with((&app.user_uin, app.account_runtime_id));
+        let mut heights = Vec::new();
+        for (text, rich, expanded) in [
+            ("a", false, false),
+            ("a\nb\nc", false, false),
+            ("1\n2\n3\n4\n5\n6\n7", false, false),
+            ("a", true, true),
+        ] {
+            for _ in 0..5 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1200.0, 800.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.sync_composer_draft(ctx);
+                        app.input_message = text.into();
+                        app.composer_format_mode = rich;
+                        ctx.data_mut(|data| data.insert_temp(scope.with("expanded"), expanded));
+                        app.render_chat_workspace(ctx, &app.palette());
+                    },
+                );
+            }
+            let (rect, bottom, editor) = ctx
+                .data(|data| data.get_temp::<(Rect, f32, f32)>(Id::new("composer-layout-bounds")))
+                .unwrap();
+            assert!(
+                (rect.bottom() - bottom).abs() < 1.0,
+                "composer bottom moved: {rect:?}, viewport bottom {bottom}"
+            );
+            heights.push(editor);
+        }
+        assert!(heights[1] > heights[0]);
+        assert!(heights[2] > heights[1]);
+        assert!(heights[3] > heights[2] * 2.0);
+        app.input_message = "line one".into();
+        ctx.memory_mut(|memory| {
+            memory.request_focus(Id::new(("chat_composer_input", "composer-fixture")))
+        });
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 800.0))),
+                modifiers: egui::Modifiers::SHIFT,
+                events: vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::SHIFT,
+                }],
+                ..Default::default()
+            },
+            |ctx| app.render_chat_workspace(ctx, &app.palette()),
+        );
+        assert!(
+            app.input_message.contains('\n'),
+            "Shift+Enter must reach the actual editor and insert a newline"
+        );
     }
 }
 
@@ -7673,10 +8518,15 @@ impl ZaloGuiApp {
                     })
                     .cloned()
                     .collect();
+                // The member view is the primary content of the drawer.  Let it
+                // consume the remaining drawer height instead of imposing the
+                // old 360 px cap, which left a large unused area below the
+                // roster on tall windows.
+                let member_view_height = ui.available_height().max(120.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("info_drawer_members", group_id))
-                    .max_height(360.0)
-                    .auto_shrink([false, true])
+                    .max_height(member_view_height)
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for member in &filtered {
                             self.render_group_member_row(ui, group_id, member, 13.0, 36.0, pal);

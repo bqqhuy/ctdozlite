@@ -175,19 +175,11 @@ impl Writer {
     ) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<ImportWork>(2);
         tokio::task::spawn_blocking(move || {
-            let mut store = match crate::store::MessageStore::open(session.history_path()) {
-                Ok(s) => s,
-                Err(_) => {
-                    if let Some(work) = rx.blocking_recv() {
-                        let _ = work
-                            .done
-                            .send(Err(anyhow::anyhow!("Không mở được CSDL lịch sử")));
-                    }
-                    return;
-                }
-            };
             while let Some(work) = rx.blocking_recv() {
-                let result = if session.is_active() {
+                let result = (|| {
+                    anyhow::ensure!(session.is_active(), "Đã đăng xuất; dừng nhập lịch sử");
+                    let (mut store, _write_permit) =
+                        crate::store::MessageStore::open_for_account_write(&session)?;
                     super::import::save(
                         &mut store,
                         &work.object,
@@ -195,9 +187,7 @@ impl Writer {
                         &work.senders,
                         session.account_key(),
                     )
-                } else {
-                    Err(anyhow::anyhow!("Đã đăng xuất; dừng nhập lịch sử"))
-                };
+                })();
                 let _ = work.done.send(result);
             }
         });

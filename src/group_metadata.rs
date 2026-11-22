@@ -16,7 +16,8 @@ pub(crate) async fn refresh(
     let account = session.clone();
     let cache =
         tokio::task::spawn_blocking(move || -> Result<HashMap<String, (String, Thread)>> {
-            let store = crate::store::MessageStore::open(account.history_path())?;
+            let (store, _write_permit) =
+                crate::store::MessageStore::open_for_account_write(&account)?;
             let mut query = store
                 .conn
                 .prepare("SELECT thread_id,version,data FROM group_metadata LIMIT 100001")?;
@@ -80,7 +81,7 @@ pub(crate) async fn refresh(
         }
     }
     let account = session.clone();
-    tokio::task::spawn_blocking(move||->Result<()>{let store=crate::store::MessageStore::open(account.history_path())?;let tx=store.conn.unchecked_transaction()?;
+    tokio::task::spawn_blocking(move||->Result<()>{let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;let tx=store.conn.unchecked_transaction()?;
         for (id,version,data) in saved {tx.execute("INSERT INTO group_metadata VALUES(?1,?2,?3) ON CONFLICT(thread_id) DO UPDATE SET version=excluded.version,data=excluded.data",rusqlite::params![id,version,data])?;}tx.commit()?;Ok(())}).await??;
     Ok(removed)
 }
@@ -92,7 +93,7 @@ pub(crate) async fn invalidate(session: &Session, group: &str) -> Result<()> {
     let bare = identity[1..].to_owned();
     let account = session.clone();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let store = crate::store::MessageStore::open(account.history_path())?;
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
         store.conn.execute(
             "DELETE FROM group_metadata WHERE thread_id IN (?1,?2,?3)",
             rusqlite::params![bare, identity, format!("group_{bare}")],

@@ -829,16 +829,26 @@ impl Thread {
                 let who = if reaction.by_self {
                     "Bạn"
                 } else {
-                    self.presentation
-                        .members
-                        .iter()
-                        .find(|member| member.id == reaction.reactor && !member.name.is_empty())
-                        .map(|member| member.name.as_str())
-                        .unwrap_or(reactor_name.unwrap_or(if self.is_group {
+                    // The caller may have a freshly resolved phonebook alias;
+                    // prefer it over the roster's cached display name.  This
+                    // keeps group reaction previews consistent with message
+                    // sender labels when aliases arrive after the roster.
+                    reactor_name
+                        .filter(|name| !name.trim().is_empty())
+                        .or_else(|| {
+                            self.presentation
+                                .members
+                                .iter()
+                                .find(|member| {
+                                    member.id == reaction.reactor && !member.name.is_empty()
+                                })
+                                .map(|member| member.name.as_str())
+                        })
+                        .unwrap_or(if self.is_group {
                             &reaction.reactor
                         } else {
                             &self.name
-                        }))
+                        })
                 };
                 return format!(
                     "{who} đã thả {} vào {}",
@@ -1544,9 +1554,11 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
                 }
             }
             // Cached previews are non-authoritative; deletion markers must win at startup too.
-            match crate::store::MessageStore::open(s.history_path())
-                .and_then(|store| store.filter_deleted(&mut threads))
-            {
+            let filtered = s.begin_account_write_blocking().and_then(|_write_permit| {
+                crate::store::MessageStore::open(s.history_path())
+                    .and_then(|store| store.filter_deleted(&mut threads))
+            });
+            match filtered {
                 Ok(()) => {}
                 Err(_) => {
                     eprintln!("Cannot filter cached deletion identities");
@@ -1565,6 +1577,9 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
     if s.account_key().is_empty() || !s.is_active() {
         return;
     }
+    let Ok(_write_permit) = s.begin_account_write_blocking() else {
+        return;
+    };
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
     let mut slim: Vec<Thread> = threads
         .iter()
@@ -1587,6 +1602,42 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
             eprintln!("Cannot save history cache: {e}");
         }
     }
+}
+
+async fn load_upload_checkpoint(
+    session: &Session,
+    upload_id: &str,
+) -> Option<crate::upload::ResumableUploadState> {
+    let session = session.clone();
+    let upload_id = upload_id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (store, _write_permit) =
+            crate::store::MessageStore::open_for_account_write(&session).ok()?;
+        store.load_upload_state(&upload_id).ok().flatten()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn save_upload_checkpoint(session: &Session, state: &crate::upload::ResumableUploadState) {
+    let session = session.clone();
+    let state = state.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&session)?;
+        store.save_upload_state(&state)
+    })
+    .await;
+}
+
+async fn delete_upload_checkpoint(session: &Session, upload_id: &str) {
+    let session = session.clone();
+    let upload_id = upload_id.to_owned();
+    let _ = tokio::task::spawn_blocking(move || {
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&session)?;
+        store.delete_upload_state(&upload_id)
+    })
+    .await;
 }
 
 /// `/api/social/friend/getfriends` — the friend list.
@@ -1783,6 +1834,8 @@ pub(crate) fn confirmed_mutation(mut response: Value) -> Result<Value> {
         .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
         .context("Máy chủ chưa xác nhận thao tác; kiểm tra hội thoại trước khi thử lại")?;
     if code != 0 {
+        // Keep the server code typed and visible in diagnostics without retaining response data.
+        crate::logger::log_error("send mutation", &format!("server rejection code={code}"));
         crate::transfer_diagnostics::send_failure(
             crate::transfer_diagnostics::SendFailure::ServerRejected,
             Some(code),
@@ -2037,9 +2090,9 @@ pub fn format_file_size(bytes: u64) -> String {
 
 /// Upload and send a photo, video, or general file attachment to a 1-1 or group conversation.
 ///
-/// Implements Zalo PC 26.10.11's two-stage chunked upload (`photo_original/upload` -> `photo_original/send`
-/// for images; `asyncfile/upload` -> `asyncfile/msg` for videos/files) with automatic fallback to
-/// single-shot `message/photo` (`11152`) and `message/sharefile_full` (`11146`).
+/// Uses chunked photo/file upload followed by message submission with the same client identity.
+/// File processing URLs may arrive through the existing socket before submission (re-notes/71).
+/// Native video preparation can fall back to a regular file; rejected submissions are not replayed.
 pub async fn send_attachment(
     s: &Session,
     to_id: &str,
@@ -2094,7 +2147,6 @@ pub(crate) async fn send_attachment_with_client_id(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp"
     );
-    let is_video = matches!(ext.as_str(), "mp4" | "mov" | "mkv" | "webm" | "avi");
 
     let file_host = if s.domains.file.is_empty() {
         crate::endpoints::FILE_LEGACY
@@ -2139,28 +2191,25 @@ pub(crate) async fn send_attachment_with_client_id(
             total_size,
             chunk_size,
         );
-        let resume_store = crate::store::MessageStore::open(s.history_path()).ok();
         let upload_reg = crate::upload::ActiveUploadRegistration::new(&upload_id);
         let mut resume_from = 0usize;
         let total_chunks_usize = total_chunks as usize;
-        if let Some(ref st) = resume_store {
-            if let Some(saved) = st.load_upload_state(&upload_id).ok().flatten() {
-                if saved.total_size == total_size
-                    && saved.chunk_size == chunk_size
-                    && saved.file_name == file_name
-                    && saved.total_chunks == total_chunks_usize
-                {
-                    let contiguous = saved.contiguous_completed_prefix();
-                    if contiguous > 0 && contiguous < total_chunks_usize {
-                        resume_from = contiguous;
-                        resumable = saved;
-                        source.skip_chunks(resume_from, chunk_size).await?;
-                    } else if contiguous >= total_chunks_usize {
-                        let _ = st.delete_upload_state(&upload_id);
-                    }
-                } else {
-                    let _ = st.delete_upload_state(&upload_id);
+        if let Some(saved) = load_upload_checkpoint(s, &upload_id).await {
+            if saved.total_size == total_size
+                && saved.chunk_size == chunk_size
+                && saved.file_name == file_name
+                && saved.total_chunks == total_chunks_usize
+            {
+                let contiguous = saved.contiguous_completed_prefix();
+                if contiguous > 0 && contiguous < total_chunks_usize {
+                    resume_from = contiguous;
+                    resumable = saved;
+                    source.skip_chunks(resume_from, chunk_size).await?;
+                } else if contiguous >= total_chunks_usize {
+                    delete_upload_checkpoint(s, &upload_id).await;
                 }
+            } else {
+                delete_upload_checkpoint(s, &upload_id).await;
             }
         }
         for idx in resume_from..total_chunks_usize {
@@ -2188,14 +2237,18 @@ pub(crate) async fn send_attachment_with_client_id(
                 "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
                 s.common_params()
             );
-            let up_raw = s
-                .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
-                .await?;
-            last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
+            last_up_dec = crate::transfer_diagnostics::attachment_result(
+                crate::transfer_diagnostics::AttachmentStage::PhotoUpload,
+                async {
+                    let raw = s
+                        .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
+                        .await?;
+                    confirmed_upload(s.maybe_decrypt(raw, s.session_key_bytes()).await)
+                }
+                .await,
+            )?;
             resumable.mark_chunk_complete(idx);
-            if let Some(ref st) = resume_store {
-                let _ = st.save_upload_state(&resumable);
-            }
+            save_upload_checkpoint(s, &resumable).await;
             let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
             crate::upload::report_progress(
                 s.account_key(),
@@ -2205,9 +2258,7 @@ pub(crate) async fn send_attachment_with_client_id(
                 total_size,
             );
         }
-        if let Some(ref st) = resume_store {
-            let _ = st.delete_upload_state(&upload_id);
-        }
+        delete_upload_checkpoint(s, &upload_id).await;
         crate::upload::report_progress(
             s.account_key(),
             s.runtime_id(),
@@ -2260,7 +2311,10 @@ pub(crate) async fn send_attachment_with_client_id(
             }
             let params = s.encoded_params(&Value::Object(send_obj))?;
             let url = format!("{file_host}{send_ep}?{}", s.common_params());
-            let r = s.post_form(&url, format!("params={params}")).await?;
+            let r = crate::transfer_diagnostics::attachment_result(
+                crate::transfer_diagnostics::AttachmentStage::PhotoSend,
+                s.post_form(&url, format!("params={params}")).await,
+            )?;
             s.maybe_decrypt(r, s.session_key_bytes()).await
         } else {
             // Fallback: single-shot `/api/message/photo` or `/api/group/sendpt`
@@ -2299,7 +2353,10 @@ pub(crate) async fn send_attachment_with_client_id(
             s.maybe_decrypt(r, s.session_key_bytes()).await
         };
 
-        let send_resp = confirmed_send(send_resp)?;
+        let send_resp = crate::transfer_diagnostics::attachment_result(
+            crate::transfer_diagnostics::AttachmentStage::PhotoSend,
+            confirmed_send(send_resp),
+        )?;
 
         let final_thumb = if !thumb_url.is_empty() {
             thumb_url
@@ -2405,35 +2462,30 @@ pub(crate) async fn send_attachment_with_client_id(
         chunk_size,
     );
     let upload_reg = crate::upload::ActiveUploadRegistration::new(&upload_id);
-    // Open store once; errors are non-fatal — upload still proceeds, just without
-    // persistence (degraded mode).
-    let resume_store = crate::store::MessageStore::open(s.history_path()).ok();
     // Resume from the last checkpoint when it still describes *this* upload:
     // same file, same size, same chunk layout.  A mismatched checkpoint is
     // discarded rather than trusted — the server would reject the chunks.
     let mut resume_from = 0usize;
     let total_chunks_usize = total_chunks as usize;
-    if let Some(ref st) = resume_store {
-        if let Some(saved) = st.load_upload_state(&upload_id).ok().flatten() {
-            if saved.total_size == total_size
-                && saved.chunk_size == chunk_size
-                && saved.file_name == file_name
-                && saved.total_chunks == total_chunks_usize
-            {
-                // Only trust the contiguous prefix the server confirmed.
-                let contiguous = saved.contiguous_completed_prefix();
-                if contiguous > 0 && contiguous < total_chunks_usize {
-                    resume_from = contiguous;
-                    resumable = saved;
-                    source.skip_chunks(resume_from, chunk_size).await?;
-                } else if contiguous >= total_chunks_usize {
-                    // Every chunk was confirmed but the final response never
-                    // reached us — the file id is unknown, so start over.
-                    let _ = st.delete_upload_state(&upload_id);
-                }
-            } else {
-                let _ = st.delete_upload_state(&upload_id);
+    if let Some(saved) = load_upload_checkpoint(s, &upload_id).await {
+        if saved.total_size == total_size
+            && saved.chunk_size == chunk_size
+            && saved.file_name == file_name
+            && saved.total_chunks == total_chunks_usize
+        {
+            // Only trust the contiguous prefix the server confirmed.
+            let contiguous = saved.contiguous_completed_prefix();
+            if contiguous > 0 && contiguous < total_chunks_usize {
+                resume_from = contiguous;
+                resumable = saved;
+                source.skip_chunks(resume_from, chunk_size).await?;
+            } else if contiguous >= total_chunks_usize {
+                // Every chunk was confirmed but the final response never
+                // reached us — the file id is unknown, so start over.
+                delete_upload_checkpoint(s, &upload_id).await;
             }
+        } else {
+            delete_upload_checkpoint(s, &upload_id).await;
         }
     }
     for idx in resume_from..total_chunks_usize {
@@ -2460,15 +2512,19 @@ pub(crate) async fn send_attachment_with_client_id(
             "{file_host}{upload_ep}?{}&params={params}&type={target_type}",
             s.common_params()
         );
-        let up_raw = s
-            .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
-            .await?;
-        last_up_dec = confirmed_upload(s.maybe_decrypt(up_raw, s.session_key_bytes()).await)?;
+        last_up_dec = crate::transfer_diagnostics::attachment_result(
+            crate::transfer_diagnostics::AttachmentStage::FileUpload,
+            async {
+                let raw = s
+                    .post_multipart(&url, "chunkContent", &file_name, mime, &chunk)
+                    .await?;
+                confirmed_upload(s.maybe_decrypt(raw, s.session_key_bytes()).await)
+            }
+            .await,
+        )?;
         // Checkpoint: mark this chunk completed so a retry can skip re-uploading it.
         resumable.mark_chunk_complete(idx);
-        if let Some(ref st) = resume_store {
-            let _ = st.save_upload_state(&resumable);
-        }
+        save_upload_checkpoint(s, &resumable).await;
         let completed_bytes = ((idx + 1) as u64 * chunk_size as u64).min(total_size);
         crate::upload::report_progress(
             s.account_key(),
@@ -2479,9 +2535,7 @@ pub(crate) async fn send_attachment_with_client_id(
         );
     }
     // Upload complete: remove the checkpoint entry.
-    if let Some(ref st) = resume_store {
-        let _ = st.delete_upload_state(&upload_id);
-    }
+    delete_upload_checkpoint(s, &upload_id).await;
     crate::upload::report_progress(
         s.account_key(),
         s.runtime_id(),
@@ -2551,7 +2605,9 @@ pub(crate) async fn send_attachment_with_client_id(
         msg_obj.insert("totalSize".into(), json!(total_size));
         msg_obj.insert("fileName".into(), json!(file_name));
         msg_obj.insert("clientId".into(), json!(client_id));
-        msg_obj.insert("fType".into(), json!(if is_video { 2 } else { 1 }));
+        // PC k3JU: 1 is a regular file, 2 is a folder archive, not a video.
+        // A video that falls back to asyncfile remains a regular file.
+        msg_obj.insert("fType".into(), json!(1));
         msg_obj.insert("fileCount".into(), json!(0));
         msg_obj.insert("fdata".into(), json!("{}"));
         msg_obj.insert("imei".into(), json!(s.imei));
@@ -2562,13 +2618,19 @@ pub(crate) async fn send_attachment_with_client_id(
         }
         let params = s.encoded_params(&Value::Object(msg_obj))?;
         let url = format!("{file_host}{msg_ep}?{}", s.common_params());
-        let r = s.post_form(&url, format!("params={params}")).await?;
+        let r = crate::transfer_diagnostics::attachment_result(
+            crate::transfer_diagnostics::AttachmentStage::FileSend,
+            s.post_form(&url, format!("params={params}")).await,
+        )?;
         s.maybe_decrypt(r, s.session_key_bytes()).await
     } else {
         json!({ "error_code": -1 })
     };
 
-    let send_resp = confirmed_send(send_resp)?;
+    let send_resp = crate::transfer_diagnostics::attachment_result(
+        crate::transfer_diagnostics::AttachmentStage::FileSend,
+        confirmed_send(send_resp),
+    )?;
 
     let final_url = if !file_url.is_empty() {
         file_url
@@ -2582,7 +2644,7 @@ pub(crate) async fn send_attachment_with_client_id(
         .get("data")
         .and_then(|d| wire_identity(d.get("msgId")))
         .unwrap_or_else(|| format!("out_{client_id}"));
-    let kind_label = if is_video { "Video" } else { "Tập tin" };
+    let kind_label = "Tập tin";
     let display_text = if !caption.trim().is_empty() {
         caption.trim().to_string()
     } else {
@@ -2593,6 +2655,7 @@ pub(crate) async fn send_attachment_with_client_id(
         client_message_id: client_id.to_string(),
         sender: "Tôi".into(),
         text: display_text,
+        kind: crate::message_model::MessageKind::File,
         time: crate::ui::clock(),
         is_outgoing: true,
         ts: client_id as i64,
@@ -5933,7 +5996,8 @@ pub async fn poll_new_messages(
     *threads = tokio::task::spawn_blocking(move || -> Result<Vec<Thread>> {
         anyhow::ensure!(account.is_active(), "Đã đăng xuất");
         let mut snapshot = snapshot;
-        let mut store = crate::store::MessageStore::open(account.history_path())?;
+        let (mut store, _write_permit) =
+            crate::store::MessageStore::open_for_account_write(&account)?;
         store.filter_deleted(&mut snapshot)?;
         crate::store::persist_threads(&mut store, &snapshot)?;
         save_threads_cache(&account, &snapshot);
@@ -7302,6 +7366,8 @@ pub struct VoiceToTextPushResult {
     pub req_id: String,
     pub text: Option<String>,
     pub error_code: i32,
+    #[serde(default)]
+    pub is_truncated: bool,
 }
 
 /// Strict parser for manual translation responses (`/api/aifeatures/translate/v1/manual`, cmd `13397`).
@@ -7432,49 +7498,26 @@ pub async fn translate_message_manual(
 pub async fn submit_voice_to_text(
     s: &Session,
     voice_url: &str,
-    msg_id: &str,
-    thread_id: &str,
+    _msg_id: &str,
+    _thread_id: &str,
 ) -> Result<VoiceToTextTicket> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
-    let client_time = crate::login::unix_now();
-    let payload = json!({
-        "msg_id": msg_id,
-        "thread_id": thread_id,
-        "voice_url": voice_url,
-        "imei": s.imei,
-        "ts": client_time,
-    });
-
-    let cipher =
-        crate::param_cipher::ParamCipher::new(crate::session::ZPW_TYPE, &s.imei, client_time)?;
-    let body = cipher.build_body(
-        crate::session::ZPW_TYPE,
-        crate::session::ZPW_VER,
-        &payload,
-        "voice2text",
-    )?;
-
-    let form = body
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Không thể tạo form tham số"))?
-        .iter()
-        .map(|(k, v)| {
-            let s_val = v
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| v.to_string());
-            format!("{k}={}", crate::session::urlencode(&s_val))
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-
-    let base_url = s.resolve_service_url("chat", "/api/aifeatures/voice2text");
+    let parsed = reqwest::Url::parse(voice_url).context("Đường dẫn âm thanh không hợp lệ")?;
+    anyhow::ensure!(
+        crate::media_download::allowed(&parsed),
+        "Nguồn âm thanh không được hỗ trợ"
+    );
+    // PC lazy/main-startup b7.requestConvert uses session AES and only {url}; see re-notes/47.
+    let form = format!("params={}", s.encoded_params(&json!({"url":voice_url}))?);
+    let base_url = s
+        .resolve_discovered_service_url("ai_features", "/api/aifeatures/voice2text")
+        .context("Tài khoản chưa có dịch vụ chuyển giọng nói thành văn bản")?;
     let url = format!("{base_url}?{}", s.common_params());
 
     let resp = s.post_form(&url, form).await?;
-    let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+    let decrypted = s.maybe_decrypt(resp, s.session_key_bytes()).await;
     try_parse_voice_to_text_ticket(&decrypted)
 }
 
@@ -7633,6 +7676,26 @@ mod tests {
             is_group: false,
             messages: Vec::new(),
         }
+    }
+
+    #[test]
+    fn reaction_preview_prefers_resolved_alias_over_roster_name() {
+        let mut thread = sample_thread("group_g1");
+        thread.is_group = true;
+        thread.presentation.members.push(SidebarMember {
+            id: "12345".into(),
+            name: "Hue Nguyen".into(),
+            ..Default::default()
+        });
+        thread.presentation.reaction_preview = Some(crate::reactions::Preview {
+            reactor: "12345".into(),
+            emoji: "❤️".into(),
+            ts: 100,
+            ..Default::default()
+        });
+
+        let preview = thread.sidebar_preview_with_reactor(Some("TNR chị Huệ"));
+        assert!(preview.starts_with("TNR chị Huệ đã thả"), "{preview}");
     }
 
     #[test]

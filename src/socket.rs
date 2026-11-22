@@ -436,32 +436,43 @@ pub(crate) fn wake_request_id(id: &str) -> String {
 const FORWARD_QUEUE: usize = 512;
 /// Threshold under which pull queues are throttled to apply backpressure to server traffic.
 const BACKPRESSURE_WATERMARK: usize = 128;
+const PRIORITY_QUEUE: usize = 32;
 
-/// Enqueue without waiting when possible; a full queue is recorded because waiting here
-/// also delays keep-alive pings.
+/// A saturated durable-page queue ends the epoch rather than stalling ping/call ingress.
+/// No cursor is committed here; the next epoch replays from the last durable page.
 async fn forward_event(forward: &mpsc::Sender<WsEvent>, event: WsEvent, epoch: u64) -> Result<()> {
+    crate::runtime_metrics::sample(
+        crate::runtime_metrics::Metric::IngressQueueDepth,
+        (forward.max_capacity() - forward.capacity()) as f64,
+    );
     match forward.try_send(event) {
         Ok(()) => Ok(()),
-        Err(mpsc::error::TrySendError::Full(event)) => {
-            let started = std::time::Instant::now();
-            // A16: Apply bounded backpressure - wait for consumer up to 5s instead of hanging indefinitely
-            match tokio::time::timeout(Duration::from_secs(5), forward.send(event)).await {
-                Ok(Ok(())) => {
-                    crate::transfer_diagnostics::socket_backpressure(
-                        epoch,
-                        started.elapsed().as_millis() as u64,
-                    );
-                    Ok(())
-                }
-                Ok(Err(_)) => Err(anyhow!("event receiver closed")),
-                Err(_) => {
-                    bail!(
-                        "event queue overflow: consumer stalled under backpressure (epoch {epoch})"
-                    );
-                }
-            }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            crate::transfer_diagnostics::socket_backpressure(epoch, 0);
+            bail!("event queue overflow: replay required (epoch {epoch})");
         }
         Err(mpsc::error::TrySendError::Closed(_)) => Err(anyhow!("event receiver closed")),
+    }
+}
+
+fn forward_priority(priority: Option<&mpsc::Sender<WsEvent>>, event: &WsEvent) -> Result<()> {
+    let data = event.payload.get("data").unwrap_or(&event.payload);
+    if let Some(priority) = priority.filter(|_| {
+        event.is_voip_ish()
+            || !crate::call::extract_voip_controls(data).is_empty()
+            || !crate::presence::typing(&event.payload, "").is_empty()
+    }) {
+        priority.try_send(event.clone()).map_err(|_| {
+            anyhow!("priority control queue unavailable; socket epoch must reconnect")
+        })?;
+    }
+    Ok(())
+}
+
+struct ForwardTask(tokio::task::JoinHandle<()>);
+impl Drop for ForwardTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -667,6 +678,27 @@ impl SyncTransport {
 }
 
 pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTransport) {
+    spawn_with_sync_inner(sess, None)
+}
+
+/// Mirror call controls to a bounded consumer that never waits for page persistence.
+/// The ordered stream remains complete for metadata and durable cursor processing.
+pub(crate) fn spawn_with_sync_priority(
+    sess: Session,
+) -> (
+    mpsc::Receiver<WsEvent>,
+    mpsc::Receiver<WsEvent>,
+    SyncTransport,
+) {
+    let (priority, priority_rx) = mpsc::channel(PRIORITY_QUEUE);
+    let (events, transport) = spawn_with_sync_inner(sess, Some(priority));
+    (events, priority_rx, transport)
+}
+
+fn spawn_with_sync_inner(
+    sess: Session,
+    priority: Option<mpsc::Sender<WsEvent>>,
+) -> (mpsc::Receiver<WsEvent>, SyncTransport) {
     let (tx, rx) = mpsc::channel(32);
     let (commands, mut writes) = mpsc::channel(8);
     let (ready_tx, ready) = tokio::sync::watch::channel(None);
@@ -695,6 +727,7 @@ pub(crate) fn spawn_with_sync(sess: Session) -> (mpsc::Receiver<WsEvent>, SyncTr
                 &controls,
                 epoch,
                 &had_success,
+                priority.as_ref(),
             )
             .await
             {
@@ -752,6 +785,7 @@ async fn run_once(
     controls: &tokio::sync::broadcast::Sender<WsEvent>,
     epoch: u64,
     had_success: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    priority: Option<&mpsc::Sender<WsEvent>>,
 ) -> Result<String> {
     let url = build_url(sess, endpoint_idx);
     trace(format!("connect {}", crate::session::redact_url(&url)));
@@ -824,13 +858,13 @@ async fn run_once(
     // events pass through a deep queue drained by a separate task; order is preserved.
     let (forward, mut forwarded) = mpsc::channel::<WsEvent>(FORWARD_QUEUE);
     let downstream = tx.clone();
-    tokio::spawn(async move {
+    let _forward_task = ForwardTask(tokio::spawn(async move {
         while let Some(event) = forwarded.recv().await {
             if downstream.send(event).await.is_err() {
                 break;
             }
         }
-    });
+    }));
     let mut catchups = queue_receiver::PullQueues::new(epoch);
     let mut pull_tick = tokio::time::interval(Duration::from_millis(100));
     pull_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1075,7 +1109,9 @@ async fn run_once(
                     // GUI history/profile work stall the authoritative phone transport.
                     if phone_only_controls(&payload){continue;}
                 }
-                forward_event(&forward, WsEvent { cmd, sub_cmd, version, payload }, epoch).await?;
+                let event = WsEvent { cmd, sub_cmd, version, payload };
+                forward_priority(priority, &event)?;
+                forward_event(&forward, event, epoch).await?;
             }
         }
     }
@@ -1083,47 +1119,90 @@ async fn run_once(
 
 /// Parse incoming `CTRL_PUSH_CTRL = 601` push event or control frame for `voice2text/convert_finish`.
 pub fn parse_voice_to_text_push(val: &Value) -> Option<crate::chat::VoiceToTextPushResult> {
-    let act_type = val
-        .get("act_type")
-        .or_else(|| val.get("act"))
-        .or_else(|| val.get("action"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    parse_voice_to_text_pushes(val).into_iter().next()
+}
 
-    if act_type != "voice2text/convert_finish" && !act_type.contains("voice2text") {
-        return None;
+/// Bounded native control traversal: voice2text -> convert_finish -> {req_id,err,text}.
+pub fn parse_voice_to_text_pushes(val: &Value) -> Vec<crate::chat::VoiceToTextPushResult> {
+    fn visit(
+        value: &Value,
+        voice: bool,
+        depth: usize,
+        budget: &mut usize,
+        out: &mut Vec<crate::chat::VoiceToTextPushResult>,
+    ) {
+        if depth > 8 || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if let Some(text) = value.as_str().filter(|text| text.len() <= 1024 * 1024) {
+            if let Ok(decoded) = serde_json::from_str::<Value>(text) {
+                visit(&decoded, voice, depth + 1, budget, out);
+            }
+            return;
+        }
+        if let Some(items) = value.as_array() {
+            for item in items {
+                visit(item, voice, depth + 1, budget, out);
+            }
+            return;
+        }
+        let act = value.get("act").and_then(Value::as_str).unwrap_or_default();
+        let kind = value
+            .get("act_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let is_voice = voice
+            || kind == "voice2text"
+            || kind == "voice2text/convert_finish"
+            || act == "voice2text/convert_finish";
+        if (is_voice && act == "convert_finish")
+            || kind == "voice2text/convert_finish"
+            || act == "voice2text/convert_finish"
+        {
+            let data = value.get("data").unwrap_or(value);
+            if let (Some(id), Some(code)) = (
+                data.get("req_id")
+                    .or_else(|| data.get("reqId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 256),
+                data.get("err")
+                    .or_else(|| data.get("error_code"))
+                    .and_then(Value::as_i64)
+                    .and_then(|code| i32::try_from(code).ok()),
+            ) {
+                let text = data
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty() && text.len() <= 1024 * 1024)
+                    .map(str::to_owned);
+                out.push(crate::chat::VoiceToTextPushResult {
+                    req_id: id.to_owned(),
+                    text,
+                    error_code: code,
+                    is_truncated: data.get("has_more").is_some_and(|value| {
+                        value == &Value::Bool(true) || value.as_i64() == Some(1)
+                    }),
+                });
+                return;
+            }
+        }
+        for key in ["data", "controls", "content", "voice2text"] {
+            if let Some(child) = value.get(key) {
+                visit(
+                    child,
+                    is_voice || key == "voice2text",
+                    depth + 1,
+                    budget,
+                    out,
+                );
+            }
+        }
     }
-
-    let data = val.get("data").unwrap_or(val);
-    let req_id = data
-        .get("req_id")
-        .or_else(|| data.get("reqId"))
-        .or_else(|| data.get("id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-
-    let error_code = data
-        .get("error_code")
-        .or_else(|| val.get("error_code"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0) as i32;
-
-    let text = data
-        .get("text")
-        .or_else(|| data.get("transcript"))
-        .or_else(|| data.get("result"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-
-    Some(crate::chat::VoiceToTextPushResult {
-        req_id,
-        text,
-        error_code,
-    })
+    let mut out = Vec::new();
+    visit(val, false, 0, &mut 256, &mut out);
+    out
 }
 
 #[cfg(test)]
@@ -1181,6 +1260,19 @@ mod tests {
             "data": { "uid": "123" }
         });
         assert!(parse_voice_to_text_push(&other_push).is_none());
+    }
+
+    #[test]
+    fn native_voice_control_keeps_all_results_and_err_codes() {
+        let push = json!({"data":{"controls":[{"content":{"act_type":"voice2text","data":[
+            {"act":"convert_finish","data":{"req_id":"one","err":0,"text":"Xin chào","has_more":false}},
+            {"act":"convert_finish","data":{"req_id":"two","err":221}},
+            {"act":"convert_finish","data":{"req_id":"malformed","text":"must not succeed"}}
+        ]}}]}});
+        let results = parse_voice_to_text_pushes(&push);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].text.as_deref(), Some("Xin chào"));
+        assert_eq!(results[1].error_code, 221);
     }
 
     #[test]
@@ -1464,23 +1556,21 @@ mod forward_tests {
     }
 
     #[tokio::test]
-    async fn forward_keeps_order_and_waits_only_when_queue_is_full() {
+    async fn forward_keeps_page_order_without_waiting_for_a_slow_consumer() {
         let (forward, mut received) = mpsc::channel(2);
         forward_event(&forward, event(1), 1).await.unwrap();
         forward_event(&forward, event(2), 1).await.unwrap();
-        let slow = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let mut seen = Vec::new();
-            while let Some(e) = received.recv().await {
-                seen.push(e.payload["n"].as_u64().unwrap());
-                if seen.len() == 3 {
-                    break;
-                }
-            }
-            seen
-        });
-        forward_event(&forward, event(3), 1).await.unwrap();
-        assert_eq!(slow.await.unwrap(), vec![1, 2, 3]);
+        let overflow = tokio::time::timeout(
+            Duration::from_millis(100),
+            forward_event(&forward, event(3), 1),
+        )
+        .await
+        .unwrap();
+        assert!(overflow.is_err()); // (INV-4) No reader-side cursor commit; replay is required.
+        assert_eq!(received.recv().await.unwrap().payload["n"], 1);
+        assert_eq!(received.recv().await.unwrap().payload["n"], 2);
+        forward_event(&forward, event(3), 2).await.unwrap();
+        assert_eq!(received.recv().await.unwrap().payload["n"], 3);
     }
 
     #[tokio::test]
@@ -1490,13 +1580,63 @@ mod forward_tests {
         assert!(forward_event(&forward, event(1), 1).await.is_err());
     }
     #[tokio::test]
-    async fn forward_times_out_when_consumer_permanently_stalled() {
+    async fn call_control_bypasses_a_stalled_durable_page_consumer() {
         let (forward, _received) = mpsc::channel(1);
-        // Fill channel
+        let (priority, mut calls) = mpsc::channel(1);
         forward_event(&forward, event(1), 1).await.unwrap();
-        // Second send will wait on backpressure; with a 0ms / immediate consumer stall simulation
-        // Test that forward channel bound is respected
-        assert_eq!(forward.capacity(), 0);
+        let call = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            ..event(2)
+        };
+        forward_priority(Some(&priority), &call).unwrap();
+        assert_eq!(calls.recv().await.unwrap().cmd, CMD_CTRL_PUSH_CTRL);
+        assert!(forward_event(&forward, call, 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn typing_and_privacy_controls_use_priority_without_waiting_for_database_pages() {
+        let (priority, mut received) = mpsc::channel(2);
+        let typing = WsEvent {
+            payload: json!({"data":{"actions":[{"act_type":"typing","act":"typing","data":{"uid":"123"}}]}}),
+            ..event(1)
+        };
+        forward_priority(Some(&priority), &typing).unwrap();
+        let privacy = WsEvent {
+            cmd: CMD_CTRL_PUSH_CTRL,
+            payload: json!({"data":{"controls":[{"content":{"act_type":"my_settings"}}]}}),
+            ..event(2)
+        };
+        forward_priority(Some(&priority), &privacy).unwrap();
+        assert!(
+            !crate::presence::typing(&received.recv().await.unwrap().payload, "other").is_empty()
+        );
+        assert!(crate::account_controls::from_frame(&received.recv().await.unwrap()).privacy);
+    }
+
+    #[tokio::test]
+    async fn priority_overflow_is_explicit_and_never_spawns_unbounded_work() {
+        let (priority, _received) = mpsc::channel(1);
+        let control = WsEvent {
+            cmd: CMD_CTRL_PULL_VOIP,
+            ..event(1)
+        };
+        forward_priority(Some(&priority), &control).unwrap();
+        assert!(forward_priority(Some(&priority), &control).is_err());
+        assert_eq!(priority.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_teardown_aborts_its_forwarder_before_reconnect() {
+        let (ended, done) = tokio::sync::oneshot::channel::<()>();
+        let guard = ForwardTask(tokio::spawn(async move {
+            let _ended = ended;
+            std::future::pending::<()>().await;
+        }));
+        drop(guard);
+        assert!(tokio::time::timeout(Duration::from_secs(1), done)
+            .await
+            .unwrap()
+            .is_err());
     }
 
     #[test]

@@ -17,3 +17,33 @@
 - [ ] Thử thu hồi nhiều tin cùng lúc: kiểm tra cả hai bên đều thấy tin nhắn biến mất và chuyển thành thông báo đã thu hồi.
 - [ ] Mở Media Viewer: phóng to, thu nhỏ, kéo pan, ấn mũi tên trái phải để chuyển ảnh trong hội thoại.
 - [ ] Ghi âm một đoạn thoại 5 giây: kiểm tra thanh sóng âm, nghe lại và gửi; tài khoản Zalo chính thức nghe được trọn vẹn.
+
+## Kiểm chứng tiếp tục ngày 22/11/2026
+
+Working tree trên `8e235f7`: bộ thư viện trước delta cuối đạt 1048 passed,
+0 failed, 11 ignored; sau sửa filter strip và thời điểm assertion smoke,
+10 regression composer/sidebar đạt. Clippy all-targets, fmt/diff check và build
+debug ARM64 đạt; ba renderer smoke dữ liệu giả đã chạy và xem ảnh.
+Chi tiết, lỗi đã tái hiện và giới hạn trong
+[bản ghi popup/contact/voice/composer](../../docs/research/2026-11-22-popup-contact-voice-composer.md#tiếp-tục-kiểm-chứng-ngày-22112026).
+Không đóng R11-T09 hoặc tiêu chí ghi âm/gửi voice từ kiểm chứng player incoming,
+fixture decoder hay ảnh renderer. Công cụ UI tương tác hiện lỗi khởi tạo sandbox;
+voice/AI server và phonebook với tài khoản thật còn cần nghiệm thu.
+
+## Delta gửi tệp 204 ngày 22/11/2026
+
+Sửa regular-file fallback theo E2 PC, thêm ZIP vào draft qua worker và chẩn
+đoán upload/submit. Lib 1052 passed / 11 ignored; audit_regressions 33 passed;
+Clippy, fmt, diff check và build debug ARM64 qua. Renderer smoke scale 1 đã xem;
+scale 1.5 còn lỗi layout header/timeline. Chưa gửi/tải lại trên server thật và
+không đóng tiêu chí native từ các kiểm thử này. Bằng chứng và ma trận còn thiếu:
+[bản ghi xử lý 204](../../docs/research/2026-11-22-attachment-204-remediation.md).
+
+## M-07: bubble tệp trước I/O — 22/11/2026
+
+R11-T10 có mã: công bố toàn bộ lô trước admission/SQLite/preparation, giữ ID và
+account/runtime/thread; bỏ cảnh báo thiếu URL đối với intent attachment cục bộ.
+Test lô 20 đường dẫn chưa tồn tại qua. Lib: 1053 passed, 0 failed, 11 ignored;
+Clippy all-targets -D warnings, build debug ARM64, fmt/diff check qua.
+Renderer smoke dữ liệu giả exit 0 và đã xem ảnh; không thay nghiệm thu thời gian
+hiện bubble trên GUI thật. R11-T10 giữ chưa đóng vì phần nghiệm thu này còn thiếu.

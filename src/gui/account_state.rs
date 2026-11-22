@@ -60,14 +60,6 @@ pub(super) fn resolve_message_sender_name_from<'a>(
         }
     }
 
-    let sender_trimmed = msg.sender.trim();
-    if !sender_trimmed.is_empty()
-        && sender_trimmed != "0"
-        && !crate::chat::is_generic_thread_name(sender_trimmed)
-    {
-        return sender_trimmed;
-    }
-
     if let Some(uid) = lookup_uid {
         if let Some(thread) = threads.iter().find(|t| !t.is_group && t.id == uid) {
             if !thread.name.trim().is_empty() && !crate::chat::is_generic_thread_name(&thread.name)
@@ -87,6 +79,9 @@ pub(super) fn resolve_message_sender_name_from<'a>(
         }
     }
 
+    // A message's wire display name can be older than the UID-scoped contact
+    // cache. Resolve the contact first without rewriting the original payload.
+    let sender_trimmed = msg.sender.trim();
     if !sender_trimmed.is_empty() && sender_trimmed != "0" {
         return sender_trimmed;
     }
@@ -162,6 +157,21 @@ pub(super) fn resolve_quote_sender_name_from<'a>(
 }
 
 impl ZaloGuiApp {
+    /// Build presentation names without turning phonebook names into alias mutations.
+    pub(super) fn refresh_contact_names(&mut self) -> bool {
+        let mut names = self.server_phonebook.clone();
+        names.retain(|_, name| !name.trim().is_empty());
+        for (uid, alias) in &self.actual_server_aliases {
+            if !alias.trim().is_empty() {
+                names.insert(uid.clone(), alias.clone());
+            }
+        }
+        let changed = !self.server_aliases_ready || self.server_aliases != names;
+        self.server_aliases_ready = true;
+        self.server_aliases = names;
+        self.apply_server_aliases();
+        changed
+    }
     /// Resolve a contact's display name, prioritizing `server_aliases` over `fallback_name`.
     pub(super) fn resolve_contact_name<'a>(&'a self, uid: &str, fallback_name: &'a str) -> &'a str {
         resolve_contact_name_from(&self.server_aliases, uid, fallback_name)
@@ -236,5 +246,107 @@ impl ZaloGuiApp {
     }
     pub(super) fn private_access(&self, id: &str, group: bool) -> bool {
         self.hidden_panel.view.allows(id, group)
+    }
+}
+
+#[cfg(test)]
+mod contact_name_tests {
+    #[test]
+    fn composer_config_event_rejects_foreign_account_and_runtime() {
+        let ctx = eframe::egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            crate::session::Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.user_uin = "99".into();
+        let runtime_id = app.account_runtime_id;
+        let config = crate::composer_config::ComposerConfig {
+            rich_max_lines: 8.0,
+            line_height: 25.0,
+        };
+        for (owner, runtime) in [("other", runtime_id), ("99", runtime_id.wrapping_add(1))] {
+            app.event_tx
+                .send(GuiEvent::ComposerConfig {
+                    owner: owner.into(),
+                    runtime_id: runtime,
+                    config,
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert_eq!(
+                app.composer_config,
+                crate::composer_config::ComposerConfig::default()
+            );
+        }
+        app.event_tx
+            .send(GuiEvent::ComposerConfig {
+                owner: "99".into(),
+                runtime_id,
+                config,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.composer_config, config);
+    }
+
+    use super::*;
+
+    #[test]
+    fn group_sender_uses_uid_contact_before_wire_public_name() {
+        let threads = vec![Thread {
+            id: "12".into(),
+            name: "TNR chị Huệ".into(),
+            ..Default::default()
+        }];
+        let message = ChatMessage {
+            sender: "Hue Nguyen".into(),
+            wire_ref: crate::message_model::WireMessageRef {
+                sender: Some(serde_json::json!("12")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let aliases = HashMap::new();
+        let members = HashMap::new();
+        assert_eq!(
+            resolve_message_sender_name_from(
+                &aliases, &threads, &members, &message, "g1", true, "Nhóm"
+            ),
+            "TNR chị Huệ"
+        );
+        assert_eq!(message.sender, "Hue Nguyen");
+    }
+
+    #[test]
+    fn phonebook_names_do_not_become_alias_mutations_and_alias_removal_reveals_phonebook() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "12".into(),
+                name: "Tên công khai".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.server_phonebook
+            .insert("12".into(), "Tên danh bạ".into());
+        app.actual_server_aliases
+            .insert("12".into(), "Biệt danh".into());
+        app.refresh_contact_names();
+        assert_eq!(app.resolve_thread_name(&app.threads[0]), "Biệt danh");
+        app.actual_server_aliases.clear();
+        app.refresh_contact_names();
+        assert_eq!(app.resolve_thread_name(&app.threads[0]), "Tên danh bạ");
+        assert_eq!(
+            app.threads[0].presentation.base_name.as_deref(),
+            Some("Tên công khai")
+        );
+        assert!(app.actual_server_aliases.is_empty());
     }
 }

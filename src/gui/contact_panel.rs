@@ -60,7 +60,7 @@ impl ZaloGuiApp {
             return;
         }
         let alias = self
-            .server_aliases
+            .actual_server_aliases
             .get(&target)
             .cloned()
             .unwrap_or_default();

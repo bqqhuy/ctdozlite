@@ -6,6 +6,7 @@ pub mod business;
 pub mod call;
 pub mod chat;
 pub mod clock;
+pub mod composer_config;
 pub mod crypto;
 pub mod device;
 pub mod e2ee_integration;
@@ -63,6 +64,7 @@ pub mod updater;
 mod video_preview;
 
 mod diagnostics;
+mod runtime_metrics;
 
 /// Phone-approved encrypted history transfer.
 pub mod phone_sync;
@@ -180,3 +182,4 @@ pub mod hidden_chat;
 
 pub mod account_controls;
 pub mod account_metadata;
+mod attachment_archive;

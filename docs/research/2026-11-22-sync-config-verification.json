@@ -1,0 +1,409 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-11-22T14:38:00.758501+07:00",
+  "scope": "Kiểm chứng sync và cấu hình server; không sửa mã sản phẩm, không commit/push.",
+  "verdict": "PARTIAL_VERIFICATION_NOT_NATIVE_PARITY",
+  "evidence_levels": {
+    "E1": "Quan sát trực tiếp giao diện trong lượt này; không có capture HTTP/WS mới của PC.",
+    "E2": "Đọc mã Zalo PC 26.11.12 và mã fork hiện tại.",
+    "historical_runtime": "Log fork có sẵn, phân biệt với chạy thử mới.",
+    "fixture": "Test offline trên dữ liệu tổng hợp; không xác nhận sync điện thoại thật."
+  },
+  "native_sources": [
+    {
+      "path": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122\\pc\\pc-dist\\compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "sha256": "78801014154a86bade096eb916e541223a5f553f888882aa0ef3a218a44d6c08",
+      "offset_unit": "zero-based Python Unicode code point",
+      "anchors": {
+        "mergeServicesMap_v3(e,t)": 17998075,
+        "static getServerInfo": 15047382,
+        "updateConfigBySocket(e)": 7944913,
+        "download_domains_swap": 7887388,
+        "getSession()": 1856886,
+        "STR_SYNC_BANNER_COMPACT_SUGGEST_TITLE": 13203968,
+        "server-info-config": 7483214,
+        "authen-info-config": 7483263
+      }
+    },
+    {
+      "path": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122\\pc\\pc-dist\\lazy\\main-startup.41abf8e6af2a55551e3b.js",
+      "sha256": "c29c9f0a7f0718c5b044764666b6fc5dec8b8eb65e178819b3cee3b1f93e3426",
+      "offset_unit": "zero-based Python Unicode code point",
+      "anchors": {
+        "sync_2_pc": 2532977,
+        "sync_suggestion_zalopc": 2531550,
+        "canShowSyncSuggestion(e)": 2558682,
+        "enable_auto_request_sync_on_log_in_new_device": 2516792,
+        "manualSync=async": 2541221
+      }
+    }
+  ],
+  "config_findings": [
+    {
+      "key": "zpw_service_map_v3",
+      "evidence": "E2",
+      "verified": "Routing được cập nhật từ server info, auth/renew và chuyển domain; bootstrap/fallback tồn tại.",
+      "fork_gap": "Nhánh get_server_info lúc khởi động GUI chỉ đọc ComposerConfig, chưa apply kết quả vào session tại nhánh đó.",
+      "fork_source": "src/gui/worker.rs:1820; src/session.rs:1271"
+    },
+    {
+      "key": "enable_encrypt_param",
+      "evidence": "E2",
+      "verified": "Cờ cho wrapper mã hóa tương ứng; getServerInfo ký tham số inline và các nhánh AES khác vẫn tồn tại.",
+      "runtime_value": "UNKNOWN"
+    },
+    {
+      "key": "zcinput",
+      "evidence": "E2+fixture",
+      "verified": "Schema và snapshot per-session trong PC; fork mới đọc inputMaxLines/lineHeight.",
+      "runtime_value": "UNKNOWN"
+    },
+    {
+      "key": "enable_feature_alias_v2",
+      "evidence": "E2",
+      "verified": "Chọn alias v2 và bỏ qua luồng phonebook tên cũ; không thay toàn bộ metadata.",
+      "runtime_value": "UNKNOWN"
+    },
+    {
+      "key": "enable_file_eecx / restricted_ext_file",
+      "evidence": "E2",
+      "verified": "Bọc ZIP trước upload; defaults exe/cmd/bat/com/lnk/vbs; server có thể bổ sung.",
+      "runtime_value": "UNKNOWN"
+    },
+    {
+      "key": "download_domains_swap",
+      "evidence": "E2",
+      "verified": "Rewrite hostname theo enabled/domains_map/mode, có đường cập nhật socket.",
+      "runtime_value": "UNKNOWN"
+    },
+    {
+      "key": "sync_2_pc",
+      "evidence": "E2",
+      "verified": "Gợi ý new_log_in/change_device/queue_evict; banner_text; cờ UI; timeout/retry/batch policies.",
+      "runtime_value": "UNKNOWN"
+    }
+  ],
+  "config_lifecycle": {
+    "static_verified": [
+      "Pre-session getServerInfo và fallback của gate mã hóa.",
+      "Auth/renew cung cấp config và phát authen-info-config.",
+      "Session manager init gọi getServerInfo, phát server-info-config.",
+      "Lịch làm mới sau thành công là một giờ trong mã; retry theo lỗi.",
+      "Socket update đã xác nhận cho download_domains_swap.",
+      "Nhận config và áp dụng config là hai mốc; composer có snapshot theo phiên."
+    ],
+    "live_fetch_timestamps": "NOT_CAPTURED",
+    "debug_endpoint": "Cổng ghi trong DevToolsActivePort không kết nối được; không bật/restart/inject debug.",
+    "cache_probe": "Không tìm thấy các tên khóa mục tiêu dưới dạng plain text trong các file cache đã đọc; không suy ra cấu hình vắng mặt."
+  },
+  "ui_observations": [
+    {
+      "case": "PC phiên đang mở",
+      "evidence": "E1",
+      "result": "Không có banner sync tại thời điểm quan sát."
+    },
+    {
+      "case": "PC Settings -> Dữ liệu -> Đồng bộ và sao lưu",
+      "evidence": "E1",
+      "result": "Hai lựa chọn Đồng bộ tin nhắn (điện thoại -> PC) và Sao lưu tin nhắn (PC -> khôi phục trên điện thoại)."
+    },
+    {
+      "case": "Chọn Đồng bộ tin nhắn trên PC",
+      "evidence": "E1",
+      "result": "Cài đặt đóng; chưa quan sát thấy banner/popup mới hoặc cửa sổ phụ. Không xác nhận request sync đã gửi, không suy ra bị server từ chối."
+    },
+    {
+      "case": "Fork phiên đang mở",
+      "evidence": "E1",
+      "result": "Có banner cảnh báo chưa lưu được cập nhật vào CSDL; nút Chi tiết mở trang Đồng bộ tin nhắn. UI khác bố cục PC."
+    }
+  ],
+  "historical_diagnostics": {
+    "rows": 11395,
+    "time_from": "2026-11-03T17:14:59.663000+07:00",
+    "time_to": "2026-11-22T14:31:06.227000+07:00",
+    "phone_round_results": {
+      "stalled": 4,
+      "complete": 25,
+      "disconnected": 4
+    },
+    "dispose_socket_write_ack": {
+      "True": 35,
+      "False": 4
+    },
+    "limitation": "Round complete/ACK không chứng minh toàn bộ lịch sử đầy đủ; đây là log cũ, không phải một lượt phone sync mới."
+  },
+  "latest_runtime_snapshot": {
+    "timestamp": "2026-11-21T21:20:20.568000+07:00",
+    "metrics": [
+      {
+        "avg": 6086.517599999999,
+        "count": 1,
+        "max": 6086.517599999999,
+        "metric": "snapshot_write",
+        "min": 6086.517599999999,
+        "p50": 6086.517599999999,
+        "p95": 6086.517599999999,
+        "p99": 6086.517599999999,
+        "sample_count": 1
+      },
+      {
+        "avg": 3540.1120285714287,
+        "count": 7,
+        "max": 5625.4328000000005,
+        "metric": "outgoing_write",
+        "min": 12.2088,
+        "p50": 3967.8488,
+        "p95": 5625.4328000000005,
+        "p99": 5625.4328000000005,
+        "sample_count": 7
+      },
+      {
+        "avg": 1050.555318181818,
+        "count": 22,
+        "max": 5624.2375999999995,
+        "metric": "received_write",
+        "min": 6.4054,
+        "p50": 10.9657,
+        "p95": 5617.2842,
+        "p99": 5624.2375999999995,
+        "sample_count": 22
+      },
+      {
+        "avg": 1.0,
+        "count": 18,
+        "max": 1.0,
+        "metric": "sqlite_busy",
+        "min": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "sample_count": 18
+      },
+      {
+        "avg": 1.0,
+        "count": 18,
+        "max": 1.0,
+        "metric": "sqlite_failure",
+        "min": 1.0,
+        "p50": 1.0,
+        "p95": 1.0,
+        "p99": 1.0,
+        "sample_count": 18
+      }
+    ],
+    "interpretation": "Các count là giá trị của snapshot, không cộng dồn các snapshot. Có bằng chứng SQLite busy/failure; nguyên nhân tranh chấp chưa xác định."
+  },
+  "database_readonly_checks": [
+    {
+      "profile": "large_history",
+      "counts": {
+        "messages": 1184008,
+        "threads": 1156,
+        "history_sync": 327,
+        "phone_sync_ranges": 1041,
+        "phone_unmapped": 0,
+        "invalid_ranges": 0,
+        "empty_or_null_identity": 0
+      },
+      "checkpoint_shape": {
+        "object": 327
+      },
+      "limitation": "Snapshot số lượng/schema; không so nội dung với PC/điện thoại, không kiểm chứng đầy đủ lịch sử."
+    },
+    {
+      "profile": "empty_history",
+      "counts": {
+        "messages": 0,
+        "threads": 0,
+        "history_sync": 0,
+        "phone_sync_ranges": 0,
+        "phone_unmapped": 0,
+        "invalid_ranges": 0,
+        "empty_or_null_identity": 0
+      },
+      "checkpoint_shape": {},
+      "limitation": "Snapshot số lượng/schema; không so nội dung với PC/điện thoại, không kiểm chứng đầy đủ lịch sử."
+    }
+  ],
+  "test_isolation": {
+    "CTDOZ_DATA_DIR": "%TEMP%/zalolite-sync-verification-20261122-tests",
+    "network": "Không gọi Zalo trong test; fixture và WASM local.",
+    "live_db": "Không dùng live DB trong cargo test; các truy vấn DB riêng biệt chỉ đọc."
+  },
+  "test_runs": [
+    {
+      "filter": "sync",
+      "passed": 94,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "filter": "composer_config::",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "filter": "queue_cursors::",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "filter": "session::tests::service",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "note": "Không khớp test; không tính là bằng chứng."
+    },
+    {
+      "filter": "server_media::",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "filter": "phone_sync::codec::tests::official_codec_interoperability -- --ignored",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "asset_sha256": "3a868037a32739a4fcb3c22425150745613006f9dbc561f30fd705effaed55fa"
+    },
+    {
+      "filter": "discovered",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    }
+  ],
+  "remaining_verification": [
+    {
+      "case": "Giá trị feature/config thật và thời điểm fetch/apply trên PC",
+      "status": "NOT_CAPTURED",
+      "needs": "Capture có whitelist trường cấu hình, không log cookies/keys/chat."
+    },
+    {
+      "case": "Banner đang sync, chờ xác nhận, gián đoạn, lỗi, thành công",
+      "status": "E2_ONLY",
+      "needs": "Một lượt phone sync có quan sát cả PC và điện thoại."
+    },
+    {
+      "case": "Điện thoại từ chối/offline/bận, cancel/retry/restart",
+      "status": "NOT_RUN_TODAY",
+      "needs": "Phối hợp thao tác điện thoại và lựa chọn tình huống không phá dữ liệu."
+    },
+    {
+      "case": "New login/change device/queue evict",
+      "status": "E2_ONLY",
+      "needs": "Môi trường test phù hợp; không xóa dữ liệu hay đăng xuất tài khoản đang dùng để giả lập."
+    },
+    {
+      "case": "Full-history equality",
+      "status": "NOT_VERIFIED",
+      "needs": "Tập mốc tin nhắn biết trước, so coverage và nội dung trên hai bên."
+    },
+    {
+      "case": "SQLite busy/failure root cause",
+      "status": "OBSERVED_UNRESOLVED",
+      "needs": "Đối chiếu các writer, thời gian giữ transaction và account-write ownership; chưa sửa."
+    }
+  ],
+  "implementation_priorities": [
+    "Điều tra SQLite busy/failure trước khi dùng chỉ báo complete làm nghiệm thu sync.",
+    "Nối vòng đời cấu hình thống nhất; ưu tiên payload serverInfo hiện bị dùng một phần trong GUI.",
+    "Thiết kế typed sync states/coverage và UI từ bằng chứng, giữ các invariant/test đang đúng.",
+    "Chạy capture và phone matrix trước khi kết luận native parity."
+  ],
+  "startup_loading_verification": {
+    "evidence": "E2_STATIC_PC_26.11.12",
+    "live_restart_capture": "NOT_RUN; không restart/đăng xuất ứng dụng đang dùng.",
+    "verdict": "PC có màn hình đăng nhập và cơ chế giữ màn hình trong lúc preload; không phải barrier cho toàn bộ cấu hình hay full-history sync.",
+    "anchors": [
+      {
+        "path": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122\\pc\\pc-dist\\compact-app-pc.0cd2e653e67efaa4bf4b.js",
+        "sha256": "78801014154a86bade096eb916e541223a5f553f888882aa0ef3a218a44d6c08",
+        "offset_unit": "zero-based Python Unicode code point",
+        "markers": {
+          "\"Pbn/\":function": 8630302,
+          "if(!this.props.user.userId||this.props.shouldKeepLoadingScreenDueToStartUpPreload)": 5351700,
+          "\"cO+G\":function": 14084702,
+          "\"+tVb\":function": 832131,
+          "IfQO:function": 6405028,
+          "static getLastMessagesForPreview(e)": 15156752,
+          "$.b.mergeServicesMap_v3(t.config.zpw_service_map_new,t.config.zpw_service_map_v3)": 14631925
+        }
+      },
+      {
+        "path": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122\\pc\\pc-dist\\lazy\\main-startup.41abf8e6af2a55551e3b.js",
+        "sha256": "c29c9f0a7f0718c5b044764666b6fc5dec8b8eb65e178819b3cee3b1f93e3426",
+        "offset_unit": "zero-based Python Unicode code point",
+        "markers": {
+          "class _4{": 1989264,
+          "e.addEventListener(rr.c.PreProcessingSettle": 134889,
+          "signalKeepLoadingScreenIfNeed()": 134483
+        }
+      },
+      {
+        "path": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122\\pc\\pc-dist\\lazy\\default-login-startup-main-startup.96f724da768b22238651.js",
+        "sha256": "6a99d074214423d43a2aa74f4b4093e5cd9b547ca8d741b694f70a62dfda1761",
+        "offset_unit": "zero-based Python Unicode code point",
+        "markers": {
+          "i=Object(V.l)(H.c,H.b,(e=>e.shouldKeepLoadingScreen))": 21039
+        }
+      }
+    ],
+    "findings": [
+      "Module Pbn/ dựng loading-page toàn màn hình, spinner và STR_LOGGING_IN.",
+      "Root FK2X trả loading screen khi !user.userId hoặc shouldKeepLoadingScreenDueToStartUpPreload.",
+      "Hook ở default-login-startup-main-startup đọc shouldKeepLoadingScreen từ manager và đưa vào root.",
+      "Manager _4 giữ màn hình, có timeout và dismiss delay lấy từ o2o.keep_loading_during_preload.",
+      "Defaults của o2o: keep_loading_during_preload.enable=0, timeout_duration=800ms, screen_dismiss_delay=200ms. Đây không phải giá trị account thực tế và không phải tổng thời gian login.",
+      "Offline-data observer: Start -> startKeepLoadingIfNeeded; PreProcessingSettle -> dismissLoadingScreen; End và OfflineProcessingUIDone là các mốc khác.",
+      "IfQO phát PreProcessingSettle khi preprocessing Settled hoặc Skip; đường lỗi cũng truyền qua settle.",
+      "+tVb preload gọi getLastMessagesForPreview, xử lý clearUnreads/clearUnreadReact và messages, lọc trùng, await _saveNewMessages rồi đánh dấu onSavedDB/onSettled; lỗi -> onSettled(error,null).",
+      "API gốc: conversation service /api/preloadconvers/get-last-msgs, request code10053; implementation có params threadIdLocalMsgId JSON và imei, session AES. Chỉ ghi bằng chứng, chưa thêm request vào fork.",
+      "Có get_last_message_timeout_before_polling mặc định 10000ms; khác timeout 800ms của lớp giữ loading.",
+      "Auth/renew áp dụng endpoint/service map và credentials trước Application.authenticate; auth-info-config và các cập nhật khác có vòng đời riêng. Chưa chứng minh mọi config hoàn tất trước khi root hiển thị.",
+      "Fork tạo is_logged_in từ session.login.is_some(); nhánh GUI chủ động mở ngay và worker lấy server info nền. Chưa có gate tương đương toàn bộ pipeline native đã truy."
+    ],
+    "recommended_fork_design": {
+      "status": "DESIGN_ONLY_NOT_IMPLEMENTED",
+      "stages": [
+        "Mở native window ngay với màn hình Đang đăng nhập.",
+        "Worker xác lập account/runtime, local store và session; nhận/kiểm tra/apply cấu hình cần thiết, dùng cache hợp lệ theo chính sách khi phù hợp.",
+        "Khôi phục danh sách hội thoại/preview cục bộ, thực hiện preload/tải bù ban đầu có giới hạn thời gian.",
+        "Phát sự kiện sẵn sàng hoặc trạng thái suy giảm có nguyên nhân rõ; UI mới chuyển sang 4 zone.",
+        "Socket, metadata bổ sung và sync lịch sử dài tiếp tục theo luồng riêng, không bị biến thành điều kiện chờ toàn bộ."
+      ],
+      "important_limits": [
+        "Không sleep cố định giả loading.",
+        "Không chặn UI thread; worker thực hiện I/O.",
+        "Timeout tải mạng không tự chứng minh DB đã ghi được; lỗi DB phải được giữ riêng.",
+        "Không gán mặc định 800ms/200ms của PC thành tổng thời gian startup hoặc giá trị server hiện tại.",
+        "Chưa khẳng định bước này tự sửa SQLite busy; vẫn cần sửa điều phối writer."
+      ]
+    }
+  },
+  "checkpoint_validation_2026_11_22": {
+    "recorded_at": "2026-11-22T15:04:42.178963+07:00",
+    "scope": "Checkpoint các bản sửa đang có, bằng chứng nghiên cứu và hướng dẫn Gemini; không triển khai redesign mới.",
+    "cargo_check_locked": "PASS; required local compilation gate before commit/push.",
+    "cargo_fmt_all_check": "PASS",
+    "cargo_clippy_locked_all_targets_deny_warnings": "PASS with CARGO_INCREMENTAL=0",
+    "test_groups_completed": 14,
+    "test_results": {
+      "passed": 1143,
+      "failed_assertions": 0,
+      "ignored": 14
+    },
+    "cargo_test_locked_j1_exit": 101,
+    "test_execution_note": "CARGO_INCREMENTAL=0 cargo test --locked -j 1 compiled all tests; 1124 passed, 14 ignored before Windows refused to launch updater_regressions by name (os error740). An identical SHA256-checked binary copy under a neutral executable name ran as a standard user: all19 updater tests passed. cargo test --locked --doc -j1 also passed (0 doctests). Do not report the aggregate cargo test command as exit0.",
+    "build_recovery": "Initial shared-cache build had metadata/compiler errors; parallel nonincremental retry exhausted memory. Serial nonincremental build completed; no product code or toolchain configuration changed to work around these environment issues.",
+    "linker_warning": "LNK4199 for unused Media Foundation DELAYLOAD entries in test binaries; clippy -D warnings passed.",
+    "staged_diff_check": "PASS after normalizing trailing whitespace in seven research Markdown files.",
+    "secrets_review": "No live session, databases, logs, captures, APK/bundle/WASM assets included. Credential-shaped literals reviewed in login tests are synthetic fixtures.",
+    "handoff": "docs/research/2026-11-22-sync-config-gemini-handoff.md",
+    "native_status": "No additional full phone sync or runtime feature-config capture; prior limitations remain."
+  }
+}

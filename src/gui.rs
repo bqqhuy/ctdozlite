@@ -28,6 +28,7 @@ mod avatar_panel;
 mod backup_panel;
 mod board_panel;
 mod composer_drafts;
+use crate::composer_config;
 mod contact_panel;
 mod contacts;
 mod content_panel;
@@ -37,6 +38,7 @@ mod file_drop;
 mod group_entry_panel;
 mod group_panel;
 mod hidden_panel;
+mod inline_voice;
 mod labels_panel;
 mod mention_composer;
 mod messages;
@@ -73,6 +75,10 @@ fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
 }
 
 fn apply_outgoing_state(app: &mut ZaloGuiApp, thread_id: String, message: ChatMessage) {
+    crate::runtime_metrics::observe_outgoing(
+        &message.client_message_id,
+        message.delivery != crate::message_model::DeliveryState::Pending,
+    );
     if let Some(session) = &mut app.forward_session {
         session.update_outgoing_state(&thread_id, &message);
     }
@@ -115,7 +121,23 @@ fn apply_outgoing_state(app: &mut ZaloGuiApp, thread_id: String, message: ChatMe
             .map(|m| m.time.clone())
             .unwrap_or_default();
         thread.refresh_sidebar_presentation();
-        app.persist_threads_async();
+        if let Some(worker) = WORKER_TX.get() {
+            if worker
+                .send(WorkerCmd::PersistThreadMetadata {
+                    owner: app.user_uin.clone(),
+                    runtime_id: app.account_runtime_id,
+                    thread_id: thread.id.clone(),
+                    name: thread.name.clone(),
+                    is_group: thread.is_group,
+                })
+                .is_err()
+            {
+                crate::logger::log_error("outgoing metadata", "Worker is closed");
+            }
+        }
+        // The sender persists this row and its thread recency independently. Keeping
+        // persistence there avoids cloning the entire resident history for every
+        // Pending/ACK event; startup hydration restores sidebar previews.
     }
 }
 
@@ -218,7 +240,13 @@ pub enum GuiEvent {
     },
     AccountMetadata {
         owner: String,
+        runtime_id: usize,
         snapshot: Box<crate::account_metadata::Snapshot>,
+    },
+    ComposerConfig {
+        owner: String,
+        runtime_id: usize,
+        config: composer_config::ComposerConfig,
     },
     GroupInvalidated {
         owner: String,
@@ -335,8 +363,15 @@ pub enum GuiEvent {
     },
     ClipboardImageRead {
         owner: String,
+        runtime_id: usize,
         thread: String,
         image: Option<(std::path::PathBuf, u32, u32, egui::ColorImage)>,
+    },
+    ClipboardFilesRead {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        paths: Result<Vec<std::path::PathBuf>, String>,
     },
     AttachmentPickerClosed {
         owner: String,
@@ -346,6 +381,12 @@ pub enum GuiEvent {
         runtime_id: usize,
         thread: String,
         paths: Result<Vec<std::path::PathBuf>, String>,
+    },
+    AttachmentArchivePrepared {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        result: Result<std::path::PathBuf, String>,
     },
     /// A region capture ready to preview, or why there is none.
     ScreenCaptureFinished {
@@ -395,6 +436,7 @@ pub enum GuiEvent {
         uin: String,
         avatar: Option<String>,
         runtime_id: usize,
+        composer_config: Option<composer_config::ComposerConfig>,
     },
     LoginFailed(String),
     E2eePeersHydrated {
@@ -780,6 +822,10 @@ pub enum GuiEvent {
         msg_id: String,
         transcript: String,
         generation: u64,
+    },
+    InlineVoiceUpdated {
+        binding: inline_voice::Binding,
+        snapshot: inline_voice::Snapshot,
     },
     VoiceTranscriptFailed {
         thread_id: String,
@@ -1250,7 +1296,11 @@ pub struct ZaloGuiApp {
     hidden_panel: hidden_panel::HiddenPanel,
     inbox_policy: crate::inbox::Policy,
     own_cloud_id: String,
+    // Presentation names: phonebook entries overridden by explicit server aliases.
     server_aliases: HashMap<String, String>,
+    actual_server_aliases: HashMap<String, String>,
+    server_phonebook: HashMap<String, String>,
+    composer_config: composer_config::ComposerConfig,
     server_aliases_ready: bool,
     metadata_status: String,
     group_policy_revision: u64,
@@ -1457,6 +1507,10 @@ pub struct ZaloGuiApp {
     clipboard_text_only: bool,
     clipboard_alternative_text: Option<String>,
     pending_clipboard_image: Option<(std::path::PathBuf, u32, u32, TextureHandle)>,
+    // Keep preview textures alive until the frame after they stop being painted.
+    // egui-wgpu may submit commands that still reference a texture after the UI
+    // drops its handle; immediate drop can therefore trigger Queue::submit.
+    retired_clipboard_textures: Vec<TextureHandle>,
     unread_counts: HashMap<String, usize>,
     conversation_preferences: HashMap<String, crate::store::ConversationPreference>,
     show_hidden_conversations: bool,
@@ -1495,6 +1549,7 @@ pub struct ZaloGuiApp {
     recorded_voice_samples: Option<(std::sync::Arc<[f32]>, u32, std::time::Duration)>,
     voice_binding: Option<VoiceDraftBinding>,
     voice_context_generation: u64,
+    inline_voice: Option<inline_voice::Active>,
     settings_tab: SettingsTab,
     settings: AppSettings,
 
@@ -1547,6 +1602,16 @@ pub fn is_status_error(msg: &str) -> bool {
 }
 
 impl ZaloGuiApp {
+    /// Remove a clipboard preview from app state while retaining its texture
+    /// until a later frame has had a chance to submit its paint commands.
+    fn retire_pending_clipboard_image(
+        &mut self,
+    ) -> Option<(std::path::PathBuf, u32, u32, TextureHandle)> {
+        let preview = self.pending_clipboard_image.take()?;
+        self.retired_clipboard_textures.push(preview.3.clone());
+        Some(preview)
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         session: Session,
@@ -1810,6 +1875,7 @@ impl ZaloGuiApp {
             clipboard_text_only: false,
             clipboard_alternative_text: None,
             pending_clipboard_image: None,
+            retired_clipboard_textures: Vec::new(),
             unread_counts,
             conversation_preferences: HashMap::new(),
             show_hidden_conversations: false,
@@ -1848,6 +1914,7 @@ impl ZaloGuiApp {
             recorded_voice_samples: None,
             voice_binding: None,
             voice_context_generation: 0,
+            inline_voice: None,
             settings_tab: SettingsTab::General,
             tools: tools_panel::ToolsPanel::default(),
             history_search: Default::default(),
@@ -1869,6 +1936,9 @@ impl ZaloGuiApp {
                 .unwrap_or_default(),
             inbox_policy: Default::default(),
             server_aliases: Default::default(),
+            actual_server_aliases: Default::default(),
+            server_phonebook: Default::default(),
+            composer_config: Default::default(),
             server_aliases_ready: false,
             metadata_status: String::new(),
             group_policy_revision: 0,
@@ -2225,6 +2295,20 @@ impl ZaloGuiApp {
                 );
                 failed.delivery = crate::message_model::DeliveryState::Failed;
                 failed.outgoing_job.as_mut().unwrap().error = "Không có kết nối mạng. Kiểm tra hội thoại trước khi gửi lại để tránh trùng tin.".into();
+                let mut rejected = crate::outgoing::pending(
+                    "[Tệp] Bộ cài thử.exe".into(),
+                    false,
+                    crate::outgoing::Payload::Attachment {
+                        path: "Bộ cài thử.exe".into(),
+                        caption: String::new(),
+                        stamp: None,
+                        hd_source: None,
+                    },
+                );
+                rejected.delivery = crate::message_model::DeliveryState::Failed;
+                rejected.outgoing_job.as_mut().unwrap().error = crate::outgoing::failure_message(
+                    &anyhow::Error::new(crate::chat::ServerRejected { code: Some(204) }),
+                );
                 let waiting = crate::outgoing::pending(
                     "Tệp tiếp theo đang chờ tải lên.".into(),
                     false,
@@ -2233,7 +2317,7 @@ impl ZaloGuiApp {
                 app.threads = vec![Thread {
                     id: "outgoing-fixture".into(),
                     name: "Kiểm thử gửi lại".into(),
-                    messages: vec![failed, waiting],
+                    messages: vec![failed, rejected, waiting],
                     ..Default::default()
                 }];
                 app.selected_thread_index = 0;
@@ -2480,6 +2564,9 @@ impl ZaloGuiApp {
         self.inbox_policy = Default::default();
         self.own_cloud_id.clear();
         self.server_aliases.clear();
+        self.actual_server_aliases.clear();
+        self.server_phonebook.clear();
+        self.composer_config = Default::default();
         self.server_aliases_ready = false;
         self.metadata_status.clear();
         self.group_policy_revision = 0;
@@ -2621,6 +2708,7 @@ impl ZaloGuiApp {
             self.clipboard_read_pending = tx
                 .send(WorkerCmd::ReadClipboardImage {
                     owner: self.user_uin.clone(),
+                    runtime_id: self.account_runtime_id,
                     thread: self
                         .threads
                         .get(self.selected_thread_index)
@@ -2632,8 +2720,13 @@ impl ZaloGuiApp {
     }
 
     fn persist_threads_async(&self) {
-        let snapshot = self.threads.clone();
         if let Some(wtx) = WORKER_TX.get() {
+            let snapshot = {
+                let _clone_timing = crate::runtime_metrics::Scope::new(
+                    crate::runtime_metrics::Metric::SnapshotClone,
+                );
+                self.threads.clone()
+            };
             let _ = wtx.send(WorkerCmd::PersistThreads {
                 owner: self.user_uin.clone(),
                 threads: snapshot,
@@ -2817,8 +2910,16 @@ impl ZaloGuiApp {
                     thread_id,
                     msg_id,
                     transcript,
-                    generation: _,
+                    generation,
                 } => {
+                    if !self.is_logged_in || generation != self.account_runtime_id as u64 {
+                        continue;
+                    }
+                    self.transcribing_voices
+                        .remove(&(thread_id.clone(), msg_id.clone()));
+                    if !self.voice_transcript_target_valid(&thread_id, &msg_id) {
+                        continue;
+                    }
                     self.measured_msg_heights
                         .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
                     self.transcribing_voices
@@ -2827,12 +2928,23 @@ impl ZaloGuiApp {
                         .insert((thread_id, msg_id), transcript);
                     ctx.request_repaint();
                 }
+                GuiEvent::InlineVoiceUpdated { binding, snapshot } => {
+                    self.inline_voice_updated(ctx, binding, snapshot)
+                }
                 GuiEvent::VoiceTranscriptFailed {
                     thread_id,
                     msg_id,
                     error,
-                    generation: _,
+                    generation,
                 } => {
+                    if !self.is_logged_in || generation != self.account_runtime_id as u64 {
+                        continue;
+                    }
+                    self.transcribing_voices
+                        .remove(&(thread_id.clone(), msg_id.clone()));
+                    if !self.voice_transcript_target_valid(&thread_id, &msg_id) {
+                        continue;
+                    }
                     self.measured_msg_heights
                         .retain(|(t, m, _), _| !(t == &thread_id && m == &msg_id));
                     self.transcribing_voices.remove(&(thread_id, msg_id));
@@ -3217,7 +3329,17 @@ impl ZaloGuiApp {
                     }
                     match result {
                         Ok((path, w, h, image)) => {
-                            if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                            if self.attachment_drafts.total_len() >= file_drop::MAX_ATTACHMENTS {
+                                std::thread::spawn(move || {
+                                    // The capture producer owns this temporary copy.
+                                    let _ = std::fs::remove_file(path);
+                                });
+                                self.show_toast(
+                                    "Danh sách chờ chỉ nhận tối đa 50 tệp; chưa thêm ảnh chụp",
+                                );
+                                continue;
+                            }
+                            if let Some((old_path, ..)) = self.retire_pending_clipboard_image() {
                                 std::thread::spawn(move || {
                                     let _ = std::fs::remove_file(old_path);
                                 });
@@ -3260,12 +3382,42 @@ impl ZaloGuiApp {
                         Err(reason) => self.show_toast(reason),
                     }
                 }
+                GuiEvent::ClipboardFilesRead {
+                    owner,
+                    runtime_id,
+                    thread,
+                    paths,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    self.clipboard_read_pending = false;
+                    self.clipboard_text_fallback = None;
+                    if !self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .is_some_and(|t| t.id == thread)
+                    {
+                        continue;
+                    }
+                    match paths {
+                        Ok(paths) => self.add_attachment_draft_paths(ctx, &thread, paths),
+                        Err(error) => self.show_toast(error),
+                    }
+                }
                 GuiEvent::ClipboardImageRead {
                     owner,
+                    runtime_id,
                     thread,
                     image,
                 } => {
-                    if owner != self.user_uin {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
                         if let Some((path, ..)) = image {
                             std::thread::spawn(move || {
                                 let _ = std::fs::remove_file(path);
@@ -3288,7 +3440,18 @@ impl ZaloGuiApp {
                         continue;
                     }
                     if let Some((path, w, h, image)) = image {
-                        if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                        if self.attachment_drafts.total_len() >= file_drop::MAX_ATTACHMENTS {
+                            std::thread::spawn(move || {
+                                // The clipboard producer owns this temporary copy.
+                                let _ = std::fs::remove_file(path);
+                            });
+                            self.clipboard_text_fallback = None;
+                            self.show_toast(
+                                "Danh sách chờ chỉ nhận tối đa 50 tệp; chưa thêm ảnh Clipboard",
+                            );
+                            continue;
+                        }
+                        if let Some((old_path, ..)) = self.retire_pending_clipboard_image() {
                             std::thread::spawn(move || {
                                 let _ = std::fs::remove_file(old_path);
                             });
@@ -3319,6 +3482,29 @@ impl ZaloGuiApp {
                         self.attachment_picker_pending = false;
                     }
                 }
+                GuiEvent::AttachmentArchivePrepared {
+                    owner,
+                    runtime_id,
+                    thread,
+                    result,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                        && self.threads.iter().any(|target| target.id == thread)
+                    {
+                        match result {
+                            Ok(path) => {
+                                let before = self.attachment_drafts.len(&thread);
+                                self.add_attachment_draft_paths(ctx, &thread, vec![path]);
+                                if self.attachment_drafts.len(&thread) > before {
+                                    self.show_toast("Đã tạo ZIP trong bản nháp. Kiểm tra tệp rồi bấm Gửi; tệp gốc được giữ nguyên.");
+                                }
+                            }
+                            Err(error) => self.show_toast(error),
+                        }
+                    }
+                }
                 GuiEvent::AttachmentDraftPicked {
                     owner,
                     runtime_id,
@@ -3332,7 +3518,7 @@ impl ZaloGuiApp {
                                 self.add_attachment_draft_paths(ctx, &thread, paths)
                             }
                             Ok(_) => {}
-                            Err(error) => self.status_msg = error,
+                            Err(error) => self.show_toast(error),
                         }
                     }
                 }
@@ -3354,6 +3540,7 @@ impl ZaloGuiApp {
                     uin,
                     avatar,
                     runtime_id,
+                    composer_config,
                 } => {
                     self.profiles_requested = false;
                     self.profiles.clear();
@@ -3364,6 +3551,7 @@ impl ZaloGuiApp {
                         self.tools.catalog_items.clear();
                     }
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
+                        self.composer_config = Default::default();
                         self.cancel_voice_recording();
                         self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                         self.auth_in_progress = false;
@@ -3389,6 +3577,9 @@ impl ZaloGuiApp {
                     }
                     self.is_logged_in = true;
                     self.account_runtime_id = runtime_id;
+                    if let Some(config) = composer_config {
+                        self.composer_config = config;
+                    }
                     self.user_name = name;
                     self.user_uin = uin;
                     if avatar.is_some() {
@@ -3690,8 +3881,24 @@ impl ZaloGuiApp {
                         self.contact_panel.presence_checked = Some(std::time::Instant::now());
                     }
                 }
-                GuiEvent::AccountMetadata { owner, snapshot } => {
-                    if owner != self.user_uin || !self.is_logged_in {
+                GuiEvent::ComposerConfig {
+                    owner,
+                    runtime_id,
+                    config,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.composer_config = config;
+                    }
+                }
+                GuiEvent::AccountMetadata {
+                    owner,
+                    runtime_id,
+                    snapshot,
+                } => {
+                    if owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                        || !self.is_logged_in
+                    {
                         continue;
                     }
                     let mut dirty = false;
@@ -3762,13 +3969,15 @@ impl ZaloGuiApp {
                             }
                         }
                     }
+                    let names_loaded = snapshot.aliases.is_some() || snapshot.phonebook.is_some();
                     if let Some(aliases) = snapshot.aliases {
-                        if !self.server_aliases_ready || self.server_aliases != aliases {
-                            dirty = true;
-                            self.server_aliases_ready = true;
-                            self.server_aliases = aliases;
-                            self.apply_server_aliases();
-                        }
+                        self.actual_server_aliases = aliases;
+                    }
+                    if let Some(phonebook) = snapshot.phonebook {
+                        self.server_phonebook = phonebook;
+                    }
+                    if names_loaded {
+                        dirty |= self.refresh_contact_names();
                     }
                     self.metadata_status = if snapshot.warnings.is_empty() {
                         String::new()
@@ -4030,7 +4239,7 @@ impl ZaloGuiApp {
                     self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
                     self.attachment_picker_pending = false;
-                    if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                    if let Some((old_path, ..)) = self.retire_pending_clipboard_image() {
                         std::thread::spawn(move || {
                             let _ = std::fs::remove_file(old_path);
                         });
@@ -4108,7 +4317,7 @@ impl ZaloGuiApp {
                     self.clear_forward_dialog();
                     self.clipboard_read_pending = false;
                     self.attachment_picker_pending = false;
-                    if let Some((old_path, ..)) = self.pending_clipboard_image.take() {
+                    if let Some((old_path, ..)) = self.retire_pending_clipboard_image() {
                         std::thread::spawn(move || {
                             let _ = std::fs::remove_file(old_path);
                         });
@@ -5937,9 +6146,8 @@ impl ZaloGuiApp {
                                 self.contact_panel.qr = Some(qr);
                             }
                             if let Some(aliases) = reply.aliases {
-                                self.server_aliases_ready = true;
-                                self.server_aliases = aliases;
-                                self.apply_server_aliases();
+                                self.actual_server_aliases = aliases;
+                                self.refresh_contact_names();
                             }
                             if let Some(presence) = reply.presence {
                                 self.contact_panel.presence = Some(presence);
@@ -6389,6 +6597,11 @@ impl ZaloGuiApp {
 
 impl eframe::App for ZaloGuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The previous frame's renderer submission has completed by this
+        // update; release previews retired during that frame now.
+        self.retired_clipboard_textures.clear();
+        let _frame_timing =
+            crate::runtime_metrics::Scope::new(crate::runtime_metrics::Metric::GuiFrameWork);
         if self.is_logged_in && !self.lock_guard.is_locked() {
             // Sidebar relative-time labels must advance while the window is idle.
             ctx.request_repaint_after(std::time::Duration::from_secs(30));
@@ -6655,6 +6868,7 @@ impl eframe::App for ZaloGuiApp {
         });
         self.sync_composer_draft(ctx);
         self.check_events(ctx);
+        self.reconcile_inline_voice(ctx);
         self.attachment_drafts.sync_owner(if self.is_logged_in {
             &self.user_uin
         } else {
@@ -7927,6 +8141,51 @@ mod audit_unread_tests {
 mod outgoing_ui_tests {
     use super::*;
     #[test]
+    fn late_pending_does_not_regress_ack_or_unrelated_sidebar_state() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![
+                Thread {
+                    id: "recipient".into(),
+                    ..Default::default()
+                },
+                Thread {
+                    id: "other".into(),
+                    preview: "untouched".into(),
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        app.input_message = "new draft".into();
+        let pending =
+            crate::outgoing::pending("reply".into(), false, crate::outgoing::Payload::Text);
+        let mut ack = pending.clone();
+        ack.id = "server-ack".into();
+        ack.delivery = crate::message_model::DeliveryState::ServerAccepted;
+        ack.outgoing_job = None;
+        apply_outgoing_state(&mut app, "recipient".into(), ack);
+        apply_outgoing_state(&mut app, "recipient".into(), pending);
+        assert_eq!(app.threads[0].messages.len(), 1); // (INV-4)
+        assert_eq!(app.threads[0].messages[0].id, "server-ack");
+        assert_eq!(
+            app.threads[0].messages[0].delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+        );
+        assert!(app.threads[0].messages[0].outgoing_job.is_none());
+        assert_eq!(
+            app.threads[0].presentation.inbox.responded_by_me,
+            Some(true)
+        );
+        assert_eq!(app.threads[0].preview, "reply");
+        assert_eq!(app.threads[1].preview, "untouched");
+        assert_eq!(app.input_message, "new draft");
+    }
+
+    #[test]
     fn stale_ordinary_send_cannot_update_relogged_same_account() {
         let ctx = egui::Context::default();
         let mut app = ZaloGuiApp::from_context(
@@ -8017,6 +8276,95 @@ mod outgoing_ui_tests {
 #[cfg(test)]
 mod capture_boundary_tests {
     use super::*;
+
+    #[test]
+    fn archive_result_only_stages_for_the_matching_account_runtime_and_existing_thread() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "archive-thread".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.input_message = "draft must survive".into();
+        let runtime = app.account_runtime_id;
+        for (owner, runtime_id, thread, expected) in [
+            ("other", runtime, "archive-thread", 0),
+            ("owner", runtime.wrapping_add(1), "archive-thread", 0),
+            ("owner", runtime, "deleted-thread", 0),
+            ("owner", runtime, "archive-thread", 1),
+        ] {
+            app.event_tx
+                .send(GuiEvent::AttachmentArchivePrepared {
+                    owner: owner.into(),
+                    runtime_id,
+                    thread: thread.into(),
+                    result: Ok("synthetic-installer.zip".into()),
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert_eq!(app.attachment_drafts.len("archive-thread"), expected);
+            assert!(
+                app.threads[0].messages.is_empty(),
+                "archive results must never send a message"
+            );
+            assert_eq!(app.input_message, "draft must survive");
+        }
+    }
+
+    #[test]
+    fn copied_files_use_drafts_and_reject_stale_runtime_or_thread() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "current-thread".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        let runtime_id = app.account_runtime_id;
+        for (runtime, thread) in [
+            (runtime_id.wrapping_add(1), "current-thread"),
+            (runtime_id, "old-thread"),
+        ] {
+            app.event_tx
+                .send(GuiEvent::ClipboardFilesRead {
+                    owner: "owner".into(),
+                    runtime_id: runtime,
+                    thread: thread.into(),
+                    paths: Ok(vec!["movie.mp4".into(), "notes.txt".into()]),
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert_eq!(app.attachment_drafts.len("current-thread"), 0);
+        }
+        app.event_tx
+            .send(GuiEvent::ClipboardFilesRead {
+                owner: "owner".into(),
+                runtime_id,
+                thread: "current-thread".into(),
+                paths: Ok(vec!["movie.mp4".into(), "notes.txt".into()]),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.attachment_drafts.len("current-thread"), 2);
+        assert!(app.pending_clipboard_image.is_none());
+        assert!(
+            app.threads[0].messages.is_empty(),
+            "Pasting files must not send them"
+        );
+    }
 
     #[test]
     fn capture_does_not_attach_to_a_different_conversation() {
@@ -8159,6 +8507,40 @@ mod v003_viewer_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_texture_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn painted_clipboard_preview_is_not_freed_until_following_frame() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "clipboard-preview-lifecycle-test",
+            egui::ColorImage::new([2, 2], Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let texture_id = texture.id();
+        let mut pending = Some(texture);
+        let mut retired = Vec::new();
+
+        let painted = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                if let Some(preview) = &pending {
+                    ui.image(preview);
+                }
+                if let Some(preview) = pending.take() {
+                    retired.push(preview.clone());
+                }
+            });
+        });
+
+        assert!(!painted.textures_delta.free.contains(&texture_id));
+        retired.clear();
+        let released = ctx.run(egui::RawInput::default(), |_| {});
+        assert!(released.textures_delta.free.contains(&texture_id));
     }
 }
 

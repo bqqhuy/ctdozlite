@@ -247,21 +247,9 @@ fn take_enqueued_at(message: &ChatMessage) -> std::time::Instant {
 fn record_queue_wait(
     context: &crate::service_resolver::SendTimingContext,
     enqueued: std::time::Instant,
-) -> Result<()> {
+) {
     let elapsed = enqueued.elapsed();
     crate::service_resolver::record_queue_phase(context, elapsed);
-    if elapsed > crate::service_resolver::QUEUE_BUDGET {
-        crate::transfer_diagnostics::send_failure(
-            crate::transfer_diagnostics::SendFailure::QueueBudget,
-            None,
-            None,
-        );
-        return Err(anyhow::Error::new(SendBudgetElapsed(
-            crate::service_resolver::TimingPhase::QueueWait,
-        ))
-        .context(BeforeMessageSend));
-    }
-    Ok(())
 }
 fn timing_session_scope(session: &Session) -> usize {
     // Arc pointer addresses can be reused after logout. Include a keyed account
@@ -315,21 +303,20 @@ pub async fn send(s: &Session, to: &str, message: &ChatMessage) -> Result<ChatMe
     };
     let text = is_text_payload(&job.payload);
     let started = take_enqueued_at(message);
-    let context = timing::SendTimingContext::from_enqueue(
+    let send_started = std::time::Instant::now();
+    let context = timing::SendTimingContext::from_start(
         timing_session_scope(s),
         &message.client_message_id,
         job.attempt,
         job.is_group,
         text,
-        started,
+        send_started,
     );
-    let queue_result = record_queue_wait(&context, started);
+    record_queue_wait(&context, started);
     timing::with_send_timing(context, async {
-        let result = if let Err(error) = queue_result {
-            Err(error)
-        } else if text {
+        let result = if text {
             tokio::time::timeout_at(
-                tokio::time::Instant::from_std(started + timing::TEXT_TOTAL_BUDGET),
+                tokio::time::Instant::from_std(send_started + timing::TEXT_TOTAL_BUDGET),
                 send_inner(s, to, message),
             )
             .await
@@ -885,8 +872,9 @@ async fn source_from_store(s: &Session, msg_id: &str) -> Option<(String, bool)> 
     let account = s.clone();
     let id = msg_id.to_owned();
     tokio::task::spawn_blocking(move || {
-        crate::store::MessageStore::open(account.history_path())
+        crate::store::MessageStore::open_for_account_write(&account)
             .ok()?
+            .0
             .unique_thread_of_message(&id)
             .ok()
             .flatten()
@@ -977,6 +965,13 @@ impl Drop for Active {
 
 /// Keep transport URLs and encrypted request parameters out of the chat bubble.
 pub(crate) fn failure_message(error: &anyhow::Error) -> String {
+    let code = error
+        .downcast_ref::<crate::chat::ServerRejected>()
+        .and_then(|e| e.code)
+        .or_else(|| crate::session::envelope_failure_code(error));
+    if code == Some(204) {
+        return "Zalo không hỗ trợ định dạng tệp này (204). Dùng Tạo ZIP… để đóng gói vào bản nháp, kiểm tra rồi gửi. Tệp gốc được giữ nguyên.".into();
+    }
     for cause in error.chain() {
         if let Some(error) = cause.downcast_ref::<reqwest::Error>() {
             return if error.is_connect() { "Không kết nối được máy chủ gửi tin. Có thể do DNS, máy chủ hoặc đường truyền; kiểm tra hội thoại trước khi gửi lại." }
@@ -1038,7 +1033,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn expired_command_queue_keeps_the_intent_and_fails_before_transport() {
+    async fn delayed_command_queue_is_timed_but_does_not_expire_send_budget() {
         let _fixture = crate::service_resolver::TIMING_FIXTURE.lock().await;
         let session = Session::new(false, false, false).unwrap();
         let message = pending("fixture queued payload".into(), false, Payload::Text);
@@ -1053,15 +1048,16 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(send_failure_kind(&error), SendFailureKind::NotSent);
+        assert!(!error.to_string().contains("QueueWait"));
         assert_eq!(message.text, "fixture queued payload");
         assert!(message.outgoing_job.is_some());
         assert!(session.request_attempt_timings().is_empty());
         assert!(send_timings(&session).iter().any(|s| s.phase
             == crate::service_resolver::TimingPhase::QueueWait
             && s.result == crate::service_resolver::AttemptResult::BudgetExceeded));
-        assert!(send_timings(&session).iter().any(|s| s.phase
-            == crate::service_resolver::TimingPhase::TotalIntent
-            && s.elapsed_ms >= 5000));
+        assert!(send_timings(&session)
+            .iter()
+            .any(|s| s.phase == crate::service_resolver::TimingPhase::TotalIntent));
     }
 
     #[tokio::test]

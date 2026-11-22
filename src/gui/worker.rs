@@ -1,5 +1,148 @@
 use super::*;
 
+#[derive(Default)]
+struct EarlyVoiceResults(
+    HashMap<(usize, String), (crate::chat::VoiceToTextPushResult, std::time::Instant)>,
+);
+type VoiceTicketMap = HashMap<(usize, String), (String, String, u64, std::time::Instant)>;
+fn voice_result_text(result: crate::chat::VoiceToTextPushResult) -> String {
+    let text = result.text.unwrap_or_default();
+    if result.is_truncated {
+        format!("{text}\n\n[Bản chép lời chưa đầy đủ]")
+    } else {
+        text
+    }
+}
+#[derive(Default)]
+struct VoiceCorrelations {
+    pending: VoiceTicketMap,
+    early: EarlyVoiceResults,
+}
+impl VoiceCorrelations {
+    fn remove_matching(
+        &mut self,
+        runtime: usize,
+        request: &str,
+        thread: &str,
+        message: &str,
+        generation: u64,
+    ) -> Option<(String, String, u64, std::time::Instant)> {
+        let key = (runtime, request.to_owned());
+        if self
+            .pending
+            .get(&key)
+            .is_some_and(|(th, mid, gen, _)| th == thread && mid == message && *gen == generation)
+        {
+            self.pending.remove(&key)
+        } else {
+            None
+        }
+    }
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.early.0.clear();
+    }
+}
+impl std::ops::Deref for VoiceCorrelations {
+    type Target = VoiceTicketMap;
+    fn deref(&self) -> &Self::Target {
+        &self.pending
+    }
+}
+impl std::ops::DerefMut for VoiceCorrelations {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pending
+    }
+}
+impl EarlyVoiceResults {
+    fn insert(&mut self, runtime: usize, result: crate::chat::VoiceToTextPushResult) {
+        self.0.retain(|(owner, _), (_, at)| {
+            *owner == runtime && at.elapsed() < Duration::from_secs(30)
+        });
+        if self.0.len() >= 128 {
+            if let Some(key) = self
+                .0
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(key, _)| key.clone())
+            {
+                self.0.remove(&key);
+            }
+        }
+        self.0.insert(
+            (runtime, result.req_id.clone()),
+            (result, std::time::Instant::now()),
+        );
+    }
+    fn take(
+        &mut self,
+        runtime: usize,
+        request: &str,
+    ) -> Option<crate::chat::VoiceToTextPushResult> {
+        self.0
+            .remove(&(runtime, request.to_owned()))
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(30))
+            .map(|(result, _)| result)
+    }
+}
+
+#[cfg(test)]
+mod early_voice_tests {
+    use super::*;
+    #[test]
+    fn old_voice_timeout_does_not_remove_new_runtime_or_message_ticket() {
+        let mut map = VoiceCorrelations::default();
+        map.pending.insert(
+            (2, "shared-id".into()),
+            (
+                "thread".into(),
+                "new-message".into(),
+                2,
+                std::time::Instant::now(),
+            ),
+        );
+        assert!(map
+            .remove_matching(1, "shared-id", "thread", "old-message", 1)
+            .is_none());
+        assert!(map
+            .remove_matching(2, "shared-id", "thread", "old-message", 2)
+            .is_none());
+        assert_eq!(map.pending.len(), 1);
+        assert!(map
+            .remove_matching(2, "shared-id", "thread", "new-message", 2)
+            .is_some());
+    }
+    #[test]
+    fn early_voice_push_is_scoped_to_runtime_and_consumed_once() {
+        let mut early = EarlyVoiceResults::default();
+        early.insert(
+            1,
+            crate::chat::VoiceToTextPushResult {
+                req_id: "request".into(),
+                text: Some("Xin chào".into()),
+                error_code: 0,
+                is_truncated: false,
+            },
+        );
+        assert!(early.take(2, "request").is_none());
+        assert_eq!(
+            early.take(1, "request").unwrap().text.as_deref(),
+            Some("Xin chào")
+        );
+        assert!(early.take(1, "request").is_none());
+    }
+    #[test]
+    fn truncated_voice_result_is_labelled_as_partial_text() {
+        let result = crate::chat::VoiceToTextPushResult {
+            req_id: "partial".into(),
+            text: Some("Xin chào".into()),
+            error_code: 0,
+            is_truncated: true,
+        };
+        assert!(voice_result_text(result).ends_with("[Bản chép lời chưa đầy đủ]"));
+    }
+}
+
 fn voice_send_session_matches(
     session_active: bool,
     actual_owner: &str,
@@ -234,6 +377,7 @@ pub enum WorkerCmd {
     },
     ReadClipboardImage {
         owner: String,
+        runtime_id: usize,
         thread: String,
     },
     /// Open the Windows region picker and attach the capture like a pasted image.
@@ -448,7 +592,16 @@ pub enum WorkerCmd {
         thread: String,
         images_only: bool,
     },
+    PrepareAttachmentArchive {
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        path: std::path::PathBuf,
+        stamp: Option<crate::outgoing::FileStamp>,
+    },
     PickAndSendAttachment {
+        owner: String,
+        runtime_id: usize,
         to_id: String,
         is_group: bool,
         images_only: bool,
@@ -597,6 +750,13 @@ pub enum WorkerCmd {
         owner: String,
         threads: Vec<Thread>,
     },
+    PersistThreadMetadata {
+        owner: String,
+        runtime_id: usize,
+        thread_id: String,
+        name: String,
+        is_group: bool,
+    },
     ResumeUpload {
         upload_id: String,
     },
@@ -622,13 +782,192 @@ pub enum WorkerCmd {
         msg_id: String,
         voice_url: String,
         generation: u64,
+        context: ChatImage,
+    },
+    PlayInlineVoice {
+        binding: inline_voice::Binding,
+        controls: inline_voice::Controls,
+        context: ChatImage,
     },
 }
+
+/// Accounts for accepted intents even when their queue or Tokio task is dropped.
+#[derive(Clone)]
+struct OutgoingLifecycle {
+    state: std::sync::Arc<std::sync::Mutex<OutgoingLifecycleState>>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+}
+#[derive(Default)]
+struct OutgoingLifecycleState {
+    next: u64,
+    intents: HashMap<u64, TrackedOutgoing>,
+    retired_started: HashMap<u64, TrackedOutgoing>,
+    retired: std::collections::HashSet<usize>,
+    closed: bool,
+}
+#[derive(Clone)]
+struct TrackedOutgoing {
+    owner: String,
+    runtime_id: usize,
+    thread: String,
+    message: ChatMessage,
+    started: bool,
+}
+struct OutgoingTicket {
+    lifecycle: OutgoingLifecycle,
+    id: u64,
+}
+impl OutgoingLifecycle {
+    fn new(events: Sender<GuiEvent>, ctx: egui::Context) -> Self {
+        Self {
+            state: Default::default(),
+            events,
+            ctx,
+        }
+    }
+    fn accept(
+        &self,
+        owner: String,
+        runtime_id: usize,
+        thread: String,
+        message: ChatMessage,
+    ) -> OutgoingTicket {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.next += 1;
+        let id = state.next;
+        let entry = TrackedOutgoing {
+            owner,
+            runtime_id,
+            thread,
+            message,
+            started: false,
+        };
+        if state.closed || state.retired.contains(&runtime_id) {
+            self.publish(entry, None);
+        } else {
+            state.intents.insert(id, entry);
+        }
+        OutgoingTicket {
+            lifecycle: self.clone(),
+            id,
+        }
+    }
+    fn publish(&self, entry: TrackedOutgoing, final_message: Option<ChatMessage>) {
+        let message = final_message.unwrap_or_else(|| {
+            let mut message = outgoing_not_sent(entry.message, "Phiên gửi đã đóng trước khi gửi");
+            if entry.started {
+                message.delivery = crate::message_model::DeliveryState::DeliveryUnknown;
+                if let Some(job) = message.outgoing_job.as_mut() {
+                    job.error = "Lần gửi bị gián đoạn; kiểm tra hội thoại trước khi gửi lại để tránh trùng tin".into();
+                }
+            }
+            message
+        });
+        let _ = self.events.send(GuiEvent::OutgoingState {
+            runtime_id: entry.runtime_id,
+            owner: entry.owner,
+            thread_id: entry.thread,
+            message,
+        });
+        self.ctx.request_repaint();
+    }
+    fn retire(&self, runtime_id: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.retired.insert(runtime_id);
+        let ids: Vec<_> = state
+            .intents
+            .iter()
+            .filter_map(|(id, entry)| (entry.runtime_id == runtime_id).then_some(*id))
+            .collect();
+        for id in ids {
+            if let Some(entry) = state.intents.remove(&id) {
+                self.publish(entry.clone(), None);
+                if entry.started {
+                    state.retired_started.insert(id, entry);
+                }
+            }
+        }
+    }
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        let intents: Vec<_> = state.intents.drain().collect();
+        for (id, entry) in intents {
+            self.publish(entry.clone(), None);
+            if entry.started {
+                state.retired_started.insert(id, entry);
+            }
+        }
+    }
+}
+impl OutgoingTicket {
+    fn update(&self, message: ChatMessage) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.intents.get_mut(&self.id) {
+            entry.message = message;
+        }
+    }
+    fn start(&self) -> bool {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = state.intents.get_mut(&self.id) else {
+            return false;
+        };
+        entry.started = true;
+        true
+    }
+    fn finish(&self, message: ChatMessage) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state
+            .intents
+            .remove(&self.id)
+            .or_else(|| state.retired_started.remove(&self.id))
+        {
+            self.lifecycle.publish(entry, Some(message));
+        }
+    }
+}
+impl Drop for OutgoingTicket {
+    fn drop(&mut self) {
+        let mut state = self
+            .lifecycle
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = state.intents.remove(&self.id) {
+            self.lifecycle.publish(entry, None);
+        }
+        state.retired_started.remove(&self.id);
+    }
+}
+struct OutgoingRuntimeGuard(OutgoingLifecycle);
+impl Drop for OutgoingRuntimeGuard {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+type OutgoingDispatch = (String, usize, String, ChatMessage, OutgoingTicket);
 
 // Replaceable mailbox: each logout tears down the old worker runtime and event channel.
 #[derive(Clone)]
 pub(super) struct WorkerSender {
     commands: tokio::sync::mpsc::UnboundedSender<WorkerCmd>,
+    outgoing: Option<tokio::sync::mpsc::UnboundedSender<OutgoingDispatch>>,
+    lifecycle: OutgoingLifecycle,
+    identity: std::sync::Arc<std::sync::RwLock<(String, usize)>>,
     images: tokio::sync::mpsc::Sender<(String, String, Option<ChatImage>)>,
     events: Sender<GuiEvent>,
     ctx: egui::Context,
@@ -657,10 +996,39 @@ impl WorkerSender {
             other => {
                 if let Some((thread_id, message)) = outgoing_command(&other) {
                     crate::outgoing::mark_queued(&message);
-                    return self
-                        .commands
-                        .send(WorkerCmd::RetryOutgoing { thread_id, message })
-                        .map_err(|_| ());
+                    crate::runtime_metrics::dispatched(&message.client_message_id);
+                    let Some(outgoing) = &self.outgoing else {
+                        return self
+                            .commands
+                            .send(WorkerCmd::RetryOutgoing { thread_id, message })
+                            .map_err(|_| ());
+                    };
+                    // The worker resolves owner/runtime at admission time. Capturing identity
+                    // in this UI sender allowed a QR/password login to leave a stale identity.
+                    let (owner, runtime_id) = self
+                        .identity
+                        .read()
+                        .map(|identity| identity.clone())
+                        .unwrap_or_else(|poisoned| poisoned.into_inner().clone());
+                    let ticket = self.lifecycle.accept(
+                        owner.clone(),
+                        runtime_id,
+                        thread_id.clone(),
+                        message.clone(),
+                    );
+                    if outgoing
+                        .send((
+                            owner.clone(),
+                            runtime_id,
+                            thread_id.clone(),
+                            message.clone(),
+                            ticket,
+                        ))
+                        .is_err()
+                    {
+                        // Dropping the failed-send envelope publishes its terminal result.
+                    }
+                    return Ok(());
                 }
                 return self.commands.send(other).map_err(|_| ());
             }
@@ -685,6 +1053,9 @@ impl WorkerSender {
         let (events, _) = std::sync::mpsc::channel();
         Self {
             commands,
+            outgoing: None,
+            lifecycle: OutgoingLifecycle::new(events.clone(), ctx.clone()),
+            identity: std::sync::Arc::new(std::sync::RwLock::new((String::new(), 0))),
             images,
             events,
             ctx,
@@ -1106,8 +1477,11 @@ async fn persist_received_since(
     let session = session.clone();
     let mut batch = threads.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Thread>, bool)> {
+        let _timing =
+            crate::runtime_metrics::Scope::new(crate::runtime_metrics::Metric::ReceivedWrite);
         anyhow::ensure!(session.is_active(), "Account changed");
-        let mut store = crate::store::MessageStore::open(session.history_path())?;
+        let (mut store, _write_permit) =
+            crate::store::MessageStore::open_for_account_write(&session)?;
         store.filter_deleted(&mut batch)?;
         // Once deletion filtering succeeds, a cache-write or automation failure must
         // not suppress otherwise valid live delivery (history persistence is fail-open).
@@ -1122,7 +1496,8 @@ async fn persist_received_since(
                 }
                 true
             }
-            Err(_) => {
+            Err(error) => {
+                crate::runtime_metrics::database_error(&error);
                 eprintln!("Cannot persist received message batch; delivering filtered messages");
                 false
             }
@@ -1141,6 +1516,11 @@ async fn persist_received_since(
         Ok(Ok((batch, stored))) => {
             *threads = batch;
             stored
+        }
+        Ok(Err(error)) => {
+            crate::runtime_metrics::database_error(&error);
+            threads.clear();
+            false
         }
         _ => {
             eprintln!("Cannot persist or filter received message batch");
@@ -1263,7 +1643,19 @@ pub(super) fn spawn_session_worker(
     egui_ctx: egui::Context,
 ) {
     session.hidden.enable();
+    let outgoing_lifecycle = OutgoingLifecycle::new(gui_tx.clone(), egui_ctx.clone());
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+    let (outgoing_tx, mut outgoing_rx) = tokio::sync::mpsc::unbounded_channel::<(
+        String,
+        usize,
+        String,
+        ChatMessage,
+        OutgoingTicket,
+    )>();
+    let outgoing_identity = std::sync::Arc::new(std::sync::RwLock::new((
+        session.account_key().to_owned(),
+        session.runtime_id(),
+    )));
     let live_updates = std::sync::Arc::new(crate::live_updates::LiveUpdates::default());
     let image_jobs = crate::media_resources::MediaJobQueue::default();
     let commands = cmd_tx.downgrade();
@@ -1271,6 +1663,9 @@ pub(super) fn spawn_session_worker(
         tokio::sync::mpsc::channel::<(String, String, Option<ChatImage>)>(128);
     WORKER_TX.set(WorkerSender {
         commands: cmd_tx,
+        outgoing: Some(outgoing_tx),
+        lifecycle: outgoing_lifecycle.clone(),
+        identity: outgoing_identity.clone(),
         images: image_tx.clone(),
         events: gui_tx.clone(),
         ctx: egui_ctx.clone(),
@@ -1308,8 +1703,28 @@ pub(super) fn spawn_session_worker(
                 .enable_all()
                 .build()
                 .unwrap();
+            let _outgoing_shutdown = OutgoingRuntimeGuard(outgoing_lifecycle.clone());
 
             rt.block_on(async move {
+                tokio::spawn(crate::runtime_metrics::export_loop());
+                {
+                    let session = session.clone();
+                    let tx = gui_tx.clone();
+                    let ctx = egui_ctx.clone();
+                    tokio::spawn(async move {
+                        while let Some((owner, runtime_id, thread_id, message, ticket)) = outgoing_rx.recv().await {
+                            let current = session.lock().await.clone();
+                            if !outgoing_identity_matches(
+                                current.is_active(), current.account_key(), current.runtime_id(),
+                                &owner, runtime_id,
+                            ) {
+                                ticket.finish(outgoing_not_sent(message, "Phiên tài khoản đã thay đổi trước khi gửi"));
+                                continue;
+                            }
+                            spawn_outgoing_send(current, session.clone(), tx.clone(), ctx.clone(), owner, thread_id, message, ticket);
+                        }
+                    });
+                }
                 {
                     let shared=session.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();let notify=metadata_notify.clone();let gate=metadata_gate.clone();let cache_started=metadata_cache_started.clone();let metadata_live=live_updates.clone();
                     tokio::spawn(async move {let mut tick=tokio::time::interval(Duration::from_secs(3));let mut previous=String::new();let mut at=std::time::Instant::now()-Duration::from_secs(121);
@@ -1319,19 +1734,25 @@ pub(super) fn spawn_session_worker(
                             if !requested && owner==previous && at.elapsed()<Duration::from_secs(900){continue;}
                             let _gate=gate.lock().await;
                             if previous!=owner {
-                                if !cache_started.swap(true,std::sync::atomic::Ordering::SeqCst) {if let Ok(Some(snapshot))=crate::account_metadata::restore_cached(&account).await {let _=tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),snapshot:Box::new(snapshot)});}}
+                                if !cache_started.swap(true,std::sync::atomic::Ordering::SeqCst) {if let Ok(Some(snapshot))=crate::account_metadata::restore_cached(&account).await {let _=tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});}}
                                 if let Ok(Some(view))=crate::hidden_chat::restore_cached(&account).await {let _=tx.send(GuiEvent::Hidden {owner:owner.clone(),generation:None,view,result:Ok(())});ctx.request_repaint();}
                             }
                             previous=owner.clone();at=std::time::Instant::now();
                             let hidden=async {let result=crate::hidden_chat::execute(&account,&crate::hidden_chat::Action::Read).await.map(|_|()).map_err(|error|error.to_string());let _=tx.send(GuiEvent::Hidden {owner:owner.clone(),generation:None,view:account.hidden.view(&owner),result});ctx.request_repaint();};
-                            let (_,snapshot)=tokio::join!(hidden,crate::account_metadata::read(&account));
+                            let publish_names = |snapshot| {
+                                if account.is_active() {
+                                    let _ = tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});
+                                    ctx.request_repaint();
+                                }
+                            };
+                            let (_,snapshot)=tokio::join!(hidden,crate::account_metadata::read(&account, publish_names));
                             if !account.is_active(){break;}
                             if let Ok(mut policy)=account.inbox_policy.write(){if let Some(friends)=&snapshot.friends{policy.friends=Some(friends.clone());}
                                 if let Some(business)=snapshot.business{policy.business=Some(business);}
                                 if let Some(privacy)=&snapshot.privacy{policy.direct=privacy.values.get(&crate::privacy::Setting::StrangerDirect).map(|value|*value!=0);policy.show_online=privacy.values.get(&crate::privacy::Setting::ShowOnline).map(|value|*value!=0);}}
 
                             crate::account_metadata::save_cached(&account,&snapshot).await;
-                            let _=tx.send(GuiEvent::AccountMetadata {owner,snapshot:Box::new(snapshot)});ctx.request_repaint();
+                            let _=tx.send(GuiEvent::AccountMetadata {owner,runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});ctx.request_repaint();
                         }
                     });
                 }
@@ -1396,7 +1817,20 @@ pub(super) fn spawn_session_worker(
                         Ok(cached) => live_updates.seed(&cached),
                         Err(_) => crate::logger::log_error("live baseline", "Cannot prime cached message identities"),
                     }
-                    let _ = crate::login::get_server_info(&s).await;
+                    match crate::login::get_server_info(&s).await {
+                        Ok(response) if s.is_active() => {
+                            if let Some(config) = super::composer_config::ComposerConfig::from_server_info(&response) {
+                                let _ = gui_tx.send(GuiEvent::ComposerConfig {
+                                    owner: s.account_key().to_owned(),
+                                    runtime_id: s.runtime_id(),
+                                    config,
+                                });
+                                egui_ctx.request_repaint();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(_) => crate::logger::log_error("composer config", "Cannot refresh server composer configuration; using defaults"),
+                    }
                     hydrate_e2ee_peers(&s, &gui_tx, &egui_ctx);
                 }
                 {
@@ -1427,11 +1861,12 @@ pub(super) fn spawn_session_worker(
                 let is_ws_connected_poll = is_ws_connected.clone();
 
                 // Correlation map for voice-to-text tickets: req_id -> (thread_id, msg_id, generation, Instant)
-                type PendingV2tStore = HashMap<String, (String, String, u64, std::time::Instant)>;
+                type PendingV2tStore = VoiceCorrelations;
                 let pending_v2t_tickets: std::sync::Arc<tokio::sync::Mutex<PendingV2tStore>> =
-                    std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                    std::sync::Arc::new(tokio::sync::Mutex::new(VoiceCorrelations::default()));
                 let pending_v2t_ws = pending_v2t_tickets.clone();
 
+                let p3_name_jobs = p3_start_name_worker(gui_tx.clone(), egui_ctx.clone());
                 // 1) Real-time `zpw_ws` WebSocket loop for instant chat messages + VoIP events
                 {
                     let live_updates = live_updates.clone();
@@ -1442,23 +1877,48 @@ pub(super) fn spawn_session_worker(
                     let gui_tx_ws = gui_tx.clone();
                     let ctx_ws = egui_ctx.clone();
                     let is_ws_connected_ws = is_ws_connected.clone();
+                    let p3_names = p3_name_jobs.clone();
                     tokio::spawn(async move {
                         let mut ws_rx: Option<
                             tokio::sync::mpsc::Receiver<crate::socket::WsEvent>,
                         > = None;
                         let mut ws_sek = String::new();
+                        let mut ws_runtime = None;
+                        let mut ws_owner: Option<Session> = None;
+                        let mut p3_side_workers: Option<P3SideWorkers> = None;
                         loop {
                             let s_snap = s_ws.lock().await.clone();
                             if s_snap.login.is_some() {
                                 let cur_sek = s_snap.zpw_sek.clone().unwrap_or_default();
-                                if !cur_sek.is_empty() && (ws_rx.is_none() || ws_sek != cur_sek) {
+                                if !cur_sek.is_empty() && (ws_rx.is_none() || !p3_same_socket_owner(ws_runtime, &ws_sek, s_snap.runtime_id(), &cur_sek)) {
                                     ws_sek = cur_sek;
-                                    let (events,transport)=crate::socket::spawn_with_sync(s_snap.clone());
+                                    ws_runtime = Some(s_snap.runtime_id());
+                                    ws_owner = Some(s_snap.clone());
+                                    let (events,mut priority,transport)=crate::socket::spawn_with_sync_priority(s_snap.clone());
                                     ws_rx = Some(events);
+                                    let priority_account = s_snap.clone();
+                                    let priority_bridge = cb.clone();
+                                    let priority_notify = metadata_notify.clone();
+                                    let priority_events = gui_tx_ws.clone();
+                                    let priority_ctx = ctx_ws.clone();
+                                    let priority_task = tokio::spawn(async move {
+                                        while let Some(event) = priority.recv().await {
+                                            if !priority_account.is_active() { break; }
+                                            let data = event.payload.get("data").unwrap_or(&event.payload);
+                                            for control in crate::call::extract_voip_controls(data) {
+                                                priority_bridge.handle_control_event(control);
+                                            }
+                                            apply_metadata_impact(&priority_account, crate::account_controls::from_frame(&event), &priority_notify, &priority_events, &priority_ctx);
+                                            p3_publish_typing(&priority_account, &event.payload, &priority_events, &priority_ctx);
+                                        }
+                                    });
+                                    p3_side_workers = Some(p3_start_side_workers(s_snap.clone(), gui_tx_ws.clone(), ctx_ws.clone(), priority_task));
                                     tokio::spawn(crate::phone_sync::clean_after_connect(s_snap.clone(),transport.clone()));
                                     let account=s_snap.clone();let notify=metadata_notify.clone();let mut epochs=transport.epochs();let epoch_tx=gui_tx_ws.clone();let epoch_ctx=ctx_ws.clone();
                                     tokio::spawn(async move {while epochs.changed().await.is_ok(){if !account.is_active(){break;}
-                                        if epochs.borrow().is_some(){account.hidden.lock();let _=epoch_tx.send(GuiEvent::Hidden {owner:account.account_key().into(),generation:None,view:account.hidden.view(account.account_key()),result:Ok(())});apply_metadata_impact(&account,crate::account_controls::Impact {all_groups:true,..Default::default()},&notify,&epoch_tx,&epoch_ctx);notify.notify_one();}}});
+                                        // Controls have no durable message cursor. A new epoch conservatively
+                                        // invalidates privacy/account caches in case an overloaded epoch lost hints.
+                                        if epochs.borrow().is_some(){account.hidden.lock();let _=epoch_tx.send(GuiEvent::Hidden {owner:account.account_key().into(),generation:None,view:account.hidden.view(account.account_key()),result:Ok(())});apply_metadata_impact(&account,crate::account_controls::Impact::for_account_switch(),&notify,&epoch_tx,&epoch_ctx);notify.notify_one();}}});
                                     phone_transport_tx.send_replace(Some(transport.clone()));
                                     // WP15.1-D: liveness thật từ transport epoch (Some = đã auth),
                                     // thay cho detection theo "có nhận event" (sai khi idle/half-dead).
@@ -1479,37 +1939,29 @@ pub(super) fn spawn_session_worker(
                                     .await
                                     {
                                         Ok(Some(ev)) => {
+                                            let Some(s_snap) = ws_owner.as_ref().filter(|owner| owner.is_active()) else { continue; };
+                                            let _page_timing = crate::runtime_metrics::Scope::new(crate::runtime_metrics::Metric::IngressPage);
                                             // WP15.1-D: liveness lấy từ epoch watch (spawn ở trên),
                                             // không set theo activity event — idle-but-connected vẫn connected.
                                             let data_node = ev
                                                 .payload
                                                 .get("data")
                                                 .unwrap_or(&ev.payload);
-                                            for voip_ev in
-                                                crate::call::extract_voip_controls(data_node)
-                                            {
-                                                cb.handle_control_event(voip_ev);
-                                            }
-                                            apply_metadata_impact(&s_snap,crate::account_controls::from_frame(&ev),&metadata_notify,&gui_tx_ws,&ctx_ws);
-                                            deliver_presence(&s_snap, &ev.payload, &gui_tx_ws, &ctx_ws).await;
+                                            // Call, typing, and privacy invalidation use the priority consumer.
                                             let reaction_events=crate::reaction_pipeline::events(&ev.payload);
                                             let has_reactions=!reaction_events.is_empty();
                                             let reactions_stored=if reaction_events.is_empty(){true}else{
-                                                let account=s_snap.clone();
-                                                match tokio::task::spawn_blocking(move||->anyhow::Result<_>{let store=crate::store::MessageStore::open(account.history_path())?;crate::reaction_pipeline::enqueue(&store,&reaction_events)?;crate::reaction_pipeline::drain(&store,&account)}).await {
-                                                    Ok(Ok(threads))=>{if !threads.is_empty(){let _=gui_tx_ws.send(GuiEvent::ThreadsUpdated{threads,source:ThreadUpdateSource::History});ctx_ws.request_repaint();}true},
-                                                    _=>{crate::logger::log_error("reaction","Cannot persist incoming reaction page");false}
-                                                }
+                                                p3_enqueue_reactions(s_snap, reaction_events).await
                                             };
 
-                                            if let Some(v2t) = crate::socket::parse_voice_to_text_push(&ev.payload) {
-                                                let mut map = pending_v2t_ws.lock().await;
-                                                if let Some((thread_id, msg_id, generation, _)) = map.remove(&v2t.req_id) {
+                                            for v2t in crate::socket::parse_voice_to_text_pushes(&ev.payload) {
+                                                let pending={let mut map=pending_v2t_ws.lock().await;let pending=map.remove(&(s_snap.runtime_id(),v2t.req_id.clone()));if pending.is_none(){map.early.insert(s_snap.runtime_id(),v2t.clone());}pending};
+                                                if let Some((thread_id, msg_id, generation, _)) = pending {
                                                     if v2t.error_code == 0 && v2t.text.is_some() {
                                                         let _ = gui_tx_ws.send(GuiEvent::VoiceTranscriptLoaded {
                                                             thread_id,
                                                             msg_id,
-                                                            transcript: v2t.text.unwrap_or_default(),
+                                                            transcript: voice_result_text(v2t),
                                                             generation,
                                                         });
                                                     } else {
@@ -1524,10 +1976,6 @@ pub(super) fn spawn_session_worker(
                                                 }
                                             }
 
-                                            if ev.is_voip_ish() {
-                                                let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
-                                                apply_server_mutes(&s_snap, mutes, &mute_sync, &gui_tx_ws, &live_updates, &ctx_ws).await;
-                                            }
                                             if ev.is_chat_ish() || has_reactions || data_node.get("clearUnreads").is_some()
                                                 || data_node.get("clearUnreadInfo").is_some() || data_node.get("chatEntries").is_some() || data_node.get("statusMap").is_some() {
                                                 let mut ws_threads = Vec::new();
@@ -1555,23 +2003,33 @@ pub(super) fn spawn_session_worker(
                                                 ws_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
                                                 let mut stored = true;
                                                 if !ws_threads.is_empty() {
-                                                    crate::chat::resolve_thread_names(
-                                                        &s_snap,
-                                                        &mut ws_threads,
-                                                    )
-                                                    .await;
-                                                    stored = persist_received(&s_snap, &mut ws_threads).await;
-                                                    if publish_live(&s_snap, &live_updates, ws_threads) {
+                                                    stored = persist_received(s_snap, &mut ws_threads).await;
+                                                    p3_resolve_names_later(&p3_names, s_snap, &ws_threads);
+                                                    if publish_live(s_snap, &live_updates, ws_threads) {
                                                         let _ = gui_tx_ws.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                                     }
                                                     ctx_ws.request_repaint();
                                                 }
                                                 // Like Zalo PC, a queue cursor advances only after its page is stored.
-                                                crate::queue_cursors::commit_socket(&s_snap, ev.cmd, ev.sub_cmd, &ev.payload, stored && reactions_stored).await;
+                                                let receipts_stored = p3_deliver_receipts(s_snap, &ev.payload, &gui_tx_ws, &ctx_ws).await;
+                                                crate::queue_cursors::commit_socket(s_snap, ev.cmd, ev.sub_cmd, &ev.payload, stored && reactions_stored && receipts_stored).await;
+                                            } else {
+                                                // Non-message controls do not carry a message-queue cursor.
+                                                p3_deliver_receipts(s_snap, &ev.payload, &gui_tx_ws, &ctx_ws).await;
+                                            }
+                                            if has_reactions && reactions_stored {
+                                                if let Some(workers) = &p3_side_workers { workers.reactions.notify_one(); }
+                                            }
+                                            if ev.is_voip_ish() {
+                                                let mutes = crate::mute_sync::parse_mute_controls(data_node, crate::login::unix_now());
+                                                apply_server_mutes(s_snap, mutes, &mute_sync, &gui_tx_ws, &live_updates, &ctx_ws).await;
                                             }
                                         }
                                         Ok(None) => {
                                             ws_rx = None;
+                                            ws_owner = None;
+                                            ws_runtime = None;
+                                            p3_side_workers = None;
                                             tokio::time::sleep(Duration::from_secs(2)).await;
                                         }
                                         Err(_) => {}
@@ -1581,6 +2039,9 @@ pub(super) fn spawn_session_worker(
                                 }
                             } else {
                                 ws_rx = None;
+                                ws_owner = None;
+                                ws_runtime = None;
+                                p3_side_workers = None;
                                 ws_sek.clear();
                                 tokio::time::sleep(Duration::from_secs(3)).await;
                             }
@@ -1680,8 +2141,9 @@ pub(super) fn spawn_session_worker(
                         let s = session_clone.lock().await.clone();
                         if s.is_active() {
                             let sessions = tokio::task::spawn_blocking(move || {
-                                crate::store::MessageStore::open(s.history_path())?
-                                    .list_upload_sessions()
+                                let (store, _write_permit) =
+                                    crate::store::MessageStore::open_for_account_write(&s)?;
+                                store.list_upload_sessions()
                             })
                             .await
                             .ok()
@@ -1711,50 +2173,19 @@ pub(super) fn spawn_session_worker(
                 let mut recovered_accounts=HashSet::new();
                 let automation_running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 while let Some(cmd) = cmd_rx.recv().await {
-                    if let Some((thread_id, mut message)) = outgoing_command(&cmd) {
-                        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else { continue; };
+                    if let Some((thread_id, message)) = outgoing_command(&cmd) {
                         let tx = gui_tx.clone();
                         let ctx = egui_ctx.clone();
                         // Capture the session before spawning so the intent remains bound to its account.
                         let s = session.lock().await.clone();
                         let owner = s.account_key().to_owned();
-                        let session_arc = session.clone();
-                        tokio::spawn(async move {
-                            let active = active;
-                            message.delivery = crate::message_model::DeliveryState::Pending;
-                            if let Some(job) = message.outgoing_job.as_mut() { job.error.clear(); }
-                            // Instant optimistic UI update
-                            let _ = tx.send(GuiEvent::OutgoingState { runtime_id: s.runtime_id(), owner: owner.clone(), thread_id: thread_id.clone(), message: message.clone() });
-                            ctx.request_repaint();
-                            // Persist in background concurrently
-                            let s_persist = s.clone();
-                            let t_persist = thread_id.clone();
-                            let m_persist = message.clone();
-                            tokio::spawn(async move {
-                                persist_outgoing(&s_persist, &t_persist, &m_persist).await;
-                            });
-                            let result = crate::outgoing::send(&s, &thread_id, &message).await;
-                            let expired = result.as_ref().err().is_some_and(|error| error.chain().any(|cause| is_session_expired_error(&cause.to_string())));
-                            match result {
-                                Ok(sent) => message = sent,
-                                Err(error) => {
-                                    message.delivery = crate::outgoing::failure_delivery(&error);
-                                    if let Some(job) = message.outgoing_job.as_mut() { job.error = crate::outgoing::failure_message(&error); }
-                                }
-                            }
-                            persist_outgoing(&s, &thread_id, &message).await;
-                            drop(active);
-                            let _ = tx.send(GuiEvent::OutgoingState { runtime_id: s.runtime_id(), owner, thread_id, message });
-                            if expired && s.is_active() {
-                                let mut current = session_arc.lock().await;
-                                if current.runtime_id() != s.runtime_id() { return; }
-                                current.logout();
-                                drop(current);
-                                let _ = tokio::task::spawn_blocking(crate::storage::remove_session).await;
-                                let _ = tx.send(GuiEvent::SessionExpired("Không thể gửi vì phiên đăng nhập đã hết hạn".into()));
-                            }
-                            ctx.request_repaint();
-                        });
+                        if owner.is_empty() || !s.is_active() {
+                            emit_outgoing_not_sent(s.runtime_id(), owner, thread_id, message,
+                                "Phiên đăng nhập đã đóng trước khi gửi", &tx, &ctx);
+                            continue;
+                        }
+                        let ticket = outgoing_lifecycle.accept(owner.clone(), s.runtime_id(), thread_id.clone(), message.clone());
+                        spawn_outgoing_send(s, session.clone(), tx, ctx, owner, thread_id, message, ticket);
                         continue;
                     }
                     match cmd {
@@ -1763,7 +2194,8 @@ pub(super) fn spawn_session_worker(
                             let id=thread.clone();let expected=owner.clone();
                             let result=tokio::task::spawn_blocking(move||->anyhow::Result<crate::mentions::Draft>{
                                 anyhow::ensure!(s.is_active() && !expected.is_empty() && s.account_key()==expected,"Tài khoản đã thay đổi");
-                                crate::store::MessageStore::open(s.history_path())?.composer_document(&id)
+                                let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s)?;
+                                store.composer_document(&id)
                             }).await.map_err(|_|"Không đọc được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không đọc được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftLoaded{owner,thread,generation,result});egui_ctx.request_repaint();
                         }
@@ -1772,7 +2204,8 @@ pub(super) fn spawn_session_worker(
                             let (id,expected,value)=(thread.clone(),owner.clone(),text.clone());
                             let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
                                 anyhow::ensure!(s.is_active() && !expected.is_empty() && s.account_key()==expected,"Tài khoản đã thay đổi");
-                                crate::store::MessageStore::open(s.history_path())?.save_composer_document(&id,&value)
+                                let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s)?;
+                                store.save_composer_document(&id,&value)
                             }).await.map_err(|_|"Không lưu được bản nháp".to_owned()).and_then(|r|r.map_err(|_|"Không lưu được bản nháp".into()));
                             let _=gui_tx.send(GuiEvent::ComposerDraftSaved{owner,thread,generation,text,result});egui_ctx.request_repaint();
                         }
@@ -1912,7 +2345,7 @@ pub(super) fn spawn_session_worker(
                                 let _permit=permit;
                                 let result=tokio::task::spawn_blocking(move||->anyhow::Result<_>{
                                     anyhow::ensure!(account.is_active(),"Phiên đã đóng");
-                                    let store=crate::store::MessageStore::open(account.history_path())?;
+                                    let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
                                     let ids=crate::message_lifecycle::purge(&store.conn,crate::login::unix_now()*1000)?;
                                     crate::message_lifecycle::clean_restored(&account,&store.conn)?;let updates=crate::reaction_pipeline::drain(&store,&account)?;Ok((ids,updates))
                                 }).await;
@@ -1928,7 +2361,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let account=s.clone();let owner=s.account_key().to_owned();
                             let due=tokio::task::spawn_blocking(move ||->anyhow::Result<_>{
                                 if !account.is_active(){return Ok(None);}
-                                let store=crate::store::MessageStore::open(account.history_path())?;
+                                let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
                                 if recover{crate::tools::recover(&store,&owner)?;}
                                 crate::tools::claim(&store,&owner,crate::login::unix_now())
                             }).await;
@@ -1940,7 +2373,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     let _automation=automation_guard;
                                     let Some(active)=crate::outgoing::Active::start(&task.message.client_message_id)else{
                                         let account=s.clone();let id=task.id.clone();let owner=task.owner.clone();
-                                        let _=tokio::task::spawn_blocking(move||->anyhow::Result<()>{let store=crate::store::MessageStore::open(account.history_path())?;crate::tools::finish(&store,&owner,&id,"uncertain","Một lần gửi khác đang xử lý; kiểm tra hội thoại trước khi thử lại")}).await;
+                                        let _=tokio::task::spawn_blocking(move||->anyhow::Result<()>{let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;crate::tools::finish(&store,&owner,&id,"uncertain","Một lần gửi khác đang xử lý; kiểm tra hội thoại trước khi thử lại")}).await;
                                         return;
                                     };
                                     persist_outgoing(&s,&task.thread_id,&task.message).await;
@@ -1951,7 +2384,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     };
                                     persist_outgoing(&s,&task.thread_id,&message).await;
                                     let account=s.clone();let id=task.id.clone();let owner=task.owner.clone();
-                                    let result=tokio::task::spawn_blocking(move ||->anyhow::Result<_>{anyhow::ensure!(account.is_active(),"Đã đăng xuất");let store=crate::store::MessageStore::open(account.history_path())?;crate::tools::finish(&store,&owner,&id,status,&error)?;Ok(super::tools_panel::ToolsResult::Tasks{tasks:crate::tools::scheduled(&store,&owner)?,paused:crate::tools::paused(&store)?})}).await;
+                                    let result=tokio::task::spawn_blocking(move ||->anyhow::Result<_>{anyhow::ensure!(account.is_active(),"Đã đăng xuất");let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;crate::tools::finish(&store,&owner,&id,status,&error)?;Ok(super::tools_panel::ToolsResult::Tasks{tasks:crate::tools::scheduled(&store,&owner)?,paused:crate::tools::paused(&store)?})}).await;
                                     match result {Ok(Ok(result))=>{let _=tx.send(GuiEvent::Tools{owner:task.owner.clone(),result:Ok(result)});},_=>crate::logger::log_error("scheduler","Cannot finalize scheduled delivery")};
                                     drop(active);let _=tx.send(GuiEvent::OutgoingState{runtime_id:s.runtime_id(),owner:task.owner,thread_id:task.thread_id,message});ctx.request_repaint();
                                 });
@@ -1993,11 +2426,17 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
+                        WorkerCmd::PlayInlineVoice {binding,controls,context} => {
+                            let account=session.lock().await.clone();
+                            let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {play_inline_voice(account,binding,controls,context,tx,ctx).await;});
+                        }
                         WorkerCmd::TranscribeVoiceMessage {
                             thread_id,
                             msg_id,
                             voice_url,
                             generation,
+                            context,
                         } => {
                             let s_arc = session.clone();
                             let tx = gui_tx.clone();
@@ -2005,7 +2444,22 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let tickets = pending_v2t_tickets.clone();
                             tokio::spawn(async move {
                                 let s = s_arc.lock().await.clone();
-                                match crate::chat::submit_voice_to_text(&s, &voice_url, &msg_id, &thread_id).await {
+                                if !s.is_active() || generation!=s.runtime_id() as u64 {
+                                    let _=tx.send(GuiEvent::VoiceTranscriptFailed {thread_id,msg_id,error:"Phiên tài khoản đã thay đổi".into(),generation});ctx.request_repaint();return;
+                                }
+                                let result=async {
+                                    anyhow::ensure!(media_context_alive(&s,Some(&context)) && context.thread==thread_id && context.message.id==msg_id && !context.message.is_e2ee && context.message.kind!=crate::message_model::MessageKind::Recall,"Tin âm thanh không còn hợp lệ để chuyển thành văn bản");
+                                    let consent=tokio::task::spawn_blocking(||AppSettings::load().ai_translation_consent).await?;
+                                    anyhow::ensure!(consent,"Bạn chưa đồng ý chuyển giọng nói bằng AI trong Cài đặt");
+                                    crate::conversation_policy::require_shareable(&s,&thread_id,context.group).await?;
+                                    anyhow::ensure!(s.is_active() && generation==s.runtime_id() as u64,"Phiên tài khoản đã thay đổi");
+                                    crate::chat::submit_voice_to_text(&s,&voice_url,&msg_id,&thread_id).await
+                                }.await;
+                                let current=s_arc.lock().await.clone();
+                                if !s.is_active() || !current.is_active() || current.runtime_id()!=s.runtime_id() || generation!=current.runtime_id() as u64 {
+                                    let _=tx.send(GuiEvent::VoiceTranscriptFailed {thread_id,msg_id,error:"Phiên tài khoản đã thay đổi".into(),generation});ctx.request_repaint();return;
+                                }
+                                match result {
                                     Ok(ticket) => {
                                         if let Some(transcript) = ticket.transcript {
                                             let _ = tx.send(GuiEvent::VoiceTranscriptLoaded {
@@ -2018,9 +2472,14 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         } else {
                                             // Register ticket in correlation map
                                             let req_id = ticket.req_id.clone();
-                                            {
+                                            let early_result={
                                                 const MAX_PENDING_V2T: usize = 128;
                                                 let mut map = tickets.lock().await;
+                                                if !s.is_active() || generation!=s.runtime_id() as u64 {return;}
+                                                let ticket_key=(s.runtime_id(),req_id.clone());
+                                                if map.contains_key(&ticket_key) {
+                                                    let _=tx.send(GuiEvent::VoiceTranscriptFailed {thread_id,msg_id,generation,error:"Yêu cầu chuyển giọng nói đang được xử lý; vui lòng chờ".into()});ctx.request_repaint();return;
+                                                }
                                                 if map.len() >= MAX_PENDING_V2T {
                                                     // Evict oldest entry based on timestamp
                                                     if let Some(oldest_key) = map
@@ -2028,22 +2487,32 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                         .min_by_key(|(_, (_, _, _, instant))| *instant)
                                                         .map(|(k, _)| k.clone())
                                                     {
-                                                        map.remove(&oldest_key);
+                                                        if let Some((thread_id,msg_id,generation,_))=map.remove(&oldest_key){
+                                                            let _=tx.send(GuiEvent::VoiceTranscriptFailed {thread_id,msg_id,generation,error:"Đang có quá nhiều yêu cầu chuyển giọng nói; vui lòng thử lại".into()});
+                                                        }
                                                     }
                                                 }
                                                 map.insert(
-                                                    req_id.clone(),
+                                                    ticket_key,
                                                     (thread_id.clone(), msg_id.clone(), generation, std::time::Instant::now()),
                                                 );
+                                                map.early.take(s.runtime_id(),&req_id)
+                                            };
+                                            if let Some(result)=early_result {
+                                                if tickets.lock().await.remove_matching(s.runtime_id(),&req_id,&thread_id,&msg_id,generation).is_some(){
+                                                    let event=if result.error_code==0 && result.text.is_some(){GuiEvent::VoiceTranscriptLoaded {thread_id:thread_id.clone(),msg_id:msg_id.clone(),transcript:voice_result_text(result),generation}}else{GuiEvent::VoiceTranscriptFailed {thread_id:thread_id.clone(),msg_id:msg_id.clone(),error:format!("Chuyển giọng nói không thành công (mã {})",result.error_code),generation}};
+                                                    let _=tx.send(event);ctx.request_repaint();
+                                                }
                                             }
                                             // Spawn 30-second timeout watcher for ticket
                                             let tickets_timeout = tickets.clone();
                                             let tx_timeout = tx.clone();
                                             let ctx_timeout = ctx.clone();
+                                            let timeout_thread=thread_id.clone();let timeout_message=msg_id.clone();let timeout_runtime=s.runtime_id();
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(Duration::from_secs(30)).await;
                                                 let mut map = tickets_timeout.lock().await;
-                                                if let Some((th, mid, gen, _)) = map.remove(&req_id) {
+                                                if let Some((th, mid, gen, _)) = map.remove_matching(timeout_runtime,&req_id,&timeout_thread,&timeout_message,generation) {
                                                     let _ = tx_timeout.send(GuiEvent::VoiceTranscriptFailed {
                                                         thread_id: th,
                                                         msg_id: mid,
@@ -2135,7 +2604,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let t=thread.clone();let a=anchor.clone();let disk=account.clone();
                                 let result=tokio::task::spawn_blocking(move||->anyhow::Result<_>{
                                     anyhow::ensure!(disk.is_active(),"Đã đăng xuất");
-                                    let store=crate::store::MessageStore::open(disk.history_path())?;
+                                    let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&disk)?;
                                     crate::tools::media_neighbor(&store,&t,&a,next)
                                 }).await.map_err(|_|"Không đọc được lịch sử media".to_owned()).and_then(|r|r.map_err(|_|"Không đọc được lịch sử media".into()));
                                 if account.is_active(){let _=tx.send(GuiEvent::MediaNeighbor{owner,thread,anchor,result});ctx.request_repaint();}
@@ -2338,16 +2807,35 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::ReadClipboardImage{owner,thread} => {
-                            let account=session.lock().await.clone();if owner!=account.account_key()||!account.is_active(){continue;}
+                        WorkerCmd::ReadClipboardImage{owner,runtime_id,thread} => {
+                            let account=session.lock().await.clone();if owner!=account.account_key()||runtime_id!=account.runtime_id()||!account.is_active(){continue;}
                             let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
                             let owner_for_read = owner.clone();
                             tokio::spawn(async move {
+                                let files = tokio::task::spawn_blocking(|| {
+                                    #[cfg(windows)]
+                                    { crate::clipboard_image::read_windows_files(super::file_drop::MAX_ATTACHMENTS) }
+                                    #[cfg(not(windows))]
+                                    { Ok::<Option<Vec<std::path::PathBuf>>, anyhow::Error>(None) }
+                                }).await;
+                                match files {
+                                    Ok(Ok(None)) => {}
+                                    result => {
+                                        let paths = match result {
+                                            Ok(Ok(Some(paths))) => Ok(paths),
+                                            Ok(Err(error)) => Err(error.to_string()),
+                                            _ => Err("Không đọc được danh sách tệp Clipboard".into()),
+                                        };
+                                        let _ = tx.send(GuiEvent::ClipboardFilesRead { owner, runtime_id, thread, paths });
+                                        ctx.request_repaint();
+                                        return;
+                                    }
+                                }
                                 let image = tokio::task::spawn_blocking(move || {
                                     super::messages::read_clipboard_image_to_png(Some(&owner_for_read))
                                 }).await.ok().flatten();
                                 if account.is_active() {
-                                    let _ = tx.send(GuiEvent::ClipboardImageRead{owner,thread,image});
+                                    let _ = tx.send(GuiEvent::ClipboardImageRead{owner,runtime_id,thread,image});
                                     ctx.request_repaint();
                                 } else if let Some((path, ..)) = image {
                                     let _ = tokio::fs::remove_file(path).await;
@@ -2364,7 +2852,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             tokio::spawn(async move {
                                 let account = s.clone(); let id = thread_id.clone();
                                 let current = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                                    Ok(crate::store::MessageStore::open(account.history_path())?.conversation_preferences()?.get(&id).copied().unwrap_or_default())
+                                    let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
+                                    Ok(store.conversation_preferences()?.get(&id).copied().unwrap_or_default())
                                 }).await;
                                 let Ok(Ok(current)) = current else {
                                     let _ = tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); ctx.request_repaint(); return;
@@ -2379,7 +2868,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 }
                                 let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                     anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
-                                    let store=crate::store::MessageStore::open(s.history_path())?;
+                                    let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&s)?;
                                     store.set_conversation_preference(&thread_id,value)?;
                                     store.conversation_preferences()
                                 }).await;
@@ -2398,7 +2887,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let id=thread.id.clone();let disk=account.clone();let visible=thread.messages.clone();
                                 tokio::task::spawn_blocking(move||->anyhow::Result<()>{
                                     anyhow::ensure!(disk.is_active(),"Đã đăng xuất");
-                                    let mut store=crate::store::MessageStore::open(disk.history_path())?;
+                                    let (mut store, _write_permit)=crate::store::MessageStore::open_for_account_write(&disk)?;
                                     store.delete_conversation(&id,&visible)?;
                                     let mut cache=crate::chat::load_threads_cache(&disk);cache.retain(|t|t.id!=id);crate::chat::save_threads_cache(&disk,&cache);Ok(())
                                 }).await??;
@@ -2413,7 +2902,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let id=thread_id.clone();
                             let result=tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                                 anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
-                                let mut store=crate::store::MessageStore::open(s.history_path())?;
+                                let (mut store, _write_permit)=crate::store::MessageStore::open_for_account_write(&s)?;
                                 store.clear_thread_history(&id)?;
                                 let mut cache=crate::chat::load_threads_cache(&s);
                                 if let Some(thread)=cache.iter_mut().find(|t|t.id==id) {
@@ -2429,14 +2918,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
                             egui_ctx.request_repaint();
                         }
+                        WorkerCmd::PersistThreadMetadata { owner, runtime_id, thread_id, name, is_group } => {
+                            let account = session.lock().await.clone();
+                            if !outgoing_identity_matches(account.is_active(), account.account_key(), account.runtime_id(), &owner, runtime_id) { continue; }
+                            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                let (store, _permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+                                store.upsert_thread(&crate::store::StoredThread {
+                                    thread_id, name, is_group, last_ts: 0, last_read_msg_id: String::new(),
+                                })
+                            }).await;
+                            if let Ok(Err(error)) = result { crate::runtime_metrics::database_error(&error); }
+                        }
                         WorkerCmd::PersistThreads { owner, threads } => {
                             let s = session.lock().await.clone();
                             if owner.is_empty() || owner != s.account_key() || !s.is_active() { continue; }
                             live_updates.seed(&threads);
                             // Await writes in command order: logout cannot race a detached snapshot write.
                             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                                let _timing = crate::runtime_metrics::Scope::new(crate::runtime_metrics::Metric::SnapshotWrite);
                                 if !s.is_active() { return Ok(()); }
-                                let mut store = crate::store::MessageStore::open(s.history_path())?;
+                                let (mut store, _write_permit) =
+                                    crate::store::MessageStore::open_for_account_write(&s)?;
                                 crate::store::persist_local_threads(&mut store, &threads)?;
                                 crate::chat::save_threads_cache(&s, &threads);
                                 Ok(())
@@ -2449,7 +2951,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let s = session.lock().await.clone();
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
-                            let commands = commands.clone();
+                            let source = session.clone();
+                            let lifecycle = outgoing_lifecycle.clone();
                             tokio::spawn(async move {
                                 // Load upload state from store and locate the original message
                                 type ResumedUploadInfo = Option<(crate::upload::ResumableUploadState, Option<(String, ChatMessage)>)>;
@@ -2460,7 +2963,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         if !s.is_active() {
                                             anyhow::bail!("Phiên đã hết hạn");
                                         }
-                                        let store = crate::store::MessageStore::open(s.history_path())?;
+                                        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s)?;
                                         if let Some(state) = store.load_upload_state(&id)? {
                                             let client_id = id
                                                 .strip_prefix("asyncfile-")
@@ -2481,9 +2984,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Ok(Some((state, maybe_msg))) => {
                                         let name = state.file_name.clone();
                                         if let Some((thread_id, message)) = maybe_msg {
-                                            if let Some(cmd_tx) = commands.upgrade() {
-                                                let _ = cmd_tx.send(WorkerCmd::RetryOutgoing { thread_id, message });
-                                            }
+                                            let owner = s.account_key().to_owned();
+                                            let ticket = lifecycle.accept(owner.clone(), s.runtime_id(), thread_id.clone(), message.clone());
+                                            spawn_outgoing_send(s, source, tx.clone(), ctx.clone(), owner, thread_id, message, ticket);
                                         }
                                         let _ = tx.send(GuiEvent::StatusUpdate(format!("Đang tiếp tục tải lên: {name}")));
                                     }
@@ -2510,8 +3013,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let _ = tokio::task::spawn_blocking({
                                     let id = id.clone();
                                     move || {
-                                        crate::store::MessageStore::open(s.history_path())?
-                                            .delete_upload_state(&id)
+                                        let (store, _write_permit) =
+                                            crate::store::MessageStore::open_for_account_write(&s)?;
+                                        store.delete_upload_state(&id)
                                     }
                                 })
                                 .await;
@@ -2522,10 +3026,37 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         }
                         command @ (WorkerCmd::Logout | WorkerCmd::AddAccount) => {
                             let keep = matches!(command, WorkerCmd::AddAccount);
+                            if let Some(task) = current_auth_task.take() { task.abort(); }
+                            auth_attempt_mgr.next_attempt();
                             let current = session.lock().await.clone();
+                            if keep {
+                                let save_session = current.clone();
+                                let saved = tokio::task::spawn_blocking(move || {
+                                    save_session.save_to_file("session.json")
+                                })
+                                .await;
+                                if !matches!(saved, Ok(Ok(()))) {
+                                    let _ = gui_tx.send(GuiEvent::LogoutFailed {
+                                        message: "Không thể lưu phiên tài khoản".into(),
+                                    });
+                                    continue;
+                                }
+                            }
+                            let Ok(_write_barrier) = current.close_account_writes().await else {
+                                let _ = gui_tx.send(GuiEvent::LogoutFailed {
+                                    message: "Không thể chờ hoàn tất ghi dữ liệu tài khoản".into(),
+                                });
+                                continue;
+                            };
+                            {
+                                let live = session.lock().await;
+                                if live.runtime_id() != current.runtime_id() || live.account_key() != current.account_key() {
+                                    continue;
+                                }
+                            }
                             let owner = current.account_key().to_owned();
                             let saved = tokio::task::spawn_blocking(move || {
-                                if keep { current.save_to_file("session.json") }
+                                if keep { Ok(()) }
                                 else { crate::profiles::perform_account_logout(&owner) }
                             }).await;
                             if !matches!(saved, Ok(Ok(()))) {
@@ -2538,9 +3069,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 egui_ctx.request_repaint();
                                 continue;
                             }
-                            // A19: Cancel auth task and bump auth attempt to invalidate all pending auth responses
-                            if let Some(task) = current_auth_task.take() { task.abort(); }
-                            auth_attempt_mgr.next_attempt();
+                            current.revoke_runtime();
+                            outgoing_lifecycle.retire(current.runtime_id());
 
                             call_bridge.end_call();
                             pending_v2t_tickets.lock().await.clear();
@@ -2549,7 +3079,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             if !account.is_empty() {
                                 let _ = tokio::task::spawn_blocking(move || crate::photo_quality::remove_account_copies(&account)).await;
                             }
-                            session.lock().await.logout();
+                            {
+                                let mut live = session.lock().await;
+                                if live.runtime_id() != current.runtime_id() || live.account_key() != current.account_key() { continue; }
+                                live.logout();
+                                refresh_outgoing_identity(&outgoing_identity, &live);
+                            }
                             let _ = gui_tx.send(GuiEvent::LoggedOut);
                             egui_ctx.request_repaint();
                             // Dropping this runtime cancels all old network tasks. A fresh UI channel
@@ -2589,9 +3124,22 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                     match load_result {
                                         Ok(Ok(new_session)) => {
-                                            // 1. Tear down old account tasks and worker resources
                                             if let Some(task) = current_auth_task.take() { task.abort(); }
                                             auth_attempt_mgr.next_attempt();
+                                            let previous = session.lock().await.clone();
+                                            let Ok(old_write_barrier) = previous.close_account_writes().await else {
+                                                let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể chờ hoàn tất ghi dữ liệu tài khoản".into()));
+                                                egui_ctx.request_repaint();
+                                                continue;
+                                            };
+                                            {
+                                                let live = session.lock().await;
+                                                if live.runtime_id() != previous.runtime_id() || live.account_key() != previous.account_key() {
+                                                    let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi trong khi chuyển hồ sơ".into()));
+                                                    continue;
+                                                }
+                                            }
+                                            // 1. Tear down old account tasks and worker resources
                                             call_bridge.end_call();
                                             pending_v2t_tickets.lock().await.clear();
                                             crate::queue_cursors::flush_all().await;
@@ -2603,15 +3151,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                             let profile_name = profile.name.clone();
                                             let previous = session.lock().await.clone();
-                                            let persisted = tokio::task::spawn_blocking(move || crate::profiles::activate_for_switch(&previous,&profile_name)).await;
+                                            let profile_session = previous.clone();
+                                            let persisted = tokio::task::spawn_blocking(move || crate::profiles::activate_for_switch(&profile_session,&profile_name)).await;
                                             if !matches!(persisted, Ok(Ok(()))) {
                                                 let _ = gui_tx.send(GuiEvent::StatusUpdate("Không lưu được tài khoản đang chọn".into()));
                                                 egui_ctx.request_repaint();
                                                 continue;
                                             }
+                                            previous.revoke_runtime();
+                                            outgoing_lifecycle.retire(previous.runtime_id());
                                             history_sync_cancel.store(true, std::sync::atomic::Ordering::Release);
                                             phone_sync_cancel.store(true, std::sync::atomic::Ordering::Release);
-                                            session.lock().await.logout();
+                                            {
+                                                let mut current = session.lock().await;
+                                                if current.runtime_id() != previous.runtime_id() || current.account_key() != previous.account_key() {
+                                                    let _ = gui_tx.send(GuiEvent::StatusUpdate("Tài khoản đã thay đổi trong khi chuyển hồ sơ".into()));
+                                                    continue;
+                                                }
+                                                current.logout();
+                                                refresh_outgoing_identity(&outgoing_identity, &current);
+                                            }
+                                            drop(old_write_barrier);
                                             let _ = gui_tx.send(GuiEvent::ProfileSwitched { session: Box::new(new_session) });
                                             egui_ctx.request_repaint();
                                             // Destroy the old runtime; the UI starts a fresh account-bound worker.
@@ -2664,11 +3224,24 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx_clone = egui_ctx.clone();
                             let commands = commands.clone();
                             let auth_mgr = auth_attempt_mgr.clone();
+                            let outgoing_identity = outgoing_identity.clone();
+                            let outgoing_lifecycle = outgoing_lifecycle.clone();
 
                             let handle = tokio::spawn(async move {
+                                let previous = session_clone.lock().await.clone();
+                                let Ok(_write_barrier) = previous.close_account_writes().await else {
+                                    let _ = gui_tx_clone.send(GuiEvent::LoginFailed(
+                                        "Không thể đóng dữ liệu phiên trước".into(),
+                                    ));
+                                    ctx_clone.request_repaint();
+                                    return;
+                                };
+                                previous.revoke_runtime();
+                                outgoing_lifecycle.retire(previous.runtime_id());
                                 {
                                     let mut s = session_clone.lock().await;
                                     s.logout();
+                                    refresh_outgoing_identity(&outgoing_identity, &s);
                                 }
                                 {
                                     let mut ps = poll_clone.lock().await;
@@ -2807,8 +3380,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                             .as_ref()
                                                             .map(|l| l.avatar.clone())
                                                             .filter(|a| !a.is_empty());
+                                                        refresh_outgoing_identity(&outgoing_identity, &s);
                                                         let _ = gui_tx_clone.send(
                                                             GuiEvent::LoginSuccess {
+                                                                composer_config: s.composer_config,
                                                                 name: dname,
                                                                 uin,
                                                                 avatar: u_ava,
@@ -3164,7 +3739,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let cached=s.clone();
                                 if let Ok(Ok(Some(snapshot)))=tokio::task::spawn_blocking(move||->anyhow::Result<Option<crate::server_pins::Snapshot>>{
                                     use rusqlite::OptionalExtension;
-                                    let store=crate::store::MessageStore::open(cached.history_path())?;
+                                    let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&cached)?;
                                     let raw:Option<String>=store.conn.query_row("SELECT value FROM tool_config WHERE key='server_pins'",[],|r|r.get(0)).optional()?;
                                     Ok(raw.and_then(|s|serde_json::from_str(&s).ok()))
                                 }).await {let _=tx.send(GuiEvent::ServerPins{owner:s.account_key().into(),snapshot});}
@@ -3178,7 +3753,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             if !s_pref.account_key().is_empty() && s_pref.is_active() {
                                 let owner=s_pref.account_key().to_owned();
                                 match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                                    let preferences = crate::store::MessageStore::open(s_pref.history_path())?.conversation_preferences()?;
+                                    let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s_pref)?;
+                                    let preferences = store.conversation_preferences()?;
                                     Ok((preferences, crate::chat::load_threads_cache(&s_pref)))
                                 }).await {
                                     Ok(Ok((values,cached))) => { live_updates.seed(&cached); live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
@@ -3196,6 +3772,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx_clone = egui_ctx.clone();
                             let known = known_threads.clone();
                             let poll_delivery = poll_delivery.clone();
+                            let outgoing_lifecycle = outgoing_lifecycle.clone();
+                            let outgoing_identity = outgoing_identity.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
                                 let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into(),success:false};
@@ -3211,11 +3789,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                     if status == crate::session::SessionStatus::Expired {
                                         notice.message="Phiên đã hết hạn; cần đăng nhập lại để đồng bộ".into();
-                                        if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
-                                        {
-                                            let mut sl = session_clone.lock().await;
-                                            sl.logout();
-                                        }
+                                        let Ok(_write_barrier) = s.close_account_writes().await else { return; };
+                                        let mut sl = session_clone.lock().await;
+                                        if sl.runtime_id() != s.runtime_id() || !sl.is_active() { return; }
+                                        sl.revoke_runtime();
+                                        outgoing_lifecycle.retire(s.runtime_id());
+                                        sl.logout();
+                                        refresh_outgoing_identity(&outgoing_identity, &sl);
+                                        drop(sl);
+                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(s.runtime_id())).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
                                         let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
                                             "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
                                                 .into(),
@@ -3226,6 +3808,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     if let Some((uid, name)) = s.sync_profile_me().await {
                                         {
                                             let mut sl = session_clone.lock().await;
+                                            if !sl.is_active() || sl.runtime_id() != s.runtime_id() || sl.account_key() != s.account_key() { return; }
                                             if let Some(ref mut li) = sl.login {
                                                 li.uin = uid.clone();
                                                 if !name.is_empty() {
@@ -3242,6 +3825,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             .map(|l| l.avatar.clone())
                                             .filter(|a| !a.is_empty());
                                         let _ = gui_tx_clone.send(GuiEvent::LoginSuccess {
+                                            composer_config: s.composer_config,
                                             name,
                                             uin: uid,
                                             avatar: u_ava,
@@ -3259,8 +3843,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     let account = s.clone();
                                     let (hydrated, preloaded) = match tokio::task::spawn_blocking(move || {
                                         let mut list = list;
-                                        let marks = crate::store::MessageStore::open(account.history_path())
-                                            .and_then(|store| store.hydrate_refresh(&mut list, crate::store::MessageStore::PRELOAD_MSGS));
+                                        let marks = crate::store::MessageStore::open_for_account_write(&account)
+                                            .and_then(|(store, _write_permit)| store.hydrate_refresh(&mut list, crate::store::MessageStore::PRELOAD_MSGS));
                                         (list, marks.unwrap_or_default())
                                     }).await {
                                         Ok(snapshot) => snapshot,
@@ -3317,6 +3901,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let ctx_clone = egui_ctx.clone();
                             let poll_guard = PollGuard(is_polling.clone());
                             let poll_delivery = poll_delivery.clone();
+                            let outgoing_lifecycle = outgoing_lifecycle.clone();
+                            let outgoing_identity = outgoing_identity.clone();
+                            let p3_names = p3_name_jobs.clone();
                             tokio::spawn(async move {
                                 let _poll_guard = poll_guard;
                                 let Ok(_cycle) = poll_delivery.acquire_owned().await else { return; };
@@ -3382,11 +3969,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                     let expired = poll_err.as_deref().is_some_and(is_session_expired_error);
                                     if expired {
-                                        if let Err(e) = crate::storage::remove_session() { eprintln!("Cannot remove session: {e}"); }
-                                        {
-                                            let mut sl = session_clone.lock().await;
-                                            sl.logout();
-                                        }
+                                        let Ok(_write_barrier) = s.close_account_writes().await else { return; };
+                                        let mut sl = session_clone.lock().await;
+                                        if sl.runtime_id() != s.runtime_id() || !sl.is_active() { return; }
+                                        sl.revoke_runtime();
+                                        outgoing_lifecycle.retire(s.runtime_id());
+                                        sl.logout();
+                                        refresh_outgoing_identity(&outgoing_identity, &sl);
+                                        drop(sl);
+                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(s.runtime_id())).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
                                         let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
                                             "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
                                         ));
@@ -3397,12 +3988,8 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         temp_threads.retain(|t| !t.messages.is_empty() || t.unread.fresh);
                                         let mut stored = true;
                                         if !temp_threads.is_empty() {
-                                            crate::chat::resolve_thread_names(
-                                                &s,
-                                                &mut temp_threads,
-                                            )
-                                            .await;
                                             stored = persist_received(&s, &mut temp_threads).await;
+                                            p3_resolve_names_later(&p3_names, &s, &temp_threads);
                                             if publish_live(&s, &live_updates, temp_threads) {
                                                 let _ = gui_tx_clone.send(GuiEvent::LiveThreadsReady(live_updates.clone()));
                                             }
@@ -3441,9 +4028,9 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         is_group: is_group && !is_send2me,
                                         messages: Vec::new(),
                                     };
-                                    let path = s.history_path();
+                                    let account = s.clone();
                                     let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Thread>> {
-                                        let store = crate::store::MessageStore::open(path)?;
+                                        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
                                         let mut list = vec![t];
                                         store.hydrate_selected_threads(&mut list, limit)?;
                                         Ok(list)
@@ -3614,7 +4201,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         let tid=to_id.clone();let snapshot=msg.clone();let disk=s.clone();
                                         let result=tokio::task::spawn_blocking(move||->anyhow::Result<()> {
                                             anyhow::ensure!(disk.is_active(),"Account changed");
-                                            let mut store=crate::store::MessageStore::open(disk.history_path())?;
+                                            let (mut store, _write_permit)=crate::store::MessageStore::open_for_account_write(&disk)?;
                                             store.delete_chat_message(&tid,&snapshot)?;
                                             let cache=crate::chat::load_threads_cache(&disk);
                                             crate::chat::save_threads_cache(&disk,&cache);
@@ -3986,7 +4573,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         }
                         WorkerCmd::SendDroppedFiles {owner,batch} => {
                             let s=session.lock().await.clone();
-                            if !s.is_active() || s.account_key()!=owner || batch.files.len()>16 {continue;}
+                            if !s.is_active() || s.account_key()!=owner || batch.files.len()>super::file_drop::MAX_ATTACHMENTS {continue;}
                             tokio::spawn(send_attachment_batch(s,batch,gui_tx.clone(),egui_ctx.clone()));
                         }
                         WorkerCmd::SendVoiceMessage {
@@ -4016,6 +4603,17 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let session_clone = session.clone();
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
+                            let lifecycle = outgoing_lifecycle.clone();
+                            let caption = format!("[Tin nhắn thoại] ({duration_secs}s)");
+                            let mut queued_message = crate::outgoing::pending(
+                                caption.clone(), is_group,
+                                crate::outgoing::Payload::Attachment {
+                                    path: std::path::PathBuf::new(), caption,
+                                    stamp: None, hd_source: None,
+                                },
+                            );
+                            queued_message.kind = crate::message_model::MessageKind::Voice;
+                            let ticket = lifecycle.accept(owner.clone(), runtime_id, to_id.clone(), queued_message);
                             tokio::spawn(async move {
                                 let before_encode = session_clone.lock().await.clone();
                                 if !voice_send_session_matches(
@@ -4170,7 +4768,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     },
                                 );
                                 message.kind = crate::message_model::MessageKind::Voice;
+                                ticket.update(message.clone());
+                                if !ticket.start() {
+                                    let _ = tokio::fs::remove_file(&temp_file).await;
+                                    return;
+                                }
                                 let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+                                    ticket.finish(outgoing_not_sent(message, "Không thể bắt đầu gửi tin nhắn thoại"));
                                     let _ = tokio::fs::remove_file(&temp_file).await;
                                     let _ = events.send(GuiEvent::VoiceSendStatus {
                                         owner,
@@ -4186,6 +4790,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     &owner,
                                     runtime_id,
                                 ) {
+                                    message.delivery = crate::message_model::DeliveryState::Failed;
+                                    if let Some(job) = message.outgoing_job.as_mut() {
+                                        job.error = "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into();
+                                    }
+                                    ticket.finish(message.clone());
                                     drop(active);
                                     let _ = tokio::fs::remove_file(&temp_file).await;
                                     let _ = events.send(GuiEvent::VoiceSendRejected {
@@ -4216,6 +4825,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         job.error = "Bản ghi âm đã hết hiệu lực sau khi tài khoản thay đổi".into();
                                     }
                                     persist_outgoing(&s, &to_id, &message).await;
+                                    ticket.finish(message.clone());
                                     drop(active);
                                     let _ = events.send(GuiEvent::VoiceOutgoingState {
                                         owner: owner.clone(),
@@ -4252,6 +4862,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         });
                                     }
                                 }
+                                ticket.finish(message.clone());
                                 if !voice_send_session_matches(
                                     s.is_active(),
                                     s.account_key(),
@@ -4272,6 +4883,27 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
+                        WorkerCmd::PrepareAttachmentArchive { owner, runtime_id, thread, path, stamp } => {
+                            let s = session.lock().await.clone();
+                            if !s.is_active() || s.account_key()!=owner || s.runtime_id()!=runtime_id { continue; }
+                            let events=gui_tx.clone(); let ctx=egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let result: anyhow::Result<_> = async {
+                                    let _permit=crate::limits::UPLOAD_JOBS.acquire().await
+                                        .map_err(|_| anyhow::anyhow!("Hàng đợi đã đóng"))?;
+                                    anyhow::ensure!(s.is_active(), "Phiên làm việc đã thay đổi");
+                                    crate::attachment_archive::prepare(path,stamp,crate::storage::account_temp_dir(&owner)).await
+                                }.await;
+                                if !s.is_active() {
+                                    // Best-effort cleanup of an archive completed after session revocation.
+                                    if let Ok(path)=result { let _=tokio::fs::remove_file(path).await; }
+                                    return;
+                                }
+                                let result=result.map_err(|_| "Không tạo được ZIP: hãy kiểm tra tệp gốc, kích thước và dung lượng ổ đĩa".to_owned());
+                                let _=events.send(GuiEvent::AttachmentArchivePrepared { owner,runtime_id,thread,result });
+                                ctx.request_repaint();
+                            });
+                        }
                         WorkerCmd::PickAttachmentDraft { owner, runtime_id, thread, images_only } => {
                             let s = session.lock().await.clone();
                             let events = gui_tx.clone();
@@ -4288,8 +4920,11 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::PickAndSendAttachment {to_id,is_group,images_only,caption,preset_path,photo_original,ephemeral} => {
+                        WorkerCmd::PickAndSendAttachment {owner,runtime_id,to_id,is_group,images_only,caption,preset_path,photo_original,ephemeral} => {
                             let s=session.lock().await.clone();let events=gui_tx.clone();let ctx=egui_ctx.clone();
+                            if !s.is_active() || s.account_key()!=owner || s.runtime_id()!=runtime_id {
+                                continue;
+                            }
                             tokio::spawn(async move {
                                 let paths=if let Some(path)=preset_path {vec![path]} else {
                                     let picker_owner=s.account_key().to_owned();
@@ -4421,7 +5056,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let result = tokio::task::spawn_blocking(move || -> anyhow::Result<crate::store::HistoryPage> {
                                     anyhow::ensure!(s.is_active() && s.account_key() == expected && s.runtime_id() == runtime_id,"Phiên làm việc đã thay đổi");
                                     anyhow::ensure!(s.hidden.view(s.account_key()).allows(&target,group),"Mở khóa PIN trước khi đọc kho lưu trữ");
-                                    let store = crate::store::MessageStore::open(s.history_path())?;
+                                    let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s)?;
                                     let page = store.history_page(&target,before.as_ref(),200)?;
                                     anyhow::ensure!(s.is_active() && s.hidden.view(s.account_key()).allows(&target,group),"Phiên làm việc đã đóng hoặc hội thoại đã khóa");
                                     Ok(page)
@@ -4521,7 +5156,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let s = s_clone.lock().await.clone();
                                 if !s.is_active() { return; }
                                 let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                                    let store = crate::store::MessageStore::open(s.history_path())?;
+                                    let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s)?;
                                     store.set_thread_read(&thread_id, &last_read_msg_id)?;
                                     Ok(())
                                 }).await;
@@ -4720,14 +5355,23 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let attempt_id = auth_attempt_mgr.next_attempt();
 
                             // Build candidate session outside the live session lock to prevent blocking across network
-                            let mut candidate = session.lock().await.clone();
-                            candidate.logout();
+                            let current = session.lock().await.clone();
+                            let mut candidate = match Session::new(current.verbose, current.dump, current.dump_raw) {
+                                Ok(candidate) => candidate,
+                                Err(_) => {
+                                    let _ = gui_tx.send(GuiEvent::LoginFailed("Không tạo được phiên xác thực".into()));
+                                    egui_ctx.request_repaint();
+                                    continue;
+                                }
+                            };
 
                             let session_clone = session.clone();
                             let commands = commands.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             let auth_mgr = auth_attempt_mgr.clone();
+                            let outgoing_identity = outgoing_identity.clone();
+                            let outgoing_lifecycle = outgoing_lifecycle.clone();
                             let handle = tokio::spawn(async move {
                                 let _ = gui_tx_clone.send(GuiEvent::StatusUpdate(
                                     "Đang xác thực tài khoản…".into(),
@@ -4752,8 +5396,19 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                     return;
                                                 }
 
+                                                let old_session = session_clone.lock().await.clone();
+                                                let Ok(_write_barrier) = old_session.close_account_writes().await else {
+                                                    let _ = gui_tx_clone.send(GuiEvent::LoginFailed(
+                                                        "Không thể đóng dữ liệu phiên trước".into(),
+                                                    ));
+                                                    ctx_clone.request_repaint();
+                                                    return;
+                                                };
                                                 let mut s = session_clone.lock().await;
-                                                if !auth_mgr.is_current(attempt_id) {
+                                                if !auth_mgr.is_current(attempt_id)
+                                                    || s.runtime_id() != old_session.runtime_id()
+                                                    || s.account_key() != old_session.account_key()
+                                                {
                                                     return;
                                                 }
                                                 let uin = candidate
@@ -4775,7 +5430,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
 
                                                 let s_clone = candidate.clone();
                                                 let s_hydrate = candidate.clone();
+                                                s.revoke_runtime();
+                                                outgoing_lifecycle.retire(old_session.runtime_id());
                                                 *s = candidate;
+                                                refresh_outgoing_identity(&outgoing_identity, &s);
                                                 drop(s);
                                                 let tx_save = gui_tx_clone.clone();
                                                 tokio::task::spawn_blocking(move || {
@@ -4784,6 +5442,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                     }
                                                 });
                                                 let _ = gui_tx_clone.send(GuiEvent::LoginSuccess {
+                                                    composer_config: s_hydrate.composer_config,
                                                     name,
                                                     uin,
                                                     avatar: u_ava,
@@ -5085,6 +5744,341 @@ mod refresh_notice_tests {
     }
 }
 
+fn p3_same_socket_owner(
+    runtime: Option<usize>,
+    cookie: &str,
+    current_runtime: usize,
+    current_cookie: &str,
+) -> bool {
+    runtime == Some(current_runtime) && cookie == current_cookie
+}
+
+/// Per-connection reaction/control workers; replacement cancels work from the old owner.
+struct P3SideWorkers {
+    reactions: std::sync::Arc<tokio::sync::Notify>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+impl Drop for P3SideWorkers {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+type P3NameJob = (Session, Vec<Thread>);
+
+fn p3_resolve_names_later(
+    names: &tokio::sync::mpsc::Sender<P3NameJob>,
+    session: &Session,
+    threads: &[Thread],
+) {
+    let metadata = threads
+        .iter()
+        .take(256)
+        .map(|thread| Thread {
+            id: thread.id.clone(),
+            name: thread.name.clone(),
+            avatar: thread.avatar.clone(),
+            is_group: thread.is_group,
+            presentation: thread.presentation.clone(),
+            ..Default::default()
+        })
+        .collect();
+    // Optional enrichment can be retried by refresh; message payloads never enter this queue.
+    if names.try_send((session.clone(), metadata)).is_err() {
+        crate::logger::log_error(
+            "name enrichment",
+            "Metadata queue full; keeping current names",
+        );
+    }
+}
+
+fn p3_start_name_worker(
+    tx: Sender<GuiEvent>,
+    repaint: egui::Context,
+) -> tokio::sync::mpsc::Sender<P3NameJob> {
+    let (names, mut name_jobs) = tokio::sync::mpsc::channel::<P3NameJob>(8);
+    tokio::spawn(async move {
+        while let Some((account, batch)) = name_jobs.recv().await {
+            if !account.is_active() {
+                continue;
+            }
+            let mut latest = HashMap::new();
+            for thread in batch {
+                latest.insert(thread.id.clone(), thread);
+            }
+            while let Ok((source, batch)) = name_jobs.try_recv() {
+                if !source.is_active() || source.runtime_id() != account.runtime_id() {
+                    continue;
+                }
+                for thread in batch {
+                    if latest.len() < 256 || latest.contains_key(&thread.id) {
+                        latest.insert(thread.id.clone(), thread);
+                    }
+                }
+            }
+            let mut threads: Vec<_> = latest.into_values().collect();
+            crate::chat::resolve_thread_names(&account, &mut threads).await;
+            if !account.is_active() {
+                continue;
+            }
+            if !threads.is_empty() {
+                let _ = tx.send(GuiEvent::ThreadsUpdated {
+                    threads,
+                    source: ThreadUpdateSource::History,
+                });
+                repaint.request_repaint();
+            }
+        }
+    });
+    names
+}
+
+fn p3_start_side_workers(
+    session: Session,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+    priority_task: tokio::task::JoinHandle<()>,
+) -> P3SideWorkers {
+    let reactions = std::sync::Arc::new(tokio::sync::Notify::new());
+    let wake = reactions.clone();
+    let reaction_task = tokio::spawn(async move {
+        let mut timer = tokio::time::interval(Duration::from_secs(2));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut pending = true;
+        loop {
+            tokio::select! { _ = timer.tick(), if pending => {}, _ = wake.notified() => {} }
+            if !session.is_active() {
+                break;
+            }
+            let account = session.clone();
+            let result =
+                tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<Thread>, bool)> {
+                    let (store, _write_permit) =
+                        crate::store::MessageStore::open_for_account_write(&account)?;
+                    let threads = crate::reaction_pipeline::drain(&store, &account)?;
+                    let pending = store.conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM pending_reactions LIMIT 1)",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    Ok((threads, pending))
+                })
+                .await;
+            if !session.is_active() {
+                break;
+            }
+            match result {
+                Ok(Ok((threads, remaining))) => {
+                    pending = remaining;
+                    if !threads.is_empty() {
+                        let _ = events.send(GuiEvent::ThreadsUpdated {
+                            threads,
+                            source: ThreadUpdateSource::History,
+                        });
+                        ctx.request_repaint();
+                    }
+                }
+                Ok(Err(error)) => {
+                    pending = true;
+                    crate::runtime_metrics::database_error(&error);
+                    crate::logger::log_error(
+                        "reaction drain",
+                        "Durable reactions retained for retry",
+                    );
+                }
+                Err(_) => {
+                    pending = true;
+                    crate::logger::log_error(
+                        "reaction drain",
+                        "Blocking task failed; reactions retained",
+                    );
+                }
+            }
+        }
+    });
+    P3SideWorkers {
+        reactions,
+        tasks: vec![priority_task, reaction_task],
+    }
+}
+
+async fn p3_enqueue_reactions(
+    session: &Session,
+    events: Vec<crate::reactions::ReactionEvent>,
+) -> bool {
+    let account = session.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+        crate::reaction_pipeline::enqueue(&store, &events)
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            crate::runtime_metrics::database_error(&error);
+            crate::logger::log_error(
+                "reaction enqueue",
+                "Page not acknowledged; keeping cursor for replay",
+            );
+            false
+        }
+        Err(_) => {
+            crate::logger::log_error(
+                "reaction enqueue",
+                "Blocking task failed; keeping cursor for replay",
+            );
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod p3_ingress_tests {
+    use super::*;
+
+    #[test]
+    fn typing_is_published_without_opening_a_database() {
+        let session = Session::new(false, false, false).unwrap();
+        let (events, received) = std::sync::mpsc::channel();
+        p3_publish_typing(
+            &session,
+            &serde_json::json!({"data":{"actions":[{"act_type":"typing","act":"typing","data":{"uid":"123"}}]}}),
+            &events,
+            &egui::Context::default(),
+        );
+        assert!(
+            matches!(received.try_recv().unwrap(), GuiEvent::Typing {events, ..} if events.len() == 1)
+        );
+    }
+
+    #[test]
+    fn same_account_cookie_cannot_reuse_a_previous_runtime_socket() {
+        assert!(p3_same_socket_owner(
+            Some(11),
+            "cookie-fixture",
+            11,
+            "cookie-fixture"
+        ));
+        assert!(!p3_same_socket_owner(
+            Some(11),
+            "cookie-fixture",
+            12,
+            "cookie-fixture"
+        ));
+        assert!(!p3_same_socket_owner(
+            Some(11),
+            "cookie-fixture",
+            11,
+            "other-fixture"
+        ));
+        assert!(!p3_same_socket_owner(
+            None,
+            "cookie-fixture",
+            11,
+            "cookie-fixture"
+        ));
+    }
+
+    fn reaction() -> crate::reactions::ReactionEvent {
+        crate::reactions::ReactionEvent {
+            message_id: "message-fixture".into(),
+            thread_id: "peer-fixture".into(),
+            sender_id: "reactor-fixture".into(),
+            event_id: "event-fixture".into(),
+            r_type: 5,
+            emoji: "❤️".into(),
+            ts: 1_800_000_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn durable_reaction_enqueue_survives_a_drain_failure_and_replay() {
+        let mut store = crate::store::MessageStore::open(":memory:").unwrap();
+        let session = Session::new(false, false, false).unwrap();
+        let thread = Thread {
+            id: "peer-fixture".into(),
+            name: "Peer".into(),
+            messages: vec![ChatMessage {
+                id: "message-fixture".into(),
+                text: "fixture".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        crate::store::persist_threads(&mut store, &[thread]).unwrap();
+        let event = reaction();
+        crate::reaction_pipeline::enqueue(&store, std::slice::from_ref(&event)).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_reaction BEFORE DELETE ON pending_reactions BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        assert!(crate::reaction_pipeline::drain(&store, &session).is_err());
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_reactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1); // (INV-4) Drain failure cannot erase the durable page obligation.
+        crate::reaction_pipeline::enqueue(&store, &[event]).unwrap();
+        let replay_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_reactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(replay_count, 1);
+        store
+            .conn
+            .execute_batch("DROP TRIGGER fail_reaction")
+            .unwrap();
+        assert_eq!(
+            crate::reaction_pipeline::drain(&store, &session)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reaction_enqueue_failure_rolls_back_the_whole_page() {
+        let store = crate::store::MessageStore::open(":memory:").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_reaction BEFORE INSERT ON pending_reactions WHEN NEW.data LIKE '%oversized-fixture%' BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        let valid = reaction();
+        let invalid = crate::reactions::ReactionEvent {
+            event_id: "oversized-fixture".into(),
+            ..valid.clone()
+        };
+        assert!(crate::reaction_pipeline::enqueue(&store, &[valid, invalid]).is_err());
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_reactions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0); // (INV-4) Caller must retain the old cursor after this failure.
+    }
+
+    #[tokio::test]
+    async fn optional_name_queue_is_bounded_and_never_holds_message_payloads() {
+        let (names, mut jobs) = tokio::sync::mpsc::channel(1);
+        let account = Session::new(false, false, false).unwrap();
+        let thread = Thread {
+            id: "thread-fixture".into(),
+            messages: vec![ChatMessage {
+                text: "must not enter enrichment".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        p3_resolve_names_later(&names, &account, std::slice::from_ref(&thread));
+        p3_resolve_names_later(&names, &account, &[thread]);
+        let (_, metadata) = jobs.recv().await.unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert!(metadata[0].messages.is_empty());
+        assert!(jobs.try_recv().is_err());
+    }
+}
+
 /// Orders server mute reconciliation against newer local or realtime mute changes.
 #[derive(Clone, Default)]
 struct MuteSync {
@@ -5103,8 +6097,8 @@ async fn persist_mutes(
     let account = s.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         anyhow::ensure!(account.is_active(), "Session ended");
-        crate::store::MessageStore::open(account.history_path())?
-            .apply_mute_changes(&changes, mark_seeded)
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+        store.apply_mute_changes(&changes, mark_seeded)
     })
     .await;
     match result {
@@ -5138,6 +6132,19 @@ async fn deliver_presence(
     gui_tx: &Sender<GuiEvent>,
     ctx: &egui::Context,
 ) {
+    p3_publish_typing(s, payload, gui_tx, ctx);
+    p3_deliver_receipts(s, payload, gui_tx, ctx).await;
+}
+
+fn p3_publish_typing(
+    s: &Session,
+    payload: &serde_json::Value,
+    gui_tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) {
+    if !s.is_active() {
+        return;
+    }
     let self_id = s.account_key().to_owned();
     let typing = crate::presence::typing(payload, &self_id);
     if !typing.is_empty() {
@@ -5147,13 +6154,25 @@ async fn deliver_presence(
         });
         ctx.request_repaint();
     }
+}
+
+async fn p3_deliver_receipts(
+    s: &Session,
+    payload: &serde_json::Value,
+    gui_tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) -> bool {
     let receipts = crate::presence::receipts(payload);
-    if receipts.is_empty() || !s.is_active() {
-        return;
+    if receipts.is_empty() {
+        return true;
+    }
+    if !s.is_active() {
+        return false;
     }
     let account = s.clone();
     let changed = tokio::task::spawn_blocking(move || {
-        crate::store::MessageStore::open(account.history_path())?.apply_receipts(&receipts)
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+        store.apply_receipts(&receipts)
     })
     .await;
     match changed {
@@ -5163,9 +6182,24 @@ async fn deliver_presence(
                 changed,
             });
             ctx.request_repaint();
+            true
         }
-        Ok(Err(e)) => crate::logger::log_error("presence::receipts", &e.to_string()),
-        _ => {}
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            crate::runtime_metrics::database_error(&error);
+            crate::logger::log_error(
+                "presence::receipts",
+                "Receipt write failed; keep message cursor for replay",
+            );
+            false
+        }
+        Err(_) => {
+            crate::logger::log_error(
+                "presence::receipts",
+                "Receipt writer failed; keep message cursor for replay",
+            );
+            false
+        }
     }
 }
 
@@ -5217,7 +6251,7 @@ async fn sync_mute_snapshot(
     let account = s.clone();
     let plan = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         anyhow::ensure!(account.is_active(), "Session ended");
-        let store = crate::store::MessageStore::open(account.history_path())?;
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
         let changes = crate::mute_sync::reconcile(&store.conversation_preferences()?, &server);
         let seeded = store.mute_sync_seeded()?;
         let mut local_only = Vec::new();
@@ -5517,10 +6551,13 @@ async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMess
     let thread_id = thread_id.to_owned();
     let message = message.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let _timing =
+            crate::runtime_metrics::Scope::new(crate::runtime_metrics::Metric::OutgoingWrite);
         if !session.is_active() {
             return Ok(());
         }
-        let mut store = crate::store::MessageStore::open(session.history_path())?;
+        let (mut store, _write_permit) =
+            crate::store::MessageStore::open_for_account_write(&session)?;
         let meta = store.thread_meta(&thread_id)?;
         let is_group = message
             .outgoing_job
@@ -5548,9 +6585,153 @@ async fn persist_outgoing(session: &Session, thread_id: &str, message: &ChatMess
         Ok(())
     })
     .await;
+    if let Ok(Err(error)) = &result {
+        crate::runtime_metrics::database_error(error);
+    }
     if !matches!(result, Ok(Ok(()))) {
         crate::logger::log_error("outgoing persistence", "Cannot persist outgoing message");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_outgoing_send(
+    session_snapshot: Session,
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    tx: Sender<GuiEvent>,
+    ctx: egui::Context,
+    owner: String,
+    thread_id: String,
+    mut message: ChatMessage,
+    ticket: OutgoingTicket,
+) {
+    let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+        ticket.finish(outgoing_not_sent(
+            message,
+            "Intent gửi đã được xử lý hoặc đang chạy",
+        ));
+        return;
+    };
+    tokio::spawn(async move {
+        let _active = active;
+        if !session_snapshot.is_active() {
+            return;
+        }
+        if !ticket.start() {
+            return;
+        }
+        message.delivery = crate::message_model::DeliveryState::Pending;
+        if let Some(job) = message.outgoing_job.as_mut() {
+            job.error.clear();
+        }
+        let _ = tx.send(GuiEvent::OutgoingState {
+            runtime_id: session_snapshot.runtime_id(),
+            owner: owner.clone(),
+            thread_id: thread_id.clone(),
+            message: message.clone(),
+        });
+        ctx.request_repaint();
+        // Admission persistence runs alongside transport. Join it before the final write
+        // so a slow Pending write cannot regress a durable ACK afterward.
+        let persist_session = session_snapshot.clone();
+        let persist_thread = thread_id.clone();
+        let persist_message = message.clone();
+        let pending_write = tokio::spawn(async move {
+            persist_outgoing(&persist_session, &persist_thread, &persist_message).await;
+        });
+        let result = crate::outgoing::send(&session_snapshot, &thread_id, &message).await;
+        let expired = result.as_ref().err().is_some_and(|error| {
+            error
+                .chain()
+                .any(|cause| is_session_expired_error(&cause.to_string()))
+        });
+        match result {
+            Ok(sent) => message = sent,
+            Err(error) => {
+                message.delivery = crate::outgoing::failure_delivery(&error);
+                if let Some(job) = message.outgoing_job.as_mut() {
+                    job.error = crate::outgoing::failure_message(&error);
+                }
+            }
+        }
+        // Record and publish the authoritative outcome before awaiting local storage.
+        // Cancellation after ACK must not replace a known success with uncertainty.
+        ticket.finish(message.clone());
+        let _ = pending_write.await;
+        persist_outgoing(&session_snapshot, &thread_id, &message).await;
+        if expired && session_snapshot.is_active() {
+            let current = session.lock().await.clone();
+            if current.runtime_id() == session_snapshot.runtime_id() {
+                let Ok(_write_barrier) = current.close_account_writes().await else {
+                    return;
+                };
+                let mut current = session.lock().await;
+                if current.runtime_id() == session_snapshot.runtime_id() {
+                    current.logout();
+                    drop(current);
+                    let runtime_id = session_snapshot.runtime_id();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::storage::remove_session_for_runtime(runtime_id)
+                    })
+                    .await;
+                    let _ = tx.send(GuiEvent::SessionExpired(
+                        "Không thể gửi vì phiên đăng nhập đã hết hạn".into(),
+                    ));
+                }
+            }
+        }
+        ctx.request_repaint();
+    });
+}
+
+fn emit_outgoing_not_sent(
+    runtime_id: usize,
+    owner: String,
+    thread_id: String,
+    mut message: ChatMessage,
+    reason: &str,
+    tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) {
+    message = outgoing_not_sent(message, reason);
+    let _ = tx.send(GuiEvent::OutgoingState {
+        runtime_id,
+        owner,
+        thread_id,
+        message,
+    });
+    ctx.request_repaint();
+}
+
+fn outgoing_identity_matches(
+    active: bool,
+    actual_owner: &str,
+    actual_runtime_id: usize,
+    expected_owner: &str,
+    expected_runtime_id: usize,
+) -> bool {
+    active
+        && !expected_owner.is_empty()
+        && actual_owner == expected_owner
+        && actual_runtime_id == expected_runtime_id
+}
+
+fn refresh_outgoing_identity(
+    identity: &std::sync::Arc<std::sync::RwLock<(String, usize)>>,
+    session: &Session,
+) {
+    let next = (session.account_key().to_owned(), session.runtime_id());
+    match identity.write() {
+        Ok(mut current) => *current = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+fn outgoing_not_sent(mut message: ChatMessage, reason: &str) -> ChatMessage {
+    message.delivery = crate::message_model::DeliveryState::Failed;
+    if let Some(job) = message.outgoing_job.as_mut() {
+        job.error = reason.to_owned();
+    }
+    message
 }
 
 fn publish_live(
@@ -5683,7 +6864,8 @@ async fn account_tools(
 
         anyhow::ensure!(session.is_active() && !session.account_key().is_empty(),"Phiên làm việc đã đóng");
 
-        let mut store=crate::store::MessageStore::open(session.history_path())?;
+        let (mut store, _write_permit) =
+            crate::store::MessageStore::open_for_account_write(&session)?;
 
         match command {
             C::OpenThread {thread,group}=>{
@@ -5981,7 +7163,8 @@ async fn mutate_archive_batch(
                     disk.is_active(),
                     "Máy chủ đã nhận nhưng phiên đã đóng trước khi lưu cục bộ"
                 );
-                let mut store = crate::store::MessageStore::open(disk.history_path())?;
+                let (mut store, _write_permit) =
+                    crate::store::MessageStore::open_for_account_write(&disk)?;
                 if recall {
                     let mut recalled = snapshot;
                     recalled.mark_recalled();
@@ -6472,6 +7655,139 @@ async fn save_media_target<F: FnMut(u64, Option<u64>)>(
     }
 }
 
+async fn play_inline_voice(
+    account: Session,
+    binding: inline_voice::Binding,
+    controls: inline_voice::Controls,
+    context: ChatImage,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+) {
+    use std::sync::atomic::Ordering;
+    let result = async {
+        anyhow::ensure!(
+            voice_send_session_matches(
+                account.is_active(),
+                account.account_key(),
+                account.runtime_id(),
+                &binding.owner,
+                binding.runtime
+            ),
+            "Phiên tài khoản đã thay đổi"
+        );
+        anyhow::ensure!(
+            media_context_alive(&account, Some(&context)),
+            "Tin âm thanh đã hết hạn"
+        );
+        anyhow::ensure!(
+            !context.message.is_e2ee,
+            "Chưa hỗ trợ giải mã tin âm thanh mã hóa đầu cuối"
+        );
+        let media = crate::message_view::media(&context.message);
+        let url = media
+            .original
+            .as_ref()
+            .or(context.message.link_url.as_ref())
+            .ok_or_else(|| anyhow::anyhow!("Tin âm thanh chưa có đường dẫn tải"))?;
+        let mut response = crate::media_download::response(url, Duration::from_secs(30)).await?;
+        const MAX_BYTES: usize = 32 * 1024 * 1024;
+        anyhow::ensure!(
+            response
+                .content_length()
+                .is_none_or(|n| n <= MAX_BYTES as u64),
+            "Tin âm thanh vượt giới hạn tải 32 MB"
+        );
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            anyhow::ensure!(
+                !controls.stop.load(Ordering::Acquire)
+                    && media_context_alive(&account, Some(&context)),
+                "Đã dừng phát âm thanh"
+            );
+            anyhow::ensure!(
+                data.len().saturating_add(chunk.len()) <= MAX_BYTES,
+                "Tin âm thanh vượt giới hạn tải 32 MB"
+            );
+            data.extend_from_slice(&chunk);
+        }
+        let root = account.history_path().with_extension("voice-cache");
+        let name = format!("{}.audio", binding.request);
+        let task_binding = binding.clone();
+        let task_controls = controls.clone();
+        let task_events = events.clone();
+        let task_ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let lease = crate::video_player::CachedVideo::reserve(&root, &name)?;
+            lease.admit(data.len())?;
+            anyhow::ensure!(
+                !task_controls.stop.load(Ordering::Acquire)
+                    && media_context_alive(&account, Some(&context)),
+                "Đã dừng phát âm thanh"
+            );
+            crate::storage::atomic_write(lease.path(), &data)?;
+            #[cfg(windows)]
+            let (samples, rate) = crate::windows_video::voice_pcm(lease.path())?;
+            #[cfg(not(windows))]
+            let (samples, rate): (Vec<f32>, u32) =
+                anyhow::bail!("Phát âm thanh hiện hỗ trợ Windows");
+            let duration = samples.len() as f32 / rate as f32;
+            anyhow::ensure!(
+                !task_controls.stop.load(Ordering::Acquire),
+                "Đã dừng phát âm thanh"
+            );
+            let player =
+                crate::voice::VoicePreviewPlayer::play(std::sync::Arc::from(samples), rate)?;
+            loop {
+                if task_controls.stop.load(Ordering::Acquire)
+                    || !media_context_alive(&account, Some(&context))
+                {
+                    player.stop();
+                    break;
+                }
+                let paused = task_controls.pause.load(Ordering::Acquire);
+                if let Some(error) = player.playback_error() {
+                    anyhow::bail!("{error}");
+                }
+                player.set_paused(paused);
+                let progress = player.progress();
+                let finished = progress >= 1.0;
+                let _ = task_events.send(GuiEvent::InlineVoiceUpdated {
+                    binding: task_binding.clone(),
+                    snapshot: inline_voice::Snapshot {
+                        loading: false,
+                        paused,
+                        finished,
+                        position: (duration * progress).min(duration),
+                        duration,
+                        error: None,
+                    },
+                });
+                task_ctx.request_repaint();
+                if finished {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(())
+        })
+        .await??;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(error) = result {
+        if !controls.stop.load(Ordering::Acquire) {
+            let _ = events.send(GuiEvent::InlineVoiceUpdated {
+                binding,
+                snapshot: inline_voice::Snapshot {
+                    error: Some(error.to_string()),
+                    ..Default::default()
+                },
+            });
+            ctx.request_repaint();
+        }
+    }
+}
+
 async fn persist_media_projection(
     s: &Session,
     context: &mut ChatImage,
@@ -6491,8 +7807,8 @@ async fn persist_media_projection(
     let message = context.message.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         anyhow::ensure!(account.is_active(), "Đã đăng xuất");
-        crate::store::MessageStore::open(account.history_path())?
-            .update_media_metadata(&thread, &message)
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+        store.update_media_metadata(&thread, &message)
     })
     .await??;
     if s.is_active() {
@@ -6507,6 +7823,91 @@ async fn persist_media_projection(
 #[cfg(test)]
 mod mentioned_outgoing_tests {
     use super::*;
+
+    #[test]
+    fn stale_outgoing_intent_gets_terminal_not_sent_state() {
+        let message =
+            crate::outgoing::pending("queued".into(), false, crate::outgoing::Payload::Text);
+        let failed = outgoing_not_sent(message, "Phiên đã thay đổi");
+        assert_eq!(failed.delivery, crate::message_model::DeliveryState::Failed);
+        assert_eq!(
+            failed.outgoing_job.as_ref().map(|job| job.error.as_str()),
+            Some("Phiên đã thay đổi")
+        );
+    }
+
+    #[test]
+    fn outgoing_identity_rejects_closed_or_replaced_session() {
+        assert!(!outgoing_identity_matches(
+            false, "owner-a", 1, "owner-a", 1
+        ));
+        assert!(!outgoing_identity_matches(true, "owner-b", 2, "owner-a", 1));
+        assert!(outgoing_identity_matches(true, "owner-a", 1, "owner-a", 1));
+    }
+
+    fn outgoing_test_lifecycle() -> (OutgoingLifecycle, std::sync::mpsc::Receiver<GuiEvent>) {
+        let (events, receiver) = std::sync::mpsc::channel();
+        (
+            OutgoingLifecycle::new(events, egui::Context::default()),
+            receiver,
+        )
+    }
+
+    fn test_outgoing_message() -> ChatMessage {
+        crate::outgoing::pending("test message".into(), false, crate::outgoing::Payload::Text)
+    }
+
+    #[test]
+    fn dropping_queued_outgoing_publishes_not_sent() {
+        let (lifecycle, events) = outgoing_test_lifecycle();
+        let ticket = lifecycle.accept("owner".into(), 7, "thread".into(), test_outgoing_message());
+        drop(ticket);
+        let GuiEvent::OutgoingState { message, .. } = events.try_recv().unwrap() else {
+            panic!("expected outgoing state")
+        };
+        assert_eq!(
+            message.delivery,
+            crate::message_model::DeliveryState::Failed
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropping_started_outgoing_publishes_delivery_unknown() {
+        let (lifecycle, events) = outgoing_test_lifecycle();
+        let ticket = lifecycle.accept("owner".into(), 7, "thread".into(), test_outgoing_message());
+        assert!(ticket.start());
+        drop(ticket);
+        let GuiEvent::OutgoingState { message, .. } = events.try_recv().unwrap() else {
+            panic!("expected outgoing state")
+        };
+        assert_eq!(
+            message.delivery,
+            crate::message_model::DeliveryState::DeliveryUnknown
+        );
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn finishing_outgoing_ack_publishes_exactly_once() {
+        let (lifecycle, events) = outgoing_test_lifecycle();
+        let ticket = lifecycle.accept("owner".into(), 7, "thread".into(), test_outgoing_message());
+        assert!(ticket.start());
+        let mut ack = test_outgoing_message();
+        ack.delivery = crate::message_model::DeliveryState::ServerAccepted;
+        ticket.finish(ack);
+        ticket.finish(test_outgoing_message());
+        drop(ticket);
+        let GuiEvent::OutgoingState { message, .. } = events.try_recv().unwrap() else {
+            panic!("expected outgoing state")
+        };
+        assert_eq!(
+            message.delivery,
+            crate::message_model::DeliveryState::ServerAccepted
+        );
+        assert!(events.try_recv().is_err());
+    }
+
     #[test]
     fn durable_job_retains_uid_quote_and_client_identity_on_retry() {
         let mut draft = crate::mentions::Draft::from("Hi ");
@@ -6542,29 +7943,130 @@ mod mentioned_outgoing_tests {
     }
 }
 
+#[cfg(test)]
+mod attachment_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_picker_batch_is_rejected_before_pending_or_file_io() {
+        let session = Session::new(false, false, false).unwrap();
+        let (events, received) = std::sync::mpsc::channel();
+        let batch = super::super::file_drop::Batch {
+            thread: "fixture".into(),
+            group: false,
+            caption: String::new(),
+            original: true,
+            files: (0..51)
+                .map(|n| (format!("missing-{n}.txt").into(), None))
+                .collect(),
+            ephemeral: false,
+        };
+        send_attachment_batch(session, batch, events, egui::Context::default()).await;
+        let GuiEvent::StatusUpdate(error) = received.try_recv().unwrap() else {
+            panic!("Oversized batch created an outgoing message");
+        };
+        assert!(error.contains("50"));
+        assert!(is_status_error(&error));
+        assert!(received.try_recv().is_err());
+    }
+}
+
+struct AnnouncedAttachment {
+    path: std::path::PathBuf,
+    stamp: Option<crate::outgoing::FileStamp>,
+    message: ChatMessage,
+    active: crate::outgoing::Active,
+}
+
+// Publish the entire bounded batch before queue admission, persistence or media preparation.
+// Otherwise a slow disk or the first large file delays even the later files' bubbles.
+fn announce_attachment_batch(
+    owner: &str,
+    runtime_id: usize,
+    batch: &mut super::file_drop::Batch,
+    events: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) -> Vec<AnnouncedAttachment> {
+    let mut announced = Vec::with_capacity(batch.files.len());
+    for (path, stamp) in std::mem::take(&mut batch.files) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let message = crate::outgoing::pending(
+            format!("[Tệp] {name}"),
+            batch.group,
+            crate::outgoing::Payload::Attachment {
+                path: path.clone(),
+                caption: batch.caption.clone(),
+                stamp: stamp.clone(),
+                hd_source: None,
+            },
+        );
+        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
+            continue;
+        };
+        if events
+            .send(GuiEvent::OutgoingState {
+                runtime_id,
+                owner: owner.to_owned(),
+                thread_id: batch.thread.clone(),
+                message: message.clone(),
+            })
+            .is_err()
+        {
+            break;
+        }
+        announced.push(AnnouncedAttachment {
+            path,
+            stamp,
+            message,
+            active,
+        });
+    }
+    ctx.request_repaint();
+    announced
+}
+
 /// Shared bounded upload path; the session is captured before any picker/preview await.
 async fn send_attachment_batch(
     s: Session,
-    batch: super::file_drop::Batch,
+    mut batch: super::file_drop::Batch,
     events: Sender<GuiEvent>,
     ctx: egui::Context,
 ) {
     let owner = s.account_key().to_owned();
+    if batch.files.len() > super::file_drop::MAX_ATTACHMENTS {
+        let _ = events.send(GuiEvent::StatusUpdate(
+            "Không thể gửi quá 50 tệp mỗi lần; chưa gửi tệp nào".into(),
+        ));
+        ctx.request_repaint();
+        return;
+    }
     static ATTACHMENT_QUEUE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
         std::sync::OnceLock::new();
     let attachment_queue =
         ATTACHMENT_QUEUE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(16)));
-    for (path, expected_stamp) in batch.files {
+    if !s.is_active() {
+        return;
+    }
+    let announced = announce_attachment_batch(&owner, s.runtime_id(), &mut batch, &events, &ctx);
+    for AnnouncedAttachment {
+        path,
+        stamp: expected_stamp,
+        mut message,
+        active,
+    } in announced
+    {
         let Ok(queued) = attachment_queue.clone().acquire_owned().await else {
             break;
         };
         if !s.is_active() {
             break;
         }
+        let original_path = path.clone();
+        persist_outgoing(&s, &batch.thread, &message).await;
+
         let current_stamp = crate::outgoing::FileStamp::read(&path).await.ok();
         let invalid_source = current_stamp.is_none();
         let source_stamp = expected_stamp.clone().or_else(|| current_stamp.clone());
-        let original_path = path.clone();
         let copy_dir = crate::photo_quality::outgoing_dir(s.account_key());
         let path_for_reduce = original_path.clone();
         let mut hd_copy = if invalid_source
@@ -6597,44 +8099,38 @@ async fn send_attachment_batch(
             path: path.clone(),
         });
         let path = hd_copy.clone().unwrap_or(path);
-        let stamp = if hd_copy.is_none() {
-            expected_stamp.or(current_stamp)
-        } else {
-            crate::outgoing::FileStamp::read(&path).await.ok()
-        };
-        let mut message = crate::outgoing::pending(
-            format!(
-                "[Tệp] {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ),
-            batch.group,
-            crate::outgoing::Payload::Attachment {
-                path,
-                caption: batch.caption.clone(),
-                stamp,
-                hd_source,
-            },
-        );
         if invalid_source {
             message.delivery = crate::message_model::DeliveryState::Failed;
             if let Some(job) = message.outgoing_job.as_mut() {
                 job.error = "Không đọc được tệp thường; thư mục không được hỗ trợ".into();
             }
-        }
-        let Some(active) = crate::outgoing::Active::start(&message.client_message_id) else {
-            continue;
-        };
-        persist_outgoing(&s, &batch.thread, &message).await;
-        let _ = events.send(GuiEvent::OutgoingState {
-            runtime_id: s.runtime_id(),
-            owner: owner.clone(),
-            thread_id: batch.thread.clone(),
-            message: message.clone(),
-        });
-        ctx.request_repaint();
-        if invalid_source {
+            persist_outgoing(&s, &batch.thread, &message).await;
+            let _ = events.send(GuiEvent::OutgoingState {
+                runtime_id: s.runtime_id(),
+                owner: owner.clone(),
+                thread_id: batch.thread.clone(),
+                message,
+            });
+            ctx.request_repaint();
             drop(active);
             continue;
+        }
+        if let Some(job) = message.outgoing_job.as_mut() {
+            if let crate::outgoing::Payload::Attachment {
+                path: payload_path,
+                stamp: payload_stamp,
+                hd_source: payload_hd_source,
+                ..
+            } = &mut job.payload
+            {
+                *payload_path = hd_copy.clone().unwrap_or(path);
+                *payload_stamp = if hd_copy.is_none() {
+                    expected_stamp.clone().or(current_stamp.clone())
+                } else {
+                    crate::outgoing::FileStamp::read(payload_path).await.ok()
+                };
+                *payload_hd_source = hd_source;
+            }
         }
         let s = s.clone();
         let owner = owner.clone();
@@ -6708,7 +8204,7 @@ async fn publish_pins(s: &Session, snapshot: crate::server_pins::Snapshot, tx: &
     let saved = snapshot.clone();
     let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
         if !account.is_active(){return Ok(());}
-        let store=crate::store::MessageStore::open(account.history_path())?;
+        let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
         store.conn.execute("INSERT INTO tool_config(key,value) VALUES('server_pins',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&saved)?])?;Ok(())
     }).await;
     if !matches!(result, Ok(Ok(()))) {
@@ -6797,7 +8293,8 @@ fn apply_metadata_impact(
                 if !account.is_active() {
                     return Ok(());
                 }
-                let store = crate::store::MessageStore::open(account.history_path())?;
+                let (store, _write_permit) =
+                    crate::store::MessageStore::open_for_account_write(&account)?;
                 if impact.all_groups {
                     store.conn.execute("DELETE FROM group_metadata", [])?;
                 } else {
@@ -6939,6 +8436,71 @@ mod audit_progress_tests {
             events.last(),
             Some(GuiEvent::UploadProgress { completed: 9, .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod attachment_announcement_tests {
+    use super::*;
+
+    #[test]
+    fn entire_batch_has_named_bubbles_before_disk_or_upload_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let mut batch = super::super::file_drop::Batch {
+            thread: "recipient".into(),
+            group: false,
+            caption: "caption".into(),
+            original: true,
+            files: (0..20)
+                .map(|i| (root.path().join(format!("Tệp {i}.zip")), None))
+                .collect(),
+            ephemeral: false,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let announced =
+            announce_attachment_batch("owner", 7, &mut batch, &tx, &egui::Context::default());
+        assert_eq!(
+            announced.len(),
+            20,
+            "batches larger than upload concurrency must appear together"
+        );
+        assert!(root.path().read_dir().unwrap().next().is_none());
+        for (index, pending) in announced.iter().enumerate() {
+            let GuiEvent::OutgoingState {
+                owner,
+                runtime_id,
+                thread_id,
+                message,
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected a real outgoing payload");
+            };
+            assert_eq!(
+                (owner.as_str(), runtime_id, thread_id.as_str()),
+                ("owner", 7, "recipient")
+            );
+            assert_eq!(
+                message.link_title.as_deref(),
+                Some(format!("Tệp {index}.zip").as_str())
+            );
+            assert_eq!(message.kind, crate::message_model::MessageKind::File);
+            assert_eq!(
+                message.delivery,
+                crate::message_model::DeliveryState::Pending
+            );
+            assert_eq!(message.client_message_id, pending.message.client_message_id);
+            assert!(crate::outgoing::is_active(&message.client_message_id));
+            assert!(matches!(message.outgoing_job.unwrap().payload,
+                crate::outgoing::Payload::Attachment { path, caption, .. }
+                if path == pending.path && caption == "caption"));
+        }
+        assert!(rx.try_recv().is_err());
+        let ids: Vec<_> = announced
+            .iter()
+            .map(|p| p.message.client_message_id.clone())
+            .collect();
+        drop(announced);
+        assert!(ids.iter().all(|id| !crate::outgoing::is_active(id)));
     }
 }
 

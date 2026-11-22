@@ -495,28 +495,28 @@ impl ZaloGuiApp {
                                 .rect_filled(rect, Rounding::same(8.0), pal.bg_hover);
                         }
 
-                        let display_name = self.resolve_contact_name(&thread.id, &thread.name);
+                        let display_name = self
+                            .resolve_contact_name(&thread.id, &thread.name)
+                            .to_owned();
 
                         // Avatar
                         let center = Pos2::new(rect.left() + 28.0, rect.center().y);
-                        ui.painter().circle_filled(
+                        paint_user_avatar(
+                            ui.painter(),
                             center,
                             18.0,
-                            avatar_color_for(display_name, false),
-                        );
-                        ui.painter().text(
-                            center,
-                            egui::Align2::CENTER_CENTER,
-                            avatar_initials(display_name),
-                            FontId::proportional(13.0),
-                            Color32::WHITE,
+                            &display_name,
+                            false,
+                            thread.avatar.as_deref(),
+                            &self.sticker_textures,
+                            &mut self.loading_stickers,
                         );
 
                         // Name
                         ui.painter().text(
                             Pos2::new(rect.left() + 58.0, rect.center().y - 8.0),
                             egui::Align2::LEFT_CENTER,
-                            display_name,
+                            &display_name,
                             FontId::proportional(13.8),
                             pal.text_primary,
                         );
@@ -641,17 +641,15 @@ impl ZaloGuiApp {
 
                         // Avatar
                         let center = Pos2::new(rect.left() + 28.0, rect.center().y);
-                        ui.painter().circle_filled(
+                        paint_user_avatar(
+                            ui.painter(),
                             center,
                             18.0,
-                            avatar_color_for(&thread.name, true),
-                        );
-                        ui.painter().text(
-                            center,
-                            egui::Align2::CENTER_CENTER,
-                            avatar_initials(&thread.name),
-                            FontId::proportional(13.0),
-                            Color32::WHITE,
+                            &thread.name,
+                            true,
+                            thread.avatar.as_deref(),
+                            &self.sticker_textures,
+                            &mut self.loading_stickers,
                         );
 
                         // Group Name

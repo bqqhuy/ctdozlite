@@ -2,8 +2,9 @@
 use super::*;
 use std::path::PathBuf;
 
-const PER_THREAD: usize = 16;
-const TOTAL: usize = 64;
+pub(super) const MAX_ATTACHMENTS: usize = 50;
+const PER_THREAD: usize = MAX_ATTACHMENTS;
+const TOTAL: usize = MAX_ATTACHMENTS;
 
 pub struct Prepared {
     pub stamp: crate::outgoing::FileStamp,
@@ -54,7 +55,7 @@ impl Drafts {
         let files = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
         let capture = if !files.is_empty() {
             if files.len() > PER_THREAD {
-                return Err("Mỗi lần chỉ nhận tối đa 16 tệp; chưa gửi hay thêm tệp nào");
+                return Err("Mỗi lần chỉ nhận tối đa 50 tệp; chưa gửi hay thêm tệp nào");
             }
             let paths: Vec<_> = files.into_iter().filter_map(|f| f.path).collect();
             if paths.is_empty() {
@@ -83,6 +84,9 @@ impl Drafts {
     }
     pub fn len(&self, thread: &str) -> usize {
         self.threads.get(thread).map_or(0, Vec::len)
+    }
+    pub(super) fn total_len(&self) -> usize {
+        self.threads.values().map(Vec::len).sum()
     }
     fn insert(&mut self, thread: &str, path: PathBuf) -> Option<u64> {
         if self.owner.is_empty()
@@ -251,6 +255,7 @@ impl ZaloGuiApp {
         if self.attachment_drafts.len(thread) == 0 {
             return egui::Rect::NOTHING;
         }
+        let mut add_more = false;
         let response = ui.scope(|ui| {
             let Some(items) = self.attachment_drafts.threads.get_mut(thread) else {
                 return;
@@ -258,78 +263,124 @@ impl ZaloGuiApp {
             if items.is_empty() {
                 return;
             }
+            let count = items.len();
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{} tệp chờ gửi", items.len())).color(pal.text_secondary),
+                    RichText::new(format!("{count} tệp"))
+                        .color(pal.text_primary)
+                        .strong()
+                        .size(14.0),
                 )
                 .on_hover_text(crate::i18n::tr(
-                    "Nhập chú thích bên dưới. Tệp chờ chỉ được giữ trong phiên làm việc này.",
+                    "Tệp sẽ được gửi khi bạn nhấn nút Gửi hoặc Enter.",
                 ));
-                if ui
-                    .button("×")
-                    .on_hover_text(crate::i18n::tr("Bỏ tất cả tệp chờ"))
-                    .clicked()
-                {
-                    items.clear();
-                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button(crate::i18n::tr("Xóa tất cả"))
+                        .on_hover_text(crate::i18n::tr("Bỏ tất cả tệp chờ"))
+                        .clicked()
+                    {
+                        items.clear();
+                    }
+                });
             });
             let mut remove = None;
-            egui::ScrollArea::vertical()
+            egui::ScrollArea::horizontal()
                 .id_salt(("attachment_draft", thread))
-                .min_scrolled_height(0.0)
-                .max_height((budget - 28.0).clamp(0.0, 112.0))
+                .auto_shrink([false, true])
+                .min_scrolled_height(94.0)
+                .max_height((budget - 26.0).clamp(94.0, 118.0))
                 .show(ui, |ui| {
-                    for (index, item) in items.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            if let Some(tex) = &item.texture {
-                                ui.add(egui::Image::new(tex).fit_to_exact_size(Vec2::splat(40.0)));
-                            } else {
-                                let category = crate::message_view::file_category(
-                                    &item.path.file_name().unwrap_or_default().to_string_lossy(),
-                                );
-                                let (rect, response) =
-                                    ui.allocate_exact_size(Vec2::new(32.0, 38.0), Sense::hover());
-                                messages::paint_file_category_icon(ui.painter(), rect, category);
-                                response.on_hover_text(crate::message_view::file_category_label(
-                                    category,
-                                ));
-                            }
-                            ui.vertical(|ui| {
-                                ui.set_max_width((ui.available_width() - 28.0).max(16.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(
-                                            item.path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy(),
-                                        )
-                                        .color(pal.text_primary),
-                                    )
-                                    .truncate(),
-                                );
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        for (index, item) in items.iter().enumerate() {
+                            let tile = egui::Frame::none()
+                                .fill(pal.bg_elevated)
+                                .rounding(Rounding::same(7.0))
+                                .stroke(Stroke::new(1.0_f32, pal.border))
+                                .inner_margin(Margin::same(6.0));
+                            tile.show(ui, |ui| {
+                                ui.set_min_size(Vec2::new(112.0, 82.0));
+                                let (preview_rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(100.0, 52.0), Sense::hover());
+                                if let Some(tex) = &item.texture {
+                                    ui.painter().image(
+                                        tex.id(),
+                                        preview_rect,
+                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                        Color32::WHITE,
+                                    );
+                                } else {
+                                    let category = crate::message_view::file_category(
+                                        &item
+                                            .path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy(),
+                                    );
+                                    messages::paint_file_category_icon(
+                                        ui.painter(),
+                                        preview_rect,
+                                        category,
+                                    );
+                                }
+                                let mut name = item
+                                    .path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                if name.chars().count() > 16 {
+                                    name =
+                                        format!("{}…", name.chars().take(15).collect::<String>());
+                                }
+                                ui.label(RichText::new(name).size(11.5).color(pal.text_primary));
                                 let status = match &item.result {
-                                    None => "Đang đọc tệp…".into(),
+                                    None => "Đang đọc…".to_owned(),
                                     Some(Ok(_)) => crate::chat::format_file_size(item.size),
-                                    Some(Err(e)) => e.clone(),
+                                    Some(Err(e)) => e.chars().take(16).collect(),
                                 };
-                                ui.label(RichText::new(status).small().color(
+                                ui.label(RichText::new(status).size(10.5).color(
                                     if matches!(item.result, Some(Err(_))) {
                                         pal.danger
                                     } else {
                                         pal.text_muted
                                     },
                                 ));
+                                let remove_rect = Rect::from_min_size(
+                                    preview_rect.right_top() - Vec2::new(21.0, -2.0),
+                                    Vec2::splat(20.0),
+                                );
+                                if ui.put(remove_rect, egui::Button::new(lucide::X)).clicked() {
+                                    remove = Some(index);
+                                }
                             });
-                            if ui
-                                .button("×")
-                                .on_hover_text(crate::i18n::tr("Bỏ tệp khỏi danh sách chờ"))
-                                .clicked()
-                            {
-                                remove = Some(index);
-                            }
-                        });
-                    }
+                        }
+                        let (plus_rect, plus_resp) =
+                            ui.allocate_exact_size(Vec2::new(70.0, 82.0), Sense::click());
+                        ui.painter().rect_stroke(
+                            plus_rect,
+                            Rounding::same(7.0),
+                            Stroke::new(1.5_f32, pal.border),
+                        );
+                        ui.painter().text(
+                            plus_rect.center_top() + Vec2::new(0.0, 14.0),
+                            egui::Align2::CENTER_CENTER,
+                            "+",
+                            FontId::proportional(30.0),
+                            pal.text_muted,
+                        );
+                        ui.painter().text(
+                            plus_rect.center_bottom() - Vec2::new(0.0, 15.0),
+                            egui::Align2::CENTER_CENTER,
+                            "Thêm",
+                            FontId::proportional(11.0),
+                            pal.text_secondary,
+                        );
+                        if plus_resp.clicked() {
+                            add_more = true;
+                        }
+                    });
                 });
             if let Some(index) = remove {
                 items.remove(index);
@@ -337,6 +388,24 @@ impl ZaloGuiApp {
         });
         if self.attachment_drafts.len(thread) == 0 {
             self.attachment_drafts.threads.remove(thread);
+        }
+        if add_more {
+            if self.attachment_picker_pending {
+                self.show_toast("Hộp chọn tệp đang mở");
+            } else {
+                self.attachment_picker_pending = WORKER_TX.get().is_some_and(|tx| {
+                    tx.send(WorkerCmd::PickAttachmentDraft {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        thread: thread.to_owned(),
+                        images_only: false,
+                    })
+                    .is_ok()
+                });
+                if !self.attachment_picker_pending {
+                    self.show_toast("Không mở được hộp chọn tệp; các tệp chờ vẫn được giữ");
+                }
+            }
         }
         response.response.rect
     }
@@ -389,14 +458,13 @@ impl ZaloGuiApp {
             Ok(Some(capture)) => capture,
             Ok(None) => return,
             Err(error) => {
-                self.status_msg = error.into();
+                self.show_toast(error);
                 return;
             }
         };
         let Some(destination) = target(capture.position, chat, compose, blocked || capture.blocked)
         else {
-            self.status_msg =
-                "Tệp chưa được gửi: hãy thả vào vùng hội thoại hoặc ô soạn tin".into();
+            self.show_toast("Tệp chưa được gửi: hãy thả vào vùng hội thoại hoặc ô soạn tin");
             return;
         };
         let paths = capture.paths;
@@ -430,10 +498,26 @@ impl ZaloGuiApp {
         paths: Vec<PathBuf>,
     ) {
         self.attachment_drafts.sync_owner(&self.user_uin);
+        let existing = self.attachment_drafts.threads.get(thread);
+        let mut unique = Vec::new();
         for path in paths {
+            if !unique.contains(&path)
+                && !existing.is_some_and(|items| items.iter().any(|item| item.path == path))
+            {
+                unique.push(path);
+            }
+        }
+        let total = self.attachment_drafts.total_len()
+            + usize::from(self.pending_clipboard_image.is_some());
+        if unique.len() > TOTAL.saturating_sub(total)
+            || unique.len() > PER_THREAD.saturating_sub(self.attachment_drafts.len(thread))
+        {
+            self.show_toast("Danh sách chờ chỉ nhận tối đa 50 tệp; chưa thêm tệp nào");
+            return;
+        }
+        for path in unique {
             let Some(id) = self.attachment_drafts.insert(thread, path.clone()) else {
-                self.status_msg =
-                    "Tệp trùng hoặc danh sách chờ đã đầy (16 tệp/hội thoại, 64 tệp tổng)".into();
+                self.status_msg = "Tệp trùng hoặc danh sách chờ đã đầy (tối đa 50 tệp)".into();
                 continue;
             };
             if WORKER_TX.get().is_none_or(|tx| {
@@ -581,13 +665,9 @@ mod tests {
                 .is_some());
         }
         assert!(drafts.insert("thread-a", "extra.txt".into()).is_none());
-        for t in 1..4 {
-            for n in 0..PER_THREAD {
-                assert!(drafts
-                    .insert(&format!("thread-{t}"), format!("{n}.txt").into())
-                    .is_some());
-            }
-        }
+        assert!(drafts
+            .insert("thread-b", "beyond-total.txt".into())
+            .is_none());
         assert!(drafts.insert("thread-b", "extra.txt".into()).is_none());
         drafts.sync_owner("owner-a");
         assert_eq!(drafts.len("thread-a"), PER_THREAD);
@@ -653,6 +733,64 @@ mod tests {
 #[cfg(test)]
 mod draft_send_tests {
     use super::*;
+    #[test]
+    fn adding_clipboard_batch_over_remaining_capacity_is_atomic() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "thread-a".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner-a".into();
+        app.attachment_drafts.sync_owner("owner-a");
+        for index in 0..49 {
+            app.attachment_drafts
+                .insert("thread-a", format!("file-{index}.txt").into())
+                .unwrap();
+        }
+        app.add_attachment_draft_paths(&ctx, "thread-b", vec!["one.mp4".into(), "two.txt".into()]);
+        assert_eq!(app.attachment_drafts.len("thread-b"), 0);
+        assert_eq!(app.attachment_drafts.len("thread-a"), 49);
+        assert!(app.toast_notice.as_ref().unwrap().0.contains("50"));
+        app.add_attachment_draft_paths(&ctx, "thread-b", vec!["one.mp4".into()]);
+        assert_eq!(app.attachment_drafts.len("thread-b"), 1);
+    }
+    #[test]
+    fn clipboard_image_counts_toward_the_combined_draft_limit() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: "thread-a".into(),
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner-a".into();
+        let texture = ctx.load_texture(
+            "clipboard-limit-fixture",
+            egui::ColorImage::new([1, 1], Color32::WHITE),
+            TextureOptions::LINEAR,
+        );
+        app.pending_clipboard_image = Some(("clipboard-fixture.png".into(), 1, 1, texture));
+        let paths: Vec<PathBuf> = (0..50)
+            .map(|n| PathBuf::from(format!("file-{n}.txt")))
+            .collect();
+        app.add_attachment_draft_paths(&ctx, "thread-a", paths.clone());
+        assert_eq!(app.attachment_drafts.total_len(), 0);
+        app.add_attachment_draft_paths(&ctx, "thread-a", paths[..49].to_vec());
+        assert_eq!(app.attachment_drafts.total_len(), 49);
+        assert!(app.pending_clipboard_image.is_some());
+    }
     #[test]
     fn reading_failed_or_modal_drafts_do_not_send_or_clear_caption() {
         let ctx = egui::Context::default();

@@ -512,6 +512,10 @@ fn store_writer_loop(rx: Receiver<StoreEnvelope>, done: tokio::sync::oneshot::Se
             reply_store_error(command, "Phiên đăng nhập đã hết hiệu lực".into());
             continue;
         }
+        let Ok(_write_permit) = session.begin_account_write_blocking() else {
+            reply_store_error(command, "Phiên đăng nhập đã hết hiệu lực".into());
+            continue;
+        };
         let current_path = session.history_path();
         if path.as_ref() != Some(&current_path) || store.is_none() {
             store = crate::store::MessageStore::open(&current_path).ok();
@@ -654,6 +658,9 @@ fn merge_hydrated(live: &mut Vec<Thread>, hydrated: Vec<Thread>) {
 }
 
 fn write_threads_cache(session: &Session, threads: &[Thread]) -> std::result::Result<(), String> {
+    let _write_permit = session
+        .begin_account_write_blocking()
+        .map_err(|error| error.to_string())?;
     let mut slim = threads.to_vec();
     for thread in &mut slim {
         let skip = thread
@@ -1908,11 +1915,16 @@ impl<'a> TuiApp<'a> {
                 self.status = "Đang xóa phiên và dọn dẹp dữ liệu...".into();
 
                 let sender = self.bg_sender();
+                let session = self.session.clone();
                 let critical = self.critical_task();
                 std::thread::spawn(move || {
                     let _critical = critical;
+                    let _write_barrier = session.close_account_writes_blocking();
                     let result =
                         crate::profiles::perform_account_logout(&owner).map_err(|e| format!("{e}"));
+                    if result.is_ok() {
+                        session.revoke_runtime();
+                    }
                     let _ = sender.send(BgEvent::LogoutDone { owner, result });
                 });
             }

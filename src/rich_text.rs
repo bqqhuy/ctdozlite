@@ -67,7 +67,7 @@ impl SendOptions {
     }
 }
 
-/// Composer formatting applies to the complete draft; each conversation keeps its own choice.
+/// Composer formatting keeps selected UTF-16 ranges separate from the active typing style.
 #[derive(Debug, Clone, Default)]
 pub struct ComposerFormat {
     pub bold: bool,
@@ -75,14 +75,195 @@ pub struct ComposerFormat {
     pub underline: bool,
     pub strike: bool,
     pub urgency: Option<Urgency>,
+    /// Explicit selection formatting; an empty collection retains whole-draft formatting.
+    pub ranges: Vec<TextStyle>,
+    /// Text corresponding to the ranges, used to map them through a subsequent edit.
+    pub observed_text: String,
+    /// A collapsed selection changes subsequent inserted text only.
+    pub typing_caret: Option<usize>,
 }
 
 impl ComposerFormat {
+    /// Return to plain text without clearing the independent message urgency.
+    pub fn clear_text_styles(&mut self) {
+        self.bold = false;
+        self.italic = false;
+        self.underline = false;
+        self.strike = false;
+        self.ranges.clear();
+        self.typing_caret = None;
+    }
+    /// Map formatting through a single editor replacement without retaining invalid offsets.
+    pub fn edit(&mut self, text: &str) {
+        if self.observed_text == text {
+            return;
+        }
+        let old: Vec<char> = self.observed_text.chars().collect();
+        let new: Vec<char> = text.chars().collect();
+        let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        let suffix = old[prefix..]
+            .iter()
+            .rev()
+            .zip(new[prefix..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        let start: u32 = old[..prefix].iter().map(|c| c.len_utf16() as u32).sum();
+        let old_end: u32 = old[..old.len() - suffix]
+            .iter()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        let new_end: u32 = new[..new.len() - suffix]
+            .iter()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        let delta = i64::from(new_end) - i64::from(old_end);
+        self.ranges.retain_mut(|range| {
+            let end = range.start + range.len;
+            if end <= start {
+                return true;
+            }
+            if range.start >= old_end {
+                range.start = (i64::from(range.start) + delta).max(0) as u32;
+                return true;
+            }
+            // A replacement inside a styled range inherits that range's style.
+            let begin = range.start.min(start);
+            let end = if end >= old_end {
+                (i64::from(end) + delta).max(i64::from(new_end)) as u32
+            } else {
+                new_end
+            };
+            range.start = begin;
+            range.len = end.saturating_sub(begin);
+            range.len > 0
+        });
+        if self.typing_caret.is_some() && new_end > start {
+            let mut retained = Vec::new();
+            for range in &self.ranges {
+                let end = range.start + range.len;
+                if range.start < start {
+                    let mut left = *range;
+                    left.len = end.min(start) - range.start;
+                    retained.push(left);
+                }
+                if end > new_end {
+                    let mut right = *range;
+                    right.start = range.start.max(new_end);
+                    right.len = end - right.start;
+                    retained.push(right);
+                }
+            }
+            if self.bold || self.italic || self.underline || self.strike {
+                retained.push(TextStyle {
+                    start,
+                    len: new_end - start,
+                    bold: self.bold,
+                    italic: self.italic,
+                    underline: self.underline,
+                    strike: self.strike,
+                    mention: false,
+                });
+            }
+            retained.sort_by_key(|range| range.start);
+            self.ranges = retained;
+        }
+        self.observed_text = text.to_owned();
+    }
+
+    /// Toggle one style on the selected character range, preserving all other style flags.
+    pub fn toggle_selection(&mut self, text: &str, start: usize, end: usize, flag: usize) {
+        self.edit(text);
+        if start >= end {
+            self.ranges = self.options(text).styles;
+            self.typing_caret = Some(start);
+            let active = match flag {
+                0 => &mut self.bold,
+                1 => &mut self.italic,
+                2 => &mut self.underline,
+                _ => &mut self.strike,
+            };
+            *active = !*active;
+            return;
+        }
+        let a = text
+            .chars()
+            .take(start)
+            .map(|c| c.len_utf16() as u32)
+            .sum::<u32>();
+        let b = text
+            .chars()
+            .take(end)
+            .map(|c| c.len_utf16() as u32)
+            .sum::<u32>();
+        if a >= b {
+            return;
+        }
+        let existing = self.options(text).styles;
+        self.typing_caret = None;
+        let all_on = segments(text, &existing)
+            .into_iter()
+            .filter(|(r, _)| {
+                let begin = text[..r.start].encode_utf16().count() as u32;
+                let finish = text[..r.end].encode_utf16().count() as u32;
+                begin < b && finish > a
+            })
+            .all(|(_, s)| match flag {
+                0 => s.bold,
+                1 => s.italic,
+                2 => s.underline,
+                _ => s.strike,
+            });
+        let mut result = Vec::new();
+        for (range, style) in segments(text, &existing) {
+            let begin = text[..range.start].encode_utf16().count() as u32;
+            let finish = text[..range.end].encode_utf16().count() as u32;
+            let mut points = vec![begin, finish];
+            if a > begin && a < finish {
+                points.push(a);
+            }
+            if b > begin && b < finish {
+                points.push(b);
+            }
+            points.sort_unstable();
+            for pair in points.windows(2) {
+                let mut item = TextStyle {
+                    start: pair[0],
+                    len: pair[1] - pair[0],
+                    bold: style.bold,
+                    italic: style.italic,
+                    underline: style.underline,
+                    strike: style.strike,
+                    mention: false,
+                };
+                if pair[0] >= a && pair[1] <= b {
+                    match flag {
+                        0 => item.bold = !all_on,
+                        1 => item.italic = !all_on,
+                        2 => item.underline = !all_on,
+                        _ => item.strike = !all_on,
+                    };
+                }
+                if item.bold || item.italic || item.underline || item.strike {
+                    result.push(item);
+                }
+            }
+        }
+        self.ranges = result;
+        self.bold = false;
+        self.italic = false;
+        self.underline = false;
+        self.strike = false;
+    }
+
     pub fn options(&self, text: &str) -> SendOptions {
         let len = text.encode_utf16().count() as u32;
         let styled = self.bold || self.italic || self.underline || self.strike;
         SendOptions {
-            styles: if styled && len > 0 {
+            styles: if !self.ranges.is_empty() || self.typing_caret.is_some() {
+                let mut adjusted = self.clone();
+                adjusted.edit(text);
+                adjusted.ranges
+            } else if styled && len > 0 {
                 vec![TextStyle {
                     start: 0,
                     len,
@@ -293,6 +474,57 @@ mod send_options_tests {
     use serde_json::json;
 
     #[test]
+    fn collapsed_style_changes_only_new_text_after_a_selected_span() {
+        let mut format = ComposerFormat::default();
+        format.toggle_selection("one two", 0, 3, 0);
+        format.toggle_selection("one two", 7, 7, 1);
+        let before = format.options("one two");
+        assert_eq!(before.styles.len(), 1);
+        assert!(before.styles[0].bold && !before.styles[0].italic);
+        format.edit("one two three");
+        let after = format.options("one two three");
+        assert_eq!(after.styles.len(), 2);
+        assert_eq!((after.styles[1].start, after.styles[1].len), (7, 6));
+        assert!(after.styles[1].italic && !after.styles[1].bold);
+        let mut plain = ComposerFormat::default();
+        plain.toggle_selection("old", 3, 3, 0);
+        assert!(plain.options("old").styles.is_empty());
+        assert_eq!(plain.options("old new").styles[0].start, 3);
+    }
+
+    #[test]
+    fn switching_back_to_plain_removes_hidden_styles_and_keeps_urgency() {
+        let mut format = ComposerFormat {
+            urgency: Some(Urgency::Important),
+            ..Default::default()
+        };
+        format.toggle_selection("hello", 0, 5, 0);
+        assert!(!format.options("hello").styles.is_empty());
+        format.clear_text_styles();
+        assert!(format.options("hello").styles.is_empty());
+        assert_eq!(format.options("hello").urgency, Some(Urgency::Important));
+    }
+
+    #[test]
+    fn selected_formatting_preserves_other_text_and_utf16_ranges_after_edit() {
+        let mut format = ComposerFormat::default();
+        format.toggle_selection("😀 one two", 2, 5, 0);
+        let options = format.options("😀 one two");
+        assert_eq!(options.styles.len(), 1);
+        assert_eq!((options.styles[0].start, options.styles[0].len), (3, 3));
+        assert!(options.styles[0].bold);
+        format.edit("x😀 one two");
+        assert_eq!(format.options("x😀 one two").styles[0].start, 4);
+        format.toggle_selection("x😀 one two", 3, 6, 1);
+        let options = format.options("x😀 one two");
+        assert!(options.styles[0].bold && options.styles[0].italic);
+        format.toggle_selection("x😀 one two", 3, 6, 0);
+        let options = format.options("x😀 one two");
+        assert!(!options.styles[0].bold && options.styles[0].italic);
+        options.apply("x😀 one two", &mut json!({})).unwrap();
+    }
+
+    #[test]
     fn metadata_round_trips_through_incoming_rtf_without_rewriting_text() {
         let text = "😀 chào Việt Nam";
         let options = ComposerFormat {
@@ -301,6 +533,7 @@ mod send_options_tests {
             underline: true,
             strike: true,
             urgency: Some(Urgency::Important),
+            ..Default::default()
         }
         .options(text);
         let mut body = json!({"message":text});

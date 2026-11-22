@@ -709,6 +709,93 @@ pub fn poster_frame(path: &std::path::Path) -> Result<(Vec<u8>, u32, u32)> {
     }
 }
 
+/// Decode a bounded local voice message to mono float PCM using installed Windows codecs.
+/// COM and decoder handles remain on the caller's media thread.
+pub(crate) fn voice_pcm(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
+    use std::os::windows::ffi::OsStrExt;
+    let _runtime = Runtime::new()?;
+    unsafe {
+        let attrs = attributes()?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let reader = MFCreateSourceReaderFromURL(windows::core::PCWSTR(wide.as_ptr()), &attrs)
+            .context("Không giải mã được tin nhắn âm thanh")?;
+        let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+        reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+        reader.SetStreamSelection(stream, true)?;
+        let mt = MFCreateMediaType()?;
+        mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        mt.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
+        reader.SetCurrentMediaType(stream, None, &mt)?;
+        let current = reader.GetCurrentMediaType(stream)?;
+        let rate = current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)?;
+        let channels = current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)? as usize;
+        anyhow::ensure!(
+            (8000..=192000).contains(&rate) && (1..=8).contains(&channels),
+            "Định dạng âm thanh không hợp lệ"
+        );
+        let mut mono = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "Giải mã âm thanh quá lâu"
+            );
+            let mut sample = None;
+            let mut flags = 0;
+            reader.ReadSample(stream, 0, None, Some(&mut flags), None, Some(&mut sample))?;
+            if let Some(sample) = sample {
+                let data = bytes(&sample)?;
+                anyhow::ensure!(
+                    data.len() % (channels * 4) == 0,
+                    "Dữ liệu âm thanh không hợp lệ"
+                );
+                for frame in data.chunks_exact(channels * 4) {
+                    let value = frame
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|v| f32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+                        .sum::<f32>()
+                        / channels as f32;
+                    mono.push(if value.is_finite() {
+                        value.clamp(-1.0, 1.0)
+                    } else {
+                        0.0
+                    });
+                }
+                anyhow::ensure!(
+                    mono.len() <= rate as usize * 600 && mono.len() * 4 <= 64 * 1024 * 1024,
+                    "Tin âm thanh vượt giới hạn phát 10 phút/64 MB"
+                );
+            }
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+        }
+        anyhow::ensure!(!mono.is_empty(), "Tin âm thanh không có dữ liệu");
+        Ok((mono, rate))
+    }
+}
+
+#[cfg(test)]
+mod voice_decode_tests {
+    #[test]
+    fn native_voice_decoder_preserves_real_duration() {
+        let path = std::env::temp_dir().join(format!(
+            "ctdozlite-voice-decode-{}.wav",
+            crate::chat::next_client_message_id()
+        ));
+        let pcm = vec![0.0; 1600];
+        std::fs::write(&path, crate::voice::pcm_to_wav(&pcm, 16000)).unwrap();
+        let decoded = super::voice_pcm(&path);
+        std::fs::remove_file(path).unwrap();
+        let (decoded, rate) = decoded.unwrap();
+        assert_eq!(rate, 16000);
+        assert!((decoded.len() as f32 / rate as f32 - 0.1).abs() < 0.01);
+        assert!(decoded.iter().all(|sample| sample.abs() < 0.00001));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

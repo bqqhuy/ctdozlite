@@ -833,7 +833,19 @@ pub fn emoji_to_tex_key(emoji: &str) -> &'static str {
         "😮" | ":o" => "surprised",
         "😢" | ":-(( " | ":-((" => "cry",
         "😠" | ":-h" => "rage",
-        _ => "like",
+        // Preserve unknown server reactions as text instead of showing a wrong Like icon.
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod emoji_tests {
+    use super::emoji_to_tex_key;
+
+    #[test]
+    fn unknown_reactions_fall_back_to_their_original_glyph() {
+        assert_eq!(emoji_to_tex_key("🫡"), "");
+        assert_eq!(emoji_to_tex_key("❤️"), "heart");
     }
 }
 

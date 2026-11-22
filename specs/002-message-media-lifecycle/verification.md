@@ -22,6 +22,8 @@ Bộ kiểm thử cục bộ chưa chứng minh đầy đủ cleanup cache thư�
 
 ## Nhật ký lần kiểm chứng tiếp theo
 
+Ngày 2026-11-21: triển khai P2/P3 realtime theo [kế hoạch đang hoạt động](../../docs/research/2026-11-21-realtime-action-plan.md), gồm durable enqueue reaction trước cursor và drain riêng. Hai audit độc lập Accept phần mã; `cargo test --locked --lib -j 1`: 1.021 passed/0 failed/11 ignored; `cargo clippy --all-targets --locked -j 1 -- -D warnings`: qua. Không đóng M-T090 hoặc toàn M-04 từ kết quả này. Native measurements ghi riêng tại [báo cáo P2–P4](../../docs/research/2026-11-21-p2-p4-implementation-verification.md).
+
 | Ngày / commit hoặc định danh working tree | Yêu cầu / task | Lệnh hoặc kịch bản | Kết quả và phạm vi | Giới hạn / thiết bị |
 | :--- | :--- | :--- | :--- | :--- |
 

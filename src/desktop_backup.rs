@@ -384,7 +384,7 @@ pub fn execute(
         ..Default::default()
     };
     let importing = expected.is_some();
-    let store = MessageStore::open(session.history_path())?;
+    let (store, _write_permit) = MessageStore::open_for_account_write(session)?;
     let mut transaction = if importing {
         Some(store.conn.unchecked_transaction()?)
     } else {

@@ -315,6 +315,7 @@ zeroize 1.9.1 | Apache-2.0 OR MIT | notices: 50e6751797c50ded, 8c7516d4b27b1e49 
 zerotrie 0.2.5 | Unicode-3.0 | notices: f367c1b8e1aa2624 | https://github.com/unicode-org/icu4x
 zerovec 0.11.8 | Unicode-3.0 | notices: f367c1b8e1aa2624 | https://github.com/unicode-org/icu4x
 zerovec-derive 0.11.6 | Unicode-3.0 | notices: f367c1b8e1aa2624 | https://github.com/unicode-org/icu4x
+zip 2.4.2 | MIT | notices: 13f16f8435b4242f | https://github.com/zip-rs/zip2.git
 zlib-rs 0.6.8 | Zlib | notices: e72111c52b7d96eb | https://github.com/trifectatechfoundation/zlib-rs
 zmij 1.0.23 | MIT | notices: 23f18e03dc49df91 | https://github.com/dtolnay/zmij
 zune-core 0.5.1 | MIT OR Apache-2.0 OR Zlib | notices: 50e6751797c50ded, d30047bca3b51663, d201d14804d3bcd3 | https://github.com/etemesi254/zune-image
@@ -15000,3 +15001,30 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+========================================================================
+NOTICE 13f16f8435b4242f
+Applies to: zip 2.4.2
+The MIT License (MIT)
+
+Copyright (c) 2014 Mathijs van de Nes
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Some files in the "tests/data" subdirectory of this repository are under other
+licences; see files named LICENSE.*.txt for details.

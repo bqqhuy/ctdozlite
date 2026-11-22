@@ -334,6 +334,7 @@ pub struct VoicePreviewPlayer {
     playing: Arc<AtomicBool>,
     playback_pos: Arc<Mutex<f64>>,
     total_samples: usize,
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl VoicePreviewPlayer {
@@ -363,7 +364,12 @@ impl VoicePreviewPlayer {
 
         let samples_clone = samples;
 
-        let err_fn = |err| {
+        let error = Arc::new(Mutex::new(None));
+        let output_error = error.clone();
+        let err_fn = move |err| {
+            if let Ok(mut error) = output_error.lock() {
+                *error = Some(format!("Thiết bị phát âm thanh gặp lỗi: {err}"));
+            }
             crate::logger::log_error("voice_player", &format!("Lỗi loa phát: {err}"));
         };
 
@@ -405,6 +411,7 @@ impl VoicePreviewPlayer {
             playing,
             playback_pos,
             total_samples,
+            error,
         })
     }
 
@@ -425,6 +432,15 @@ impl VoicePreviewPlayer {
 
     pub fn stop(&self) {
         self.playing.store(false, Ordering::Relaxed);
+    }
+
+    /// Pause without discarding the device stream or playback position.
+    pub fn set_paused(&self, paused: bool) {
+        self.playing.store(!paused, Ordering::Relaxed);
+    }
+
+    pub fn playback_error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|error| error.clone())
     }
 }
 

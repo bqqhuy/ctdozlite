@@ -58,10 +58,16 @@ async fn link_send_rejects_unreadable_encryption_policy_before_network() {
 }
 
 async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    fixture_responses(vec![body.map(str::to_owned)]).await
+}
+
+async fn fixture_responses(
+    bodies: Vec<Option<String>>,
+) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+    assert!(!bodies.is_empty());
     std::env::set_var("CTDOZ_ALLOW_TEST_LOOPBACK", "1");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
-    let body = body.map(str::to_owned);
     let task = tokio::spawn(async move {
         let mut requests = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -102,7 +108,7 @@ async fn fixture(body: Option<&str>) -> (String, tokio::task::JoinHandle<Vec<Str
                 }
             }
             requests.push(String::from_utf8_lossy(&request).into_owned());
-            if let Some(body) = &body {
+            if let Some(body) = &bodies[(requests.len() - 1).min(bodies.len() - 1)] {
                 stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
             drop(stream);
@@ -496,6 +502,115 @@ async fn streaming_upload_preserves_chunk_order_checksum_and_final_ack() {
         format!("{:x}", Md5::digest(&bytes))
     );
     assert_eq!(message.id, "999");
+}
+
+#[tokio::test]
+async fn attachment_video_fallback_is_a_regular_file_not_a_folder() {
+    if isolated_fixture("attachment_video_fallback_is_a_regular_file_not_a_folder") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.mkv");
+    std::fs::write(&path, b"fixture video sent as an ordinary file").unwrap();
+    let (host, server) = fixture(Some(r#"{"error_code":0,"data":{"fileId":"7","fileUrl":"https://fixture.invalid/file","msgId":"99"}}"#)).await;
+    let (_, message) = chat::send_attachment(&session(&host), "456", false, &path, "")
+        .await
+        .unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /api/message/asyncfile/upload"));
+    assert!(requests[1].starts_with("POST /api/message/asyncfile/msg"));
+    assert_eq!(
+        params(&requests[1])["fType"],
+        1,
+        "PC uses 2 for folders, not videos"
+    );
+    assert_eq!(params(&requests[1])["extension"], "mkv");
+    assert_eq!(message.kind, zalo_rust::message_model::MessageKind::File);
+}
+
+#[tokio::test]
+async fn attachment_upload_rejection_204_stops_before_message_submission() {
+    if isolated_fixture("attachment_upload_rejection_204_stops_before_message_submission") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("installer.exe");
+    std::fs::write(&path, b"synthetic installer fixture").unwrap();
+    let (host, server) = fixture(Some(r#"{"error_code":204,"data":{}}"#)).await;
+    let error = chat::send_attachment(&session(&host), "456", false, &path, "")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("204"));
+    assert!(error.to_string().contains("Tải tệp lên"));
+    let requests = server.await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "rejection must not retry, fall back or submit a message"
+    );
+    assert!(requests[0].starts_with("POST /api/message/asyncfile/upload"));
+    assert_eq!(std::fs::read(path).unwrap(), b"synthetic installer fixture");
+}
+
+#[tokio::test]
+async fn attachment_submit_204_does_not_reupload_or_resubmit() {
+    if isolated_fixture("attachment_submit_204_does_not_reupload_or_resubmit") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.txt");
+    std::fs::write(&path, b"source survives server rejection").unwrap();
+    let (host, server) = fixture_responses(vec![
+        Some(
+            r#"{"error_code":0,"data":{"fileId":"7","fileUrl":"https://fixture.invalid/file"}}"#
+                .into(),
+        ),
+        Some(r#"{"error_code":204,"data":{}}"#.into()),
+    ])
+    .await;
+    let error = chat::send_attachment(&session(&host), "456", false, &path, "")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("204"));
+    assert!(error.to_string().contains("Gửi tin tệp"));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].starts_with("POST /api/message/asyncfile/msg"));
+    assert_eq!(
+        std::fs::read(path).unwrap(),
+        b"source survives server rejection"
+    );
+}
+
+#[tokio::test]
+async fn attachment_regular_file_routes_preserve_target_and_client_identity() {
+    if isolated_fixture("attachment_regular_file_routes_preserve_target_and_client_identity") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fixture.txt");
+    std::fs::write(&path, b"ordinary attachment").unwrap();
+    for (target, group, prefix, key, value) in [
+        ("456", false, "/api/message/asyncfile/", "toid", "456"),
+        ("g789", true, "/api/group/asyncfile/", "grid", "789"),
+    ] {
+        let (host,server)=fixture(Some(r#"{"error_code":0,"data":{"fileId":"7","fileUrl":"https://fixture.invalid/file","msgId":"99"}}"#)).await;
+        let (_, message) = chat::send_attachment(&session(&host), target, group, &path, "")
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(&format!("POST {prefix}upload")));
+        assert!(requests[1].starts_with(&format!("POST {prefix}msg")));
+        let body = params(&requests[1]);
+        assert_eq!(body[key], value);
+        assert_eq!(body["fType"], 1);
+        assert_eq!(
+            body["clientId"].as_u64().unwrap().to_string(),
+            message.client_message_id
+        );
+    }
 }
 #[tokio::test]
 async fn forward_message_body_matches_zalo_pc_forward_message() {

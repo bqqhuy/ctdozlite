@@ -1,0 +1,521 @@
+{
+  "date": "2026-11-22",
+  "classification": "E2 static source, no authenticated traffic capture",
+  "scratch_root": "C:\\Users\\bqqhu\\AppData\\Local\\Temp\\zalolite-direct-audit-20261122",
+  "source_offsets": "zero-based; codepoint/UTF16/UTF8 recorded separately",
+  "archives": {
+    "pc_app_asar_sha256": "4c3a7aa9b8fb409a95c6739ef9dccdc01127d0dc4f6383ee396400b7f94484c5",
+    "android_apkm_sha256": "8a16f9616ed52b9b41d02579d3f8e26c947160e777af3403aaa70a78d1bac1c6"
+  },
+  "sources": {
+    "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js": {
+      "sha256": "78801014154a86bade096eb916e541223a5f553f888882aa0ef3a218a44d6c08",
+      "bytes": 21691083
+    },
+    "pc/pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js": {
+      "sha256": "c29c9f0a7f0718c5b044764666b6fc5dec8b8eb65e178819b3cee3b1f93e3426",
+      "bytes": 2702490
+    },
+    "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.css": {
+      "sha256": "1e0041c361f41015597bd5a876a77396ea1cbf68470382fd356128e028c03e76",
+      "bytes": 2366824
+    },
+    "web/1.c72c0957b455ab70b73c.js": {
+      "sha256": "29784a88e51221a64f854b059e49e68707ae58cee7a4114bc722ce028a887bf1",
+      "bytes": 16302277
+    },
+    "web/web-startup.a00a02c532982ab4915a.js": {
+      "sha256": "5dc90183d21e826518884e9b67e74d9d265593816952984e9d4ac0cde132cf01",
+      "bytes": 2393291
+    },
+    "android/classes.dex": {
+      "sha256": "ccd53daa8d49c618df28bab09dec2ecaa8b5d4a1cd70889e21eb88f8d4bd4106",
+      "bytes": 5881036
+    },
+    "android/classes2.dex": {
+      "sha256": "9868532f34ec1623020e42aabd7d7fd69d00a92d1175598265b16f533fcc2aea",
+      "bytes": 9571352
+    },
+    "android/classes3.dex": {
+      "sha256": "cd0fed36f025b3680c228c35fdd69395645a0795889dd07e8bb5de2bcc7b439a",
+      "bytes": 9164424
+    },
+    "android/classes4.dex": {
+      "sha256": "34960193827f59c55ed41cf4e010316183915850a4efd28a155fa4dd332dd850",
+      "bytes": 10813880
+    },
+    "android/classes5.dex": {
+      "sha256": "7f6b6855bf429f133a3bb24a31d7ee00c6da47e3ffe455acca873f7debf83c43",
+      "bytes": 11409928
+    },
+    "android/classes6.dex": {
+      "sha256": "f6dff064be99e59d93b1a9f320c153ec80a6885f9758d66021289604e090dc0f",
+      "bytes": 8559784
+    }
+  },
+  "anchors": [
+    {
+      "id": "pc-phonebook-v2",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "static getPhonebookV2",
+      "codepoint_offset": 15120390,
+      "utf16_offset": 15120542,
+      "utf8_byte_offset": 15154518
+    },
+    {
+      "id": "pc-phonebook-manager",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "_startFlowFetchPhonebook(e){",
+      "codepoint_offset": 10571146,
+      "utf16_offset": 10571275,
+      "utf8_byte_offset": 10600247
+    },
+    {
+      "id": "pc-phonebook-gate",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "getPhonebookName(e){",
+      "codepoint_offset": 6884823,
+      "utf16_offset": 6884925,
+      "utf8_byte_offset": 6905523
+    },
+    {
+      "id": "pc-alias-v2",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "static getAliasV2",
+      "codepoint_offset": 15132619,
+      "utf16_offset": 15132771,
+      "utf8_byte_offset": 15166747
+    },
+    {
+      "id": "pc-alias-update",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "_updateDataAlias(e){",
+      "codepoint_offset": 11639856,
+      "utf16_offset": 11639985,
+      "utf8_byte_offset": 11669514
+    },
+    {
+      "id": "pc-mini-profile",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "getMiniInfo(e){if(!o.default.valueValid(e)",
+      "codepoint_offset": 6883130,
+      "utf16_offset": 6883232,
+      "utf8_byte_offset": 6903830
+    },
+    {
+      "id": "pc-label-close",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "_cancel(e=null,t=!0)",
+      "codepoint_offset": 11379124,
+      "utf16_offset": 11379253,
+      "utf8_byte_offset": 11408608
+    },
+    {
+      "id": "pc-legacy-geometry",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "WJhq:function",
+      "codepoint_offset": 11657383,
+      "utf16_offset": 11657512,
+      "utf8_byte_offset": 11687041
+    },
+    {
+      "id": "pc-config-defaults",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "gpmR:function",
+      "codepoint_offset": 15579158,
+      "utf16_offset": 15579316,
+      "utf8_byte_offset": 15614050
+    },
+    {
+      "id": "pc-composer-rollout",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "WmaB:function",
+      "codepoint_offset": 11723997,
+      "utf16_offset": 11724126,
+      "utf8_byte_offset": 11753973
+    },
+    {
+      "id": "pc-config-session",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "static getRemoteConfigPerSession(){",
+      "codepoint_offset": 6124434,
+      "utf16_offset": 6124534,
+      "utf8_byte_offset": 6142838
+    },
+    {
+      "id": "pc-voice-upload",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "static sendVoice(",
+      "codepoint_offset": 15098602,
+      "utf16_offset": 15098754,
+      "utf8_byte_offset": 15132730
+    },
+    {
+      "id": "pc-v2t-result",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "needle": "v9mf:function",
+      "codepoint_offset": 19473581,
+      "utf16_offset": 19479916,
+      "utf8_byte_offset": 19541025
+    },
+    {
+      "id": "pc-v2t-submit",
+      "source": "pc/pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js",
+      "needle": "async requestConvert(e){const{url:t}=e",
+      "codepoint_offset": 2091549,
+      "utf16_offset": 2091549,
+      "utf8_byte_offset": 2092636
+    },
+    {
+      "id": "pc-v2t-push",
+      "source": "pc/pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js",
+      "needle": "onReceiveVoiceToTextResultPushEventControl(e)",
+      "codepoint_offset": 2092997,
+      "utf16_offset": 2092997,
+      "utf8_byte_offset": 2094084
+    },
+    {
+      "id": "pc-voice-direct",
+      "source": "pc/pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js",
+      "needle": "getDirectURL(e,t)",
+      "codepoint_offset": 82795,
+      "utf16_offset": 82795,
+      "utf8_byte_offset": 83512
+    },
+    {
+      "id": "pc-voice-model",
+      "source": "pc/pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js",
+      "needle": "formats:{m4a:s.m4a}",
+      "codepoint_offset": 1322849,
+      "utf16_offset": 1322849,
+      "utf8_byte_offset": 1323892
+    },
+    {
+      "id": "pc-column-expanded",
+      "source": "pc/pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.css",
+      "needle": "[data-chat-input-layout=column] .chat-input-frame[data-size=expanded]{",
+      "codepoint_offset": 1635613,
+      "utf16_offset": 1635613,
+      "utf8_byte_offset": 1635613
+    },
+    {
+      "id": "web-alias-v2",
+      "source": "web/1.c72c0957b455ab70b73c.js",
+      "needle": "static getAliasV2",
+      "codepoint_offset": 11663912,
+      "utf16_offset": 11664052,
+      "utf8_byte_offset": 11669176
+    },
+    {
+      "id": "web-phonebook-v2",
+      "source": "web/1.c72c0957b455ab70b73c.js",
+      "needle": "static getPhonebookV2",
+      "codepoint_offset": 11651683,
+      "utf16_offset": 11651823,
+      "utf8_byte_offset": 11656947
+    },
+    {
+      "id": "web-phonebook-gate",
+      "source": "web/1.c72c0957b455ab70b73c.js",
+      "needle": "getPhonebookName(e){",
+      "codepoint_offset": 5587170,
+      "utf16_offset": 5587269,
+      "utf8_byte_offset": 5590475
+    },
+    {
+      "id": "web-legacy-geometry",
+      "source": "web/1.c72c0957b455ab70b73c.js",
+      "needle": "WJhq:function",
+      "codepoint_offset": 9227842,
+      "utf16_offset": 9227967,
+      "utf8_byte_offset": 9232266
+    },
+    {
+      "id": "web-composer-rollout",
+      "source": "web/1.c72c0957b455ab70b73c.js",
+      "needle": "WmaB:function",
+      "codepoint_offset": 9264996,
+      "utf16_offset": 9265121,
+      "utf8_byte_offset": 9269424
+    },
+    {
+      "id": "web-v2t-push",
+      "source": "web/web-startup.a00a02c532982ab4915a.js",
+      "needle": "onReceiveVoiceToTextResultPushEventControl(e)",
+      "codepoint_offset": 1914305,
+      "utf16_offset": 1914305,
+      "utf8_byte_offset": 1915145
+    }
+  ],
+  "web_downloads": [
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/1.c72c0957b455ab70b73c.js",
+      "sha256": "29784a88e51221a64f854b059e49e68707ae58cee7a4114bc722ce028a887bf1",
+      "bytes": 16302277
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/14.1529669323de1588caef.js",
+      "sha256": "f9fba1049984768e49a7dd389d5d02b873acf4a10f2b67efd3034a0b454d203b",
+      "bytes": 80321
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/2.c3bf296c1dc0dcd10294.js",
+      "sha256": "1f9cd862ee6f5e63c3a30bf9cbfdcfd0401372cd1d24f12882bed4123ff8beb7",
+      "bytes": 2339447
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/3.037eb2baf9d1ad9f2d7e.js",
+      "sha256": "7809c2ed151ad6fe86dea248d2bd904435b38e5bed944150b946f7ebe00d5df6",
+      "bytes": 36477
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/4.733701f2750eeefc49d7.js",
+      "sha256": "5911fea711695b701bb82f8853d704106a479fe2d47026128c5400726ffc4516",
+      "bytes": 861
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/default-embed-render-trusted-device-bridge.945a394c838bda8229c0.js",
+      "sha256": "36b9e8bd08e74076482e737554e80cb0470e5417682b5c0c8d531af3465b4210",
+      "bytes": 2869
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/default-embed-render.0f437fad1343714f4897.js",
+      "sha256": "d9b8e96d5fba1d18cb992569c57b41b2dbc6b4b1e194bb17cee312cccfe4dfcb",
+      "bytes": 946093
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/default-trusted-device-bridge-web-startup.cc5992c1dd3c583c7102.js",
+      "sha256": "6ce43f982ab12d73ee87c3f6377017f7ce598d04e4273b40147b7bd7eb923ec2",
+      "bytes": 10640
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/render.081738ba2350940a6b28.js",
+      "sha256": "b9244a51f741d50d7f4cb75d827726f1ee4ffd28672aab7d1bba2ae39dbf5553",
+      "bytes": 203673
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/vendors-embed-render-trusted-device-bridge.85a0370800e761976138.js",
+      "sha256": "fb57e3e23b25a7b4d11fe8ad759b4f895cb1af97d2910b12c14a79824c271af3",
+      "bytes": 26789
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/vendors-embed-render.0f79c9d9451c44466079.js",
+      "sha256": "c6b6463675fb24fd1b92e4f29e7103c0894cd720e55905c4ecb3e32d3b2a8c91",
+      "bytes": 1156542
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/vendors-web-startup.be15797b10fe9afd5ad0.js",
+      "sha256": "b031e129537aee181f8eaee63af93fa891d81c683ac2c74abd28100d1313eac6",
+      "bytes": 438207
+    },
+    {
+      "url": "https://zalo-chat-static.zadn.vn/v1/lazy/web-startup.a00a02c532982ab4915a.js",
+      "sha256": "5dc90183d21e826518884e9b67e74d9d265593816952984e9d4ac0cde132cf01",
+      "bytes": 2393291
+    }
+  ],
+  "android_method_index": [
+    {
+      "dex": "classes3.dex",
+      "method": "Li2;->invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
+      "matches": [
+        "v2, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lipe;->M(Z Lo4g;)V",
+      "matches": [
+        "v9, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->a(Lix; I Ljava/lang/Throwable; Lox; Lgx;)V",
+      "matches": [
+        "v6, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->d()V",
+      "matches": [
+        "v2, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->c()V",
+      "matches": [
+        "v2, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->e()V",
+      "matches": [
+        "v2, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->m()V",
+      "matches": [
+        "v1, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->n(I Lxul; Z Lox; Lgx;)Ly8r;",
+      "matches": [
+        "v2, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->o(Ljava/lang/Object;)V",
+      "matches": [
+        "v0, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->r(Ljava/lang/String; Ljava/lang/String; Z)V",
+      "matches": [
+        "v6, \"delete from alias_friend where currentUserUid = ? and uIdTo = ?\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lp3g;->E(Landroidx/recyclerview/widget/o; I Ljava/util/List;)V",
+      "matches": [
+        "v0, \"UPDATE_ALIAS_NAME\""
+      ]
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lz8;->invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
+      "matches": [
+        "v3, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes4.dex",
+      "method": "Lgx;->invokeSuspend(Ljava/lang/Object;)Ljava/lang/Object;",
+      "matches": [
+        "v12, \"AliasManager\""
+      ]
+    },
+    {
+      "dex": "classes4.dex",
+      "method": "Lxg7;->a()Ljava/lang/Object;",
+      "matches": [
+        "v5, \"dictation_record_tracking\""
+      ]
+    },
+    {
+      "dex": "classes4.dex",
+      "method": "Lyhl;->onClick(Landroid/view/View;)V",
+      "matches": [
+        "v2, \"/alias_name\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Lac1;->d()V",
+      "matches": [
+        "v4, \"dictation_record_tracking\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Ldxn;->run()V",
+      "matches": [
+        "v2, \"VoiceToTextController\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Lfgs;->run()V",
+      "matches": [
+        "v2, \"VoiceToTextController\"",
+        "v2, \"VoiceToTextController\"",
+        "v3, \"VoiceToTextController\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Lfi;->handleMessage(Landroid/os/Message;)Z",
+      "matches": [
+        "v0, \"VoiceToTextController\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Lkva;->c(Ljava/lang/Object; Ljava/lang/Object;)Ljava/lang/Object;",
+      "matches": [
+        "v3, \"UPDATE_ALIAS_NAME\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Ltls;->run()V",
+      "matches": [
+        "v1, \"VoiceToTextController\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Luqn;->d(Ljava/lang/Object;)V",
+      "matches": [
+        "v2, \"VoiceToTextController\""
+      ]
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Lzlg;->E(Landroidx/recyclerview/widget/o; I Ljava/util/List;)V",
+      "matches": [
+        "v8, \"UPDATE_ALIAS_NAME\""
+      ]
+    }
+  ],
+  "android_bytecode": [
+    {
+      "dex": "classes5.dex",
+      "method": "Luls;->a(Lxls;)V",
+      "instructions": "30-33 JSON url/fileId; 52-59 packet 760 and timeout 30000",
+      "dump": "android/classes5-controller-smali.txt"
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Luls;->e(Lxls; Z)V",
+      "instructions": "4-30 AAC format gate",
+      "dump": "android/classes5-controller-smali.txt"
+    },
+    {
+      "dex": "classes5.dex",
+      "method": "Luqn;->d(Ljava/lang/Object;)V",
+      "instructions": "19-35 cliFileId correlation; 37-53 text/asr",
+      "dump": "android/classes5-alias-result-smali.txt"
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->r(Ljava/lang/String; Ljava/lang/String; Z)V",
+      "instructions": "48-52 account-scoped alias delete",
+      "dump": "android/classes3-alias-result-smali.txt"
+    },
+    {
+      "dex": "classes3.dex",
+      "method": "Lix;->o(Ljava/lang/Object;)V",
+      "instructions": "12-17 feature guards; 29-33 userId/alias parsing",
+      "dump": "android/classes3-alias-result-smali.txt"
+    }
+  ],
+  "android_manifest": {
+    "package": "com.zing.zalo",
+    "version_name": "26.11.01",
+    "version_code": "261101901",
+    "min_sdk": "24",
+    "reader": "androguard 4.1.4"
+  }
+}

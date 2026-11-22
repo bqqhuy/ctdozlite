@@ -17,6 +17,89 @@ use serde_json::{Map, Value};
 
 use crate::crypto;
 
+#[derive(Default)]
+struct AccountWriteState {
+    writers: usize,
+    closing: usize,
+    sealed: bool,
+}
+
+/// Session-generation admission gate for blocking local writes.
+/// Clones share it; logout seals it before installing a fresh runtime gate.
+#[derive(Default)]
+struct AccountWriteGate {
+    state: std::sync::Mutex<AccountWriteState>,
+    changed: std::sync::Condvar,
+}
+
+pub(crate) struct AccountWritePermit {
+    gate: Arc<AccountWriteGate>,
+}
+
+pub(crate) struct AccountWriteBarrier {
+    _gate: Arc<AccountWriteGate>,
+}
+
+impl Drop for AccountWriteBarrier {
+    fn drop(&mut self) {
+        let mut state = self._gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closing -= 1;
+        self._gate.changed.notify_all();
+    }
+}
+
+impl Drop for AccountWritePermit {
+    fn drop(&mut self) {
+        let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.writers -= 1;
+        if state.writers == 0 {
+            self.gate.changed.notify_all();
+        }
+    }
+}
+
+impl AccountWriteGate {
+    fn admit(self: &Arc<Self>, active: bool) -> anyhow::Result<AccountWritePermit> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            active && !state.sealed && state.closing == 0,
+            "Account runtime is closed for writes"
+        );
+        state.writers += 1;
+        Ok(AccountWritePermit { gate: self.clone() })
+    }
+
+    fn begin_close(self: &Arc<Self>) -> AccountWriteBarrier {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.closing += 1;
+        AccountWriteBarrier {
+            _gate: self.clone(),
+        }
+    }
+
+    fn seal(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.sealed = true;
+        self.changed.notify_all();
+    }
+}
+
+impl AccountWriteBarrier {
+    fn drain(self) -> Self {
+        {
+            let mut state = self._gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            while state.writers != 0 {
+                state = self
+                    ._gate
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+        }
+        self
+    }
+}
+
 /// Maximum service-map candidates examined for one read request.
 pub(crate) const MAX_SERVICE_CANDIDATES: usize = 3;
 const MAX_REQUEST_TIMING_SAMPLES: usize = 16;
@@ -234,7 +317,10 @@ impl Domains {
             .iter()
             .filter_map(|service| crate::endpoints::service(service))
             .any(|host| host == key)
-                || matches!(key.as_str(), "media_store" | "media_store_send2me");
+                || matches!(
+                    key.as_str(),
+                    "media_store" | "media_store_send2me" | "ai_features"
+                );
             if !known {
                 return false;
             }
@@ -355,7 +441,7 @@ fn attempt_result_for_response(value: &Value) -> crate::service_resolver::Attemp
     }
 }
 
-fn envelope_failure_code(error: &anyhow::Error) -> Option<i64> {
+pub(crate) fn envelope_failure_code(error: &anyhow::Error) -> Option<i64> {
     error
         .downcast_ref::<EnvelopeFailure>()
         .map(|failure| failure.0)
@@ -453,6 +539,8 @@ pub struct Session {
     pub inbox_policy: Arc<std::sync::RwLock<crate::inbox::Policy>>,
     /// Permission generations reject metadata fetched before an invalidating control.
     pub group_revision: Arc<std::sync::atomic::AtomicU64>,
+    pub composer_config: Option<crate::composer_config::ComposerConfig>,
+    account_write_gate: Arc<AccountWriteGate>,
     active: Arc<AtomicBool>,
     pub http: Client,
     pub jar: Arc<Jar>,
@@ -554,6 +642,8 @@ impl Session {
             hidden: Arc::new(crate::hidden_chat::Vault::default()),
             inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
             group_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            composer_config: None,
+            account_write_gate: Arc::new(AccountWriteGate::default()),
             active: Arc::new(AtomicBool::new(true)),
             http,
             jar,
@@ -839,8 +929,12 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         self.active.store(false, Ordering::SeqCst);
+        // Old Session clones retain this sealed gate and cannot admit delayed writes.
+        self.account_write_gate.seal();
+        self.account_write_gate = Arc::new(AccountWriteGate::default());
         self.active = Arc::new(AtomicBool::new(true));
         self.runtime_generation = next_runtime_generation();
+        self.composer_config = None;
         self.login = None;
         self.hidden = Arc::new(crate::hidden_chat::Vault::default());
         self.inbox_policy = Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default()));
@@ -893,6 +987,27 @@ impl Session {
         self.runtime_generation
     }
 
+    /// Acquire inside the blocking closure, immediately before touching account-local storage.
+    /// Keep the returned permit alive until every SQLite/cache write in that closure is done.
+    pub(crate) fn begin_account_write_blocking(&self) -> anyhow::Result<AccountWritePermit> {
+        self.account_write_gate.admit(self.is_active())
+    }
+
+    /// Close admission, then wait off the Tokio worker until admitted writes finish.
+    /// Dropping an uncommitted boundary reopens admission; revocation seals it permanently.
+    pub(crate) async fn close_account_writes(&self) -> anyhow::Result<AccountWriteBarrier> {
+        // Own closure admission before spawning: cancellation keeps the token with the drain.
+        let barrier = self.account_write_gate.begin_close();
+        tokio::task::spawn_blocking(move || barrier.drain())
+            .await
+            .map_err(|error| anyhow::anyhow!("Cannot join account write barrier: {error}"))
+    }
+
+    /// Close and drain account writes for synchronous worker threads such as the TUI actor.
+    pub(crate) fn close_account_writes_blocking(&self) -> AccountWriteBarrier {
+        self.account_write_gate.begin_close().drain()
+    }
+
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
@@ -900,6 +1015,7 @@ impl Session {
     /// Revoke clones before publishing an account switch; credential cleanup follows in logout.
     pub(crate) fn revoke_runtime(&self) {
         self.active.store(false, Ordering::SeqCst);
+        self.account_write_gate.seal();
     }
 
     pub fn account_key(&self) -> &str {
@@ -926,6 +1042,11 @@ impl Session {
     /// Save the authenticated session to disk so subsequent runs can restore it without re-authenticating.
     pub fn save_to_file(&self, path: &str) -> Result<()> {
         use base64::Engine;
+        let _write_permit = if path == "session.json" {
+            Some(self.begin_account_write_blocking()?)
+        } else {
+            None
+        };
         let _lock = crate::storage::SESSION_IO
             .lock()
             .map_err(|_| anyhow::anyhow!("Session lock poisoned"))?;
@@ -949,6 +1070,9 @@ impl Session {
         let text = serde_json::to_string_pretty(&saved)?;
         let protected = crate::storage::protect(text.as_bytes())?;
         crate::storage::atomic_write(&crate::storage::session_path(path), &protected)?;
+        if path == "session.json" {
+            crate::storage::mark_session_file_runtime(self.runtime_id());
+        }
         drop(_lock);
         if path == "session.json" && !self.account_key().is_empty() {
             crate::profiles::remember_session(self)?;
@@ -980,12 +1104,14 @@ impl Session {
                     self.account_key() == profile.uid,
                     "Phiên đăng nhập không khớp tài khoản đã chọn"
                 );
+                crate::storage::mark_session_file_runtime_if_unclaimed(self.runtime_id())?;
                 return Ok(());
             }
         }
         let bytes = std::fs::read(crate::storage::session_path(path))?;
         let text = crate::storage::unprotect(&bytes)?;
         let saved: SavedSession = serde_json::from_slice(&text)?;
+        self.composer_config = None;
 
         self.link_preview_cache
             .lock()
@@ -1056,6 +1182,10 @@ impl Session {
         } else {
             self.login = None;
             anyhow::bail!("session.json thiếu mã xác thực zpw_sek");
+        }
+
+        if path == "session.json" {
+            crate::storage::mark_session_file_runtime(self.runtime_id());
         }
 
         Ok(())
@@ -1183,11 +1313,13 @@ impl Session {
                 "label",
                 "media_store",
                 "media_store_send2me",
+                "ai_features",
             ] {
                 let Some(value) = map.get(key) else { continue };
-                if let Some(verified) = crate::endpoints::service(key)
-                    .or_else(|| matches!(key, "media_store" | "media_store_send2me").then_some(key))
-                {
+                if let Some(verified) = crate::endpoints::service(key).or_else(|| {
+                    matches!(key, "media_store" | "media_store_send2me" | "ai_features")
+                        .then_some(key)
+                }) {
                     let mut discovered = Vec::new();
                     let mut has_valid_host = false;
                     let values = value
@@ -2309,6 +2441,28 @@ mod credential_destination_tests {
 mod candidate_persistence_tests {
     use super::*;
     #[test]
+    fn voice_ai_requires_discovered_service_and_retains_it_across_reload() {
+        let mut session = Session::new(false, false, false).unwrap();
+        assert!(session
+            .resolve_discovered_service_url("ai_features", "/api/aifeatures/voice2text")
+            .is_err());
+        session.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"ai_features":["https://ai-fixture.zalo.me","https://untrusted.invalid"]}}));
+        let mut restored: Domains =
+            serde_json::from_value(serde_json::to_value(&session.domains).unwrap()).unwrap();
+        restored.prefer_verified_rest();
+        assert_eq!(
+            restored.service_fallbacks["ai_features"],
+            vec!["https://ai-fixture.zalo.me"]
+        );
+        session.domains = restored;
+        assert_eq!(
+            session
+                .resolve_discovered_service_url("ai_features", "/api/aifeatures/voice2text")
+                .unwrap(),
+            "https://ai-fixture.zalo.me/api/aifeatures/voice2text"
+        );
+    }
+    #[test]
     fn label_and_alias_discovery_survive_sanitized_persistence() {
         let mut session = Session::new(false, false, false).unwrap();
         session.apply_server_info(&serde_json::json!({"zpw_service_map_v3":{"alias":["https://alias-fallback.zalo.me"],"label":["https://label-fallback.zaloapp.com"]}}));
@@ -2824,6 +2978,7 @@ fn default_reaction() -> String {
 #[cfg(test)]
 mod runtime_generation_tests {
     use super::*;
+
     #[test]
     fn revoked_runtimes_cannot_reuse_permission_cache_identity() {
         let mut session = Session::new(false, false, false).unwrap();
@@ -2837,5 +2992,118 @@ mod runtime_generation_tests {
         assert_eq!(clone.runtime_id(), original);
         assert!(!clone.is_active());
         assert!(!session.hidden.view("old").ready);
+    }
+
+    #[tokio::test]
+    async fn sealed_generation_drains_admitted_writes_and_rejects_stale_clones() {
+        let mut session = Session::new(false, false, false).unwrap();
+        let stale = session.clone();
+        let stale_after_switch = session.clone();
+        let closing = session.clone();
+        let gate = stale.account_write_gate.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = tokio::task::spawn_blocking(move || {
+            let _permit = stale.begin_account_write_blocking().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let close = tokio::spawn(async move { closing.close_account_writes().await.unwrap() });
+
+        loop {
+            let closed = gate.state.lock().unwrap().closing != 0;
+            if closed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(session.begin_account_write_blocking().is_err()); // (INV-P1-WRITE)
+        assert!(!close.is_finished()); // boundary waits for the admitted blocking write
+
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+        let barrier = close.await.unwrap();
+        session.logout();
+        drop(barrier);
+
+        // Logout gives the new runtime a fresh gate; old clones retain the sealed gate.
+        assert!(session.begin_account_write_blocking().is_ok());
+        assert!(stale_after_switch.begin_account_write_blocking().is_err());
+        assert!(gate.state.lock().unwrap().sealed);
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_write_barrier_reopens_when_transition_is_abandoned() {
+        let session = Session::new(false, false, false).unwrap();
+        let stale = session.clone();
+        let barrier = session.close_account_writes().await.unwrap();
+        assert!(stale.begin_account_write_blocking().is_err());
+        drop(barrier);
+        assert!(session.begin_account_write_blocking().is_ok()); // (INV-P1-ROLLBACK)
+
+        let barrier = session.close_account_writes().await.unwrap();
+        session.revoke_runtime();
+        drop(barrier);
+        assert!(stale.begin_account_write_blocking().is_err());
+    }
+
+    #[test]
+    fn session_json_write_is_gated_before_account_identity_exists() {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(session.account_key().is_empty());
+        let barrier = session.close_account_writes_blocking();
+        assert!(session.save_to_file("session.json").is_err()); // (INV-P1-WRITE)
+        session.revoke_runtime();
+        drop(barrier);
+        assert!(session.save_to_file("session.json").is_err()); // (INV-P1-WRITE)
+    }
+
+    #[tokio::test]
+    async fn concurrent_boundaries_keep_admission_closed_until_every_owner_releases() {
+        let session = Session::new(false, false, false).unwrap();
+        let first = session.close_account_writes().await.unwrap();
+        let second = session.close_account_writes().await.unwrap();
+        drop(first);
+        assert!(session.begin_account_write_blocking().is_err()); // (INV-P1-ROLLBACK)
+        drop(second);
+        assert!(session.begin_account_write_blocking().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_boundary_keeps_its_token_until_blocking_writer_finishes() {
+        let session = Session::new(false, false, false).unwrap();
+        let writing = session.clone();
+        let closing = session.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer = tokio::task::spawn_blocking(move || {
+            let _permit = writing.begin_account_write_blocking().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+        let close = tokio::spawn(async move { closing.close_account_writes().await });
+        loop {
+            if session.account_write_gate.state.lock().unwrap().closing != 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        close.abort();
+        assert!(matches!(close.await, Err(error) if error.is_cancelled()));
+        assert!(session.begin_account_write_blocking().is_err());
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if session.begin_account_write_blocking().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

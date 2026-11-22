@@ -46,6 +46,12 @@
 - Tìm kiếm tức thời qua cache hoặc query route `11747 /api/message/sticker/search`.
 
 ## 2. Trình tự thực hiện
+M-07 bổ sung 22/11/2026: worker công bố toàn bộ intent tệp (tối đa 50) qua
+OutgoingState trước lượt semaphore/SQLite/metadata. Giữ Active/client ID suốt
+luồng xử lý, không đổi protocol gửi; renderer phân biệt intent cục bộ chưa có
+URL với media nhận về đã mất URL. Kiểm thử IPC với lô lớn hơn concurrency và
+nghiệm thu riêng thời điểm bubble trên GUI thật.
+
 1. **Bước 1**: Triển khai M-01 (Chia sẻ Danh thiếp) & M-02 (Batch Forward / Recall) - ít rủi ro về phần cứng âm thanh/video nhất, có thể kiểm thử logic/network ngay.
 2. **Bước 2**: Triển khai M-03 (Media Viewer nâng cao với Zoom/Pan/Gallery).
 3. **Bước 3**: Triển khai M-04 (Voice Recorder & Send) và M-05 (Sticker Search).

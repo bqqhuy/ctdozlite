@@ -13,6 +13,7 @@ pub(super) struct LabelsPanel {
     pub confirm: Option<crate::labels::Action>,
     pub filter: Option<i64>,
 }
+
 impl ZaloGuiApp {
     pub(super) fn open_labels(&mut self, target: Option<(String, bool)>) {
         self.labels_panel.open = true;
@@ -53,6 +54,9 @@ impl ZaloGuiApp {
         let mut intent = None;
         egui::Window::new("Phân loại hội thoại")
             .id(Id::new("server-labels"))
+            // The full-screen backdrop is foreground too; the dialog must be
+            // painted after it on that same layer to receive pointer input.
+            .order(egui::Order::Foreground)
             .open(&mut open)
             .vscroll(true)
             .min_width(120.0)
@@ -189,5 +193,90 @@ impl ZaloGuiApp {
         if let Some(action) = intent {
             self.labels_command(action);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_button_receives_click_above_backdrop_and_ungates_workspace() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.labels_panel.open = true;
+        // An unanswered request must not prevent closing the dialog.
+        app.labels_panel.pending = true;
+        assert!(app.is_workspace_input_gated(&ctx));
+        let input = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+            ..Default::default()
+        };
+        let mut output = ctx.run(input(), |ctx| app.render_labels_panel(ctx));
+        for _ in 0..3 {
+            output = ctx.run(input(), |ctx| app.render_labels_panel(ctx));
+        }
+        let window = ctx
+            .memory(|m| m.area_rect(Id::new("server-labels")))
+            .unwrap();
+        // Find the painted X, so the test does not depend on theme margins.
+        fn diagonal_centers(shape: &egui::Shape, points: &mut Vec<Pos2>) {
+            match shape {
+                egui::Shape::LineSegment { points: ends, .. }
+                    if (ends[0].x - ends[1].x).abs() > 1.0
+                        && (ends[0].y - ends[1].y).abs() > 1.0 =>
+                {
+                    points.push(ends[0].lerp(ends[1], 0.5));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        diagonal_centers(shape, points);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut points = Vec::new();
+        for shape in &output.shapes {
+            diagonal_centers(&shape.shape, &mut points);
+        }
+        let close = points
+            .into_iter()
+            .filter(|p| window.contains(*p) && p.y < window.top() + 50.0)
+            .max_by(|a, b| a.x.total_cmp(&b.x))
+            .expect("window close icon is painted");
+        assert_eq!(
+            ctx.layer_id_at(close),
+            Some(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new("server-labels")
+            )),
+            "dialog must receive input above its full-screen backdrop",
+        );
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(close),
+                egui::Event::PointerButton {
+                    pos: close,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(raw, |ctx| app.render_labels_panel(ctx));
+        }
+        assert!(
+            !app.labels_panel.open,
+            "pointer click must close the dialog"
+        );
+        assert!(!app.is_workspace_input_gated(&ctx));
     }
 }

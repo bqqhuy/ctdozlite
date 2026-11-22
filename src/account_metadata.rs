@@ -12,6 +12,7 @@ pub struct Snapshot {
     pub labels: Option<crate::labels::Snapshot>,
     pub archive: Option<crate::archive::Snapshot>,
     pub aliases: Option<HashMap<String, String>>,
+    pub phonebook: Option<HashMap<String, String>>,
     pub friends: Option<HashSet<String>>,
     pub business: Option<bool>,
     pub profile: Option<crate::profile::Snapshot>,
@@ -82,6 +83,37 @@ pub async fn aliases(s: &Session) -> Result<HashMap<String, String>> {
     }
     anyhow::bail!("Danh sách biệt danh vượt giới hạn")
 }
+/// Full UID-to-name snapshot, matching PC getPhonebookV2(version=0).
+/// E2 contract and name precedence are recorded in re-notes/69-contact-names.md.
+pub async fn phonebook(s: &Session) -> Result<HashMap<String, String>> {
+    let data = get(
+        s,
+        &s.domains.profile,
+        "/api/social/friend/phonebook/v2",
+        json!({"phonebook_version":0}),
+    )
+    .await?;
+    parse_phonebook(&data, s.account_key())
+}
+
+fn parse_phonebook(data: &Value, owner: &str) -> Result<HashMap<String, String>> {
+    let names = data
+        .get("phonebook")
+        .and_then(Value::as_object)
+        .context("Thiếu danh bạ điện thoại")?;
+    ensure!(names.len() <= 100_000, "Danh bạ điện thoại quá lớn");
+    let mut result = HashMap::new();
+    for (uid, value) in names {
+        id(Some(&json!(uid)))?;
+        let name = value.as_str().context("Tên danh bạ không hợp lệ")?;
+        ensure!(name.len() <= 1024, "Tên danh bạ quá dài");
+        if uid != owner && !name.trim().is_empty() {
+            result.insert(uid.clone(), name.to_owned());
+        }
+    }
+    Ok(result)
+}
+
 fn id(value: Option<&Value>) -> Result<String> {
     let id = value
         .and_then(|id| {
@@ -197,12 +229,46 @@ async fn bounded<T>(future: impl std::future::Future<Output = Result<T>>) -> Res
         .await
         .context("Hết giờ tải metadata")?
 }
-pub async fn read(s: &Session) -> Snapshot {
-    let (privacy, labels, archive, aliases, friends, profile, inbox) = tokio::join!(
+pub async fn read(s: &Session, publish_names: impl Fn(Snapshot)) -> Snapshot {
+    let cloud_id = s
+        .login
+        .as_ref()
+        .map(|login| login.send2me_id.clone())
+        .unwrap_or_default();
+    // Publish each independent name source when ready; slow privacy or inbox
+    // capabilities must not hold back names used in every group message.
+    let alias_read = async {
+        let result = bounded(aliases(s)).await;
+        if s.is_active() {
+            if let Ok(names) = &result {
+                publish_names(Snapshot {
+                    cloud_id: cloud_id.clone(),
+                    aliases: Some(names.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        result
+    };
+    let phonebook_read = async {
+        let result = bounded(phonebook(s)).await;
+        if s.is_active() {
+            if let Ok(names) = &result {
+                publish_names(Snapshot {
+                    cloud_id: cloud_id.clone(),
+                    phonebook: Some(names.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        result
+    };
+    let (privacy, labels, archive, aliases, phonebook, friends, profile, inbox) = tokio::join!(
         bounded(crate::privacy::execute(s, &crate::privacy::Action::Read)),
         bounded(crate::labels::execute(s, &crate::labels::Action::Read)),
         bounded(crate::archive::execute(s, "", false, None)),
-        bounded(aliases(s)),
+        alias_read,
+        phonebook_read,
         bounded(friends(s)),
         bounded(crate::profile::execute(s, &crate::profile::Action::Read)),
         bounded(inbox(s))
@@ -219,6 +285,9 @@ pub async fn read(s: &Session) -> Snapshot {
     }
     if aliases.is_err() {
         warnings.push("biệt danh");
+    }
+    if phonebook.is_err() {
+        warnings.push("danh bạ điện thoại");
     }
     if friends.is_err() {
         warnings.push("bạn bè");
@@ -241,6 +310,7 @@ pub async fn read(s: &Session) -> Snapshot {
         labels: labels.ok(),
         archive: archive.ok(),
         aliases: aliases.ok(),
+        phonebook: phonebook.ok(),
         friends: friends.ok(),
         business: profile.as_ref().ok().map(|profile| profile.business),
         profile: profile.ok(),
@@ -254,6 +324,8 @@ struct Cache {
     owner: String,
     policy: crate::inbox::Policy,
     aliases: Option<HashMap<String, String>>,
+    #[serde(default)]
+    phonebook: Option<HashMap<String, String>>,
 }
 fn decode_cache(bytes: &[u8], owner: &str) -> Result<Cache> {
     let cache: Cache = serde_json::from_slice(bytes)?;
@@ -271,7 +343,7 @@ fn decode_cache(bytes: &[u8], owner: &str) -> Result<Cache> {
         cache.policy.profile_types.len() <= 20_000,
         "Cache phân loại quá lớn"
     );
-    if let Some(aliases) = &cache.aliases {
+    for aliases in [&cache.aliases, &cache.phonebook].into_iter().flatten() {
         ensure!(aliases.len() <= 100_000, "Danh sách biệt danh lưu quá lớn");
         for (key, name) in aliases {
             id(Some(&json!(key)))?;
@@ -318,6 +390,7 @@ pub async fn restore_cached(s: &Session) -> Result<Option<Snapshot>> {
         friends: cache.policy.friends,
         business: cache.policy.business,
         aliases: cache.aliases,
+        phonebook: cache.phonebook,
         cloud_id: s
             .login
             .as_ref()
@@ -331,6 +404,7 @@ pub async fn save_cached(s: &Session, snapshot: &Snapshot) {
     let account = s.clone();
     let path = s.cache_path().with_file_name("account_metadata_cache.json");
     let aliases = snapshot.aliases.clone();
+    let phonebook = snapshot.phonebook.clone();
     let policy = s
         .inbox_policy
         .read()
@@ -338,6 +412,7 @@ pub async fn save_cached(s: &Session, snapshot: &Snapshot) {
         .unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || -> Result<()> {
         ensure!(account.is_active(), "Phiên đã đóng");
+        let _write_permit = account.begin_account_write_blocking()?;
         let old = crate::limits::read_file(&path, 8 * 1024 * 1024)
             .ok()
             .and_then(|bytes| decode_cache(&bytes, account.account_key()).ok());
@@ -345,7 +420,8 @@ pub async fn save_cached(s: &Session, snapshot: &Snapshot) {
             version: 1,
             owner: account.account_key().into(),
             policy,
-            aliases: aliases.or_else(|| old.and_then(|old| old.aliases)),
+            aliases: aliases.or_else(|| old.as_ref().and_then(|old| old.aliases.clone())),
+            phonebook: phonebook.or_else(|| old.and_then(|old| old.phonebook)),
         };
         let bytes = serde_json::to_vec(&cache)?;
         ensure!(bytes.len() <= 8 * 1024 * 1024, "Metadata lưu quá lớn");
@@ -363,6 +439,18 @@ pub async fn save_cached(s: &Session, snapshot: &Snapshot) {
 mod cache_tests {
     use super::*;
     #[test]
+    fn phonebook_full_snapshot_is_strict_and_excludes_self() {
+        let names = parse_phonebook(
+            &json!({"version":7,"phonebook":{"12":"Tên danh bạ","99":"Tôi","13":""}}),
+            "99",
+        )
+        .unwrap();
+        assert_eq!(names, HashMap::from([("12".into(), "Tên danh bạ".into())]));
+        assert!(parse_phonebook(&json!({"version":7}), "99").is_err());
+        assert!(parse_phonebook(&json!({"phonebook":{"invalid":"Tên"}}), "99").is_err());
+        assert!(parse_phonebook(&json!({"phonebook":{"12":42}}), "99").is_err());
+    }
+    #[test]
     fn account_policy_cache_rejects_foreign_and_malformed_membership() {
         let bytes = serde_json::to_vec(&Cache {
             version: 1,
@@ -373,6 +461,7 @@ mod cache_tests {
                 ..Default::default()
             },
             aliases: Some(HashMap::from([("12".into(), "Tên 🎉".into())])),
+            phonebook: Some(HashMap::from([("13".into(), "Tên danh bạ".into())])),
         })
         .unwrap();
         let cache = decode_cache(&bytes, "owner").unwrap();

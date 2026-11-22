@@ -251,6 +251,72 @@ fn render_emf(bytes: &[u8]) -> Result<image::RgbaImage> {
     }
 }
 
+/// Copy all Explorer file paths from CF_HDROP without decoding or uploading their contents.
+/// Must run on a worker thread; rejects an oversized batch before accepting any path.
+#[cfg(windows)]
+pub fn read_windows_files(max_files: usize) -> Result<Option<Vec<std::path::PathBuf>>> {
+    use std::ffi::c_void;
+    #[link(name = "user32")]
+    extern "system" {
+        fn OpenClipboard(hwnd: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> *mut c_void;
+        fn IsClipboardFormatAvailable(format: u32) -> i32;
+    }
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragQueryFileW(handle: *mut c_void, index: u32, name: *mut u16, length: u32) -> u32;
+    }
+    // SAFETY: querying format availability does not borrow clipboard memory.
+    if unsafe { IsClipboardFormatAvailable(15) } == 0 {
+        return Ok(None);
+    }
+    let mut opened = false;
+    for _ in 0..8 {
+        // SAFETY: this worker opens the clipboard read-only without an owner window.
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(8));
+    }
+    ensure!(opened, "Clipboard đang được ứng dụng khác sử dụng");
+    struct Clipboard;
+    impl Drop for Clipboard {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns one successful OpenClipboard call.
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+    let _clipboard = Clipboard;
+    // SAFETY: HDROP is borrowed only while the clipboard guard is alive; paths are copied.
+    unsafe {
+        let handle = GetClipboardData(15);
+        ensure!(!handle.is_null(), "Không đọc được danh sách tệp Clipboard");
+        let count = DragQueryFileW(handle, u32::MAX, std::ptr::null_mut(), 0) as usize;
+        ensure!(
+            count > 0 && count <= max_files,
+            "Clipboard chỉ nhận tối đa {max_files} tệp; chưa thêm tệp nào"
+        );
+        let mut paths = Vec::with_capacity(count);
+        for index in 0..count {
+            let len = DragQueryFileW(handle, index as u32, std::ptr::null_mut(), 0);
+            ensure!(len > 0 && len < 32768, "Đường dẫn Clipboard không hợp lệ");
+            let mut name = vec![0; len as usize + 1];
+            ensure!(
+                DragQueryFileW(handle, index as u32, name.as_mut_ptr(), len + 1) == len,
+                "Không đọc đủ đường dẫn Clipboard"
+            );
+            paths.push(std::path::PathBuf::from(String::from_utf16(
+                &name[..len as usize],
+            )?));
+        }
+        Ok(Some(paths))
+    }
+}
+
 #[cfg(windows)]
 pub fn read_windows() -> Result<Option<image::RgbaImage>> {
     use std::ffi::c_void;
