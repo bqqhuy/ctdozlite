@@ -1411,6 +1411,8 @@ pub fn merge_thread_into(
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
             identities.remove(existing_msg, idx);
+            let incoming_is_backfill = msg.history_source.is_some();
+            let existing_is_realtime = existing_msg.history_source.is_none();
             existing_msg.merge_reaction_metadata(&msg);
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
@@ -1418,11 +1420,20 @@ pub fn merge_thread_into(
             {
                 existing_msg.id = msg.id.clone();
             }
-            if msg.ts > 0 && existing_msg.ts != msg.ts {
+            if msg.ts > 0
+                && existing_msg.ts != msg.ts
+                && (!incoming_is_backfill
+                    || !existing_is_realtime
+                    || existing_msg.ts == 0
+                    || crate::clock::normalize_ts_ms(msg.ts)
+                        > crate::clock::normalize_ts_ms(existing_msg.ts))
+            {
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
             }
-            let recalled = existing_msg.text.trim() == "[Tin nhắn đã thu hồi]"
+            let recalled = existing_msg.kind == crate::message_model::MessageKind::Recall
+                || msg.kind == crate::message_model::MessageKind::Recall
+                || existing_msg.text.trim() == "[Tin nhắn đã thu hồi]"
                 || msg.text.trim() == "[Tin nhắn đã thu hồi]";
             if recalled {
                 existing_msg.mark_recalled();
@@ -1533,8 +1544,11 @@ pub fn deduplicate_threads(
     *threads = merged;
 }
 
-/// Load locally cached conversations and message history.
-pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
+/// Load locally cached conversations and message history using an already-opened store and write permit.
+pub(crate) fn load_threads_cache_with_store(
+    s: &Session,
+    store: &crate::store::MessageStore,
+) -> Vec<Thread> {
     if s.account_key().is_empty() || !s.is_active() {
         return Vec::new();
     }
@@ -1554,16 +1568,9 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
                 }
             }
             // Cached previews are non-authoritative; deletion markers must win at startup too.
-            let filtered = s.begin_account_write_blocking().and_then(|_write_permit| {
-                crate::store::MessageStore::open(s.history_path())
-                    .and_then(|store| store.filter_deleted(&mut threads))
-            });
-            match filtered {
-                Ok(()) => {}
-                Err(_) => {
-                    eprintln!("Cannot filter cached deletion identities");
-                    return Vec::new();
-                }
+            if store.filter_deleted(&mut threads).is_err() {
+                eprintln!("Cannot filter cached deletion identities");
+                return Vec::new();
             }
             deduplicate_threads(&mut threads, None);
             return threads;
@@ -1572,14 +1579,33 @@ pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
     Vec::new()
 }
 
-/// Persist conversations and message history locally so they survive app restarts.
-pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
+/// Load locally cached conversations and message history.
+pub fn load_threads_cache(s: &Session) -> Vec<Thread> {
     if s.account_key().is_empty() || !s.is_active() {
-        return;
+        return Vec::new();
     }
     let Ok(_write_permit) = s.begin_account_write_blocking() else {
-        return;
+        return Vec::new();
     };
+    let Ok(store) = crate::store::MessageStore::open(s.history_path()) else {
+        eprintln!("Cannot filter cached deletion identities");
+        return Vec::new();
+    };
+    load_threads_cache_with_store(s, &store)
+}
+
+/// Persist conversations and message history cache using an already-opened store and write permit.
+/// # Errors
+/// Returns deletion-filter, serialization, or filesystem errors.
+pub(crate) fn save_threads_cache_with_store(
+    s: &Session,
+    store: &crate::store::MessageStore,
+    threads: &[Thread],
+) -> Result<()> {
+    anyhow::ensure!(
+        !s.account_key().is_empty() && s.is_active(),
+        "Phiên tài khoản đã đóng"
+    );
     let keep = crate::store::MessageStore::PRELOAD_MSGS;
     let mut slim: Vec<Thread> = threads
         .iter()
@@ -1590,17 +1616,30 @@ pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
             t
         })
         .collect();
-    if crate::store::MessageStore::open(s.history_path())
-        .and_then(|store| store.filter_deleted(&mut slim))
-        .is_err()
-    {
-        eprintln!("Cannot filter history cache before saving");
+    store.filter_deleted(&mut slim)?;
+    let text = serde_json::to_string(&slim)?;
+    crate::storage::atomic_write(&s.cache_path(), text.as_bytes())?;
+    Ok(())
+}
+
+/// Persist conversations and message history locally so they survive app restarts.
+pub fn save_threads_cache(s: &Session, threads: &[Thread]) {
+    if s.account_key().is_empty() || !s.is_active() {
         return;
     }
-    if let Ok(text) = serde_json::to_string(&slim) {
-        if let Err(e) = crate::storage::atomic_write(&s.cache_path(), text.as_bytes()) {
-            eprintln!("Cannot save history cache: {e}");
-        }
+    let Ok(_write_permit) = s.begin_account_write_blocking() else {
+        return;
+    };
+    let Ok(store) = crate::store::MessageStore::open(s.history_path()) else {
+        crate::logger::log_error("threads cache", "Cannot filter history cache before saving");
+        return;
+    };
+    if let Err(error) = save_threads_cache_with_store(s, &store, threads) {
+        crate::runtime_metrics::database_error(&error);
+        crate::logger::log_error(
+            "threads cache",
+            &format!("Cannot save history cache: {error}"),
+        );
     }
 }
 
@@ -2132,12 +2171,12 @@ pub(crate) async fn send_attachment_with_client_id(
     // 1 GiB on normal threads, 50 MiB on E2EE threads.  Fail before network work.
     let e2ee_thread = !is_group && crate::e2ee_integration::is_thread_e2ee(s.account_key(), to_id);
     crate::upload::check_upload_size(source.size, e2ee_thread)?;
-    let file_name = file_path
+    let mut file_name = file_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("attachment.bin")
         .to_string();
-    let ext = file_path
+    let mut ext = file_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -2161,9 +2200,9 @@ pub(crate) async fn send_attachment_with_client_id(
     } else {
         to_id
     };
-    let total_size = source.size;
+    let mut total_size = source.size;
     let chunk_size: usize = crate::upload::CHUNK; // 3 MiB, khop Zalo PC 26.11.12
-    let total_chunks = total_size.div_ceil(chunk_size as u64);
+    let mut total_chunks = total_size.div_ceil(chunk_size as u64);
     let target_type = if is_group { 11 } else { 2 };
 
     if is_image {
@@ -2431,6 +2470,27 @@ pub(crate) async fn send_attachment_with_client_id(
         }
     }
 
+    // Auto-wrap restricted executable extensions into a ZIP level-0 (Stored) archive
+    // named `<original>.zip` with EEXC wire metadata when `enable_file_eecx` is active.
+    let mut is_eecx = false;
+    let mut _eecx_archive_guard: Option<tempfile::NamedTempFile> = None;
+    if s.server_config.file_eecx.should_wrap_path(file_path) {
+        let src_path = file_path.to_path_buf();
+        let temp_dir = crate::storage::account_temp_dir(s.account_key());
+        let (archive_file, archive_name) = tokio::task::spawn_blocking(move || {
+            crate::attachment_archive::create_eecx(&src_path, &temp_dir)
+        })
+        .await??;
+        source = crate::upload::Source::open(archive_file.path()).await?;
+        total_size = source.size;
+        crate::upload::check_upload_size(total_size, e2ee_thread)?;
+        total_chunks = total_size.div_ceil(chunk_size as u64);
+        file_name = archive_name;
+        ext = "zip".to_owned();
+        is_eecx = true;
+        _eecx_archive_guard = Some(archive_file);
+    }
+
     // Video / Audio / Document / Archive upload (`asyncfile/upload` -> `asyncfile/msg`, fallback `sharefile_full`)
     let mime = match ext.as_str() {
         "mp4" => "video/mp4",
@@ -2489,7 +2549,7 @@ pub(crate) async fn send_attachment_with_client_id(
         }
     }
     for idx in resume_from..total_chunks_usize {
-        if upload_reg.is_cancelled() {
+        if upload_reg.is_cancelled() || !s.is_active() {
             anyhow::bail!("Tải lên đã bị hủy");
         }
         let chunk = source.next_chunk().await?;
@@ -2594,28 +2654,19 @@ pub(crate) async fn send_attachment_with_client_id(
             .parse::<u64>()
             .map(|n| json!(n))
             .unwrap_or_else(|_| json!(fid));
-        let mut msg_obj = serde_json::Map::new();
-        msg_obj.insert("fileId".into(), fid_val);
-        if !file_url.is_empty() {
-            msg_obj.insert("fileUrl".into(), json!(file_url));
-        }
-        msg_obj.insert("checksum".into(), json!(checksum));
-        msg_obj.insert("checksumSha".into(), json!(""));
-        msg_obj.insert("extension".into(), json!(ext));
-        msg_obj.insert("totalSize".into(), json!(total_size));
-        msg_obj.insert("fileName".into(), json!(file_name));
-        msg_obj.insert("clientId".into(), json!(client_id));
-        // PC k3JU: 1 is a regular file, 2 is a folder archive, not a video.
-        // A video that falls back to asyncfile remains a regular file.
-        msg_obj.insert("fType".into(), json!(1));
-        msg_obj.insert("fileCount".into(), json!(0));
-        msg_obj.insert("fdata".into(), json!("{}"));
-        msg_obj.insert("imei".into(), json!(s.imei));
-        if is_group {
-            msg_obj.insert("grid".into(), json!(clean_target));
-        } else {
-            msg_obj.insert("toid".into(), json!(clean_target));
-        }
+        let msg_obj = build_asyncfile_msg_payload(
+            fid_val,
+            &file_url,
+            &checksum,
+            &ext,
+            total_size,
+            &file_name,
+            client_id,
+            &s.imei,
+            clean_target,
+            is_group,
+            is_eecx,
+        );
         let params = s.encoded_params(&Value::Object(msg_obj))?;
         let url = format!("{file_host}{msg_ep}?{}", s.common_params());
         let r = crate::transfer_diagnostics::attachment_result(
@@ -2674,6 +2725,50 @@ pub(crate) async fn send_attachment_with_client_id(
         ..Default::default()
     };
     Ok((send_resp, cm))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_asyncfile_msg_payload(
+    fid_val: Value,
+    file_url: &str,
+    checksum: &str,
+    ext: &str,
+    total_size: u64,
+    file_name: &str,
+    client_id: u64,
+    imei: &str,
+    clean_target: &str,
+    is_group: bool,
+    is_eecx: bool,
+) -> serde_json::Map<String, Value> {
+    let mut msg_obj = serde_json::Map::new();
+    msg_obj.insert("fileId".into(), fid_val);
+    if !file_url.is_empty() {
+        msg_obj.insert("fileUrl".into(), json!(file_url));
+    }
+    msg_obj.insert("checksum".into(), json!(checksum));
+    msg_obj.insert("checksumSha".into(), json!(""));
+    msg_obj.insert("extension".into(), json!(ext));
+    msg_obj.insert("totalSize".into(), json!(total_size));
+    msg_obj.insert("fileName".into(), json!(file_name));
+    msg_obj.insert("clientId".into(), json!(client_id));
+    // PC k3JU: 1 is a regular file, 2 is a folder archive, not a video.
+    // A video that falls back to asyncfile remains a regular file.
+    msg_obj.insert("fType".into(), json!(1));
+    msg_obj.insert("fileCount".into(), json!(0));
+    if is_eecx {
+        msg_obj.insert("fdata".into(), json!("{\"type\":2}"));
+        msg_obj.insert("subType".into(), json!(24));
+    } else {
+        msg_obj.insert("fdata".into(), json!("{}"));
+    }
+    msg_obj.insert("imei".into(), json!(imei));
+    if is_group {
+        msg_obj.insert("grid".into(), json!(clean_target));
+    } else {
+        msg_obj.insert("toid".into(), json!(clean_target));
+    }
+    msg_obj
 }
 
 /// Outcome of the video-message path.
@@ -5185,7 +5280,10 @@ pub async fn get_groups(s: &Session) -> Result<Vec<Thread>> {
         .get("gridVerMap")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("Danh sách nhóm thiếu gridVerMap"))?;
-    let cached = load_threads_cache(s);
+    let cache_session = s.clone();
+    let cached = tokio::task::spawn_blocking(move || load_threads_cache(&cache_session))
+        .await
+        .unwrap_or_default();
     let mut groups: Vec<Thread> = map
         .keys()
         .map(|id| {
@@ -6000,7 +6098,7 @@ pub async fn poll_new_messages(
             crate::store::MessageStore::open_for_account_write(&account)?;
         store.filter_deleted(&mut snapshot)?;
         crate::store::persist_threads(&mut store, &snapshot)?;
-        save_threads_cache(&account, &snapshot);
+        save_threads_cache_with_store(&account, &store, &snapshot)?;
         Ok(snapshot)
     })
     .await??;
@@ -9846,5 +9944,349 @@ mod a10_realtime_e2ee_tests {
             err_link.contains("E2EE") || err_link.contains("mã hóa"),
             "Error must indicate E2EE refusal: {err_link}"
         );
+    }
+
+    #[test]
+    fn eecx_config_packages_restricted_extensions_as_stored_zip_with_subtype_24() {
+        let mut server_config = crate::server_config::ServerConfig::default();
+        assert!(server_config.file_eecx.should_wrap_eecx("exe"));
+        assert!(!server_config.file_eecx.should_wrap_eecx("txt"));
+        assert!(!server_config.file_eecx.should_wrap_eecx("msi"));
+
+        server_config.apply_payload(&serde_json::json!({
+            "setttings": {
+                "features": {
+                    "sharefile": {
+                        "enable_file_eecx": true,
+                        "restricted_ext_file": ["msi", ".bat"]
+                    }
+                }
+            }
+        }));
+        assert!(server_config.file_eecx.should_wrap_eecx("msi"));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let source_path = dir.path().join("setup_tool.exe");
+        let payload_bytes = b"MZ-dummy-executable-content";
+        std::fs::write(&source_path, payload_bytes).expect("write dummy exe");
+
+        let (archive_temp, archive_name) =
+            crate::attachment_archive::create_eecx(&source_path, dir.path())
+                .expect("create eecx archive");
+        assert_eq!(archive_name, "setup_tool.exe.zip");
+
+        let zip_file = std::fs::File::open(archive_temp.path()).expect("open archive");
+        let mut archive = zip::ZipArchive::new(zip_file).expect("parse zip");
+        assert_eq!(archive.len(), 1);
+        let mut entry = archive.by_index(0).expect("zip entry");
+        assert_eq!(entry.name(), "setup_tool.exe");
+        assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+        let mut unpacked = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut unpacked).expect("read entry");
+        assert_eq!(unpacked.as_slice(), payload_bytes);
+
+        let eecx_msg = build_asyncfile_msg_payload(
+            serde_json::json!(998877),
+            "https://f.zdn.vn/setup_tool.exe.zip",
+            "deadbeef",
+            "zip",
+            archive_temp.path().metadata().unwrap().len(),
+            &archive_name,
+            123456,
+            "imei-test",
+            "peer-1",
+            false,
+            true,
+        );
+        assert_eq!(eecx_msg.get("subType").and_then(|v| v.as_i64()), Some(24));
+        assert_eq!(
+            eecx_msg.get("fdata").and_then(|v| v.as_str()),
+            Some("{\"type\":2}")
+        );
+
+        let normal_msg = build_asyncfile_msg_payload(
+            serde_json::json!(998878),
+            "https://f.zdn.vn/notes.txt",
+            "cafebabe",
+            "txt",
+            42,
+            "notes.txt",
+            123457,
+            "imei-test",
+            "peer-1",
+            false,
+            false,
+        );
+        assert!(normal_msg.get("subType").is_none());
+        assert_eq!(normal_msg.get("fdata").and_then(|v| v.as_str()), Some("{}"));
+    }
+
+    #[tokio::test]
+    async fn eecx_upload_sends_stored_zip_on_first_multipart_request_with_eecx_metadata_and_skips_plain_zip(
+    ) {
+        use std::io::{Cursor, Read, Write};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+
+        #[derive(Debug)]
+        struct CapturedUpload {
+            path: String,
+            body: Vec<u8>,
+        }
+
+        let server = tokio::spawn(async move {
+            let mut captured = Vec::new();
+            // 1. EEXC .exe upload + asyncfile/msg
+            // 2. Plain .zip upload + asyncfile/msg
+            // 3. Disabled EEXC .exe -> 204 rejection on upload
+            for step in 0..5 {
+                let (mut stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+
+                let mut buf = Vec::new();
+                let header_end = loop {
+                    let mut tmp = [0u8; 4096];
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    buf.extend_from_slice(&tmp[..n]);
+                    if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&buf[..header_end]).into_owned();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .to_owned();
+                let content_len: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (k, v) = line.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                while buf.len() < header_end + content_len {
+                    let mut tmp = [0u8; 4096];
+                    let n = stream.read(&mut tmp).await.unwrap();
+                    assert!(n > 0);
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = buf[header_end..header_end + content_len].to_vec();
+                captured.push(CapturedUpload {
+                    path: path.clone(),
+                    body,
+                });
+
+                let resp_json = if step == 4 {
+                    json!({"error_code": 204, "error_message": "FILE_EXTENSION_NOT_ALLOWED"})
+                } else if path.contains("/asyncfile/upload") {
+                    json!({"error_code": 0, "data": {"fileId": "9001", "fileUrl": "https://f1.zdn.vn/uploaded.zip"}})
+                } else {
+                    json!({"error_code": 0, "data": {"msgId": "88001"}})
+                };
+                let payload = resp_json.to_string();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                stream.write_all(http.as_bytes()).await.unwrap();
+            }
+            captured
+        });
+
+        let uin = format!("eecx-test-{}", crate::param_cipher::random_hex(8));
+        let account_dir = crate::storage::account_dir(&uin);
+        let temp_dir = crate::storage::account_temp_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: uin.clone(),
+            zpw_enk: String::new(),
+            zpw_sek: "sek-eecx".into(),
+            display_name: "Tester".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        session.secret_key = Some(vec![7u8; 32]);
+        session.domains.file = host;
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("Báo cáo.v2.tar.gz.exe");
+        let exe_bytes = b"MZ-native-executable-fixture-payload-0123456789";
+        std::fs::write(&exe_path, exe_bytes).unwrap();
+
+        // 1. Restricted file -> auto-wrapped into level-0 Stored ZIP on the very first upload request.
+        let (_, cm_eecx) =
+            send_attachment_with_client_id(&session, "peer-eecx", false, &exe_path, "", 70001)
+                .await
+                .unwrap();
+        assert_eq!(cm_eecx.id, "88001");
+        assert!(cm_eecx.text.contains("Báo cáo.v2.tar.gz.exe.zip"));
+        // Original user file untouched, temp ZIP cleaned up immediately.
+        assert_eq!(std::fs::read(&exe_path).unwrap(), exe_bytes);
+        if temp_dir.exists() {
+            assert_eq!(std::fs::read_dir(&temp_dir).unwrap().count(), 0);
+        }
+
+        // 2. Plain .zip file -> NOT double-wrapped and NO subType=24/fdata.type=2.
+        let plain_zip_path = dir.path().join("manual.zip");
+        {
+            let file = std::fs::File::create(&plain_zip_path).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file(
+                    "readme.txt",
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Stored),
+                )
+                .unwrap();
+            writer.write_all(b"plain zip contents").unwrap();
+            writer.finish().unwrap();
+        }
+        let plain_zip_bytes = std::fs::read(&plain_zip_path).unwrap();
+        let (_, cm_plain_zip) = send_attachment_with_client_id(
+            &session,
+            "peer-eecx",
+            false,
+            &plain_zip_path,
+            "",
+            70002,
+        )
+        .await
+        .unwrap();
+        assert!(cm_plain_zip.text.contains("manual.zip"));
+        assert!(!cm_plain_zip.text.contains("manual.zip.zip"));
+
+        // 3. With enable_file_eecx=false, raw .exe is sent and error 204 is classified as fatal Failed (not retryable).
+        session.server_config.file_eecx.enable_file_eecx = false;
+        let err =
+            send_attachment_with_client_id(&session, "peer-eecx", false, &exe_path, "", 70003)
+                .await
+                .expect_err("204 rejection must surface cleanly");
+        assert_eq!(
+            crate::outgoing::failure_delivery(&err),
+            crate::message_model::DeliveryState::Failed
+        );
+        assert!(crate::outgoing::failure_message(&err).contains("204"));
+
+        let captured = server.await.unwrap();
+        assert_eq!(captured.len(), 5);
+
+        // Verify Request #0: first upload multipart received ZIP archive (`PK\x03\x04`) and `.zip` filename!
+        assert!(captured[0].path.contains("/api/message/asyncfile/upload"));
+        let req0_str = String::from_utf8_lossy(&captured[0].body);
+        assert!(
+            req0_str.contains("filename=\"Báo cáo.v2.tar.gz.exe.zip\""),
+            "expected .zip filename in first upload multipart, got headers"
+        );
+        let pk_pos = captured[0]
+            .body
+            .windows(4)
+            .position(|w| w == b"PK\x03\x04")
+            .expect("first upload must contain ZIP PK\\x03\\x04 header, never raw EXE");
+        let b0_end = captured[0]
+            .body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("multipart opening boundary");
+        let marker0: Vec<u8> = [b"\r\n", &captured[0].body[..b0_end]].concat();
+        let tail_pos = captured[0].body[pk_pos..]
+            .windows(marker0.len())
+            .rposition(|w| w == marker0.as_slice())
+            .expect("multipart boundary tail");
+        let uploaded_zip_bytes = &captured[0].body[pk_pos..pk_pos + tail_pos];
+        let mut archive = zip::ZipArchive::new(Cursor::new(uploaded_zip_bytes)).unwrap();
+        assert_eq!(archive.len(), 1);
+        let mut entry = archive.by_index(0).unwrap();
+        assert_eq!(entry.name(), "Báo cáo.v2.tar.gz.exe");
+        assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+        let mut unpacked = Vec::new();
+        entry.read_to_end(&mut unpacked).unwrap();
+        assert_eq!(unpacked.as_slice(), exe_bytes);
+
+        // Verify Request #1: asyncfile/msg carries fType=1, fdata={"type":2}, subType=24, and exact archive totalSize.
+        assert!(captured[1].path.contains("/api/message/asyncfile/msg"));
+        let form1 = reqwest::Url::parse(&format!(
+            "http://fixture.invalid/?{}",
+            String::from_utf8_lossy(&captured[1].body)
+        ))
+        .unwrap();
+        let enc1 = form1
+            .query_pairs()
+            .find(|(k, _)| k == "params")
+            .unwrap()
+            .1
+            .into_owned();
+        let msg1: Value =
+            serde_json::from_str(&crate::crypto::decode_aes(&[7u8; 32], &enc1).unwrap()).unwrap();
+        assert_eq!(msg1["fileName"], "Báo cáo.v2.tar.gz.exe.zip");
+        assert_eq!(msg1["extension"], "zip");
+        assert_eq!(msg1["fType"], 1);
+        assert_eq!(msg1["totalSize"], uploaded_zip_bytes.len() as u64);
+        assert_eq!(msg1["fdata"], "{\"type\":2}");
+        assert_eq!(msg1["subType"], 24);
+
+        // Verify Request #2 & #3: plain ZIP is uploaded unchanged with fdata={} and NO subType=24.
+        let req2_str = String::from_utf8_lossy(&captured[2].body);
+        assert!(req2_str.contains("filename=\"manual.zip\""));
+        assert!(!req2_str.contains("manual.zip.zip"));
+        let hdr2_end = captured[2]
+            .body
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let b2_end = captured[2]
+            .body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .unwrap();
+        let marker2: Vec<u8> = [b"\r\n", &captured[2].body[..b2_end]].concat();
+        let tail2 = captured[2].body[hdr2_end..]
+            .windows(marker2.len())
+            .rposition(|w| w == marker2.as_slice())
+            .unwrap();
+        assert_eq!(
+            &captured[2].body[hdr2_end..hdr2_end + tail2],
+            plain_zip_bytes.as_slice()
+        );
+        let form3 = reqwest::Url::parse(&format!(
+            "http://fixture.invalid/?{}",
+            String::from_utf8_lossy(&captured[3].body)
+        ))
+        .unwrap();
+        let enc3 = form3
+            .query_pairs()
+            .find(|(k, _)| k == "params")
+            .unwrap()
+            .1
+            .into_owned();
+        let msg3: Value =
+            serde_json::from_str(&crate::crypto::decode_aes(&[7u8; 32], &enc3).unwrap()).unwrap();
+        assert_eq!(msg3["fileName"], "manual.zip");
+        assert_eq!(msg3["fdata"], "{}");
+        assert!(msg3.get("subType").is_none());
+
+        // Verify Request #4: disabled flag sends raw EXE bytes un-zipped.
+        assert!(String::from_utf8_lossy(&captured[4].body)
+            .contains("filename=\"Báo cáo.v2.tar.gz.exe\""));
+        assert!(captured[4]
+            .body
+            .windows(exe_bytes.len())
+            .any(|w| w == exe_bytes));
+
+        let _ = std::fs::remove_dir_all(&account_dir);
     }
 }

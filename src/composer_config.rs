@@ -32,6 +32,10 @@ impl ComposerConfig {
         Self::parse(config.pointer("/settings/features/zcinput")?)
     }
 
+    pub(crate) fn from_value(config: &Value) -> Option<Self> {
+        Self::parse(config)
+    }
+
     fn parse(config: &Value) -> Option<Self> {
         if config.get("version").and_then(Value::as_u64) != Some(1) {
             return None;

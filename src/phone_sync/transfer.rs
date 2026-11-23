@@ -69,15 +69,14 @@ fn peer_served_since(round: usize, since: std::time::Instant) -> bool {
         .is_some_and(|(at, other)| other != round && at > since)
 }
 
-/// Message sessions open at once (Zalo PC `max_number_of_concurrent_sync_items`).
+/// Message sessions open at once in test fixtures (production uses `Sync2PcConfig::max_concurrent_sync_items`).
+#[cfg(test)]
 const PARALLEL_ROUNDS: usize = 4;
 /// Recent conversations fetched first with a short page (Zalo PC `sync_recent_chat`).
 const PRIORITY_CONVERSATIONS: usize = 10;
 const PRIORITY_MESSAGES: u32 = 100;
 /// Spacing between session requests, as Zalo Web sends a wave.
 const ROUND_START_GAP: Duration = Duration::from_millis(600);
-/// Waiting for the user's confirmation (Zalo PC `awaiting_mobile_timeout_ms`).
-const AWAIT_CONFIRM: Duration = Duration::from_secs(600);
 /// A phone reporting Idle this long is treated as stalled (`sync_paused_timeout_ms`).
 const IDLE_LIMIT: Duration = Duration::from_secs(600);
 /// Hint the user after this much silence from a confirmed phone.
@@ -86,8 +85,6 @@ const STALL_HINT: Duration = Duration::from_secs(20);
 const AUTO_WAKE_AFTER: Duration = Duration::from_secs(30);
 /// Minimum spacing between wake-up requests for one session.
 const WAKE_SPACING: Duration = Duration::from_secs(15);
-/// Window granted after an acknowledged wake-up (Zalo PC `wakeup_timeout`).
-const WAKE_GRACE: Duration = Duration::from_secs(180);
 /// Silence after which a confirmed round is declared stalled.
 const STALL_AFTER: Duration = Duration::from_secs(300);
 /// Upper bound for one round, counted from the phone's confirmation.
@@ -124,6 +121,230 @@ impl std::error::Error for Disconnected {}
 /// Ask every active round to send a wake-up to the phone (rate limited per session).
 pub(crate) fn request_wake() {
     WAKE_SEQ.fetch_add(1, Ordering::AcqRel);
+}
+
+type ActivePrioritySlot = (String, usize, Arc<std::sync::Mutex<TransferQueue>>);
+static ACTIVE_PRIORITY_QUEUE: std::sync::Mutex<Option<ActivePrioritySlot>> =
+    std::sync::Mutex::new(None);
+
+/// Move missing ranges of the currently opened conversation to the front of the active
+/// Sync2 transfer queue (`SELECT_CONVERSATION` / `addRangesToFrontInQueue`), scoped by
+/// account owner and runtime generation. Returns `true` if any pending range was promoted.
+pub(crate) fn prioritize_conversation(owner: &str, runtime_id: usize, thread_id: &str) -> bool {
+    let queue_arc = {
+        let guard = ACTIVE_PRIORITY_QUEUE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some((active_owner, active_runtime, q))
+                if active_owner == owner && *active_runtime == runtime_id =>
+            {
+                Some(q.clone())
+            }
+            _ => None,
+        }
+    };
+    let Some(queue_arc) = queue_arc else {
+        return false;
+    };
+    let mut queue = queue_arc.lock().unwrap_or_else(|e| e.into_inner());
+    queue.add_ranges_to_front_in_queue(thread_id)
+}
+
+struct ActivePriorityRegistration {
+    owner: String,
+    runtime_id: usize,
+}
+
+impl ActivePriorityRegistration {
+    fn register(
+        owner: String,
+        runtime_id: usize,
+        queue: Arc<std::sync::Mutex<TransferQueue>>,
+    ) -> Self {
+        if let Ok(mut slot) = ACTIVE_PRIORITY_QUEUE.lock() {
+            *slot = Some((owner.clone(), runtime_id, queue));
+        }
+        Self { owner, runtime_id }
+    }
+}
+
+impl Drop for ActivePriorityRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = ACTIVE_PRIORITY_QUEUE.lock() {
+            if matches!(slot.as_ref(), Some((o, r, _)) if o == &self.owner && *r == self.runtime_id)
+            {
+                *slot = None;
+            }
+        }
+    }
+}
+
+const MAX_CONSECUTIVE_PRIORITY_POPS: usize = 2;
+
+/// Thread-safe Sync2 job queue supporting open-conversation front prioritization
+/// with deduplication and anti-starvation scheduling.
+pub(super) struct TransferQueue {
+    queue: std::collections::VecDeque<Job>,
+    thread_partitions: HashMap<String, Vec<String>>,
+    in_flight: HashSet<String>,
+    front_promoted: HashSet<String>,
+    consecutive_priority_pops: usize,
+    next_number: usize,
+}
+
+impl TransferQueue {
+    fn new(
+        queue: std::collections::VecDeque<Job>,
+        owners: &HashMap<String, String>,
+        next_number: usize,
+    ) -> Self {
+        let mut thread_partitions: HashMap<String, Vec<String>> = HashMap::new();
+        for (partition, thread_id) in owners {
+            thread_partitions
+                .entry(thread_id.clone())
+                .or_default()
+                .push(partition.clone());
+        }
+        Self {
+            queue,
+            thread_partitions,
+            in_flight: HashSet::new(),
+            front_promoted: HashSet::new(),
+            consecutive_priority_pops: 0,
+            next_number,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    fn allocate_number(&mut self) -> usize {
+        self.next_number += 1;
+        self.next_number
+    }
+
+    /// Promote pending full-range queries for `thread_id` (or raw partition key) to the front,
+    /// skipping partitions already in-flight or already front-promoted to prevent duplicate jobs.
+    fn add_ranges_to_front_in_queue(&mut self, thread_or_partition: &str) -> bool {
+        let target_partitions: Vec<String> = self
+            .thread_partitions
+            .get(thread_or_partition)
+            .cloned()
+            .unwrap_or_else(|| {
+                if thread_or_partition.contains('/') {
+                    vec![thread_or_partition.to_owned()]
+                } else {
+                    Vec::new()
+                }
+            });
+        let eligible: HashSet<String> = target_partitions
+            .into_iter()
+            .filter(|p| !self.in_flight.contains(p) && !self.front_promoted.contains(p))
+            .collect();
+        if eligible.is_empty() {
+            return false;
+        }
+
+        // Do not pull out of jobs that are already front-promoted user priority jobs;
+        // extract matching missing ranges from background jobs without duplicating them.
+        let mut promoted_queries: Vec<plan::Query> = Vec::new();
+        let mut seen_ranges: HashSet<(String, i64, i64)> = HashSet::new();
+        let mut rebuilt = std::collections::VecDeque::with_capacity(self.queue.len());
+
+        while let Some(mut job) = self.queue.pop_front() {
+            if job.priority || job.user_prioritized {
+                rebuilt.push_back(job);
+                continue;
+            }
+            let mut remaining = Vec::with_capacity(job.wanted.len());
+            for q in job.wanted.drain(..) {
+                if eligible.contains(&q.partition) {
+                    if seen_ranges.insert((q.partition.clone(), q.from, q.to)) {
+                        promoted_queries.push(q);
+                    }
+                } else {
+                    remaining.push(q);
+                }
+            }
+            if !remaining.is_empty() {
+                job.wanted = remaining;
+                rebuilt.push_back(job);
+            }
+        }
+        self.queue = rebuilt;
+
+        if promoted_queries.is_empty() {
+            return false;
+        }
+        for q in &promoted_queries {
+            self.front_promoted.insert(q.partition.clone());
+        }
+        let number = self.allocate_number();
+        self.queue.push_front(Job {
+            wanted: promoted_queries,
+            number,
+            attempt: 0,
+            priority: false,
+            user_prioritized: true,
+        });
+        true
+    }
+
+    /// Pop next job while enforcing anti-starvation fairness for background jobs.
+    fn pop_next(&mut self) -> Option<Job> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let job = if self.consecutive_priority_pops >= MAX_CONSECUTIVE_PRIORITY_POPS {
+            if let Some(bg_idx) = self
+                .queue
+                .iter()
+                .position(|j| !j.priority && !j.user_prioritized)
+            {
+                self.consecutive_priority_pops = 0;
+                self.queue.remove(bg_idx)?
+            } else {
+                let front = self.queue.pop_front()?;
+                if front.priority || front.user_prioritized {
+                    self.consecutive_priority_pops += 1;
+                } else {
+                    self.consecutive_priority_pops = 0;
+                }
+                front
+            }
+        } else {
+            let front = self.queue.pop_front()?;
+            if front.priority || front.user_prioritized {
+                self.consecutive_priority_pops += 1;
+            } else {
+                self.consecutive_priority_pops = 0;
+            }
+            front
+        };
+        for q in &job.wanted {
+            self.front_promoted.remove(&q.partition);
+            self.in_flight.insert(q.partition.clone());
+        }
+        Some(job)
+    }
+
+    fn finish_job(&mut self, wanted: &[plan::Query]) {
+        for q in wanted {
+            self.in_flight.remove(&q.partition);
+        }
+    }
+
+    fn push_front_requeue(&mut self, job: Job) {
+        self.finish_job(&job.wanted);
+        self.queue.push_front(job);
+    }
+
+    fn push_back_retry(&mut self, job: Job) {
+        self.finish_job(&job.wanted);
+        self.queue.push_back(job);
+    }
 }
 
 fn routing_id(id: &str) -> bool {
@@ -550,6 +771,7 @@ impl RunningRound {
         progress: Arc<std::sync::Mutex<F>>,
         number: usize,
         limit: u32,
+        state_sink: crate::sync_coordinator::SyncStateSink,
     ) -> Result<Self> {
         let id = sync_id()?;
         let packet = request(&id, crypto, wanted, limit);
@@ -579,6 +801,7 @@ impl RunningRound {
             number,
             ready,
             id.clone(),
+            state_sink.clone(),
         );
         let account = session.clone();
         let transfer = transport.clone();
@@ -592,6 +815,8 @@ impl RunningRound {
             let mut confirmed_at: Option<std::time::Instant> = None;
             let mut idle_since: Option<std::time::Instant> = None;
             let mut active_wait = Duration::ZERO;
+            let await_confirm = account.server_config.sync_2_pc.awaiting_mobile_timeout();
+            let wake_grace_dur = account.server_config.sync_2_pc.wakeup_timeout();
             let mut previous = std::time::Instant::now();
             let mut tick = tokio::time::interval(Duration::from_millis(200));
             let mut last_display = std::time::Instant::now();
@@ -614,7 +839,7 @@ impl RunningRound {
                         if engaged && confirmed_at.is_none() {confirmed_at=Some(now);}
                         match confirmed_at {
                             Some(at)=>ensure!(now.duration_since(at)<ROUND_CAP,"Lượt đồng bộ quá 2 giờ; đã dừng và giữ dữ liệu đã nhập"),
-                            None=>ensure!(active_wait<AWAIT_CONFIRM,"Điện thoại chưa xác nhận đồng bộ; mở Zalo trên điện thoại rồi thử lại"),
+                            None=>ensure!(active_wait<await_confirm,"Điện thoại chưa xác nhận đồng bộ; mở Zalo trên điện thoại rồi thử lại"),
                         }
                         if idle_since.is_some_and(|since|now.duration_since(since)>=IDLE_LIMIT) {return Err(Stalled.into());}
                         if let Some(since)=idle_since.filter(|_|state.idle) {
@@ -653,7 +878,7 @@ impl RunningRound {
                             if reply==Some(wake_reply.as_str()) {
                                 let code=event.payload.get("error_code").and_then(integer).unwrap_or(0);
                                 crate::transfer_diagnostics::wake(&sync,false,true,Some(code));
-                                if code==0 {wake_grace=Some(std::time::Instant::now()+WAKE_GRACE);}
+                                if code==0 {wake_grace=Some(std::time::Instant::now()+wake_grace_dur);}
                             }
                             continue;
                         }
@@ -667,8 +892,24 @@ impl RunningRound {
                         if state.idle && !was_idle {idle_since=Some(std::time::Instant::now());}
                         if !state.idle {idle_since=None;}
                         if state.activity!=before{active_wait=Duration::ZERO;previous=std::time::Instant::now();}
-                        if waiting{if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}}
-                        for batch in state.batches.drain(..){batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;}
+                        if waiting{
+                            if let Ok(mut p)=progress.lock(){p(format!("Tải về: lượt {number} • chờ xác nhận trên điện thoại…"));}
+                            if let Some((_, cb)) = &state_sink {
+                                cb(crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
+                                    timeout_at: std::time::Instant::now() + await_confirm,
+                                });
+                            }
+                        }
+                        let mut received_descriptor = false;
+                        for batch in state.batches.drain(..){
+                            received_descriptor = true;
+                            batch_tx.try_send(batch).map_err(|_|anyhow::anyhow!("Hàng đợi gói đồng bộ vượt giới hạn"))?;
+                        }
+                        if received_descriptor {
+                            if let Some((tracker, cb)) = &state_sink {
+                                cb(tracker.record_descriptor_received());
+                            }
+                        }
                         if state.activity!=before {if let Ok(mut p)=progress.lock(){p(state.progress(0));}last_display=std::time::Instant::now();}
                         if state.complete(&[]){state.trace(&sync,0,true);return Ok(state.failed);}
                     }
@@ -857,18 +1098,32 @@ async fn decoded_file(
 /// Request phone approval once, then import history without pausing the live-chat transport.
 /// # Errors
 /// Returns bounded download/decode/identity/store failures; committed pages remain available.
+/// Request phone approval once, emitting typed 5-milestone `SyncState` updates and holding
+/// `pauseIdx` (`IndexingPauseGuard`) without ever auto-falling back to Legacy V1 on failure.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread) + Send>(
+pub(crate) async fn download_with_state<
+    F: FnMut(String) + Send + 'static,
+    G: FnMut(Thread) + Send,
+    S: Fn(crate::sync_coordinator::SyncState) + Send + Sync + 'static,
+>(
     session: &Session,
     transport: SyncTransport,
     cancel: Arc<AtomicBool>,
     full_rescan: bool,
     recent_only: bool,
     range_days: u32,
+    source: crate::sync_coordinator::SyncSource,
+    tracker: crate::sync_coordinator::SyncProgressTracker,
+    state_cb: S,
     mut progress: F,
     page: G,
 ) -> Result<crate::history_sync::SyncReport> {
     let _owner = SYNC_OWNER.lock().await;
+    // Pause heavy FTS backfill (`pauseIdx`) for the full lifetime of Sync2 (RAII ensures resume on return/cancel/error).
+    let _indexing_pause = crate::sync_coordinator::pause_indexing();
+    let state_cb: Arc<dyn Fn(crate::sync_coordinator::SyncState) + Send + Sync> =
+        Arc::new(state_cb);
+    state_cb(crate::sync_coordinator::SyncState::Preparing { source });
     ensure!(
         session.is_active() && session.login.is_some(),
         "Chưa đăng nhập"
@@ -939,6 +1194,12 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         .map(|t| (t.presentation.global_id.clone(), t.id.clone()))
         .collect();
     progress("Đang gửi yêu cầu đồng bộ; hãy mở Zalo trên điện thoại và xác nhận…".into());
+    state_cb(
+        crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
+            timeout_at: std::time::Instant::now()
+                + session.server_config.sync_2_pc.awaiting_mobile_timeout(),
+        },
+    );
     clean_old(session, &transport, epoch).await?;
     let progress = Arc::new(std::sync::Mutex::new(progress));
     let mut run = RunningRound::open(
@@ -951,6 +1212,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         progress.clone(),
         0,
         UNLIMITED,
+        Some((tracker.clone(), state_cb.clone())),
     )
     .await?;
     let mut conversations = Vec::new();
@@ -1126,26 +1388,36 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             .cloned()
             .collect()
     };
-    let mut queue = std::collections::VecDeque::new();
+    let mut raw_queue = std::collections::VecDeque::new();
     let mut number = 0;
     if !priority.is_empty() {
         number += 1;
-        queue.push_back(Job {
+        raw_queue.push_back(Job {
             wanted: priority,
             number,
             attempt: 0,
             priority: true,
+            user_prioritized: false,
         });
     }
     for wanted in policy::split(jobs, Some(per_round))? {
         number += 1;
-        queue.push_back(Job {
+        raw_queue.push_back(Job {
             wanted,
             number,
             attempt: 0,
             priority: false,
+            user_prioritized: false,
         });
     }
+    let transfer_queue = Arc::new(std::sync::Mutex::new(TransferQueue::new(
+        raw_queue, &owners, number,
+    )));
+    let _priority_registration = ActivePriorityRegistration::register(
+        session.account_key().to_owned(),
+        session.runtime_id(),
+        transfer_queue.clone(),
+    );
     let identity = (
         crypto.identity.public.clone(),
         crypto.identity.private.clone(),
@@ -1179,6 +1451,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
         page: &page,
         board: &board,
         next_start: std::sync::Mutex::new(tokio::time::Instant::now()),
+        state_sink: Some((tracker.clone(), state_cb.clone())),
     };
     let emit = |text: String| {
         if let Ok(mut p) = progress.lock() {
@@ -1194,11 +1467,19 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
     let mut adjustments = 0usize;
     let mut disconnected = false;
     let mut fatal: Option<anyhow::Error> = None;
+    let parallel_rounds = session
+        .server_config
+        .sync_2_pc
+        .max_concurrent_sync_items
+        .max(1);
     loop {
         while fatal.is_none()
             && !disconnected
-            && running.len() < PARALLEL_ROUNDS
-            && !queue.is_empty()
+            && running.len() < parallel_rounds
+            && !transfer_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
             && session.is_active()
             && !cancel.load(Ordering::Acquire)
         {
@@ -1206,7 +1487,11 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                 disconnected = true;
                 break;
             }
-            if let Some(job) = queue.pop_front() {
+            let next_job = transfer_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop_next();
+            if let Some(job) = next_job {
                 running.push(run_round(&ctx, job, epoch));
             }
         }
@@ -1275,6 +1560,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                     })
                     .await??;
                 }
+                transfer_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finish_job(&job.wanted);
                 if !job.priority {
                     let mut completed: Vec<_> = job
                         .wanted
@@ -1296,6 +1585,7 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                         store.save_phone_sync_ranges(&ranges)
                     })
                     .await??;
+                    state_cb(tracker.record_partition_complete());
                 }
                 let inserted = shared.lock().map(|s| s.inserted).unwrap_or(0);
                 emit(format!(
@@ -1305,7 +1595,10 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
             }
             (crate::transfer_diagnostics::RoundOutcome::Disconnected, _) => {
                 disconnected = true;
-                queue.push_front(job);
+                transfer_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_front_requeue(job);
             }
             (crate::transfer_diagnostics::RoundOutcome::Stalled, _) => {
                 if job.attempt == 0 {
@@ -1313,8 +1606,15 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                         "Tải về: lượt {} chưa đầy đủ; sẽ xin lại một lần",
                         job.number
                     ));
-                    queue.push_back(Job { attempt: 1, ..job });
+                    transfer_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back_retry(Job { attempt: 1, ..job });
                 } else {
+                    transfer_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .finish_job(&job.wanted);
                     consecutive += 1;
                     skipped += 1;
                     failures += partitions;
@@ -1341,30 +1641,44 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                             .min(partitions - 1)
                             .max(1);
                         limits.count = Some(maximum);
+                        let user_prioritized = job.user_prioritized;
+                        let priority = job.priority;
+                        let attempt = job.attempt;
+                        let job_number = job.number;
                         let mut pieces = policy::split(job.wanted, Some(maximum))?.into_iter();
                         let mut replanned = Vec::new();
                         if let Some(first) = pieces.next() {
                             replanned.push(Job {
                                 wanted: first,
-                                number: job.number,
-                                attempt: job.attempt,
-                                priority: job.priority,
+                                number: job_number,
+                                attempt,
+                                priority,
+                                user_prioritized,
                             });
                         }
                         for wanted in pieces {
-                            number += 1;
+                            let next_num = transfer_queue
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .allocate_number();
                             replanned.push(Job {
                                 wanted,
-                                number,
-                                attempt: job.attempt,
-                                priority: job.priority,
+                                number: next_num,
+                                attempt,
+                                priority,
+                                user_prioritized,
                             });
                         }
                         if let Ok(mut b) = board.lock() {
-                            b.total = number;
+                            b.total = b
+                                .total
+                                .max(replanned.iter().map(|j| j.number).max().unwrap_or(b.total));
                         }
-                        for job in replanned.into_iter().rev() {
-                            queue.push_front(job);
+                        {
+                            let mut q = transfer_queue.lock().unwrap_or_else(|e| e.into_inner());
+                            for j in replanned.into_iter().rev() {
+                                q.push_front_requeue(j);
+                            }
                         }
                         let path = limit_path.clone();
                         let data = serde_json::to_vec(&limits)?;
@@ -1377,9 +1691,18 @@ pub(crate) async fn download<F: FnMut(String) + Send + 'static, G: FnMut(Thread)
                         continue;
                     }
                 }
+                transfer_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finish_job(&job.wanted);
                 fatal = Some(error);
             }
-            (_, Ok(_)) => {}
+            (_, Ok(_)) => {
+                transfer_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .finish_job(&job.wanted);
+            }
         }
     }
     drop(running);
@@ -1456,6 +1779,7 @@ struct Job {
     number: usize,
     attempt: u8,
     priority: bool,
+    user_prioritized: bool,
 }
 
 /// Import state shared by parallel rounds; locks are never held across an await.
@@ -1526,6 +1850,7 @@ struct RoundCtx<'a, F, G> {
     page: &'a std::sync::Mutex<G>,
     board: &'a Arc<std::sync::Mutex<Board<F>>>,
     next_start: std::sync::Mutex<tokio::time::Instant>,
+    state_sink: crate::sync_coordinator::SyncStateSink,
 }
 
 fn classify(
@@ -1641,6 +1966,7 @@ where
             progress,
             job.number,
             limit,
+            ctx.state_sink.clone(),
         )
         .await?;
         let emit = |text: String| {
@@ -1670,6 +1996,9 @@ where
                         job.number,
                     )
                     .await?;
+                    if let Some((tracker, cb)) = &ctx.state_sink {
+                        cb(tracker.record_decoded());
+                    }
                     crypto = next;
                     if crypto.record.is_some() {
                         let _ = run.decoder_ready.send(true);
@@ -1714,6 +2043,9 @@ where
                         let mut trace = crate::transfer_diagnostics::BatchWork::start(&run.id, job.number, batch_index, crate::transfer_diagnostics::BatchStage::Import);
                         let imported = ctx.writer.save(object, senders).await?;
                         trace.finish(imported.inserted);
+                        if let Some((tracker, cb)) = &ctx.state_sink {
+                            cb(tracker.record_db_committed(imported.inserted as u64));
+                        }
                         let inserted = {
                             let mut shared = ctx.shared.lock().unwrap_or_else(|e| e.into_inner());
                             shared.read += imported.read;
@@ -2315,5 +2647,105 @@ mod resilience_tests {
         // If a chunk is missing in r1, it must not complete
         r1.seen.remove(&1);
         assert!(!r1.complete(&wanted));
+    }
+
+    #[test]
+    fn priority_queue_moves_open_thread_ranges_to_front_with_dedup_and_anti_starvation() {
+        let mut owners = HashMap::new();
+        owners.insert("oneone/bg1".into(), "t-bg1".into());
+        owners.insert("oneone/bg2".into(), "t-bg2".into());
+        owners.insert("oneone/p1".into(), "t-p1".into());
+        owners.insert("oneone/p2".into(), "t-p2".into());
+        owners.insert("oneone/p3".into(), "t-p3".into());
+
+        let q = |partition: &str| plan::Query {
+            partition: partition.into(),
+            from: 0,
+            to: 1000,
+        };
+        let mut raw = std::collections::VecDeque::new();
+        raw.push_back(Job {
+            wanted: vec![q("oneone/bg1"), q("oneone/p1")],
+            number: 1,
+            attempt: 0,
+            priority: false,
+            user_prioritized: false,
+        });
+        raw.push_back(Job {
+            wanted: vec![q("oneone/bg2"), q("oneone/p2"), q("oneone/p3")],
+            number: 2,
+            attempt: 0,
+            priority: false,
+            user_prioritized: false,
+        });
+
+        let mut tq = TransferQueue::new(raw, &owners, 2);
+
+        // Promote t-p1 -> moves to front, removed from job 1 without duplicating.
+        assert!(tq.add_ranges_to_front_in_queue("t-p1"));
+        // Repeated click while front-promoted is deduplicated (returns false).
+        assert!(!tq.add_ranges_to_front_in_queue("t-p1"));
+
+        // Promote t-p2 and t-p3 to test anti-starvation fairness.
+        assert!(tq.add_ranges_to_front_in_queue("t-p2"));
+        assert!(tq.add_ranges_to_front_in_queue("t-p3"));
+
+        // Pop 1 & Pop 2: priority jobs p3, p2
+        let j1 = tq.pop_next().unwrap();
+        assert_eq!(j1.wanted[0].partition, "oneone/p3");
+        assert!(j1.user_prioritized);
+        // Repeated click while in-flight is rejected.
+        assert!(!tq.add_ranges_to_front_in_queue("t-p3"));
+
+        let j2 = tq.pop_next().unwrap();
+        assert_eq!(j2.wanted[0].partition, "oneone/p2");
+        assert!(j2.user_prioritized);
+
+        // Pop 3: after MAX_CONSECUTIVE_PRIORITY_POPS (2), background job MUST run to prevent starvation!
+        let j3 = tq.pop_next().unwrap();
+        assert!(!j3.user_prioritized);
+        assert_eq!(j3.wanted.len(), 1);
+        assert_eq!(j3.wanted[0].partition, "oneone/bg1");
+
+        // Pop 4: remaining promoted job p1 can now run.
+        let j4 = tq.pop_next().unwrap();
+        assert_eq!(j4.wanted[0].partition, "oneone/p1");
+    }
+
+    #[test]
+    fn active_priority_registration_is_scoped_to_owner_and_runtime() {
+        let mut owners = HashMap::new();
+        owners.insert("oneone/g1".into(), "thread-1".into());
+        let mut raw = std::collections::VecDeque::new();
+        raw.push_back(Job {
+            wanted: vec![plan::Query {
+                partition: "oneone/g-other".into(),
+                from: 0,
+                to: 100,
+            }],
+            number: 1,
+            attempt: 0,
+            priority: false,
+            user_prioritized: false,
+        });
+        raw.push_back(Job {
+            wanted: vec![plan::Query {
+                partition: "oneone/g1".into(),
+                from: 0,
+                to: 100,
+            }],
+            number: 2,
+            attempt: 0,
+            priority: false,
+            user_prioritized: false,
+        });
+        let tq = Arc::new(std::sync::Mutex::new(TransferQueue::new(raw, &owners, 2)));
+        let _reg = ActivePriorityRegistration::register("acct-a".into(), 7, tq.clone());
+
+        // Foreign account/runtime cannot promote.
+        assert!(!prioritize_conversation("acct-b", 7, "thread-1"));
+        assert!(!prioritize_conversation("acct-a", 8, "thread-1"));
+        // Matching account & runtime succeeds.
+        assert!(prioritize_conversation("acct-a", 7, "thread-1"));
     }
 }

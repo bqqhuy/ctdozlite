@@ -278,21 +278,32 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
         thread.messages.clear();
         let read_session = session.clone();
         let tid_read = thread.id.clone();
-        let checkpoint: Option<String> = tokio::task::spawn_blocking(move || {
-            let (store, _write_permit) =
-                MessageStore::open_for_account_write(&read_session).ok()?;
-            store
+        let checkpoint_result: Result<Option<String>> = tokio::task::spawn_blocking(move || {
+            use rusqlite::OptionalExtension;
+            let (store, _write_permit) = MessageStore::open_for_account_write(&read_session)?;
+            Ok(store
                 .conn
                 .query_row(
                     "SELECT cursor FROM history_sync WHERE thread_id=?1",
                     [&tid_read],
                     |row| row.get(0),
                 )
-                .ok()
+                .optional()?)
         })
         .await
-        .ok()
-        .flatten();
+        .map_err(|error| anyhow::anyhow!("Cannot join history checkpoint task: {error}"))
+        .and_then(|res| res);
+        let checkpoint = match checkpoint_result {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                crate::logger::log_error(
+                    "history sync",
+                    &format!("Cannot read checkpoint: {error}"),
+                );
+                failed += 1;
+                continue;
+            }
+        };
         let mut checkpoint = HistoryCheckpoint::decode(checkpoint.as_deref());
         let (mut cursor, mut old) = checkpoint.start();
         for page in 0..200 {
@@ -337,15 +348,15 @@ pub async fn download<F: FnMut(String), G: FnMut(Thread)>(
 
                 // Offload SQLite store operations to blocking threadpool to free Tokio network executor (N-05)
                 let mut thread_to_save = thread.clone();
-                let updated_to_save = updated.clone();
+                let updated_json = updated.as_ref().map(serde_json::to_string).transpose()?;
                 let write_session = session.clone();
                 let (count, filtered_thread) = tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, Thread)> {
                     let (mut store, _write_permit) = MessageStore::open_for_account_write(&write_session)?;
-                    let ins = crate::store::persist_threads(&mut store, std::slice::from_ref(&thread_to_save))?;
-                    if let Some(ref upd) = updated_to_save {
-                        store.conn.execute("INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
-                            rusqlite::params![thread_to_save.id, serde_json::to_string(upd)?])?;
-                    }
+                    let ins = crate::store::persist_history_sync_page(
+                        &mut store,
+                        &thread_to_save,
+                        updated_json.as_deref(),
+                    )?;
                     store.filter_deleted(std::slice::from_mut(&mut thread_to_save))?;
                     Ok((ins, thread_to_save))
                 }).await??;

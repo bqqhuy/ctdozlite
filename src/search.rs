@@ -224,7 +224,18 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
     Ok(())
 }
 /// Backfill only derived rows. New writes and deletions remain covered by triggers.
+/// Automatically yields/pauses when `pauseIdx` (`sync_coordinator::is_indexing_paused`) is held.
 fn ensure_ready(store: &MessageStore, cancel: &dyn Fn() -> bool) -> Result<()> {
+    ensure_ready_with_pause(store, cancel, &|| {
+        crate::sync_coordinator::is_indexing_paused()
+    })
+}
+
+fn ensure_ready_with_pause(
+    store: &MessageStore,
+    cancel: &dyn Fn() -> bool,
+    paused: &dyn Fn() -> bool,
+) -> Result<()> {
     loop {
         ensure!(!cancel(), "Đã dừng chuẩn bị chỉ mục tìm kiếm");
         let complete: bool = store.conn.query_row(
@@ -235,6 +246,10 @@ fn ensure_ready(store: &MessageStore, cancel: &dyn Fn() -> bool) -> Result<()> {
         if complete {
             return Ok(());
         }
+        ensure!(
+            !paused(),
+            "Đang tạm dừng lập chỉ mục tìm kiếm khi đồng bộ lịch sử"
+        );
         let tx = rusqlite::Transaction::new_unchecked(
             &store.conn,
             rusqlite::TransactionBehavior::Immediate,
@@ -862,5 +877,61 @@ mod legacy_media_tests {
                 .as_deref(),
             Some("https://dlfl.vn/example")
         );
+    }
+
+    #[test]
+    fn search_indexing_pauses_during_guard_and_resumes_after_drop() {
+        let store = MessageStore::open(":memory:").unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE search_index_state SET is_complete=0, thread_cursor='', msg_cursor='' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM search_entries", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO messages(thread_id,msg_id,text,ts,msg_type,raw_json,sender_id,sender_name) VALUES('t1','m1','hello search',10,'chat.text','{}','u1','Alice')",
+                [],
+            )
+            .unwrap();
+        // Reset search_entries and incomplete cursor to simulate pending FTS backfill.
+        store
+            .conn
+            .execute("DELETE FROM search_entries", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE search_index_state SET is_complete=0, thread_cursor='', msg_cursor='' WHERE id=1",
+                [],
+            )
+            .unwrap();
+
+        let gate = crate::sync_coordinator::IndexingGate::default();
+        {
+            let _guard = gate.pause();
+            let err = ensure_ready_with_pause(&store, &|| false, &|| gate.is_paused())
+                .expect_err("backfill must pause while guard is held");
+            assert!(err.to_string().contains("tạm dừng"));
+            let count: i64 = store
+                .conn
+                .query_row("SELECT count(*) FROM search_entries", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0);
+        }
+
+        // Guard dropped -> indexing resumes and completes cleanly.
+        ensure_ready_with_pause(&store, &|| false, &|| gate.is_paused()).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM search_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

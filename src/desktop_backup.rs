@@ -384,9 +384,8 @@ pub fn execute(
         ..Default::default()
     };
     let importing = expected.is_some();
-    let (store, _write_permit) = MessageStore::open_for_account_write(session)?;
-    let mut transaction = if importing {
-        Some(store.conn.unchecked_transaction()?)
+    let store = if importing {
+        Some(MessageStore::open_for_account_write(session)?)
     } else {
         None
     };
@@ -399,14 +398,57 @@ pub fn execute(
         crate::storage::private_dir(&vault)?;
     }
     let mut new_files = Vec::new();
+    let commit_batch = |store: &MessageStore,
+                        batch: &mut Vec<(crate::store::StoredMessage, Value)>,
+                        report: &mut Report|
+     -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let tx = store.conn.unchecked_transaction()?;
+        let mut recalled = Vec::new();
+        for (message, references) in batch.iter() {
+            if store.upsert_message_collecting_recalled(message, Some(&mut recalled))? {
+                report.imported += 1;
+                if let Some(files) = references.as_object() {
+                    for (quality, name) in files {
+                        if let Some(name) = name.as_str() {
+                            store.conn.execute(
+                                "INSERT OR REPLACE INTO restored_assets(thread_id,msg_id,quality,name) VALUES(?1,?2,?3,?4)",
+                                rusqlite::params![message.thread_id, message.msg_id, quality, name],
+                            )?;
+                        }
+                    }
+                }
+            } else {
+                report.skipped += 1;
+                if let Some(files) = references.as_object() {
+                    for name in files.values().filter_map(Value::as_str) {
+                        store.conn.execute(
+                            "INSERT OR IGNORE INTO restored_gc(name) VALUES(?1)",
+                            [name],
+                        )?;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        store.purge_recalled_e2ee(&recalled)?;
+        batch.clear();
+        Ok(())
+    };
+
     let result = (|| -> Result<()> {
-        if importing {
+        if let Some((store, _)) = &store {
+            let tx = store.conn.unchecked_transaction()?;
             for thread in threads.values() {
                 store.upsert_thread(thread)?;
             }
+            tx.commit()?;
         }
         reader.rewind()?;
         let mut asset_reader = EncryptedTarReader::new(std::fs::File::open(path)?, key, &cancel)?;
+        let mut batch: Vec<(crate::store::StoredMessage, Value)> = Vec::new();
         for entry in tar::Archive::new(&mut reader).entries()?.raw(true) {
             let entry = entry?;
             if !String::from_utf8_lossy(&entry.path_bytes())
@@ -423,14 +465,7 @@ pub fn execute(
                 if message.msg_type == "backup.unknown" {
                     report.unsupported += 1;
                 }
-                if importing && report.records.is_multiple_of(250) {
-                    if let Some(tx) = transaction.take() {
-                        tx.commit()?;
-                    }
-                    new_files.clear();
-                    transaction = Some(store.conn.unchecked_transaction()?);
-                }
-                if importing {
+                if let Some((store, _)) = &store {
                     // Do not overwrite a live row with a less expressive backup projection.
                     let exists: bool = store.conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id=?1 AND msg_id=?2)",
@@ -441,6 +476,7 @@ pub fn execute(
                         report.skipped += 1;
                         continue;
                     }
+                    // Decrypt and copy backup assets outside any SQLite transaction.
                     let mut restored = json!({});
                     let prefix = record_prefix(&value, session.account_key());
                     for asset in prefix
@@ -475,39 +511,24 @@ pub fn execute(
                         raw["message_state"]["history_source"]["backup_assets"] = restored;
                         message.raw_json = raw.to_string();
                     }
-                    if store.upsert_message(&message)? {
-                        report.imported += 1;
-                        if let Some(files) = references.as_object() {
-                            for (quality, name) in files {
-                                if let Some(name) = name.as_str() {
-                                    store.conn.execute("INSERT OR REPLACE INTO restored_assets(thread_id,msg_id,quality,name) VALUES(?1,?2,?3,?4)",rusqlite::params![message.thread_id,message.msg_id,quality,name])?;
-                                }
-                            }
-                        }
-                    } else {
-                        report.skipped += 1;
-                        if let Some(files) = references.as_object() {
-                            for name in files.values().filter_map(Value::as_str) {
-                                store.conn.execute(
-                                    "INSERT OR IGNORE INTO restored_gc(name) VALUES(?1)",
-                                    [name],
-                                )?;
-                            }
-                        }
+                    batch.push((message, references));
+                    if batch.len() >= 250 {
+                        commit_batch(store, &mut batch, &mut report)?;
+                        new_files.clear();
                     }
                 }
             }
         }
         check(session, &cancel)?;
-        if let Some(tx) = transaction.take() {
-            tx.commit()?;
+        if let Some((store, _)) = &store {
+            commit_batch(store, &mut batch, &mut report)?;
+            new_files.clear();
         }
         Ok(())
     })();
     if result.is_err() {
-        // Committed batches remain; only the current batch and its new media are rolled back.
+        // Committed batches remain; only the uncommitted staged batch's new media is removed.
         // SQLite owns WAL recovery; copying a main DB file over a live store loses rows.
-        drop(transaction);
         for path in new_files {
             let _ = std::fs::remove_file(path);
         }

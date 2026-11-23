@@ -66,6 +66,7 @@ fn batch_feed(
         },
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn start<F: FnMut(String) + Send + 'static>(
     session: Session,
     batches: tokio::sync::mpsc::Receiver<Batch>,
@@ -74,6 +75,7 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
     round: usize,
     ready: tokio::sync::watch::Receiver<bool>,
     sync_id: String,
+    state_sink: crate::sync_coordinator::SyncStateSink,
 ) -> (
     tokio::sync::mpsc::Receiver<Result<Staged>>,
     tokio::task::JoinHandle<()>,
@@ -106,6 +108,7 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                 let cancel = cancel.clone();
                 let progress = progress.clone();
                 let sync_id = sync_id.clone();
+                let state_sink = state_sink.clone();
                 async move {
                     let batch = batch?;
                     ensure!(
@@ -146,6 +149,12 @@ pub(super) fn start<F: FnMut(String) + Send + 'static>(
                         },
                     )
                     .await?;
+                    let downloaded_len = std::fs::metadata(&staged.path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    if let Some((tracker, cb)) = &state_sink {
+                        cb(tracker.record_downloaded_bytes(downloaded_len));
+                    }
                     trace.finish(0);
                     Ok(staged)
                 }

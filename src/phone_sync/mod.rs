@@ -7,8 +7,8 @@ mod plan;
 mod policy;
 mod transfer;
 mod wire;
-pub(crate) use transfer::download;
-
-pub(crate) use transfer::{clean_after_connect, request_wake};
+pub(crate) use transfer::{
+    clean_after_connect, download_with_state, prioritize_conversation, request_wake,
+};
 
 pub(crate) mod legacy;

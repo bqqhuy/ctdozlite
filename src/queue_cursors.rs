@@ -264,20 +264,37 @@ fn commit_poll_inner(s: &Session, state: &crate::chat::PollState) {
 }
 
 /// Write any pending cursors now (logout, shutdown).
-fn flush_owned(entry: &mut Entry, path: &std::path::Path) {
-    let Some(owner) = entry.owner.clone() else {
-        return;
-    };
-    let Ok(_write_permit) = owner.begin_account_write_blocking() else {
-        return;
-    };
-    flush(entry, path, true);
-}
-
 fn flush_all_inner() {
-    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    for ((path, _), entry) in guard.iter_mut().flat_map(|c| c.iter_mut()) {
-        flush_owned(entry, path);
+    // Snapshot dirty keys and owners first, then release `CACHE` before acquiring
+    // `AccountWritePermit` so lock order stays strictly `AccountWriteGate -> CACHE`.
+    let pending: Vec<(PathBuf, usize, Session)> = {
+        let guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .flat_map(|c| c.iter())
+            .filter_map(|((path, runtime_id), entry)| {
+                if !entry.dirty {
+                    return None;
+                }
+                entry
+                    .owner
+                    .clone()
+                    .map(|owner| (path.clone(), *runtime_id, owner))
+            })
+            .collect()
+    };
+
+    for (path, runtime_id, owner) in pending {
+        let Ok(_write_permit) = owner.begin_account_write_blocking() else {
+            continue;
+        };
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard
+            .as_mut()
+            .and_then(|c| c.get_mut(&(path.clone(), runtime_id)))
+        {
+            flush(entry, &path, true);
+        }
     }
 }
 
@@ -407,16 +424,79 @@ mod tests {
     }
     #[test]
     fn revoked_cursor_owner_cannot_flush_dirty_state_after_account_boundary() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("queue-cursors.json");
-        let owner = Session::new(false, false, false).unwrap();
-        let mut entry = entry();
-        entry.owner = Some(owner.clone());
-        record_socket(&mut entry, "510_0", json!(100), json!([]));
+        let uin = format!("cursor-revoke-{}", crate::param_cipher::random_hex(12));
+        let account_dir = crate::storage::account_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+        let mut owner = Session::new(false, false, false).unwrap();
+        owner.login = Some(crate::session::LoginInfo {
+            uin: uin.clone(),
+            zpw_enk: String::new(),
+            zpw_sek: String::new(),
+            display_name: "Test".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        let path = path(&owner).unwrap();
+        let runtime_id = owner.runtime_id();
+        with(&owner, |entry| {
+            record_socket(entry, "510_0", json!(100), json!([]));
+        });
         owner.revoke_runtime();
-        flush_owned(&mut entry, &path);
+        flush_all_inner();
         assert!(!path.exists()); // (INV-P1-WRITE)
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard
+            .as_mut()
+            .and_then(|c| c.remove(&(path.clone(), runtime_id)))
+            .unwrap();
         assert!(entry.dirty, "unflushed progress must remain replayable");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[tokio::test]
+    async fn concurrent_commit_and_flush_all_never_deadlock() {
+        let uin = format!("cursor-concurrent-{}", crate::param_cipher::random_hex(12));
+        let account_dir = crate::storage::account_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+        let mut session = Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: uin.clone(),
+            zpw_enk: String::new(),
+            zpw_sek: String::new(),
+            display_name: "Test".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        let cursor_path = path(&session).unwrap();
+        let runtime_id = session.runtime_id();
+
+        let s1 = session.clone();
+        let committer = tokio::spawn(async move {
+            for idx in 2..40u64 {
+                let mut poll = crate::chat::PollState::default();
+                poll.last_action_id = idx.to_string();
+                commit_poll(&s1, &poll).await;
+            }
+        });
+        let flusher = tokio::spawn(async move {
+            for _ in 0..40 {
+                flush_all().await;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            committer.await.unwrap();
+            flusher.await.unwrap();
+        })
+        .await
+        .expect("commit_poll and flush_all must never ABBA-deadlock");
+
+        let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cache) = guard.as_mut() {
+            cache.remove(&(cursor_path, runtime_id));
+        }
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&account_dir);
     }
     #[test]
     fn boundary_ids_advance_even_when_last_id_is_equal() {

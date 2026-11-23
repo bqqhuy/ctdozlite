@@ -50,6 +50,7 @@ mod profile_panel;
 mod schedule_modal;
 mod search_panel;
 mod stickers;
+pub(crate) mod sync_banner;
 mod theme;
 mod tools_panel;
 mod worker;
@@ -157,6 +158,23 @@ pub struct StickerSprite {
     pub delays: Vec<std::time::Duration>,
 }
 
+pub(crate) const STR_LOGGING_IN: &str = "Đang đăng nhập...";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StartupState {
+    Unauthenticated,
+    Loading {
+        stage_text: String,
+        started_at: std::time::Instant,
+        timeout: std::time::Duration,
+        settle_deadline: Option<std::time::Instant>,
+    },
+    FatalError {
+        message: String,
+    },
+    Ready,
+}
+
 pub enum GuiEvent {
     E2eeTrialPrepared {
         owner: String,
@@ -247,6 +265,26 @@ pub enum GuiEvent {
         owner: String,
         runtime_id: usize,
         config: composer_config::ComposerConfig,
+    },
+    ServerConfigUpdated {
+        owner: String,
+        runtime_id: usize,
+        config: crate::server_config::ServerConfig,
+    },
+    StartupStage {
+        owner: String,
+        runtime_id: usize,
+        stage_text: String,
+    },
+    StartupPreloadSettled {
+        owner: String,
+        runtime_id: usize,
+        preload_threads: Option<Vec<Thread>>,
+    },
+    StartupFatalError {
+        owner: String,
+        runtime_id: usize,
+        message: String,
     },
     GroupInvalidated {
         owner: String,
@@ -418,6 +456,12 @@ pub enum GuiEvent {
         running: bool,
         success: bool,
         message: String,
+    },
+    PhoneSyncState {
+        owner: String,
+        runtime_id: usize,
+        operation_id: u64,
+        state: crate::sync_coordinator::SyncState,
     },
     HistorySyncStatus {
         running: bool,
@@ -1301,6 +1345,8 @@ pub struct ZaloGuiApp {
     actual_server_aliases: HashMap<String, String>,
     server_phonebook: HashMap<String, String>,
     composer_config: composer_config::ComposerConfig,
+    server_config: crate::server_config::ServerConfig,
+    startup_state: StartupState,
     server_aliases_ready: bool,
     metadata_status: String,
     group_policy_revision: u64,
@@ -1421,6 +1467,11 @@ pub struct ZaloGuiApp {
     profiles: Vec<crate::profiles::Profile>,
     profiles_requested: bool,
     sidebar_order: Option<SidebarOrderCache>,
+    pub(crate) sync_state: crate::sync_coordinator::SyncState,
+    pub(crate) sync_operation_id: u64,
+    pub(crate) sync_state_revision: u64,
+    pub(crate) sync_suggest_dismissed: bool,
+    pub(crate) sync_error_dismissed: bool,
 
     info_drawer_open: bool,
     pub drawer_view: DrawerView,
@@ -1716,6 +1767,22 @@ impl ZaloGuiApp {
         let lock_guard = auth_guard::AppLockGuard::with_initial_lock(
             is_logged_in && loaded_settings.lock_configured(),
         );
+        let initial_server_config = session.server_config.clone();
+        let initial_composer_config = session
+            .composer_config
+            .unwrap_or(initial_server_config.zcinput);
+        let initial_startup_state = if !is_logged_in {
+            StartupState::Unauthenticated
+        } else if !bootstrap {
+            StartupState::Ready
+        } else {
+            StartupState::Loading {
+                stage_text: "Đang khởi tạo phiên và lịch sử cục bộ…".into(),
+                started_at: std::time::Instant::now(),
+                timeout: initial_server_config.o2o.keep_loading_timeout(),
+                settle_deadline: None,
+            }
+        };
         let mut app = Self {
             #[cfg(windows)]
             tray: None,
@@ -1785,6 +1852,11 @@ impl ZaloGuiApp {
             profiles: Vec::new(),
             profiles_requested: false,
             sidebar_order: None,
+            sync_state: crate::sync_coordinator::SyncState::default(),
+            sync_operation_id: 0,
+            sync_state_revision: 0,
+            sync_suggest_dismissed: false,
+            sync_error_dismissed: false,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             drawer_view: DrawerView::Overview,
@@ -1938,7 +2010,9 @@ impl ZaloGuiApp {
             server_aliases: Default::default(),
             actual_server_aliases: Default::default(),
             server_phonebook: Default::default(),
-            composer_config: Default::default(),
+            composer_config: initial_composer_config,
+            server_config: initial_server_config,
+            startup_state: initial_startup_state,
             server_aliases_ready: false,
             metadata_status: String::new(),
             group_policy_revision: 0,
@@ -2022,6 +2096,7 @@ impl ZaloGuiApp {
                     .unwrap_or(0),
             });
             app.is_logged_in = true;
+            app.startup_state = StartupState::Ready;
             app.user_name = "ARM64 UI fixture".into();
             app.settings_modal_open = !args
                 .iter()
@@ -3542,6 +3617,9 @@ impl ZaloGuiApp {
                     runtime_id,
                     composer_config,
                 } => {
+                    let identity_changed = !self.is_logged_in
+                        || self.user_uin != uin
+                        || self.account_runtime_id != runtime_id;
                     self.profiles_requested = false;
                     self.profiles.clear();
                     if self.account_runtime_id != runtime_id {
@@ -3552,6 +3630,7 @@ impl ZaloGuiApp {
                     }
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
                         self.composer_config = Default::default();
+                        self.server_config = Default::default();
                         self.cancel_voice_recording();
                         self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                         self.auth_in_progress = false;
@@ -3579,6 +3658,7 @@ impl ZaloGuiApp {
                     self.account_runtime_id = runtime_id;
                     if let Some(config) = composer_config {
                         self.composer_config = config;
+                        self.server_config.zcinput = config;
                     }
                     self.user_name = name;
                     self.user_uin = uin;
@@ -3589,6 +3669,16 @@ impl ZaloGuiApp {
                     self.password_input.clear();
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Đã đăng nhập · Nhận cập nhật".into();
+                    if identity_changed {
+                        let timeout = self.server_config.o2o.keep_loading_timeout();
+                        self.startup_state = StartupState::Loading {
+                            stage_text: "Đang tải cấu hình và tin nhắn gần đây…".into(),
+                            started_at: std::time::Instant::now(),
+                            timeout,
+                            settle_deadline: None,
+                        };
+                        ctx.request_repaint_after(timeout);
+                    }
                 }
                 GuiEvent::LoginFailed(err) => {
                     self.login_in_progress = false;
@@ -3888,6 +3978,97 @@ impl ZaloGuiApp {
                 } => {
                     if owner == self.user_uin && runtime_id == self.account_runtime_id {
                         self.composer_config = config;
+                        self.server_config.zcinput = config;
+                    }
+                }
+                GuiEvent::ServerConfigUpdated {
+                    owner,
+                    runtime_id,
+                    config,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.composer_config = config.zcinput;
+                        self.server_config = config;
+                        if let StartupState::Loading { timeout, .. } = &mut self.startup_state {
+                            *timeout = self.server_config.o2o.keep_loading_timeout();
+                        }
+                    }
+                }
+                GuiEvent::StartupStage {
+                    owner,
+                    runtime_id,
+                    stage_text,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        if let StartupState::Loading {
+                            stage_text: current,
+                            ..
+                        } = &mut self.startup_state
+                        {
+                            *current = stage_text;
+                        }
+                    }
+                }
+                GuiEvent::StartupFatalError {
+                    owner,
+                    runtime_id,
+                    message,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.startup_state = StartupState::FatalError { message };
+                    }
+                }
+                GuiEvent::StartupPreloadSettled {
+                    owner,
+                    runtime_id,
+                    preload_threads,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        if let Some(threads) = preload_threads {
+                            if !threads.is_empty() {
+                                if self.threads.is_empty() {
+                                    self.threads = threads;
+                                } else {
+                                    for thread in threads {
+                                        if let Some(existing) =
+                                            self.threads.iter_mut().find(|t| t.id == thread.id)
+                                        {
+                                            crate::chat::merge_thread_into(existing, thread, false);
+                                        } else {
+                                            self.threads.push(thread);
+                                        }
+                                    }
+                                }
+                                crate::chat::deduplicate_threads(&mut self.threads, None);
+                            }
+                        }
+                        if matches!(self.startup_state, StartupState::Loading { .. }) {
+                            let delay = self.server_config.o2o.screen_dismiss_delay();
+                            if delay.is_zero() {
+                                self.startup_state = StartupState::Ready;
+                            } else if let StartupState::Loading {
+                                settle_deadline,
+                                stage_text,
+                                ..
+                            } = &mut self.startup_state
+                            {
+                                *stage_text = "Đã sẵn sàng…".into();
+                                *settle_deadline = Some(std::time::Instant::now() + delay);
+                                ctx.request_repaint_after(delay);
+                            }
+                        }
                     }
                 }
                 GuiEvent::AccountMetadata {
@@ -4113,6 +4294,9 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.is_logged_in = false;
                     self.account_runtime_id = 0;
+                    self.composer_config = Default::default();
+                    self.server_config = Default::default();
+                    self.startup_state = StartupState::Unauthenticated;
                     self.tools.devices.clear();
                     self.tools.two_factor_status = None;
                     self.tools.catalog_items.clear();
@@ -4221,6 +4405,9 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.is_logged_in = false;
                     self.account_runtime_id = 0;
+                    self.composer_config = Default::default();
+                    self.server_config = Default::default();
+                    self.startup_state = StartupState::Unauthenticated;
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
@@ -4305,6 +4492,18 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.user_uin = uid.clone();
                     self.account_runtime_id = runtime_id;
+                    self.server_config = session.server_config.clone();
+                    self.composer_config = session
+                        .composer_config
+                        .unwrap_or(self.server_config.zcinput);
+                    let timeout = self.server_config.o2o.keep_loading_timeout();
+                    self.startup_state = StartupState::Loading {
+                        stage_text: "Đang chuyển tài khoản và kiểm tra dữ liệu…".into(),
+                        started_at: std::time::Instant::now(),
+                        timeout,
+                        settle_deadline: None,
+                    };
+                    ctx.request_repaint_after(timeout);
                     self.user_name.clear();
                     self.threads.clear();
                     self.selected_thread_index = 0;
@@ -6408,6 +6607,31 @@ impl ZaloGuiApp {
                     self.phone_sync_status = message.clone();
                     self.status_msg = message;
                 }
+                GuiEvent::PhoneSyncState {
+                    owner,
+                    runtime_id,
+                    operation_id,
+                    state,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    if operation_id != 0 && operation_id < self.sync_operation_id {
+                        continue;
+                    }
+                    if operation_id > self.sync_operation_id {
+                        self.sync_operation_id = operation_id;
+                    }
+                    self.phone_sync_running = state.is_running();
+                    self.sync_state = state;
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    if self.sync_state.is_running() {
+                        self.sync_error_dismissed = false;
+                    }
+                }
                 GuiEvent::HistorySyncStatus {
                     running,
                     success,
@@ -6868,6 +7092,7 @@ impl eframe::App for ZaloGuiApp {
         });
         self.sync_composer_draft(ctx);
         self.check_events(ctx);
+        self.advance_startup_state(std::time::Instant::now(), ctx);
         self.reconcile_inline_voice(ctx);
         self.attachment_drafts.sync_owner(if self.is_logged_in {
             &self.user_uin
@@ -6875,7 +7100,11 @@ impl eframe::App for ZaloGuiApp {
             ""
         });
         self.sync_composer_draft(ctx);
-        if self.is_logged_in && self.tools.loaded_for != self.user_uin && self.smoke.is_none() {
+        if self.is_logged_in
+            && matches!(self.startup_state, StartupState::Ready)
+            && self.tools.loaded_for != self.user_uin
+            && self.smoke.is_none()
+        {
             self.tools = tools_panel::ToolsPanel {
                 loaded_for: self.user_uin.clone(),
                 ..Default::default()
@@ -6965,21 +7194,38 @@ impl eframe::App for ZaloGuiApp {
                 });
         }
 
-        // Main Workspace
-        if !self.is_logged_in {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
-                .show(ctx, |ui| {
-                    self.render_login_screen(ui, &pal);
-                });
-        } else if self.lock_guard.is_locked() {
-            // Render lock screen (WP16-4 / MAP-00)
-            self.render_lock_screen(ctx, &pal);
-        } else {
-            self.render_chat_workspace(ctx, &pal);
-            self.render_reactor_details(ctx);
-            self.render_message_details(ctx);
-            self.render_archive_confirmation(ctx, &pal);
+        // Main Workspace: never render 4 zones before StartupState::Ready
+        match self.startup_state.clone() {
+            StartupState::Unauthenticated => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+                    .show(ctx, |ui| {
+                        self.render_login_screen(ui, &pal);
+                    });
+            }
+            StartupState::Loading { stage_text, .. } => {
+                self.render_startup_loading_screen(ctx, &pal, &stage_text);
+            }
+            StartupState::FatalError { message } => {
+                self.render_startup_fatal_error_screen(ctx, &pal, &message);
+            }
+            StartupState::Ready => {
+                if !self.is_logged_in {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+                        .show(ctx, |ui| {
+                            self.render_login_screen(ui, &pal);
+                        });
+                } else if self.lock_guard.is_locked() {
+                    // Render lock screen (WP16-4 / MAP-00)
+                    self.render_lock_screen(ctx, &pal);
+                } else {
+                    self.render_chat_workspace(ctx, &pal);
+                    self.render_reactor_details(ctx);
+                    self.render_message_details(ctx);
+                    self.render_archive_confirmation(ctx, &pal);
+                }
+            }
         }
         self.sync_composer_draft(ctx);
         self.preserve_draft_before_close(ctx);
@@ -7004,6 +7250,149 @@ impl eframe::App for ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
+    /// Non-blocking startup progression; `FatalError` never times out into `Ready`.
+    pub(crate) fn advance_startup_state(&mut self, now: std::time::Instant, ctx: &egui::Context) {
+        if !self.is_logged_in {
+            if !matches!(self.startup_state, StartupState::Unauthenticated) {
+                self.startup_state = StartupState::Unauthenticated;
+            }
+            return;
+        }
+        if let StartupState::Loading {
+            started_at: _,
+            timeout: _,
+            settle_deadline,
+            ..
+        } = &self.startup_state
+        {
+            if let Some(settle_deadline) = settle_deadline {
+                if now >= *settle_deadline {
+                    self.startup_state = StartupState::Ready;
+                } else {
+                    ctx.request_repaint_after(settle_deadline.saturating_duration_since(now));
+                }
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    fn render_startup_loading_screen(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &ThemePalette,
+        stage_text: &str,
+    ) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    let avail_h = ui.available_height();
+                    ui.add_space((avail_h * 0.28).max(48.0));
+                    if let Some(tex) = &self.app_logo_texture {
+                        ui.image((tex.id(), Vec2::new(72.0, 72.0)));
+                        ui.add_space(16.0);
+                    }
+                    ui.label(RichText::new("Zalo").color(pal.primary).size(28.0).strong());
+                    ui.add_space(18.0);
+                    ui.spinner();
+                    ui.add_space(12.0);
+                    ui.label(
+                        RichText::new(crate::i18n::tr(STR_LOGGING_IN))
+                            .color(pal.text_primary)
+                            .size(16.0)
+                            .strong(),
+                    );
+                    if !stage_text.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(stage_text)
+                                .color(pal.text_secondary)
+                                .size(13.0),
+                        );
+                    }
+                });
+            });
+    }
+
+    fn render_startup_fatal_error_screen(
+        &mut self,
+        ctx: &egui::Context,
+        pal: &ThemePalette,
+        message: &str,
+    ) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(pal.bg_chat_canvas))
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    let avail_h = ui.available_height();
+                    ui.add_space((avail_h * 0.24).max(40.0));
+                    if let Some(tex) = &self.app_logo_texture {
+                        ui.image((tex.id(), Vec2::new(64.0, 64.0)));
+                        ui.add_space(14.0);
+                    }
+                    egui::Frame::none()
+                        .fill(pal.bg_elevated)
+                        .rounding(Rounding::same(16.0))
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .inner_margin(Margin::symmetric(28.0, 24.0))
+                        .show(ui, |ui| {
+                            ui.set_width(380.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(
+                                    RichText::new("Không thể khởi động phiên Zalo")
+                                        .color(pal.danger)
+                                        .size(18.0)
+                                        .strong(),
+                                );
+                                ui.add_space(10.0);
+                                ui.label(RichText::new(message).color(pal.text_primary).size(13.5));
+                                ui.add_space(18.0);
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                RichText::new("Thử lại")
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .fill(pal.primary)
+                                            .rounding(Rounding::same(8.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        let timeout = self.server_config.o2o.keep_loading_timeout();
+                                        self.startup_state = StartupState::Loading {
+                                            stage_text: "Đang thử khởi tạo lại…".into(),
+                                            started_at: std::time::Instant::now(),
+                                            timeout,
+                                            settle_deadline: None,
+                                        };
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::RetryStartup);
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .add(
+                                            egui::Button::new("Đăng nhập lại")
+                                                .rounding(Rounding::same(8.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::Logout);
+                                        } else {
+                                            self.is_logged_in = false;
+                                            self.startup_state = StartupState::Unauthenticated;
+                                        }
+                                    }
+                                });
+                            });
+                        });
+                });
+            });
+    }
+
     fn render_login_screen(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
         ui.vertical_centered(|ui| {
             let avail_h = ui.available_height();
@@ -10204,5 +10593,236 @@ mod phase5_friend_event_tests {
         app.clear_presence_state();
         assert!(app.friend_status_map.is_empty());
         assert!(app.friend_requests.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod startup_and_server_config_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn logged_in_session(uin: &str) -> Session {
+        let mut s = Session::new(false, false, false).unwrap();
+        s.login = Some(crate::session::LoginInfo {
+            uin: uin.to_owned(),
+            zpw_enk: String::new(),
+            zpw_sek: "sek".into(),
+            display_name: "Tester".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        s
+    }
+
+    #[test]
+    fn startup_loading_settles_with_dismiss_delay_and_fatal_error_never_times_out_to_ready() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("1001"), false, Vec::new(), true);
+        assert!(matches!(app.startup_state, StartupState::Loading { .. }));
+
+        // Configure o2o screen_dismiss_delay = 200ms and timeout = 800ms for runtime.
+        let mut cfg = crate::server_config::ServerConfig::default();
+        cfg.o2o.keep_loading_during_preload.enable = true;
+        cfg.o2o.keep_loading_during_preload.timeout_duration_ms = 800;
+        cfg.o2o.keep_loading_during_preload.screen_dismiss_delay_ms = 200;
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "1001".into(),
+                runtime_id: app.account_runtime_id,
+                config: cfg,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Before StartupPreloadSettled arrives (`settle_deadline == None`), advancing past
+        // timeout (800ms+) must keep the UI in Loading and never transition early to Ready.
+        app.advance_startup_state(Instant::now() + Duration::from_secs(5), &ctx);
+        assert!(
+            matches!(
+                app.startup_state,
+                StartupState::Loading {
+                    settle_deadline: None,
+                    ..
+                }
+            ),
+            "unsettled startup must remain Loading even past timeout, got {:?}",
+            app.startup_state
+        );
+
+        app.event_tx
+            .send(GuiEvent::StartupPreloadSettled {
+                owner: "1001".into(),
+                runtime_id: app.account_runtime_id,
+                preload_threads: Some(vec![Thread {
+                    id: "t1".into(),
+                    name: "Bạn bè".into(),
+                    ..Default::default()
+                }]),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.threads.len(), 1);
+        let settle_at = match &app.startup_state {
+            StartupState::Loading {
+                settle_deadline: Some(deadline),
+                ..
+            } => *deadline,
+            other => panic!("expected Loading with settle_deadline, got {other:?}"),
+        };
+        app.advance_startup_state(settle_at - Duration::from_millis(50), &ctx);
+        assert!(matches!(app.startup_state, StartupState::Loading { .. }));
+        app.advance_startup_state(settle_at + Duration::from_millis(1), &ctx);
+        assert_eq!(app.startup_state, StartupState::Ready);
+
+        // Fatal error must never degrade or time out to Ready, even if StartupPreloadSettled arrives later.
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+        app.event_tx = tx.clone();
+        app.startup_state = StartupState::Loading {
+            stage_text: "checking".into(),
+            started_at: Instant::now() - Duration::from_secs(60),
+            timeout: Duration::from_millis(800),
+            settle_deadline: None,
+        };
+        tx.send(GuiEvent::StartupFatalError {
+            owner: "1001".into(),
+            runtime_id: app.account_runtime_id,
+            message: "SQLite migration failed".into(),
+        })
+        .unwrap();
+        tx.send(GuiEvent::StartupPreloadSettled {
+            owner: "1001".into(),
+            runtime_id: app.account_runtime_id,
+            preload_threads: None,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        app.advance_startup_state(Instant::now() + Duration::from_secs(600), &ctx);
+        assert_eq!(
+            app.startup_state,
+            StartupState::FatalError {
+                message: "SQLite migration failed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn server_config_event_is_scoped_by_account_and_resets_on_logout_without_clobbering_draft() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("2001"), false, Vec::new(), false);
+        app.input_message = "đang gõ dở".into();
+
+        let foreign_cfg = crate::server_config::ServerConfig {
+            enable_feature_alias_v2: true,
+            zcinput: crate::composer_config::ComposerConfig {
+                line_height: 31.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for (owner, runtime_id) in [
+            ("other", app.account_runtime_id),
+            ("2001", app.account_runtime_id.wrapping_add(1)),
+        ] {
+            app.event_tx
+                .send(GuiEvent::ServerConfigUpdated {
+                    owner: owner.into(),
+                    runtime_id,
+                    config: foreign_cfg.clone(),
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(!app.server_config.enable_feature_alias_v2);
+        assert_eq!(app.composer_config.line_height, 22.0);
+        assert_eq!(app.input_message, "đang gõ dở");
+
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "2001".into(),
+                runtime_id: app.account_runtime_id,
+                config: foreign_cfg,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.server_config.enable_feature_alias_v2);
+        assert_eq!(app.composer_config.line_height, 31.0);
+        assert_eq!(app.input_message, "đang gõ dở");
+
+        app.event_tx.send(GuiEvent::LoggedOut).unwrap();
+        app.check_events(&ctx);
+        assert!(!app.server_config.enable_feature_alias_v2);
+        assert_eq!(app.composer_config.line_height, 22.0);
+        assert_eq!(app.startup_state, StartupState::Unauthenticated);
+    }
+
+    #[test]
+    fn phone_sync_state_event_scopes_by_owner_runtime_and_operation_id() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+        let rt = app.account_runtime_id;
+        // Foreign owner / runtime must be ignored.
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "other".into(),
+                runtime_id: rt,
+                operation_id: 5,
+                state: crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Full,
+                },
+            })
+            .unwrap();
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt.wrapping_add(1),
+                operation_id: 5,
+                state: crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Full,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.sync_state.is_running());
+
+        // Matching operation 10 advances state; stale operation 9 is dropped.
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 10,
+                state: crate::sync_coordinator::SyncState::Transferring {
+                    stage: crate::sync_coordinator::SyncTransferStage::DbCommitted,
+                    downloaded_bytes: 4096,
+                    total_bytes: None,
+                    inserted_messages: 12,
+                    total_messages: None,
+                },
+            })
+            .unwrap();
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 9,
+                state: crate::sync_coordinator::SyncState::Failed {
+                    error: "stale failure".into(),
+                    fatal: false,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_state.is_running());
+        assert_eq!(app.sync_operation_id, 10);
+
+        // Logout resets sync_state and sync_operation_id cleanly.
+        app.event_tx.send(GuiEvent::LoggedOut).unwrap();
+        app.check_events(&ctx);
+        assert!(!app.sync_state.is_running());
+        assert_eq!(app.sync_operation_id, 0);
     }
 }

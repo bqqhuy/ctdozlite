@@ -29,22 +29,32 @@ async fn get(s: &Session, host: &str, path: &str, body: Value) -> Result<Value> 
     ensure!(s.is_active(), "Phiên tài khoản đã thay đổi");
     crate::api_response::checked_data(s.maybe_decrypt(raw, s.session_key_bytes()).await)
 }
+fn alias_endpoint_and_body(s: &Session, page: usize) -> (&'static str, Value) {
+    if s.server_config.enable_feature_alias_v2 {
+        (
+            "/api/alias/list/v2",
+            json!({"page": page, "count": 100, "src": 0, "imei": s.imei}),
+        )
+    } else {
+        (
+            "/api/alias/list",
+            json!({"page": page, "count": 100, "imei": s.imei}),
+        )
+    }
+}
+
 /// Fetch all alias pages; malformed/looping/partial lists never replace a complete old snapshot.
 pub async fn aliases(s: &Session) -> Result<HashMap<String, String>> {
     let host = crate::endpoints::service("alias").context("Thiếu dịch vụ biệt danh")?;
     let mut result = HashMap::new();
     let mut pages = HashSet::new();
     for page in 1..=1000 {
-        let data = get(
-            s,
-            host,
-            "/api/alias/list",
-            json!({"page":page,"count":100,"imei":s.imei}),
-        )
-        .await?;
+        let (path, body) = alias_endpoint_and_body(s, page);
+        let data = get(s, host, path, body).await?;
         let rows = data
             .get("items")
             .and_then(Value::as_array)
+            .or_else(|| data.as_array())
             .context("Thiếu danh sách biệt danh")?;
         ensure!(rows.len() <= 100, "Trang biệt danh quá lớn");
         let signature = rows
@@ -250,7 +260,12 @@ pub async fn read(s: &Session, publish_names: impl Fn(Snapshot)) -> Snapshot {
         }
         result
     };
+    let alias_v2_enabled = s.server_config.enable_feature_alias_v2;
     let phonebook_read = async {
+        if alias_v2_enabled {
+            // PC `_startFlowFetchPhonebook` skips old phonebook when alias v2 is enabled.
+            return Ok(HashMap::new());
+        }
         let result = bounded(phonebook(s)).await;
         if s.is_active() {
             if let Ok(names) = &result {
@@ -449,6 +464,26 @@ mod cache_tests {
         assert!(parse_phonebook(&json!({"version":7}), "99").is_err());
         assert!(parse_phonebook(&json!({"phonebook":{"invalid":"Tên"}}), "99").is_err());
         assert!(parse_phonebook(&json!({"phonebook":{"12":42}}), "99").is_err());
+    }
+    #[test]
+    fn alias_v2_config_switches_endpoint_and_resets_on_logout() {
+        let mut s = Session::new(false, false, false).unwrap();
+        assert_eq!(alias_endpoint_and_body(&s, 1).0, "/api/alias/list");
+        s.apply_server_info(&json!({
+            "error_code": 0,
+            "data": {
+                "setttings": {
+                    "features": {
+                        "enable_feature_alias_v2": true
+                    }
+                }
+            }
+        }));
+        let (path, body) = alias_endpoint_and_body(&s, 1);
+        assert_eq!(path, "/api/alias/list/v2");
+        assert_eq!(body.get("src"), Some(&json!(0)));
+        s.logout();
+        assert_eq!(alias_endpoint_and_body(&s, 1).0, "/api/alias/list");
     }
     #[test]
     fn account_policy_cache_rejects_foreign_and_malformed_membership() {

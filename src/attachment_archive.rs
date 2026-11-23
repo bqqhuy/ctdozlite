@@ -30,6 +30,20 @@ pub(crate) async fn prepare(
     Ok(path)
 }
 
+/// Package a restricted executable file into a temporary ZIP level-0 (Stored) archive
+/// named `<original_name>.zip` for EEXC upload; caller holds the temp file until upload completes.
+pub(crate) fn create_eecx(
+    source: &Path,
+    directory: &Path,
+) -> Result<(tempfile::NamedTempFile, String)> {
+    let name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("Tên tệp không hợp lệ")?;
+    let archive = create(source, directory)?;
+    Ok((archive, format!("{name}.zip")))
+}
+
 fn create(source: &Path, directory: &Path) -> Result<tempfile::NamedTempFile> {
     let mut input = std::fs::File::open(source).context("Không mở được tệp gốc")?;
     let metadata = input.metadata()?;
@@ -71,7 +85,13 @@ fn create(source: &Path, directory: &Path) -> Result<tempfile::NamedTempFile> {
         after.len() == metadata.len() && after.modified().ok() == metadata.modified().ok(),
         "Tệp gốc đã thay đổi trong khi tạo ZIP"
     );
-    archive.finish()?.sync_all()?;
+    let finished_file = archive.finish()?;
+    finished_file.sync_all()?;
+    let final_len = output.as_file().metadata()?.len();
+    ensure!(
+        final_len <= crate::upload::MAX_UPLOAD_BYTES,
+        "Kích thước gói ZIP sau đóng gói vượt giới hạn tải lên"
+    );
     Ok(output)
 }
 
@@ -109,5 +129,37 @@ mod tests {
             .await
             .is_err());
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn create_eecx_produces_level0_stored_zip_with_single_entry_unicode_multidot_and_temp_cleanup()
+    {
+        let root = tempfile::tempdir().unwrap();
+        let temp_dir = root.path().join("temp");
+        let source = root.path().join("Báo cáo.tar.gz.exe");
+        let payload = b"MZ-eecx-payload-\x00\x01\x02\xff-end";
+        std::fs::write(&source, payload).unwrap();
+
+        let temp_zip_path = {
+            let (archive, archive_name) = create_eecx(&source, &temp_dir).unwrap();
+            assert_eq!(archive_name, "Báo cáo.tar.gz.exe.zip");
+            let archive_path = archive.path().to_path_buf();
+            assert!(archive_path.starts_with(&temp_dir));
+
+            let mut zip =
+                zip::ZipArchive::new(std::fs::File::open(&archive_path).unwrap()).unwrap();
+            assert_eq!(zip.len(), 1);
+            let mut entry = zip.by_index(0).unwrap();
+            assert_eq!(entry.name(), "Báo cáo.tar.gz.exe");
+            assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+            let mut unpacked = Vec::new();
+            entry.read_to_end(&mut unpacked).unwrap();
+            assert_eq!(unpacked, payload);
+            archive_path
+        };
+
+        // Temp archive cleaned up automatically on drop; original user file stays intact.
+        assert!(!temp_zip_path.exists());
+        assert_eq!(std::fs::read(&source).unwrap(), payload);
     }
 }

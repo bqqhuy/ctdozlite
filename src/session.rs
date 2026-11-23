@@ -22,10 +22,11 @@ struct AccountWriteState {
     writers: usize,
     closing: usize,
     sealed: bool,
+    owner: Option<std::thread::ThreadId>,
 }
 
-/// Session-generation admission gate for blocking local writes.
-/// Clones share it; logout seals it before installing a fresh runtime gate.
+/// Session-generation admission and serialization gate for account-local writes.
+/// Serializes concurrent writers per runtime; logout seals it before installing a fresh gate.
 #[derive(Default)]
 struct AccountWriteGate {
     state: std::sync::Mutex<AccountWriteState>,
@@ -53,25 +54,39 @@ impl Drop for AccountWritePermit {
         let mut state = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
         state.writers -= 1;
         if state.writers == 0 {
+            state.owner = None;
             self.gate.changed.notify_all();
         }
     }
 }
 
 impl AccountWriteGate {
-    fn admit(self: &Arc<Self>, active: bool) -> anyhow::Result<AccountWritePermit> {
+    fn admit(self: &Arc<Self>, active: &AtomicBool) -> anyhow::Result<AccountWritePermit> {
+        let current = std::thread::current().id();
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        anyhow::ensure!(
-            active && !state.sealed && state.closing == 0,
-            "Account runtime is closed for writes"
-        );
-        state.writers += 1;
-        Ok(AccountWritePermit { gate: self.clone() })
+        loop {
+            anyhow::ensure!(
+                active.load(Ordering::SeqCst) && !state.sealed && state.closing == 0,
+                "Account runtime is closed for writes"
+            );
+            if state.writers == 0 {
+                state.writers = 1;
+                state.owner = Some(current);
+                return Ok(AccountWritePermit { gate: self.clone() });
+            }
+            anyhow::ensure!(
+                state.owner != Some(current),
+                "Re-entrant AccountWritePermit acquisition on the same thread"
+            );
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     fn begin_close(self: &Arc<Self>) -> AccountWriteBarrier {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closing += 1;
+        // Wake waiting writers so they abort immediately rather than stalling on the active writer.
+        self.changed.notify_all();
         AccountWriteBarrier {
             _gate: self.clone(),
         }
@@ -353,6 +368,10 @@ impl Domains {
         self.conversation = self.convers_api.clone();
     }
 }
+pub(crate) fn trusted_service_url_str(value: &str) -> bool {
+    trusted_service_url(value)
+}
+
 pub(crate) fn trusted_service_url(value: &str) -> bool {
     reqwest::Url::parse(value)
         .map(|url| {
@@ -540,6 +559,7 @@ pub struct Session {
     /// Permission generations reject metadata fetched before an invalidating control.
     pub group_revision: Arc<std::sync::atomic::AtomicU64>,
     pub composer_config: Option<crate::composer_config::ComposerConfig>,
+    pub server_config: crate::server_config::ServerConfig,
     account_write_gate: Arc<AccountWriteGate>,
     active: Arc<AtomicBool>,
     pub http: Client,
@@ -643,6 +663,7 @@ impl Session {
             inbox_policy: Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default())),
             group_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             composer_config: None,
+            server_config: crate::server_config::ServerConfig::default(),
             account_write_gate: Arc::new(AccountWriteGate::default()),
             active: Arc::new(AtomicBool::new(true)),
             http,
@@ -935,6 +956,7 @@ impl Session {
         self.active = Arc::new(AtomicBool::new(true));
         self.runtime_generation = next_runtime_generation();
         self.composer_config = None;
+        self.server_config = crate::server_config::ServerConfig::default();
         self.login = None;
         self.hidden = Arc::new(crate::hidden_chat::Vault::default());
         self.inbox_policy = Arc::new(std::sync::RwLock::new(crate::inbox::Policy::default()));
@@ -988,9 +1010,9 @@ impl Session {
     }
 
     /// Acquire inside the blocking closure, immediately before touching account-local storage.
-    /// Keep the returned permit alive until every SQLite/cache write in that closure is done.
+    /// Serializes concurrent writers per runtime; keep alive until every SQLite/cache write in that closure is done.
     pub(crate) fn begin_account_write_blocking(&self) -> anyhow::Result<AccountWritePermit> {
-        self.account_write_gate.admit(self.is_active())
+        self.account_write_gate.admit(&self.active)
     }
 
     /// Close admission, then wait off the Tokio worker until admitted writes finish.
@@ -1082,7 +1104,6 @@ impl Session {
 
     /// Load a previously saved session from disk and restore cookies, keys, and endpoints.
     pub fn load_from_file(&mut self, path: &str) -> Result<()> {
-        use base64::Engine;
         if !crate::storage::remember_login()? {
             crate::storage::remove_session()?;
             anyhow::bail!("Remember login is disabled");
@@ -1110,8 +1131,20 @@ impl Session {
         }
         let bytes = std::fs::read(crate::storage::session_path(path))?;
         let text = crate::storage::unprotect(&bytes)?;
-        let saved: SavedSession = serde_json::from_slice(&text)?;
+        self.apply_loaded_session_bytes(&text)?;
+
+        if path == "session.json" {
+            crate::storage::mark_session_file_runtime(self.runtime_id());
+        }
+
+        Ok(())
+    }
+
+    fn apply_loaded_session_bytes(&mut self, text: &[u8]) -> Result<()> {
+        use base64::Engine;
+        let saved: SavedSession = serde_json::from_slice(text)?;
         self.composer_config = None;
+        self.server_config = crate::server_config::ServerConfig::default();
 
         self.link_preview_cache
             .lock()
@@ -1183,11 +1216,6 @@ impl Session {
             self.login = None;
             anyhow::bail!("session.json thiếu mã xác thực zpw_sek");
         }
-
-        if path == "session.json" {
-            crate::storage::mark_session_file_runtime(self.runtime_id());
-        }
-
         Ok(())
     }
 
@@ -1263,12 +1291,33 @@ impl Session {
         format!("params={}", urlencode(&v.to_string()))
     }
 
-    /// Re-apply the endpoint table from a `getServerInfo` / `getLoginInfo` payload.
-    ///
-    /// [O] `setEndpoints(chts, ctrs, serviceMapNew, conf, ws)`:
-    /// `zpw_chts_new` → chat, `zpw_ctrs_new` → conversation,
-    /// `zpw_service_map_new.{friend,conversation,profile,group,file}` → the rest.
-    pub fn apply_server_info(&mut self, data: &Value) {
+    /// Rewrite a media/file download URL according to the active `download_domains_swap` policy.
+    pub fn rewrite_download_url(&self, raw: &str) -> String {
+        self.server_config.download_domains_swap.rewrite_url(raw)
+    }
+
+    /// Re-apply the endpoint table and all remote server config groups from a
+    /// `getServerInfo` / `getLoginInfo` payload (either full `{error_code, data}` or unwrapped `data`).
+    pub fn apply_server_info(&mut self, payload: &Value) {
+        if let Some(code) = payload.get("error_code") {
+            if crate::api_response::integer(code) != Some(0) {
+                return;
+            }
+        }
+        let data = payload.get("data").unwrap_or(payload);
+        self.server_config.apply_payload(payload);
+        if let Some(cfg) = crate::composer_config::ComposerConfig::from_server_info(payload)
+            .or_else(|| crate::composer_config::ComposerConfig::from_login_config(data))
+            .or_else(|| {
+                data.pointer("/setttings/features/zcinput")
+                    .or_else(|| data.pointer("/settings/features/zcinput"))
+                    .or_else(|| data.pointer("/config/settings/features/zcinput"))
+                    .and_then(crate::composer_config::ComposerConfig::from_value)
+            })
+        {
+            self.composer_config = Some(cfg);
+        }
+
         fn first(v: &Value) -> Option<String> {
             v.as_array()
                 .and_then(|a| a.first())
@@ -3105,5 +3154,237 @@ mod runtime_generation_tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_account_writers_are_serialized() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let session = Session::new(false, false, false).unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = session.clone();
+            let active = active.clone();
+            let max_seen = max_seen.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let _permit = s.begin_account_write_blocking().unwrap();
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        assert_eq!(max_seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_writer_aborts_immediately_when_account_closes() {
+        let session = Session::new(false, false, false).unwrap();
+        let first_session = session.clone();
+        let second_session = session.clone();
+        let closing_session = session.clone();
+        let gate = session.account_write_gate.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let first = tokio::task::spawn_blocking(move || {
+            let _permit = first_session.begin_account_write_blocking().unwrap();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.recv().unwrap();
+
+        let (queued_tx, queued_rx) = std::sync::mpsc::channel();
+        let second = tokio::task::spawn_blocking(move || {
+            queued_tx.send(()).unwrap();
+            second_session.begin_account_write_blocking().map(|_| ())
+        });
+        queued_rx.recv().unwrap();
+        // Give the queued blocking task a moment to enter the condvar wait.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let close =
+            tokio::spawn(async move { closing_session.close_account_writes().await.unwrap() });
+        loop {
+            if gate.state.lock().unwrap().closing != 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // Queued writer must abort immediately without waiting for the active writer.
+        let second_result = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second_result.is_err());
+        assert!(!close.is_finished());
+
+        release_tx.send(()).unwrap();
+        first.await.unwrap();
+        let barrier = close.await.unwrap();
+        drop(barrier);
+    }
+
+    #[test]
+    fn reentrant_account_write_permit_on_same_thread_is_rejected() {
+        let session = Session::new(false, false, false).unwrap();
+        let _first = session.begin_account_write_blocking().unwrap();
+        let second = session.begin_account_write_blocking();
+        assert!(second.is_err());
+    }
+
+    #[test]
+    fn apply_server_info_updates_all_8_groups_and_logout_resets_to_defaults() {
+        let mut session = Session::new(false, false, false).unwrap();
+        assert_eq!(
+            session.server_config,
+            crate::server_config::ServerConfig::default()
+        );
+
+        session.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "zpw_service_map_v3": {
+                    "alias": ["https://alias-v2.zalo.me"]
+                },
+                "setttings": {
+                    "features": {
+                        "enable_encrypt_param": false,
+                        "enable_feature_alias_v2": true,
+                        "zcinput": {
+                            "version": 1,
+                            "behavior": { "inputMaxLines": 8 },
+                            "style": { "lineHeight": 24 }
+                        },
+                        "sharefile": {
+                            "enable_file_eecx": true,
+                            "restricted_ext_file": ["exe", "msi"]
+                        },
+                        "download_domains_swap": {
+                            "enabled": true,
+                            "domains_map": { "f1.zdn.vn": "f2.zdn.vn" },
+                            "mode": 2
+                        },
+                        "sync_2_pc": {
+                            "enable_auto_request_sync_on_log_in_new_device": true,
+                            "sync_suggestion_zalopc": true,
+                            "max_number_of_concurrent_sync_items": 6
+                        },
+                        "o2o": {
+                            "keep_loading_during_preload": {
+                                "enable": true,
+                                "timeout_duration_ms": 1500,
+                                "screen_dismiss_delay_ms": 300
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        assert!(!session.server_config.enable_encrypt_param);
+        assert!(session.server_config.enable_feature_alias_v2);
+        assert_eq!(session.server_config.zcinput.rich_max_lines, 8.0);
+        assert_eq!(session.composer_config.map(|c| c.line_height), Some(24.0));
+        assert!(session.server_config.file_eecx.should_wrap_eecx("msi"));
+        assert_eq!(
+            session.rewrite_download_url("https://f1.zdn.vn/a/b.png?sig=1"),
+            "https://f2.zdn.vn/a/b.png?sig=1"
+        );
+        assert_eq!(session.server_config.sync_2_pc.max_concurrent_sync_items, 6);
+        assert!(session.server_config.o2o.keep_loading_during_preload.enable);
+        assert_eq!(
+            session
+                .server_config
+                .o2o
+                .keep_loading_during_preload
+                .timeout_duration_ms,
+            1500
+        );
+        assert_eq!(session.server_config.revision, 1);
+
+        session.logout();
+        assert_eq!(
+            session.server_config,
+            crate::server_config::ServerConfig::default()
+        );
+        assert_eq!(session.composer_config, None);
+        assert_eq!(
+            session.rewrite_download_url("https://f1.zdn.vn/a/b.png?sig=1"),
+            "https://f1.zdn.vn/a/b.png?sig=1"
+        );
+    }
+
+    #[test]
+    fn load_from_file_resets_server_and_composer_config_to_defaults() {
+        let mut session = Session::new(false, false, false).unwrap();
+        session.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "setttings": {
+                    "features": {
+                        "enable_encrypt_param": false,
+                        "enable_feature_alias_v2": true,
+                        "zcinput": {
+                            "version": 1,
+                            "behavior": { "inputMaxLines": 6 },
+                            "style": { "lineHeight": 20 }
+                        },
+                        "download_domains_swap": {
+                            "enabled": true,
+                            "domains_map": { "f1.zdn.vn": "f2.zdn.vn" },
+                            "mode": 1
+                        }
+                    }
+                }
+            }
+        }));
+        assert!(!session.server_config.enable_encrypt_param);
+        assert!(session.server_config.enable_feature_alias_v2);
+        assert!(session.composer_config.is_some());
+
+        let saved = SavedSession {
+            imei: session.imei.clone(),
+            computer_name: session.computer_name.clone(),
+            secret_key_b64: None,
+            session_key: None,
+            zpw_sek: Some("restored-sek".into()),
+            login: Some(LoginInfo {
+                uin: "2002".into(),
+                zpw_enk: String::new(),
+                zpw_sek: "restored-sek".into(),
+                display_name: "Restored".into(),
+                send2me_id: String::new(),
+                avatar: String::new(),
+            }),
+            domains: Domains::default(),
+        };
+        let bytes = serde_json::to_vec(&saved).unwrap();
+        if crate::storage::remember_login().unwrap_or(false) {
+            let dir = tempfile::tempdir().unwrap();
+            let session_file = dir.path().join("custom_session.dat");
+            let protected = crate::storage::protect(&bytes).unwrap();
+            std::fs::write(&session_file, protected).unwrap();
+            session
+                .load_from_file(session_file.to_str().unwrap())
+                .unwrap();
+        } else {
+            session.apply_loaded_session_bytes(&bytes).unwrap();
+        }
+
+        assert_eq!(session.account_key(), "2002");
+        assert_eq!(
+            session.server_config,
+            crate::server_config::ServerConfig::default()
+        );
+        assert_eq!(session.composer_config, None);
+        assert_eq!(
+            session.rewrite_download_url("https://f1.zdn.vn/a/b.png?sig=1"),
+            "https://f1.zdn.vn/a/b.png?sig=1"
+        );
     }
 }

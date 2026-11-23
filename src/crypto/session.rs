@@ -400,9 +400,20 @@ impl E2eeManager {
             "Thiếu định danh tin E2EE"
         );
         let hash = Sha256::digest(payload);
-        let tx = self.conn.unchecked_transaction()?;
-        let previous = tx.query_row("SELECT payload_hash,plaintext_enc,identity_changed FROM e2ee_received WHERE profile_id=?1 AND peer_id=?2 AND message_id=?3",
-            params![self.profile_id,peer_id,message_id], |row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,bool>(2)?))).optional()?;
+        let previous = self
+            .conn
+            .query_row(
+                "SELECT payload_hash,plaintext_enc,identity_changed FROM e2ee_received WHERE profile_id=?1 AND peer_id=?2 AND message_id=?3",
+                params![self.profile_id, peer_id, message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
         if let Some((previous_hash, protected, changed)) = previous {
             anyhow::ensure!(
                 previous_hash.as_slice() == hash.as_slice(),
@@ -414,6 +425,7 @@ impl E2eeManager {
                 identity_changed: changed,
             });
         }
+        let tx = self.conn.unchecked_transaction()?;
         let message = self.decrypt_core(peer_id, payload)?;
         let protected = crate::storage::protect(message.text.as_bytes())?;
         let path = crate::e2ee_integration::history_key(&crate::storage::account_file(

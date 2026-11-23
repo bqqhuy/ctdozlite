@@ -713,6 +713,7 @@ pub fn import_history(
     );
     let tx = store.conn.unchecked_transaction()?;
     let mut inserted = 0;
+    let mut recalled = Vec::new();
     for path in paths {
         ensure!(active(), "Đã dừng nhập vì tài khoản đã đăng xuất");
         let meta = path.symlink_metadata()?;
@@ -792,7 +793,7 @@ pub fn import_history(
                     last_ts: ts,
                     last_read_msg_id: String::new(),
                 })?;
-                inserted += import_message(store, &thread_id, m)?;
+                inserted += import_message(store, &thread_id, m, &mut recalled)?;
             }
         } else {
             ensure!(
@@ -816,16 +817,22 @@ pub fn import_history(
                     last_read_msg_id: thread.unread.last_seen_id.clone().unwrap_or_default(),
                 })?;
                 for message in thread.messages {
-                    inserted += import_message(store, &thread.id, message)?;
+                    inserted += import_message(store, &thread.id, message, &mut recalled)?;
                 }
             }
         }
     }
     ensure!(active(), "Đã đăng xuất");
     tx.commit()?;
+    store.purge_recalled_e2ee(&recalled)?;
     Ok(inserted)
 }
-fn import_message(store: &MessageStore, thread: &str, mut message: ChatMessage) -> Result<usize> {
+fn import_message(
+    store: &MessageStore,
+    thread: &str,
+    mut message: ChatMessage,
+    recalled: &mut Vec<(String, String)>,
+) -> Result<usize> {
     ensure!(
         !thread.is_empty()
             && !message.id.is_empty()
@@ -843,7 +850,9 @@ fn import_message(store: &MessageStore, thread: &str, mut message: ChatMessage) 
     let mut sm = crate::store::StoredMessage::from(&message);
     sm.thread_id = thread.into();
     store.reconcile_send_identity(&message, &mut sm)?;
-    Ok(usize::from(store.upsert_message(&sm)?))
+    Ok(usize::from(
+        store.upsert_message_collecting_recalled(&sm, Some(recalled))?,
+    ))
 }
 
 #[cfg(test)]

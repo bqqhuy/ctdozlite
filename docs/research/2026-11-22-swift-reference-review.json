@@ -1,0 +1,91 @@
+{
+  "date": "2026-11-22",
+  "source_repository": "https://github.com/qnguyen3/zalo-swift-re",
+  "commit": "c81437e7614ec77e96a005c72bd00ecd4108074b",
+  "source_type": "Third-party implementation and reverse-engineering notes, not an E1 ZaloLite capture.",
+  "official_runtime_version_in_source": "macOS PC 26.10.20; compared selectively to Windows PC26.11.12.",
+  "method": "Read source only; no scripts, app, Swift tests or live login executed.",
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "666db33566cccf4d5413ab9d70477a4e6b92254a71ee088c34dd0b9db1a64104",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/README.md"
+    },
+    {
+      "path": "REVERSE-ENGINEERING-NOTES.md",
+      "sha256": "93463dcf5d4841f16b3dac379ef826e9c3e62c34e293f5bfea65f4ad11a8b6cb",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/REVERSE-ENGINEERING-NOTES.md"
+    },
+    {
+      "path": "reanalysis/bridge-spec.md",
+      "sha256": "abce4086b809a48cca99e293b2d5d34b530847cf5b5eed0d5455096060083888",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/reanalysis/bridge-spec.md"
+    },
+    {
+      "path": "Sources/Olaz/HostScripts/transfer-adapter.js",
+      "sha256": "bfcc39bfa050a247f4a57670658581aa66e7450698d0799a48991578b9fee3c5",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Sources/Olaz/HostScripts/transfer-adapter.js"
+    },
+    {
+      "path": "Sources/Olaz/ZaloRuntime/SharedWorkerRouter.swift",
+      "sha256": "65d5d936798d83f34a05a64f6d0f98744cded7d8cce38e8048027aca19ea1dbd",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Sources/Olaz/ZaloRuntime/SharedWorkerRouter.swift"
+    },
+    {
+      "path": "Sources/Olaz/ZaloRuntime/SQLiteHost.swift",
+      "sha256": "bc7d19fdf78c9cd6e92fe9be5c651445943e146c709133204fd89c5560c1f66f",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Sources/Olaz/ZaloRuntime/SQLiteHost.swift"
+    },
+    {
+      "path": "Sources/Olaz/ZaloRuntime/ZaloEngine+Transfer.swift",
+      "sha256": "a06d4f67cfe36894c2f56200ecf7abe02165d9db4254ddc3e23868429054ee16",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Sources/Olaz/ZaloRuntime/ZaloEngine+Transfer.swift"
+    },
+    {
+      "path": "Tests/OlazTests/SyncGlobalIdPatchTests.swift",
+      "sha256": "440c26870d803333a642fb49588cb214074b352c3c0da0bc17d03a89c1d36412",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Tests/OlazTests/SyncGlobalIdPatchTests.swift"
+    },
+    {
+      "path": "Tests/OlazTests/SQLiteHostTests.swift",
+      "sha256": "cd2565d4f1e32ceca83288140bddd2e282bb4b953b97839f05d44b9402566715",
+      "permalink": "https://github.com/qnguyen3/zalo-swift-re/blob/c81437e7614ec77e96a005c72bd00ecd4108074b/Tests/OlazTests/SQLiteHostTests.swift"
+    }
+  ],
+  "native_crosschecks": [
+    {
+      "file": "main-dist/main.js",
+      "marker": "handleRecoverRemoteConfig(e){",
+      "codepoint_offset": 3176473,
+      "finding": "Replays last remote configuration to worker after did-finish-load."
+    },
+    {
+      "file": "pc-dist/lazy/main-startup.41abf8e6af2a55551e3b.js",
+      "marker": "lI.oneToOnePCNoised2gNoised=",
+      "codepoint_offset": 832212,
+      "finding": "PC-to-global one-to-one ID resolution uses getGlobalIdsFromUserIds with retry; Olaz fallback is an explicit external fork deviation."
+    },
+    {
+      "file": "pc-dist/compact-app-pc.0cd2e653e67efaa4bf4b.js",
+      "marker": "getGlobalIdFromServer",
+      "codepoint_offset": 19786136,
+      "finding": "Separate native global-ID service exists. Full request contract and applicability must be verified before any new fork request."
+    }
+  ],
+  "plan_additions": [
+    "Replay correct config snapshot after worker late start/restart; terminate old pending work.",
+    "Separate startup readiness from manual sync availability, with reason and worker-side recheck.",
+    "Resume tests with missing mini-profile/global-noised-ID mappings and loss of in-memory caches.",
+    "Separate range progress from imported-message activity and durable commit metrics.",
+    "Reject stale banner actions using operation/runtime/state revision, not phase alone.",
+    "Test per-database ownership, concurrent opens, migration single-flight and rollback."
+  ],
+  "do_not_transplant": [
+    "WKWebView/headless renderer/Electron bridge into native Rust product.",
+    "Olaz custom progress estimates, silent-source set and display timers as native UI requirements.",
+    "gid/encrypt fallback without native contract and ownership verification.",
+    "Broad UNIQUE error suppression or unverified fixed DB flush interval.",
+    "Hardcoded enum values/module IDs from another platform/version."
+  ],
+  "validation": "JSON parse, local link check and git diff --check; no product code changes or device acceptance in this research turn."
+}

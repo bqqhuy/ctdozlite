@@ -844,6 +844,11 @@ impl ZaloGuiApp {
         self.phone_sync_status.clear();
         self.phone_download_status.clear();
         self.phone_import_status.clear();
+        self.sync_state = crate::sync_coordinator::SyncState::default();
+        self.sync_operation_id = 0;
+        self.sync_state_revision = 0;
+        self.sync_suggest_dismissed = false;
+        self.sync_error_dismissed = false;
         self.history_sync_running = false;
         self.history_sync_status.clear();
         self.refresh_sync_running = false;
@@ -870,125 +875,157 @@ impl ZaloGuiApp {
         }
     }
 
+    pub(crate) fn handle_sync_banner_action(
+        &mut self,
+        action: crate::gui::sync_banner::SyncBannerAction,
+        fencing: crate::gui::sync_banner::SyncBannerFencing,
+    ) -> bool {
+        // Fencing Protection (Invariant 4)
+        if !fencing.is_valid(
+            &self.user_uin,
+            self.account_runtime_id as u64,
+            self.sync_state_revision,
+        ) {
+            return false;
+        }
+
+        match action {
+            crate::gui::sync_banner::SyncBannerAction::StartSuggestSync => {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                    });
+                }
+                self.phone_sync_running = true;
+                self.sync_cancel_requested = false;
+                self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                true
+            }
+            crate::gui::sync_banner::SyncBannerAction::RetryFailedSync => {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                    });
+                }
+                self.phone_sync_running = true;
+                self.sync_cancel_requested = false;
+                self.sync_error_dismissed = false;
+                self.sync_state = crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Recent,
+                };
+                self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                true
+            }
+            crate::gui::sync_banner::SyncBannerAction::CancelSync => {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::CancelPhoneHistoryFenced {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        operation_id: self.sync_operation_id,
+                    });
+                }
+                self.sync_cancel_requested = true;
+                self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                true
+            }
+            crate::gui::sync_banner::SyncBannerAction::DismissOrClose => {
+                if matches!(
+                    self.sync_state,
+                    crate::sync_coordinator::SyncState::Failed { .. }
+                ) {
+                    // When Error: clearErrorAndHideAllUI
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::ClearSyncError {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                        });
+                    }
+                    self.sync_error_dismissed = true;
+                    self.sync_state = crate::sync_coordinator::SyncState::Idle {
+                        availability: crate::sync_coordinator::SyncAvailability::Ready,
+                    };
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    true
+                } else if self.phone_sync_running
+                    || self.history_sync_running
+                    || self.sync_state.is_running()
+                    || matches!(
+                        self.sync_state,
+                        crate::sync_coordinator::SyncState::Interrupted { .. }
+                    )
+                {
+                    // When Running / Interrupted: cancelSync
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::CancelPhoneHistoryFenced {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            operation_id: self.sync_operation_id,
+                        });
+                    }
+                    self.sync_cancel_requested = true;
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    true
+                } else if self.sync_success_until.is_some() {
+                    // When Success: hide immediately
+                    self.sync_success_until = None;
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    true
+                } else {
+                    // When Suggest: closeSuggestNewSyncBanner
+                    self.sync_suggest_dismissed = true;
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    true
+                }
+            }
+        }
+    }
+
     fn render_sync_banner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, pal: &ThemePalette) {
-        let running =
+        let popup_visible = self.is_workspace_input_gated(ctx);
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new(
+            self.user_uin.clone(),
+            self.account_runtime_id as u64,
+            self.sync_operation_id,
+            self.sync_state_revision,
+        );
+
+        let legacy_running =
             self.phone_sync_running || self.history_sync_running || self.refresh_sync_running;
-        let success_visible = self
-            .sync_success_until
-            .is_some_and(|deadline| std::time::Instant::now() < deadline);
-        let success_completed = self.sync_success_until.is_some();
-        if !running && success_completed && !success_visible {
-            return;
-        }
-        if !self.is_logged_in
-            || self.sync_notice_dismissed
-            || (!running
-                && (self.sync_notice_dismissed
-                    || (self.sync_status_message().is_empty() && !success_completed)))
-        {
-            return;
-        }
-        if !running && success_visible {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-
-        let phone = self.phone_sync_running
-            || (!self.phone_sync_status.is_empty()
-                && !self.history_sync_running
-                && !self.refresh_sync_running);
-        let detail = if phone && !self.phone_download_status.is_empty() {
-            self.phone_download_status.clone()
+        let legacy_detail = if self.phone_sync_running && !self.phone_download_status.is_empty() {
+            Some(self.phone_download_status.as_str())
+        } else if !self.sync_status_message().is_empty() {
+            Some(self.sync_status_message())
         } else {
-            self.sync_status_message().to_owned()
-        };
-        let (fill, status) = if success_visible && !running {
-            (
-                Color32::from_rgb(225, 245, 234),
-                "Đồng bộ thành công".to_owned(),
-            )
-        } else if running {
-            (Color32::from_rgb(230, 242, 255), detail)
-        } else {
-            (Color32::from_rgb(255, 241, 222), detail)
+            None
         };
 
-        // Use an opaque palette surface so the status remains legible in dark mode.
-        let banner_fill = if pal.is_dark { pal.bg_elevated } else { fill };
-        egui::Frame::none()
-            .fill(banner_fill)
-            .rounding(Rounding::same(6.0))
-            .inner_margin(Margin::symmetric(8.0, 5.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let show_cancel = self.phone_sync_running || self.history_sync_running;
-                    let action_width = 56.0 + 24.0 + if show_cancel { 76.0 } else { 0.0 };
-                    let label_width = (ui.available_width() - action_width - 36.0).max(1.0);
-                    if running {
-                        ui.spinner();
-                    } else if success_visible {
-                        ui.label("✓");
-                    } else {
-                        ui.label("⚠");
-                    }
-                    let label = ui.add_sized(
-                        Vec2::new(label_width, 20.0),
-                        egui::Label::new(RichText::new(&status).size(11.5).color(pal.text_primary))
-                            .truncate(),
-                    );
-                    label.on_hover_text(status.as_str());
+        let banner_input = crate::gui::sync_banner::SyncBannerInput {
+            is_logged_in: self.is_logged_in,
+            popup_visible,
+            suggest_dismissed: self.sync_suggest_dismissed,
+            error_dismissed: self.sync_error_dismissed,
+            success_until: self.sync_success_until,
+            legacy_running,
+            legacy_detail,
+        };
+        let banner_state =
+            crate::gui::sync_banner::resolve_banner_state(&banner_input, &self.sync_state);
 
-                    if show_cancel
-                        && ui
-                            .add_enabled(
-                                !self.sync_cancel_requested,
-                                egui::Button::new(if self.sync_cancel_requested {
-                                    "Đang dừng…"
-                                } else {
-                                    "Dừng"
-                                })
-                                .small(),
-                            )
-                            .clicked()
-                    {
-                        if let Some(tx) = WORKER_TX.get() {
-                            let command = if self.phone_sync_running {
-                                WorkerCmd::CancelPhoneHistory
-                            } else {
-                                WorkerCmd::CancelHistorySync
-                            };
-                            if tx.send(command).is_ok() {
-                                self.sync_cancel_requested = true;
-                            }
-                        }
-                    }
-                    if ui
-                        .button(crate::i18n::tr("Chi tiết"))
-                        .on_hover_text("Mở trạng thái đồng bộ chi tiết")
-                        .clicked()
-                    {
-                        self.settings_tab = SettingsTab::Sync;
-                        self.settings_modal_open = true;
-                    }
-                    if ui
-                        .small_button(lucide::X)
-                        .on_hover_text(crate::i18n::tr("Ẩn thông báo"))
-                        .clicked()
-                    {
-                        self.sync_notice_dismissed = true;
-                    }
-                });
-            });
-        if phone && !self.phone_import_status.is_empty() && running {
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&self.phone_import_status)
-                        .size(10.5)
-                        .color(pal.text_secondary),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&self.phone_import_status);
+        let Some(kind) = banner_state else {
+            return;
+        };
+
+        if let Some(action) = crate::gui::sync_banner::render_sync_banner(
+            ui,
+            ctx,
+            pal,
+            &kind,
+            &fencing,
+            self.sync_cancel_requested,
+        ) {
+            self.handle_sync_banner_action(action, fencing);
         }
     }
 
@@ -1501,15 +1538,6 @@ impl ZaloGuiApp {
                 let ui = &mut content_ui;
                 if modal_open {
                     ui.style_mut().interaction.tooltip_delay = 86_400.0;
-                }
-                if !is_narrow_w {
-                    let top = ui.next_widget_position();
-                    let mut banner_ui = ui.new_child(egui::UiBuilder::new()
-                        .id_salt("sidebar_sync_section")
-                        .max_rect(Rect::from_min_max(top, Pos2::new(bounds.right(), bounds.bottom()))));
-                    self.render_sync_banner(&mut banner_ui, ctx, pal);
-                    ui.advance_cursor_after_rect(Rect::from_min_size(top, Vec2::new(bounds.width(), banner_ui.min_rect().height())));
-                    ui.add_space(6.0);
                 }
                 let header_top = ui.next_widget_position();
                 let mut header_ui = ui.new_child(egui::UiBuilder::new()
@@ -2144,6 +2172,20 @@ impl ZaloGuiApp {
                 let mut report_target = None;
                 let mut clicked_thread: Option<(usize, String, bool)> = None;
                 let mut mention_target: Option<(String, String)> = None;
+
+                // Sync Banner V2 placement: below filter tabs and directly ABOVE thread list scroll area
+                let banner_top = ui.next_widget_position();
+                let mut banner_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("sidebar_sync_section_v2")
+                        .max_rect(Rect::from_min_max(banner_top, Pos2::new(bounds.right(), bounds.bottom()))),
+                );
+                self.render_sync_banner(&mut banner_ui, ctx, pal);
+                let banner_h = banner_ui.min_rect().height();
+                if banner_h > 0.0 {
+                    ui.advance_cursor_after_rect(Rect::from_min_size(banner_top, Vec2::new(bounds.width(), banner_h)));
+                    ui.add_space(4.0);
+                }
 
                 let row_height = if is_narrow_w { 50.0 } else { 58.0 };
                 egui::ScrollArea::vertical()
@@ -5597,6 +5639,13 @@ impl ZaloGuiApp {
             self.common_groups_expanded = false;
         }
         self.selected_thread_index = idx;
+        if let Some(tx) = WORKER_TX.get() {
+            let _ = tx.send(WorkerCmd::PrioritizeConversationSync {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                thread_id: tid.clone(),
+            });
+        }
         self.refresh_message_pins(&tid, is_group);
         if is_group {
             if let Some(tx) = WORKER_TX.get() {
@@ -12032,5 +12081,268 @@ mod tests {
         assert_eq!(app.threads[0].unread.mention_ids.len(), 1);
         assert!(!app.threads[0].unread.mention_ids.contains("m-mention-1"));
         assert!(app.threads[0].unread.mention_ids.contains("m-mention-2"));
+    }
+
+    fn test_app_and_context() -> (ZaloGuiApp, egui::Context) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.is_logged_in = true;
+        (app, ctx)
+    }
+
+    #[test]
+    fn sync_banner_fencing_protection_and_stale_rejection() {
+        let (mut app, _ctx) = test_app_and_context();
+        app.is_logged_in = true;
+        app.user_uin = "user_abc".into();
+        app.account_runtime_id = 42;
+        app.sync_operation_id = 100;
+        app.sync_state_revision = 5;
+
+        let valid_fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_abc", 42, 100, 5);
+        let stale_owner = crate::gui::sync_banner::SyncBannerFencing::new("user_xyz", 42, 100, 5);
+        let stale_runtime = crate::gui::sync_banner::SyncBannerFencing::new("user_abc", 43, 100, 5);
+        let stale_revision =
+            crate::gui::sync_banner::SyncBannerFencing::new("user_abc", 42, 100, 4);
+
+        // Stale owner rejected
+        assert!(!app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::StartSuggestSync,
+            stale_owner
+        ));
+        // Stale runtime rejected
+        assert!(!app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::StartSuggestSync,
+            stale_runtime
+        ));
+        // Stale revision rejected
+        assert!(!app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::StartSuggestSync,
+            stale_revision
+        ));
+
+        // Valid fencing advances state revision
+        let rev_before = app.sync_state_revision;
+        assert!(app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::StartSuggestSync,
+            valid_fencing
+        ));
+        assert_eq!(app.sync_state_revision, rev_before + 1);
+        assert!(app.phone_sync_running);
+    }
+
+    #[test]
+    fn sync_banner_dismiss_or_close_classification() {
+        let (mut app, _ctx) = test_app_and_context();
+        app.is_logged_in = true;
+        app.user_uin = "user_test".into();
+        app.account_runtime_id = 1;
+
+        // 1. In Error state: close clears error and resets to Idle
+        app.sync_state = crate::sync_coordinator::SyncState::Failed {
+            error: "Lỗi mạng".into(),
+            fatal: false,
+        };
+        app.sync_state_revision = 1;
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 0, 1);
+        assert!(app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::DismissOrClose,
+            fencing
+        ));
+        assert!(app.sync_error_dismissed);
+        assert!(matches!(
+            app.sync_state,
+            crate::sync_coordinator::SyncState::Idle { .. }
+        ));
+
+        // 2. In Running state: close requests cancellation
+        app.sync_state = crate::sync_coordinator::SyncState::Preparing {
+            source: crate::sync_coordinator::SyncSource::Sync2Full,
+        };
+        app.sync_cancel_requested = false;
+        app.sync_state_revision = 2;
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 0, 2);
+        assert!(app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::DismissOrClose,
+            fencing
+        ));
+        assert!(app.sync_cancel_requested);
+
+        // 3. In Success state: close clears success timer immediately
+        app.sync_state = crate::sync_coordinator::SyncState::Completed {
+            inserted_messages: 10,
+            duration: std::time::Duration::from_secs(1),
+        };
+        app.sync_success_until =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        app.sync_state_revision = 3;
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 0, 3);
+        assert!(app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::DismissOrClose,
+            fencing
+        ));
+        assert_eq!(app.sync_success_until, None);
+
+        // 4. In Suggest state: close sets sync_suggest_dismissed
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Ready,
+        };
+        app.sync_suggest_dismissed = false;
+        app.sync_state_revision = 4;
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 0, 4);
+        assert!(app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::DismissOrClose,
+            fencing
+        ));
+        assert!(app.sync_suggest_dismissed);
+    }
+
+    #[test]
+    fn sync_banner_popup_suppression_on_app() {
+        let (mut app, ctx) = test_app_and_context();
+        app.is_logged_in = true;
+        app.user_uin = "user_popup".into();
+        app.sync_state = crate::sync_coordinator::SyncState::Preparing {
+            source: crate::sync_coordinator::SyncSource::Sync2Full,
+        };
+
+        // When no modal is open: banner resolves
+        let banner_input = |app: &ZaloGuiApp| crate::gui::sync_banner::SyncBannerInput {
+            is_logged_in: app.is_logged_in,
+            popup_visible: app.is_workspace_input_gated(&ctx),
+            suggest_dismissed: app.sync_suggest_dismissed,
+            error_dismissed: app.sync_error_dismissed,
+            success_until: app.sync_success_until,
+            legacy_running: app.phone_sync_running,
+            legacy_detail: None,
+        };
+        let kind =
+            crate::gui::sync_banner::resolve_banner_state(&banner_input(&app), &app.sync_state);
+        assert_eq!(
+            kind,
+            Some(crate::gui::sync_banner::SyncBannerKind::Preparing)
+        );
+
+        // When settings modal is open: Popup Suppression Invariant kicks in (returns None)
+        app.settings_modal_open = true;
+        assert!(app.is_workspace_input_gated(&ctx));
+        let kind_suppressed =
+            crate::gui::sync_banner::resolve_banner_state(&banner_input(&app), &app.sync_state);
+        assert_eq!(kind_suppressed, None);
+
+        // When phone modal is open: also suppressed
+        app.settings_modal_open = false;
+        app.phone_modal_open = true;
+        assert!(app.is_workspace_input_gated(&ctx));
+        let kind_suppressed_phone =
+            crate::gui::sync_banner::resolve_banner_state(&banner_input(&app), &app.sync_state);
+        assert_eq!(kind_suppressed_phone, None);
+    }
+
+    #[test]
+    fn sync_banner_state_transitions_never_expand_sidebar_width() {
+        let (mut app, ctx) = test_app_and_context();
+        app.hidden_panel.view.ready = true;
+        app.policy_panel.snapshot = Some(Default::default());
+
+        let mut baseline_panel: Option<Rect> = None;
+
+        let states_to_test = [
+            // 1. Suggest
+            crate::sync_coordinator::SyncState::Idle {
+                availability: crate::sync_coordinator::SyncAvailability::Ready,
+            },
+            // 2. WaitConfirmation
+            crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
+                timeout_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            },
+            // 3. Preparing
+            crate::sync_coordinator::SyncState::Preparing {
+                source: crate::sync_coordinator::SyncSource::Sync2Full,
+            },
+            // 4. SyncingConvListRecent
+            crate::sync_coordinator::SyncState::Transferring {
+                stage: crate::sync_coordinator::SyncTransferStage::DescriptorReceived,
+                downloaded_bytes: 0,
+                total_bytes: None,
+                inserted_messages: 0,
+                total_messages: None,
+            },
+            // 5. SyncingOtherMessages with very long status text
+            crate::sync_coordinator::SyncState::Transferring {
+                stage: crate::sync_coordinator::SyncTransferStage::Downloaded,
+                downloaded_bytes: 50 * 1024 * 1024,
+                total_bytes: Some(100 * 1024 * 1024),
+                inserted_messages: 5000,
+                total_messages: Some(10000),
+            },
+            // 6. Interrupted
+            crate::sync_coordinator::SyncState::Interrupted {
+                reason: "Mất kết nối mạng đột ngột trong khi đang truyền tải dữ liệu rất dài"
+                    .repeat(5),
+                retryable: true,
+            },
+            // 7. Error with long error message
+            crate::sync_coordinator::SyncState::Failed {
+                error:
+                    "Lỗi ghi CSDL cục bộ không thể hoàn tất do tập tin bị khóa bởi tiến trình khác"
+                        .repeat(5),
+                fatal: false,
+            },
+            // 8. Success
+            crate::sync_coordinator::SyncState::Completed {
+                inserted_messages: 1234,
+                duration: std::time::Duration::from_secs(12),
+            },
+        ];
+
+        for (idx, state) in states_to_test.into_iter().enumerate() {
+            app.sync_state = state;
+            app.sync_state_revision = app.sync_state_revision.wrapping_add(1);
+            if matches!(
+                app.sync_state,
+                crate::sync_coordinator::SyncState::Completed { .. }
+            ) {
+                app.sync_success_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            } else {
+                app.sync_success_until = None;
+            }
+
+            for _ in 0..2 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(1020.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        app.render_chat_workspace(ctx, &app.palette());
+                    },
+                );
+            }
+
+            let panel = ctx
+                .data(|data| data.get_temp::<Rect>(egui::Id::new("sidebar-panel-rect")))
+                .expect("sidebar-panel-rect must be recorded");
+
+            if let Some(expected) = baseline_panel {
+                assert_eq!(
+                    panel.width(),
+                    expected.width(),
+                    "state {idx}: sidebar width changed during banner transition"
+                );
+            } else {
+                baseline_panel = Some(panel);
+            }
+        }
     }
 }

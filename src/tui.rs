@@ -585,7 +585,7 @@ fn execute_store_command(
                 .filter_deleted(&mut threads)
                 .and_then(|_| crate::store::persist_local_threads(store, &threads).map(|_| ()))
                 .map_err(|error| error.to_string())
-                .and_then(|_| write_threads_cache(&session, &threads));
+                .and_then(|_| write_threads_cache_unlocked(&session, &threads));
             match result {
                 Ok(()) => {
                     let _ = completion.send(BgEvent::StoreSaved);
@@ -607,7 +607,7 @@ fn execute_store_command(
                 persist_acknowledged_delete(store, &thread_id, &message)?;
                 store.filter_deleted(&mut threads)?;
                 crate::store::persist_local_threads(store, &threads)?;
-                write_threads_cache(&session, &threads).map_err(anyhow::Error::msg)?;
+                write_threads_cache_unlocked(&session, &threads).map_err(anyhow::Error::msg)?;
                 Ok(())
             })();
             match result {
@@ -657,10 +657,13 @@ fn merge_hydrated(live: &mut Vec<Thread>, hydrated: Vec<Thread>) {
     }
 }
 
-fn write_threads_cache(session: &Session, threads: &[Thread]) -> std::result::Result<(), String> {
-    let _write_permit = session
-        .begin_account_write_blocking()
-        .map_err(|error| error.to_string())?;
+fn write_threads_cache_unlocked(
+    session: &Session,
+    threads: &[Thread],
+) -> std::result::Result<(), String> {
+    if !session.is_active() {
+        return Err("Account runtime is closed for writes".to_owned());
+    }
     let mut slim = threads.to_vec();
     for thread in &mut slim {
         let skip = thread

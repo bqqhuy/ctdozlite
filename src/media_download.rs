@@ -94,8 +94,21 @@ fn client() -> Result<&'static reqwest::Client> {
 pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response> {
     let mut url =
         reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("Đường dẫn media không hợp lệ"))?;
+    response_parsed(&mut url, timeout).await
+}
+
+pub async fn response_with_swap(
+    raw: &str,
+    timeout: Duration,
+    swap: &crate::server_config::DownloadDomainsSwapConfig,
+) -> Result<reqwest::Response> {
+    let rewritten = swap.rewrite_url(raw);
+    response(&rewritten, timeout).await
+}
+
+async fn response_parsed(url: &mut reqwest::Url, timeout: Duration) -> Result<reqwest::Response> {
     for _ in 0..5 {
-        ensure!(allowed(&url), "Nguồn media không được hỗ trợ");
+        ensure!(allowed(url), "Nguồn media không được hỗ trợ");
         let result = client()?
             .get(url.clone())
             .header(reqwest::header::REFERER, crate::endpoints::WEB_ORIGIN)
@@ -165,7 +178,7 @@ pub async fn response(raw: &str, timeout: Duration) -> Result<reqwest::Response>
                 .get(reqwest::header::LOCATION)
                 .and_then(|h| h.to_str().ok())
                 .context("Nguồn media chuyển hướng không hợp lệ")?;
-            url = url
+            *url = url
                 .join(location)
                 .map_err(|_| anyhow::anyhow!("Nguồn media chuyển hướng không hợp lệ"))?;
             continue;

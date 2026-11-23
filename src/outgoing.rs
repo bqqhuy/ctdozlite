@@ -900,8 +900,9 @@ async fn download_for_forward(
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watch = cancel.clone();
     let session = s.clone();
+    let rewritten = s.rewrite_download_url(url);
     crate::media_download::save_classified(
-        url,
+        &rewritten,
         path,
         cancel,
         move |bytes, _| {

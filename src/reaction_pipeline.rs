@@ -70,6 +70,7 @@ pub(crate) fn drain(store: &MessageStore, session: &Session) -> Result<Vec<Threa
     };
     let tx = store.conn.unchecked_transaction()?;
     let mut updates: std::collections::HashMap<String, Thread> = std::collections::HashMap::new();
+    let mut recalled = Vec::new();
     for (key, raw) in due {
         ensure!(session.is_active(), "Phiên tài khoản đã đóng");
         let mut event: ReactionEvent = serde_json::from_str(&raw)?;
@@ -176,7 +177,7 @@ pub(crate) fn drain(store: &MessageStore, session: &Session) -> Result<Vec<Threa
         if changed {
             let mut stored = StoredMessage::from(&message);
             stored.thread_id = thread_id.clone();
-            store.upsert_message(&stored)?;
+            store.upsert_message_collecting_recalled(&stored, Some(&mut recalled))?;
         }
         if preview_changed {
             if let Some(preview) = &thread.presentation.reaction_preview {
@@ -196,6 +197,7 @@ pub(crate) fn drain(store: &MessageStore, session: &Session) -> Result<Vec<Threa
         }
     }
     tx.commit()?;
+    store.purge_recalled_e2ee(&recalled)?;
     Ok(updates.into_values().collect())
 }
 

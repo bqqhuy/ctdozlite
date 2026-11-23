@@ -230,9 +230,11 @@ impl MessageStore {
 
         let schema: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         anyhow::ensure!(schema <= 14, "Cơ sở dữ liệu cần phiên bản ứng dụng mới hơn");
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
-        )?;
+        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 msg_id TEXT NOT NULL,
@@ -635,6 +637,27 @@ impl MessageStore {
     /// # Errors
     /// Returns SQLite or stored metadata validation failures.
     pub fn upsert_message(&self, msg: &StoredMessage) -> Result<bool> {
+        let mut recalled = Vec::new();
+        let inserted = self.upsert_message_collecting_recalled(msg, Some(&mut recalled))?;
+        self.purge_recalled_e2ee(&recalled)?;
+        Ok(inserted)
+    }
+
+    /// Purge E2EE recovery copies for recalled messages after the history transaction commits.
+    pub(crate) fn purge_recalled_e2ee(&self, recalled: &[(String, String)]) -> Result<()> {
+        for (thread_id, msg_id) in recalled {
+            crate::e2ee_integration::purge_received(self.conn.path(), thread_id, Some(msg_id))?;
+        }
+        Ok(())
+    }
+
+    /// Insert or reconcile a message inside an active transaction, deferring external `e2ee.db`
+    /// cleanup into `recalled_out` until after the `zalo_history.db` transaction commits.
+    pub(crate) fn upsert_message_collecting_recalled(
+        &self,
+        msg: &StoredMessage,
+        recalled_out: Option<&mut Vec<(String, String)>>,
+    ) -> Result<bool> {
         if self.is_deleted_message(msg)? {
             return Ok(false);
         }
@@ -659,16 +682,19 @@ impl MessageStore {
             if self.is_deleted_message(msg)? {
                 return Ok(false);
             }
-            let (old_text, old_raw): (String, String) = self.conn.query_row(
-                "SELECT text,raw_json FROM messages WHERE thread_id=?1 AND msg_id=?2",
-                params![msg.thread_id, msg.msg_id],
-                |r| {
-                    Ok((
-                        r.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                    ))
-                },
-            )?;
+            let (old_text, old_msg_type, old_ts, old_raw): (String, String, i64, String) =
+                self.conn.query_row(
+                    "SELECT text,msg_type,COALESCE(ts,0),raw_json FROM messages WHERE thread_id=?1 AND msg_id=?2",
+                    params![msg.thread_id, msg.msg_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                            r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        ))
+                    },
+                )?;
             let old = serde_json::from_str::<serde_json::Value>(&old_raw)
                 .unwrap_or(serde_json::json!({}));
             let mut new = serde_json::from_str::<serde_json::Value>(&msg.raw_json)
@@ -692,8 +718,15 @@ impl MessageStore {
             {
                 state.restore_state(&value)?;
             }
-            let recalled =
-                old_text == "[Tin nhắn đã thu hồi]" || msg.text == "[Tin nhắn đã thu hồi]";
+            let existing_recalled = old_text == "[Tin nhắn đã thu hồi]"
+                || old_msg_type == "chat.undo"
+                || old
+                    .pointer("/message_state/kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("recall");
+            let recalled = existing_recalled
+                || msg.text == "[Tin nhắn đã thu hồi]"
+                || msg.msg_type == "chat.undo";
             if recalled {
                 state.mark_recalled();
             }
@@ -730,6 +763,14 @@ impl MessageStore {
                     new.as_object_mut().unwrap().remove(key);
                 }
             }
+            let is_backfill = new
+                .pointer("/message_state/history_source")
+                .is_some_and(|v| !v.is_null());
+            let existing_is_realtime = old
+                .pointer("/message_state/history_source")
+                .is_none_or(serde_json::Value::is_null);
+            let preserve_realtime_payload = is_backfill
+                && (existing_is_realtime || crate::clock::normalize_ts_ms(old_ts) > normalized_ts);
             let keep_decrypted = old
                 .pointer("/message_state/is_e2ee")
                 .and_then(serde_json::Value::as_bool)
@@ -738,10 +779,21 @@ impl MessageStore {
                 && crate::e2ee_integration::is_placeholder(&msg.text);
             let text = if recalled {
                 "[Tin nhắn đã thu hồi]"
-            } else if keep_decrypted {
+            } else if keep_decrypted
+                || (preserve_realtime_payload
+                    && !old_text.is_empty()
+                    && !crate::e2ee_integration::is_placeholder(&old_text))
+            {
                 &old_text
             } else {
                 &msg.text
+            };
+            let msg_type = if recalled {
+                "chat.undo"
+            } else if preserve_realtime_payload && !old_msg_type.is_empty() {
+                &old_msg_type
+            } else {
+                &msg.msg_type
             };
             if keep_decrypted {
                 new["message_state"]["is_e2ee"] = serde_json::json!(true);
@@ -751,15 +803,19 @@ impl MessageStore {
                     .unwrap_or(serde_json::json!(false));
             }
             if recalled {
-                crate::e2ee_integration::purge_received(
-                    self.conn.path(),
-                    &msg.thread_id,
-                    Some(&msg.msg_id),
-                )?;
+                if let Some(out) = recalled_out {
+                    out.push((msg.thread_id.clone(), msg.msg_id.clone()));
+                } else {
+                    crate::e2ee_integration::purge_received(
+                        self.conn.path(),
+                        &msg.thread_id,
+                        Some(&msg.msg_id),
+                    )?;
+                }
             }
             self.conn.execute(
                 "UPDATE messages SET raw_json=?1,msg_type=?2,text=?3 WHERE thread_id=?4 AND msg_id=?5",
-                params![new.to_string(),msg.msg_type,text,msg.thread_id,msg.msg_id])?;
+                params![new.to_string(),msg_type,text,msg.thread_id,msg.msg_id])?;
         }
         Ok(rows > 0)
     }
@@ -1472,7 +1528,7 @@ impl MessageStore {
         self.filter_deleted(threads)?;
         crate::chat::deduplicate_threads(threads, None);
 
-        let stored_threads = self.all_threads().unwrap_or_default();
+        let stored_threads = self.all_threads()?;
         for st in stored_threads {
             if st.thread_id.is_empty() || st.thread_id == "0" {
                 continue;
@@ -1965,12 +2021,48 @@ pub fn persist_threads_counted(
 pub fn persist_local_threads(store: &mut MessageStore, threads: &[Thread]) -> Result<usize> {
     persist_snapshot(store, threads, true).map(|c| c.inserted)
 }
+/// Persist one history-sync page and its cursor checkpoint in a single SQLite transaction.
+/// # Errors
+/// Returns database or serialization failures and rolls back both messages and cursor.
+pub(crate) fn persist_history_sync_page(
+    store: &mut MessageStore,
+    thread: &Thread,
+    checkpoint_json: Option<&str>,
+) -> Result<usize> {
+    let mut recalled = Vec::new();
+    let transaction = store.conn.unchecked_transaction()?;
+    let counts = persist_snapshot_inner(store, std::slice::from_ref(thread), false, &mut recalled)?;
+    if let Some(cursor) = checkpoint_json {
+        store.conn.execute(
+            "INSERT INTO history_sync(thread_id,cursor) VALUES (?1,?2) \
+             ON CONFLICT(thread_id) DO UPDATE SET cursor=excluded.cursor",
+            params![thread.id, cursor],
+        )?;
+    }
+    transaction.commit()?;
+    store.purge_recalled_e2ee(&recalled)?;
+    Ok(counts.inserted)
+}
+
 fn persist_snapshot(
     store: &mut MessageStore,
     threads: &[Thread],
     local_flags: bool,
 ) -> Result<PersistCounts> {
+    let mut recalled = Vec::new();
     let transaction = store.conn.unchecked_transaction()?;
+    let counts = persist_snapshot_inner(store, threads, local_flags, &mut recalled)?;
+    transaction.commit()?;
+    store.purge_recalled_e2ee(&recalled)?;
+    Ok(counts)
+}
+
+fn persist_snapshot_inner(
+    store: &MessageStore,
+    threads: &[Thread],
+    local_flags: bool,
+    recalled_out: &mut Vec<(String, String)>,
+) -> Result<PersistCounts> {
     let mut counts = PersistCounts::default();
     for t in threads {
         let last_ts = t
@@ -2026,7 +2118,7 @@ fn persist_snapshot(
                 counts.deleted += 1;
                 continue;
             }
-            if store.upsert_message(&sm)? {
+            if store.upsert_message_collecting_recalled(&sm, Some(recalled_out))? {
                 counts.inserted += 1;
             } else if store.is_deleted_message(&sm)? {
                 counts.deleted += 1;
@@ -2039,7 +2131,6 @@ fn persist_snapshot(
             }
         }
     }
-    transaction.commit()?;
     Ok(counts)
 }
 
@@ -4233,5 +4324,276 @@ mod archive_history_paging_tests {
                 samples[19]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_for_account_write_never_hits_sqlite_busy() {
+        let uin = format!("test-db-serialize-{}", crate::param_cipher::random_hex(12));
+        let mut session = crate::session::Session::new(false, false, false).unwrap();
+        session.login = Some(crate::session::LoginInfo {
+            uin: uin.clone(),
+            zpw_enk: String::new(),
+            zpw_sek: String::new(),
+            display_name: "Test".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        let account_dir = crate::storage::account_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+
+        // Seed initial database before parallel tasks contend on it.
+        {
+            let s = session.clone();
+            tokio::task::spawn_blocking(move || {
+                let (_store, _permit) = MessageStore::open_for_account_write(&s).unwrap();
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut tasks = Vec::new();
+        for worker in 0..16usize {
+            let s = session.clone();
+            tasks.push(tokio::task::spawn_blocking(move || -> Result<()> {
+                let (mut store, _permit) = MessageStore::open_for_account_write(&s)?;
+                let mut thread = Thread {
+                    id: format!("thread-{}", worker % 4),
+                    name: format!("Thread {}", worker % 4),
+                    is_group: false,
+                    messages: (0..5)
+                        .map(|idx| ChatMessage {
+                            id: format!("msg-{worker}-{idx}"),
+                            sender: "Tester".into(),
+                            text: format!("payload {worker}/{idx}"),
+                            ts: 1_800_000_000_000 + (worker as i64) * 100 + idx,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                if worker % 3 == 0 {
+                    persist_history_sync_page(
+                        &mut store,
+                        &thread,
+                        Some(&format!(r#"{{"next":"{worker}"}}"#)),
+                    )?;
+                } else {
+                    persist_threads(&mut store, std::slice::from_ref(&thread))?;
+                }
+                if worker % 4 == 0 {
+                    let mut list = vec![Thread {
+                        id: thread.id.clone(),
+                        ..Default::default()
+                    }];
+                    let _ = store.hydrate_refresh(&mut list, MessageStore::PRELOAD_MSGS)?;
+                }
+                if worker % 5 == 0 {
+                    store.save_phone_sync_ranges(&[(
+                        format!("oneone/part-{worker}"),
+                        PhoneSyncRange {
+                            thread_id: thread.id.clone(),
+                            from_ts: 1_800_000_000_000,
+                            to_ts: 1_800_000_010_000,
+                        },
+                    )])?;
+                }
+                store.filter_deleted(std::slice::from_mut(&mut thread))?;
+                Ok(())
+            }));
+        }
+
+        for task in tasks {
+            task.await
+                .unwrap()
+                .expect("serialized account writer must never hit SQLITE_BUSY");
+        }
+
+        let store = MessageStore::open(session.history_path()).unwrap();
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 16 * 5);
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[test]
+    fn persist_history_sync_page_rolls_back_atomically_on_failure() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_cursor BEFORE INSERT ON history_sync \
+                 BEGIN SELECT RAISE(ABORT, 'fixture cursor failure'); END;",
+            )
+            .unwrap();
+        let thread = Thread {
+            id: "thread-valid".into(),
+            name: "Valid".into(),
+            messages: vec![ChatMessage {
+                id: "m1".into(),
+                text: "persisted".into(),
+                ts: 1_800_000_000_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(persist_history_sync_page(&mut store, &thread, Some(r#"{"next":"10"}"#)).is_err());
+        let msg_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let cursor_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM history_sync", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 0);
+        assert_eq!(cursor_count, 0);
+
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_cursor;")
+            .unwrap();
+        assert_eq!(
+            persist_history_sync_page(&mut store, &thread, Some(r#"{"next":"10"}"#)).unwrap(),
+            1
+        );
+        // Replaying the same page is deduplicated.
+        assert_eq!(
+            persist_history_sync_page(&mut store, &thread, Some(r#"{"next":"10"}"#)).unwrap(),
+            0
+        );
+        let msg_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let cursor_count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM history_sync", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 1);
+        assert_eq!(cursor_count, 1);
+    }
+
+    #[test]
+    fn realtime_state_and_read_receipts_and_recall_and_delete_markers_survive_history_backfill() {
+        let mut store = MessageStore::open(":memory:").unwrap();
+
+        // 1. Realtime read receipt + newer timestamp must not be downgraded by phone backfill.
+        let mut rt_read = ChatMessage {
+            id: "rt-read".into(),
+            text: "Realtime updated text".into(),
+            ts: 1_700_000_050_000,
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::Read,
+            ..Default::default()
+        };
+        let mut rt_read_stored = StoredMessage::from(&rt_read);
+        rt_read_stored.thread_id = "thread-rt".into();
+        rt_read_stored.msg_type = "chat.text".into();
+        store.upsert_message(&rt_read_stored).unwrap();
+
+        let backfill_read = ChatMessage {
+            id: "rt-read".into(),
+            text: "Older backfill text".into(),
+            ts: 1_700_000_010_000,
+            is_outgoing: true,
+            delivery: crate::message_model::DeliveryState::ServerAccepted,
+            history_source: Some(serde_json::json!({"msgType": 0})),
+            ..Default::default()
+        };
+        let mut backfill_read_stored = StoredMessage::from(&backfill_read);
+        backfill_read_stored.thread_id = "thread-rt".into();
+        backfill_read_stored.msg_type = "chat.text".into();
+        store.upsert_message(&backfill_read_stored).unwrap();
+
+        // 2. Realtime recall must not be un-recalled by backfill.
+        let mut rt_recall = ChatMessage {
+            id: "rt-recall".into(),
+            text: "Before recall".into(),
+            ts: 1_700_000_040_000,
+            ..Default::default()
+        };
+        rt_recall.mark_recalled();
+        let mut rt_recall_stored = StoredMessage::from(&rt_recall);
+        rt_recall_stored.thread_id = "thread-rt".into();
+        rt_recall_stored.msg_type = "chat.undo".into();
+        store.upsert_message(&rt_recall_stored).unwrap();
+
+        let backfill_recall = ChatMessage {
+            id: "rt-recall".into(),
+            text: "Original plain text from history".into(),
+            ts: 1_700_000_020_000,
+            history_source: Some(serde_json::json!({"msgType": 0})),
+            ..Default::default()
+        };
+        let mut backfill_recall_stored = StoredMessage::from(&backfill_recall);
+        backfill_recall_stored.thread_id = "thread-rt".into();
+        backfill_recall_stored.msg_type = "chat.text".into();
+        store.upsert_message(&backfill_recall_stored).unwrap();
+
+        // 3. Delete marker must prevent backfill from resurrecting a deleted message.
+        let rt_deleted = ChatMessage {
+            id: "rt-deleted".into(),
+            text: "Deleted locally".into(),
+            ts: 1_700_000_030_000,
+            ..Default::default()
+        };
+        let mut rt_deleted_stored = StoredMessage::from(&rt_deleted);
+        rt_deleted_stored.thread_id = "thread-rt".into();
+        rt_deleted_stored.msg_type = "chat.text".into();
+        store.upsert_message(&rt_deleted_stored).unwrap();
+        store
+            .delete_message("thread-rt", "rt-deleted", 1_700_000_030_000)
+            .unwrap();
+
+        let backfill_deleted = ChatMessage {
+            id: "rt-deleted".into(),
+            text: "Resurrect attempt".into(),
+            ts: 1_700_000_030_000,
+            history_source: Some(serde_json::json!({"msgType": 0})),
+            ..Default::default()
+        };
+        let mut backfill_deleted_stored = StoredMessage::from(&backfill_deleted);
+        backfill_deleted_stored.thread_id = "thread-rt".into();
+        backfill_deleted_stored.msg_type = "chat.text".into();
+        assert!(!store.upsert_message(&backfill_deleted_stored).unwrap());
+
+        let mut hydrated = vec![crate::chat::Thread {
+            id: "thread-rt".into(),
+            ..Default::default()
+        }];
+        store.hydrate_threads(&mut hydrated, 20).unwrap();
+        let msgs = &hydrated[0].messages;
+        assert_eq!(msgs.len(), 2);
+        let read_msg = msgs.iter().find(|m| m.id == "rt-read").unwrap();
+        assert_eq!(read_msg.delivery, crate::message_model::DeliveryState::Read);
+        assert_eq!(read_msg.text, "Realtime updated text");
+        assert_eq!(read_msg.ts, 1_700_000_050_000);
+
+        let recall_msg = msgs.iter().find(|m| m.id == "rt-recall").unwrap();
+        assert_eq!(recall_msg.text, "[Tin nhắn đã thu hồi]");
+        assert_eq!(recall_msg.kind, crate::message_model::MessageKind::Recall);
+
+        // 4. Thread-level memory merge also preserves newer realtime timestamp over backfill.
+        rt_read.delivery = crate::message_model::DeliveryState::Read;
+        let mut ui_thread = crate::chat::Thread {
+            id: "thread-rt".into(),
+            messages: vec![rt_read],
+            ..Default::default()
+        };
+        let backfill_thread = crate::chat::Thread {
+            id: "thread-rt".into(),
+            messages: vec![backfill_read],
+            ..Default::default()
+        };
+        crate::chat::merge_thread_into(&mut ui_thread, backfill_thread, false);
+        assert_eq!(ui_thread.messages[0].ts, 1_700_000_050_000);
+        assert_eq!(
+            ui_thread.messages[0].delivery,
+            crate::message_model::DeliveryState::Read
+        );
     }
 }
