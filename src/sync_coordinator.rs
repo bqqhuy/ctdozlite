@@ -17,6 +17,17 @@ pub enum DataStream {
     Realtime,
 }
 
+/// Trigger or invocation origin for a synchronization operation.
+/// Disentangles the entrypoint origin (Setting, AutoSync, Banner, Legacy)
+/// from the data stream and transfer mode represented by `SyncSource`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SyncOrigin {
+    Setting,
+    AutoSync,
+    Banner,
+    Legacy,
+}
+
 /// Explicit phone history source selected by the user.
 /// Legacy V1 is always an explicit choice; Sync2 failures never fall back to Legacy V1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +117,23 @@ pub fn evaluate_sync_availability(
     } else {
         SyncAvailability::Ready
     }
+}
+
+/// Evaluate whether a phone-sync operation is allowed to start right now for a given origin.
+pub fn evaluate_sync_availability_for_origin(
+    has_permission: bool,
+    db_ready: bool,
+    ws_ready: bool,
+    origin_enabled: bool,
+    already_syncing: bool,
+) -> SyncAvailability {
+    evaluate_sync_availability(
+        has_permission,
+        db_ready,
+        ws_ready,
+        origin_enabled,
+        already_syncing,
+    )
 }
 
 /// Five distinct data milestones during phone-history transfer.
@@ -472,6 +500,14 @@ mod tests {
         );
         assert_eq!(
             evaluate_sync_availability(true, true, true, true, false),
+            SyncAvailability::Ready
+        );
+        assert_eq!(
+            evaluate_sync_availability_for_origin(true, true, true, false, false),
+            SyncAvailability::Unavailable(SyncUnavailableReason::SourceDisabled)
+        );
+        assert_eq!(
+            evaluate_sync_availability_for_origin(true, true, true, true, false),
             SyncAvailability::Ready
         );
     }

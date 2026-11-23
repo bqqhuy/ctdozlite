@@ -35,3 +35,17 @@ audit đầy đủ 0 vulnerabilities, không còn gói yank. Warning bảo trì 
 Xem [ADR-0033](../../docs/adr/0033-v1-rsa-backend-release-audit.md) và
 [release verification](../../docs/releases/v0.007-arm-verification.md).
 Điều này không xác nhận V1 trên iPhone hay giải mã BinNet.
+
+
+## 23/11/2026 — bảo toàn gate V1 trong đợt sửa sync/config
+
+Working tree Codex trên `f33f43a`, không commit/release. H-01: V1 vẫn là lựa chọn chủ động riêng, không bị cờ `sync_2_pc.enable` khóa nhầm; vẫn bắt buộc account/DB/socket hợp lệ. Regression `banner_and_legacy_gate_still_require_live_account_database_and_socket` nằm trong lượt `cargo test --locked --lib -j 1`: 1115 passed, 11 ignored. Nguồn và fork policy: [re-notes/73](../../re-notes/73-sync-origin-timeouts-and-startup-completion.md).
+
+Chỉ xác nhận local gate/fixture; không xác nhận transfer V1/iPhone, BinNet hay native acceptance. Các task pipeline và H-T090/H-T099 chưa tự chuyển thành hoàn tất.
+
+
+## 23/11/2026 — kiểm tra sau vòng lặp sync/config
+
+Trên working tree nền f33f43a, candidate SHA-256 `c416614389549a0d30c8beb533717b2fa11441886bd636837bb8e5265c32c7ba` đạt hai lượt Codex audit theo hai phương pháp, giữ nguyên nguồn. Library 1121 passed/11 ignored; integration desktop backup 4 passed; 58 test nhắm mục tiêu và 200 vòng stress startup/config đều đạt; Clippy all-targets `-D warnings` exit 0. Regression gate V1/DB/socket vẫn nằm trong bộ kiểm tra đạt. Chi tiết: [audit dossier](../../docs/research/2026-11-23-sync-config-audit-dossier.md).
+
+Chỉ xác nhận code/fixture/harness, không nâng H-T090/H-T099 hay transfer V1/iPhone/BinNet thành native acceptance. Không E1 mới và không release.

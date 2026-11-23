@@ -167,6 +167,7 @@ pub(crate) enum StartupState {
         stage_text: String,
         started_at: std::time::Instant,
         timeout: std::time::Duration,
+        prerequisites_settled: bool,
         settle_deadline: Option<std::time::Instant>,
     },
     FatalError {
@@ -175,7 +176,27 @@ pub(crate) enum StartupState {
     Ready,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AutoSyncIntentStage {
+    Pending,
+    AwaitingAcceptance { dispatched_at: std::time::Instant },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAutoSyncIntent {
+    pub intent_id: u64,
+    pub owner: String,
+    pub runtime_id: usize,
+    pub source: crate::sync_coordinator::SyncSource,
+    pub stage: AutoSyncIntentStage,
+}
+
 pub enum GuiEvent {
+    SyncSuggestionRequested {
+        owner: String,
+        runtime_id: usize,
+        trigger: crate::gui::sync_banner::SyncSuggestionTrigger,
+    },
     E2eeTrialPrepared {
         owner: String,
         peer_id: String,
@@ -276,10 +297,27 @@ pub enum GuiEvent {
         runtime_id: usize,
         stage_text: String,
     },
+    StartupPrerequisitesSettled {
+        owner: String,
+        runtime_id: usize,
+        preload_threads: Vec<Thread>,
+    },
     StartupPreloadSettled {
         owner: String,
         runtime_id: usize,
-        preload_threads: Option<Vec<Thread>>,
+    },
+    AutoSyncIntentAccepted {
+        owner: String,
+        runtime_id: usize,
+        intent_id: u64,
+        operation_id: u64,
+    },
+    AutoSyncIntentRejected {
+        owner: String,
+        runtime_id: usize,
+        intent_id: u64,
+        temporary: bool,
+        reason: String,
     },
     StartupFatalError {
         owner: String,
@@ -485,6 +523,7 @@ pub enum GuiEvent {
     LoginFailed(String),
     E2eePeersHydrated {
         owner: String,
+        runtime_id: usize,
         peers: Vec<String>,
     },
     E2eePeerRequired {
@@ -1324,6 +1363,7 @@ pub enum DrawerView {
 }
 
 pub struct ZaloGuiApp {
+    worker_bootstrap_enabled: bool,
     tools: tools_panel::ToolsPanel,
     history_search: search_panel::SearchPanel,
     server_pins: crate::server_pins::Snapshot,
@@ -1472,6 +1512,13 @@ pub struct ZaloGuiApp {
     pub(crate) sync_state_revision: u64,
     pub(crate) sync_suggest_dismissed: bool,
     pub(crate) sync_error_dismissed: bool,
+    pub(crate) sync_suggestion_trigger: Option<crate::gui::sync_banner::SyncSuggestionTrigger>,
+    pub(crate) sync_suggestion_timer: Option<(
+        std::time::Instant,
+        crate::gui::sync_banner::SyncSuggestionTrigger,
+        usize,
+    )>,
+    pub(crate) pending_auto_sync: Option<PendingAutoSyncIntent>,
 
     info_drawer_open: bool,
     pub drawer_view: DrawerView,
@@ -1780,10 +1827,12 @@ impl ZaloGuiApp {
                 stage_text: "Đang khởi tạo phiên và lịch sử cục bộ…".into(),
                 started_at: std::time::Instant::now(),
                 timeout: initial_server_config.o2o.keep_loading_timeout(),
+                prerequisites_settled: false,
                 settle_deadline: None,
             }
         };
         let mut app = Self {
+            worker_bootstrap_enabled: bootstrap,
             #[cfg(windows)]
             tray: None,
             smoke: None,
@@ -1857,6 +1906,9 @@ impl ZaloGuiApp {
             sync_state_revision: 0,
             sync_suggest_dismissed: false,
             sync_error_dismissed: false,
+            sync_suggestion_trigger: None,
+            sync_suggestion_timer: None,
+            pending_auto_sync: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
             info_drawer_open: loaded_settings.info_drawer_open,
             drawer_view: DrawerView::Overview,
@@ -3104,8 +3156,15 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::E2eePeersHydrated { owner, peers } => {
-                    if owner == self.user_uin {
+                GuiEvent::E2eePeersHydrated {
+                    owner,
+                    runtime_id,
+                    peers,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
                         self.trial_peers.extend(peers);
                     }
                 }
@@ -3670,11 +3729,23 @@ impl ZaloGuiApp {
                     self.composer_sticker_cache.retain(|_, v| !v.is_empty());
                     self.status_msg = "Đã đăng nhập · Nhận cập nhật".into();
                     if identity_changed {
+                        self.schedule_sync_suggestion(
+                            crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn,
+                            ctx,
+                        );
+                        self.pending_auto_sync = Some(PendingAutoSyncIntent {
+                            intent_id: crate::sync_coordinator::next_operation_id(),
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            source: crate::sync_coordinator::SyncSource::Sync2Recent,
+                            stage: AutoSyncIntentStage::Pending,
+                        });
                         let timeout = self.server_config.o2o.keep_loading_timeout();
                         self.startup_state = StartupState::Loading {
                             stage_text: "Đang tải cấu hình và tin nhắn gần đây…".into(),
                             started_at: std::time::Instant::now(),
                             timeout,
+                            prerequisites_settled: false,
                             settle_deadline: None,
                         };
                         ctx.request_repaint_after(timeout);
@@ -3992,9 +4063,16 @@ impl ZaloGuiApp {
                     {
                         self.composer_config = config.zcinput;
                         self.server_config = config;
+                        if !self.server_config.sync_2_pc.enable
+                            || !self.server_config.sync_2_pc.new_banner_sync_v2
+                        {
+                            self.sync_suggestion_timer = None;
+                            self.sync_suggestion_trigger = None;
+                        }
                         if let StartupState::Loading { timeout, .. } = &mut self.startup_state {
                             *timeout = self.server_config.o2o.keep_loading_timeout();
                         }
+                        self.try_trigger_pending_auto_sync();
                     }
                 }
                 GuiEvent::StartupStage {
@@ -4015,6 +4093,18 @@ impl ZaloGuiApp {
                         }
                     }
                 }
+                GuiEvent::SyncSuggestionRequested {
+                    owner,
+                    runtime_id,
+                    trigger,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.schedule_sync_suggestion(trigger, ctx);
+                    }
+                }
                 GuiEvent::StartupFatalError {
                     owner,
                     runtime_id,
@@ -4027,46 +4117,123 @@ impl ZaloGuiApp {
                         self.startup_state = StartupState::FatalError { message };
                     }
                 }
-                GuiEvent::StartupPreloadSettled {
+                GuiEvent::StartupPrerequisitesSettled {
                     owner,
                     runtime_id,
-                    preload_threads,
+                    mut preload_threads,
                 } => {
                     if self.is_logged_in
                         && owner == self.user_uin
                         && runtime_id == self.account_runtime_id
                     {
-                        if let Some(threads) = preload_threads {
-                            if !threads.is_empty() {
-                                if self.threads.is_empty() {
-                                    self.threads = threads;
-                                } else {
-                                    for thread in threads {
-                                        if let Some(existing) =
-                                            self.threads.iter_mut().find(|t| t.id == thread.id)
-                                        {
-                                            crate::chat::merge_thread_into(existing, thread, false);
-                                        } else {
-                                            self.threads.push(thread);
-                                        }
-                                    }
-                                }
-                                crate::chat::deduplicate_threads(&mut self.threads, None);
+                        for thread in &mut preload_threads {
+                            let before = thread.messages.len();
+                            thread.messages.retain(|message| {
+                                !self.deleted_message_ids.contains(&(
+                                    thread.id.clone(),
+                                    if message.id.is_empty() {
+                                        format!("msg_{}", message.ts)
+                                    } else {
+                                        message.id.clone()
+                                    },
+                                ))
+                            });
+                            if before != thread.messages.len() {
+                                thread.refresh_after_removal();
                             }
                         }
-                        if matches!(self.startup_state, StartupState::Loading { .. }) {
-                            let delay = self.server_config.o2o.screen_dismiss_delay();
-                            if delay.is_zero() {
+                        if !preload_threads.is_empty() {
+                            if self.threads.is_empty() {
+                                self.threads = preload_threads;
+                            } else {
+                                for thread in preload_threads {
+                                    if let Some(existing) = self.threads.iter_mut().find(|t| {
+                                        crate::chat::threads_represent_same_contact(t, &thread)
+                                    }) {
+                                        crate::chat::merge_cached_thread_into(existing, thread);
+                                    } else {
+                                        self.threads.push(thread);
+                                    }
+                                }
+                            }
+                            crate::chat::deduplicate_threads(&mut self.threads, None);
+                        }
+                        if let StartupState::Loading {
+                            prerequisites_settled,
+                            started_at,
+                            ..
+                        } = &mut self.startup_state
+                        {
+                            *prerequisites_settled = true;
+                            *started_at = std::time::Instant::now();
+                            if !self.server_config.o2o.keep_loading_during_preload.enable {
                                 self.startup_state = StartupState::Ready;
-                            } else if let StartupState::Loading {
-                                settle_deadline,
-                                stage_text,
-                                ..
-                            } = &mut self.startup_state
-                            {
-                                *stage_text = "Đã sẵn sàng…".into();
-                                *settle_deadline = Some(std::time::Instant::now() + delay);
-                                ctx.request_repaint_after(delay);
+                            }
+                        }
+                        self.try_trigger_pending_auto_sync();
+                    }
+                }
+                GuiEvent::StartupPreloadSettled { owner, runtime_id } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        if let StartupState::Loading {
+                            prerequisites_settled,
+                            settle_deadline,
+                            stage_text,
+                            ..
+                        } = &mut self.startup_state
+                        {
+                            if *prerequisites_settled {
+                                if !self.server_config.o2o.keep_loading_during_preload.enable {
+                                    self.startup_state = StartupState::Ready;
+                                } else {
+                                    let delay = self.server_config.o2o.screen_dismiss_delay();
+                                    if delay.is_zero() {
+                                        self.startup_state = StartupState::Ready;
+                                    } else {
+                                        *stage_text = "Đã sẵn sàng…".into();
+                                        *settle_deadline = Some(std::time::Instant::now() + delay);
+                                        ctx.request_repaint_after(delay);
+                                    }
+                                }
+                            }
+                        }
+                        self.try_trigger_pending_auto_sync();
+                    }
+                }
+                GuiEvent::AutoSyncIntentAccepted {
+                    owner,
+                    runtime_id,
+                    intent_id,
+                    ..
+                } => {
+                    if owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                        && self
+                            .pending_auto_sync
+                            .as_ref()
+                            .is_some_and(|i| i.intent_id == intent_id)
+                    {
+                        self.pending_auto_sync = None;
+                    }
+                }
+                GuiEvent::AutoSyncIntentRejected {
+                    owner,
+                    runtime_id,
+                    intent_id,
+                    temporary,
+                    ..
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(intent) = &mut self.pending_auto_sync {
+                            if intent.intent_id == intent_id {
+                                if temporary {
+                                    intent.stage = AutoSyncIntentStage::Pending;
+                                } else {
+                                    self.pending_auto_sync = None;
+                                }
                             }
                         }
                     }
@@ -4297,6 +4464,9 @@ impl ZaloGuiApp {
                     self.composer_config = Default::default();
                     self.server_config = Default::default();
                     self.startup_state = StartupState::Unauthenticated;
+                    self.pending_auto_sync = None;
+                    self.sync_suggestion_timer = None;
+                    self.sync_suggestion_trigger = None;
                     self.tools.devices.clear();
                     self.tools.two_factor_status = None;
                     self.tools.catalog_items.clear();
@@ -4408,6 +4578,9 @@ impl ZaloGuiApp {
                     self.composer_config = Default::default();
                     self.server_config = Default::default();
                     self.startup_state = StartupState::Unauthenticated;
+                    self.pending_auto_sync = None;
+                    self.sync_suggestion_timer = None;
+                    self.sync_suggestion_trigger = None;
                     self.user_name.clear();
                     self.user_uin.clear();
                     self.threads.clear();
@@ -4463,6 +4636,9 @@ impl ZaloGuiApp {
                     let (tx, rx) = channel();
                     self.event_rx = rx;
                     self.event_tx = tx.clone();
+                    if !self.worker_bootstrap_enabled {
+                        continue;
+                    }
                     match Session::new(self.dev_mode, false, false) {
                         Ok(session) => {
                             spawn_session_worker(session, tx, ctx.clone());
@@ -4496,11 +4672,15 @@ impl ZaloGuiApp {
                     self.composer_config = session
                         .composer_config
                         .unwrap_or(self.server_config.zcinput);
+                    self.pending_auto_sync = None;
+                    self.sync_suggestion_timer = None;
+                    self.sync_suggestion_trigger = None;
                     let timeout = self.server_config.o2o.keep_loading_timeout();
                     self.startup_state = StartupState::Loading {
                         stage_text: "Đang chuyển tài khoản và kiểm tra dữ liệu…".into(),
                         started_at: std::time::Instant::now(),
                         timeout,
+                        prerequisites_settled: false,
                         settle_deadline: None,
                     };
                     ctx.request_repaint_after(timeout);
@@ -4555,6 +4735,9 @@ impl ZaloGuiApp {
                     let (tx, rx) = channel();
                     self.event_rx = rx;
                     self.event_tx = tx.clone();
+                    if !self.worker_bootstrap_enabled {
+                        continue;
+                    }
                     spawn_session_worker(*session, tx, ctx.clone());
                     // The new account receives a fresh worker, mailbox and event stream.
                     if let Some(tx) = WORKER_TX.get() {
@@ -6619,6 +6802,9 @@ impl ZaloGuiApp {
                     {
                         continue;
                     }
+                    if self.sync_state.is_running() && operation_id == 0 {
+                        continue;
+                    }
                     if operation_id != 0 && operation_id < self.sync_operation_id {
                         continue;
                     }
@@ -6629,8 +6815,11 @@ impl ZaloGuiApp {
                     self.sync_state = state;
                     self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
                     if self.sync_state.is_running() {
+                        self.pending_auto_sync = None;
                         self.sync_error_dismissed = false;
+                        self.sync_suggestion_timer = None;
                     }
+                    self.try_trigger_pending_auto_sync();
                 }
                 GuiEvent::HistorySyncStatus {
                     running,
@@ -7252,6 +7441,28 @@ impl eframe::App for ZaloGuiApp {
 impl ZaloGuiApp {
     /// Non-blocking startup progression; `FatalError` never times out into `Ready`.
     pub(crate) fn advance_startup_state(&mut self, now: std::time::Instant, ctx: &egui::Context) {
+        self.advance_sync_suggestion_timer(now, ctx);
+        if self.pending_auto_sync.as_ref().is_some_and(|intent| {
+            !self.is_logged_in
+                || intent.owner != self.user_uin
+                || intent.runtime_id != self.account_runtime_id
+        }) {
+            self.pending_auto_sync = None;
+        }
+        if self.pending_auto_sync.as_ref().is_some_and(|intent| {
+            matches!(intent.stage, AutoSyncIntentStage::AwaitingAcceptance { .. })
+        }) {
+            if WORKER_TX
+                .get()
+                .is_none_or(|tx| tx.is_command_channel_closed())
+            {
+                // Delivery is uncertain: retire the intent, never resend it automatically.
+                self.pending_auto_sync = None;
+                self.show_toast("Mất kết nối worker; chưa xác nhận được tác vụ đồng bộ");
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
         if !self.is_logged_in {
             if !matches!(self.startup_state, StartupState::Unauthenticated) {
                 self.startup_state = StartupState::Unauthenticated;
@@ -7259,20 +7470,227 @@ impl ZaloGuiApp {
             return;
         }
         if let StartupState::Loading {
-            started_at: _,
-            timeout: _,
+            started_at,
+            timeout,
+            prerequisites_settled,
             settle_deadline,
             ..
-        } = &self.startup_state
+        } = &mut self.startup_state
         {
-            if let Some(settle_deadline) = settle_deadline {
-                if now >= *settle_deadline {
+            // Mandatory prerequisites (DB open/migrate and SEK verification) must be completed
+            // by worker before 4 zones can be rendered under any circumstance.
+            if !*prerequisites_settled {
+                return;
+            }
+
+            if !self.server_config.o2o.keep_loading_during_preload.enable {
+                self.startup_state = StartupState::Ready;
+                return;
+            }
+
+            if now.saturating_duration_since(*started_at) >= *timeout {
+                self.startup_state = StartupState::Ready;
+                return;
+            }
+
+            if let Some(deadline) = settle_deadline {
+                if now >= *deadline {
                     self.startup_state = StartupState::Ready;
                 } else {
-                    ctx.request_repaint_after(settle_deadline.saturating_duration_since(now));
+                    ctx.request_repaint_after(deadline.saturating_duration_since(now));
                 }
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                let remaining_timeout = (*started_at + *timeout).saturating_duration_since(now);
+                ctx.request_repaint_after(remaining_timeout);
+            }
+        }
+    }
+
+    pub(crate) fn schedule_sync_suggestion(
+        &mut self,
+        trigger: crate::gui::sync_banner::SyncSuggestionTrigger,
+        ctx: &egui::Context,
+    ) {
+        if !self.is_logged_in {
+            return;
+        }
+        if self.phone_sync_running || self.sync_state.is_running() {
+            return;
+        }
+        if !self.server_config.sync_2_pc.enable || !self.server_config.sync_2_pc.new_banner_sync_v2
+        {
+            return;
+        }
+        let enabled = match trigger {
+            crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn => {
+                self.server_config
+                    .sync_2_pc
+                    .sync_suggestion_zalopc
+                    .new_log_in
+            }
+            crate::gui::sync_banner::SyncSuggestionTrigger::ChangeDevice => {
+                self.server_config
+                    .sync_2_pc
+                    .sync_suggestion_zalopc
+                    .change_device
+            }
+            crate::gui::sync_banner::SyncSuggestionTrigger::QueueEvict => {
+                self.server_config
+                    .sync_2_pc
+                    .sync_suggestion_zalopc
+                    .queue_evict
+            }
+            crate::gui::sync_banner::SyncSuggestionTrigger::Persisted => true,
+        };
+        if !enabled {
+            return;
+        }
+
+        let delay_ms = match trigger {
+            crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn => 0,
+            crate::gui::sync_banner::SyncSuggestionTrigger::ChangeDevice
+            | crate::gui::sync_banner::SyncSuggestionTrigger::QueueEvict => {
+                self.server_config
+                    .sync_2_pc
+                    .sync_suggestion_zalopc
+                    .show_delay_ms
+            }
+            crate::gui::sync_banner::SyncSuggestionTrigger::Persisted => 0,
+        };
+
+        if delay_ms == 0 {
+            self.sync_suggestion_timer = None;
+            self.sync_suggestion_trigger = Some(trigger);
+            ctx.request_repaint();
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
+            self.sync_suggestion_timer = Some((deadline, trigger, self.account_runtime_id));
+            ctx.request_repaint_after(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+
+    pub(crate) fn advance_sync_suggestion_timer(
+        &mut self,
+        now: std::time::Instant,
+        ctx: &egui::Context,
+    ) {
+        let Some((deadline, trigger, timer_runtime_id)) = self.sync_suggestion_timer else {
+            return;
+        };
+        if !self.is_logged_in || timer_runtime_id != self.account_runtime_id {
+            self.sync_suggestion_timer = None;
+            return;
+        }
+        if self.phone_sync_running || self.sync_state.is_running() {
+            self.sync_suggestion_timer = None;
+            return;
+        }
+        if now >= deadline {
+            self.sync_suggestion_timer = None;
+            if !self.server_config.sync_2_pc.enable
+                || !self.server_config.sync_2_pc.new_banner_sync_v2
+            {
+                return;
+            }
+            let trigger_enabled = match trigger {
+                crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn => {
+                    self.server_config
+                        .sync_2_pc
+                        .sync_suggestion_zalopc
+                        .new_log_in
+                }
+                crate::gui::sync_banner::SyncSuggestionTrigger::ChangeDevice => {
+                    self.server_config
+                        .sync_2_pc
+                        .sync_suggestion_zalopc
+                        .change_device
+                }
+                crate::gui::sync_banner::SyncSuggestionTrigger::QueueEvict => {
+                    self.server_config
+                        .sync_2_pc
+                        .sync_suggestion_zalopc
+                        .queue_evict
+                }
+                crate::gui::sync_banner::SyncSuggestionTrigger::Persisted => true,
+            };
+            if trigger_enabled {
+                self.sync_suggestion_trigger = Some(trigger);
+                ctx.request_repaint();
+            }
+        } else {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        }
+    }
+
+    pub(crate) fn try_trigger_pending_auto_sync(&mut self) {
+        let Some(intent) = &mut self.pending_auto_sync else {
+            return;
+        };
+        if intent.owner != self.user_uin || intent.runtime_id != self.account_runtime_id {
+            self.pending_auto_sync = None;
+            return;
+        }
+
+        if intent.stage != AutoSyncIntentStage::Pending {
+            return;
+        }
+
+        if self.sync_state.is_running() {
+            self.pending_auto_sync = None;
+            return;
+        }
+
+        // Authoritative server config check
+        if self.server_config.sync_2_pc_authoritative {
+            if !self.server_config.sync_2_pc.enable
+                || !self
+                    .server_config
+                    .sync_2_pc
+                    .enable_auto_request_sync_on_log_in_new_device
+                || !self
+                    .server_config
+                    .sync_2_pc
+                    .is_feature_enabled_by_origin(crate::sync_coordinator::SyncOrigin::AutoSync)
+            {
+                // Policy confirms sync is disabled or auto-request is turned off: retire intent
+                self.pending_auto_sync = None;
+                return;
+            }
+        } else {
+            // Authoritative server config has not arrived yet: keep intent pending
+            return;
+        }
+
+        // Check availability:
+        // Must be Idle with availability == Ready (guarantees DB ready + WS connected and no active sync)
+        if !self.phone_sync_running
+            && !self.sync_state.is_running()
+            && matches!(
+                self.sync_state,
+                crate::sync_coordinator::SyncState::Idle {
+                    availability: crate::sync_coordinator::SyncAvailability::Ready,
+                    ..
+                }
+            )
+        {
+            if let Some(tx) = WORKER_TX.get() {
+                let owner = intent.owner.clone();
+                let runtime_id = intent.runtime_id;
+                let intent_id = intent.intent_id;
+                intent.stage = AutoSyncIntentStage::AwaitingAcceptance {
+                    dispatched_at: std::time::Instant::now(),
+                };
+                if tx
+                    .send(WorkerCmd::SyncPhoneRecentFenced {
+                        owner,
+                        runtime_id,
+                        intent_id: Some(intent_id),
+                        origin: crate::sync_coordinator::SyncOrigin::AutoSync,
+                    })
+                    .is_err()
+                {
+                    self.pending_auto_sync = None;
+                }
             }
         }
     }
@@ -7365,6 +7783,7 @@ impl ZaloGuiApp {
                                             stage_text: "Đang thử khởi tạo lại…".into(),
                                             started_at: std::time::Instant::now(),
                                             timeout,
+                                            prerequisites_settled: false,
                                             settle_deadline: None,
                                         };
                                         if let Some(tx) = WORKER_TX.get() {
@@ -10601,6 +11020,151 @@ mod startup_and_server_config_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    #[test]
+    fn optional_peer_payload_cannot_cross_runtime_for_the_same_account() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            logged_in_session("peer-payload-owner"),
+            false,
+            Vec::new(),
+            false,
+        );
+        let runtime_id = app.account_runtime_id;
+        for (event_runtime, peer) in [
+            (runtime_id.wrapping_add(1), "stale-peer"),
+            (runtime_id, "current-peer"),
+        ] {
+            app.event_tx
+                .send(GuiEvent::E2eePeersHydrated {
+                    owner: "peer-payload-owner".into(),
+                    runtime_id: event_runtime,
+                    peers: vec![peer.into()],
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(!app.trial_peers.contains("stale-peer"));
+        assert!(app.trial_peers.contains("current-peer"));
+    }
+
+    #[test]
+    fn mandatory_cache_is_scoped_and_cannot_replay_deleted_or_stale_live_content() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            logged_in_session("cache-owner"),
+            false,
+            Vec::new(),
+            false,
+        );
+        let runtime_id = app.account_runtime_id;
+        app.startup_state = StartupState::Loading {
+            stage_text: "Đang tải…".into(),
+            started_at: Instant::now(),
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: false,
+            settle_deadline: None,
+        };
+        app.server_config.o2o.keep_loading_during_preload.enable = false;
+        app.threads = vec![Thread {
+            id: "thread-1".into(),
+            name: "Fresh name".into(),
+            messages: vec![ChatMessage {
+                id: "77".into(),
+                text: "Fresh text".into(),
+                ts: 200,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        app.deleted_message_ids
+            .insert(("thread-1".into(), "66".into()));
+        app.deleted_message_ids
+            .insert(("deleted-only".into(), "1".into()));
+        for (owner, event_runtime) in [
+            ("other", runtime_id),
+            ("cache-owner", runtime_id.wrapping_add(1)),
+        ] {
+            app.event_tx
+                .send(GuiEvent::StartupPrerequisitesSettled {
+                    owner: owner.into(),
+                    runtime_id: event_runtime,
+                    preload_threads: vec![Thread {
+                        id: "stale-thread".into(),
+                        ..Default::default()
+                    }],
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(matches!(
+            app.startup_state,
+            StartupState::Loading {
+                prerequisites_settled: false,
+                ..
+            }
+        ));
+        assert_eq!(app.threads.len(), 1);
+        app.event_tx
+            .send(GuiEvent::StartupPrerequisitesSettled {
+                owner: "cache-owner".into(),
+                runtime_id,
+                preload_threads: vec![
+                    Thread {
+                        id: "thread-1".into(),
+                        name: "Stale name".into(),
+                        messages: vec![
+                            ChatMessage {
+                                id: "77".into(),
+                                text: "Stale text".into(),
+                                ts: 100,
+                                ..Default::default()
+                            },
+                            ChatMessage {
+                                id: "66".into(),
+                                text: "Deleted text".into(),
+                                ts: 90,
+                                ..Default::default()
+                            },
+                            ChatMessage {
+                                id: "55".into(),
+                                text: "Cached history".into(),
+                                ts: 50,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    Thread {
+                        id: "deleted-only".into(),
+                        preview: "Deleted preview".into(),
+                        messages: vec![ChatMessage {
+                            id: "1".into(),
+                            text: "Deleted preview".into(),
+                            ts: 1,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ],
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.startup_state, StartupState::Ready);
+        let thread = app.threads.iter().find(|t| t.id == "thread-1").unwrap();
+        assert_eq!(thread.name, "Fresh name");
+        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(
+            thread.messages.iter().find(|m| m.id == "77").unwrap().text,
+            "Fresh text"
+        );
+        assert!(thread.messages.iter().any(|m| m.id == "55"));
+        assert!(!thread.messages.iter().any(|m| m.id == "66"));
+        let deleted = app.threads.iter().find(|t| t.id == "deleted-only").unwrap();
+        assert!(deleted.messages.is_empty() && deleted.preview.is_empty());
+    }
+
     fn logged_in_session(uin: &str) -> Session {
         let mut s = Session::new(false, false, false).unwrap();
         s.login = Some(crate::session::LoginInfo {
@@ -10613,6 +11177,8 @@ mod startup_and_server_config_tests {
         });
         s
     }
+
+    static TEST_WORKER_TX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn startup_loading_settles_with_dismiss_delay_and_fatal_error_never_times_out_to_ready() {
@@ -10650,15 +11216,32 @@ mod startup_and_server_config_tests {
             app.startup_state
         );
 
+        // Send StartupPrerequisitesSettled to settle mandatory prerequisites
+        app.event_tx
+            .send(GuiEvent::StartupPrerequisitesSettled {
+                owner: "1001".into(),
+                runtime_id: app.account_runtime_id,
+                preload_threads: vec![Thread {
+                    id: "t1".into(),
+                    name: "Bạn bè".into(),
+                    ..Default::default()
+                }],
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(matches!(
+            app.startup_state,
+            StartupState::Loading {
+                prerequisites_settled: true,
+                settle_deadline: None,
+                ..
+            }
+        ));
+
         app.event_tx
             .send(GuiEvent::StartupPreloadSettled {
                 owner: "1001".into(),
                 runtime_id: app.account_runtime_id,
-                preload_threads: Some(vec![Thread {
-                    id: "t1".into(),
-                    name: "Bạn bè".into(),
-                    ..Default::default()
-                }]),
             })
             .unwrap();
         app.check_events(&ctx);
@@ -10683,6 +11266,7 @@ mod startup_and_server_config_tests {
             stage_text: "checking".into(),
             started_at: Instant::now() - Duration::from_secs(60),
             timeout: Duration::from_millis(800),
+            prerequisites_settled: false,
             settle_deadline: None,
         };
         tx.send(GuiEvent::StartupFatalError {
@@ -10694,7 +11278,6 @@ mod startup_and_server_config_tests {
         tx.send(GuiEvent::StartupPreloadSettled {
             owner: "1001".into(),
             runtime_id: app.account_runtime_id,
-            preload_threads: None,
         })
         .unwrap();
         app.check_events(&ctx);
@@ -10705,6 +11288,174 @@ mod startup_and_server_config_tests {
                 message: "SQLite migration failed".into()
             }
         );
+    }
+
+    #[test]
+    fn auto_sync_intent_persists_until_prerequisites_ready_and_fires_once() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        worker::WORKER_TX.clear();
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            logged_in_session("old_3000"),
+            false,
+            Vec::new(),
+            false,
+        );
+
+        // Simulate LoginSuccess with different uin so identity_changed becomes true
+        app.event_tx
+            .send(GuiEvent::LoginSuccess {
+                name: "User 3001".into(),
+                uin: "3001".into(),
+                avatar: None,
+                runtime_id: app.account_runtime_id,
+                composer_config: None,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // PendingAutoSyncIntent must be recorded and bound to owner and runtime_id
+        let intent = app.pending_auto_sync.as_ref().expect("intent must exist");
+        assert_eq!(intent.owner, "3001");
+        assert_eq!(intent.runtime_id, app.account_runtime_id);
+        assert_eq!(
+            intent.source,
+            crate::sync_coordinator::SyncSource::Sync2Recent
+        );
+        assert_eq!(intent.stage, AutoSyncIntentStage::Pending);
+
+        // If server config arrives but DB / WS is not ready (availability is Unavailable),
+        // intent must NOT be consumed or discarded!
+        let mut cfg = crate::server_config::ServerConfig {
+            revision: 1,
+            sync_2_pc_authoritative: true,
+            ..Default::default()
+        };
+        cfg.sync_2_pc.enable = true;
+        cfg.sync_2_pc.enable_auto_request_sync_on_log_in_new_device = true;
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Unavailable(
+                crate::sync_coordinator::SyncUnavailableReason::DbMigrating,
+            ),
+        };
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                config: cfg.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(
+            app.pending_auto_sync.is_some(),
+            "auto-sync intent must be retained when runtime is not ready"
+        );
+
+        // Now simulate DB and WS becoming Ready via PhoneSyncState
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                operation_id: 0,
+                state: crate::sync_coordinator::SyncState::Idle {
+                    availability: crate::sync_coordinator::SyncAvailability::Ready,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Intent must remain pending until sync starts running
+        assert!(
+            app.pending_auto_sync.is_some(),
+            "intent is not cleared blindly when command is triggered"
+        );
+
+        // Worker transitions to active sync (is_running() == true)
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                operation_id: 1,
+                state: crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Recent,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            app.pending_auto_sync.is_none(),
+            "auto-sync intent must be cleared once sync is actively running"
+        );
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn sync_suggestion_timer_and_triggers_respect_delay_and_guards() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("4001"), false, Vec::new(), false);
+
+        let mut cfg = crate::server_config::ServerConfig {
+            revision: 1,
+            ..Default::default()
+        };
+        cfg.sync_2_pc.enable = true;
+        cfg.sync_2_pc.new_banner_sync_v2 = true;
+        cfg.sync_2_pc.sync_suggestion_zalopc.show_delay_ms = 500;
+        cfg.sync_2_pc.sync_suggestion_zalopc.new_log_in = true;
+        cfg.sync_2_pc.sync_suggestion_zalopc.change_device = true;
+        cfg.sync_2_pc.sync_suggestion_zalopc.queue_evict = true;
+        app.server_config = cfg;
+
+        // 1. NewLogIn trigger has delay = 0: immediate
+        app.schedule_sync_suggestion(
+            crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn,
+            &ctx,
+        );
+        assert_eq!(
+            app.sync_suggestion_trigger,
+            Some(crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn)
+        );
+        assert!(app.sync_suggestion_timer.is_none());
+
+        // Reset
+        app.sync_suggestion_trigger = None;
+
+        // 2. ChangeDevice trigger applies show_delay_ms (500ms)
+        app.schedule_sync_suggestion(
+            crate::gui::sync_banner::SyncSuggestionTrigger::ChangeDevice,
+            &ctx,
+        );
+        assert_eq!(app.sync_suggestion_trigger, None);
+        assert!(app.sync_suggestion_timer.is_some());
+
+        // Advance 200ms (before deadline): still None
+        let now = Instant::now();
+        app.advance_sync_suggestion_timer(now + Duration::from_millis(200), &ctx);
+        assert_eq!(app.sync_suggestion_trigger, None);
+
+        // Advance 600ms (after deadline): banner trigger activates!
+        app.advance_sync_suggestion_timer(now + Duration::from_millis(600), &ctx);
+        assert_eq!(
+            app.sync_suggestion_trigger,
+            Some(crate::gui::sync_banner::SyncSuggestionTrigger::ChangeDevice)
+        );
+        assert!(app.sync_suggestion_timer.is_none());
+
+        // 3. Logout cancels active timer
+        app.schedule_sync_suggestion(
+            crate::gui::sync_banner::SyncSuggestionTrigger::QueueEvict,
+            &ctx,
+        );
+        assert!(app.sync_suggestion_timer.is_some());
+        app.event_tx.send(GuiEvent::LoggedOut).unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_suggestion_timer.is_none());
+        assert_eq!(app.sync_suggestion_trigger, None);
     }
 
     #[test]
@@ -10824,5 +11575,567 @@ mod startup_and_server_config_tests {
         app.check_events(&ctx);
         assert!(!app.sync_state.is_running());
         assert_eq!(app.sync_operation_id, 0);
+    }
+
+    #[test]
+    fn operation_fencing_protects_running_sync_against_id_zero_events() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+        let rt = app.account_runtime_id;
+
+        // 1. Establish an active sync operation with ID=10
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 10,
+                state: crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Recent,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.sync_state.is_running());
+        assert_eq!(app.sync_operation_id, 10);
+
+        // 2. While running, an incoming event with operation_id=0 MUST NOT overwrite state
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 0,
+                state: crate::sync_coordinator::SyncState::Idle {
+                    availability: crate::sync_coordinator::SyncAvailability::Unavailable(
+                        crate::sync_coordinator::SyncUnavailableReason::AlreadySyncing,
+                    ),
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(
+            app.sync_state.is_running(),
+            "running sync must NOT be clobbered by operation_id=0 event"
+        );
+        assert_eq!(app.sync_operation_id, 10);
+
+        // 3. When sync completes, state is no longer running
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 10,
+                state: crate::sync_coordinator::SyncState::Completed {
+                    inserted_messages: 5,
+                    duration: Duration::from_secs(1),
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.sync_state.is_running());
+
+        // 4. When not running, operation_id=0 updates availability normally
+        app.event_tx
+            .send(GuiEvent::PhoneSyncState {
+                owner: "3001".into(),
+                runtime_id: rt,
+                operation_id: 0,
+                state: crate::sync_coordinator::SyncState::Idle {
+                    availability: crate::sync_coordinator::SyncAvailability::Ready,
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(matches!(
+            app.sync_state,
+            crate::sync_coordinator::SyncState::Idle {
+                availability: crate::sync_coordinator::SyncAvailability::Ready,
+            }
+        ));
+    }
+
+    #[test]
+    fn empty_server_config_metadata_does_not_clear_pending_intent() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+
+        // Set pending auto-sync intent
+        app.pending_auto_sync = Some(PendingAutoSyncIntent {
+            intent_id: 1,
+            owner: "3001".into(),
+            runtime_id: app.account_runtime_id,
+            source: crate::sync_coordinator::SyncSource::Sync2Recent,
+            stage: AutoSyncIntentStage::Pending,
+        });
+
+        // Config without authoritative sync flags (e.g. empty metadata) arrives:
+        let empty_cfg = crate::server_config::ServerConfig {
+            revision: 1,
+            sync_2_pc_authoritative: false,
+            ..Default::default()
+        };
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                config: empty_cfg,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Intent MUST be retained!
+        assert!(
+            app.pending_auto_sync.is_some(),
+            "pending intent must not be cleared by non-authoritative server config"
+        );
+
+        // Authoritative config with sync disabled arrives:
+        let mut disabled_cfg = crate::server_config::ServerConfig {
+            revision: 2,
+            sync_2_pc_authoritative: true,
+            ..Default::default()
+        };
+        disabled_cfg.sync_2_pc.enable = false;
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                config: disabled_cfg,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Now intent is retired cleanly
+        assert!(
+            app.pending_auto_sync.is_none(),
+            "authoritative disabled config must retire pending auto-sync intent"
+        );
+    }
+
+    #[test]
+    fn startup_timeout_gating_respects_prerequisites_and_optional_preload() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+        let t0 = Instant::now();
+
+        // Configure keep_loading_during_preload enabled
+        app.server_config.o2o.keep_loading_during_preload.enable = true;
+        app.server_config
+            .o2o
+            .keep_loading_during_preload
+            .timeout_duration_ms = 800;
+        app.server_config
+            .o2o
+            .keep_loading_during_preload
+            .screen_dismiss_delay_ms = 200;
+
+        // Branch 1: Mandatory prerequisites pending (prerequisites_settled == false)
+        // Even past timeout, it MUST NOT transition to Ready!
+        app.startup_state = StartupState::Loading {
+            stage_text: "Checking DB...".into(),
+            started_at: t0,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: false,
+            settle_deadline: None,
+        };
+        app.advance_startup_state(t0 + Duration::from_millis(5000), &ctx);
+        assert!(
+            matches!(
+                app.startup_state,
+                StartupState::Loading {
+                    prerequisites_settled: false,
+                    ..
+                }
+            ),
+            "mandatory prerequisites pending must never transition to Ready"
+        );
+
+        // Branch 2: Prerequisites settled, preload in progress (settle_deadline == None)
+        app.startup_state = StartupState::Loading {
+            stage_text: "Preloading...".into(),
+            started_at: t0,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: true,
+            settle_deadline: None,
+        };
+        // 400ms: still loading
+        app.advance_startup_state(t0 + Duration::from_millis(400), &ctx);
+        assert!(matches!(app.startup_state, StartupState::Loading { .. }));
+        // 800ms: optional preload timeout reached -> transitions to Ready
+        app.advance_startup_state(t0 + Duration::from_millis(800), &ctx);
+        assert_eq!(app.startup_state, StartupState::Ready);
+
+        // Branch 3: Prerequisites settled early with settle_deadline
+        let deadline = t0 + Duration::from_millis(200);
+        app.startup_state = StartupState::Loading {
+            stage_text: "Ready...".into(),
+            started_at: t0,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: true,
+            settle_deadline: Some(deadline),
+        };
+        // 100ms: before deadline -> still loading
+        app.advance_startup_state(t0 + Duration::from_millis(100), &ctx);
+        assert!(matches!(app.startup_state, StartupState::Loading { .. }));
+        // 200ms: deadline reached -> transitions to Ready
+        app.advance_startup_state(t0 + Duration::from_millis(200), &ctx);
+        assert_eq!(app.startup_state, StartupState::Ready);
+
+        // Branch 4: Preload disabled -> immediate Ready once prerequisites settled
+        app.server_config.o2o.keep_loading_during_preload.enable = false;
+        app.startup_state = StartupState::Loading {
+            stage_text: "Prereqs settled...".into(),
+            started_at: t0,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: true,
+            settle_deadline: None,
+        };
+        app.advance_startup_state(t0 + Duration::from_millis(10), &ctx);
+        assert_eq!(app.startup_state, StartupState::Ready);
+    }
+
+    #[test]
+    fn auto_sync_intent_deduplication_and_ack_lifecycle() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+
+        // Configure authoritative sync flags
+        app.server_config.sync_2_pc_authoritative = true;
+        app.server_config.sync_2_pc.enable = true;
+        app.server_config
+            .sync_2_pc
+            .enable_auto_request_sync_on_log_in_new_device = true;
+        app.server_config.sync_2_pc.auto_sync.enable = true;
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Ready,
+        };
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+        let worker_sender = worker::WorkerSender::new_for_test(cmd_tx, ctx.clone());
+        worker::WORKER_TX.set(worker_sender);
+
+        app.pending_auto_sync = Some(PendingAutoSyncIntent {
+            intent_id: 42,
+            owner: "3001".into(),
+            runtime_id: app.account_runtime_id,
+            source: crate::sync_coordinator::SyncSource::Sync2Recent,
+            stage: AutoSyncIntentStage::Pending,
+        });
+
+        // 1. First trigger emits exactly 1 WorkerCmd and transitions to AwaitingAcceptance
+        app.try_trigger_pending_auto_sync();
+        let cmd = cmd_rx
+            .try_recv()
+            .expect("first trigger must dispatch WorkerCmd");
+        match cmd {
+            WorkerCmd::SyncPhoneRecentFenced {
+                owner,
+                runtime_id,
+                intent_id,
+                origin,
+            } => {
+                assert_eq!(owner, "3001");
+                assert_eq!(runtime_id, app.account_runtime_id);
+                assert_eq!(intent_id, Some(42));
+                assert_eq!(origin, crate::sync_coordinator::SyncOrigin::AutoSync);
+            }
+            _ => panic!("expected SyncPhoneRecentFenced"),
+        }
+        assert!(matches!(
+            app.pending_auto_sync.as_ref().map(|i| &i.stage),
+            Some(AutoSyncIntentStage::AwaitingAcceptance { .. })
+        ));
+
+        // 2. Second trigger before ACK: must NOT emit another command
+        app.try_trigger_pending_auto_sync();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "duplicate trigger while AwaitingAcceptance must not emit duplicate command"
+        );
+
+        // 3. Repeated config or readiness update while in AwaitingAcceptance: still no command emitted
+        app.event_tx
+            .send(GuiEvent::ServerConfigUpdated {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                config: app.server_config.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "config refresh while AwaitingAcceptance must not emit duplicate command"
+        );
+
+        // 4. Temporary rejection: returns intent to Pending stage without clearing it
+        app.event_tx
+            .send(GuiEvent::AutoSyncIntentRejected {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                intent_id: 42,
+                temporary: true,
+                reason: "Transient mobile busy".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(
+            app.pending_auto_sync.as_ref().map(|i| &i.stage),
+            Some(&AutoSyncIntentStage::Pending),
+            "temporary rejection must return intent stage to Pending"
+        );
+
+        // 5. Subsequent trigger after return to Pending dispatches command once more
+        app.try_trigger_pending_auto_sync();
+        let cmd2 = cmd_rx
+            .try_recv()
+            .expect("trigger after temporary rejection must dispatch WorkerCmd again");
+        assert!(matches!(
+            cmd2,
+            WorkerCmd::SyncPhoneRecentFenced {
+                intent_id: Some(42),
+                ..
+            }
+        ));
+        assert!(matches!(
+            app.pending_auto_sync.as_ref().map(|i| &i.stage),
+            Some(AutoSyncIntentStage::AwaitingAcceptance { .. })
+        ));
+
+        // 6. Acceptance removes pending auto-sync intent
+        app.event_tx
+            .send(GuiEvent::AutoSyncIntentAccepted {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                intent_id: 42,
+                operation_id: 999,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(
+            app.pending_auto_sync.is_none(),
+            "accepted auto-sync intent must be retired"
+        );
+
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn auto_sync_intent_closed_channel_clears_intent_to_prevent_deadlock() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+
+        app.server_config.sync_2_pc_authoritative = true;
+        app.server_config.sync_2_pc.enable = true;
+        app.server_config
+            .sync_2_pc
+            .enable_auto_request_sync_on_log_in_new_device = true;
+        app.server_config.sync_2_pc.auto_sync.enable = true;
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Ready,
+        };
+
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+        drop(cmd_rx); // Channel is closed immediately
+
+        let worker_sender = worker::WorkerSender::new_for_test(cmd_tx, ctx.clone());
+        worker::WORKER_TX.set(worker_sender);
+
+        app.pending_auto_sync = Some(PendingAutoSyncIntent {
+            intent_id: 99,
+            owner: "3001".into(),
+            runtime_id: app.account_runtime_id,
+            source: crate::sync_coordinator::SyncSource::Sync2Recent,
+            stage: AutoSyncIntentStage::Pending,
+        });
+
+        app.try_trigger_pending_auto_sync();
+        assert!(
+            app.pending_auto_sync.is_none(),
+            "closed channel must retire pending intent to prevent deadlocks"
+        );
+
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn mock_worker_mailboxes_are_isolated_between_ui_test_threads() {
+        let ctx = egui::Context::default();
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        worker::WORKER_TX.set(worker::WorkerSender::new_for_test(cmd_tx, ctx.clone()));
+        std::thread::spawn(|| {
+            assert!(worker::WORKER_TX.get().is_none());
+            let (other_tx, _other_rx) = tokio::sync::mpsc::unbounded_channel();
+            worker::WORKER_TX.set(worker::WorkerSender::new_for_test(
+                other_tx,
+                egui::Context::default(),
+            ));
+            worker::WORKER_TX.clear();
+        })
+        .join()
+        .unwrap();
+        worker::WORKER_TX
+            .get()
+            .unwrap()
+            .send(WorkerCmd::RequestQr)
+            .unwrap();
+        assert!(matches!(cmd_rx.try_recv().unwrap(), WorkerCmd::RequestQr));
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn non_bootstrapped_app_keeps_worker_disabled_across_account_transitions() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        worker::WORKER_TX.set(worker::WorkerSender::new_for_test(cmd_tx, ctx.clone()));
+        app.event_tx
+            .send(GuiEvent::ProfileSwitched {
+                session: Box::new(logged_in_session("3002")),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.user_uin, "3002");
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        app.event_tx.send(GuiEvent::LoggedOut).unwrap();
+        app.check_events(&ctx);
+        assert!(!app.is_logged_in);
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn closed_worker_after_dispatch_retires_intent_without_resending_unknown_operation() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+        app.server_config.sync_2_pc_authoritative = true;
+        app.server_config
+            .sync_2_pc
+            .enable_auto_request_sync_on_log_in_new_device = true;
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Ready,
+        };
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        worker::WORKER_TX.set(worker::WorkerSender::new_for_test(cmd_tx, ctx.clone()));
+        app.pending_auto_sync = Some(PendingAutoSyncIntent {
+            intent_id: 100,
+            owner: "3001".into(),
+            runtime_id: app.account_runtime_id,
+            source: crate::sync_coordinator::SyncSource::Sync2Recent,
+            stage: AutoSyncIntentStage::Pending,
+        });
+        app.try_trigger_pending_auto_sync();
+        assert!(matches!(
+            cmd_rx.try_recv().unwrap(),
+            WorkerCmd::SyncPhoneRecentFenced {
+                intent_id: Some(100),
+                ..
+            }
+        ));
+        assert!(matches!(
+            app.pending_auto_sync.as_ref().unwrap().stage,
+            AutoSyncIntentStage::AwaitingAcceptance { .. }
+        ));
+        drop(cmd_rx);
+        app.advance_startup_state(Instant::now(), &ctx);
+        assert!(app.pending_auto_sync.is_none());
+        app.try_trigger_pending_auto_sync();
+        assert!(app.pending_auto_sync.is_none());
+        worker::WORKER_TX.clear();
+    }
+
+    #[test]
+    fn startup_prerequisites_settled_transitions_phase_independently_from_preload() {
+        let ctx = egui::Context::default();
+        let mut app =
+            ZaloGuiApp::from_context(&ctx, logged_in_session("3001"), false, Vec::new(), false);
+
+        app.server_config.o2o.keep_loading_during_preload.enable = true;
+        app.server_config
+            .o2o
+            .keep_loading_during_preload
+            .timeout_duration_ms = 800;
+
+        let t_init = Instant::now() - Duration::from_secs(10);
+        app.startup_state = StartupState::Loading {
+            stage_text: "Checking auth & DB...".into(),
+            started_at: t_init,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: false,
+            settle_deadline: None,
+        };
+
+        // Emit StartupPrerequisitesSettled
+        app.event_tx
+            .send(GuiEvent::StartupPrerequisitesSettled {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                preload_threads: Vec::new(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        match &app.startup_state {
+            StartupState::Loading {
+                prerequisites_settled,
+                started_at,
+                ..
+            } => {
+                assert!(*prerequisites_settled, "prerequisites must be settled");
+                assert!(
+                    *started_at > t_init,
+                    "started_at must be reset to now for optional preload timeout"
+                );
+            }
+            other => {
+                panic!("expected Loading state with prerequisites_settled=true, got {other:?}")
+            }
+        }
+
+        // Preload disabled variant: immediate Ready
+        app.server_config.o2o.keep_loading_during_preload.enable = false;
+        app.startup_state = StartupState::Loading {
+            stage_text: "Checking auth...".into(),
+            started_at: t_init,
+            timeout: Duration::from_millis(800),
+            prerequisites_settled: false,
+            settle_deadline: None,
+        };
+        app.event_tx
+            .send(GuiEvent::StartupPrerequisitesSettled {
+                owner: "3001".into(),
+                runtime_id: app.account_runtime_id,
+                preload_threads: Vec::new(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(
+            app.startup_state,
+            StartupState::Ready,
+            "when keep_loading_during_preload is disabled, settling prerequisites transitions immediately to Ready"
+        );
     }
 }

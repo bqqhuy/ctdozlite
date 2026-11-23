@@ -849,6 +849,9 @@ impl ZaloGuiApp {
         self.sync_state_revision = 0;
         self.sync_suggest_dismissed = false;
         self.sync_error_dismissed = false;
+        self.sync_suggestion_trigger = None;
+        self.sync_suggestion_timer = None;
+        self.pending_auto_sync = None;
         self.history_sync_running = false;
         self.history_sync_status.clear();
         self.refresh_sync_running = false;
@@ -895,6 +898,8 @@ impl ZaloGuiApp {
                     let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
                         owner: self.user_uin.clone(),
                         runtime_id: self.account_runtime_id,
+                        intent_id: None,
+                        origin: crate::sync_coordinator::SyncOrigin::Banner,
                     });
                 }
                 self.phone_sync_running = true;
@@ -903,10 +908,22 @@ impl ZaloGuiApp {
                 true
             }
             crate::gui::sync_banner::SyncBannerAction::RetryFailedSync => {
+                let can_retry = match &self.sync_state {
+                    crate::sync_coordinator::SyncState::Failed { fatal, error } => {
+                        !*fatal && !crate::gui::sync_banner::is_non_retryable_error(error)
+                    }
+                    crate::sync_coordinator::SyncState::Interrupted { retryable, .. } => *retryable,
+                    _ => false,
+                };
+                if !can_retry {
+                    return false;
+                }
                 if let Some(tx) = WORKER_TX.get() {
                     let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
                         owner: self.user_uin.clone(),
                         runtime_id: self.account_runtime_id,
+                        intent_id: None,
+                        origin: crate::sync_coordinator::SyncOrigin::Banner,
                     });
                 }
                 self.phone_sync_running = true;
@@ -1009,6 +1026,8 @@ impl ZaloGuiApp {
             success_until: self.sync_success_until,
             legacy_running,
             legacy_detail,
+            suggestion_trigger: self.sync_suggestion_trigger,
+            sync_config: Some(&self.server_config.sync_2_pc),
         };
         let banner_state =
             crate::gui::sync_banner::resolve_banner_state(&banner_input, &self.sync_state);
@@ -12221,6 +12240,8 @@ mod tests {
             success_until: app.sync_success_until,
             legacy_running: app.phone_sync_running,
             legacy_detail: None,
+            suggestion_trigger: app.sync_suggestion_trigger,
+            sync_config: None,
         };
         let kind =
             crate::gui::sync_banner::resolve_banner_state(&banner_input(&app), &app.sync_state);

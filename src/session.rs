@@ -33,7 +33,7 @@ struct AccountWriteGate {
     changed: std::sync::Condvar,
 }
 
-pub(crate) struct AccountWritePermit {
+pub struct AccountWritePermit {
     gate: Arc<AccountWriteGate>,
 }
 
@@ -560,6 +560,7 @@ pub struct Session {
     pub group_revision: Arc<std::sync::atomic::AtomicU64>,
     pub composer_config: Option<crate::composer_config::ComposerConfig>,
     pub server_config: crate::server_config::ServerConfig,
+    encrypt_param_disabled: Arc<AtomicBool>,
     account_write_gate: Arc<AccountWriteGate>,
     active: Arc<AtomicBool>,
     pub http: Client,
@@ -664,6 +665,7 @@ impl Session {
             group_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             composer_config: None,
             server_config: crate::server_config::ServerConfig::default(),
+            encrypt_param_disabled: Arc::new(AtomicBool::new(false)),
             account_write_gate: Arc::new(AccountWriteGate::default()),
             active: Arc::new(AtomicBool::new(true)),
             http,
@@ -954,6 +956,7 @@ impl Session {
         self.account_write_gate.seal();
         self.account_write_gate = Arc::new(AccountWriteGate::default());
         self.active = Arc::new(AtomicBool::new(true));
+        self.encrypt_param_disabled = Arc::new(AtomicBool::new(false));
         self.runtime_generation = next_runtime_generation();
         self.composer_config = None;
         self.server_config = crate::server_config::ServerConfig::default();
@@ -1011,7 +1014,7 @@ impl Session {
 
     /// Acquire inside the blocking closure, immediately before touching account-local storage.
     /// Serializes concurrent writers per runtime; keep alive until every SQLite/cache write in that closure is done.
-    pub(crate) fn begin_account_write_blocking(&self) -> anyhow::Result<AccountWritePermit> {
+    pub fn begin_account_write_blocking(&self) -> anyhow::Result<AccountWritePermit> {
         self.account_write_gate.admit(&self.active)
     }
 
@@ -1291,6 +1294,23 @@ impl Session {
         format!("params={}", urlencode(&v.to_string()))
     }
 
+    /// Whether outbound parameter encryption is enabled for this session.
+    pub fn encrypt_param_enabled(&self) -> bool {
+        self.server_config.enable_encrypt_param
+            && !self.encrypt_param_disabled.load(Ordering::Acquire)
+    }
+
+    /// Handles an API error code. When the server signals 19000, disables `enable_encrypt_param`
+    /// in parity with Zalo PC native handler (`compact-app-pc.js:20326324`).
+    pub fn handle_api_error_code(&self, error_code: i64) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        if error_code == 19000 {
+            self.encrypt_param_disabled.store(true, Ordering::Release);
+        }
+    }
+
     /// Rewrite a media/file download URL according to the active `download_domains_swap` policy.
     pub fn rewrite_download_url(&self, raw: &str) -> String {
         self.server_config.download_domains_swap.rewrite_url(raw)
@@ -1306,6 +1326,9 @@ impl Session {
         }
         let data = payload.get("data").unwrap_or(payload);
         self.server_config.apply_payload(payload);
+        if crate::server_config::ServerConfig::contains_encrypt_param_config(payload) {
+            self.encrypt_param_disabled.store(false, Ordering::Release);
+        }
         if let Some(cfg) = crate::composer_config::ComposerConfig::from_server_info(payload)
             .or_else(|| crate::composer_config::ComposerConfig::from_login_config(data))
             .or_else(|| {
@@ -1908,6 +1931,11 @@ impl Session {
     /// `decryptResp` — when the request was param-encrypted, `data` comes back as
     /// base64 AES over the key (AES-128 or AES-256), not plain JSON.
     pub async fn maybe_decrypt(&self, v: Value, key: &[u8]) -> Value {
+        // Inspect raw envelope for cipher fallback error 19000
+        if let Some(code) = v.get("error_code").and_then(crate::api_response::integer) {
+            self.handle_api_error_code(code);
+        }
+
         let Some(data) = v.get("data") else {
             return v;
         };
@@ -1927,7 +1955,13 @@ impl Session {
                         eprintln!("  data decrypted ({} bytes)", pt.len());
                     }
                     // The decrypted payload is itself a full response envelope with its
-                    // own error_code — propagate it instead of masking as success.
+                    // own error_code — inspect for 19000 and propagate instead of masking as success.
+                    if let Some(code) = inner
+                        .get("error_code")
+                        .and_then(crate::api_response::integer)
+                    {
+                        self.handle_api_error_code(code);
+                    }
                     inner
                 }
                 Err(e) => {
@@ -3266,8 +3300,12 @@ mod runtime_generation_tests {
                         },
                         "download_domains_swap": {
                             "enabled": true,
-                            "domains_map": { "f1.zdn.vn": "f2.zdn.vn" },
-                            "mode": 2
+                            "domains_map": {
+                                "f1.zdn.vn": {
+                                    "to": "f2.zdn.vn",
+                                    "mode": 1
+                                }
+                            }
                         },
                         "sync_2_pc": {
                             "enable_auto_request_sync_on_log_in_new_device": true,
@@ -3319,6 +3357,114 @@ mod runtime_generation_tests {
         );
     }
 
+    #[tokio::test]
+    async fn error_19000_disables_encrypt_param_on_raw_and_decrypted_and_propagates_across_clones()
+    {
+        let session = Session::new(false, false, false).unwrap();
+        assert!(session.encrypt_param_enabled());
+
+        // Clone inherits shared atomic disabled flag
+        let session_clone = session.clone();
+
+        // 1. Raw response with error_code: 19000 disables encrypt_param
+        let raw_resp = serde_json::json!({
+            "error_code": 19000,
+            "error_message": "Cipher v2 unsupported or downgraded"
+        });
+        let _ = session.maybe_decrypt(raw_resp, b"fake-key-16-byte").await;
+        assert!(!session.encrypt_param_enabled());
+        assert!(!session_clone.encrypt_param_enabled());
+
+        // Reset via apply_server_info
+        let mut session_mut = session.clone();
+        session_mut.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "setttings": {
+                    "features": {
+                        "enable_encrypt_param": true
+                    }
+                }
+            }
+        }));
+        assert!(session_mut.encrypt_param_enabled());
+
+        // 2. Encrypted payload whose inner decrypted envelope contains error_code: 19000
+        let key = b"1234567890123456";
+        let inner_json = serde_json::json!({
+            "error_code": 19000,
+            "error_message": "inner cipher fallback"
+        })
+        .to_string();
+        let enc_b64 = crate::crypto::encode_aes(key, &inner_json).unwrap();
+        let enc_resp = serde_json::json!({
+            "error_code": 0,
+            "data": enc_b64
+        });
+        let decrypted = session_mut.maybe_decrypt(enc_resp, key).await;
+        assert_eq!(decrypted["error_code"], 19000);
+        assert!(!session_mut.encrypt_param_enabled());
+    }
+
+    #[test]
+    fn test_encrypt_param_isolation_across_runtime_and_logout() {
+        let mut session = Session::new(false, false, false).unwrap();
+        assert!(session.encrypt_param_enabled());
+
+        // Clones in the same runtime share the atomic flag
+        let same_runtime_clone = session.clone();
+        assert!(same_runtime_clone.encrypt_param_enabled());
+
+        // 19000 error received in active runtime disables encrypt_param for all clones
+        session.handle_api_error_code(19000);
+        assert!(!session.encrypt_param_enabled());
+        assert!(!same_runtime_clone.encrypt_param_enabled());
+
+        // Empty metadata does NOT reset encrypt_param_disabled
+        session.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {}
+        }));
+        assert!(!session.encrypt_param_enabled());
+
+        // Metadata with unrelated fields does NOT reset encrypt_param_disabled
+        session.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "zpw_service_map_v3": {}
+            }
+        }));
+        assert!(!session.encrypt_param_enabled());
+
+        // Logout allocates a fresh encrypt_param_disabled atomic flag and revokes old runtime
+        session.logout();
+        assert!(session.encrypt_param_enabled());
+        assert!(!same_runtime_clone.is_active());
+
+        // Stale clone receiving 19000 cannot affect the new runtime (both via active guard and separate Arc)
+        same_runtime_clone.handle_api_error_code(19000);
+        assert!(session.encrypt_param_enabled());
+
+        // New clone inherits the new runtime's flag
+        let new_clone = session.clone();
+        assert!(new_clone.encrypt_param_enabled());
+
+        // New runtime clone receiving 19000 disables encrypt_param for new runtime
+        new_clone.handle_api_error_code(19000);
+        assert!(!session.encrypt_param_enabled());
+        assert!(!new_clone.encrypt_param_enabled());
+
+        // Applying server info with explicit enable_encrypt_param config resets the flag
+        session.apply_server_info(&serde_json::json!({
+            "error_code": 0,
+            "data": {
+                "enable_encrypt_param": true
+            }
+        }));
+        assert!(session.encrypt_param_enabled());
+        assert!(new_clone.encrypt_param_enabled());
+    }
+
     #[test]
     fn load_from_file_resets_server_and_composer_config_to_defaults() {
         let mut session = Session::new(false, false, false).unwrap();
@@ -3336,8 +3482,12 @@ mod runtime_generation_tests {
                         },
                         "download_domains_swap": {
                             "enabled": true,
-                            "domains_map": { "f1.zdn.vn": "f2.zdn.vn" },
-                            "mode": 1
+                            "domains_map": {
+                                "f1.zdn.vn": {
+                                    "to": "f2.zdn.vn",
+                                    "mode": 1
+                                }
+                            }
                         }
                     }
                 }

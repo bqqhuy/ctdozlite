@@ -173,6 +173,93 @@ pub async fn login_by_password_v1(s: &mut Session, phone: &str, password: &str) 
     Ok(resp)
 }
 
+/// Build the `signInPasswordV2` payload (`g` in compact-app-pc bundle).
+///
+/// When `encrypt_param == true`:
+///   - Generates an 8-character CSPRNG `salt`.
+///   - Encrypts password: `pwd = encrypt_password(phone, imei, password, &salt)`.
+///   - Includes `"password": json!(pwd)` and `"salt": json!(salt)`.
+///
+/// When `encrypt_param == false`:
+///   - Uses raw password: `"password": json!(password)`.
+///   - Strictly omits `"salt"` (parity with Zalo PC `signInPasswordV2` E2).
+pub fn build_login_payload(
+    phone: &str,
+    password: &str,
+    iso: &str,
+    imei: &str,
+    computer_name: &str,
+    encrypt_param: bool,
+) -> Result<Value> {
+    build_login_payload_inner(
+        phone,
+        password,
+        iso,
+        imei,
+        computer_name,
+        encrypt_param,
+        None,
+    )
+}
+
+pub(crate) fn build_login_payload_inner(
+    phone: &str,
+    password: &str,
+    iso: &str,
+    imei: &str,
+    computer_name: &str,
+    encrypt_param: bool,
+    explicit_salt: Option<&str>,
+) -> Result<Value> {
+    if encrypt_param {
+        let salt = match explicit_salt {
+            Some(s) => s.to_string(),
+            None => random_salt()?,
+        };
+        let pwd = encrypt_password(phone, imei, password, &salt)?;
+        Ok(obj(&[
+            ("phone_num", json!(phone)),
+            ("iso_country_code", json!(iso)),
+            ("password", json!(pwd)),
+            ("salt", json!(salt)),
+            ("cptch_token", json!("")),
+            ("cptch_answer", json!("")),
+            ("make_answer", json!(0)),
+            ("language", json!("en")),
+            ("logged_uids", json!(null)),
+            ("computer_name", json!(computer_name)),
+            ("imei", json!(imei)),
+        ]))
+    } else {
+        Ok(obj(&[
+            ("phone_num", json!(phone)),
+            ("iso_country_code", json!(iso)),
+            ("password", json!(password)),
+            ("cptch_token", json!("")),
+            ("cptch_answer", json!("")),
+            ("make_answer", json!(0)),
+            ("language", json!("en")),
+            ("logged_uids", json!(null)),
+            ("computer_name", json!(computer_name)),
+            ("imei", json!(imei)),
+        ]))
+    }
+}
+
+/// Build request body for `loginByPasswv2` using the given cipher policy.
+pub fn build_login_body(
+    phone: &str,
+    password: &str,
+    iso: &str,
+    imei: &str,
+    computer_name: &str,
+    encrypt_param: bool,
+    cipher: &ParamCipher,
+) -> Result<Value> {
+    let payload = build_login_payload(phone, password, iso, imei, computer_name, encrypt_param)?;
+    cipher.build_body_with_policy(ZPW_TYPE, ZPW_VER, &payload, "loginbypasswv2", encrypt_param)
+}
+
 /// `POST {auth}/api/login/loginByPasswv2` — ParamCipher v2 body.
 ///
 /// [O] Exact bundle flow (`signInPasswordV2`):
@@ -192,57 +279,55 @@ pub async fn login_by_password(
     password: &str,
     iso: &str,
 ) -> Result<Value> {
-    let salt = random_salt()?;
-    let pwd = encrypt_password(phone, &s.imei, password, &salt)?;
     let client_time = unix_now();
+    let mut encrypt_param = s.encrypt_param_enabled();
+    let mut retried = false;
 
-    // Field order and set must match `g` exactly — the signkey hashes sorted values.
-    //
-    // `logged_uids` is passed as the caller's value; the real client sends the stored
-    // uid list, and `null` when there is none. Sending the string "[]" changes both the
-    // signed payload and what the server expects to see.
-    let payload = obj(&[
-        ("phone_num", json!(phone)),
-        ("iso_country_code", json!(iso)),
-        ("password", json!(pwd)),
-        ("salt", json!(salt)),
-        ("cptch_token", json!("")),
-        ("cptch_answer", json!("")),
-        ("make_answer", json!(0)),
-        ("language", json!("en")),
-        ("logged_uids", json!(null)),
-        ("computer_name", json!(s.computer_name)),
-        ("imei", json!(s.imei)),
-    ]);
+    loop {
+        let cipher = ParamCipher::new(ZPW_TYPE, &s.imei, client_time)?;
+        let body = build_login_body(
+            phone,
+            password,
+            iso,
+            &s.imei,
+            &s.computer_name,
+            encrypt_param,
+            &cipher,
+        )?;
 
-    let cipher = ParamCipher::new(ZPW_TYPE, &s.imei, client_time)?;
-    let body = cipher.build_body(ZPW_TYPE, ZPW_VER, &payload, "loginbypasswv2")?;
+        // Signed set only — no `enk`, no `ref` (both are outside the hash server-side).
+        let query = flatten_query(&body);
+        let url = format!(
+            "{}/api/login/loginByPasswv2?{query}&ref={}",
+            s.domains.auth,
+            urlencode(crate::endpoints::WEB_BASE)
+        );
 
-    // Signed set only — no `enk`, no `ref` (both are outside the hash server-side).
-    let query = flatten_query(&body);
-    let url = format!(
-        "{}/api/login/loginByPasswv2?{query}&ref={}",
-        s.domains.auth,
-        urlencode(crate::endpoints::WEB_BASE)
-    );
+        let resp = s.post_form(&url, String::new()).await?;
+        let resp = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
 
-    let resp = s.post_form(&url, String::new()).await?;
-    let resp = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+        // Surface an error code hidden inside the encrypted envelope.
+        let code = resp.get("error_code").and_then(|c| c.as_i64()).unwrap_or(0);
+        if code == 19000 && encrypt_param && !retried {
+            s.handle_api_error_code(19000);
+            encrypt_param = false;
+            retried = true;
+            continue;
+        }
 
-    // Surface an error code hidden inside the encrypted envelope.
-    let code = resp.get("error_code").and_then(|c| c.as_i64()).unwrap_or(0);
-    if code != 0 {
-        let msg = resp
-            .get("error_message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
-        anyhow::bail!("login error {code}: {msg}");
+        if code != 0 {
+            let msg = resp
+                .get("error_message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            anyhow::bail!("login error {code}: {msg}");
+        }
+
+        if let Some(cfg) = resp.get("data") {
+            apply_login_config(s, cfg);
+        }
+        return Ok(resp);
     }
-
-    if let Some(cfg) = resp.get("data") {
-        apply_login_config(s, cfg);
-    }
-    Ok(resp)
 }
 
 /// `_constructUrlParams(obj)` — flatten a JSON object into `k=v&k=v`.
@@ -271,34 +356,59 @@ pub async fn get_login_info(s: &Session) -> Result<Value> {
         ("language", json!("vi")),
         ("ts", json!(client_time)),
     ]);
-    let cipher = ParamCipher::new(ZPW_TYPE, &s.imei, client_time)?;
-    let body = cipher.build_body(ZPW_TYPE, ZPW_VER, &payload, "getlogininfo")?;
-    let query = flatten_query(&body);
 
-    // Try both auth host (wpa.zaloapp.com, where PC session cookies live)
-    // and wpa_chat (wpa.chat.zalo.me, where web session cookies live).
-    let hosts = [&s.domains.auth, &s.domains.wpa_chat];
-    let mut last_err = anyhow::anyhow!("get_login_info failed on all hosts");
+    let mut encrypt_param = s.encrypt_param_enabled();
+    let mut retried = false;
 
-    for host in hosts {
-        let url = format!("{host}/api/login/getLoginInfo?{query}&nretry=0");
-        match s.get(&url).await {
-            Ok(resp) => {
-                let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
-                let code = decrypted
-                    .get("error_code")
-                    .and_then(|c| c.as_i64())
-                    .unwrap_or(0);
-                if code == 0 {
-                    return Ok(decrypted);
+    loop {
+        let cipher = ParamCipher::new(ZPW_TYPE, &s.imei, client_time)?;
+        let body = cipher.build_body_with_policy(
+            ZPW_TYPE,
+            ZPW_VER,
+            &payload,
+            "getlogininfo",
+            encrypt_param,
+        )?;
+        let query = flatten_query(&body);
+
+        // Try both auth host (wpa.zaloapp.com, where PC session cookies live)
+        // and wpa_chat (wpa.chat.zalo.me, where web session cookies live).
+        let hosts = [&s.domains.auth, &s.domains.wpa_chat];
+        let mut last_err = anyhow::anyhow!("get_login_info failed on all hosts");
+        let mut saw_19000 = false;
+
+        for host in hosts {
+            let url = format!("{host}/api/login/getLoginInfo?{query}&nretry=0");
+            match s.get(&url).await {
+                Ok(resp) => {
+                    let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+                    let code = decrypted
+                        .get("error_code")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
+                    if code == 0 {
+                        return Ok(decrypted);
+                    }
+                    if code == 19000 {
+                        s.handle_api_error_code(19000);
+                        saw_19000 = true;
+                        break;
+                    }
+                }
+                Err(e) => {
+                    last_err = e;
                 }
             }
-            Err(e) => {
-                last_err = e;
-            }
         }
+
+        if saw_19000 && encrypt_param && !retried {
+            encrypt_param = false;
+            retried = true;
+            continue;
+        }
+
+        return Err(last_err);
     }
-    Err(last_err)
 }
 
 /// Pull `dkey` / `zpw_enk` / domains out of a login response payload.
@@ -511,5 +621,146 @@ mod tests {
         assert!(!manager.is_current(attempt_1));
         assert!(!manager.is_current(attempt_2));
         assert!(manager.is_current(attempt_3));
+    }
+
+    #[test]
+    fn test_build_login_payload_encrypted_branch() {
+        let phone = "0912345678";
+        let password = "super_secret_password";
+        let iso = "VN";
+        let imei = "fake-imei-123";
+        let computer_name = "test-pc";
+
+        let payload = build_login_payload(phone, password, iso, imei, computer_name, true).unwrap();
+        assert_eq!(payload["phone_num"], phone);
+        assert_eq!(payload["iso_country_code"], iso);
+        assert_eq!(payload["cptch_token"], "");
+        assert_eq!(payload["cptch_answer"], "");
+        assert_eq!(payload["make_answer"], 0);
+        assert_eq!(payload["language"], "en");
+        assert!(payload["logged_uids"].is_null());
+        assert_eq!(payload["computer_name"], computer_name);
+        assert_eq!(payload["imei"], imei);
+
+        // Salt must be present, exactly 8 characters
+        let salt = payload
+            .get("salt")
+            .and_then(Value::as_str)
+            .expect("salt must be present");
+        assert_eq!(salt.len(), 8);
+
+        // Password must be encrypted (not raw password)
+        let pwd = payload
+            .get("password")
+            .and_then(Value::as_str)
+            .expect("password must be present");
+        assert_ne!(pwd, password);
+
+        // Verify password matches encrypt_password with this salt
+        let expected_pwd = encrypt_password(phone, imei, password, salt).unwrap();
+        assert_eq!(pwd, expected_pwd);
+    }
+
+    #[test]
+    fn test_build_login_payload_unencrypted_branch_omits_salt() {
+        let phone = "0912345678";
+        let password = "super_secret_password";
+        let iso = "VN";
+        let imei = "fake-imei-123";
+        let computer_name = "test-pc";
+
+        let payload =
+            build_login_payload(phone, password, iso, imei, computer_name, false).unwrap();
+        assert_eq!(payload["phone_num"], phone);
+        assert_eq!(payload["iso_country_code"], iso);
+        assert_eq!(payload["cptch_token"], "");
+        assert_eq!(payload["cptch_answer"], "");
+        assert_eq!(payload["make_answer"], 0);
+        assert_eq!(payload["language"], "en");
+        assert!(payload["logged_uids"].is_null());
+        assert_eq!(payload["computer_name"], computer_name);
+        assert_eq!(payload["imei"], imei);
+
+        // Crucial invariant: salt MUST NOT be present
+        assert!(
+            payload.get("salt").is_none(),
+            "salt must be omitted when encrypt_param is false"
+        );
+
+        // Password must be the raw password
+        assert_eq!(payload["password"], password);
+    }
+
+    #[test]
+    fn test_build_login_body_encrypted_and_unencrypted_and_fallback_simulation() {
+        let phone = "0912345678";
+        let password = "super_secret_password";
+        let iso = "VN";
+        let imei = "fake-imei-123";
+        let computer_name = "test-pc";
+        let client_time = 1700000000;
+
+        let cipher = ParamCipher::new(ZPW_TYPE, imei, client_time).unwrap();
+
+        // 1. Encrypted branch: body contains "params" envelope and signkey
+        let body_enc =
+            build_login_body(phone, password, iso, imei, computer_name, true, &cipher).unwrap();
+        assert!(body_enc.get("params").is_some());
+        assert!(body_enc.get("signkey").is_some());
+        assert_eq!(body_enc["type"], ZPW_TYPE);
+        assert_eq!(body_enc["client_version"], ZPW_VER);
+        // Envelope does not leak raw fields at top-level
+        assert!(body_enc.get("phone_num").is_none());
+        assert!(body_enc.get("password").is_none());
+        assert!(body_enc.get("salt").is_none());
+
+        // 2. Unencrypted branch: body has raw fields, raw password, NO salt, plus signkey
+        let body_unenc =
+            build_login_body(phone, password, iso, imei, computer_name, false, &cipher).unwrap();
+        assert!(body_unenc.get("params").is_none());
+        assert_eq!(body_unenc["phone_num"], phone);
+        assert_eq!(body_unenc["password"], password);
+        assert!(
+            body_unenc.get("salt").is_none(),
+            "salt must not appear in unencrypted body"
+        );
+        assert_eq!(body_unenc["type"], ZPW_TYPE);
+        assert_eq!(body_unenc["client_version"], ZPW_VER);
+        assert!(body_unenc.get("signkey").is_some());
+
+        // 3. Fallback progression: simulating 19000
+        let session = Session::new(false, false, false).unwrap();
+        assert!(session.encrypt_param_enabled());
+
+        let mut encrypt_param = session.encrypt_param_enabled();
+        let payload_1 = build_login_payload(
+            phone,
+            password,
+            iso,
+            &session.imei,
+            &session.computer_name,
+            encrypt_param,
+        )
+        .unwrap();
+        assert!(payload_1.get("salt").is_some());
+        assert_ne!(payload_1["password"], password);
+
+        // Server returns 19000
+        let simulated_error_code = 19000;
+        session.handle_api_error_code(simulated_error_code);
+        assert!(!session.encrypt_param_enabled());
+
+        encrypt_param = session.encrypt_param_enabled();
+        let payload_2 = build_login_payload(
+            phone,
+            password,
+            iso,
+            &session.imei,
+            &session.computer_name,
+            encrypt_param,
+        )
+        .unwrap();
+        assert!(payload_2.get("salt").is_none());
+        assert_eq!(payload_2["password"], password);
     }
 }

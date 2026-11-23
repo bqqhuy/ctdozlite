@@ -6,7 +6,7 @@ use std::time::Instant;
 use eframe::egui::{self, Color32, Margin, RichText, Rounding, Stroke, Vec2};
 
 use crate::gui::theme::ThemePalette;
-use crate::sync_coordinator::{SyncAvailability, SyncState, SyncTransferStage};
+use crate::sync_coordinator::{SyncState, SyncTransferStage};
 
 // ----------------------------------------------------------------------------
 // Authoritative Zalo PC native string keys and Vietnamese display labels
@@ -61,11 +61,41 @@ impl SyncBannerFencing {
     }
 }
 
+/// Suggestion triggers recognized by Zalo PC native (`canShowSyncSuggestion`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SyncSuggestionTrigger {
+    NewLogIn,
+    ChangeDevice,
+    QueueEvict,
+    Persisted,
+}
+
+/// Detects errors that must not offer retry (e.g. database migration, permission denied, fatal, revoked).
+pub fn is_non_retryable_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("dbmigrat")
+        || lower.contains("permissiondenied")
+        || lower.contains("quyền bị từ chối")
+        || lower.contains("sessionexpired")
+        || lower.contains("hết hạn")
+        || lower.contains("revoked")
+        || lower.contains("thu hồi")
+        || lower.contains("unsupported_version")
+        || lower.contains("không tương thích")
+        || lower.contains("device_rejected")
+        || lower.contains("fatal")
+        || lower.contains("corrupt")
+}
+
 /// Typed representation of the eight distinct banner states in Zalo PC V2 (`pA`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum SyncBannerKind {
     /// Suggesting synchronization to the user.
-    Suggest,
+    Suggest {
+        title: Option<String>,
+        cta: Option<String>,
+    },
     /// Waiting for user confirmation on mobile device with timeout deadline.
     WaitConfirmation { timeout_at: Instant },
     /// Preparing synchronization metadata and connection.
@@ -99,9 +129,10 @@ impl SyncBannerKind {
         )
     }
 
-    pub fn title(&self) -> &'static str {
+    pub fn title(&self) -> &str {
         match self {
-            Self::Suggest => STR_SYNC_BANNER_COMPACT_SUGGEST_TITLE,
+            Self::Suggest { title: Some(t), .. } => t.as_str(),
+            Self::Suggest { title: None, .. } => STR_SYNC_BANNER_COMPACT_SUGGEST_TITLE,
             Self::WaitConfirmation { .. } => "Chờ xác nhận từ điện thoại…",
             Self::Preparing => "Đang chuẩn bị đồng bộ…",
             Self::SyncingConvListRecent { .. } => STR_SYNC_IN_PROGRESS_BANNER_LABEL,
@@ -136,14 +167,17 @@ pub struct SyncBannerInput<'a> {
     pub success_until: Option<Instant>,
     pub legacy_running: bool,
     pub legacy_detail: Option<&'a str>,
+    pub suggestion_trigger: Option<SyncSuggestionTrigger>,
+    pub sync_config: Option<&'a crate::server_config::Sync2PcConfig>,
 }
 
 /// Pure state resolver that determines the active banner kind according to Zalo PC native rules.
 ///
 /// Invariant:
 /// - If `!is_logged_in` or `popup_visible`, returns `None` (Popup Suppression Invariant).
-/// - Error takes priority over idle/interrupted.
+/// - Error takes priority over idle/interrupted. Non-retryable errors suppress retry CTA.
 /// - Success is shown until `success_until` deadline.
+/// - Idle only suggests when a valid trigger is active and allowed by server config.
 /// - Percentages are never fabricated when the denominator is unknown.
 pub(super) fn resolve_banner_state(
     input: &SyncBannerInput<'_>,
@@ -154,12 +188,24 @@ pub(super) fn resolve_banner_state(
         return None;
     }
 
+    // New banner v2 gate: when new_banner_sync_v2 is explicitly disabled, do not render banner v2
+    if let Some(cfg) = input.sync_config {
+        if !cfg.new_banner_sync_v2 {
+            return None;
+        }
+    }
+
     // 1. Error state (sA in native)
-    if let SyncState::Failed { error, .. } = sync_state {
+    if let SyncState::Failed { error, fatal } = sync_state {
         if !input.error_dismissed {
+            let can_retry = if *fatal {
+                false
+            } else {
+                !is_non_retryable_error(error)
+            };
             return Some(SyncBannerKind::Error {
                 message: error.clone(),
-                can_retry: true,
+                can_retry,
             });
         }
     }
@@ -230,16 +276,50 @@ pub(super) fn resolve_banner_state(
         });
     }
 
-    // 5. Suggest state (AA in native)
-    if (matches!(
-        sync_state,
-        SyncState::Idle {
-            availability: SyncAvailability::Ready
+    // 5. Suggest state (AA in native: canShowSyncSuggestion)
+    if let SyncState::Idle { availability } = sync_state {
+        if availability.is_ready() && !input.suggest_dismissed {
+            if let Some(trigger) = input.suggestion_trigger {
+                let enabled = match input.sync_config {
+                    Some(cfg) => {
+                        cfg.enable
+                            && match trigger {
+                                SyncSuggestionTrigger::NewLogIn => {
+                                    cfg.sync_suggestion_zalopc.new_log_in
+                                }
+                                SyncSuggestionTrigger::ChangeDevice => {
+                                    cfg.sync_suggestion_zalopc.change_device
+                                }
+                                SyncSuggestionTrigger::QueueEvict => {
+                                    cfg.sync_suggestion_zalopc.queue_evict
+                                }
+                                SyncSuggestionTrigger::Persisted => true,
+                            }
+                    }
+                    None => true,
+                };
+                if enabled {
+                    let (title, cta) = match input.sync_config {
+                        Some(cfg) => {
+                            let text = &cfg.sync_suggestion_zalopc.banner_text;
+                            let title = if !text.title.vi.is_empty() {
+                                Some(text.title.vi.clone())
+                            } else {
+                                None
+                            };
+                            let cta = if !text.cta.vi.is_empty() {
+                                Some(text.cta.vi.clone())
+                            } else {
+                                None
+                            };
+                            (title, cta)
+                        }
+                        None => (None, None),
+                    };
+                    return Some(SyncBannerKind::Suggest { title, cta });
+                }
+            }
         }
-    ) || matches!(sync_state, SyncState::Idle { .. }))
-        && !input.suggest_dismissed
-    {
-        return Some(SyncBannerKind::Suggest);
     }
 
     None
@@ -342,7 +422,7 @@ pub(super) fn render_sync_banner(
                 )
             }
         }
-        SyncBannerKind::Suggest => (pal.bg_elevated, pal.border, "↺"),
+        SyncBannerKind::Suggest { .. } => (pal.bg_elevated, pal.border, "↺"),
     };
 
     let avail_width = ui.available_width().max(1.0);
@@ -372,8 +452,10 @@ pub(super) fn render_sync_banner(
                 }
 
                 // 2. Action button width reservation
-                let has_cta =
-                    matches!(kind, SyncBannerKind::Suggest | SyncBannerKind::Error { .. });
+                let has_cta = matches!(
+                    kind,
+                    SyncBannerKind::Suggest { .. } | SyncBannerKind::Error { .. }
+                );
                 let has_stop =
                     kind.is_running() || matches!(kind, SyncBannerKind::Interrupted { .. });
                 let action_width = if has_cta {
@@ -439,14 +521,13 @@ pub(super) fn render_sync_banner(
 
                 // 4. CTA / Stop button
                 match kind {
-                    SyncBannerKind::Suggest => {
-                        let btn = egui::Button::new(
-                            RichText::new(STR_SYNC_BANNER_COMPACT_SUGGEST_CTA)
-                                .size(11.0)
-                                .strong(),
-                        )
-                        .fill(pal.primary)
-                        .small();
+                    SyncBannerKind::Suggest { cta, .. } => {
+                        let cta_label = cta
+                            .as_deref()
+                            .unwrap_or(STR_SYNC_BANNER_COMPACT_SUGGEST_CTA);
+                        let btn = egui::Button::new(RichText::new(cta_label).size(11.0).strong())
+                            .fill(pal.primary)
+                            .small();
                         if ui.add(btn).clicked() {
                             triggered_action = Some(SyncBannerAction::StartSuggestSync);
                         }
@@ -480,7 +561,7 @@ pub(super) fn render_sync_banner(
                 // 5. Close [x] button with state-specific semantics
                 let close_tooltip = match kind {
                     SyncBannerKind::Error { .. } => "Đóng và xóa thông báo lỗi",
-                    SyncBannerKind::Suggest => "Ẩn gợi ý đồng bộ",
+                    SyncBannerKind::Suggest { .. } => "Ẩn gợi ý đồng bộ",
                     SyncBannerKind::Success { .. } => "Đóng thông báo",
                     _ => "Dừng đồng bộ",
                 };
@@ -501,6 +582,7 @@ pub(super) fn render_sync_banner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync_coordinator::SyncAvailability;
     use std::time::Duration;
 
     #[allow(clippy::too_many_arguments)]
@@ -522,6 +604,8 @@ mod tests {
             success_until,
             legacy_running,
             legacy_detail,
+            suggestion_trigger: Some(SyncSuggestionTrigger::NewLogIn),
+            sync_config: None,
         };
         resolve_banner_state(&input, sync_state)
     }
@@ -556,8 +640,35 @@ mod tests {
         };
         assert_eq!(
             test_resolve(true, false, false, false, None, &idle_state, false, None),
-            Some(SyncBannerKind::Suggest)
+            Some(SyncBannerKind::Suggest {
+                title: None,
+                cta: None
+            })
         );
+        // Idle when Unavailable MUST NEVER show Suggest banner
+        let unavail_state = SyncState::Idle {
+            availability: SyncAvailability::Unavailable(
+                crate::sync_coordinator::SyncUnavailableReason::WorkerNotReady,
+            ),
+        };
+        assert_eq!(
+            test_resolve(true, false, false, false, None, &unavail_state, false, None),
+            None
+        );
+        // Idle when trigger is None MUST NEVER show Suggest banner
+        let no_trigger_input = SyncBannerInput {
+            is_logged_in: true,
+            popup_visible: false,
+            suggest_dismissed: false,
+            error_dismissed: false,
+            success_until: None,
+            legacy_running: false,
+            legacy_detail: None,
+            suggestion_trigger: None,
+            sync_config: None,
+        };
+        assert_eq!(resolve_banner_state(&no_trigger_input, &idle_state), None);
+
         // Dismissing suggest hides it
         assert_eq!(
             test_resolve(true, false, true, false, None, &idle_state, false, None),
@@ -713,8 +824,104 @@ mod tests {
                 false,
                 None
             ),
-            Some(SyncBannerKind::Suggest)
+            Some(SyncBannerKind::Suggest {
+                title: None,
+                cta: None,
+            })
         );
+    }
+
+    #[test]
+    fn non_retryable_errors_suppress_retry_button() {
+        let fatal_state = SyncState::Failed {
+            error: "SQLite migration failed (DbMigrating)".to_string(),
+            fatal: true,
+        };
+        let res = test_resolve(true, false, false, false, None, &fatal_state, false, None);
+        assert_eq!(
+            res,
+            Some(SyncBannerKind::Error {
+                message: "SQLite migration failed (DbMigrating)".to_string(),
+                can_retry: false,
+            })
+        );
+
+        // Even with a generic error message, if fatal: true, can_retry MUST BE false!
+        let generic_fatal = SyncState::Failed {
+            error: "something went wrong".to_string(),
+            fatal: true,
+        };
+        let res2 = test_resolve(true, false, false, false, None, &generic_fatal, false, None);
+        assert_eq!(
+            res2,
+            Some(SyncBannerKind::Error {
+                message: "something went wrong".to_string(),
+                can_retry: false,
+            })
+        );
+    }
+
+    #[test]
+    fn new_banner_sync_v2_flag_gates_banner_rendering() {
+        let cfg = crate::server_config::Sync2PcConfig {
+            new_banner_sync_v2: false,
+            ..Default::default()
+        };
+        let idle_state = SyncState::Idle {
+            availability: SyncAvailability::Ready,
+        };
+        let input = SyncBannerInput {
+            is_logged_in: true,
+            popup_visible: false,
+            suggest_dismissed: false,
+            error_dismissed: false,
+            success_until: None,
+            legacy_running: false,
+            legacy_detail: None,
+            suggestion_trigger: Some(SyncSuggestionTrigger::NewLogIn),
+            sync_config: Some(&cfg),
+        };
+        assert_eq!(
+            resolve_banner_state(&input, &idle_state),
+            None,
+            "new_banner_sync_v2 = false must suppress banner v2"
+        );
+    }
+
+    #[test]
+    fn custom_banner_text_and_triggers_respected() {
+        let mut cfg = crate::server_config::Sync2PcConfig::default();
+        cfg.sync_suggestion_zalopc.banner_text.title.vi = "Đồng bộ từ điện thoại của bạn".into();
+        cfg.sync_suggestion_zalopc.banner_text.cta.vi = "Bắt đầu".into();
+        cfg.sync_suggestion_zalopc.change_device = false;
+
+        let idle_state = SyncState::Idle {
+            availability: SyncAvailability::Ready,
+        };
+        let input_new = SyncBannerInput {
+            is_logged_in: true,
+            popup_visible: false,
+            suggest_dismissed: false,
+            error_dismissed: false,
+            success_until: None,
+            legacy_running: false,
+            legacy_detail: None,
+            suggestion_trigger: Some(SyncSuggestionTrigger::NewLogIn),
+            sync_config: Some(&cfg),
+        };
+        assert_eq!(
+            resolve_banner_state(&input_new, &idle_state),
+            Some(SyncBannerKind::Suggest {
+                title: Some("Đồng bộ từ điện thoại của bạn".into()),
+                cta: Some("Bắt đầu".into()),
+            })
+        );
+
+        let input_change = SyncBannerInput {
+            suggestion_trigger: Some(SyncSuggestionTrigger::ChangeDevice),
+            ..input_new
+        };
+        assert_eq!(resolve_banner_state(&input_change, &idle_state), None);
     }
 
     #[test]

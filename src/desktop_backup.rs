@@ -33,6 +33,11 @@ struct Asset {
     size: u64,
     name: String,
 }
+
+#[doc(hidden)]
+pub static TEST_IMPORT_MEDIA_HOOK: std::sync::RwLock<
+    Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+> = std::sync::RwLock::new(None);
 fn check(session: &Session, cancel: &AtomicBool) -> Result<()> {
     ensure!(
         session.is_active() && !cancel.load(Ordering::Acquire),
@@ -384,8 +389,8 @@ pub fn execute(
         ..Default::default()
     };
     let importing = expected.is_some();
-    let store = if importing {
-        Some(MessageStore::open_for_account_write(session)?)
+    let read_store = if importing {
+        Some(MessageStore::open(session.history_path())?)
     } else {
         None
     };
@@ -398,13 +403,18 @@ pub fn execute(
         crate::storage::private_dir(&vault)?;
     }
     let mut new_files = Vec::new();
-    let commit_batch = |store: &MessageStore,
+    let commit_batch = |session: &crate::session::Session,
+                        cancel: &AtomicBool,
                         batch: &mut Vec<(crate::store::StoredMessage, Value)>,
                         report: &mut Report|
      -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        check(session, cancel)?;
+        // Acquire short-lived write permit per batch; released immediately after commit.
+        let (store, _write_permit) = MessageStore::open_for_account_write(session)?;
+        check(session, cancel)?;
         let tx = store.conn.unchecked_transaction()?;
         let mut recalled = Vec::new();
         for (message, references) in batch.iter() {
@@ -439,12 +449,16 @@ pub fn execute(
     };
 
     let result = (|| -> Result<()> {
-        if let Some((store, _)) = &store {
+        if importing {
+            check(session, &cancel)?;
+            let (store, _write_permit) = MessageStore::open_for_account_write(session)?;
+            check(session, &cancel)?;
             let tx = store.conn.unchecked_transaction()?;
             for thread in threads.values() {
                 store.upsert_thread(thread)?;
             }
             tx.commit()?;
+            // Write permit dropped here before heavy archive/media decryption.
         }
         reader.rewind()?;
         let mut asset_reader = EncryptedTarReader::new(std::fs::File::open(path)?, key, &cancel)?;
@@ -465,7 +479,7 @@ pub fn execute(
                 if message.msg_type == "backup.unknown" {
                     report.unsupported += 1;
                 }
-                if let Some((store, _)) = &store {
+                if let Some(store) = &read_store {
                     // Do not overwrite a live row with a less expressive backup projection.
                     let exists: bool = store.conn.query_row(
                         "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id=?1 AND msg_id=?2)",
@@ -476,7 +490,14 @@ pub fn execute(
                         report.skipped += 1;
                         continue;
                     }
-                    // Decrypt and copy backup assets outside any SQLite transaction.
+                    if let Some(hook) = TEST_IMPORT_MEDIA_HOOK
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                    {
+                        hook();
+                    }
+                    // Decrypt and copy backup assets outside any SQLite transaction or write permit.
                     let mut restored = json!({});
                     let prefix = record_prefix(&value, session.account_key());
                     for asset in prefix
@@ -512,16 +533,16 @@ pub fn execute(
                         message.raw_json = raw.to_string();
                     }
                     batch.push((message, references));
-                    if batch.len() >= 250 {
-                        commit_batch(store, &mut batch, &mut report)?;
+                    if batch.len() >= 249 {
+                        commit_batch(session, &cancel, &mut batch, &mut report)?;
                         new_files.clear();
                     }
                 }
             }
         }
         check(session, &cancel)?;
-        if let Some((store, _)) = &store {
-            commit_batch(store, &mut batch, &mut report)?;
+        if importing && !batch.is_empty() {
+            commit_batch(session, &cancel, &mut batch, &mut report)?;
             new_files.clear();
         }
         Ok(())

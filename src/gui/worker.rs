@@ -484,6 +484,8 @@ pub enum WorkerCmd {
     SyncPhoneRecentFenced {
         owner: String,
         runtime_id: usize,
+        intent_id: Option<u64>,
+        origin: crate::sync_coordinator::SyncOrigin,
     },
     SyncPhoneLegacy,
     CancelPhoneHistory,
@@ -992,6 +994,10 @@ pub(super) struct WorkerSender {
     ctx: egui::Context,
 }
 impl WorkerSender {
+    pub(super) fn is_command_channel_closed(&self) -> bool {
+        self.commands.is_closed()
+    }
+
     pub(super) fn send(&self, command: WorkerCmd) -> Result<(), ()> {
         let image = match command {
             WorkerCmd::FetchStickerImage { key, url } => Some((key, url, None)),
@@ -1081,16 +1087,41 @@ impl WorkerSender {
         }
     }
 }
+#[cfg(not(test))]
 pub(super) struct WorkerMailbox(std::sync::Mutex<Option<WorkerSender>>);
+#[cfg(not(test))]
 impl WorkerMailbox {
     pub(super) fn get(&self) -> Option<WorkerSender> {
         self.0.lock().ok()?.clone()
     }
-    fn set(&self, sender: WorkerSender) {
+    pub(super) fn set(&self, sender: WorkerSender) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(sender);
     }
 }
+#[cfg(not(test))]
 pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox(std::sync::Mutex::new(None));
+
+// Each test drives its own UI thread; its mock mailbox must not reach another app.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_WORKER_TX: std::cell::RefCell<Option<WorkerSender>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) struct WorkerMailbox;
+#[cfg(test)]
+impl WorkerMailbox {
+    pub(super) fn get(&self) -> Option<WorkerSender> {
+        TEST_WORKER_TX.with(|slot| slot.borrow().clone())
+    }
+    pub(super) fn set(&self, sender: WorkerSender) {
+        TEST_WORKER_TX.with(|slot| *slot.borrow_mut() = Some(sender));
+    }
+    pub(super) fn clear(&self) {
+        TEST_WORKER_TX.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+#[cfg(test)]
+pub(super) static WORKER_TX: WorkerMailbox = WorkerMailbox;
 
 async fn forward_upload_progress(
     receiver: &mut tokio::sync::broadcast::Receiver<crate::upload::UploadProgress>,
@@ -1866,6 +1897,14 @@ async fn run_startup_preload(
     });
     egui_ctx.request_repaint();
 
+    // Authentication must use the configuration just applied, not the pre-refresh clone.
+    let s = {
+        let guard = session_arc.lock().await;
+        if !guard.is_active() || guard.runtime_id() != runtime_id || guard.account_key() != owner {
+            return;
+        }
+        guard.clone()
+    };
     let status = s.validate_session().await;
     if status == crate::session::SessionStatus::Expired {
         db_ready_runtime.store(0, std::sync::atomic::Ordering::Release);
@@ -1905,13 +1944,46 @@ async fn run_startup_preload(
         guard.is_active() && guard.runtime_id() == runtime_id && guard.account_key() == owner
     };
     if still_active {
-        hydrate_e2ee_peers(&s, &gui_tx, &egui_ctx);
-        let _ = gui_tx.send(GuiEvent::StartupPreloadSettled {
-            owner,
-            runtime_id,
-            preload_threads: Some(preload),
-        });
-        egui_ctx.request_repaint();
+        run_optional_startup_preload(
+            &s,
+            &gui_tx,
+            &egui_ctx,
+            preload,
+            hydrate_e2ee_peers(&s, &gui_tx, &egui_ctx),
+        )
+        .await;
+    }
+}
+
+async fn run_optional_startup_preload(
+    session: &Session,
+    tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+    preload: Vec<Thread>,
+    optional: impl std::future::Future<Output = anyhow::Result<()>>,
+) {
+    if !session.is_active() {
+        return;
+    }
+    let owner = session.account_key().to_owned();
+    let runtime_id = session.runtime_id();
+    let _ = tx.send(GuiEvent::StartupPrerequisitesSettled {
+        owner: owner.clone(),
+        runtime_id,
+        preload_threads: preload,
+    });
+    ctx.request_repaint();
+
+    // Optional failure settles the preload, never the mandatory DB/auth gate.
+    if let Err(error) = optional.await {
+        crate::logger::log_error(
+            "startup preload",
+            &format!("Optional preload failed: {error}"),
+        );
+    }
+    if session.is_active() {
+        let _ = tx.send(GuiEvent::StartupPreloadSettled { owner, runtime_id });
+        ctx.request_repaint();
     }
 }
 
@@ -3811,7 +3883,6 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                                 }
                                                             }
                                                         });
-                                                        hydrate_e2ee_peers(&committed, &gui_tx_clone, &ctx_clone);
                                                     }
                                                 }
                                             }
@@ -3898,7 +3969,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 &db_ready_runtime,
                                 ws_ready,
                                 already_syncing,
-                                true,
+                                account
+                                    .server_config
+                                    .sync_2_pc
+                                    .is_feature_enabled_by_origin(
+                                        crate::sync_coordinator::SyncOrigin::Banner,
+                                    ),
                             );
                             let _ = gui_tx.send(GuiEvent::PhoneSyncState {
                                 owner,
@@ -3913,7 +3989,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                         | WorkerCmd::SyncPhoneRecent
                         | WorkerCmd::SyncPhoneRecentFenced { .. }
                         | WorkerCmd::SyncPhoneLegacy) => {
-                            if let WorkerCmd::SyncPhoneRecentFenced { ref owner, runtime_id } = command {
+                            if let WorkerCmd::SyncPhoneRecentFenced { ref owner, runtime_id, .. } = command {
                                 let account = session.lock().await.clone();
                                 if account.account_key() != owner || account.runtime_id() != runtime_id {
                                     continue;
@@ -3937,6 +4013,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             } else {
                                 crate::sync_coordinator::SyncSource::Sync2Full
                             };
+                            let fenced_intent_id = match command {
+                                WorkerCmd::SyncPhoneRecentFenced { intent_id, .. } => intent_id,
+                                _ => None,
+                            };
+                            let origin = match command {
+                                WorkerCmd::SyncPhoneRecentFenced { origin, .. } => origin,
+                                WorkerCmd::SyncPhoneLegacy => crate::sync_coordinator::SyncOrigin::Legacy,
+                                _ => crate::sync_coordinator::SyncOrigin::Setting,
+                            };
 
                             let account = session.lock().await.clone();
                             let owner = account.account_key().to_owned();
@@ -3955,7 +4040,10 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 &db_ready_runtime,
                                 ws_ready,
                                 already_syncing,
-                                true,
+                                account
+                                    .server_config
+                                    .sync_2_pc
+                                    .is_feature_enabled_by_origin(origin),
                             );
                             if !availability.is_ready() {
                                 let reason_msg = availability
@@ -3963,14 +4051,25 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     .map(|r| r.user_message())
                                     .unwrap_or("Chưa sẵn sàng đồng bộ")
                                     .to_owned();
-                                let _ = gui_tx.send(GuiEvent::PhoneSyncState {
-                                    owner,
-                                    runtime_id,
-                                    operation_id: 0,
-                                    state: crate::sync_coordinator::SyncState::Idle {
-                                        availability,
-                                    },
-                                });
+                                if let Some(id) = fenced_intent_id {
+                                    let _ = gui_tx.send(GuiEvent::AutoSyncIntentRejected {
+                                        owner: owner.clone(),
+                                        runtime_id,
+                                        intent_id: id,
+                                        temporary: true,
+                                        reason: reason_msg.clone(),
+                                    });
+                                }
+                                if !already_syncing {
+                                    let _ = gui_tx.send(GuiEvent::PhoneSyncState {
+                                        owner,
+                                        runtime_id,
+                                        operation_id: 0,
+                                        state: crate::sync_coordinator::SyncState::Idle {
+                                            availability,
+                                        },
+                                    });
+                                }
                                 let _ = gui_tx.send(GuiEvent::PhoneSyncStatus {
                                     running: already_syncing,
                                     success: false,
@@ -3981,16 +4080,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
 
                             if phone_sync_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                                let _ = gui_tx.send(GuiEvent::PhoneSyncState {
-                                    owner,
-                                    runtime_id,
-                                    operation_id: 0,
-                                    state: crate::sync_coordinator::SyncState::Idle {
-                                        availability: crate::sync_coordinator::SyncAvailability::Unavailable(
-                                            crate::sync_coordinator::SyncUnavailableReason::AlreadySyncing,
-                                        ),
-                                    },
-                                });
+                                if let Some(id) = fenced_intent_id {
+                                    let _ = gui_tx.send(GuiEvent::AutoSyncIntentRejected {
+                                        owner: owner.clone(),
+                                        runtime_id,
+                                        intent_id: id,
+                                        temporary: true,
+                                        reason: "Already syncing".into(),
+                                    });
+                                }
                                 let _ = gui_tx.send(GuiEvent::PhoneSyncStatus {
                                     running: true,
                                     success: false,
@@ -4001,6 +4099,14 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             }
 
                             let operation_id = crate::sync_coordinator::next_operation_id();
+                            if let Some(id) = fenced_intent_id {
+                                let _ = gui_tx.send(GuiEvent::AutoSyncIntentAccepted {
+                                    owner: owner.clone(),
+                                    runtime_id,
+                                    intent_id: id,
+                                    operation_id,
+                                });
+                            }
                             let op_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                             phone_sync_cancel.store(false, std::sync::atomic::Ordering::Release);
                             let task_cancel = op_cancel.clone();
@@ -4095,6 +4201,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                             recent_only,
                                             range_days,
                                             source,
+                                            origin,
                                             tracker.clone(),
                                             move |sync_state| {
                                                 let _ = state_cb_tx.send(GuiEvent::PhoneSyncState {
@@ -4160,10 +4267,14 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         reason: format!("Đã hủy đồng bộ: {e}"),
                                         retryable: true,
                                     },
-                                    Err(e) => crate::sync_coordinator::SyncState::Failed {
-                                        error: e.to_string(),
-                                        fatal: false,
-                                    },
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        let fatal = crate::gui::sync_banner::is_non_retryable_error(&err_str);
+                                        crate::sync_coordinator::SyncState::Failed {
+                                            error: err_str,
+                                            fatal,
+                                        }
+                                    }
                                 };
                                 let _ = tx.send(GuiEvent::PhoneSyncState {
                                     owner: state_owner,
@@ -6222,7 +6333,6 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 if let Some(tx) = commands.upgrade() {
                                                     let _ = tx.send(WorkerCmd::RefreshThreads);
                                                 }
-                                                hydrate_e2ee_peers(&s_hydrate, &gui_tx_clone, &ctx_clone);
                                             }
                                         }
                                     }
@@ -9111,26 +9221,29 @@ async fn send_attachment_batch(
     }
 }
 
-fn hydrate_e2ee_peers(s: &Session, tx: &Sender<GuiEvent>, ctx: &egui::Context) {
+async fn hydrate_e2ee_peers(
+    s: &Session,
+    tx: &Sender<GuiEvent>,
+    ctx: &egui::Context,
+) -> anyhow::Result<()> {
     if !s.is_active() {
-        return;
+        return Ok(());
     }
-    let s_e2ee = s.clone();
-    let tx_e2ee = tx.clone();
-    let ctx_e2ee = ctx.clone();
-    tokio::spawn(async move {
-        let owner = s_e2ee.account_key().to_owned();
-        let owner_for_task = owner.clone();
-        let peers = tokio::task::spawn_blocking(move || {
-            crate::e2ee_integration::list_e2ee_peers(&owner_for_task)
-        })
-        .await
-        .unwrap_or_default();
-        if !peers.is_empty() {
-            let _ = tx_e2ee.send(GuiEvent::E2eePeersHydrated { owner, peers });
-            ctx_e2ee.request_repaint();
-        }
-    });
+    let owner = s.account_key().to_owned();
+    let owner_for_task = owner.clone();
+    let peers = tokio::task::spawn_blocking(move || {
+        crate::e2ee_integration::list_e2ee_peers(&owner_for_task)
+    })
+    .await?;
+    if s.is_active() && !peers.is_empty() {
+        let _ = tx.send(GuiEvent::E2eePeersHydrated {
+            owner,
+            runtime_id: s.runtime_id(),
+            peers,
+        });
+        ctx.request_repaint();
+    }
+    Ok(())
 }
 
 async fn publish_pins(s: &Session, snapshot: crate::server_pins::Snapshot, tx: &Sender<GuiEvent>) {
@@ -9465,6 +9578,192 @@ mod voice_send_owner_tests {
 #[cfg(test)]
 mod db_write_serialization_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn optional_startup_producer_waits_for_work_and_ui_timeout_does_not_fake_settle() {
+        use crate::gui::{StartupState, ZaloGuiApp};
+        for (keep_loading, timeout_ms) in [(false, 800), (true, 800), (true, 2000)] {
+            let uin = format!("optional-preload-{}", crate::param_cipher::random_hex(12));
+            let session = test_session(&uin);
+            let ctx = egui::Context::default();
+            let mut app = ZaloGuiApp::from_context(&ctx, session.clone(), false, Vec::new(), false);
+            app.server_config.o2o.keep_loading_during_preload.enable = keep_loading;
+            app.server_config
+                .o2o
+                .keep_loading_during_preload
+                .timeout_duration_ms = timeout_ms;
+            app.startup_state = StartupState::Loading {
+                stage_text: "Đang khởi tạo…".into(),
+                started_at: std::time::Instant::now(),
+                timeout: Duration::from_millis(timeout_ms),
+                prerequisites_settled: false,
+                settle_deadline: None,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.event_rx = rx;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let context = ctx.clone();
+            let task = tokio::spawn(async move {
+                let cached = vec![Thread {
+                    id: "cached-thread".into(),
+                    name: "Hội thoại đã lưu".into(),
+                    messages: vec![ChatMessage {
+                        id: "cached-message".into(),
+                        text: "Tin đã lưu".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }];
+                run_optional_startup_preload(&session, &tx, &context, cached, async move {
+                    let _ = entered_tx.send(());
+                    release_rx.await?;
+                    Ok(())
+                })
+                .await;
+            });
+            tokio::time::timeout(Duration::from_secs(2), entered_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            app.check_events(&ctx);
+            assert_eq!(app.threads.len(), 1);
+            assert_eq!(app.threads[0].messages[0].text, "Tin đã lưu");
+            if keep_loading {
+                let started_at = match app.startup_state {
+                    StartupState::Loading {
+                        prerequisites_settled: true,
+                        settle_deadline: None,
+                        started_at,
+                        ..
+                    } => started_at,
+                    ref state => panic!("optional work must still be pending: {state:?}"),
+                };
+                app.advance_startup_state(started_at + Duration::from_millis(1000), &ctx);
+                assert_eq!(
+                    matches!(app.startup_state, StartupState::Ready),
+                    timeout_ms == 800
+                );
+            } else {
+                assert_eq!(app.startup_state, StartupState::Ready);
+            }
+            assert!(
+                !task.is_finished(),
+                "UI timeout must not complete the optional task"
+            );
+            release_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            app.check_events(&ctx);
+            if !keep_loading || timeout_ms == 800 {
+                assert_eq!(
+                    app.startup_state,
+                    StartupState::Ready,
+                    "late completion must not reopen loading"
+                );
+            } else {
+                assert!(matches!(
+                    app.startup_state,
+                    StartupState::Loading {
+                        settle_deadline: Some(_),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_startup_failure_settles_but_retired_runtime_never_publishes_completion() {
+        let uin = format!("optional-error-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        run_optional_startup_preload(&session, &tx, &ctx, Vec::new(), async {
+            anyhow::bail!("synthetic optional failure")
+        })
+        .await;
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                GuiEvent::StartupPrerequisitesSettled { .. },
+                GuiEvent::StartupPreloadSettled { .. }
+            ]
+        ));
+
+        let old_session = session.clone();
+        let old_context = ctx.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            run_optional_startup_preload(&old_session, &tx, &old_context, Vec::new(), async {
+                let _ = entered_tx.send(());
+                release_rx.await?;
+                Ok(())
+            })
+            .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::StartupPrerequisitesSettled { .. }
+        ));
+        session.logout();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "old runtime must not publish preload completion"
+        );
+    }
+
+    #[test]
+    fn banner_and_legacy_gate_still_require_live_account_database_and_socket() {
+        use crate::sync_coordinator::{SyncAvailability, SyncOrigin};
+        let uin = format!("origin-gate-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session
+            .server_config
+            .sync_2_pc
+            .enable_on_sync_source_setting = false;
+        let ready = std::sync::atomic::AtomicUsize::new(session.runtime_id());
+        for origin in [SyncOrigin::Banner, SyncOrigin::Legacy] {
+            let enabled = session
+                .server_config
+                .sync_2_pc
+                .is_feature_enabled_by_origin(origin);
+            assert!(enabled);
+            assert_eq!(
+                current_sync_availability(&session, &ready, true, false, enabled),
+                SyncAvailability::Ready
+            );
+            assert!(!current_sync_availability(&session, &ready, false, false, enabled).is_ready());
+            let migrating = std::sync::atomic::AtomicUsize::new(0);
+            assert!(
+                !current_sync_availability(&session, &migrating, true, false, enabled).is_ready()
+            );
+        }
+        session.server_config.sync_2_pc.enable = false;
+        assert!(session
+            .server_config
+            .sync_2_pc
+            .is_feature_enabled_by_origin(SyncOrigin::Legacy));
+        assert!(!session
+            .server_config
+            .sync_2_pc
+            .is_feature_enabled_by_origin(SyncOrigin::Banner));
+        session.login = None;
+        assert!(!current_sync_availability(&session, &ready, true, false, true).is_ready());
+    }
 
     fn test_session(uin: &str) -> Session {
         let mut s = Session::new(false, false, false).unwrap();

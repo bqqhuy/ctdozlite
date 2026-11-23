@@ -1323,9 +1323,39 @@ pub(crate) fn merge_sent_message(thread: &mut Thread, mut message: ChatMessage) 
 /// `target.id` is migrated to `incoming.id` so actions (chat/VoIP call) always target the active session's `userId`.
 pub fn merge_thread_into(
     target: &mut Thread,
-    mut incoming: Thread,
+    incoming: Thread,
     incoming_id_is_authoritative: bool,
 ) {
+    merge_thread_snapshot(target, incoming, incoming_id_is_authoritative, false);
+}
+
+/// Seed startup history without replacing metadata or message state already on screen.
+pub fn merge_cached_thread_into(target: &mut Thread, incoming: Thread) {
+    merge_thread_snapshot(target, incoming, false, true);
+}
+
+fn merge_thread_snapshot(
+    target: &mut Thread,
+    mut incoming: Thread,
+    incoming_id_is_authoritative: bool,
+    startup_cache: bool,
+) {
+    if startup_cache {
+        if !is_generic_thread_name(&target.name) {
+            incoming.name.clear();
+        }
+        if target.avatar.is_some() {
+            incoming.avatar = None;
+        }
+        let global_id = if target.presentation.global_id.is_empty() {
+            std::mem::take(&mut incoming.presentation.global_id)
+        } else {
+            String::new()
+        };
+        incoming.presentation = Default::default();
+        incoming.presentation.global_id = global_id;
+        incoming.unread = Default::default();
+    }
     crate::message_view::remove_call_logs(&mut incoming);
     crate::message_view::remove_call_logs(target);
     if incoming_id_is_authoritative && !incoming.id.is_empty() && incoming.id != "0" {
@@ -1411,9 +1441,11 @@ pub fn merge_thread_into(
         if let Some(idx) = found {
             let existing_msg = &mut target.messages[idx];
             identities.remove(existing_msg, idx);
-            let incoming_is_backfill = msg.history_source.is_some();
+            let incoming_is_backfill = startup_cache || msg.history_source.is_some();
             let existing_is_realtime = existing_msg.history_source.is_none();
-            existing_msg.merge_reaction_metadata(&msg);
+            if !startup_cache {
+                existing_msg.merge_reaction_metadata(&msg);
+            }
             if existing_msg.id.starts_with("out_")
                 && !msg.id.is_empty()
                 && !pending_message_id(&msg.id)
@@ -1422,6 +1454,7 @@ pub fn merge_thread_into(
             }
             if msg.ts > 0
                 && existing_msg.ts != msg.ts
+                && (!startup_cache || existing_msg.ts == 0)
                 && (!incoming_is_backfill
                     || !existing_is_realtime
                     || existing_msg.ts == 0
@@ -1430,6 +1463,15 @@ pub fn merge_thread_into(
             {
                 existing_msg.ts = msg.ts;
                 existing_msg.time = msg.time;
+            }
+            if startup_cache
+                && (existing_msg.text.is_empty()
+                    || crate::e2ee_integration::is_placeholder(&existing_msg.text))
+                && !msg.text.is_empty()
+                && !crate::e2ee_integration::is_placeholder(&msg.text)
+            {
+                existing_msg.text = msg.text.clone();
+                existing_msg.is_e2ee |= msg.is_e2ee;
             }
             let recalled = existing_msg.kind == crate::message_model::MessageKind::Recall
                 || msg.kind == crate::message_model::MessageKind::Recall
@@ -1454,18 +1496,20 @@ pub fn merge_thread_into(
                 existing_msg.link_desc = msg.link_desc;
                 existing_msg.link_thumb = msg.link_thumb;
                 existing_msg.link_src = msg.link_src;
-                if !msg.text.is_empty() {
+                if !msg.text.is_empty() && (!startup_cache || existing_msg.text.is_empty()) {
                     existing_msg.text = msg.text;
                 }
             }
-            if existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
+            if !startup_cache && existing_msg.reactions.is_empty() && !msg.reactions.is_empty() {
                 existing_msg.reactions = msg.reactions;
             }
             if recalled {
                 existing_msg.mark_recalled();
             }
-            existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
-            existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+            if !startup_cache {
+                existing_msg.is_pinned = existing_msg.is_pinned || msg.is_pinned;
+                existing_msg.is_starred = existing_msg.is_starred || msg.is_starred;
+            }
             identities.insert(existing_msg, idx);
         } else {
             let idx = target.messages.len();
@@ -7561,35 +7605,53 @@ pub async fn translate_message_manual(
         "ts": client_time,
     });
 
-    let cipher =
-        crate::param_cipher::ParamCipher::new(crate::session::ZPW_TYPE, &s.imei, client_time)?;
-    let body = cipher.build_body(
-        crate::session::ZPW_TYPE,
-        crate::session::ZPW_VER,
-        &payload,
-        "manual",
-    )?;
+    let mut encrypt_param = s.encrypt_param_enabled();
+    let mut retried = false;
 
-    let form = body
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("Không thể tạo form tham số"))?
-        .iter()
-        .map(|(k, v)| {
-            let s_val = v
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| v.to_string());
-            format!("{k}={}", crate::session::urlencode(&s_val))
-        })
-        .collect::<Vec<_>>()
-        .join("&");
+    loop {
+        let cipher =
+            crate::param_cipher::ParamCipher::new(crate::session::ZPW_TYPE, &s.imei, client_time)?;
+        let body = cipher.build_body_with_policy(
+            crate::session::ZPW_TYPE,
+            crate::session::ZPW_VER,
+            &payload,
+            "manual",
+            encrypt_param,
+        )?;
 
-    let base_url = s.resolve_service_url("chat", "/api/aifeatures/translate/v1/manual");
-    let url = format!("{base_url}?{}", s.common_params());
+        let form = body
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Không thể tạo form tham số"))?
+            .iter()
+            .map(|(k, v)| {
+                let s_val = v
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string());
+                format!("{k}={}", crate::session::urlencode(&s_val))
+            })
+            .collect::<Vec<_>>()
+            .join("&");
 
-    let resp = s.post_form(&url, form).await?;
-    let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
-    try_parse_translation_result(&decrypted)
+        let base_url = s.resolve_service_url("chat", "/api/aifeatures/translate/v1/manual");
+        let url = format!("{base_url}?{}", s.common_params());
+
+        let resp = s.post_form(&url, form).await?;
+        let decrypted = s.maybe_decrypt(resp, cipher.key().as_bytes()).await;
+
+        let code = decrypted
+            .get("error_code")
+            .and_then(|c| c.as_i64())
+            .unwrap_or(0);
+        if code == 19000 && encrypt_param && !retried {
+            s.handle_api_error_code(19000);
+            encrypt_param = false;
+            retried = true;
+            continue;
+        }
+
+        return try_parse_translation_result(&decrypted);
+    }
 }
 
 /// Submit voice message for transcription (`/api/aifeatures/voice2text`, cmd `13394`).
@@ -7794,6 +7856,105 @@ mod tests {
 
         let preview = thread.sidebar_preview_with_reactor(Some("TNR chị Huệ"));
         assert!(preview.starts_with("TNR chị Huệ đã thả"), "{preview}");
+    }
+
+    #[test]
+    fn startup_cache_fills_history_without_replacing_current_metadata_or_plaintext() {
+        let mut live = sample_thread("oneone_123");
+        live.name = "Fresh alias".into();
+        live.avatar = Some("https://example.invalid/fresh-avatar".into());
+        live.presentation.server_alias = Some("Fresh alias".into());
+        live.unread.fresh = true;
+        live.unread.settings_fresh = true;
+        live.unread.muted = true;
+        let unread = live.unread.clone();
+        live.messages = vec![
+            ChatMessage {
+                id: "77".into(),
+                text: "Current plaintext".into(),
+                ts: 200,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "88".into(),
+                text: "Not yet recalled on screen".into(),
+                ts: 210,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "99".into(),
+                text: "[Tin nhắn mã hoá]".into(),
+                ts: 220,
+                is_e2ee: true,
+                ..Default::default()
+            },
+        ];
+        let mut cached = live.clone();
+        cached.name = "Stale alias".into();
+        cached.avatar = Some("https://example.invalid/stale-avatar".into());
+        cached.presentation.server_alias = Some("Stale alias".into());
+        cached.unread.muted = false;
+        cached.messages = vec![
+            ChatMessage {
+                id: "77".into(),
+                text: "Stale cached text".into(),
+                ts: 100,
+                link_url: Some("https://example.invalid/cached-link".into()),
+                is_pinned: true,
+                is_starred: true,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "66".into(),
+                text: "Older history".into(),
+                ts: 50,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "88".into(),
+                text: "[Tin nhắn đã thu hồi]".into(),
+                kind: crate::message_model::MessageKind::Recall,
+                ts: 210,
+                ..Default::default()
+            },
+            ChatMessage {
+                id: "99".into(),
+                text: "Locally decrypted plaintext".into(),
+                ts: 220,
+                is_e2ee: true,
+                ..Default::default()
+            },
+        ];
+        merge_cached_thread_into(&mut live, cached.clone());
+        merge_cached_thread_into(&mut live, cached);
+        assert_eq!(live.name, "Fresh alias");
+        assert_eq!(
+            live.avatar.as_deref(),
+            Some("https://example.invalid/fresh-avatar")
+        );
+        assert_eq!(
+            live.presentation.server_alias.as_deref(),
+            Some("Fresh alias")
+        );
+        assert_eq!(live.unread, unread);
+        assert_eq!(live.messages.len(), 4);
+        let current = live.messages.iter().find(|m| m.id == "77").unwrap();
+        assert_eq!(current.text, "Current plaintext");
+        assert_eq!(current.ts, 200);
+        assert!(!current.is_pinned && !current.is_starred);
+        assert!(
+            current.link_url.is_some(),
+            "missing immutable media details may be filled"
+        );
+        assert_eq!(
+            live.messages.iter().find(|m| m.id == "88").unwrap().kind,
+            crate::message_model::MessageKind::Recall
+        );
+        assert!(live.messages.iter().any(|m| m.id == "66"));
+        assert_eq!(
+            live.messages.iter().find(|m| m.id == "99").unwrap().text,
+            "Locally decrypted plaintext"
+        );
     }
 
     #[test]

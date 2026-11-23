@@ -106,13 +106,38 @@ impl ParamCipher {
         payload: &Value,
         tag: &str,
     ) -> Result<Value> {
-        let encrypted = self.encrypt_payload(payload)?;
+        self.build_body_with_policy(api_type, api_version, payload, tag, true)
+    }
 
+    /// Builds the request body using the specified encryption policy.
+    ///
+    /// Parity with Zalo PC `encryptParam(e, t)`:
+    /// - When `enable_encrypt_param` is true: encrypts `payload` with per-request AES key into `params`,
+    ///   attaches `zcid`, `zcid_ext`, `enc_ver: "v2"`, `type`, `client_version`, and computes `signkey`.
+    /// - When `enable_encrypt_param` is false: preserves plaintext parameters, attaches `type`,
+    ///   `client_version`, and computes `signkey` (evidence: `compact-app-pc.js:20325217`).
+    pub fn build_body_with_policy(
+        &self,
+        api_type: &str,
+        api_version: &str,
+        payload: &Value,
+        tag: &str,
+        enable_encrypt_param: bool,
+    ) -> Result<Value> {
         let mut m = Map::new();
-        for (k, v) in self.params().as_object().cloned().unwrap_or_default() {
-            m.insert(k, v);
+        if enable_encrypt_param {
+            let encrypted = self.encrypt_payload(payload)?;
+            for (k, v) in self.params().as_object().cloned().unwrap_or_default() {
+                m.insert(k, v);
+            }
+            m.insert("params".into(), json!(encrypted));
+        } else if let Some(obj) = payload.as_object() {
+            for (k, v) in obj {
+                m.insert(k.clone(), v.clone());
+            }
+        } else {
+            m.insert("params".into(), payload.clone());
         }
-        m.insert("params".into(), json!(encrypted));
         m.insert("type".into(), json!(api_type));
         m.insert("client_version".into(), json!(api_version));
 
@@ -214,5 +239,36 @@ mod tests {
             "captured reply was Invalid Signature"
         );
         assert_eq!(v["error_message"], "Invalid Signature");
+    }
+
+    #[test]
+    fn policy_controls_param_encryption_or_plaintext() {
+        let p = ParamCipher::new("30", "abc", 1000).unwrap();
+        let payload = json!({"phone_num": "0123456789", "imei": "test-imei"});
+
+        // When enable_encrypt_param is true: params are encrypted, enc_ver is present
+        let enc_body = p
+            .build_body_with_policy("30", "693", &payload, "loginbypasswv2", true)
+            .unwrap();
+        assert_eq!(enc_body["enc_ver"], "v2");
+        assert_eq!(enc_body["type"], "30");
+        assert_eq!(enc_body["client_version"], "693");
+        assert!(enc_body.get("zcid").is_some());
+        assert!(enc_body.get("zcid_ext").is_some());
+        assert!(enc_body["signkey"].as_str().is_some());
+        assert_ne!(enc_body["params"].as_str().unwrap(), payload.to_string());
+
+        // When enable_encrypt_param is false: parameters are plaintext, no v2 cipher envelope
+        let plain_body = p
+            .build_body_with_policy("30", "693", &payload, "loginbypasswv2", false)
+            .unwrap();
+        assert!(plain_body.get("enc_ver").is_none());
+        assert!(plain_body.get("zcid").is_none());
+        assert!(plain_body.get("zcid_ext").is_none());
+        assert_eq!(plain_body["type"], "30");
+        assert_eq!(plain_body["client_version"], "693");
+        assert_eq!(plain_body["phone_num"], "0123456789");
+        assert_eq!(plain_body["imei"], "test-imei");
+        assert!(plain_body["signkey"].as_str().is_some());
     }
 }

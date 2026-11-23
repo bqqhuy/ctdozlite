@@ -763,6 +763,7 @@ impl RunningRound {
     #[allow(clippy::too_many_arguments)]
     async fn open<F: FnMut(String) + Send + 'static>(
         session: &Session,
+        timeouts: crate::server_config::SyncTimeoutConfig,
         transport: &SyncTransport,
         epoch: u64,
         cancel: Arc<AtomicBool>,
@@ -815,8 +816,8 @@ impl RunningRound {
             let mut confirmed_at: Option<std::time::Instant> = None;
             let mut idle_since: Option<std::time::Instant> = None;
             let mut active_wait = Duration::ZERO;
-            let await_confirm = account.server_config.sync_2_pc.awaiting_mobile_timeout();
-            let wake_grace_dur = account.server_config.sync_2_pc.wakeup_timeout();
+            let await_confirm = timeouts.awaiting_mobile_timeout();
+            let wake_grace_dur = timeouts.wakeup_timeout();
             let mut previous = std::time::Instant::now();
             let mut tick = tokio::time::interval(Duration::from_millis(200));
             let mut last_display = std::time::Instant::now();
@@ -1113,11 +1114,13 @@ pub(crate) async fn download_with_state<
     recent_only: bool,
     range_days: u32,
     source: crate::sync_coordinator::SyncSource,
+    origin: crate::sync_coordinator::SyncOrigin,
     tracker: crate::sync_coordinator::SyncProgressTracker,
     state_cb: S,
     mut progress: F,
     page: G,
 ) -> Result<crate::history_sync::SyncReport> {
+    let timeouts = session.server_config.sync_2_pc.timeouts_for_origin(origin);
     let _owner = SYNC_OWNER.lock().await;
     // Pause heavy FTS backfill (`pauseIdx`) for the full lifetime of Sync2 (RAII ensures resume on return/cancel/error).
     let _indexing_pause = crate::sync_coordinator::pause_indexing();
@@ -1196,14 +1199,14 @@ pub(crate) async fn download_with_state<
     progress("Đang gửi yêu cầu đồng bộ; hãy mở Zalo trên điện thoại và xác nhận…".into());
     state_cb(
         crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
-            timeout_at: std::time::Instant::now()
-                + session.server_config.sync_2_pc.awaiting_mobile_timeout(),
+            timeout_at: std::time::Instant::now() + timeouts.awaiting_mobile_timeout(),
         },
     );
     clean_old(session, &transport, epoch).await?;
     let progress = Arc::new(std::sync::Mutex::new(progress));
     let mut run = RunningRound::open(
         session,
+        timeouts,
         &transport,
         epoch,
         cancel.clone(),
@@ -1442,6 +1445,7 @@ pub(crate) async fn download_with_state<
     }));
     let ctx = RoundCtx {
         session,
+        timeouts,
         transport: &transport,
         cancel: &cancel,
         codec_bytes: &codec_bytes,
@@ -1841,6 +1845,7 @@ impl<F: FnMut(String)> Board<F> {
 
 struct RoundCtx<'a, F, G> {
     session: &'a Session,
+    timeouts: crate::server_config::SyncTimeoutConfig,
     transport: &'a SyncTransport,
     cancel: &'a Arc<AtomicBool>,
     codec_bytes: &'a [u8],
@@ -1958,6 +1963,7 @@ where
         ensure!(ctx.session.is_active() && !ctx.cancel.load(Ordering::Acquire), "Đã dừng đồng bộ điện thoại");
         let mut run = RunningRound::open(
             ctx.session,
+            ctx.timeouts,
             ctx.transport,
             epoch,
             ctx.cancel.clone(),
@@ -1974,9 +1980,20 @@ where
                 b.update(job.number, text);
             }
         };
+        let batch_timeout = ctx.timeouts.batch_timeout();
         let consumed = async {
             let mut waiting = std::collections::VecDeque::new();
-            while let Some(staged) = run.files.recv().await {
+            loop {
+                let staged = match tokio::time::timeout(batch_timeout, run.files.recv()).await {
+                    Ok(Some(staged)) => staged,
+                    Ok(None) => break,
+                    Err(_) => {
+                        anyhow::bail!(
+                            "Quá thời gian chờ nhận batch file đồng bộ ({:?})",
+                            batch_timeout
+                        );
+                    }
+                };
                 let staged = staged?;
                 if !staged.batch.metadata && crypto.record.is_none() {
                     ensure!(waiting.len() < 8, "Chưa nhận khóa metadata; đã đạt giới hạn chờ");

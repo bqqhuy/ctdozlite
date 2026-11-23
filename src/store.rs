@@ -205,7 +205,7 @@ impl MessageStore {
 
     /// Open an account store under a session-generation write permit.
     /// Keep the returned permit alive for the complete blocking write closure.
-    pub(crate) fn open_for_account_write(
+    pub fn open_for_account_write(
         session: &crate::session::Session,
     ) -> Result<(Self, crate::session::AccountWritePermit)> {
         let permit = session.begin_account_write_blocking()?;
