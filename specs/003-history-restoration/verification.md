@@ -49,3 +49,10 @@ Chỉ xác nhận local gate/fixture; không xác nhận transfer V1/iPhone, Bin
 Trên working tree nền f33f43a, candidate SHA-256 `c416614389549a0d30c8beb533717b2fa11441886bd636837bb8e5265c32c7ba` đạt hai lượt Codex audit theo hai phương pháp, giữ nguyên nguồn. Library 1121 passed/11 ignored; integration desktop backup 4 passed; 58 test nhắm mục tiêu và 200 vòng stress startup/config đều đạt; Clippy all-targets `-D warnings` exit 0. Regression gate V1/DB/socket vẫn nằm trong bộ kiểm tra đạt. Chi tiết: [audit dossier](../../docs/research/2026-11-23-sync-config-audit-dossier.md).
 
 Chỉ xác nhận code/fixture/harness, không nâng H-T090/H-T099 hay transfer V1/iPhone/BinNet thành native acceptance. Không E1 mới và không release.
+
+
+## 24/11/2026 — kiểm tra bảo toàn sau sửa metadata/call/privacy
+
+Candidate c494c88d95052d3dfd8f1a8d9a9c13b6a184aa524962e197a606a08cbade17f3 trên working tree c9a274f: library 1154 passed/11 ignored; desktop_backup_v2 4 passed/0 failed; Clippy all-targets -D warnings exit 0; 100 vòng stress 8/16 thread trên startup/config và các nhóm metadata/call/privacy đạt. Hai lượt source/harness audit scoped giữ nguyên nguồn. [Hồ sơ](../../docs/research/2026-11-23-sync-config-audit-dossier.md).
+
+Không đổi H-01 Legacy gate, backup write batches/replay invariants hay wire protocol. Không xác nhận V1/iPhone/BinNet, không nâng H-T090/H-T099 thành native acceptance và không release.

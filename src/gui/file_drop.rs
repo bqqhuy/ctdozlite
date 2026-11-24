@@ -88,7 +88,7 @@ impl Drafts {
     pub(super) fn total_len(&self) -> usize {
         self.threads.values().map(Vec::len).sum()
     }
-    fn insert(&mut self, thread: &str, path: PathBuf) -> Option<u64> {
+    pub(super) fn insert(&mut self, thread: &str, path: PathBuf) -> Option<u64> {
         if self.owner.is_empty()
             || self.len(thread) >= PER_THREAD
             || self.threads.values().map(Vec::len).sum::<usize>() >= TOTAL
@@ -266,10 +266,10 @@ impl ZaloGuiApp {
             let count = items.len();
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{count} tệp"))
+                    RichText::new(format!("{count} file"))
                         .color(pal.text_primary)
                         .strong()
-                        .size(14.0),
+                        .size(13.0),
                 )
                 .on_hover_text(crate::i18n::tr(
                     "Tệp sẽ được gửi khi bạn nhấn nút Gửi hoặc Enter.",
@@ -288,95 +288,153 @@ impl ZaloGuiApp {
             egui::ScrollArea::horizontal()
                 .id_salt(("attachment_draft", thread))
                 .auto_shrink([false, true])
-                .min_scrolled_height(94.0)
-                .max_height((budget - 26.0).clamp(94.0, 118.0))
+                .min_scrolled_height(78.0)
+                .max_height((budget - 26.0).clamp(78.0, 100.0))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         for (index, item) in items.iter().enumerate() {
-                            let tile = egui::Frame::none()
-                                .fill(pal.bg_elevated)
-                                .rounding(Rounding::same(7.0))
-                                .stroke(Stroke::new(1.0_f32, pal.border))
-                                .inner_margin(Margin::same(6.0));
-                            tile.show(ui, |ui| {
-                                ui.set_min_size(Vec2::new(112.0, 82.0));
-                                let (preview_rect, _) =
-                                    ui.allocate_exact_size(Vec2::new(100.0, 52.0), Sense::hover());
-                                if let Some(tex) = &item.texture {
-                                    ui.painter().image(
-                                        tex.id(),
-                                        preview_rect,
-                                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                                        Color32::WHITE,
-                                    );
-                                } else {
-                                    let category = crate::message_view::file_category(
-                                        &item
-                                            .path
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy(),
-                                    );
-                                    messages::paint_file_category_icon(
-                                        ui.painter(),
-                                        preview_rect,
-                                        category,
-                                    );
-                                }
-                                let mut name = item
-                                    .path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-                                if name.chars().count() > 16 {
-                                    name =
-                                        format!("{}…", name.chars().take(15).collect::<String>());
-                                }
-                                ui.label(RichText::new(name).size(11.5).color(pal.text_primary));
-                                let status = match &item.result {
-                                    None => "Đang đọc…".to_owned(),
-                                    Some(Ok(_)) => crate::chat::format_file_size(item.size),
-                                    Some(Err(e)) => e.chars().take(16).collect(),
-                                };
-                                ui.label(RichText::new(status).size(10.5).color(
-                                    if matches!(item.result, Some(Err(_))) {
-                                        pal.danger
-                                    } else {
-                                        pal.text_muted
-                                    },
-                                ));
-                                let remove_rect = Rect::from_min_size(
-                                    preview_rect.right_top() - Vec2::new(21.0, -2.0),
-                                    Vec2::splat(20.0),
+                            let (card_rect, card_resp) =
+                                ui.allocate_exact_size(Vec2::new(72.0, 72.0), Sense::hover());
+
+                            // Thẻ vuông 72x72px, bo góc 8px, nền pal.bg_elevated, viền pal.border
+                            ui.painter().rect_filled(
+                                card_rect,
+                                Rounding::same(8.0),
+                                pal.bg_elevated,
+                            );
+                            ui.painter().rect_stroke(
+                                card_rect,
+                                Rounding::same(8.0),
+                                Stroke::new(1.0_f32, pal.border),
+                            );
+
+                            // Icon file to rõ ràng ở giữa (hoặc ảnh thumbnail)
+                            let preview_rect = Rect::from_center_size(
+                                Pos2::new(card_rect.center().x, card_rect.min.y + 22.0),
+                                Vec2::new(34.0, 30.0),
+                            );
+                            if let Some(tex) = &item.texture {
+                                ui.painter().image(
+                                    tex.id(),
+                                    preview_rect,
+                                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                                    Color32::WHITE,
                                 );
-                                if ui.put(remove_rect, egui::Button::new(lucide::X)).clicked() {
+                            } else {
+                                let category = crate::message_view::file_category(
+                                    &item.path.file_name().unwrap_or_default().to_string_lossy(),
+                                );
+                                messages::paint_file_category_icon(
+                                    ui.painter(),
+                                    preview_rect,
+                                    category,
+                                );
+                            }
+
+                            // Tên file cắt ngắn ở đáy kèm dung lượng nhỏ
+                            let full_name =
+                                item.path.file_name().unwrap_or_default().to_string_lossy();
+                            let mut short_name = full_name.to_string();
+                            if short_name.chars().count() > 10 {
+                                short_name =
+                                    format!("{}…", short_name.chars().take(9).collect::<String>());
+                            }
+                            ui.painter().text(
+                                Pos2::new(card_rect.center().x, card_rect.min.y + 45.0),
+                                egui::Align2::CENTER_CENTER,
+                                short_name,
+                                FontId::proportional(10.0),
+                                pal.text_primary,
+                            );
+
+                            let status = match &item.result {
+                                None => "Đang đọc…".to_owned(),
+                                Some(Ok(_)) => crate::chat::format_file_size(item.size),
+                                Some(Err(e)) => {
+                                    let err: String = e.chars().take(8).collect();
+                                    format!("{err}…")
+                                }
+                            };
+                            ui.painter().text(
+                                Pos2::new(card_rect.center().x, card_rect.min.y + 58.0),
+                                egui::Align2::CENTER_CENTER,
+                                status,
+                                FontId::proportional(9.0),
+                                if matches!(item.result, Some(Err(_))) {
+                                    pal.danger
+                                } else {
+                                    pal.text_muted
+                                },
+                            );
+
+                            let card_resp = card_resp.on_hover_text(format!(
+                                "{}\n{}",
+                                full_name,
+                                crate::chat::format_file_size(item.size)
+                            ));
+
+                            // Nút tròn (X) màu xám đậm ở góc trên bên phải thẻ xuất hiện khi hover để xóa từng tệp
+                            if card_resp.hovered() || ui.rect_contains_pointer(card_rect) {
+                                let x_center =
+                                    Pos2::new(card_rect.max.x - 9.0, card_rect.min.y + 9.0);
+                                let x_rect = Rect::from_center_size(x_center, Vec2::splat(16.0));
+                                let x_resp = ui.interact(
+                                    x_rect,
+                                    ui.id().with(("remove_draft", index)),
+                                    Sense::click(),
+                                );
+                                let circle_bg = if x_resp.hovered() {
+                                    Color32::from_rgb(60, 60, 60)
+                                } else {
+                                    Color32::from_rgba_premultiplied(40, 40, 40, 220)
+                                };
+                                ui.painter().circle_filled(x_center, 7.5, circle_bg);
+                                let x_stroke = Stroke::new(1.3_f32, Color32::WHITE);
+                                let d = 2.8_f32;
+                                ui.painter().line_segment(
+                                    [x_center + Vec2::new(-d, -d), x_center + Vec2::new(d, d)],
+                                    x_stroke,
+                                );
+                                ui.painter().line_segment(
+                                    [x_center + Vec2::new(-d, d), x_center + Vec2::new(d, -d)],
+                                    x_stroke,
+                                );
+                                let x_resp = x_resp
+                                    .on_hover_text(crate::i18n::tr("Xóa file"))
+                                    .on_hover_cursor(CursorIcon::PointingHand);
+                                if x_resp.clicked() {
                                     remove = Some(index);
                                 }
-                            });
+                            }
                         }
+
+                        // Thẻ cuối cùng: Thẻ vuông 72px x 72px viền nét mỏng/đứt có dấu cộng '+' to ở giữa
                         let (plus_rect, plus_resp) =
-                            ui.allocate_exact_size(Vec2::new(70.0, 82.0), Sense::click());
+                            ui.allocate_exact_size(Vec2::new(72.0, 72.0), Sense::click());
+                        if plus_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(plus_rect, Rounding::same(8.0), pal.bg_hover);
+                        }
                         ui.painter().rect_stroke(
                             plus_rect,
-                            Rounding::same(7.0),
-                            Stroke::new(1.5_f32, pal.border),
+                            Rounding::same(8.0),
+                            Stroke::new(1.0_f32, pal.border),
                         );
                         ui.painter().text(
-                            plus_rect.center_top() + Vec2::new(0.0, 14.0),
+                            plus_rect.center(),
                             egui::Align2::CENTER_CENTER,
                             "+",
-                            FontId::proportional(30.0),
-                            pal.text_muted,
+                            FontId::proportional(28.0),
+                            if plus_resp.hovered() {
+                                pal.text_primary
+                            } else {
+                                pal.text_muted
+                            },
                         );
-                        ui.painter().text(
-                            plus_rect.center_bottom() - Vec2::new(0.0, 15.0),
-                            egui::Align2::CENTER_CENTER,
-                            "Thêm",
-                            FontId::proportional(11.0),
-                            pal.text_secondary,
-                        );
+                        let plus_resp = plus_resp
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .on_hover_text(crate::i18n::tr("Thêm tệp"));
                         if plus_resp.clicked() {
                             add_more = true;
                         }
@@ -545,10 +603,6 @@ impl ZaloGuiApp {
         if !self.is_logged_in || self.attachment_drafts.owner != self.user_uin {
             return;
         }
-        if self.composer_has_metadata(ctx, thread, group) {
-            self.status_msg="Chưa hỗ trợ định dạng hoặc mức Quan trọng/Khẩn cấp cho tệp; hãy tắt chúng hoặc gửi văn bản riêng. Tệp và nội dung vẫn được giữ.".into();
-            return;
-        }
         if self.file_drop_blocked(ctx) {
             self.status_msg = "Hãy đóng cửa sổ phụ hoặc menu trước khi gửi tệp".into();
             return;
@@ -557,15 +611,6 @@ impl ZaloGuiApp {
             return;
         };
         if items.is_empty() {
-            return;
-        }
-        if !self.composer_mentions.mentions.is_empty()
-            || self.replying_to.is_some()
-            || self.pending_clipboard_image.is_some()
-        {
-            self.status_msg =
-                "Bỏ mention, hủy trích dẫn hoặc bỏ ảnh clipboard trước khi gửi tệp; tệp chờ vẫn được giữ"
-                    .into();
             return;
         }
         if items.iter().any(|i| !matches!(i.result, Some(Ok(_)))) {
@@ -598,6 +643,7 @@ impl ZaloGuiApp {
             self.attachment_drafts.threads.remove(thread);
             self.input_message.clear();
             self.composer_mentions.clear();
+            self.composer_focus_pending = true;
         } else {
             self.status_msg = "Không gửi được tệp; danh sách chờ vẫn được giữ".into();
         }
@@ -829,7 +875,9 @@ mod draft_send_tests {
             )
         });
         app.send_attachment_draft(&ctx, "thread-a", false);
-        assert!(app.status_msg.contains("Chưa hỗ trợ định dạng"));
+        // Metadata is present (Important/Urgent), but no longer blocks draft sending.
+        // It proceeds to checking if files are ready to send, hitting the pending read check.
+        assert!(app.status_msg.contains("chờ đọc tệp"));
         assert_eq!(app.attachment_drafts.len("thread-a"), 1);
         assert_eq!(app.input_message, "caption");
         assert!(app.composer_has_metadata(&ctx, "thread-a", false));

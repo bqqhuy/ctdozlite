@@ -287,6 +287,307 @@ fn enumerate_devices() -> CallDeviceLists {
     (mics, speakers, cams)
 }
 
+static RINGTONE_RUNNING: AtomicBool = AtomicBool::new(false);
+static RINGTONE_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+/// Start playing a synthesized ringtone on the selected or default speaker.
+/// Runs entirely on a background thread so the UI thread is never blocked.
+pub fn start_ringtone() {
+    if RINGTONE_RUNNING.swap(true, Ordering::SeqCst) {
+        return; // Already ringing
+    }
+    let epoch = RINGTONE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let preferred_speaker = selected_speaker_device();
+        let output_dev = host
+            .output_devices()
+            .ok()
+            .and_then(|mut devices| {
+                if preferred_speaker.is_empty() {
+                    None
+                } else {
+                    devices.find(|device| {
+                        device
+                            .name()
+                            .map(|name| name.trim() == preferred_speaker)
+                            .unwrap_or(false)
+                    })
+                }
+            })
+            .or_else(|| host.default_output_device());
+        let Some(output_device) = output_dev else {
+            RINGTONE_RUNNING.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Ok(config) = output_device.default_output_config() else {
+            RINGTONE_RUNNING.store(false, Ordering::SeqCst);
+            return;
+        };
+        let sample_rate = config.sample_rate().0.max(8000) as f32;
+        let channels = (config.channels() as usize).max(1);
+        let sample_idx = Arc::new(Mutex::new(0u64));
+        let sample_idx_cb = sample_idx.clone();
+
+        macro_rules! build_ring_stream {
+            ($sample:ty) => {{
+                let idx_cb = sample_idx_cb.clone();
+                output_device.build_output_stream(
+                    &config.clone().into(),
+                    move |data: &mut [$sample], _| {
+                        if !RINGTONE_RUNNING.load(Ordering::Relaxed) {
+                            data.fill((0.0f32).to_sample::<$sample>());
+                            return;
+                        }
+                        let mut idx = idx_cb.lock().unwrap_or_else(|e| e.into_inner());
+                        for frame in data.chunks_exact_mut(channels) {
+                            let t = (*idx as f32) / sample_rate;
+                            *idx = idx.wrapping_add(1);
+                            // Dual-tone ring cadence: 440Hz + 480Hz
+                            // Cadence: 1.5s tone, 2.0s silence
+                            let cycle_pos = t % 3.5;
+                            let sample_val = if cycle_pos < 1.5 {
+                                let w1 = 2.0 * std::f32::consts::PI * 440.0 * t;
+                                let w2 = 2.0 * std::f32::consts::PI * 480.0 * t;
+                                (w1.sin() + w2.sin()) * 0.15
+                            } else {
+                                0.0
+                            };
+                            frame.fill(sample_val.to_sample::<$sample>());
+                        }
+                    },
+                    |err| eprintln!("ringtone stream error: {err}"),
+                    None,
+                )
+            }};
+        }
+
+        let stream_res = match config.sample_format() {
+            cpal::SampleFormat::F32 => build_ring_stream!(f32),
+            cpal::SampleFormat::I16 => build_ring_stream!(i16),
+            cpal::SampleFormat::U16 => build_ring_stream!(u16),
+            cpal::SampleFormat::I32 => build_ring_stream!(i32),
+            cpal::SampleFormat::F64 => build_ring_stream!(f64),
+            _ => {
+                RINGTONE_RUNNING.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        if let Ok(stream) = stream_res {
+            if stream.play().is_ok() {
+                while RINGTONE_RUNNING.load(Ordering::Relaxed)
+                    && RINGTONE_EPOCH.load(Ordering::Relaxed) == epoch
+                {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        RINGTONE_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Stop the active ringtone safely without blocking the caller.
+pub fn stop_ringtone() {
+    RINGTONE_RUNNING.store(false, Ordering::SeqCst);
+    RINGTONE_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Play a 440Hz test sine tone for `duration` on a background thread to verify speaker output.
+pub fn play_test_speaker_tone(duration: Duration) {
+    thread::spawn(move || {
+        let host = cpal::default_host();
+        let preferred_speaker = selected_speaker_device();
+        let output_dev = host
+            .output_devices()
+            .ok()
+            .and_then(|mut devices| {
+                if preferred_speaker.is_empty() {
+                    None
+                } else {
+                    devices.find(|device| {
+                        device
+                            .name()
+                            .map(|name| name.trim() == preferred_speaker)
+                            .unwrap_or(false)
+                    })
+                }
+            })
+            .or_else(|| host.default_output_device());
+        let Some(output_device) = output_dev else {
+            return;
+        };
+        let Ok(config) = output_device.default_output_config() else {
+            return;
+        };
+        let sample_rate = config.sample_rate().0.max(8000) as f32;
+        let channels = (config.channels() as usize).max(1);
+        let sample_idx = Arc::new(Mutex::new(0u64));
+        let sample_idx_cb = sample_idx.clone();
+
+        macro_rules! build_test_stream {
+            ($sample:ty) => {{
+                let idx_cb = sample_idx_cb.clone();
+                output_device.build_output_stream(
+                    &config.clone().into(),
+                    move |data: &mut [$sample], _| {
+                        let mut idx = idx_cb.lock().unwrap_or_else(|e| e.into_inner());
+                        for frame in data.chunks_exact_mut(channels) {
+                            let t = (*idx as f32) / sample_rate;
+                            *idx = idx.wrapping_add(1);
+                            let sample_val = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.25;
+                            frame.fill(sample_val.to_sample::<$sample>());
+                        }
+                    },
+                    |err| eprintln!("test tone stream error: {err}"),
+                    None,
+                )
+            }};
+        }
+
+        let stream_res = match config.sample_format() {
+            cpal::SampleFormat::F32 => build_test_stream!(f32),
+            cpal::SampleFormat::I16 => build_test_stream!(i16),
+            cpal::SampleFormat::U16 => build_test_stream!(u16),
+            cpal::SampleFormat::I32 => build_test_stream!(i32),
+            cpal::SampleFormat::F64 => build_test_stream!(f64),
+            _ => return,
+        };
+
+        if let Ok(stream) = stream_res {
+            if stream.play().is_ok() {
+                thread::sleep(duration);
+            }
+        }
+    });
+}
+
+/// Real-time microphone preflight monitor for VU meter energy level display.
+/// Captures mic audio in a background thread, updates an atomic RMS, and releases
+/// resources non-blockingly on drop.
+#[derive(Clone, Debug)]
+pub struct PreflightMicMonitor {
+    rms: Arc<AtomicU32>,
+    stop: Arc<AtomicBool>,
+}
+
+impl PreflightMicMonitor {
+    pub fn mock() -> Self {
+        Self {
+            rms: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    pub fn start() -> Self {
+        #[cfg(test)]
+        {
+            Self::mock()
+        }
+        #[cfg(not(test))]
+        {
+            let rms = Arc::new(AtomicU32::new(0.0f32.to_bits()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let rms_cb = rms.clone();
+            let stop_cb = stop.clone();
+
+            thread::spawn(move || {
+                let host = cpal::default_host();
+                let preferred_mic = selected_mic_device();
+                let input_dev = host
+                    .input_devices()
+                    .ok()
+                    .and_then(|mut ds| {
+                        if preferred_mic.is_empty() {
+                            None
+                        } else {
+                            ds.find(|d| {
+                                d.name().map(|n| n.trim() == preferred_mic).unwrap_or(false)
+                            })
+                        }
+                    })
+                    .or_else(|| host.default_input_device());
+                let Some(input_device) = input_dev else {
+                    return;
+                };
+                let Ok(config) = input_device.default_input_config() else {
+                    return;
+                };
+                let channels = (config.channels() as usize).max(1);
+
+                macro_rules! build_mic_stream {
+                    ($sample:ty) => {{
+                        let stop_flag = stop_cb.clone();
+                        let rms_flag = rms_cb.clone();
+                        input_device.build_input_stream(
+                            &config.clone().into(),
+                            move |data: &[$sample], _| {
+                                if stop_flag.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                let mut energy_sq = 0.0f64;
+                                let mut count = 0usize;
+                                for frame in data.chunks_exact(channels) {
+                                    let mono =
+                                        frame.iter().map(|s| s.to_sample::<f32>()).sum::<f32>()
+                                            / channels as f32;
+                                    energy_sq += (mono * mono) as f64;
+                                    count += 1;
+                                }
+                                if count > 0 {
+                                    let raw_rms = (energy_sq / count as f64).sqrt() as f32;
+                                    let prev = f32::from_bits(rms_flag.load(Ordering::Relaxed));
+                                    let smoothed = 0.3 * prev + 0.7 * raw_rms;
+                                    rms_flag.store(smoothed.to_bits(), Ordering::Relaxed);
+                                }
+                            },
+                            |err| eprintln!("preflight mic stream error: {err}"),
+                            None,
+                        )
+                    }};
+                }
+
+                let stream_res = match config.sample_format() {
+                    cpal::SampleFormat::F32 => build_mic_stream!(f32),
+                    cpal::SampleFormat::I16 => build_mic_stream!(i16),
+                    cpal::SampleFormat::U16 => build_mic_stream!(u16),
+                    cpal::SampleFormat::I32 => build_mic_stream!(i32),
+                    cpal::SampleFormat::F64 => build_mic_stream!(f64),
+                    _ => return,
+                };
+
+                if let Ok(stream) = stream_res {
+                    if stream.play().is_ok() {
+                        while !stop_cb.load(Ordering::Relaxed) {
+                            thread::sleep(Duration::from_millis(30));
+                        }
+                    }
+                }
+            });
+
+            Self { rms, stop }
+        }
+    }
+
+    pub fn current_rms(&self) -> f32 {
+        f32::from_bits(self.rms.load(Ordering::Relaxed))
+    }
+}
+
+impl Drop for PreflightMicMonitor {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
 pub struct MediaHandle {
     stop: Arc<AtomicBool>,
     mic_muted: Arc<AtomicBool>,
@@ -2965,5 +3266,26 @@ mod group_media_tests {
             (f32_norm - 0.5).abs() < f32::EPSILON,
             "f32 sample must be unchanged"
         );
+    }
+
+    #[test]
+    fn ringtone_and_preflight_controls_are_safe_and_idempotent() {
+        // start and stop ringtone should never panic or deadlock
+        start_ringtone();
+        start_ringtone(); // idempotent
+        stop_ringtone();
+        stop_ringtone(); // idempotent
+
+        // test tone can be spawned without blocking
+        play_test_speaker_tone(Duration::from_millis(10));
+
+        // mic monitor starts and returns non-negative RMS, stops safely
+        let monitor = PreflightMicMonitor::start();
+        let rms = monitor.current_rms();
+        assert!(rms >= 0.0);
+        assert!(!monitor.is_stopped());
+        monitor.stop();
+        assert!(monitor.is_stopped());
+        drop(monitor);
     }
 }

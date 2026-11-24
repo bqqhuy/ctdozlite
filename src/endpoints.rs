@@ -89,6 +89,7 @@ pub const GROUP_INVITE_HOST: &str = "zalo.me";
 
 /// Allowed WebSocket hosts for real-time connection and push/pull messaging (A24).
 pub const WS_HOSTS: &[&str] = &[
+    "chat-wpa.zalo.me",
     "ws1-msg.chat.zalo.me",
     "ws2-msg.chat.zalo.me",
     "ws3-msg.chat.zalo.me",

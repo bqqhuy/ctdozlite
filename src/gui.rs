@@ -191,6 +191,17 @@ pub(crate) struct PendingAutoSyncIntent {
     pub stage: AutoSyncIntentStage,
 }
 
+/// Distinguish solicited reads from unsolicited snapshots without treating reads as mutations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataResultKind {
+    /// Unsolicited refresh; never completes an outstanding UI request.
+    Snapshot,
+    /// Read requested by the UI, correlated by generation.
+    Read,
+    /// Mutation requested by the UI, correlated by generation.
+    Mutation,
+}
+
 pub enum GuiEvent {
     SyncSuggestionRequested {
         owner: String,
@@ -268,11 +279,14 @@ pub enum GuiEvent {
 
     ActivityUpdated {
         owner: String,
+        runtime_id: usize,
         uid: String,
         status: crate::last_activity::Status,
     },
     AccountMetadataInvalidated {
         owner: String,
+        runtime_id: usize,
+        revision: u64,
         privacy: bool,
         relations: bool,
         business: bool,
@@ -280,6 +294,7 @@ pub enum GuiEvent {
     AccountMetadata {
         owner: String,
         runtime_id: usize,
+        revision: u64,
         snapshot: Box<crate::account_metadata::Snapshot>,
     },
     ComposerConfig {
@@ -731,26 +746,30 @@ pub enum GuiEvent {
     },
     Archive {
         owner: String,
+        runtime_id: usize,
         generation: u64,
-        mutation: bool,
+        kind: MetadataResultKind,
         result: Result<crate::archive::Snapshot, String>,
     },
     ManualMarks {
         owner: String,
+        runtime_id: usize,
         generation: u64,
-        mutation: bool,
+        kind: MetadataResultKind,
         result: Result<Vec<crate::unread::ManualUnreadMark>, String>,
     },
     Privacy {
         owner: String,
+        runtime_id: usize,
         generation: u64,
         mutation: bool,
         result: Result<crate::privacy::Snapshot, String>,
     },
     Labels {
         owner: String,
+        runtime_id: usize,
         generation: u64,
-        mutation: bool,
+        kind: MetadataResultKind,
         result: Result<crate::labels::Snapshot, String>,
     },
     Profile {
@@ -932,6 +951,19 @@ struct ActiveCallOverlay {
     is_incoming_ringing: bool,
     error_code: Option<i64>,
     error_reason: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct PreflightCallState {
+    pub owner: String,
+    pub runtime_id: usize,
+    pub partner_id: String,
+    pub partner_name: String,
+    pub partner_avatar: Option<String>,
+    pub is_video: bool,
+    pub is_group: bool,
+    pub mic_monitor: Option<crate::media::PreflightMicMonitor>,
+    pub test_tone_playing_until: Option<std::time::Instant>,
 }
 
 #[derive(Clone, Copy)]
@@ -1394,9 +1426,12 @@ pub struct ZaloGuiApp {
     manual_mark_pending: bool,
     manual_mark_uncertain: bool,
     manual_mark_generation: u64,
+    manual_mark_revision: u64,
     archive_pending: bool,
     archive_uncertain: bool,
     archive_generation: u64,
+    archive_revision: u64,
+    privacy_revision: u64,
     policy_panel: policy_panel::PolicyPanel,
     group_content: content_panel::ContentPanel,
     reactor_profiles: HashMap<String, crate::chat::SidebarMember>,
@@ -1461,6 +1496,8 @@ pub struct ZaloGuiApp {
     chat_anchor: Option<(String, String, f32)>,
     /// `(thread without prefix, is_group)` → (who is typing, when it was reported).
     typing_map: HashMap<(String, bool), (String, std::time::Instant)>,
+    pub presence_map:
+        std::collections::HashMap<String, (crate::last_activity::Status, std::time::Instant)>,
     /// Group rosters loaded for the info drawer, by thread ID.
     group_members: HashMap<String, (Vec<crate::chat::SidebarMember>, Option<u64>)>,
     /// Groups whose roster is loading, or failed (with the error).
@@ -1493,6 +1530,7 @@ pub struct ZaloGuiApp {
     forward_note: String,
     filter_starred_only: bool,
     active_call: Option<ActiveCallOverlay>,
+    pub preflight_call: Option<PreflightCallState>,
     call_terminals: crate::call_lifecycle::TerminalCalls,
     image_viewer: Option<ImageViewerModal>,
     doc_viewer: Option<doc_viewer::DocViewerModal>,
@@ -1640,6 +1678,8 @@ pub struct ZaloGuiApp {
     selected_msg_ids: HashSet<String>,
     send_contact_modal_open: bool,
     send_contact_query: String,
+    send_contact_selected: Option<String>,
+    send_contact_filter: usize,
     voice_worker: Option<crate::voice::VoiceWorker>,
     voice_start_pending: bool,
     voice_finish_pending: bool,
@@ -1862,6 +1902,7 @@ impl ZaloGuiApp {
             chat_geometry_revision: 0,
             chat_anchor: None,
             typing_map: HashMap::new(),
+            presence_map: HashMap::new(),
             typing_sent: HashMap::new(),
             screen_capture_pending: false,
             group_members: HashMap::new(),
@@ -1887,6 +1928,7 @@ impl ZaloGuiApp {
             forward_note: String::new(),
             filter_starred_only: false,
             active_call: None,
+            preflight_call: None,
             call_terminals: Default::default(),
             image_viewer: None,
             doc_viewer: None,
@@ -2031,6 +2073,8 @@ impl ZaloGuiApp {
             selected_msg_ids: HashSet::new(),
             send_contact_modal_open: false,
             send_contact_query: String::new(),
+            send_contact_selected: None,
+            send_contact_filter: 0,
             voice_worker: None,
             voice_start_pending: false,
             voice_finish_pending: false,
@@ -2079,9 +2123,12 @@ impl ZaloGuiApp {
             manual_mark_pending: false,
             manual_mark_uncertain: false,
             manual_mark_generation: 0,
+            manual_mark_revision: 0,
             archive_pending: false,
             archive_uncertain: false,
             archive_generation: 0,
+            archive_revision: 0,
+            privacy_revision: 0,
             policy_panel: Default::default(),
             group_content: Default::default(),
             reactor_profiles: Default::default(),
@@ -2570,6 +2617,39 @@ impl ZaloGuiApp {
         app
     }
 
+    pub(crate) fn clear_preflight_call(&mut self) {
+        if let Some(mut state) = self.preflight_call.take() {
+            if let Some(monitor) = state.mic_monitor.take() {
+                monitor.stop();
+            }
+        }
+    }
+
+    pub(crate) fn open_preflight_call(
+        &mut self,
+        partner_id: String,
+        partner_name: String,
+        partner_avatar: Option<String>,
+        is_video: bool,
+        is_group: bool,
+    ) {
+        if !self.is_logged_in || self.user_uin.is_empty() {
+            return;
+        }
+        self.clear_preflight_call();
+        self.preflight_call = Some(PreflightCallState {
+            owner: self.user_uin.clone(),
+            runtime_id: self.account_runtime_id,
+            partner_id,
+            partner_name,
+            partner_avatar,
+            is_video,
+            is_group,
+            mic_monitor: Some(crate::media::PreflightMicMonitor::start()),
+            test_tone_playing_until: None,
+        });
+    }
+
     pub(super) fn can_lock_app(&self) -> bool {
         self.settings.lock_configured()
     }
@@ -2667,8 +2747,25 @@ impl ZaloGuiApp {
         palette
     }
 
+    fn apply_privacy_snapshot(&mut self, snapshot: &crate::privacy::Snapshot) {
+        self.inbox_policy.show_online = snapshot
+            .values
+            .get(&crate::privacy::Setting::ShowOnline)
+            .map(|value| *value != 0);
+        self.inbox_policy.direct = snapshot
+            .values
+            .get(&crate::privacy::Setting::StrangerDirect)
+            .map(|value| *value != 0);
+        if self.inbox_policy.show_online != Some(true) {
+            self.contact_panel.presence = None;
+            self.contact_panel.presence_checked = None;
+        }
+    }
+
     /// Forget per-account typing, roster and capture state at an account boundary.
     fn clear_presence_state(&mut self) {
+        self.clear_preflight_call();
+        self.presence_map.clear();
         self.backup_panel
             .cancel
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2701,9 +2798,12 @@ impl ZaloGuiApp {
         self.manual_mark_pending = false;
         self.manual_mark_uncertain = false;
         self.manual_mark_generation = crate::search::generation();
+        self.manual_mark_revision = self.manual_mark_generation;
         self.archive_pending = false;
         self.archive_uncertain = false;
         self.archive_generation = crate::search::generation();
+        self.archive_revision = self.archive_generation;
+        self.privacy_revision = crate::search::generation();
         self.policy_panel = Default::default();
         self.group_content = Default::default();
         self.reactor_profiles.clear();
@@ -4010,15 +4110,23 @@ impl ZaloGuiApp {
                         .unwrap_or_else(|| format!("Đã cập nhật {}", crate::ui::clock()));
                 }
                 GuiEvent::AccountMetadataInvalidated {
+                    revision,
                     owner,
+                    runtime_id,
                     privacy,
                     relations,
                     business,
                 } => {
-                    if owner == self.user_uin && self.is_logged_in {
-                        if privacy {
+                    if owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                        && self.is_logged_in
+                    {
+                        if privacy && revision >= self.privacy_revision {
+                            self.privacy_revision = revision;
                             self.inbox_policy.direct = None;
                             self.inbox_policy.show_online = None;
+                            self.contact_panel.presence = None;
+                            self.contact_panel.presence_checked = None;
                             if !self.privacy_panel.pending {
                                 self.privacy_panel.snapshot = None;
                             }
@@ -4032,10 +4140,21 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::ActivityUpdated { owner, uid, status } => {
-                    if owner == self.user_uin
-                        && self.is_logged_in
-                        && self.inbox_policy.show_online == Some(true)
+                GuiEvent::ActivityUpdated {
+                    owner,
+                    runtime_id,
+                    uid,
+                    status,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    self.presence_map
+                        .insert(uid.clone(), (status.clone(), std::time::Instant::now()));
+                    if self.inbox_policy.show_online == Some(true)
                         && self.contact_panel.target == uid
                     {
                         self.contact_panel.presence = Some(status);
@@ -4241,6 +4360,7 @@ impl ZaloGuiApp {
                 GuiEvent::AccountMetadata {
                     owner,
                     runtime_id,
+                    revision,
                     snapshot,
                 } => {
                     if owner != self.user_uin
@@ -4252,15 +4372,12 @@ impl ZaloGuiApp {
                     let mut dirty = false;
                     self.own_cloud_id = snapshot.cloud_id;
                     if let Some(privacy) = snapshot.privacy {
-                        self.inbox_policy.show_online = privacy
-                            .values
-                            .get(&crate::privacy::Setting::ShowOnline)
-                            .map(|value| *value != 0);
-                        self.inbox_policy.direct = privacy
-                            .values
-                            .get(&crate::privacy::Setting::StrangerDirect)
-                            .map(|value| *value != 0);
-                        if !self.privacy_panel.pending {
+                        if !self.privacy_panel.pending
+                            && revision >= self.privacy_revision
+                            && revision >= self.privacy_panel.generation
+                        {
+                            self.privacy_revision = revision;
+                            self.apply_privacy_snapshot(&privacy);
                             self.privacy_panel.uncertain = snapshot.from_cache;
                             self.privacy_panel.snapshot = Some(privacy);
                         }
@@ -4280,12 +4397,14 @@ impl ZaloGuiApp {
                         self.inbox_policy.business = Some(business);
                     }
                     if let Some(labels) = snapshot.labels {
-                        if !self.labels_panel.pending {
+                        if !self.labels_panel.pending && revision >= self.labels_panel.revision {
+                            self.labels_panel.revision = revision;
                             self.labels_panel.snapshot = Some(labels);
                         }
                     }
                     if let Some(archive) = snapshot.archive {
-                        if !self.archive_pending {
+                        if !self.archive_pending && revision >= self.archive_revision {
+                            self.archive_revision = revision;
                             let archived = archive
                                 .items
                                 .into_iter()
@@ -6364,19 +6483,51 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::Labels {
                     owner,
+                    runtime_id,
                     generation,
-                    mutation,
+                    kind,
                     result,
                 } => {
                     if !self.is_logged_in
                         || owner != self.user_uin
-                        || generation != self.labels_panel.generation
+                        || runtime_id != self.account_runtime_id
                     {
                         continue;
                     }
-                    self.labels_panel.pending = false;
-                    match result {
-                        Ok(snapshot) => {
+                    let mutation = kind == MetadataResultKind::Mutation;
+                    if kind != MetadataResultKind::Snapshot {
+                        if generation != self.labels_panel.generation
+                            || generation < self.labels_panel.revision
+                        {
+                            continue;
+                        }
+                        self.labels_panel.pending = false;
+                        match result {
+                            Ok(snapshot) => {
+                                if self.labels_panel.filter.is_some_and(|id| {
+                                    !snapshot.labels.iter().any(|label| label.id == id)
+                                }) {
+                                    self.labels_panel.filter = None;
+                                }
+                                self.labels_panel.status = format!(
+                                    "{} phân loại đã tải từ máy chủ",
+                                    snapshot.labels.len()
+                                );
+                                self.labels_panel.snapshot = Some(snapshot);
+                                self.labels_panel.uncertain = false;
+                            }
+                            Err(error) => {
+                                self.labels_panel.uncertain |= mutation;
+                                self.labels_panel.status =
+                                    format!("Chưa cập nhật phân loại: {error}");
+                            }
+                        }
+                    } else {
+                        if self.labels_panel.pending || generation < self.labels_panel.revision {
+                            continue;
+                        }
+                        self.labels_panel.revision = generation;
+                        if let Ok(snapshot) = result {
                             if self.labels_panel.filter.is_some_and(|id| {
                                 !snapshot.labels.iter().any(|label| label.id == id)
                             }) {
@@ -6387,31 +6538,33 @@ impl ZaloGuiApp {
                             self.labels_panel.snapshot = Some(snapshot);
                             self.labels_panel.uncertain = false;
                         }
-                        Err(error) => {
-                            self.labels_panel.uncertain |= mutation;
-                            self.labels_panel.status = format!("Chưa cập nhật phân loại: {error}");
-                        }
                     }
                 }
                 GuiEvent::Privacy {
                     owner,
+                    runtime_id,
                     generation,
                     mutation,
                     result,
                 } => {
                     if !self.is_logged_in
                         || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
                         || generation != self.privacy_panel.generation
                     {
                         continue;
                     }
                     self.privacy_panel.pending = false;
+                    if generation < self.privacy_revision {
+                        self.privacy_panel.uncertain = true;
+                        self.privacy_panel.status =
+                            "Quyền riêng tư đã thay đổi; vui lòng tải lại".into();
+                        continue;
+                    }
                     match result {
                         Ok(snapshot) => {
-                            self.inbox_policy.direct = snapshot
-                                .values
-                                .get(&crate::privacy::Setting::StrangerDirect)
-                                .map(|value| *value != 0);
+                            self.privacy_revision = generation;
+                            self.apply_privacy_snapshot(&snapshot);
                             self.privacy_panel.snapshot = Some(snapshot);
                             self.privacy_panel.uncertain = false;
                             self.privacy_panel.status = if mutation {
@@ -6428,45 +6581,106 @@ impl ZaloGuiApp {
                 }
                 GuiEvent::ManualMarks {
                     owner,
+                    runtime_id,
                     generation,
-                    mutation,
+                    kind,
                     result,
                 } => {
                     if !self.is_logged_in
                         || owner != self.user_uin
-                        || generation != self.manual_mark_generation
+                        || runtime_id != self.account_runtime_id
                     {
                         continue;
                     }
-                    self.manual_mark_pending = false;
-                    match result {
-                        Ok(marks) => {
+                    let mutation = kind == MetadataResultKind::Mutation;
+                    if kind != MetadataResultKind::Snapshot {
+                        if generation != self.manual_mark_generation
+                            || generation < self.manual_mark_revision
+                        {
+                            continue;
+                        }
+                        self.manual_mark_pending = false;
+                        match result {
+                            Ok(marks) => {
+                                self.manual_mark_uncertain = false;
+                                crate::unread::merge_manual_unread_marks(&mut self.threads, &marks);
+                                self.persist_threads_async();
+                                self.show_toast("Đã cập nhật dấu chưa đọc từ máy chủ");
+                            }
+                            Err(error) => {
+                                self.manual_mark_uncertain |= mutation;
+                                self.show_toast(format!("Chưa cập nhật dấu chưa đọc: {error}"));
+                            }
+                        }
+                    } else {
+                        if self.manual_mark_pending || generation < self.manual_mark_revision {
+                            continue;
+                        }
+                        self.manual_mark_revision = generation;
+                        if let Ok(marks) = result {
                             self.manual_mark_uncertain = false;
                             crate::unread::merge_manual_unread_marks(&mut self.threads, &marks);
                             self.persist_threads_async();
-                            self.show_toast("Đã cập nhật dấu chưa đọc từ máy chủ");
-                        }
-                        Err(error) => {
-                            self.manual_mark_uncertain |= mutation;
-                            self.show_toast(format!("Chưa cập nhật dấu chưa đọc: {error}"));
                         }
                     }
                 }
                 GuiEvent::Archive {
                     owner,
+                    runtime_id,
                     generation,
-                    mutation,
+                    kind,
                     result,
                 } => {
                     if !self.is_logged_in
                         || owner != self.user_uin
-                        || generation != self.archive_generation
+                        || runtime_id != self.account_runtime_id
                     {
                         continue;
                     }
-                    self.archive_pending = false;
-                    match result {
-                        Ok(snapshot) => {
+                    let mutation = kind == MetadataResultKind::Mutation;
+                    if kind != MetadataResultKind::Snapshot {
+                        if generation != self.archive_generation
+                            || generation < self.archive_revision
+                        {
+                            continue;
+                        }
+                        self.archive_pending = false;
+                        match result {
+                            Ok(snapshot) => {
+                                self.archive_uncertain = false;
+                                let archived: std::collections::HashSet<_> = snapshot
+                                    .items
+                                    .into_iter()
+                                    .map(|item| (item.id, item.kind))
+                                    .collect();
+                                for thread in &mut self.threads {
+                                    thread.presentation.archived =
+                                        crate::server_pins::identity(&thread.id, thread.is_group)
+                                            .ok()
+                                            .map(|id| {
+                                                let bare = if thread.is_group {
+                                                    id[1..].to_owned()
+                                                } else {
+                                                    id
+                                                };
+                                                archived
+                                                    .contains(&(bare, u8::from(thread.is_group)))
+                                            });
+                                }
+                                self.persist_threads_async();
+                                self.show_toast("Đã cập nhật danh sách lưu trữ từ máy chủ");
+                            }
+                            Err(error) => {
+                                self.archive_uncertain |= mutation;
+                                self.show_toast(format!("Chưa cập nhật lưu trữ: {error}. Tải lại trạng thái trước khi thử tiếp."));
+                            }
+                        }
+                    } else {
+                        if self.archive_pending || generation < self.archive_revision {
+                            continue;
+                        }
+                        self.archive_revision = generation;
+                        if let Ok(snapshot) = result {
                             self.archive_uncertain = false;
                             let archived: std::collections::HashSet<_> = snapshot
                                 .items
@@ -6487,11 +6701,6 @@ impl ZaloGuiApp {
                                         });
                             }
                             self.persist_threads_async();
-                            self.show_toast("Đã cập nhật danh sách lưu trữ từ máy chủ");
-                        }
-                        Err(error) => {
-                            self.archive_uncertain |= mutation;
-                            self.show_toast(format!("Chưa cập nhật lưu trữ: {error}. Tải lại trạng thái trước khi thử tiếp."));
                         }
                     }
                 }
@@ -6584,6 +6793,7 @@ impl ZaloGuiApp {
                     if !self.is_logged_in || owner != self.user_uin {
                         continue;
                     }
+                    crate::media::stop_ringtone();
                     if self.active_call.as_ref().is_some_and(|call| {
                         call.call_id == Some(call_id) && !call.is_incoming_ringing
                     }) {
@@ -6620,6 +6830,7 @@ impl ZaloGuiApp {
                         continue;
                     }
                     if state == "free" {
+                        crate::media::stop_ringtone();
                         self.call_terminals
                             .remember(&owner, call_id, std::time::Instant::now());
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
@@ -6680,6 +6891,7 @@ impl ZaloGuiApp {
                         .resolve_contact_name(&caller_id, &fallback_name)
                         .to_owned();
                     if self.settings.call_notifications_enabled {
+                        crate::media::start_ringtone();
                         self.status_msg = format!(
                             "📲 Cuộc gọi {} đến từ {resolved_name}…",
                             if is_video { "video" } else { "thoại" }
@@ -7413,6 +7625,7 @@ impl eframe::App for ZaloGuiApp {
                     self.render_reactor_details(ctx);
                     self.render_message_details(ctx);
                     self.render_archive_confirmation(ctx, &pal);
+                    self.render_preflight_dialog(ctx);
                 }
             }
         }
@@ -9513,6 +9726,48 @@ mod v008_gui_boundary_tests {
         app.event_tx.send(incoming(12)).unwrap();
         app.check_events(&ctx);
         assert!(!app.active_call.as_ref().unwrap().is_incoming_ringing);
+    }
+    #[test]
+    fn preflight_call_initializes_properly() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        assert!(app.preflight_call.is_none());
+        app.open_preflight_call(
+            "partner-1".into(),
+            "Partner One".into(),
+            Some("avatar.png".into()),
+            true,
+            false,
+        );
+        let preflight = app.preflight_call.as_ref().unwrap();
+        assert_eq!(preflight.partner_id, "partner-1");
+        assert_eq!(preflight.partner_name, "Partner One");
+        assert_eq!(preflight.partner_avatar.as_deref(), Some("avatar.png"));
+        assert!(preflight.is_video);
+        assert!(!preflight.is_group);
+        assert!(preflight.mic_monitor.is_some());
+    }
+    #[test]
+    fn watchdog_timer_terminates_incoming_call_after_65s() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.event_tx.send(incoming(42)).unwrap();
+        app.check_events(&ctx);
+        assert!(app.active_call.is_some());
+        assert!(app.active_call.as_ref().unwrap().is_incoming_ringing);
+
+        // Fast-forward started_at by 66 seconds
+        if let Some(ref mut call) = app.active_call {
+            call.started_at = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(66))
+                .unwrap();
+        }
+
+        // Now render_call_overlay should trigger the 65s watchdog
+        let pal = app.palette();
+        app.render_call_overlay(&ctx, &pal);
+        assert!(app.active_call.is_none());
+        assert_eq!(app.status_msg, "Cuộc gọi nhỡ (quá thời gian chờ 65s)");
     }
     #[test]
     fn cancelling_folder_picker_preserves_the_previous_configuration() {

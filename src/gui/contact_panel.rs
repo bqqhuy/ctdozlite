@@ -284,7 +284,7 @@ impl ZaloGuiApp {
                 if let Some(texture)=self.sticker_textures.get(&key){ui.image((texture.id(),Vec2::splat(ui.available_width().min(200.0))));}
                 else if !self.contact_panel.qr_requested && !self.loading_stickers.contains(&key) {if let Some(tx)=WORKER_TX.get(){self.contact_panel.qr_requested=true;self.loading_stickers.insert(key.clone());let _=tx.send(WorkerCmd::FetchStickerImage {key,url:url.clone()});}}
             }
-            if let Some(status)=&self.contact_panel.presence {
+            if let Some(status)=self.contact_panel.presence.as_ref().filter(|_| self.inbox_policy.show_online == Some(true)) {
                 ui.label(match status {
                     crate::last_activity::Status::PrivacyUnavailable=>"Không truy vấn khi quyền hiển thị hoạt động đang tắt hoặc chưa xác định".to_owned(),
                     crate::last_activity::Status::Unavailable=>"Máy chủ chưa cung cấp thời gian hoạt động".to_owned(),
@@ -341,11 +341,14 @@ impl ZaloGuiApp {
         if self.archive_pending || (archived.is_some() && self.archive_uncertain) {
             return;
         }
-        self.archive_generation = crate::search::generation();
+        let gen = crate::search::generation();
+        self.archive_generation = gen;
+        self.archive_revision = gen;
         self.archive_pending = true;
         if !WORKER_TX.get().is_some_and(|tx| {
             tx.send(WorkerCmd::Archive {
                 owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
                 generation: self.archive_generation,
                 target,
                 group,
@@ -371,11 +374,14 @@ impl ZaloGuiApp {
         {
             return;
         }
-        self.manual_mark_generation = crate::search::generation();
+        let gen = crate::search::generation();
+        self.manual_mark_generation = gen;
+        self.manual_mark_revision = gen;
         self.manual_mark_pending = true;
         if !WORKER_TX.get().is_some_and(|tx| {
             tx.send(WorkerCmd::ManualMark {
                 owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
                 generation: self.manual_mark_generation,
                 target,
                 group,

@@ -726,6 +726,32 @@ pub(super) fn same_message_cluster(a: &ChatMessage, b: &ChatMessage) -> bool {
     true
 }
 
+pub(super) fn resolve_local_file_path(msg: &ChatMessage) -> Option<std::path::PathBuf> {
+    if let Some(crate::outgoing::Payload::Attachment { path, .. }) =
+        msg.outgoing_job.as_ref().map(|j| &j.payload)
+    {
+        if path.is_file() {
+            return Some(path.clone());
+        }
+    }
+    let media = crate::message_view::media(msg);
+    if let Some(ref orig) = media.original {
+        let clean = orig
+            .strip_prefix("file:///")
+            .or_else(|| orig.strip_prefix("file://"))
+            .unwrap_or(orig);
+        let p = std::path::Path::new(clean);
+        if p.is_file() {
+            return Some(p.to_path_buf());
+        }
+        let p2 = std::path::Path::new(orig);
+        if p2.is_file() {
+            return Some(p2.to_path_buf());
+        }
+    }
+    None
+}
+
 // Rendering arguments describe one immediate-mode paint operation.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_message_body(
@@ -954,7 +980,9 @@ pub(super) fn render_message_body(
                 body_action = Some(BubbleAction::MediaUnavailable);
             }
         }
-        if media.original.is_some() && ui.small_button(crate::i18n::tr("Lưu về máy")).clicked()
+        if !msg.is_outgoing
+            && media.original.is_some()
+            && ui.small_button(crate::i18n::tr("Lưu về máy")).clicked()
         {
             body_action = Some(BubbleAction::SaveAttachment {
                 url: media.original.clone().unwrap_or_default(),
@@ -970,59 +998,89 @@ pub(super) fn render_message_body(
     }
     if media.kind == crate::message_view::MediaKind::File {
         let category = crate::message_view::attachment_file_category(&media, msg);
+        let mut clicked_file = false;
         ui.horizontal(|ui| {
-            let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 32.0), Sense::hover());
+            let (rect, response) = ui.allocate_exact_size(Vec2::new(28.0, 32.0), Sense::click());
             paint_file_category_icon(ui.painter(), rect, category);
-            response.on_hover_text(crate::message_view::file_category_label(category));
-            ui.add(egui::Label::new(RichText::new(&media.name).color(text_col)).wrap());
-        });
-        if let Some(url) = media.original {
-            let is_text_doc = {
-                let ext = media.name.rsplit('.').next().unwrap_or("").to_lowercase();
-                matches!(
-                    ext.as_str(),
-                    "txt"
-                        | "log"
-                        | "json"
-                        | "md"
-                        | "rs"
-                        | "py"
-                        | "c"
-                        | "cpp"
-                        | "csv"
-                        | "xml"
-                        | "toml"
-                        | "yaml"
-                        | "yml"
-                        | "ini"
-                        | "sh"
-                        | "bat"
+            let icon_resp = response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(crate::message_view::file_category_label(category));
+            let name_resp = ui
+                .add(
+                    egui::Label::new(RichText::new(&media.name).color(text_col))
+                        .wrap()
+                        .sense(Sense::click()),
                 )
-            };
-            if is_text_doc
-                && ui
+                .on_hover_cursor(CursorIcon::PointingHand);
+            if icon_resp.clicked() || name_resp.clicked() {
+                clicked_file = true;
+            }
+        });
+        let local_path = if msg.is_outgoing {
+            resolve_local_file_path(msg)
+        } else {
+            None
+        };
+        let is_text_doc = {
+            let ext = media.name.rsplit('.').next().unwrap_or("").to_lowercase();
+            matches!(
+                ext.as_str(),
+                "txt"
+                    | "log"
+                    | "json"
+                    | "md"
+                    | "rs"
+                    | "py"
+                    | "c"
+                    | "cpp"
+                    | "csv"
+                    | "xml"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "ini"
+                    | "sh"
+                    | "bat"
+            )
+        };
+        if is_text_doc {
+            if let Some(ref url) = media.original {
+                if ui
                     .small_button(crate::i18n::tr("Xem trước"))
                     .on_hover_text(crate::i18n::tr("Xem nội dung văn bản trực tiếp"))
                     .clicked()
-            {
-                return Some(BubbleAction::PreviewDocument {
-                    url,
-                    name: media.name,
-                });
+                {
+                    return Some(BubbleAction::PreviewDocument {
+                        url: url.clone(),
+                        name: media.name.clone(),
+                    });
+                }
             }
-            if ui
-                .button("Mở tệp")
-                .on_hover_text(crate::i18n::tr(
-                    "Tải vào cache và mở bằng ứng dụng mặc định",
-                ))
-                .clicked()
+        }
+        if let Some(path) = local_path {
+            if clicked_file
+                || ui
+                    .button("Mở tệp")
+                    .on_hover_text(crate::i18n::tr("Mở tệp bằng ứng dụng mặc định"))
+                    .clicked()
+            {
+                return Some(BubbleAction::OpenLocalFile(path));
+            }
+        } else if let Some(url) = media.original {
+            if clicked_file
+                || ui
+                    .button("Mở tệp")
+                    .on_hover_text(crate::i18n::tr(
+                        "Tải vào cache và mở bằng ứng dụng mặc định",
+                    ))
+                    .clicked()
             {
                 return Some(BubbleAction::OpenAttachment {
                     url,
                     name: media.name,
                 });
             }
-            if ui.small_button(crate::i18n::tr("Lưu thành…")).clicked() {
+            if !msg.is_outgoing && ui.small_button(crate::i18n::tr("Lưu thành…")).clicked() {
                 return Some(BubbleAction::SaveAttachment {
                     url,
                     name: media.name,
@@ -1871,6 +1929,8 @@ pub(super) fn render_chat_bubble(
 
 #[derive(Clone, PartialEq)]
 pub(super) enum BubbleAction {
+    OpenLocalFile(std::path::PathBuf),
+    OpenContainingFolder(std::path::PathBuf),
     PreviewDocument {
         url: String,
         name: String,
@@ -2057,12 +2117,46 @@ pub(super) fn bubble_context_menu(
             .link_url
             .clone()
             .or_else(|| crate::chat::extract_first_url(&msg.text));
+        let media = crate::message_view::media(msg);
+        let is_file = media.kind == crate::message_view::MediaKind::File;
+        let local_path = resolve_local_file_path(msg);
+
+        if is_file {
+            let can_open = local_path.is_some() || media.original.is_some();
+            if bubble_menu_item(ui, lucide::EXTERNAL_LINK, "Mở tệp", can_open, false).clicked()
+            {
+                if let Some(ref path) = local_path {
+                    action = Some(BubbleAction::OpenLocalFile(path.clone()));
+                } else if let Some(ref url) = media.original {
+                    action = Some(BubbleAction::OpenAttachment {
+                        url: url.clone(),
+                        name: media.name.clone(),
+                    });
+                }
+                ui.close_menu();
+            }
+            if let Some(ref path) = local_path {
+                if bubble_menu_item(ui, lucide::FOLDER_OPEN, "Mở thư mục chứa", true, false)
+                    .clicked()
+                {
+                    action = Some(BubbleAction::OpenContainingFolder(path.clone()));
+                    ui.close_menu();
+                }
+            }
+            ui.separator();
+        }
+
         if bubble_menu_item(ui, lucide::MESSAGE_SQUARE, "Trả lời", server_actions, false).clicked()
         {
             action = Some(BubbleAction::Reply);
             ui.close_menu();
         }
-        if bubble_menu_item(ui, lucide::SEND, "Chia sẻ…", share, false)
+        let forward_label = if is_file {
+            "Chuyển tiếp"
+        } else {
+            "Chia sẻ…"
+        };
+        if bubble_menu_item(ui, lucide::SEND, forward_label, share, false)
             .on_disabled_hover_text(
                 "Nội dung chưa được máy chủ xác nhận, đã thu hồi hoặc không cho phép chia sẻ.",
             )
@@ -2071,7 +2165,18 @@ pub(super) fn bubble_context_menu(
             action = Some(BubbleAction::Forward);
             ui.close_menu();
         }
-        if let Some(link) = link_for_copy.as_ref() {
+        if is_file {
+            if bubble_menu_item(ui, lucide::COPY, "Sao chép tệp", !protected && !call, false)
+                .clicked()
+            {
+                if let Some(ref path) = local_path {
+                    ui.ctx().copy_text(path.display().to_string());
+                } else {
+                    ui.ctx().copy_text(copyable_message_payload(msg));
+                }
+                ui.close_menu();
+            }
+        } else if let Some(link) = link_for_copy.as_ref() {
             if bubble_menu_item(ui, lucide::LINK, "Copy link", !protected && !call, false).clicked()
             {
                 action = Some(BubbleAction::CopyLink(link.clone()));
@@ -2629,7 +2734,7 @@ pub(super) fn render_reactions(
     }
 
     let mut action = None;
-    ui.add_space(2.0);
+    ui.add_space(-12.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing = Vec2::new(4.0, 2.0);
 
@@ -2692,15 +2797,16 @@ pub(super) fn render_reactions(
                 let pill_resp = egui::Frame::none()
                     .fill(pill_bg)
                     .stroke(Stroke::new(1.0_f32, pal.border))
-                    .rounding(Rounding::same(10.0))
+                    .rounding(Rounding::same(11.0))
                     .shadow(egui::epaint::Shadow {
                         offset: Vec2::new(0.0, 1.0),
                         blur: 4.0,
                         spread: 0.0,
                         color: Color32::from_black_alpha(25),
                     })
-                    .inner_margin(Margin::symmetric(7.0, 2.5))
+                    .inner_margin(Margin::symmetric(7.0, 2.0))
                     .show(ui, |ui| {
+                        ui.set_height(22.0);
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing = Vec2::new(3.0, 0.0);
                             for (emoji_str, _) in reactions.iter().take(3) {
@@ -2729,11 +2835,48 @@ pub(super) fn render_reactions(
                     pill_resp.response.id.with("click"),
                     Sense::click(),
                 );
-                if interact
+                let interact = interact
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(crate::i18n::tr("Xem người thả cảm xúc"))
-                    .clicked()
-                {
+                    .on_hover_ui(|ui| {
+                        let mut reactor_names: Vec<&str> = Vec::new();
+                        for summary in &msg.reaction_summaries {
+                            for r_id in &summary.reactor_ids {
+                                if !reactor_names.contains(&r_id.as_str()) {
+                                    reactor_names.push(r_id.as_str());
+                                }
+                            }
+                        }
+                        for r_id in msg.reaction_versions.keys() {
+                            if !reactor_names.contains(&r_id.as_str()) {
+                                reactor_names.push(r_id.as_str());
+                            }
+                        }
+                        if reactor_names.is_empty() {
+                            ui.label(
+                                RichText::new(crate::i18n::tr("Xem người thả cảm xúc"))
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(0, 104, 255)),
+                            );
+                        } else {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                for (i, name) in reactor_names.iter().enumerate() {
+                                    if i > 0 {
+                                        ui.label(
+                                            RichText::new(",").size(11.5).color(pal.text_muted),
+                                        );
+                                    }
+                                    ui.label(
+                                        RichText::new(*name)
+                                            .size(11.5)
+                                            .color(Color32::from_rgb(0, 104, 255))
+                                            .strong(),
+                                    );
+                                }
+                            });
+                        }
+                    });
+                if interact.clicked() {
                     action = Some(BubbleAction::ShowReactors);
                 }
             });
@@ -3246,7 +3389,7 @@ mod thumbnail_geometry_tests {
     }
 }
 
-/// Native controls on a stable message identity; requires >150ms steady dwell and honors modal gating.
+/// Native controls on a stable message identity; triggers hover immediately and honors modal gating.
 pub(super) fn hover_message_actions(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -3255,9 +3398,6 @@ pub(super) fn hover_message_actions(
     emoji: &HashMap<String, TextureHandle>,
     modal_open: bool,
 ) -> Option<BubbleAction> {
-    const HOVER_DWELL_SECS: f64 = 0.15;
-    const HOVER_MOVE_TOLERANCE_PX: f32 = 6.0;
-
     let key = Id::new(("hover_message", thread));
     let dwell_key = Id::new(("hover_message_dwell", thread));
     let react_key = Id::new(("hover_reaction_btn", thread));
@@ -3277,27 +3417,44 @@ pub(super) fn hover_message_actions(
         return None;
     }
 
+    let is_dark = ui.visuals().dark_mode;
+    let pal = if is_dark {
+        ThemePalette::dark()
+    } else {
+        ThemePalette::light()
+    };
+
     let bubble_rect_opt = ui
         .ctx()
         .data(|d| d.get_temp::<egui::Rect>(Id::new(("bubble_rect", &msg.id, msg.ts))));
     let bubble_rect = bubble_rect_opt.unwrap_or(rect);
     let clip = ui.clip_rect();
 
-    // Compact 3-button toolbar (Reply, Share, More) tucked beside the bottom edge of the bubble.
-    let bar_w = 88.0_f32;
-    let bar_h = 28.0_f32;
+    // MQA Toolbar 80x24px, bo góc 12px, đặt cách mép ngoài bubble 20px
+    let bar_w = 80.0_f32;
+    let bar_h = 24.0_f32;
     let bar_y = (bubble_rect.bottom() - bar_h)
         .max(bubble_rect.top())
         .clamp(clip.top(), (clip.bottom() - bar_h).max(clip.top()));
     // Separate reaction trigger placed at the bottom corner of the bubble.
     let react_size = Vec2::splat(22.0);
     let bar_x = match (bubble_rect_opt, msg.is_outgoing) {
-        (Some(b), true) => (b.left() - bar_w - 4.0).max(clip.left() + 4.0),
-        (Some(b), false) => {
-            (b.right() + 4.0).min((clip.right() - bar_w - 4.0).max(clip.left() + 4.0))
-        }
-        (None, true) => (rect.right() - bar_w).max(clip.left() + 4.0),
-        (None, false) => (rect.right() - bar_w - react_size.x - 8.0).max(clip.left() + 4.0),
+        (Some(b), true) => (b.left() - bar_w - 20.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - bar_w - 4.0).max(clip.left() + 4.0),
+        ),
+        (Some(b), false) => (b.right() + 20.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - bar_w - 4.0).max(clip.left() + 4.0),
+        ),
+        (None, true) => (rect.right() - bar_w - 20.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - bar_w - 4.0).max(clip.left() + 4.0),
+        ),
+        (None, false) => (rect.left() + 20.0).clamp(
+            clip.left() + 4.0,
+            (clip.right() - bar_w - 4.0).max(clip.left() + 4.0),
+        ),
     };
     let bar = egui::Rect::from_min_size(egui::pos2(bar_x, bar_y), Vec2::new(bar_w, bar_h));
 
@@ -3348,7 +3505,7 @@ pub(super) fn hover_message_actions(
 
     let active_bar = active.as_ref().map(|a| a.2).unwrap_or(bar);
     let active_react_box = active_react.as_ref().map(|a| a.2).unwrap_or(react_rect);
-    // Exact horizontal corridor between bubble and toolbar; no vertical expansion into neighbor rows.
+    // Exact horizontal corridor between bubble and toolbar; preserves hover over the 20px gap.
     let corridor = egui::Rect::from_min_max(
         egui::pos2(
             bubble_rect.left().min(active_bar.left()),
@@ -3385,34 +3542,9 @@ pub(super) fn hover_message_actions(
     } else {
         let p = pointer.filter(|p| bubble_rect.contains(*p))?;
         let now = ui.input(|i| i.time);
-        let dwell = ui
-            .ctx()
-            .data(|d| d.get_temp::<(String, i64, f64, Pos2)>(dwell_key));
-        let elapsed = match dwell {
-            Some((ref id, ts, since, prev_pos))
-                if (id.as_str(), ts) == (msg.id.as_str(), msg.ts) =>
-            {
-                if p.distance(prev_pos) > HOVER_MOVE_TOLERANCE_PX {
-                    ui.ctx().data_mut(|d| {
-                        d.insert_temp(dwell_key, (msg.id.clone(), msg.ts, now, p));
-                    });
-                    0.0
-                } else {
-                    now - since
-                }
-            }
-            _ => {
-                ui.ctx().data_mut(|d| {
-                    d.insert_temp(dwell_key, (msg.id.clone(), msg.ts, now, p));
-                });
-                0.0
-            }
-        };
-        if elapsed <= HOVER_DWELL_SECS {
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(160));
-            return None;
-        }
+        ui.ctx().data_mut(|d| {
+            d.insert_temp(dwell_key, (msg.id.clone(), msg.ts, now, p));
+        });
     }
 
     let mut action = None;
@@ -3423,12 +3555,22 @@ pub(super) fn hover_message_actions(
         .fixed_pos(bar.left_top())
         .constrain_to(clip)
         .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style())
-                .inner_margin(2.0)
+            ui.set_max_size(Vec2::new(bar_w, bar_h));
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(12.0))
+                .shadow(egui::epaint::Shadow {
+                    offset: Vec2::new(0.0, 1.0),
+                    blur: 6.0,
+                    spread: 0.0,
+                    color: Color32::from_black_alpha(20),
+                })
+                .inner_margin(Margin::symmetric(4.0, 1.0))
                 .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().button_padding = Vec2::new(3.0, 0.0);
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-
                         if ui
                             .button("↩")
                             .on_hover_text(crate::i18n::tr("Trả lời"))
@@ -3439,7 +3581,7 @@ pub(super) fn hover_message_actions(
 
                         if ui
                             .button("↪")
-                            .on_hover_text(crate::i18n::tr("Chia sẻ"))
+                            .on_hover_text(crate::i18n::tr("Chuyển tiếp"))
                             .clicked()
                         {
                             action = Some(BubbleAction::Forward);
@@ -3500,27 +3642,62 @@ pub(super) fn hover_message_actions(
         .fixed_pos(react_rect.left_top())
         .constrain_to(clip)
         .show(ui.ctx(), |ui| {
-            ui.spacing_mut().button_padding = Vec2::new(3.0, 1.0);
-            let btn_bg = ui.style().visuals.window_fill();
-            let btn_stroke = ui.style().visuals.widgets.noninteractive.bg_stroke;
+            ui.spacing_mut().button_padding = Vec2::new(2.0, 1.0);
+            let btn_bg = pal.bg_elevated;
+            let btn_stroke = Stroke::new(1.0_f32, pal.border);
             egui::Frame::none()
                 .fill(btn_bg)
                 .stroke(btn_stroke)
                 .rounding(Rounding::same(11.0))
                 .inner_margin(Margin::symmetric(2.0, 1.0))
                 .show(ui, |ui| {
+                    ui.style_mut().visuals.menu_rounding = Rounding::same(19.0);
+                    ui.style_mut().visuals.window_fill = pal.bg_elevated;
+                    ui.style_mut().visuals.window_stroke = Stroke::new(1.0_f32, pal.border);
+                    ui.style_mut().visuals.popup_shadow = egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, 2.0),
+                        blur: 10.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(30),
+                    };
+                    ui.style_mut().spacing.menu_margin = Margin::symmetric(7.0, 2.0);
+
                     ui.menu_button("☺", |ui| {
                         child_menu_open = true;
+                        ui.set_min_size(Vec2::new(222.0, 34.0));
+                        ui.set_max_size(Vec2::new(222.0, 34.0));
                         ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing = Vec2::new(6.0, 0.0);
                             for &(code, key, hint) in &REACTION_LIST {
-                                let response = if let Some(tex) = emoji.get(key) {
-                                    ui.add(egui::ImageButton::new(
-                                        egui::Image::new(tex).fit_to_exact_size(Vec2::splat(22.0)),
-                                    ))
+                                let emoji_id =
+                                    ui.make_persistent_id(("reaction_capsule_emoji", &msg.id, key));
+                                let (slot_rect, resp) =
+                                    ui.allocate_exact_size(Vec2::new(32.0, 34.0), Sense::click());
+                                let is_hovered = resp.hovered();
+                                let t = ui.ctx().animate_bool_responsive(emoji_id, is_hovered);
+                                let current_size = 24.0 + 6.0 * t; // 24.0 -> 30.0 (1.25x zoom)
+                                let icon_rect = Rect::from_center_size(
+                                    slot_rect.center(),
+                                    Vec2::splat(current_size),
+                                );
+
+                                if let Some(tex) = emoji.get(key) {
+                                    let img = egui::Image::new(tex)
+                                        .fit_to_exact_size(Vec2::splat(current_size));
+                                    img.paint_at(ui, icon_rect);
                                 } else {
-                                    ui.button(code)
-                                };
-                                if response.on_hover_text(hint).clicked() {
+                                    let font_size = 18.0 + 4.5 * t;
+                                    ui.painter().text(
+                                        icon_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        code,
+                                        FontId::proportional(font_size),
+                                        pal.text_primary,
+                                    );
+                                }
+
+                                let resp = resp.on_hover_text(crate::i18n::tr(hint));
+                                if resp.clicked() {
                                     action = Some(BubbleAction::React(code));
                                     ui.close_menu();
                                 }
@@ -3656,49 +3833,14 @@ mod hover_action_tests {
         };
         let rect = egui::Rect::from_min_size(egui::pos2(40.0, 80.0), Vec2::new(300.0, 60.0));
 
-        // Frame 0 (t=0.0s): dwell starts, toolbar must not show immediately.
-        // Frame 1 (t=0.1s): <=150ms, toolbar still suppressed.
-        for t in [0.0_f64, 0.10] {
-            let _ = ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        Pos2::ZERO,
-                        Vec2::new(800.0, 600.0),
-                    )),
-                    time: Some(t),
-                    events: vec![egui::Event::PointerMoved(rect.center())],
-                    ..Default::default()
-                },
-                |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        assert!(hover_message_actions(
-                            ui,
-                            rect,
-                            "thread_dwell",
-                            &message,
-                            &HashMap::new(),
-                            false,
-                        )
-                        .is_none());
-                    });
-                },
-            );
-            assert!(ctx
-                .data(|d| d.get_temp::<(String, i64, egui::Rect)>(Id::new((
-                    "hover_message",
-                    "thread_dwell"
-                ))))
-                .is_none());
-        }
-
-        // Steady hover past >150ms (t=0.30s) activates toolbar and reaction button.
+        // Frame 0 (t=0.0s): hover activates immediately without delay.
         let _ = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     Pos2::ZERO,
                     Vec2::new(800.0, 600.0),
                 )),
-                time: Some(0.30),
+                time: Some(0.0),
                 events: vec![egui::Event::PointerMoved(rect.center())],
                 ..Default::default()
             },
@@ -4089,5 +4231,184 @@ mod hover_action_position_tests {
             .expect("separate reaction button for incoming bubble");
         assert!(react_in.2.right() <= bubble_in.right());
         assert!(!bar_in.intersects(react_in.2));
+    }
+}
+
+#[cfg(test)]
+mod local_file_lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_local_file_path_from_outgoing_job() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_job_file_{}.pdf", std::process::id()));
+        std::fs::write(&temp_file, b"test payload").unwrap();
+
+        let mut msg = ChatMessage {
+            id: "msg_outgoing_job".into(),
+            is_outgoing: true,
+            kind: crate::message_model::MessageKind::File,
+            outgoing_job: Some(Box::new(crate::outgoing::Job {
+                payload: crate::outgoing::Payload::Attachment {
+                    path: temp_file.clone(),
+                    caption: String::new(),
+                    stamp: None,
+                    hd_source: None,
+                },
+                is_group: false,
+                is_e2ee: false,
+                attempt: 1,
+                error: String::new(),
+            })),
+            ..Default::default()
+        };
+
+        let resolved = resolve_local_file_path(&msg);
+        assert_eq!(resolved, Some(temp_file.clone()));
+
+        // If file does not exist, should return None
+        let nonexistent = temp_dir.join("nonexistent_path_file.xyz");
+        msg.outgoing_job = Some(Box::new(crate::outgoing::Job {
+            payload: crate::outgoing::Payload::Attachment {
+                path: nonexistent,
+                caption: String::new(),
+                stamp: None,
+                hd_source: None,
+            },
+            is_group: false,
+            is_e2ee: false,
+            attempt: 1,
+            error: String::new(),
+        }));
+        assert_eq!(resolve_local_file_path(&msg), None);
+
+        let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_resolve_local_file_path_from_media_original() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_media_orig_{}.txt", std::process::id()));
+        std::fs::write(&temp_file, b"hello").unwrap();
+
+        let msg = ChatMessage {
+            id: "msg_orig".into(),
+            kind: crate::message_model::MessageKind::File,
+            link_url: Some(temp_file.to_string_lossy().to_string()),
+            link_title: Some("test.txt".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_local_file_path(&msg), Some(temp_file.clone()));
+        let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[test]
+    fn test_file_bubble_actions_outgoing_vs_incoming() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("test_bubble_{}.docx", std::process::id()));
+        std::fs::write(&temp_file, b"doc content").unwrap();
+
+        // 1. Outgoing message with local file
+        let msg_out = ChatMessage {
+            id: "msg_out_1".into(),
+            is_outgoing: true,
+            kind: crate::message_model::MessageKind::File,
+            link_title: Some("report.docx".into()),
+            outgoing_job: Some(Box::new(crate::outgoing::Job {
+                payload: crate::outgoing::Payload::Attachment {
+                    path: temp_file.clone(),
+                    caption: String::new(),
+                    stamp: None,
+                    hd_source: None,
+                },
+                is_group: false,
+                is_e2ee: false,
+                attempt: 1,
+                error: String::new(),
+            })),
+            ..Default::default()
+        };
+
+        let ctx = egui::Context::default();
+        let pal = ThemePalette::light();
+        let failures = HashMap::new();
+        let sticker_tex = HashMap::new();
+        let mut loading_stickers = HashSet::new();
+        let server_aliases = HashMap::new();
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(600.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = render_message_body(
+                        ui,
+                        &msg_out,
+                        "Thread",
+                        "t1",
+                        false,
+                        &failures,
+                        &pal,
+                        true,
+                        300.0,
+                        &sticker_tex,
+                        &mut loading_stickers,
+                        None,
+                        &server_aliases,
+                        false,
+                        false,
+                    );
+                });
+            },
+        );
+
+        // 2. Incoming message with remote url
+        let msg_in = ChatMessage {
+            id: "msg_in_1".into(),
+            is_outgoing: false,
+            kind: crate::message_model::MessageKind::File,
+            link_url: Some("https://example.com/file.docx".into()),
+            link_title: Some("file.docx".into()),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    Pos2::ZERO,
+                    Vec2::new(600.0, 400.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ = render_message_body(
+                        ui,
+                        &msg_in,
+                        "Thread",
+                        "t1",
+                        false,
+                        &failures,
+                        &pal,
+                        false,
+                        300.0,
+                        &sticker_tex,
+                        &mut loading_stickers,
+                        None,
+                        &server_aliases,
+                        false,
+                        false,
+                    );
+                });
+            },
+        );
+
+        let _ = std::fs::remove_file(temp_file);
     }
 }

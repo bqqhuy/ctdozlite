@@ -260,16 +260,19 @@ pub enum WorkerCmd {
     },
     Labels {
         owner: String,
+        runtime_id: usize,
         generation: u64,
         action: crate::labels::Action,
     },
     Privacy {
         owner: String,
+        runtime_id: usize,
         generation: u64,
         action: crate::privacy::Action,
     },
     ManualMark {
         owner: String,
+        runtime_id: usize,
         generation: u64,
         target: String,
         group: bool,
@@ -277,10 +280,17 @@ pub enum WorkerCmd {
     },
     Archive {
         owner: String,
+        runtime_id: usize,
         generation: u64,
         target: String,
         group: bool,
         archived: Option<bool>,
+    },
+    FetchLastOnline {
+        owner: String,
+        runtime_id: usize,
+        target: String,
+        official: bool,
     },
     Contact {
         owner: String,
@@ -670,6 +680,8 @@ pub enum WorkerCmd {
         phone: String,
     },
     StartCall {
+        owner: String,
+        runtime_id: usize,
         partner_id: String,
         partner_name: String,
         partner_avatar: Option<String>,
@@ -1987,6 +1999,14 @@ async fn run_optional_startup_preload(
     }
 }
 
+// A worker-private admission semaphore is never explicitly closed. Holding a permit
+// across HTTP awaits serializes snapshots/mutations without retaining a data mutex.
+async fn metadata_permit(gate: &tokio::sync::Semaphore) -> tokio::sync::SemaphorePermit<'_> {
+    gate.acquire()
+        .await
+        .expect("private metadata admission gate is never closed")
+}
+
 pub(super) fn spawn_session_worker(
     session: Session,
     gui_tx: Sender<GuiEvent>,
@@ -2027,7 +2047,7 @@ pub(super) fn spawn_session_worker(
     let mute_sync = MuteSync::default();
     let metadata_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let metadata_cache_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let metadata_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let metadata_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let pin_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let search_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
     let search_latest = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2084,16 +2104,51 @@ pub(super) fn spawn_session_worker(
                             let awakened=tokio::select! {_=tick.tick()=>false,_=notify.notified()=>true};let requested=metadata_live.take_metadata_request()||awakened;
                             let account=shared.lock().await.clone();if !account.is_active(){break;}let owner=account.account_key().to_owned();if owner.is_empty(){continue;}
                             if !requested && owner==previous && at.elapsed()<Duration::from_secs(900){continue;}
-                            let _gate=gate.lock().await;
+                            let _gate=metadata_permit(&gate).await;
                             if previous!=owner {
-                                if !cache_started.swap(true,std::sync::atomic::Ordering::SeqCst) {if let Ok(Some(snapshot))=crate::account_metadata::restore_cached(&account).await {let _=tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});}}
+                                if !cache_started.swap(true,std::sync::atomic::Ordering::SeqCst) {
+                                    let cache_rev = crate::search::generation();
+                                    if let Ok(Some(snapshot))=crate::account_metadata::restore_cached(&account).await {
+                                        let _=tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),revision:cache_rev,snapshot:Box::new(snapshot)});
+                                    }
+                                }
                                 if let Ok(Some(view))=crate::hidden_chat::restore_cached(&account).await {let _=tx.send(GuiEvent::Hidden {owner:owner.clone(),generation:None,view,result:Ok(())});ctx.request_repaint();}
                             }
                             previous=owner.clone();at=std::time::Instant::now();
+                            let snapshot_rev = crate::search::generation();
+                            let runtime_id = account.runtime_id();
+                            let unread_fut = crate::unread::fetch_manual_unread_marks(&account);
+                            let archive_fut = crate::archive::execute(&account, "", false, None);
+                            let labels_fut = crate::labels::execute(&account, &crate::labels::Action::Read);
+                            let (unread_res, archive_res, labels_res) = tokio::join!(unread_fut, archive_fut, labels_fut);
+                            let _ = tx.send(GuiEvent::ManualMarks {
+                                owner: owner.clone(),
+                                runtime_id,
+                                generation: snapshot_rev,
+                                kind: MetadataResultKind::Snapshot,
+                                result: unread_res.map_err(|error| error.to_string()),
+                            });
+                            let _ = tx.send(GuiEvent::Archive {
+                                owner: owner.clone(),
+                                runtime_id,
+                                generation: snapshot_rev,
+                                kind: MetadataResultKind::Snapshot,
+                                result: archive_res.map_err(|error| error.to_string()),
+                            });
+                            let _ = tx.send(GuiEvent::Labels {
+                                owner: owner.clone(),
+                                runtime_id,
+                                generation: snapshot_rev,
+                                kind: MetadataResultKind::Snapshot,
+                                result: labels_res.map_err(|error| error.to_string()),
+                            });
+                            ctx.request_repaint();
+
                             let hidden=async {let result=crate::hidden_chat::execute(&account,&crate::hidden_chat::Action::Read).await.map(|_|()).map_err(|error|error.to_string());let _=tx.send(GuiEvent::Hidden {owner:owner.clone(),generation:None,view:account.hidden.view(&owner),result});ctx.request_repaint();};
+                            let meta_rev = crate::search::generation();
                             let publish_names = |snapshot| {
                                 if account.is_active() {
-                                    let _ = tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});
+                                    let _ = tx.send(GuiEvent::AccountMetadata {owner:owner.clone(),runtime_id:account.runtime_id(),revision:meta_rev,snapshot:Box::new(snapshot)});
                                     ctx.request_repaint();
                                 }
                             };
@@ -2104,7 +2159,7 @@ pub(super) fn spawn_session_worker(
                                 if let Some(privacy)=&snapshot.privacy{policy.direct=privacy.values.get(&crate::privacy::Setting::StrangerDirect).map(|value|*value!=0);policy.show_online=privacy.values.get(&crate::privacy::Setting::ShowOnline).map(|value|*value!=0);}}
 
                             crate::account_metadata::save_cached(&account,&snapshot).await;
-                            let _=tx.send(GuiEvent::AccountMetadata {owner,runtime_id:account.runtime_id(),snapshot:Box::new(snapshot)});ctx.request_repaint();
+                            let _=tx.send(GuiEvent::AccountMetadata {owner,runtime_id:account.runtime_id(),revision:meta_rev,snapshot:Box::new(snapshot)});ctx.request_repaint();
                         }
                     });
                 }
@@ -4333,7 +4388,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let metadata_gate=metadata_gate.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 let mutation=action.mutation();
                                 let result=if owner!=account.account_key(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::avatar_history::execute(&account,&action).await.map_err(|error|error.to_string())};
                                 if let Ok(reply)=&result {if let Some(profile)=&reply.profile {let mut current=shared.lock().await;if current.is_active() && current.account_key()==owner {if let Some(login)=current.login.as_mut(){if let Some(avatar)=&profile.avatar{login.avatar=avatar.clone();}}}}}
@@ -4352,7 +4407,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let metadata_gate=metadata_gate.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 let result=if owner!=account.account_key(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::avatar::upload(&account,&target,&draft,&client).await.map_err(|error|error.to_string())};
                                 if let Ok(Some(profile))=&result {
                                     let mut current=shared.lock().await;if current.is_active() && current.account_key()==owner {if let Some(login)=current.login.as_mut(){login.display_name=profile.name.clone();if let Some(avatar)=&profile.avatar{login.avatar=avatar.clone();}}}
@@ -4365,7 +4420,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let metadata_gate=metadata_gate.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 let mutation=!matches!(action,crate::profile::Action::Read);
                                 let result=if owner!=account.account_key(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::profile::execute(&account,&action).await.map_err(|error|error.to_string())};
                                 if let Ok(profile)=&result {
@@ -4375,47 +4430,56 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 let _=tx.send(GuiEvent::Profile {owner,generation,mutation,result});ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::Labels {owner,generation,action}=>{
+                        WorkerCmd::Labels {owner,runtime_id,generation,action}=>{
                             let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             let metadata_gate=metadata_gate.clone();let metadata_notify=metadata_notify.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 struct Refresh(std::sync::Arc<tokio::sync::Notify>);impl Drop for Refresh {fn drop(&mut self){self.0.notify_one();}}let _refresh=(!matches!(action,crate::labels::Action::Read)).then(||Refresh(metadata_notify));
                                 let mutation=!matches!(action,crate::labels::Action::Read);
-                                let result=if owner!=account.account_key(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::labels::execute(&account,&action).await.map_err(|error|error.to_string())};
-                                let _=tx.send(GuiEvent::Labels {owner,generation,mutation,result});ctx.request_repaint();
+                                let result=if !account.is_active() || owner!=account.account_key() || runtime_id!=account.runtime_id(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::labels::execute(&account,&action).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::Labels {owner,runtime_id,generation,kind: if mutation { MetadataResultKind::Mutation } else { MetadataResultKind::Read },result});ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::Privacy {owner,generation,action}=>{
+                        WorkerCmd::Privacy {owner,runtime_id,generation,action}=>{
                             let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             let metadata_gate=metadata_gate.clone();let metadata_notify=metadata_notify.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 struct Refresh(std::sync::Arc<tokio::sync::Notify>);impl Drop for Refresh {fn drop(&mut self){self.0.notify_one();}}let _refresh=(matches!(action,crate::privacy::Action::Set {..})).then(||Refresh(metadata_notify));
                                 let mutation=!matches!(action,crate::privacy::Action::Read);
-                                let result=if owner!=account.account_key() {Err("Phiên tài khoản đã thay đổi".into())}else{crate::privacy::execute(&account,&action).await.map_err(|error|error.to_string())};
-                                let _=tx.send(GuiEvent::Privacy {owner,generation,mutation,result});ctx.request_repaint();
+                                let result=if !account.is_active() || owner!=account.account_key() || runtime_id!=account.runtime_id() {Err("Phiên tài khoản đã thay đổi".into())}else{crate::privacy::execute(&account,&action).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::Privacy {owner,runtime_id,generation,mutation,result});ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::ManualMark {owner,generation,target,group,action}=>{
+                        WorkerCmd::ManualMark {owner,runtime_id,generation,target,group,action}=>{
                             let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            let metadata_gate=metadata_gate.clone();
+                            let metadata_notify=metadata_notify.clone();
+                            let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
+                                // Share admission with refresh: a read must not straddle this mutation.
+                                let _metadata=metadata_permit(&metadata_gate).await;
+                                metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 let mutation=!matches!(action,crate::unread::MarkAction::Refresh);
-                                let result=if owner!=account.account_key() {Err("Phiên tài khoản đã thay đổi".into())}else{crate::unread::update_manual_mark(&account,&target,group,&action).await.map_err(|error|error.to_string())};
-                                let _=tx.send(GuiEvent::ManualMarks {owner,generation,mutation,result});ctx.request_repaint();
+                                struct Refresh(std::sync::Arc<tokio::sync::Notify>);
+                                impl Drop for Refresh { fn drop(&mut self) { self.0.notify_one(); } }
+                                let _refresh=mutation.then(|| Refresh(metadata_notify));
+                                let result=if !account.is_active() || owner!=account.account_key() || runtime_id!=account.runtime_id(){Err("Phiên tài khoản đã thay đổi".into())}else{crate::unread::update_manual_mark(&account,&target,group,&action).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::ManualMarks {owner,runtime_id,generation,kind: if mutation { MetadataResultKind::Mutation } else { MetadataResultKind::Read },result});ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::Archive {owner,generation,target,group,archived}=>{
+                        WorkerCmd::Archive {owner,runtime_id,generation,target,group,archived}=>{
                             let account=session.lock().await.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             let metadata_gate=metadata_gate.clone();let metadata_notify=metadata_notify.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 struct Refresh(std::sync::Arc<tokio::sync::Notify>);impl Drop for Refresh {fn drop(&mut self){self.0.notify_one();}}let _refresh=(archived.is_some()).then(||Refresh(metadata_notify));
-                                let result=if owner!=account.account_key() {Err("Phiên tài khoản đã thay đổi".into())}else {crate::archive::execute(&account,&target,group,archived).await.map_err(|error|error.to_string())};
-                                let _=tx.send(GuiEvent::Archive {owner,generation,mutation:archived.is_some(),result});ctx.request_repaint();
+                                let result=if !account.is_active() || owner!=account.account_key() || runtime_id!=account.runtime_id(){Err("Phiên tài khoản đã thay đổi".into())}else {crate::archive::execute(&account,&target,group,archived).await.map_err(|error|error.to_string())};
+                                let _=tx.send(GuiEvent::Archive {owner,runtime_id,generation,kind: if archived.is_some() { MetadataResultKind::Mutation } else { MetadataResultKind::Read },result});ctx.request_repaint();
                             });
                         }
                         WorkerCmd::Contact {owner,target,generation,action} => {
@@ -4423,11 +4487,25 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let metadata_gate=metadata_gate.clone();let metadata_notify=metadata_notify.clone();
                             let metadata_cache_started=metadata_cache_started.clone();
                             tokio::spawn(async move {
-                                let _metadata=metadata_gate.lock().await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
+                                let _metadata=metadata_permit(&metadata_gate).await;metadata_cache_started.store(true,std::sync::atomic::Ordering::SeqCst);
                                 struct Refresh(std::sync::Arc<tokio::sync::Notify>);impl Drop for Refresh {fn drop(&mut self){self.0.notify_one();}}let _refresh=(action.mutation()).then(||Refresh(metadata_notify));
                                 let mutation=action.mutation();
                                 let result=if owner!=account.account_key() { Err("Phiên tài khoản đã thay đổi".into()) } else { crate::contact_actions::execute(&account,&target,&action).await.map_err(|error|error.to_string()) };
                                 let _=tx.send(GuiEvent::Contact {owner,target,generation,mutation,result});ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchLastOnline { owner, runtime_id, target, official } => {
+                            let account = session.lock().await.clone();
+                            if !account.is_active() || account.account_key() != owner || account.runtime_id() != runtime_id {
+                                continue;
+                            }
+                            let tx = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                if let Ok(status) = crate::last_activity::read(&account, &target, official).await {
+                                    let _ = tx.send(GuiEvent::ActivityUpdated { owner, runtime_id, uid: target, status });
+                                    ctx.request_repaint();
+                                }
                             });
                         }
                         WorkerCmd::Group {owner,target,generation,action} => {
@@ -5780,14 +5858,28 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::StartCall {
+                            owner,
+                            runtime_id,
                             partner_id,
                             partner_name,
                             partner_avatar,
                             is_video,
                             is_group,
                         } => {
+                            let current = session.lock().await.clone();
+                            if !current.is_active() || current.account_key() != owner || current.runtime_id() != runtime_id {
+                                crate::logger::log_error(
+                                    "call::preflight",
+                                    &format!(
+                                        "StartCall rejected: session mismatch (cmd owner={owner}, rt={runtime_id}, active owner={}, rt={})",
+                                        current.account_key(), current.runtime_id()
+                                    ),
+                                );
+                                continue;
+                            }
                             let kind_label = if is_video { "Gọi video" } else { "Gọi thoại" };
                             call_bridge.make_call(
+                                &current,
                                 &partner_id,
                                 &partner_name,
                                 partner_avatar.as_deref(),
@@ -9295,6 +9387,7 @@ fn apply_metadata_impact(
     for (uid, status) in impact.activities {
         let _ = tx.send(GuiEvent::ActivityUpdated {
             owner: s.account_key().into(),
+            runtime_id: s.runtime_id(),
             uid,
             status,
         });
@@ -9315,6 +9408,8 @@ fn apply_metadata_impact(
         }
         if impact.privacy || impact.relations || impact.profiles {
             let _ = tx.send(GuiEvent::AccountMetadataInvalidated {
+                runtime_id: s.runtime_id(),
+                revision: crate::search::generation(),
                 owner: s.account_key().into(),
                 privacy: impact.privacy,
                 relations: impact.relations,
@@ -10154,5 +10249,45 @@ mod db_write_serialization_tests {
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
 
         let _ = std::fs::remove_dir_all(&account_dir);
+    }
+}
+
+#[cfg(test)]
+mod metadata_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metadata_snapshot_waits_for_mutation_and_reads_committed_state() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let writer_gate = gate.clone();
+        let writer_state = committed.clone();
+        let writer = tokio::spawn(async move {
+            let _permit = metadata_permit(&writer_gate).await;
+            entered_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            writer_state.store(true, Ordering::SeqCst);
+        });
+        entered_rx.await.unwrap();
+        let (reader_started_tx, reader_started_rx) = tokio::sync::oneshot::channel();
+        let reader_gate = gate.clone();
+        let reader = tokio::spawn(async move {
+            reader_started_tx.send(()).unwrap();
+            let _permit = metadata_permit(&reader_gate).await;
+            committed.load(Ordering::SeqCst)
+        });
+        reader_started_rx.await.unwrap();
+        assert!(gate.try_acquire().is_err());
+        assert!(!reader.is_finished());
+        release_tx.send(()).unwrap();
+        writer.await.unwrap();
+        assert!(
+            reader.await.unwrap(),
+            "snapshot must observe the completed write"
+        );
+        assert_eq!(gate.available_permits(), 1);
     }
 }

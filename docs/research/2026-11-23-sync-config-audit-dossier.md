@@ -483,3 +483,91 @@ Trên cùng candidate, rà soát lại theo các tình huống đối nghịch: 
 Log bổ sung trong `%TEMP%`: `zalolite-clean-audit2-*.log` (58 test nhắm mục tiêu), `zalolite-clean-audit2-stress-1.log` đến `-100.log`, `zalolite-two-audits-final2-backup.log`, `zalolite-two-audits-final2-clippy.log`. Snapshot và log tạm có thể bị hệ điều hành dọn; hồ sơ này giữ kết quả, phạm vi hash và lệnh để tái chạy.
 
 **Giới hạn:** kết luận trên là audit mã/fixture/harness, không đảm bảo mọi lỗi tiềm ẩn đều đã được loại trừ và không phải hai reviewer độc lập. Không có E1 mới; ChangeDevice/QueueEvict vẫn AMBIGUOUS, ZIP-08 và sync với điện thoại thật chưa nghiệm thu. Không commit/push/tag/release; giữ nguyên công việc khác trong working tree.
+
+
+## Codex trực tiếp khắc phục các finding còn lại — 24/11/2026
+
+Bắt đầu trên HEAD c9a274f và working tree có sửa GUI/call của Antigravity. Các tuyên bố PASS/100% trước đây không chứng minh ba finding mới đã đóng. Không commit/push/reset hay thao tác tài khoản thật.
+
+### Tái hiện trước sửa
+
+`cargo test --locked --lib test_remediation_ -j1`: **0 passed, 2 failed**, exit 101. Test đi qua command UI/mock transport và GUI event handler:
+- UI read Labels thành công vẫn giữ pending=true.
+- AccountMetadata cũ đến sau invalidation khôi phục show_online=Some(true) thay vì giữ None.
+Log: `%TEMP%/zalolite-remediation-red.log`. Đây là regression đỏ thực chạy trước khi đổi logic, không phải capture/native acceptance.
+
+### Bản sửa đang được kiểm chứng
+
+- IPC metadata dùng MetadataResultKind::{Snapshot,Read,Mutation}. Read và Mutation phải khớp generation/revision của UI; snapshot không hoàn tất request đang chờ. Đã cập nhật mọi producer, handler và fixture liên quan; giữ payload success/error.
+- CallBridge đưa owner/runtime vào CallEngineCmd::MakeCall. prepare_call_session kiểm tra trước và sau readiness, kể cả readiness error; tín hiệu chỉ dùng Session snapshot đã xác minh, không lấy phiên mới thay intent cũ. Không đổi route/params/frame/cipher hoặc outbound target lock.
+- Privacy tăng revision tại dispatch UI và invalidation. ACK tới sau invalidation hoàn tất pending nhưng không áp dữ liệu cũ; đánh dấu cần tải lại. ACK hợp lệ cập nhật cả show_online; helper áp privacy đồng nhất cho ACK/background. Contact drawer cũng tuân thủ gate và xóa presence khi privacy bị che.
+- Regression call dùng hàng đợi CallBridge thật và production readiness guard với oneshot barrier; không mở thiết bị hay network. Kiểm tra đổi owner hoặc relogin cùng UID trước dequeue, trong readiness thành công/lỗi, và scope hợp lệ.
+
+Lần check đầu sau triển khai: compiler không lỗi nhưng có 4 warning unused trong test/handler mới. Đã chuyển thành assertion identity và sửa xử lý uncertainty cho read; không che warning. Kết quả sau sửa và hai lượt audit được ghi tiếp bên dưới khi thực chạy hoàn tất.
+
+Parity: sửa lifecycle/IPC/cache nội bộ fork; không suy hợp đồng server mới. Nguồn PC E2 liên quan vẫn là re-notes/73 và /74. C-T090, ZIP-08, sync với điện thoại và ChangeDevice/QueueEvict giữ nguyên giới hạn chưa nghiệm thu/AMBIGUOUS.
+
+
+### Phát hiện thêm trước khi công nhận lượt sạch
+
+Candidate dbec1c... có library **1150 passed/11 ignored** và Clippy all-targets exit 0, nhưng source review phát hiện ManualMark chưa chia sẻ admission gate với metadata refresh. Read bắt đầu trong lúc mutation đang chạy có thể có revision lớn hơn dispatch nhưng vẫn đọc dữ liệu server cũ. Chưa công nhận lượt sạch nào; bộ đếm giữ 0. Đã đưa ManualMark vào cùng gate/refresh notification. Gate chuyển từ Tokio Mutex<()> sang semaphore một permit (giữ cùng thứ tự tuần tự hóa, không giữ data mutex qua HTTP await); barrier regression xác nhận snapshot chờ mutation commit. Integration đang build đã dừng trước khi hoàn tất để sửa bản ứng viên này.
+
+
+### Lượt sạch 1 — bản cuối sau sửa admission
+
+Candidate trên HEAD c9a274f, SHA-256 `cdc8d321c9d3d491677de6458471e328f4d76e0eb683311aeb93c660ea98ab77`, 240 tệp src/tests (cả fixture) và Cargo.toml/Cargo.lock/build.rs/rust-toolchain.toml/.cargo/config.toml. Hash theo đường dẫn sắp xếp + NUL + bytes + NUL như các lượt trước; docs ngoài phạm vi hash.
+
+Rà luồng UI Read -> WorkerCmd -> Read result -> đúng request/pending/payload; snapshot revision và admission trước/sau mutation; scope qua hai hàng đợi call và readiness; privacy dispatch/invalidation/ACK/background/contact render. Không tìm thêm finding sau bản sửa admission.
+
+- `cargo test --locked --lib -j1`: **1151 passed, 0 failed, 11 ignored**, 72.99s. Cả bảy test mới đạt, bao gồm các nhánh tham số thành công/lỗi/đổi phiên.
+- `cargo clippy --locked --all-targets -j1 -- -D warnings`: exit 0, không warning (2m52s, có thời gian chờ build lock).
+- `cargo fmt --all -- --check`, `git diff --check`: exit 0.
+- Kiểm tra lại hash sau các lệnh: trùng candidate. Bộ đếm sạch = 1. Cùng Codex thực hiện, không phải reviewer độc lập.
+
+Log: `%TEMP%/zalolite-remediation-final-lib.log`, `zalolite-remediation-final-clippy.log`, `zalolite-remediation-final-candidate.json`.
+
+
+### Lượt 2 phát hiện delivery-time barrier — bộ đếm về 0
+
+Candidate cdc8d3... đã qua 100 vòng stress (2700 lần chạy test), nhưng source review lượt 2 phát hiện privacy barrier tạo lúc UI consume event có thể lớn hơn revision của read mới đã bắt đầu sau invalidation ở worker. Read mới bị loại nhầm khi UI xử lý chậm. Không công nhận lượt 2 sạch; đặt lại bộ đếm về 0. Dừng integration đang build, chưa ghi nhận integration đạt cho candidate này.
+
+Sửa: AccountMetadataInvalidated mang revision tại producer, trước notify refresh; privacy_revision là watermark dữ liệu/invalidation, còn privacy_panel.generation giữ cutoff request UI. Snapshot phải qua cả hai; invalidation cũ hơn dữ liệu đã áp dụng không xóa policy mới. Không lấy thời điểm UI delivery làm thời điểm invalidation. Thêm regression read mới đã được producer phát trước khi UI consume invalidation, replay invalidation cũ, và UI read bắt đầu sau invalidation nhưng trước lúc UI consume event. Đây là thay đổi IPC/cache nội bộ, không đổi giao thức server.
+
+
+Cùng vòng rà soát, bổ sung runtime cho Privacy command/result và AccountMetadataInvalidated (trước đó chỉ có owner). Worker kiểm tra active/owner/runtime trước privacy API; GUI bỏ thông điệp cũ của cùng UID sau re-login trước mọi cập nhật policy/pending. Regression mô phỏng stale ACK và stale invalidation có revision mới nhưng runtime cũ. Đây là hardening cùng đường privacy đang sửa, không đổi HTTP contract. Bộ đếm vẫn 0; chưa công nhận candidate kế tiếp trước khi chạy kiểm tra.
+
+
+### Hai lượt audit cuối — candidate đã có producer stamp và runtime privacy
+
+Candidate `c494c88d95052d3dfd8f1a8d9a9c13b6a184aa524962e197a606a08cbade17f3`, HEAD nền c9a274f, cùng phạm vi hash 240 tệp đã mô tả. Hai lượt trước không được cộng dồn sau finding mới.
+
+**Lượt 1:** rà theo luồng dữ liệu và ownership: UI read/mutation/snapshot, payload và pending; gate read/write metadata; owner/runtime qua call engine/readiness; privacy request cutoff, producer invalidation watermark, stale/fresh result, runtime boundary và cả header/contact drawer. Không phát hiện thêm vấn đề trong phạm vi sửa sau bản này.
+
+`cargo test --locked --lib -j1`: **1154 passed, 0 failed, 11 ignored**, 74.33s. Mười regression mới đạt, gồm các ca tham số thành công/lỗi/same-UID/new-runtime. `cargo fmt --all -- --check` và `git diff --check`: exit 0. Hash kiểm tra lại trùng candidate. Bộ đếm sạch = 1.
+
+Log: `%TEMP%/zalolite-verified-lib.log`, `zalolite-verified-candidate.json`. Các lượt audit đều do cùng Codex theo hai phương pháp; không phải hai reviewer độc lập. Lượt 2 chỉ được kết luận sau khi thực chạy hoàn tất.
+
+
+**Lượt 2 — phản ví dụ, interleaving và hồi quy song song:** trên cùng candidate, rà trước/sau dispatch/ACK, read trong lúc mutation, device readiness success/error sau đổi phiên, same-UID/new-runtime, invalidation được produce trước read nhưng UI consume muộn, replay invalidation cũ, unknown/privacy-off và recovery read. Không phát hiện thêm finding trong phạm vi sửa sau bản c494c88....
+
+- 100 vòng, luân phiên `--test-threads=8` và `16`; mỗi vòng chạy 5 nhóm: startup/config (16), remediation (6), queued call scope (3), metadata admission (1), metadata regressions cũ (4). **3000 lần chạy test đạt, 0 failed, 0 ignored**; kiểm tra đủ 500 log, không chỉ đọc vòng cuối.
+- `cargo clippy --locked --all-targets -j1 -- -D warnings`: **exit 0, không warning**, 3m05s gồm chờ build lock. Kiểm tra compile cả production và unit-test branches.
+- `cargo test --locked --test desktop_backup_v2 -j1`: **4 passed, 0 failed, 0 ignored**, 43.21s. Bao gồm ghi realtime đồng thời, cancellation và account switch/logout.
+- Source hash sau kiểm tra: trùng `c494c88d95052d3dfd8f1a8d9a9c13b6a184aa524962e197a606a08cbade17f3`; HEAD vẫn c9a274f, nhánh main. Không sửa nguồn/test giữa hai lượt cuối.
+- **Bộ đếm sạch = 2 liên tiếp trên bản c494c88....** Hai phương pháp do cùng Codex thực hiện, không phải hai reviewer độc lập; kết luận giới hạn trong các đường sửa và kiểm tra trên, không khẳng định toàn bộ ứng dụng không còn lỗi.
+
+Log cuối trong `%TEMP%`: `zalolite-verified-lib.log`, `zalolite-verified-clippy.log`, `zalolite-verified-backup.log`, `zalolite-verified-candidate.json`; stress `zalolite-verified-stress-{round}-{group}.log`, round=1..100, group=0..4. Log tạm có thể bị hệ điều hành dọn; hồ sơ giữ lệnh/kết quả/phạm vi/hash để tái chạy.
+
+### Đối chiếu finding -> thay đổi -> bằng chứng
+
+| Finding | Thay đổi cuối | Bằng chứng |
+| --- | --- | --- |
+| UI read kẹt pending | MetadataResultKind tách Snapshot/Read/Mutation; result UI khớp generation/revision; snapshot không hoàn tất request khác | Regression command UI -> mock transport -> handler cho Labels/ManualMarks/Archive, success/error/stale read/background xen vào; regression đỏ trước sửa rồi xanh |
+| Scope mất ở call engine | MakeCall mang owner/runtime; guard trước/sau readiness và dùng đúng Session snapshot; không lấy phiên mới thay ý định cũ | 3 test queue/helper production, tham số owner khác/cùng UID runtime mới, readiness success/error, scope đúng và không đụng thiết bị/network |
+| Snapshot privacy cũ mở lại gate | Producer stamp + runtime, request generation cutoff riêng; stale ACK/invalidation bị loại; fresh read qua UI tiêu thụ muộn vẫn được áp dụng | Invalidation -> stale/fresh metadata, delayed UI, replay old invalidation, UI request/ACK/recovery và same-UID/runtime-old |
+| Read straddle ManualMark mutation | Metadata admission semaphore một permit dùng cho refresh và mọi writer liên quan; notification sau mutation | Barrier regression admission và source review worker; giữ các kiểm tra realtime/backup |
+| Privacy ACK chưa áp show_online / contact drawer cache | Áp policy chung cho ACK/background; clear/hide contact presence khi policy không cho phép | Privacy command/ACK tests và rà tất cả render của presence |
+
+Đọc trực tiếp `search::generation`: counter dùng `AtomicU64::fetch_add(Ordering::Relaxed)`, không phải SeqCst như mô tả Antigravity cũ. RMW vẫn có modification order đơn điệu; bản sửa không đổi memory ordering. Manual marks đi qua GuiEvent::ManualMarks riêng; không bịa thêm trường manual_marks vào AccountMetadata.
+
+Phạm vi parity: chỉ thay IPC/lifecycle/cache của fork để bảo toàn account/runtime và request identity; HTTP params, route, frame ID, signing/cipher, service routing và outbound target lock không đổi. Native call/sync, ZIP-08, C-T090/H-T090, ChangeDevice/QueueEvict và các envelope còn AMBIGUOUS chưa tự chuyển thành nghiệm thu. Không commit/push/tag/release; giữ công việc khác trong shared working tree.

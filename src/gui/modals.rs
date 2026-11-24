@@ -2140,6 +2140,25 @@ impl ZaloGuiApp {
         let Some(mut call) = self.active_call.clone() else {
             return;
         };
+        // Watchdog Timer 65s for unanswered incoming calls (Task 1.3)
+        if call.is_incoming_ringing
+            && call.started_at.elapsed() >= std::time::Duration::from_secs(65)
+        {
+            crate::media::stop_ringtone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Reset,
+            ));
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::AnswerCall {
+                    accept: false,
+                    call_id: call.call_id,
+                });
+            }
+            self.active_call = None;
+            self.show_toast("Cuộc gọi nhỡ (quá thời gian chờ 65s)");
+            return;
+        }
+
         // Keep timer and video textures updating smoothly while call window is open
         ctx.request_repaint_after(Duration::from_millis(66));
 
@@ -2151,6 +2170,7 @@ impl ZaloGuiApp {
 
         let mut hangup_clicked = false;
         let mut retry_clicked = false;
+        let mut incoming_rejected_by_close = false;
 
         let has_err = call.error_reason.is_some();
         let is_video_stage = (call.is_video
@@ -2178,11 +2198,14 @@ impl ZaloGuiApp {
             .with_min_inner_size([380.0, 420.0]);
 
         ctx.show_viewport_immediate(viewport_id, builder, |vp_ctx, _class| {
-            if vp_ctx.input(|i| i.viewport().close_requested()) {
-                hangup_clicked = true;
-            }
-            if vp_ctx.input(|i| i.key_pressed(Key::Escape)) && call.error_reason.is_some() {
-                hangup_clicked = true;
+            let close_req = vp_ctx.input(|i| i.viewport().close_requested());
+            let esc_pressed = vp_ctx.input(|i| i.key_pressed(Key::Escape));
+            if close_req || esc_pressed {
+                if call.is_incoming_ringing {
+                    incoming_rejected_by_close = true;
+                } else if close_req || call.error_reason.is_some() {
+                    hangup_clicked = true;
+                }
             }
 
             egui::CentralPanel::default()
@@ -2729,6 +2752,12 @@ impl ZaloGuiApp {
                                             .on_hover_text(crate::i18n::tr("Từ chối cuộc gọi"))
                                             .clicked()
                                         {
+                                            crate::media::stop_ringtone();
+                                            ctx.send_viewport_cmd(
+                                                egui::ViewportCommand::RequestUserAttention(
+                                                    egui::UserAttentionType::Reset,
+                                                ),
+                                            );
                                             if let Some(tx) = WORKER_TX.get() {
                                                 let _ = tx.send(WorkerCmd::AnswerCall {
                                                     accept: false,
@@ -2764,6 +2793,12 @@ impl ZaloGuiApp {
                                             .on_hover_text(crate::i18n::tr("Nghe máy"))
                                             .clicked()
                                         {
+                                            crate::media::stop_ringtone();
+                                            ctx.send_viewport_cmd(
+                                                egui::ViewportCommand::RequestUserAttention(
+                                                    egui::UserAttentionType::Reset,
+                                                ),
+                                            );
                                             call.is_incoming_ringing = false;
                                             call.state_label = "Đang kết nối cuộc gọi…".into();
                                             if let Some(tx) = WORKER_TX.get() {
@@ -2934,6 +2969,24 @@ impl ZaloGuiApp {
                 });
         });
 
+        if incoming_rejected_by_close {
+            crate::media::stop_ringtone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Reset,
+            ));
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::AnswerCall {
+                    accept: false,
+                    call_id: call.call_id,
+                });
+            }
+            self.active_call = None;
+            self.sticker_textures.remove("call_remote_video");
+            self.sticker_textures.remove("call_remote_video_1");
+            self.sticker_textures.remove("call_local_video");
+            return;
+        }
+
         if retry_clicked {
             call.error_code = None;
             call.error_reason = None;
@@ -2945,6 +2998,8 @@ impl ZaloGuiApp {
             };
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::StartCall {
+                    owner: self.user_uin.clone(),
+                    runtime_id: self.account_runtime_id,
                     partner_id: call.partner_id.clone(),
                     partner_name: call.partner_name.clone(),
                     partner_avatar: None,
@@ -2954,6 +3009,10 @@ impl ZaloGuiApp {
             }
             self.active_call = Some(call);
         } else if hangup_clicked {
+            crate::media::stop_ringtone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Reset,
+            ));
             self.active_call = None;
             self.sticker_textures.remove("call_remote_video");
             self.sticker_textures.remove("call_remote_video_1");
@@ -2965,6 +3024,346 @@ impl ZaloGuiApp {
             }
         } else if self.active_call.is_some() {
             self.active_call = Some(call);
+        }
+    }
+
+    pub(super) fn render_preflight_dialog(&mut self, ctx: &egui::Context) {
+        if self.preflight_call.as_ref().is_none_or(|p| {
+            !self.is_logged_in
+                || p.owner != self.user_uin
+                || p.runtime_id != self.account_runtime_id
+        }) {
+            self.clear_preflight_call();
+            return;
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.clear_preflight_call();
+            return;
+        }
+
+        render_modal_backdrop(ctx, "preflight_dialog_backdrop");
+
+        let pal = self.palette();
+        let mut is_open = true;
+        let mut start_call = false;
+        let mut cancel_call = false;
+        let mut trigger_test_tone = false;
+
+        let rms = self
+            .preflight_call
+            .as_ref()
+            .and_then(|p| p.mic_monitor.as_ref())
+            .map(|m| m.current_rms())
+            .unwrap_or(0.0);
+
+        let tone_active = self
+            .preflight_call
+            .as_ref()
+            .and_then(|p| p.test_tone_playing_until)
+            .is_some_and(|t| t > std::time::Instant::now());
+
+        let (partner_id, partner_name, partner_avatar, is_video, is_group) = {
+            let p = self.preflight_call.as_ref().unwrap();
+            (
+                p.partner_id.clone(),
+                p.partner_name.clone(),
+                p.partner_avatar.clone(),
+                p.is_video,
+                p.is_group,
+            )
+        };
+
+        let resolved_avatar = partner_avatar.clone().or_else(|| {
+            self.threads
+                .iter()
+                .find(|t| t.id == partner_id || t.name == partner_name)
+                .and_then(|t| t.avatar.clone())
+        });
+
+        egui::Window::new("Kiểm tra thiết bị cuộc gọi")
+            .id(Id::new("preflight_call_dialog"))
+            .order(egui::Order::Foreground)
+            .open(&mut is_open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .frame(
+                egui::Frame::window(&ctx.style())
+                    .rounding(Rounding::same(14.0))
+                    .inner_margin(Margin::symmetric(22.0, 18.0)),
+            )
+            .show(ctx, |ui| {
+                // Header: Avatar, Name, Call Type
+                ui.vertical_centered(|ui| {
+                    let (av_rect, _) = ui.allocate_exact_size(Vec2::splat(60.0), Sense::hover());
+                    paint_user_avatar(
+                        ui.painter(),
+                        av_rect.center(),
+                        26.0,
+                        &partner_name,
+                        is_group,
+                        resolved_avatar.as_deref(),
+                        &self.sticker_textures,
+                        &mut self.loading_stickers,
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(&partner_name)
+                            .size(16.0)
+                            .color(pal.text_primary)
+                            .strong(),
+                    );
+                    let call_type_txt = if is_video {
+                        format!("{} Cuộc gọi Video", lucide::VIDEO)
+                    } else {
+                        format!("{} Cuộc gọi Thoại", lucide::PHONE)
+                    };
+                    ui.label(
+                        RichText::new(call_type_txt)
+                            .size(12.0)
+                            .color(pal.text_secondary),
+                    );
+                });
+
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Section 1: Microphone
+                ui.label(
+                    RichText::new(format!("{} Microphone", lucide::MIC))
+                        .size(13.0)
+                        .color(pal.text_primary)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+
+                let (mics, speakers, _cams) = crate::media::list_call_devices(false);
+                let cur_mic_lbl = if self.settings.selected_mic_device.is_empty() {
+                    mics.first()
+                        .map(String::as_str)
+                        .unwrap_or("Mặc định hệ thống")
+                } else {
+                    &self.settings.selected_mic_device
+                };
+                let mut mic_changed = false;
+                egui::ComboBox::from_id_salt("preflight_mic_combo")
+                    .selected_text(truncate_chars(cur_mic_lbl, 32))
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.settings.selected_mic_device.is_empty(),
+                                crate::i18n::tr("Mặc định hệ thống"),
+                            )
+                            .clicked()
+                        {
+                            self.settings.selected_mic_device.clear();
+                            crate::media::set_selected_mic_device("");
+                            self.save_settings();
+                            mic_changed = true;
+                        }
+                        for m in &mics {
+                            if ui
+                                .selectable_label(self.settings.selected_mic_device == *m, m)
+                                .clicked()
+                            {
+                                self.settings.selected_mic_device = m.clone();
+                                crate::media::set_selected_mic_device(m);
+                                self.save_settings();
+                                mic_changed = true;
+                            }
+                        }
+                    });
+
+                if mic_changed {
+                    if let Some(ref mut p) = self.preflight_call {
+                        p.mic_monitor = Some(crate::media::PreflightMicMonitor::start());
+                    }
+                }
+
+                ui.add_space(6.0);
+                let vu_val = (rms * 2.5).clamp(0.0, 1.0);
+                let vu_bar = egui::ProgressBar::new(vu_val)
+                    .text(format!(
+                        "Âm lượng mic: {:.0}%",
+                        (rms * 100.0).clamp(0.0, 100.0)
+                    ))
+                    .animate(false);
+                ui.add(vu_bar);
+
+                ui.add_space(14.0);
+
+                // Section 2: Speaker
+                ui.label(
+                    RichText::new("🔊 Loa (Tai nghe)")
+                        .size(13.0)
+                        .color(pal.text_primary)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+
+                let cur_spk_lbl = if self.settings.selected_speaker_device.is_empty() {
+                    speakers
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or("Mặc định hệ thống")
+                } else {
+                    &self.settings.selected_speaker_device
+                };
+                egui::ComboBox::from_id_salt("preflight_speaker_combo")
+                    .selected_text(truncate_chars(cur_spk_lbl, 32))
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(
+                                self.settings.selected_speaker_device.is_empty(),
+                                crate::i18n::tr("Mặc định hệ thống"),
+                            )
+                            .clicked()
+                        {
+                            self.settings.selected_speaker_device.clear();
+                            crate::media::set_selected_speaker_device("");
+                            self.save_settings();
+                        }
+                        for s in &speakers {
+                            if ui
+                                .selectable_label(self.settings.selected_speaker_device == *s, s)
+                                .clicked()
+                            {
+                                self.settings.selected_speaker_device = s.clone();
+                                crate::media::set_selected_speaker_device(s);
+                                self.save_settings();
+                            }
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if tone_active {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Đang phát âm thanh thử (2s)...")
+                                .size(12.0)
+                                .color(pal.accent_online),
+                        );
+                    } else {
+                        let test_btn = egui::Button::new(
+                            RichText::new("🔊 Kiểm tra loa")
+                                .size(12.0)
+                                .color(pal.text_primary),
+                        )
+                        .fill(pal.bg_elevated)
+                        .stroke(Stroke::new(1.0_f32, pal.border))
+                        .rounding(Rounding::same(6.0));
+
+                        if ui
+                            .add(test_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            trigger_test_tone = true;
+                        }
+                    }
+                });
+
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Section 3: Action Buttons
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+
+                    let cancel_btn = egui::Button::new(
+                        RichText::new("Hủy").size(13.0).color(pal.text_secondary),
+                    )
+                    .fill(pal.bg_elevated)
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .min_size(Vec2::new(100.0, 36.0));
+
+                    if ui
+                        .add(cancel_btn)
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        cancel_call = true;
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let start_btn = egui::Button::new(
+                            RichText::new(if is_video {
+                                "Bắt đầu gọi video"
+                            } else {
+                                "Bắt đầu cuộc gọi"
+                            })
+                            .size(13.0)
+                            .color(Color32::WHITE)
+                            .strong(),
+                        )
+                        .fill(Color32::from_rgb(0, 104, 255)) // Zalo blue #0068ff
+                        .rounding(Rounding::same(8.0))
+                        .min_size(Vec2::new(150.0, 36.0));
+
+                        if ui
+                            .add(start_btn)
+                            .on_hover_cursor(CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            start_call = true;
+                        }
+                    });
+                });
+            });
+
+        if trigger_test_tone {
+            crate::media::play_test_speaker_tone(std::time::Duration::from_secs(2));
+            if let Some(ref mut p) = self.preflight_call {
+                p.test_tone_playing_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+        }
+
+        if !is_open || cancel_call {
+            self.clear_preflight_call();
+        } else if start_call {
+            let owner = self.user_uin.clone();
+            let runtime_id = self.account_runtime_id;
+            self.clear_preflight_call();
+            self.active_call = Some(ActiveCallOverlay {
+                call_id: None,
+                partner_id: partner_id.clone(),
+                partner_name: partner_name.clone(),
+                is_video,
+                is_group,
+                state_label: if is_video {
+                    "Đang kết nối cuộc gọi video…".into()
+                } else {
+                    "Đang kết nối cuộc gọi thoại…".into()
+                },
+                started_at: std::time::Instant::now(),
+                mic_muted: false,
+                cam_enabled: is_video,
+                is_incoming_ringing: false,
+                error_code: None,
+                error_reason: None,
+            });
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::StartCall {
+                    owner,
+                    runtime_id,
+                    partner_id,
+                    partner_name,
+                    partner_avatar: resolved_avatar,
+                    is_video,
+                    is_group,
+                });
+            }
         }
     }
 }

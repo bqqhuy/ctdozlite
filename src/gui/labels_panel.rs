@@ -8,6 +8,7 @@ pub(super) struct LabelsPanel {
     pub pending: bool,
     pub uncertain: bool,
     pub generation: u64,
+    pub revision: u64,
     pub name: String,
     pub status: String,
     pub confirm: Option<crate::labels::Action>,
@@ -27,11 +28,14 @@ impl ZaloGuiApp {
         if self.labels_panel.pending {
             return;
         }
-        self.labels_panel.generation = crate::search::generation();
+        let gen = crate::search::generation();
+        self.labels_panel.generation = gen;
+        self.labels_panel.revision = gen;
         self.labels_panel.pending = true;
         if !WORKER_TX.get().is_some_and(|tx| {
             tx.send(WorkerCmd::Labels {
                 owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
                 generation: self.labels_panel.generation,
                 action,
             })

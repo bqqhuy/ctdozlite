@@ -11,6 +11,18 @@ pub fn local_record_id(call_id: i64) -> String {
         )
     }
 }
+
+/// Matches an actor string against either the 19-digit account owner UIN or the 32-bit session UID.
+pub fn actor_matches_self(actor_str: &str, owner: &str, self_uid32: &str) -> bool {
+    let actor = actor_str.trim();
+    if actor.is_empty() {
+        return false;
+    }
+    let own = owner.trim();
+    let u32_id = self_uid32.trim();
+    (!own.is_empty() && actor == own) || (!u32_id.is_empty() && actor == u32_id)
+}
+
 pub fn answered_elsewhere(
     call_id: i64,
     event_id: i64,
@@ -43,6 +55,42 @@ mod tests {
         assert_eq!(local_record_id(42), local_record_id(42));
         assert_ne!(local_record_id(42), local_record_id(43));
         assert_ne!(local_record_id(0), local_record_id(0));
+    }
+    #[test]
+    fn actor_matches_self_handles_uin_and_uid32_and_rejects_partner_and_empty() {
+        let owner = "2847291847192847192";
+        let self_uid32 = "39281742";
+        let partner_uin = "9827364512345678901";
+        let partner_uid32 = "77665544";
+
+        // Matches 19-digit owner UIN
+        assert!(actor_matches_self(owner, owner, self_uid32));
+        assert!(actor_matches_self(
+            &format!("  {owner}  "),
+            owner,
+            self_uid32
+        ));
+
+        // Matches 32-bit session UID
+        assert!(actor_matches_self(self_uid32, owner, self_uid32));
+        assert!(actor_matches_self(
+            &format!("  {self_uid32}  "),
+            owner,
+            self_uid32
+        ));
+
+        // Rejects partner UIN and partner UID
+        assert!(!actor_matches_self(partner_uin, owner, self_uid32));
+        assert!(!actor_matches_self(partner_uid32, owner, self_uid32));
+
+        // Rejects empty or whitespace strings
+        assert!(!actor_matches_self("", owner, self_uid32));
+        assert!(!actor_matches_self("   ", owner, self_uid32));
+
+        // Handles empty owner or empty self_uid32 gracefully
+        assert!(actor_matches_self(owner, owner, ""));
+        assert!(actor_matches_self(self_uid32, "", self_uid32));
+        assert!(!actor_matches_self("12345", "", ""));
     }
     #[test]
     fn only_the_pending_matching_receiver_with_explicit_self_actor_is_dismissed() {

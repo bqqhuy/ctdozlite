@@ -19,6 +19,7 @@ impl ZaloGuiApp {
         if !WORKER_TX.get().is_some_and(|tx| {
             tx.send(WorkerCmd::Privacy {
                 owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
                 generation: self.privacy_panel.generation,
                 action,
             })
@@ -128,5 +129,170 @@ impl ZaloGuiApp {
         if let Some(action) = intent {
             self.privacy_command(action);
         }
+    }
+}
+
+#[cfg(test)]
+mod remediation_privacy_tests {
+    use super::*;
+
+    fn snapshot(enabled: i64) -> crate::privacy::Snapshot {
+        crate::privacy::Snapshot {
+            values: [(crate::privacy::Setting::ShowOnline, enabled)]
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn privacy_command_ack_updates_gate_and_fences_older_metadata() {
+        for invalidated_during_request in [true, false] {
+            let ctx = egui::Context::default();
+            let mut app = ZaloGuiApp::from_context(
+                &ctx,
+                Session::new(false, false, false).unwrap(),
+                false,
+                Vec::new(),
+                false,
+            );
+            app.is_logged_in = true;
+            app.user_uin = "privacy-owner".into();
+            app.account_runtime_id = 42;
+            app.inbox_policy.show_online = Some(true);
+            app.contact_panel.presence = Some(crate::last_activity::Status::LastActivity(1));
+            let old_revision = crate::search::generation();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+            app.privacy_command(crate::privacy::Action::Set {
+                setting: crate::privacy::Setting::ShowOnline,
+                value: 0,
+            });
+            let WorkerCmd::Privacy {
+                owner, generation, ..
+            } = rx.try_recv().unwrap()
+            else {
+                panic!("expected privacy command");
+            };
+            assert!(app.privacy_panel.generation > old_revision);
+            if invalidated_during_request {
+                app.event_tx
+                    .send(GuiEvent::AccountMetadataInvalidated {
+                        runtime_id: app.account_runtime_id,
+                        revision: crate::search::generation(),
+                        owner: owner.clone(),
+                        privacy: true,
+                        relations: false,
+                        business: false,
+                    })
+                    .unwrap();
+            }
+            app.event_tx
+                .send(GuiEvent::Privacy {
+                    runtime_id: app.account_runtime_id,
+                    owner: owner.clone(),
+                    generation,
+                    mutation: true,
+                    result: Ok(snapshot(0)),
+                })
+                .unwrap();
+            app.event_tx
+                .send(GuiEvent::AccountMetadata {
+                    owner,
+                    runtime_id: 42,
+                    revision: old_revision,
+                    snapshot: Box::new(crate::account_metadata::Snapshot {
+                        privacy: Some(snapshot(1)),
+                        ..Default::default()
+                    }),
+                })
+                .unwrap();
+            app.check_events(&ctx);
+            assert!(!app.privacy_panel.pending);
+            assert_eq!(app.privacy_panel.uncertain, invalidated_during_request);
+            assert_eq!(
+                app.inbox_policy.show_online,
+                if invalidated_during_request {
+                    None
+                } else {
+                    Some(false)
+                }
+            );
+            assert!(app.contact_panel.presence.is_none());
+            if invalidated_during_request {
+                app.privacy_command(crate::privacy::Action::Read);
+                let WorkerCmd::Privacy {
+                    owner, generation, ..
+                } = rx.try_recv().unwrap()
+                else {
+                    panic!("expected recovery read");
+                };
+                app.event_tx
+                    .send(GuiEvent::Privacy {
+                        runtime_id: app.account_runtime_id,
+                        owner,
+                        generation,
+                        mutation: false,
+                        result: Ok(snapshot(0)),
+                    })
+                    .unwrap();
+                app.check_events(&ctx);
+                assert!(!app.privacy_panel.pending);
+                assert!(!app.privacy_panel.uncertain);
+                assert_eq!(app.inbox_policy.show_online, Some(false));
+            }
+            WORKER_TX.clear();
+        }
+    }
+
+    #[test]
+    fn delayed_invalidation_hides_pending_read_but_accepts_its_newer_result() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            Vec::new(),
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "privacy-owner".into();
+        app.inbox_policy.show_online = Some(true);
+        let invalidation_revision = crate::search::generation();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        app.privacy_command(crate::privacy::Action::Read);
+        let WorkerCmd::Privacy {
+            owner, generation, ..
+        } = rx.try_recv().unwrap()
+        else {
+            panic!("expected read");
+        };
+        app.event_tx
+            .send(GuiEvent::AccountMetadataInvalidated {
+                runtime_id: app.account_runtime_id,
+                owner: owner.clone(),
+                revision: invalidation_revision,
+                privacy: true,
+                relations: false,
+                business: false,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app.privacy_panel.pending);
+        assert_eq!(app.inbox_policy.show_online, None);
+        app.event_tx
+            .send(GuiEvent::Privacy {
+                runtime_id: app.account_runtime_id,
+                owner,
+                generation,
+                mutation: false,
+                result: Ok(snapshot(0)),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.privacy_panel.pending);
+        assert!(!app.privacy_panel.uncertain);
+        assert_eq!(app.inbox_policy.show_online, Some(false));
+        WORKER_TX.clear();
     }
 }

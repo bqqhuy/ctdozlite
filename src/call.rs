@@ -2072,8 +2072,35 @@ pub fn build_callee_extend_data(
     format!("{extend_obj}\n")
 }
 
+/// Recheck the queued intent after device setup; never replace it with a newer session.
+async fn prepare_call_session(
+    session: &Mutex<Session>,
+    owner: &str,
+    runtime_id: usize,
+    readiness: impl std::future::Future<Output = Result<()>>,
+) -> Result<Option<Session>> {
+    let matches = |current: &Session| {
+        current.is_active() && current.account_key() == owner && current.runtime_id() == runtime_id
+    };
+    {
+        let current = session.lock().await;
+        if !matches(&current) {
+            return Ok(None);
+        }
+    }
+    let ready = readiness.await;
+    let current = session.lock().await;
+    if !matches(&current) {
+        return Ok(None);
+    }
+    ready?;
+    Ok(Some(current.clone()))
+}
+
 enum CallEngineCmd {
     MakeCall {
+        owner: String,
+        runtime_id: usize,
         partner_id: String,
         partner_name: String,
         is_video: bool,
@@ -2119,45 +2146,40 @@ impl CallBridge {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     CallEngineCmd::MakeCall {
+                        owner,
+                        runtime_id,
                         partner_id,
                         partner_name,
                         is_video,
                         is_group,
                     } => {
-                        let gui_owner = session.lock().await.account_key().to_owned();
-                        // Outbound-dial lock: refuse everything but the three test accounts before
-                        // any server contact, and surface it in the call overlay.
-                        if let Err(e) =
-                            ensure_call_target_allowed(&partner_id, &partner_name, is_group)
-                        {
-                            let _ = gui_tx.send(GuiEvent::CallRejected {
-                                owner: gui_owner.clone(),
-                                partner_id: partner_id.clone(),
-                                call_id: None,
-                                code: -403,
-                                reason: e.to_string(),
-                            });
-                            egui_ctx.request_repaint();
-                            continue;
-                        }
-
-                        if is_video {
-                            if let Err(error) = tokio::task::spawn_blocking(crate::video::readiness)
-                                .await
-                                .unwrap_or_else(|e| Err(e.into()))
-                            {
+                        let allowed =
+                            ensure_call_target_allowed(&partner_id, &partner_name, is_group);
+                        let reject_code = if allowed.is_err() { -403 } else { -503 };
+                        let prepared = prepare_call_session(&session, &owner, runtime_id, async {
+                            // Preserve the outbound test-target lock before device or server work.
+                            allowed?;
+                            if is_video {
+                                tokio::task::spawn_blocking(crate::video::readiness).await??;
+                            }
+                            Ok(())
+                        })
+                        .await;
+                        let s_snap = match prepared {
+                            Ok(Some(account)) => account,
+                            Ok(None) => continue,
+                            Err(error) => {
                                 let _ = gui_tx.send(GuiEvent::CallRejected {
-                                    owner: gui_owner.clone(),
+                                    owner,
                                     partner_id: partner_id.clone(),
                                     call_id: None,
-                                    code: -503,
+                                    code: reject_code,
                                     reason: error.to_string(),
                                 });
                                 egui_ctx.request_repaint();
                                 continue;
                             }
-                        }
-                        let s_snap = session.lock().await.clone();
+                        };
                         let gui_owner = s_snap.account_key().to_owned();
 
                         let now_ms = std::time::SystemTime::now()
@@ -3283,6 +3305,11 @@ impl CallBridge {
                                     | "group_cancel"
                                     | "ring_ring"
                                     | "group_ring_ring"
+                                    | "ReceiveCall"
+                                    | "miss_call"
+                                    | "MissCall"
+                                    | "RejectCall"
+                                    | "reject_call"
                             )
                         {
                             trace_line("EVT", format!("act={act} ignored=missing_call_identity"));
@@ -3294,36 +3321,34 @@ impl CallBridge {
                             .as_ref()
                             .map(|login| login.uin.as_str())
                             .unwrap_or("");
+                        let self_uid32 = s_snap
+                            .zpw_sek
+                            .as_deref()
+                            .and_then(|sek| sek.split('.').nth(1))
+                            .unwrap_or("");
                         let now = std::time::Instant::now();
                         if terminal_calls.contains(owner, ev_call_id, now) {
                             continue;
                         }
                         // An explicit self answer can arrive before its invitation on another queue.
                         // Only known UID namespaces qualify; a peer's answer is not our acceptance.
-                        let actor_is_self = [
-                            ("uidN", owner),
-                            (
-                                "uidFrom",
-                                s_snap
-                                    .zpw_sek
-                                    .as_deref()
-                                    .and_then(|sek| sek.split('.').nth(1))
-                                    .unwrap_or(""),
-                            ),
-                        ]
-                        .iter()
-                        .any(|(field, own)| {
-                            !own.is_empty()
-                                && data
-                                    .get(*field)
-                                    .and_then(|value| {
-                                        value
-                                            .as_str()
-                                            .map(str::to_owned)
-                                            .or_else(|| value.as_u64().map(|id| id.to_string()))
-                                    })
-                                    .is_some_and(|actor| actor == *own)
-                        });
+                        let actor_is_self =
+                            ["uidN", "uidFrom", "fromId", "userId", "calleeId", "uidTo"]
+                                .iter()
+                                .any(|field| {
+                                    data.get(*field)
+                                        .and_then(|value| match value {
+                                            Value::String(s) => Some(s.clone()),
+                                            Value::Number(n) => Some(n.to_string()),
+                                            _ => None,
+                                        })
+                                        .map(|val_str| {
+                                            crate::call_lifecycle::actor_matches_self(
+                                                &val_str, owner, self_uid32,
+                                            )
+                                        })
+                                        .unwrap_or(false)
+                                });
                         trace_line("EVT",format!("act={act} call_id={ev_call_id} status={:?} actor_self={actor_is_self}",data.get("status").and_then(crate::api_response::integer)));
                         if matches!(act, "answer" | "group_answer")
                             && actor_is_self
@@ -3333,12 +3358,80 @@ impl CallBridge {
                             terminal_calls.remember(owner, ev_call_id, now);
                             continue;
                         }
-                        if matches!(act, "end_call" | "cancel") {
+                        if matches!(
+                            act,
+                            "end_call"
+                                | "cancel"
+                                | "miss_call"
+                                | "MissCall"
+                                | "RejectCall"
+                                | "reject_call"
+                                | "ReceiveCall"
+                        ) {
                             terminal_calls.remember(owner, ev_call_id, now);
                         }
 
                         let gui_owner = owner.to_owned();
                         match act {
+                            "ReceiveCall" => {
+                                call_trace!("[call] ctrl ReceiveCall call_id={}", ev_call_id);
+                                let mut guard = active_call.lock().await;
+                                let matches_call = guard
+                                    .as_ref()
+                                    .map(|st| ev_call_id == 0 || st.call_id == ev_call_id)
+                                    .unwrap_or(false);
+                                if matches_call || guard.is_none() {
+                                    terminal_calls.remember(owner, ev_call_id, now);
+                                }
+                                if matches_call {
+                                    guard.take();
+                                    let _ = gui_tx.send(GuiEvent::CallAnsweredElsewhere {
+                                        owner: gui_owner.clone(),
+                                        call_id: ev_call_id,
+                                    });
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: ev_call_id,
+                                        state: "free".into(),
+                                    });
+                                    egui_ctx.request_repaint();
+                                }
+                            }
+                            "miss_call" | "MissCall" | "RejectCall" | "reject_call" => {
+                                call_trace!("[call] ctrl {} call_id={}", act, ev_call_id);
+                                terminal_calls.remember(owner, ev_call_id, now);
+                                let mut guard = active_call.lock().await;
+                                let matches_call = guard
+                                    .as_ref()
+                                    .map(|st| ev_call_id == 0 || st.call_id == ev_call_id)
+                                    .unwrap_or(true);
+                                if matches_call {
+                                    let taken = guard.take();
+                                    let _ = gui_tx.send(GuiEvent::CallStateChanged {
+                                        owner: gui_owner.clone(),
+                                        call_id: ev_call_id,
+                                        state: "free".into(),
+                                    });
+                                    if let Some(st) = taken {
+                                        let label = if st.is_video {
+                                            "📹 Cuộc gọi video nhỡ".to_string()
+                                        } else {
+                                            "📞 Cuộc gọi nhỡ".to_string()
+                                        };
+                                        let _ = gui_tx.send(GuiEvent::LocalCallRecord {
+                                            runtime_id: s_snap.runtime_id(),
+                                            outgoing: st.is_caller,
+                                            owner: gui_owner.clone(),
+                                            thread_id: st.thread_id.clone(),
+                                            text: label,
+                                            msg_id: crate::call_lifecycle::local_record_id(
+                                                ev_call_id,
+                                            ),
+                                        });
+                                    }
+                                    egui_ctx.request_repaint();
+                                }
+                            }
                             "ring_ring" | "group_ring_ring" => {
                                 let mut guard = active_call.lock().await;
                                 let Some(st) = guard.as_mut() else {
@@ -4258,6 +4351,7 @@ impl CallBridge {
     /// Initiate an outgoing voice or video call (1-on-1 or Group) 100% in pure Rust.
     pub fn make_call(
         &self,
+        account: &Session,
         partner_id: &str,
         partner_name: &str,
         _partner_avatar: Option<&str>,
@@ -4265,6 +4359,8 @@ impl CallBridge {
         is_group: bool,
     ) {
         let _ = self.cmd_tx.send(CallEngineCmd::MakeCall {
+            owner: account.account_key().to_owned(),
+            runtime_id: account.runtime_id(),
             partner_id: partner_id.to_string(),
             partner_name: partner_name.to_string(),
             is_video,
@@ -4777,5 +4873,156 @@ mod tests {
         assert_eq!(u16::from_le_bytes(end[18..20].try_into().unwrap()), 0x0003);
         assert_eq!(end[20], 0x01);
         assert_eq!(u32::from_le_bytes(end[21..25].try_into().unwrap()), 3001);
+    }
+}
+
+#[cfg(test)]
+mod queued_call_scope_tests {
+    use super::*;
+
+    fn account(owner: &str) -> Session {
+        let mut account = Session::new(false, false, false).unwrap();
+        account.login = Some(crate::session::LoginInfo {
+            uin: owner.into(),
+            zpw_enk: String::new(),
+            zpw_sek: "fixture".into(),
+            display_name: "Fixture".into(),
+            send2me_id: String::new(),
+            avatar: String::new(),
+        });
+        account
+    }
+
+    #[tokio::test]
+    async fn queued_call_rejects_replaced_account_before_readiness() {
+        for next_owner in ["1", "2"] {
+            let original = account("1");
+            let expected_runtime = original.runtime_id();
+            let shared = Mutex::new(original);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let bridge = CallBridge { cmd_tx: tx };
+            bridge.make_call(&*shared.lock().await, "123", "Fixture", None, true, false);
+            {
+                let mut current = shared.lock().await;
+                current.revoke_runtime();
+                *current = account(next_owner);
+            }
+            let CallEngineCmd::MakeCall {
+                owner,
+                runtime_id,
+                partner_id,
+                ..
+            } = rx.recv().await.unwrap()
+            else {
+                panic!("expected queued call intent");
+            };
+            assert_eq!(runtime_id, expected_runtime);
+            assert_eq!(partner_id, "123");
+            let touched = std::sync::atomic::AtomicBool::new(false);
+            let prepared = prepare_call_session(&shared, &owner, runtime_id, async {
+                touched.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert!(prepared.is_none());
+            assert!(!touched.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_call_rechecks_scope_after_readiness_success_and_error() {
+        for next_owner in ["1", "2"] {
+            for fails in [true, false] {
+                let original = account("1");
+                let expected_runtime = original.runtime_id();
+                let shared = Arc::new(Mutex::new(original));
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                CallBridge { cmd_tx: tx }.make_call(
+                    &*shared.lock().await,
+                    "123",
+                    "Fixture",
+                    None,
+                    true,
+                    false,
+                );
+                let CallEngineCmd::MakeCall {
+                    owner, runtime_id, ..
+                } = rx.recv().await.unwrap()
+                else {
+                    panic!("expected queued call intent");
+                };
+                assert_eq!(runtime_id, expected_runtime);
+                let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let task_session = shared.clone();
+                let task = tokio::spawn(async move {
+                    prepare_call_session(&task_session, &owner, runtime_id, async {
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        if fails {
+                            bail!("fixture device failure");
+                        }
+                        Ok(())
+                    })
+                    .await
+                });
+                entered_rx.await.unwrap();
+                {
+                    let mut current = shared.lock().await;
+                    current.revoke_runtime();
+                    *current = account(next_owner);
+                }
+                release_tx.send(()).unwrap();
+                assert!(
+                    task.await.unwrap().unwrap().is_none(),
+                    "old call must neither signal nor reject a new session"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_call_preserves_valid_scope_and_reports_current_readiness_error() {
+        let original = account("1");
+        let expected_runtime = original.runtime_id();
+        let shared = Mutex::new(original);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let bridge = CallBridge { cmd_tx: tx };
+        bridge.make_call(&*shared.lock().await, "123", "Fixture", None, false, false);
+        let CallEngineCmd::MakeCall {
+            owner,
+            runtime_id,
+            is_video,
+            ..
+        } = rx.recv().await.unwrap()
+        else {
+            panic!("expected queued call intent");
+        };
+        assert_eq!(runtime_id, expected_runtime);
+        assert!(!is_video);
+        let ready = prepare_call_session(&shared, &owner, runtime_id, async { Ok(()) })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.account_key(), "1");
+        assert_eq!(ready.runtime_id(), runtime_id);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let failure = prepare_call_session(&shared, &owner, runtime_id, async {
+            bail!("fixture device failure")
+        })
+        .await;
+        assert!(failure
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("fixture device failure"));
     }
 }
