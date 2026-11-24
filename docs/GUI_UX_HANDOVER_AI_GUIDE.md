@@ -1,5 +1,7 @@
 # Hướng dẫn Bàn giao & Triển khai Tái cấu trúc GUI & UX (AI Agent Handover Guide)
 
+> **Quy chế bắt buộc cho mọi thay đổi GUI:** đọc [UI/UX consistency and acceptance](standards/ui-ux-consistency.md). Hoạt động đúng backend chưa đủ nghiệm thu UI: phải đồng nhất với thành phần xung quanh, kiểm tra trạng thái, bố cục, thao tác và ghi riêng kết quả code/fixture/native. Các bước commit/push bên dưới chỉ thực hiện khi đã có quyền tương ứng trong phiên làm việc.
+
 > **Bổ sung khảo sát thực tế 17/11/2026:** xem [bảng tổng hợp và hướng dẫn Antigravity](ZALO_PC_UI_UX_ANTIGRAVITY_HANDOFF_2026-11-17.md) trước khi tiếp tục sửa UX/UI. Tài liệu này ghi các sai khác sau 5 phase, gồm lỗi glyph dấu vuông, modal xuyên hover, forward gửi ngay khi chọn và responsive. Trạng thái phase cũ không thay thế nghiệm thu các mục mới.
 
 > **Dành cho các AI Agent (Gemini, Claude, GPT, v.v., bao gồm conversation ID `d9f5916e-d894-4e09-aebf-00a2920b78a0` và các phiên tiếp nối):**

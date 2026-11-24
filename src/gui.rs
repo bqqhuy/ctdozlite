@@ -2867,6 +2867,7 @@ impl ZaloGuiApp {
             || self.forward_session.is_some()
             || self.phone_modal_open
             || self.pin_setup_modal_open
+            || self.preflight_call.is_some()
             || self.active_call.is_some()
             || self.image_viewer.is_some()
             || self.doc_viewer.is_some()

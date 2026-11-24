@@ -9,6 +9,11 @@ của ông hoặc một cơ chế bảo đảm agent luôn làm đúng.
 
 ## Cách áp dụng
 
+Mọi AI sửa GUI phải đọc [quy chế đồng nhất và nghiệm thu UI/UX](standards/ui-ux-consistency.md)
+theo `AGENTS.md`. Không nghiệm thu chỉ vì nút/link đã gọi được backend: cần kiểm tra
+giao diện trong bố cục chung, trạng thái và tương tác, có bằng chứng kiểm chứng.
+Quy chế dùng chung cho các công cụ; không tạo bộ luật riêng theo nhà cung cấp AI.
+
 Nguồn quy tắc duy nhất là [AGENTS.md](../AGENTS.md), mục **Karpathy-inspired coding
 discipline**. Đã thích nghi các nguyên tắc với repo và cách làm việc đã thống nhất:
 agent tiếp tục công việc được phép, tự xử lý lựa chọn thường lệ, chỉ hỏi khi thiếu

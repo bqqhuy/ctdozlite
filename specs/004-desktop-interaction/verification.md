@@ -58,3 +58,46 @@ Kiểm tra local: 812 test mặc định, 815 test có feature, không lỗi; 12
 được tách riêng theo yêu cầu fixture/device/benchmark. Nguồn và giới hạn xem
 [remediation](../../docs/audits/2026-11-09-independent-remediation.md), ADR-0037.
 Không đóng các task nghiệm thu Zalo/tài khoản thật hoặc thiết bị ARM64 từ check x64.
+
+
+## 24/11/2026 — Khắc phục audit popup/banner/attachment: hai lượt offline sạch
+
+Nền HEAD `802893b`; giữ diff Antigravity và tài liệu Codex có trước. Phạm vi U-01/U-02
+và UI-06: Settings khóa tương tác khi PIN child mở; banner tách CTA sang hàng wrap;
+preview vẫn ở trong composer, tên tệp đo theo font/width, thu gọn ở ranh giới grapheme
+và giữ đuôi nếu đủ chỗ. Tooltip giữ tên đầy đủ. Startup expiry được thu hồi đúng runtime,
+không tiếp tục Ready; phản hồi cũ không xóa readiness của runtime mới cùng tài khoản.
+Không đổi route/params/signing/cipher hoặc thêm API; đây là sửa lifecycle/layout nội bộ
+của fork, không tuyên bố parity server mới.
+
+Regression đã thêm: `pin_child_blocks_parent_settings_and_restores_input_on_escape`,
+`draft_filename_fits_card_and_preserves_extension_and_graphemes`,
+`configured_cta_and_all_banner_states_stay_inside_parent_width`,
+`confirmed_startup_expiry_revokes_only_its_runtime_without_ready`.
+Ma trận banner kiểm tra 8 kind, width 80/160/260/340, scale 1/1.5/2, ba frame.
+Candidate đầu phát hiện spinner đẩy tràn ở width80; đã sửa, bộ đếm audit sạch chưa
+được tính cho candidate lỗi. Candidate cố định: `fb424a38795d9e001c61adc00e0d1f01a4cf65599e1b2216a11b09f10e8630b6`.
+Fingerprint gồm 197 file: src/**/*.rs, mọi file tests/, Cargo.toml/Cargo.lock/build.rs/
+rust-toolchain.toml/.cargo/config.toml; sort relative POSIX path, SHA256 nối
+UTF8(path)+NUL+raw bytes+NUL. Tài liệu không nằm trong fingerprint.
+
+Lượt 1: source review data-flow/ownership và suite thư viện **1158 passed, 0 failed,
+11 ignored**, 128.16s; fmt/diff-check đạt; clippy --locked --all-targets -j1 -- -D warnings
+exit0 không warning (4m34s gồm chờ build lock). Không có finding mới trong phạm vi sửa.
+
+Lượt 2: rà stale expiry sau relogin cùng UID, readiness của runtime thay thế, cleanup
+credentials theo runtime, parent/child Escape và re-enable, width/grapheme/extension,
+CTA dài và chuỗi liền không có khoảng trắng. **20 vòng, 5 regression/vòng**, luân phiên
+8/16 test threads: **100 executions passed**, xác minh đủ 20 summary. Harness egui
+đọc renderer từ source cũng qua CTA liền dài và ma trận width/scale; đây là offline
+source harness, không phải native app test. Không có finding mới trong phạm vi sửa. Desktop backup integration:
+`cargo test --locked --test desktop_backup_v2 -j1`: **4 passed, 0 failed, 0 ignored**,
+83.92s (build 8m09s gồm chờ lock). Hash nguồn/test sau tất cả kiểm tra trùng candidate.
+**Bộ đếm sạch = 2 liên tiếp**, cùng Codex theo hai góc kiểm tra, không phải hai reviewer
+độc lập. Kết luận giới hạn trong bốn finding; không chứng nhận toàn ứng dụng/native.
+
+Log cục bộ: `%TEMP%/zalolite-audit-20261124/fixed-lib.log`, `fixed-clippy.log`,
+`fixed-backup.log`, `fixed-candidate.json`, `round2-1.log` đến `round2-20.log`. File tạm có thể bị dọn;
+record giữ test names, lệnh, phạm vi và fingerprint để tái chạy.
+
+Chưa nghiệm thu thao tác native/DPI/IME/tài khoản thật; U-T090 và UI-T007 vẫn mở.

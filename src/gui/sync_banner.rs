@@ -425,150 +425,124 @@ pub(super) fn render_sync_banner(
         SyncBannerKind::Suggest { .. } => (pal.bg_elevated, pal.border, "↺"),
     };
 
-    let avail_width = ui.available_width().max(1.0);
-
+    let title_text = match kind {
+        SyncBannerKind::SyncingOtherMessages {
+            percentage: Some(pct),
+            ..
+        } => format!("{} ({:.0}%)", STR_SYNC_IN_PROGRESS_BANNER_LABEL, pct),
+        SyncBannerKind::WaitConfirmation { timeout_at } => {
+            let remaining = timeout_at
+                .saturating_duration_since(Instant::now())
+                .as_secs();
+            format!("Chờ xác nhận điện thoại ({remaining}s)…")
+        }
+        _ => kind.title().to_string(),
+    };
+    let tooltip = match kind {
+        SyncBannerKind::Error { message, .. } | SyncBannerKind::Success { message, .. } => {
+            message.clone()
+        }
+        SyncBannerKind::Interrupted { description, .. } => description.clone(),
+        SyncBannerKind::SyncingConvListRecent {
+            detail: Some(detail),
+        }
+        | SyncBannerKind::SyncingOtherMessages {
+            detail: Some(detail),
+            ..
+        } => detail.clone(),
+        _ => title_text.clone(),
+    };
+    let action = match kind {
+        SyncBannerKind::Suggest { cta, .. } => Some((
+            cta.as_deref()
+                .unwrap_or(STR_SYNC_BANNER_COMPACT_SUGGEST_CTA),
+            SyncBannerAction::StartSuggestSync,
+            true,
+        )),
+        SyncBannerKind::Error {
+            can_retry: true, ..
+        } => Some((
+            STR_SYNC_BANNER_COMPACT_RETRY_CTA,
+            SyncBannerAction::RetryFailedSync,
+            true,
+        )),
+        _ if kind.is_running() || matches!(kind, SyncBannerKind::Interrupted { .. }) => Some((
+            if cancel_requested {
+                "Đang dừng…"
+            } else {
+                "Dừng"
+            },
+            SyncBannerAction::CancelSync,
+            !cancel_requested,
+        )),
+        _ => None,
+    };
     egui::Frame::none()
         .fill(bg_color)
         .stroke(Stroke::new(1.0_f32, border_color))
         .rounding(Rounding::same(6.0))
         .inner_margin(Margin::symmetric(8.0, 6.0))
         .show(ui, |ui| {
-            // Constrain layout so label text cannot expand the container width
-            ui.set_max_width(avail_width);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-
-                // 1. Icon / Spinner
-                if kind.is_running() {
+                // On narrow sidebars the title already conveys progress; prioritize controls.
+                if kind.is_running() && ui.available_width() >= 100.0 {
                     ui.spinner();
                 } else if !icon_str.is_empty() {
-                    let icon_color = match kind {
+                    let color = match kind {
                         SyncBannerKind::Error { .. } => pal.danger,
                         SyncBannerKind::Success { .. } => pal.accent_online,
                         SyncBannerKind::Interrupted { .. } => pal.warning,
                         _ => pal.primary,
                     };
-                    ui.colored_label(icon_color, icon_str);
+                    ui.colored_label(color, icon_str);
                 }
-
-                // 2. Action button width reservation
-                let has_cta = matches!(
-                    kind,
-                    SyncBannerKind::Suggest { .. } | SyncBannerKind::Error { .. }
-                );
-                let has_stop =
-                    kind.is_running() || matches!(kind, SyncBannerKind::Interrupted { .. });
-                let action_width = if has_cta {
-                    76.0
-                } else if has_stop {
-                    54.0
-                } else {
-                    0.0
-                };
-                let close_btn_width = 20.0;
-                let spacing_total = 20.0;
-                let label_width =
-                    (ui.available_width() - action_width - close_btn_width - spacing_total)
-                        .max(1.0);
-
-                // 3. Text block
-                ui.allocate_ui_with_layout(
-                    Vec2::new(label_width, 24.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let title_text = match kind {
-                            SyncBannerKind::SyncingOtherMessages {
-                                percentage: Some(pct),
-                                ..
-                            } => format!("{} ({:.0}%)", STR_SYNC_IN_PROGRESS_BANNER_LABEL, pct),
-                            SyncBannerKind::WaitConfirmation { timeout_at } => {
-                                let rem = timeout_at
-                                    .saturating_duration_since(Instant::now())
-                                    .as_secs();
-                                if rem > 0 {
-                                    format!("Chờ xác nhận điện thoại ({}s)…", rem)
-                                } else {
-                                    "Chờ xác nhận điện thoại…".to_string()
-                                }
-                            }
-                            _ => kind.title().to_string(),
-                        };
-
-                        let tooltip = match kind {
-                            SyncBannerKind::Error { message, .. } => message.clone(),
-                            SyncBannerKind::Interrupted { description, .. } => description.clone(),
-                            SyncBannerKind::Success { message, .. } => message.clone(),
-                            SyncBannerKind::SyncingConvListRecent { detail: Some(d) } => d.clone(),
-                            SyncBannerKind::SyncingOtherMessages {
-                                detail: Some(d), ..
-                            } => d.clone(),
-                            _ => title_text.clone(),
-                        };
-
-                        let label = ui.add_sized(
-                            Vec2::new(label_width, 18.0),
-                            egui::Label::new(
-                                RichText::new(&title_text)
-                                    .size(11.5)
-                                    .strong()
-                                    .color(pal.text_primary),
-                            )
-                            .truncate(),
-                        );
-                        label.on_hover_text(tooltip);
-                    },
-                );
-
-                // 4. CTA / Stop button
-                match kind {
-                    SyncBannerKind::Suggest { cta, .. } => {
-                        let cta_label = cta
-                            .as_deref()
-                            .unwrap_or(STR_SYNC_BANNER_COMPACT_SUGGEST_CTA);
-                        let btn = egui::Button::new(RichText::new(cta_label).size(11.0).strong())
-                            .fill(pal.primary)
-                            .small();
-                        if ui.add(btn).clicked() {
-                            triggered_action = Some(SyncBannerAction::StartSuggestSync);
-                        }
-                    }
-                    SyncBannerKind::Error { can_retry, .. } if *can_retry => {
-                        let btn = egui::Button::new(
-                            RichText::new(STR_SYNC_BANNER_COMPACT_RETRY_CTA)
-                                .size(11.0)
-                                .strong(),
-                        )
-                        .fill(pal.primary)
-                        .small();
-                        if ui.add(btn).clicked() {
-                            triggered_action = Some(SyncBannerAction::RetryFailedSync);
-                        }
-                    }
-                    _ if has_stop => {
-                        let label = if cancel_requested {
-                            "Đang dừng…"
-                        } else {
-                            "Dừng"
-                        };
-                        let btn = egui::Button::new(RichText::new(label).size(11.0)).small();
-                        if ui.add_enabled(!cancel_requested, btn).clicked() {
-                            triggered_action = Some(SyncBannerAction::CancelSync);
-                        }
-                    }
-                    _ => {}
-                }
-
-                // 5. Close [x] button with state-specific semantics
+                let title_width = (ui.available_width() - 36.0).max(0.0);
+                ui.add_sized(
+                    Vec2::new(title_width, 24.0),
+                    egui::Label::new(
+                        RichText::new(&title_text)
+                            .size(11.5)
+                            .strong()
+                            .color(pal.text_primary),
+                    )
+                    .truncate(),
+                )
+                .on_hover_text(&tooltip);
                 let close_tooltip = match kind {
                     SyncBannerKind::Error { .. } => "Đóng và xóa thông báo lỗi",
                     SyncBannerKind::Suggest { .. } => "Ẩn gợi ý đồng bộ",
                     SyncBannerKind::Success { .. } => "Đóng thông báo",
                     _ => "Dừng đồng bộ",
                 };
-                if ui.small_button("✕").on_hover_text(close_tooltip).clicked() {
+                if ui
+                    .add_sized(
+                        Vec2::splat(24.0),
+                        egui::Button::new(RichText::new("✕").size(11.0)).small(),
+                    )
+                    .on_hover_text(close_tooltip)
+                    .clicked()
+                {
                     triggered_action = Some(SyncBannerAction::DismissOrClose);
                 }
             });
+            // Actions get their own wrapping row, so remote copy cannot evict the close target.
+            if let Some((label, intent, enabled)) = action {
+                let mut button = egui::Button::new(RichText::new(label).size(11.0).strong())
+                    .wrap()
+                    .small();
+                if intent != SyncBannerAction::CancelSync {
+                    button = button.fill(pal.primary);
+                }
+                ui.add_enabled_ui(enabled, |ui| {
+                    if ui
+                        .add_sized(Vec2::new(ui.available_width(), 0.0), button)
+                        .clicked()
+                    {
+                        triggered_action = Some(intent);
+                    }
+                });
+            }
         });
 
     triggered_action
@@ -584,6 +558,69 @@ mod tests {
     use super::*;
     use crate::sync_coordinator::SyncAvailability;
     use std::time::Duration;
+
+    #[test]
+    fn configured_cta_and_all_banner_states_stay_inside_parent_width() {
+        for scale in [1.0, 1.5, 2.0] {
+            for width in [80.0, 160.0, 260.0, 340.0] {
+                for kind in [
+                    SyncBannerKind::Suggest {
+                        title: None,
+                        cta: Some("Nhấn để đồng bộ ngay với điện thoại của bạn".into()),
+                    },
+                    SyncBannerKind::Preparing,
+                    SyncBannerKind::WaitConfirmation {
+                        timeout_at: Instant::now() + Duration::from_secs(20),
+                    },
+                    SyncBannerKind::SyncingConvListRecent { detail: None },
+                    SyncBannerKind::SyncingOtherMessages {
+                        percentage: Some(50.0),
+                        detail: None,
+                    },
+                    SyncBannerKind::Error {
+                        message: "Lỗi".into(),
+                        can_retry: true,
+                    },
+                    SyncBannerKind::Interrupted {
+                        description: "Gián đoạn".into(),
+                        retryable: true,
+                    },
+                    SyncBannerKind::Success {
+                        deadline: Instant::now(),
+                        message: "Xong".into(),
+                    },
+                ] {
+                    let ctx = egui::Context::default();
+                    ctx.set_pixels_per_point(scale);
+                    for _ in 0..3 {
+                        let _ = ctx.run(Default::default(), |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let bounds = egui::Rect::from_min_size(
+                                    ui.cursor().min,
+                                    Vec2::new(width, 500.0),
+                                );
+                                let mut child =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(bounds));
+                                render_sync_banner(
+                                    &mut child,
+                                    ctx,
+                                    &ThemePalette::light(),
+                                    &kind,
+                                    &SyncBannerFencing::new("owner", 1, 1, 1),
+                                    false,
+                                );
+                                assert!(
+                                    child.min_rect().right() <= bounds.right() + 1.0,
+                                    "{width}@{scale}: {kind:?}: {:?}",
+                                    child.min_rect()
+                                );
+                            });
+                        });
+                    }
+                }
+            }
+        }
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn test_resolve(

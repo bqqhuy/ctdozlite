@@ -1919,35 +1919,16 @@ async fn run_startup_preload(
     };
     let status = s.validate_session().await;
     if status == crate::session::SessionStatus::Expired {
-        db_ready_runtime.store(0, std::sync::atomic::Ordering::Release);
-        let Ok(_write_barrier) = s.close_account_writes().await else {
-            return;
-        };
-        let mut revoked = false;
-        {
-            let mut guard = session_arc.lock().await;
-            if guard.runtime_id() == runtime_id && guard.is_active() {
-                guard.revoke_runtime();
-                outgoing_lifecycle.retire(runtime_id);
-                guard.logout();
-                refresh_outgoing_identity(&outgoing_identity, &guard);
-                revoked = true;
-            }
-        }
-        if revoked {
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::storage::remove_session_for_runtime(runtime_id)
-            })
-            .await;
-            let _ = gui_tx.send(GuiEvent::StartupFatalError {
-                owner,
-                runtime_id,
-                message:
-                    "Phiên đăng nhập (zpw_sek) đã hết hạn hoặc bị thu hồi; vui lòng đăng nhập lại."
-                        .into(),
-            });
-            egui_ctx.request_repaint();
-        }
+        reject_expired_startup(
+            &session_arc,
+            &s,
+            &outgoing_lifecycle,
+            &outgoing_identity,
+            &db_ready_runtime,
+            &gui_tx,
+            &egui_ctx,
+        )
+        .await;
         return;
     }
 
@@ -1965,6 +1946,56 @@ async fn run_startup_preload(
         )
         .await;
     }
+}
+
+// Expiry is authoritative; a transport failure is handled separately as Unreachable.
+async fn reject_expired_startup(
+    session_arc: &std::sync::Arc<tokio::sync::Mutex<Session>>,
+    expired: &Session,
+    outgoing_lifecycle: &OutgoingLifecycle,
+    outgoing_identity: &std::sync::Arc<std::sync::RwLock<(String, usize)>>,
+    db_ready_runtime: &std::sync::atomic::AtomicUsize,
+    gui_tx: &Sender<GuiEvent>,
+    egui_ctx: &egui::Context,
+) {
+    let runtime_id = expired.runtime_id();
+    let owner = expired.account_key().to_owned();
+    let Ok(_write_barrier) = expired.close_account_writes().await else {
+        return;
+    };
+    {
+        let mut guard = session_arc.lock().await;
+        if !guard.is_active() || guard.runtime_id() != runtime_id || guard.account_key() != owner {
+            return;
+        }
+        // A late expiry must not clear readiness for a replacement runtime.
+        let _ = db_ready_runtime.compare_exchange(
+            runtime_id,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        guard.revoke_runtime();
+        outgoing_lifecycle.retire(runtime_id);
+        guard.logout();
+        refresh_outgoing_identity(outgoing_identity, &guard);
+    }
+    if let Err(error) =
+        tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(runtime_id))
+            .await
+            .unwrap_or_else(|error| Err(error.into()))
+    {
+        crate::logger::log_error(
+            "startup expiry",
+            &format!("Cannot remove expired session: {error}"),
+        );
+    }
+    let _ = gui_tx.send(GuiEvent::StartupFatalError {
+        owner,
+        runtime_id,
+        message: "Phiên đăng nhập đã hết hạn hoặc bị thu hồi; vui lòng đăng nhập lại.".into(),
+    });
+    egui_ctx.request_repaint();
 }
 
 async fn run_optional_startup_preload(
@@ -10132,6 +10163,48 @@ mod db_write_serialization_tests {
         assert_eq!(count, 3);
         drop(store);
         let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[tokio::test]
+    async fn confirmed_startup_expiry_revokes_only_its_runtime_without_ready() {
+        for replaced in [false, true] {
+            let expired = test_session(&format!("expiry-{}", crate::param_cipher::random_hex(12)));
+            let current = if replaced {
+                test_session(expired.account_key())
+            } else {
+                expired.clone()
+            };
+            let runtime = current.runtime_id();
+            let session = std::sync::Arc::new(tokio::sync::Mutex::new(current));
+            let ready = std::sync::atomic::AtomicUsize::new(runtime);
+            let identity = std::sync::Arc::new(std::sync::RwLock::new((
+                expired.account_key().to_owned(),
+                runtime,
+            )));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = egui::Context::default();
+            let lifecycle = OutgoingLifecycle::new(tx.clone(), ctx.clone());
+            reject_expired_startup(&session, &expired, &lifecycle, &identity, &ready, &tx, &ctx)
+                .await;
+            let events: Vec<_> = rx.try_iter().collect();
+            let current = session.lock().await;
+            if replaced {
+                assert!(current.is_active());
+                assert!(current.login.is_some());
+                assert_eq!(ready.load(std::sync::atomic::Ordering::Acquire), runtime);
+                assert!(events.is_empty());
+            } else {
+                assert!(!expired.is_active());
+                assert!(current.login.is_none());
+                assert_eq!(ready.load(std::sync::atomic::Ordering::Acquire), 0);
+                assert!(events.iter().any(|event| matches!(event, GuiEvent::StartupFatalError { runtime_id, .. } if *runtime_id == runtime)));
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    GuiEvent::StartupPrerequisitesSettled { .. }
+                        | GuiEvent::StartupPreloadSettled { .. }
+                )));
+            }
+        }
     }
 
     #[tokio::test]

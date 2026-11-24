@@ -55,6 +55,7 @@ Operating guide for AI agents and humans working in this repository.
 - **Do not silently change protocol behaviour.** Any change to params, signing, frame IDs or cipher flow requires evidence (capture, note in `re-notes/`) and a test or documented manual verification.
 - **Local compilation verification before commit/push.** The local Rust toolchain is available at `$env:USERPROFILE\.cargo\bin\cargo.exe`. Developers and AI agents MUST run `powershell scripts/audit-prepush.ps1` (or `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"; cargo check --locked`) before committing or pushing to ensure zero compiler errors, zero type mismatches, and zero broken bindings. Never push unverified code to remote CI.
 - **No UI Stubs and No Dropped Payloads Invariant.** Every interactive UI control (buttons, forms) MUST be connected end-to-end: `UI -> WorkerCmd -> Network/DB -> GuiEvent(Payload) -> App State -> Reactive Render`. Fake buttons that only mutate `self.status_msg` without backend execution, and worker handlers that discard API response data or only send toast messages, are strictly prohibited. Always inspect the exact struct declaration in the defining module before writing field accessors.
+- **UI/UX consistency is part of completion.** All GUI additions and changes MUST follow [UI/UX consistency and acceptance](docs/standards/ui-ux-consistency.md). Working backend wiring alone does not complete a UI task. Reuse established visual and interaction patterns, verify integration with surrounding surfaces, and report code/fixture/native acceptance separately. Do not generalize a component defect into a panel-wide redesign without evidence.
 - **Release tag and version synchronization invariant.** When creating a release tag (`v*`), four locations MUST be synchronized in lockstep before tagging:
   1. `src/lib.rs`: `pub const PRODUCT_VERSION: &str = "vX.YYY-arm";` (MUST match the Git tag name exactly).
   2. `src/updater.rs`: Regression test `assert_eq!(version(crate::PRODUCT_VERSION), Some((major, minor, serial)));`.
@@ -69,6 +70,7 @@ MUST read the corresponding standard file under `docs/standards/` before modifyi
 - **Issue tracking & tickets** → `docs/standards/issue-tracker.md`
 - **Domain glossary & ADRs** → `docs/standards/domain-docs.md`
 - **Comments & docstrings** → `docs/standards/code-comment-taxonomy.md`
+- **GUI layout, widgets, banners, dialogs, menus and interaction** → `docs/standards/ui-ux-consistency.md`
 - **API calls, IPC, and error handling** → `docs/standards/api-design-and-error-handling.md`
 - **SQLite schema and migrations** → `docs/standards/database-and-migrations.md`
 - **Threads, channels, locks, and races** → `docs/standards/concurrency-and-locking.md`

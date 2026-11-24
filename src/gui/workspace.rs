@@ -1921,7 +1921,7 @@ impl ZaloGuiApp {
                             // Clean Zalo PC Filter Strip: [Tất cả] | [Chưa đọc] ... [Phân loại ▾] [⋯]
                             let strip_w = (bounds.width() - if is_narrow_w { 8.0 } else { 28.0 }).max(1.0);
                             ui.allocate_ui_with_layout(Vec2::new(strip_w, 26.0), Layout::left_to_right(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
+                                ui.spacing_mut().item_spacing.x = 8.0;
 
                                 // Tab 1: Tất cả
                                 let is_all = !self.unread_only && self.thread_filter == ThreadFilter::All;
@@ -1989,7 +1989,7 @@ impl ZaloGuiApp {
                                 }
 
                                 // Right-aligned actions: Phân loại ▾ and ⋯ Menu
-                                let right_w = (strip_w - 108.0).max(1.0);
+                                let right_w = ui.available_width().max(1.0);
                                 ui.allocate_ui_with_layout(Vec2::new(right_w, 26.0), Layout::right_to_left(Align::Center), |ui| {
                                     // ⋯ Menu Button
                                     let (more_rect, more_resp) =
@@ -4775,8 +4775,6 @@ impl ZaloGuiApp {
                     }
                     if ctx.input(|i|i.events.iter().any(|e|matches!(e,egui::Event::Paste(_)))) {self.clipboard_text_only=false;}
                     let compose_top = ui.cursor().top();
-                    let attachment_budget=(ui.available_height()-editor_height-64.0-if self.pending_clipboard_image.is_some(){64.0}else{0.0}).max(28.0);
-                    self.render_attachment_draft(ui, &thread_id, pal, attachment_budget);
                     if self.pending_clipboard_image.is_some() {
                         let mut clear_clip = false;
                         if ui.input(|i| i.key_pressed(Key::Escape)) {
@@ -5236,6 +5234,12 @@ impl ZaloGuiApp {
                                 .on_hover_cursor(CursorIcon::PointingHand)
                                 .on_hover_text(crate::i18n::tr("Tùy chọn thêm"));
                             });
+
+                            // Tier 1.5: Staged Attachment Preview Tray (Inside composer container)
+                            if self.attachment_drafts.len(&thread_id) > 0 {
+                                ui.add_space(3.0);
+                                self.render_attachment_draft(ui, &thread_id, pal, 110.0);
+                            }
 
                             ui.add_space(3.0);
 
@@ -9250,11 +9254,11 @@ impl ZaloGuiApp {
             ui.painter().circle_filled(rect.center(), 18.0, bg);
             ui.painter()
                 .circle_stroke(rect.center(), 18.0, Stroke::new(1.0_f32, stroke_col));
-            ui.painter().text(
+            draw_lucide_icon(
+                ui.painter(),
                 rect.center(),
-                egui::Align2::CENTER_CENTER,
                 icon,
-                FontId::proportional(14.5),
+                16.0,
                 if active {
                     pal.primary
                 } else {
@@ -9476,7 +9480,7 @@ impl ZaloGuiApp {
                             ui.allocate_ui(Vec2::new(col_w, 58.0), |ui| {
                                 mute_clicked = Self::draw_quick_circle_btn(
                                     ui,
-                                    if is_muted { "🔕" } else { "🔔" },
+                                    lucide::BELL,
                                     if is_muted {
                                         "Bật chuông"
                                     } else {
@@ -9490,7 +9494,7 @@ impl ZaloGuiApp {
                             ui.allocate_ui(Vec2::new(col_w, 58.0), |ui| {
                                 pin_clicked = Self::draw_quick_circle_btn(
                                     ui,
-                                    "📌",
+                                    lucide::PIN,
                                     if is_pinned { "Bỏ ghim" } else { "Ghim tin" },
                                     is_pinned,
                                     pal,
@@ -9499,19 +9503,24 @@ impl ZaloGuiApp {
 
                             ui.allocate_ui(Vec2::new(col_w, 58.0), |ui| {
                                 let (icon, label) = if d_is_cloud {
-                                    ("🔄", "Đồng bộ")
+                                    (lucide::REFRESH, "Đồng bộ")
                                 } else if d_is_group {
-                                    ("👥+", "Thêm bạn")
+                                    (lucide::USER_PLUS, "Thêm bạn")
                                 } else {
-                                    ("👥+", "Tạo nhóm")
+                                    (lucide::USERS, "Tạo nhóm")
                                 };
                                 grp_clicked =
                                     Self::draw_quick_circle_btn(ui, icon, label, false, pal);
                             });
 
                             ui.allocate_ui(Vec2::new(col_w, 58.0), |ui| {
-                                settings_clicked =
-                                    Self::draw_quick_circle_btn(ui, "⚙️", "Cài đặt", false, pal);
+                                settings_clicked = Self::draw_quick_circle_btn(
+                                    ui,
+                                    lucide::SETTINGS,
+                                    "Cài đặt",
+                                    false,
+                                    pal,
+                                );
                             });
                         });
                     });

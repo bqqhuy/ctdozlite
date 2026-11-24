@@ -256,13 +256,31 @@ mod tests {
             .filter(|p| window.contains(*p) && p.y < window.top() + 50.0)
             .max_by(|a, b| a.x.total_cmp(&b.x))
             .expect("window close icon is painted");
+
+        // Multi-frame test: Click outside on backdrop at (10.0, 10.0) first across multiple frames.
+        let outside = Pos2::new(10.0, 10.0);
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(raw, |ctx| app.render_labels_panel(ctx));
+        }
+
+        // Invariant check: The dialog in Foreground MUST STILL be on top of backdrop in Middle!
         assert_eq!(
             ctx.layer_id_at(close),
             Some(egui::LayerId::new(
                 egui::Order::Foreground,
                 Id::new("server-labels")
             )),
-            "dialog must receive input above its full-screen backdrop",
+            "dialog in Foreground must NOT be occluded by backdrop in Middle after outside clicks",
         );
         for pressed in [true, false] {
             let mut raw = input();
@@ -281,6 +299,49 @@ mod tests {
             !app.labels_panel.open,
             "pointer click must close the dialog"
         );
+        assert!(!app.is_workspace_input_gated(&ctx));
+
+        // Reopen sequence: open -> outside click -> close via escape or pointer
+        app.labels_panel.open = true;
+        let _ = ctx.run(input(), |ctx| app.render_labels_panel(ctx));
+        assert!(app.is_workspace_input_gated(&ctx));
+
+        // Outside click on reopen
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(outside),
+                egui::Event::PointerButton {
+                    pos: outside,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(raw, |ctx| app.render_labels_panel(ctx));
+        }
+        assert_eq!(
+            ctx.layer_id_at(close),
+            Some(egui::LayerId::new(
+                egui::Order::Foreground,
+                Id::new("server-labels")
+            )),
+            "dialog remains interactive on reopen after outside click",
+        );
+        for pressed in [true, false] {
+            let mut raw = input();
+            raw.events = vec![
+                egui::Event::PointerMoved(close),
+                egui::Event::PointerButton {
+                    pos: close,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(raw, |ctx| app.render_labels_panel(ctx));
+        }
+        assert!(!app.labels_panel.open);
         assert!(!app.is_workspace_input_gated(&ctx));
     }
 }

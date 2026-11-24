@@ -82,16 +82,21 @@ impl ZaloGuiApp {
 }
 
 /// Paint a standard dimmed backdrop behind centered modals.
-pub fn render_modal_backdrop(ctx: &egui::Context, id: &str) {
+/// Uses `Order::Middle` so that the backdrop is always above workspace panels (`Order::Background`),
+/// but strictly below foreground dialog windows (`Order::Foreground`).
+/// This invariant prevents outside clicks from reordering the backdrop above the dialog via egui's `move_to_top`.
+pub fn render_modal_backdrop(ctx: &egui::Context, id: &str) -> egui::Response {
     let screen = ctx.screen_rect();
     egui::Area::new(Id::new(id))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
-            let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(screen.size(), Sense::click());
             ui.painter()
                 .rect_filled(rect, Rounding::ZERO, Color32::from_black_alpha(110));
-        });
+            resp
+        })
+        .inner
 }
 
 impl ZaloGuiApp {
@@ -756,6 +761,9 @@ impl ZaloGuiApp {
         let response = egui::Window::new("settings_window_modal")
             .title_bar(false)
             .order(egui::Order::Foreground)
+            // The PIN dialog owns input until it closes, including the parent's title bar.
+            .enabled(!self.pin_setup_modal_open)
+            .interactable(!self.pin_setup_modal_open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
@@ -5906,6 +5914,67 @@ mod forward_dialog_tests {
     }
 
     #[test]
+    fn pin_child_blocks_parent_settings_and_restores_input_on_escape() {
+        let (mut app, ctx) = test_app();
+        app.settings_modal_open = true;
+        app.settings_tab = SettingsTab::General;
+        app.pin_setup_modal_open = true;
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                Pos2::ZERO,
+                Vec2::new(1000.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let draw = |app: &mut ZaloGuiApp, ctx: &egui::Context| {
+            app.render_settings_modal(ctx, &ThemePalette::light());
+            app.render_pin_setup_modal(ctx, &ThemePalette::light());
+        };
+        let mut tab = None;
+        for _ in 0..4 {
+            let output = ctx.run(input(vec![]), |ctx| draw(&mut app, ctx));
+            tab = find_text_center(&output.shapes, "Giao diện");
+        }
+        let tab = tab.expect("parent appearance tab is rendered");
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(tab),
+                egui::Event::PointerButton {
+                    pos: tab,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        for pressed in [true, false] {
+            let _ = ctx.run(input(click(pressed)), |ctx| draw(&mut app, ctx));
+        }
+        assert_eq!(app.settings_tab, SettingsTab::General);
+        assert!(app.pin_setup_modal_open);
+        let _ = ctx.run(
+            input(vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| draw(&mut app, ctx),
+        );
+        assert!(!app.pin_setup_modal_open);
+        assert!(app.settings_modal_open);
+        for _ in 0..2 {
+            let _ = ctx.run(input(vec![]), |ctx| draw(&mut app, ctx));
+        }
+        for pressed in [true, false] {
+            let _ = ctx.run(input(click(pressed)), |ctx| draw(&mut app, ctx));
+        }
+        assert_eq!(app.settings_tab, SettingsTab::Appearance);
+    }
+
+    #[test]
     fn modal_gate_tracks_open_modals_and_dialogs() {
         let (mut app, _) = test_app();
         assert!(!app.is_any_modal_open());
@@ -5939,6 +6008,12 @@ mod forward_dialog_tests {
         app.profile_panel.open = true;
         assert!(app.is_any_modal_open());
         app.profile_panel.open = false;
+
+        app.user_uin = "self_uin".into();
+        app.open_preflight_call("u1".into(), "Bạn A".into(), None, false, false);
+        assert!(app.is_any_modal_open());
+        app.clear_preflight_call();
+        assert!(!app.is_any_modal_open());
 
         app.forward_msg = Some(ChatMessage {
             id: "m1".into(),

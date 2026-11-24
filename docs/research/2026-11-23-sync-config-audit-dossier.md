@@ -571,3 +571,22 @@ Log cuối trong `%TEMP%`: `zalolite-verified-lib.log`, `zalolite-verified-clipp
 Đọc trực tiếp `search::generation`: counter dùng `AtomicU64::fetch_add(Ordering::Relaxed)`, không phải SeqCst như mô tả Antigravity cũ. RMW vẫn có modification order đơn điệu; bản sửa không đổi memory ordering. Manual marks đi qua GuiEvent::ManualMarks riêng; không bịa thêm trường manual_marks vào AccountMetadata.
 
 Phạm vi parity: chỉ thay IPC/lifecycle/cache của fork để bảo toàn account/runtime và request identity; HTTP params, route, frame ID, signing/cipher, service routing và outbound target lock không đổi. Native call/sync, ZIP-08, C-T090/H-T090, ChangeDevice/QueueEvict và các envelope còn AMBIGUOUS chưa tự chuyển thành nghiệm thu. Không commit/push/tag/release; giữ công việc khác trong shared working tree.
+
+
+## 24/11/2026 — Sửa bốn finding popup/composer và expiry sau bàn giao V2
+
+Theo yêu cầu sửa/audit tới hai lượt sạch, nền HEAD `802893b`, giữ các diff dùng chung.
+Đã khôi phục chặn Ready/revoke khi session được xác nhận hết hạn (khác Unreachable),
+fence late expiry theo runtime; khóa Settings khi PIN child mở; CTA banner wrap hàng
+riêng; tên attachment đo width/grapheme và giữ extension nếu đủ chỗ. Không thay wire,
+service route, params, cipher/signkey hay capability server.
+
+Candidate `fb424a38795d9e001c61adc00e0d1f01a4cf65599e1b2216a11b09f10e8630b6`:
+1158 library PASS/11 ignored; clippy all-targets -D warnings exit0; fmt/diff exit0;
+20 vòng x 5 regression = 100 executions PASS (8/16 threads); desktop backup 4/4 PASS.
+Hai lượt source/data-flow và phản ví dụ/lifecycle sạch liên tiếp trên cùng fingerprint;
+cùng Codex tự audit, không gọi là hai reviewer độc lập. Candidate trước sửa spinner
+width80 đã fail và không được cộng vào bộ đếm. Chi tiết, cách hash, test names và log
+ở [verification desktop](../../specs/004-desktop-interaction/verification.md).
+Native Windows/DPI/IME/tài khoản thật chưa nghiệm thu trong đợt này; ZIP-08 và các device
+cases trước vẫn mở. Không commit/push/tag/release.

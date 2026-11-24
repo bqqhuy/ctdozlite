@@ -2,6 +2,52 @@
 use super::*;
 use std::path::PathBuf;
 
+/// Fit a filename by rendered width, retaining its extension and whole graphemes.
+fn fit_draft_filename(ui: &egui::Ui, name: &str, font: &FontId, width: f32) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let fits = |text: &str| {
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+            .size()
+            .x
+            <= width
+    };
+    if fits(name) {
+        return name.to_owned();
+    }
+    let (stem, suffix) = name
+        .rsplit_once('.')
+        .filter(|(stem, ext)| !stem.is_empty() && !ext.is_empty())
+        .map_or((name, String::new()), |(stem, ext)| {
+            (stem, format!(".{ext}"))
+        });
+    let tail = format!("…{suffix}");
+    if fits(&tail) {
+        let mut result = tail.clone();
+        for (index, grapheme) in stem.grapheme_indices(true) {
+            let candidate = format!("{}{}", &stem[..index + grapheme.len()], tail);
+            if !fits(&candidate) {
+                break;
+            }
+            result = candidate;
+        }
+        return result;
+    }
+    // An extension can itself be longer than the card; the tooltip retains the full name.
+    let mut result = String::new();
+    for grapheme in name.graphemes(true) {
+        let candidate = format!("{result}{grapheme}…");
+        if !fits(&candidate) {
+            break;
+        }
+        result.push_str(grapheme);
+    }
+    if fits(&format!("{result}…")) {
+        result.push('…');
+    }
+    result
+}
+
 pub(super) const MAX_ATTACHMENTS: usize = 50;
 const PER_THREAD: usize = MAX_ATTACHMENTS;
 const TOTAL: usize = MAX_ATTACHMENTS;
@@ -335,16 +381,18 @@ impl ZaloGuiApp {
                             // Tên file cắt ngắn ở đáy kèm dung lượng nhỏ
                             let full_name =
                                 item.path.file_name().unwrap_or_default().to_string_lossy();
-                            let mut short_name = full_name.to_string();
-                            if short_name.chars().count() > 10 {
-                                short_name =
-                                    format!("{}…", short_name.chars().take(9).collect::<String>());
-                            }
+                            let name_font = FontId::proportional(10.0);
+                            let short_name = fit_draft_filename(
+                                ui,
+                                &full_name,
+                                &name_font,
+                                card_rect.width() - 8.0,
+                            );
                             ui.painter().text(
                                 Pos2::new(card_rect.center().x, card_rect.min.y + 45.0),
                                 egui::Align2::CENTER_CENTER,
                                 short_name,
-                                FontId::proportional(10.0),
+                                name_font,
                                 pal.text_primary,
                             );
 
@@ -698,6 +746,47 @@ mod tests {
         assert_eq!(target(Some(chat.center()), chat, compose, true), None);
         assert_eq!(target(Some(compose.center()), chat, compose, true), None);
     }
+    #[test]
+    fn draft_filename_fits_card_and_preserves_extension_and_graphemes() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let font = FontId::proportional(10.0);
+                for name in [
+                    "WWWWWWWWW_report.zip",
+                    "Báo cáo tháng 11 rất dài.pdf",
+                    "👩‍👩‍👧‍👦👩‍👩‍👧‍👦_family.zip",
+                    "a.txt",
+                ] {
+                    let fitted = fit_draft_filename(ui, name, &font, 64.0);
+                    let measured =
+                        ui.painter()
+                            .layout_no_wrap(fitted.clone(), font.clone(), Color32::WHITE);
+                    assert!(measured.size().x <= 64.0, "{name}: {fitted}");
+                    assert!(fitted.ends_with(name.rsplit_once('.').unwrap().1));
+                    if let Some((prefix, _)) = fitted.split_once('…') {
+                        use unicode_segmentation::UnicodeSegmentation;
+                        assert!(name
+                            .grapheme_indices(true)
+                            .any(|(index, _)| index == prefix.len()));
+                    } else {
+                        assert_eq!(fitted, name);
+                    }
+                }
+                for width in [0.0, 5.0, 20.0] {
+                    let fitted = fit_draft_filename(ui, "file.verylongextension", &font, width);
+                    assert!(
+                        ui.painter()
+                            .layout_no_wrap(fitted, font.clone(), Color32::WHITE)
+                            .size()
+                            .x
+                            <= width
+                    );
+                }
+            });
+        });
+    }
+
     #[test]
     fn staged_files_are_bounded_deduplicated_and_scoped() {
         let mut drafts = Drafts::default();
