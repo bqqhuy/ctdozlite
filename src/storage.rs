@@ -70,11 +70,12 @@ fn default_root() -> Result<PathBuf> {
         );
         return Ok(path);
     }
-    // Safety guard: Under tests, NEVER fall back to live user data directories if CTDOZ_DATA_DIR is missing!
+    // Only explicit test signals may isolate storage. Release filenames and profile names
+    // can contain "test"; treating those as tests loses the saved login on every new PID.
     let is_test = cfg!(test)
         || std::env::var_os("RUST_TEST_THREADS").is_some()
         || std::env::var_os("CTDOZ_ALLOW_TEST_LOOPBACK").is_some()
-        || std::env::args().any(|a| a == "--test" || a.contains("test"));
+        || std::env::args_os().skip(1).any(|a| a == "--test");
     if is_test {
         let fallback = std::env::temp_dir().join(format!("ctdoz_test_data_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&fallback);
