@@ -150,7 +150,9 @@ try {
     $size = [NativeManifestResources]::SizeofResource($module, $resource)
     $data = [NativeManifestResources]::LockResource([NativeManifestResources]::LoadResource($module, $resource))
     if ($size -eq 0 -or $data -eq [IntPtr]::Zero) { throw 'Cannot read application manifest' }
-    $manifest = [System.Runtime.InteropServices.Marshal]::PtrToStringUTF8($data, [int]$size)
+    $rawBytes = New-Object byte[] $size
+    [System.Runtime.InteropServices.Marshal]::Copy($data, $rawBytes, 0, [int]$size)
+    $manifest = [System.Text.Encoding]::UTF8.GetString($rawBytes)
     [xml]$manifestXml = $manifest
     if ($manifestXml.assembly.assemblyIdentity.processorArchitecture -ne 'arm64' -or $manifest -notmatch 'level="asInvoker"') {
         throw 'Application manifest must declare ARM64 and standard-user privileges'
@@ -201,29 +203,34 @@ try {
         $process = [Diagnostics.Process]::new()
         $process.StartInfo.FileName = $binary
         $process.StartInfo.UseShellExecute = $false
-        if ($case.ContainsKey('E2eeTrial')) { $process.StartInfo.ArgumentList.Add('--e2ee-experimental') }
+        $argsList = [System.Collections.Generic.List[string]]::new()
+        if ($case.ContainsKey('E2eeTrial')) { $argsList.Add('--e2ee-experimental') }
         $process.StartInfo.CreateNoWindow = $true
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
-        if ($case.ContainsKey('E2eeTrial')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-group-long') }
-        else { $process.StartInfo.ArgumentList.Add('--dev') }
+        if ($case.ContainsKey('E2eeTrial')) { $argsList.Add('--ui-smoke-group-long') }
+        else { $argsList.Add('--dev') }
         foreach ($argument in @('--gui', '--ui-smoke-test', $png, '--ui-smoke-size', $case.Size, '--ui-smoke-scale', $case.Scale, '--ui-smoke-tab', $case.Tab)) {
-            $process.StartInfo.ArgumentList.Add($argument)
+            $argsList.Add($argument)
         }
-        if ($case.ContainsKey('Tray')) { $process.StartInfo.ArgumentList.Add('--tray-smoke-test') }
-        if ($case.ContainsKey('WorkspaceSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-workspace-sync') }
-        if ($case.ContainsKey('PhoneSync')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-phone-sync') }
-        if ($case.ContainsKey('ToolsTab')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-tools'); $process.StartInfo.ArgumentList.Add('--ui-smoke-tools-tab'); $process.StartInfo.ArgumentList.Add([string]$case.ToolsTab) }
-        if ($case.ContainsKey('Outgoing')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-outgoing') }
-        if ($case.ContainsKey('Viewer')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-viewer') }
-        if ($case.ContainsKey('Light')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-light') }
-        if ($case.ContainsKey('Photo')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-photo') }
-        if ($case.ContainsKey('Media')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-media') }
-        if ($case.ContainsKey('Contacts')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-contacts') }
-        if ($case.ContainsKey('Schedule')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-schedule') }
-        if ($case.ContainsKey('Ami')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-ami') }
-        if ($case.ContainsKey('RichText')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-rich-text') }
-        if ($case.ContainsKey('QuoteJump')) { $process.StartInfo.ArgumentList.Add('--ui-smoke-quote-jump') }
+        if ($case.ContainsKey('Tray')) { $argsList.Add('--tray-smoke-test') }
+        if ($case.ContainsKey('WorkspaceSync')) { $argsList.Add('--ui-smoke-workspace-sync') }
+        if ($case.ContainsKey('PhoneSync')) { $argsList.Add('--ui-smoke-phone-sync') }
+        if ($case.ContainsKey('ToolsTab')) { $argsList.Add('--ui-smoke-tools'); $argsList.Add('--ui-smoke-tools-tab'); $argsList.Add([string]$case.ToolsTab) }
+        if ($case.ContainsKey('Outgoing')) { $argsList.Add('--ui-smoke-outgoing') }
+        if ($case.ContainsKey('Viewer')) { $argsList.Add('--ui-smoke-viewer') }
+        if ($case.ContainsKey('Light')) { $argsList.Add('--ui-smoke-light') }
+        if ($case.ContainsKey('Photo')) { $argsList.Add('--ui-smoke-photo') }
+        if ($case.ContainsKey('Media')) { $argsList.Add('--ui-smoke-media') }
+        if ($case.ContainsKey('Contacts')) { $argsList.Add('--ui-smoke-contacts') }
+        if ($case.ContainsKey('Schedule')) { $argsList.Add('--ui-smoke-schedule') }
+        if ($case.ContainsKey('Ami')) { $argsList.Add('--ui-smoke-ami') }
+        if ($case.ContainsKey('RichText')) { $argsList.Add('--ui-smoke-rich-text') }
+        if ($case.ContainsKey('QuoteJump')) { $argsList.Add('--ui-smoke-quote-jump') }
+        $escapedArgs = $argsList | ForEach-Object {
+            if ($_ -match '[\s"]') { '"{0}"' -f ($_ -replace '(\\*)(")', '$1$1\"' -replace '(\\+)$', '$1$1') } else { $_ }
+        }
+        $process.StartInfo.Arguments = $escapedArgs -join ' '
         try {
             if (-not $process.Start()) { throw 'Cannot start GUI process' }
             $outTask = $process.StandardOutput.ReadToEndAsync()

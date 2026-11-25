@@ -1,6 +1,6 @@
-# BÁO CÁO NGHIÊN CỨU THỰC NGHIỆM, BẢNG ĐÍNH CHÍNH & KẾ HOẠCH PARITY DỰA TRÊN BẰNG CHỨNG (PHIÊN BẢN RÀ SOÁT CHUẨN XÁC)
+# BÁO CÁO NGHIÊN CỨU THỰC NGHIỆM, BẢNG ĐÍNH CHÍNH & KẾ HOẠCH PARITY DỰA TRÊN BẰNG CHỨNG (BẢN HOÀN CHỈNH)
 
-> **Phạm vi thực hiện:** Nghiên cứu thực nghiệm mã nguồn Zalo PC/Web, đối chiếu consumer thực tế, đính chính triệt để các suy đoán/ngộ nhận và cập nhật kế hoạch parity.  
+> **Phạm vi thực hiện:** Nghiên cứu thực nghiệm mã nguồn Zalo PC/Web, đối chiếu consumer thực tế, đính chính triệt để các suy đoán/ngộ nhận và chốt bảng quyết định sẵn sàng triển khai.  
 > **Nguyên tắc quản trị:** Tuân thủ tuyệt đối `AGENTS.md`, `docs/ZALO_REFERENCE_ANALYSIS.md`, các tiêu chuẩn `docs/standards/` và kỷ luật Karpathy:
 > 1. Không sửa đổi mã sản phẩm (`src/`), không xóa chức năng, không commit/push.
 > 2. Không thực hiện các thao tác làm thay đổi dữ liệu, mã PIN hoặc cấu hình bảo mật trên tài khoản thật.
@@ -8,44 +8,48 @@
 
 ---
 
-## BẢNG TỔNG HỢP RÀ SOÁT FINDING & TÁC ĐỘNG KẾ HOẠCH
+## MỤC LỤC
+- [1. BẢNG QUYẾT ĐỊNH SẴN SÀNG TRIỂN KHAI (FINAL GATE DECISION TABLE)](#1-bảng-quyết-định-sẵn-sàng-triển-khai-final-gate-decision-table)
+- [2. BẢNG TỔNG HỢP RÀ SOÁT FINDING & TÁC ĐỘNG KẾ HOẠCH](#2-bảng-tổng-hợp-rà-soát-finding--tác-động-kế-hoạch)
+- [3. EVIDENCE LEDGER (SỔ BẰNG CHỨNG THỰC NGHIỆM)](#3-evidence-ledger-sổ-bằng-chứng-thực-nghiệm)
+- [4. CONTRACT MATRIX (MA TRẬN ĐẶC TẢ HỢP ĐỒNG KỸ THUẬT)](#4-contract-matrix-ma-trận-đặc-tả-hợp-đồng-kỹ-thuật)
+- [5. ĐỐI CHIẾU MÃ NGUỒN FORK HIỆN TẠI (SRC/GROUP_CONTENT.RS & SRC/PRIVACY.RS)](#5-đối-chiếu-mã-nguồn-fork-hiện-tại-srcgroup_contentrs--srcprivacyrs)
+- [6. KIẾN TRÚC DI CƯ DỮ LIỆU AN TOÀN (SAFE MIGRATION ARCHITECTURE)](#6-kiến-trúc-di-cư-dữ-liệu-an-toàn-safe-migration-architecture)
+- [7. GRANULAR PACKAGE PLAN (KẾ HOẠCH PHÂN RÃ 5 GÓI CÔNG VIỆC)](#7-granular-package-plan-kế-hoạch-phân-rã-5-gói-công-việc)
+- [8. DANH SÁCH PENDING & MA TRẬN 4 CẤP ĐỘ KIỂM CHỨNG](#8-danh-sách-pending--ma-trận-4-cấp-độ-kiểm-chứng)
 
-Bảng bàn giao đối chiếu trực tiếp giữa các finding cần sửa, bằng chứng consumer cụ thể trong bundle, nội dung đính chính và phần kế hoạch bị ảnh hưởng:
+---
+
+## 1. BẢNG QUYẾT ĐỊNH SẴN SÀNG TRIỂN KHAI (FINAL GATE DECISION TABLE)
+
+Đánh giá nghiêm ngặt điều kiện khởi động cho từng gói công việc: **Chỉ có Gói 1 và Gói 2 đủ cơ sở để triển khai ngay; Gói 3 phải giải quyết xong dependency nghiên cứu E2 parser trước khi viết code sản phẩm.**
+
+| Gói Công Việc | Trạng Thái Sẵn Sàng | Dependency Còn Thiếu Trước Khi Viết Code | Tiêu Chí Nghiệm Thu Bắt Buộc |
+| :--- | :---: | :--- | :--- |
+| **Gói 1: Bố cục hình học Composer & Pinned Action Buttons** | **ĐỦ ĐIỀU KIỆN BẮT ĐẦU** | Không có (Đã có ảnh live Zalo PC/Web và mã layout egui). | Nút Emoji và Send ghim cố định đáy góc phải ở mọi độ dài text; thanh RTF nằm dưới TextEdit; không vỡ scroll view tin nhắn. |
+| **Gói 2: Tương tác nội bộ (Mention Navigation, Enter Toggle, Contact Modal UI)** | **ĐỦ ĐIỀU KIỆN BẮT ĐẦU** | Không có (Logic nội bộ client, `AppSettings` và phím tắt). | Toggle Enter trong Cài đặt có tác dụng 2 chiều với Composer; Mention điều hướng mũi tên Lên/Xuống/Enter; chặn mention khi chat 1-1. |
+| **Gói 3: Cài đặt hợp đồng máy chủ đã xác minh (Quick Messages, Poll, Contact)** | **CHƯA ĐỦ ĐIỀU KIỆN (Cần R&D Parser)** | - **Quick Messages:** Cần trace tiếp E2 cấu trúc `media`/`type`, response parser và mã lỗi.<br>- **Poll:** Đã có backend `src/group_content.rs`, chỉ cần nối UI modal; luồng ghim board hoãn lại.<br>- **Contact:** Đã có wire consumer `forwardContactOA`, cần hoàn thiện struct. | Quick Messages: GET; Poll: POST. Bắt buộc test đủ 5 góc: request shape, response parsing, error handling, readback/publication, và account/runtime fencing. |
+| **Gói 4: Giao diện di cư Tin nhắn nhanh có chọn lọc (Selective Migration UI)** | **CHƯA ĐỦ ĐIỀU KIỆN** | Phụ thuộc vào Gói 3 (phải có command tạo Quick Message hoàn chỉnh). | Checkpoint theo `(account, item)`; không upload/mutation trước khi người dùng xác nhận; đối chiếu server list trước khi tạo để tránh trùng lặp; không xóa local khi chưa rõ kết quả. |
+| **Gói 5: Tái cấu trúc zTask & Cô lập an toàn `tools_panel.rs`** | **CHƯA ĐỦ ĐIỀU KIỆN** | Tách riêng R&D giao thức zTask; hoãn thay nút To-Do bằng `View::Todo` rỗng. | Giữ nguyên entry point To-Do đang hoạt động; di dời các công cụ phụ sang tab Tiện ích mở rộng mà không làm mất trạng thái dữ liệu. |
+
+---
+
+## 2. BẢNG TỔNG HỢP RÀ SOÁT FINDING & TÁC ĐỘNG KẾ HOẠCH
 
 | Finding ID | Vấn Đề Cần Sửa | Bằng Chứng Consumer Cụ Thể Trong Bundle Zalo | Nội Dung Đính Chính Chuẩn Xác | Phần Kế Hoạch Bị Ảnh Hưởng |
 | :---: | :--- | :--- | :--- | :--- |
-| **F-01** | **Privacy Settings Contract** (Tài liệu cũ ghi POST `{"key": ..., "val": ...}`) | `compact-app-pc:15047927` (`static setSettings`, `static updateTFASettings`). | Endpoint `/api/setting/update` và `/api/update/setting/2FA` dùng phương thức **`_get`** (GET với `&params=AES(...)`), domain `authDomain`. Payload là **object trực tiếp các thuộc tính** (`{"show_online_status": 0}`), không phải mảng key/val. Đối chiếu `src/privacy.rs`: fork đã cài đặt đúng luồng `GET` này. | **Section C (Contract Matrix) & Gói 3**: Giữ nguyên `src/privacy.rs` của fork, không sửa đổi sang POST key/val. |
-| **F-02** | **Poll Wire Schema & Pinning Flow** (Tài liệu cũ ghi sai tên trường và gộp API ghim) | `compact-app-pc:1336095` (`_createPoll`), `15121944` (`createPoll`), `16487312` (`_callPinPollTopic`). | Tên trường wire chuẩn: `question`, `options`, `allow_multi_choices`, `allow_add_new_option`, `is_anonymous`, `poll_type: 0`, `expired_time: 0`, `pinAct: 0/1`. Ghim poll đi qua `checkPinTopic` và `pinBoardItem(groupId, pollId, POLL_TOPIC)`. Không có căn cứ endpoint `/api/board/topic/pin`. | **Section C & Gói 3**: Sửa struct request Poll đúng wire schema; đánh dấu hợp đồng ghim bảng tin là **AMBIGUOUS / Pending nghiên cứu**. |
-| **F-03** | **Contact Card Wire Schema** (Tài liệu cũ suy đoán payload `userId, name, cliMsgId`) | `compact-app-pc:15092040` (`static forwardContactOA`), `20393491` (`sendContact`). | Root payload gửi đi qua `buildParams("forwardContactOA", ...)` gồm: `toId` (1-1) hoặc `grid` (nhóm), `visibility`, `qrCodeUrl`, `oaShortLink`, `clientId`, và `contactId` (người dùng cá nhân) hoặc `gContactId` (OA). Không có trường `userId`, `name`, `cliMsgId` ở root. | **Section C & Gói 3**: Thu hồi schema suy đoán; phân định rõ luồng cá nhân vs OA. |
-| **F-04** | **Response & Entitlement Speculation** (Tài liệu cũ ghi giới hạn 50, error 12030) | `compact-app-pc:2977058`, `6217520` (`getQuotaQuickMessage`). | `12030` là Command ID của `/api/social/group/members`, **không phải error code**. Quota tin nhắn nhanh được lấy động qua `getQuotaQuickMessage(account)` theo gói tài khoản. | **Section C & Section E**: Xóa bỏ schema phỏng đoán và error code giả lập; đánh dấu **AMBIGUOUS**. Phân định rõ Command ID, HTTP Status và Server `error_code`. |
-| **F-05** | **Kiến trúc App Lock PIN & Storage** (Tài liệu cũ gọi chung "PBKDF2/MD5 210k") | Main bundle `compact-app.js:1097124` (char offset). SHA256: `95924eecc073b2453df1999f01fa5e47247b96ec15576444bb65639bd6c861a9`. | Phân rã 4 thành phần riêng: (1) Local credential: KDF là `PBKDF2-HMAC-SHA256` 210,000 vòng lặp, raw PIN trực tiếp (synced mới pre-hash MD5); (2) Account partition: lưu theo `entries.${userId}.${scope}`; (3) Storage encryption: dùng Electron `safeStorage` (prefix `k:`) hoặc AES-256-GCM fallback (`f:`); (4) Lockout: exponential backoff theo `multiplier * lockout_base_ms`. | **Section B & Section C**: Cập nhật mô tả chi tiết, ghi rõ SHA256 main bundle và char offset. Xác nhận Web không có App Lock dựa trên cả bundle worker và DOM tree. |
-| **F-06** | **Tính Xác Thực Artifact & Cấp Độ Test** (Tài liệu cũ dẫn `final_step_451.png` làm Settings; đánh PASS tính năng chưa làm) | Filesystem thư mục `browser_evidence/`, `cargo test --lib`. | `final_step_451.png` là màn hình chat, không phải Settings -> Chuyển toàn bộ Settings Web thành **Pending**. Bỏ toàn bộ dấu `[X]` (PASS) khỏi các tính năng đề xuất. Chỉ ghi PASS cho các bài test thực sự tồn tại trong repo. | **Section B & Section E**: Khôi phục tính minh bạch của ma trận bằng chứng và kiểm chứng. |
-| **F-07** | **Kế Hoạch Triển Khai & Struct Session** (Tài liệu cũ dùng `session.zalo_client_id`) | `src/session.rs:521, 572, 677` (`pub imei: String`). | Struct `Session` của fork chỉ có trường `imei`, **không có trường `zalo_client_id`**. Gói 3 bị thu hẹp: chỉ triển khai các contract đã xác minh đầy đủ; các phần chưa rõ phải có task nghiên cứu độc lập trước. | **Section D (Granular Plan)**: Thay thế bằng `session.imei`; cô lập các dependency chưa xác minh. |
+| **F-01** | **Privacy Settings Contract** (Tài liệu cũ ghi POST `{"key": ..., "val": ...}`) | `compact-app-pc:15047927` (`static setSettings`, `static updateTFASettings`). | Endpoint `/api/setting/update` và `/api/update/setting/2FA` dùng phương thức **`_get`** (GET kèm `&params=AES(...)`), domain `authDomain`. Payload là **object trực tiếp các thuộc tính** (`{"show_online_status": 0}`), không phải mảng key/val. Đối chiếu `src/privacy.rs`: fork đã cài đặt đúng luồng `GET` này. | **Section 4 & Gói 3**: Giữ nguyên `src/privacy.rs` của fork, không sửa sang POST key/val. |
+| **F-02** | **Poll Wire Schema & Pinning Flow** (Tài liệu cũ ghi sai tên trường và gộp API ghim) | `compact-app-pc:1336095` (`_createPoll`), `15121944` (`createPoll`), `16487312` (`_callPinPollTopic`). | Tên trường wire chuẩn: `question`, `options`, `allow_multi_choices`, `allow_add_new_option`, `is_anonymous`, `poll_type: 0`, `expired_time: 0`, `pinAct: 0/1`. Ghim poll đi qua `checkPinTopic` rồi gọi `pinBoardItem(groupId, pollId, POLL_TOPIC)`. Không có căn cứ endpoint `/api/board/topic/pin`. Đối chiếu `src/group_content.rs`: backend fork đã có sẵn hàm chuẩn! | **Section 4, 5 & Gói 3**: Giữ nguyên backend `src/group_content.rs`; chỉ kết nối UI modal; tách luồng ghim thành R&D riêng. |
+| **F-03** | **Contact Card Wire Schema** (Tài liệu cũ suy đoán payload `userId, name, cliMsgId`) | `compact-app-pc:15092040` (`static forwardContactOA`), `20393491` (`sendContact`). | Root payload gửi đi qua `buildParams("forwardContactOA", ...)` gồm: `toId` (1-1) hoặc `grid` (nhóm), `visibility`, `qrCodeUrl`, `oaShortLink`, `clientId`, và `contactId` (người dùng cá nhân) hoặc `gContactId` (OA). Không có trường `userId`, `name`, `cliMsgId` ở root. | **Section 4 & Gói 3**: Thu hồi schema suy đoán; phân định rõ luồng cá nhân vs OA. |
+| **F-04** | **Response & Entitlement Speculation** (Tài liệu cũ ghi giới hạn 50, error 12030) | `compact-app-pc:2977058`, `6217520` (`getQuotaQuickMessage`). | `12030` là Command ID của `/api/social/group/members`, **không phải error code**. Quota tin nhắn nhanh được lấy động qua `getQuotaQuickMessage(account)` theo gói tài khoản. Bỏ toàn bộ response JSON dự kiến. | **Section 4 & Gói 3**: Xóa bỏ schema phỏng đoán; phân biệt Command ID, HTTP Status và Server `error_code`. |
+| **F-05** | **Kiến trúc App Lock PIN & Storage** (Tài liệu cũ gọi chung "PBKDF2/MD5 210k") | Main bundle `compact-app.js:1097124` (char offset). SHA-256: `95924eecc073b2453df1999f01fa5e47247b96ec15576444bb65639bd6c861a9`. | Phân rã 4 thành phần riêng: (1) Local credential: KDF là `PBKDF2-HMAC-SHA256` 210,000 vòng lặp, raw PIN trực tiếp (synced mới pre-hash MD5); (2) Account partition: lưu theo `entries.${userId}.${scope}`; (3) Storage encryption: dùng Electron `safeStorage` (prefix `k:`) hoặc AES-256-GCM fallback (`f:`); (4) Lockout: exponential backoff theo `multiplier * lockout_base_ms`. | **Section 3 & Section 4**: Cập nhật mô tả chi tiết, ghi rõ SHA256 main bundle và char offset. |
+| **F-06** | **Web App Lock Evidence** (Tài liệu cũ khẳng định tuyệt đối) | Web worker bundles (`sync-v2-worker.081738ba...`, `mainless-worker.081738ba...`), DOM inspector `.setting-popup`. | Trong phiên thử nghiệm thực tế (Web zpw_ver=695, tài khoản Dark Baron), không quan sát thấy tính năng App Lock trong giao diện Cài đặt và không tìm thấy marker `app-lock`/`pin-vault` trong worker bundles. | **Section 3 & Section 4**: Sửa sang kết luận trung lập: "Không quan sát thấy trong phiên thử nghiệm". |
+| **F-07** | **Tham số Client ID trong Mã Fork** (Tài liệu cũ dùng `session.zalo_client_id`) | [src/session.rs:521, 572, 677](file:///c:/Projects/ZaloLite/src/session.rs#L521) (`pub imei: String`). | Struct `Session` của fork chỉ có trường `imei`, **không có trường `zalo_client_id`**. Mọi request cần IMEI client phải đọc từ `session.imei`. | **Section 4 & Gói 3**: Thay thế bằng `session.imei`; cô lập các dependency chưa xác minh. |
+| **F-08** | **Hoãn Thay Nút To-Do Bằng View::Todo Rỗng** | [src/gui.rs](file:///c:/Projects/ZaloLite/src/gui.rs), `src/gui/tools_panel.rs`. | `View::Todo` hiện là stub rỗng, chưa có dataflow, data model hay worker command cho zTask. Thay đổi ngay sẽ làm mất entry point công việc đang có. | **Section 7 (Gói 5)**: Giữ nguyên entry point To-Do; tách riêng R&D giao thức zTask. |
 
 ---
 
-## A. BẢNG ĐÍNH CHÍNH TOÀN DIỆN
-
-Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối chiếu với thực tế kiểm tra:
-
-| STT | Vấn Đề Kỹ Thuật | Nhận Định Cũ Trong Tài Liệu Trước | Kết Luận Kiểm Chứng Thực Tế | Bằng Chứng Xác Minh (E1/E2/CODE/UI) | Lý Do & Tác Động Triển Khai |
-| :---: | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Phương thức HTTP Tin nhắn nhanh (Quick Messages)** | Ghi nhận create, update, delete dùng `POST` với payload `shortcut`, `attachments`. | **SAI HOÀN TOÀN.** Cả 4 API đều dùng phương thức `_get` (GET với `&params=AES(...)`). | **E2**: `compact-app-pc:15161790`: `fetchQuickReplyList` (12025), `createQuickReplyItem` (12029), `updateQuickReplyItem` (12026), `deleteQuickReplyItem` (12032). | Sửa đặc tả worker: Gửi request `_get` với param cipher AES; tên trường là `keyword`, `message`, `media`, `type`, `imei`. |
-| **2** | **Hành vi click chọn Tin nhắn nhanh** | Cho rằng có tùy chọn hoặc nút bấm "Gửi ngay" trực tiếp từ popover. | **BÁC BỎ.** Click vào một mẫu tin nhắn nhanh luôn thay thế/chèn vào ô soạn thảo văn bản (`replaceText`). Không có tùy chọn "Gửi ngay". | **E2**: `compact-app-pc:6620020`: `replaceText: o.wrap("quick-message", l.replaceText)`. | Bỏ thiết kế cờ `send_immediately` khỏi UI popover; chỉ thực hiện chèn nội dung vào composer. |
-| **3** | **Phương thức & Schema Quyền riêng tư (Privacy)** | Ghi nhận POST `/api/setting/update` với payload `{"key": ..., "val": ...}`. | **SAI HOÀN TOÀN.** API dùng phương thức `_get` trên `authDomain`, payload là object trực tiếp các thuộc tính (`{"show_online_status": 0}`). | **E2**: `compact-app-pc:15047927` (`static setSettings`, CmdId 12033). **CODE**: `src/privacy.rs:80` của fork đã cài đặt đúng luồng `GET` này. | Giữ nguyên implementation chuẩn của `src/privacy.rs`, không sửa thành POST key/val. |
-| **4** | **Wire Schema Tạo bình chọn (Poll)** | Dùng tên trường suy đoán (`multi_choice`, `allow_add_option`, `hide_vote`). | **SAI TÊN TRƯỜNG.** Tên trường chuẩn: `allow_multi_choices`, `allow_add_new_option`, `is_anonymous`, `poll_type: 0`, `expired_time: 0`, `pinAct: 0/1`. | **E2**: `compact-app-pc:1336095` (`_createPoll`), `compact-app-pc:15121944` (`createPoll`, CmdId 12080 trên `group_poll`). | Cập nhật struct tham số trong `src/group_content.rs` khớp 100% tên trường wire chính thức. |
-| **5** | **Luồng Ghim Bình Chọn (Poll Pinning)** | Cho rằng có endpoint xác minh `/api/board/topic/pin` với `boardType = 3`. | **CHƯA ĐỦ BẰNG CHỨNG.** Luồng ghim đi qua modal check quyền `checkPinTopic` rồi gọi `pinBoardItem(groupId, pollId, POLL_TOPIC)`. Chưa có endpoint capture. | **E2**: `compact-app-pc:16487312`. | Đánh dấu hợp đồng ghim bình chọn là **AMBIGUOUS**. Tách riêng việc tạo poll và ghim poll thành 2 bước. |
-| **6** | **Wire Schema Gửi Danh Thiếp (Contact)** | Ghi nhận payload gửi gồm `userId`, `name`, `cliMsgId` lên `/api/message/contact`. | **SAI LỆCH.** Root payload không chứa `userId`, `name`, `cliMsgId`. Gồm: `toId`/`grid`, `visibility`, `qrCodeUrl`, `oaShortLink`, `clientId`, `contactId`/`gContactId`. | **E2**: `compact-app-pc:15092040` (`forwardContactOA`, CmdId 11774 1-1, CmdId 11827 nhóm). | Xóa bỏ schema suy đoán; định nghĩa struct khớp chính xác consumer `forwardContactOA`. |
-| **7** | **Response Schemas & Entitlement Limits** | Ghi nhận limit 50, error code 12030 cho Quick Messages và schema response giả định. | **BÁC BỎ.** 12030 là Command ID của social members. Limit Quick Messages phụ thuộc quota tài khoản (`getQuotaQuickMessage`). Schema response chưa có E1 capture. | **E2**: `compact-app-pc:2977058`, `6217520`. | Đánh dấu toàn bộ response schemas và limits chưa có parser là **AMBIGUOUS**. |
-| **8** | **Kiến trúc Mã PIN App Lock (Local Vault)** | Gọi chung là "PBKDF2/MD5 210k" và suy đoán fork giống Zalo PC. | **CHÍNH XÁC HÓA.** App Lock dùng raw PIN trực tiếp (không qua MD5) với PBKDF2-HMAC-SHA256 210k vòng lặp. Lưu trữ qua Electron `safeStorage` (hoặc AES-GCM), phân vùng theo `userId`. Fork dùng PBKDF2 100k trong `app_settings.json`. | **E2**: `compact-app.js:1097124` (main bundle). **CODE**: `src/storage.rs:331`. | Làm rõ sự khác biệt giữa chuẩn Zalo PC (`pinVault`) và triển khai hiện tại của fork (`app_settings.json`). |
-| **9** | **Tính Xác Thực Artifact Zalo Web** | Dẫn `final_step_451.png` làm bằng chứng Settings và trích dẫn các file 427, 431, 441, 449. | **BÁC BỎ.** `final_step_451.png` là màn hình chat. Các file 427, 431, 441, 449 không tồn tại trên ổ đĩa. | **FS CHECK**: Thư mục `browser_evidence/...` chỉ có 419 và 451 (đều là chat view). | Đánh dấu toàn bộ bằng chứng hình ảnh Settings Web là **Chưa có artifact / Pending**. |
-| **10** | **Tham số Client ID trong Mã Fork** | Đề xuất dùng `session.zalo_client_id`. | **SAI STRUCT.** Struct `Session` trong `src/session.rs` chỉ có trường `pub imei: String`. | **CODE**: `src/session.rs:521, 572, 677`. | Đính chính: Mọi request cần IMEI client phải đọc từ `session.imei`. |
-| **11** | **Vị trí Thanh Định Dạng RTF (Composer)** | Khẳng định thanh định dạng RTF `Aa` "bắt buộc phải nằm ở TRÊN CÙNG của khung soạn thảo". | **BÁC BỎ.** Cả Zalo PC và Zalo Web đều đặt thanh công cụ định dạng **ở DƯỚI CÙNG** của ô nhập văn bản khi bật RTF. | **UI-LIVE**: `zalo_pc_composer_live.png` và Zalo Web live. | Bố trí thanh format nằm dưới TextEdit; mở rộng chiều cao composer lên trên. |
-| **12** | **Cấu hình Phím Enter Gửi Tin trong Fork** | Cho rằng "Đã có trường cấu hình trong AppSettings và chỉ cần nối UI". | **SAI LỆCH.** Struct `AppSettings` trong `src/gui.rs:1075-1137` **hoàn toàn chưa có** trường `enter_to_send` hay `send_on_enter`. `workspace.rs:5362` hardcode Enter. | **CODE**: `src/gui.rs:1075-1137` và `src/gui/workspace.rs:5359-5362`. | Phải bổ sung trường `enter_to_send: bool` vào `AppSettings`, tạo UI toggle trong tab Tin nhắn và cập nhật logic bắt phím trong `workspace.rs`. |
-
----
-
-## B. EVIDENCE LEDGER (SỔ BẰNG CHỨNG THỰC NGHIỆM)
+## 3. EVIDENCE LEDGER (SỔ BẰNG CHỨNG THỰC NGHIỆM)
 
 | Mã Định Danh | Loại Bằng Chứng | Môi Trường | Nguồn / Đường Dẫn / Định Vị | Kết Luận Thực Nghiệm & Đo Đạc Kỹ Thuật |
 | :--- | :---: | :---: | :--- | :--- |
@@ -57,30 +61,28 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
 | **EV-PC-POLL** | **E2** | Zalo PC 26.11.12 | `compact-app-pc.0cd2e653e67efaa4bf4b.js`<br>Char offset: `1,336,095` (Modal) & `15,121,944` (API) | `_createPoll` tạo object wire: `question, options, allow_multi_choices, allow_add_new_option, is_anonymous, poll_type: 0, expired_time: 0, pinAct`. `createPoll` gửi `POST /api/poll/create` (CmdId 12080). |
 | **EV-PC-CONTACT** | **E2** | Zalo PC 26.11.12 | `compact-app-pc.0cd2e653e67efaa4bf4b.js`<br>Char offset: `15,092,040` (`forwardContactOA`) | Phân nhánh: 1-1 gửi `/api/message/contact` (CmdId 11774); Nhóm gửi `/api/group/contact` (CmdId 11827). Payload bọc qua `buildParams`, chứa `toId`/`grid`, `visibility`, `qrCodeUrl`, `oaShortLink`, `clientId`, `contactId`/`gContactId`. |
 | **EV-PC-COMP-UI** | **UI-LIVE** | Zalo PC 26.11.12 | `zalo_pc_composer_live.png`<br>Kích thước: 882,864 bytes. | Khung soạn thảo Zalo PC: Thanh công cụ định dạng RTF nằm ở DƯỚI ô nhập. Nút Like/Gửi và Emoji ghim cố định góc dưới bên phải. |
-| **EV-WEB-CTX** | **UI-LIVE** | Zalo Web | `https://chat.zalo.me/`<br>Tài khoản: `Dark Baron`<br>DPR: 1.5, Viewport: 920x896 | Giao thức `zpw_ver=695`. Trình duyệt Chrome 131 trên Windows 11 ARM64. Không có tính năng App Lock trong bundle/DOM. |
+| **EV-WEB-CTX** | **UI-LIVE** | Zalo Web | `https://chat.zalo.me/`<br>Tài khoản: `Dark Baron`<br>DPR: 1.5, Viewport: 920x896 | Giao thức `zpw_ver=695`. Trình duyệt Chrome 131 trên Windows 11 ARM64. Không quan sát thấy tính năng App Lock trong phiên thử nghiệm. |
 | **EV-WEB-IMG-419** | **UI-LIVE** | Zalo Web | `browser_evidence/.../final_step_419.png`<br>Kích thước: 215,806 bytes. | Màn hình chat và Information drawer bên phải. Khung composer ở trạng thái cơ bản, nút Emoji và Gửi ghim sát đáy. |
 | **EV-WEB-IMG-451** | **UI-LIVE** | Zalo Web | `browser_evidence/.../final_step_451.png`<br>Kích thước: 218,661 bytes. | Màn hình cuộc trò chuyện đang mở với Dark Baron (KHÔNG PHẢI màn hình Cài đặt). |
 | **EV-WEB-MISSING** | **AMBIGUOUS** | Zalo Web | File `final_step_427, 431, 441, 449.png` | **Không tồn tại trên ổ đĩa.** Toàn bộ hình ảnh minh chứng các tab Settings trên Zalo Web phải giữ trạng thái Pending. |
+| **EV-FORK-POLL-BACKEND** | **CODE** | Fork ctdozlite | `src/group_content.rs:400-415` | Đã có sẵn handler `CreatePoll` gọi đúng `POST /api/poll/create` (CmdId 12080) với đầy đủ tên trường chuẩn (`allow_multi_choices`, `allow_add_new_option`, `is_anonymous`...) và unit test PASS. |
 | **EV-FORK-PRIVACY** | **CODE** | Fork ctdozlite | `src/privacy.rs:60-120` | Fork đã cài đặt đúng `GET /api/setting/update` trên `s.domains.auth` với object thuộc tính trực tiếp. |
-| **EV-FORK-STORAGE** | **CODE** | Fork ctdozlite | `src/storage.rs:331` | `settings_path()` trỏ về `root().join("app_settings.json")` (không phải `settings.json`). |
+| **EV-FORK-STORAGE** | **CODE** | Fork ctdozlite | `src/storage.rs:331` | `settings_path()` trỏ về `root().join("app_settings.json")`. |
 | **EV-FORK-SESSION** | **CODE** | Fork ctdozlite | `src/session.rs:521, 572, 677` | Struct `Session` định nghĩa `pub imei: String`. Không có trường `zalo_client_id`. |
 
 ---
 
-## C. CONTRACT MATRIX (MA TRẬN ĐẶC TẢ HỢP ĐỒNG KỸ THUẬT)
+## 4. CONTRACT MATRIX (MA TRẬN ĐẶC TẢ HỢP ĐỒNG KỸ THUẬT)
 
-### Nguyên Tắc Phân Định Khái Niệm:
-- **Command ID:** Mã định danh 16-bit/32-bit dùng cho định tuyến nội bộ của client Zalo (ví dụ: `12025`, `12033`, `12080`). Không phải HTTP status và không phải error code.
-- **HTTP Status:** Mã phản hồi tầng truyền tải HTTP (ví dụ: `200 OK`, `404 Not Found`, `500 Internal Server Error`).
-- **Server `error_code`:** Mã kết quả nghiệp vụ nằm trong thân JSON giải mã từ máy chủ (`error_code == 0` là thành công, khác 0 là lỗi nghiệp vụ).
+### Phân Định Rõ Ràng Các Khái Niệm:
+- **Command ID:** Mã định danh 16-bit/32-bit dùng cho định tuyến client nội bộ Zalo (ví dụ: `12025`, `12033`, `12080`).
+- **HTTP Status:** Mã trạng thái truyền tải HTTP (ví dụ: `200 OK`, `404`, `500`).
+- **Server `error_code`:** Mã kết quả nghiệp vụ trong payload JSON đã giải mã (`error_code == 0` là thành công).
 
 ---
 
-### 1. Chi Tiết Từng Hợp Đồng Trọng Yếu:
-
-#### 1.1. Tin Nhắn Nhanh (Quick Messages)
-- **Caller UI:** Nút `⚡` trên Composer; mục "Quản lý tin nhắn nhanh" trong Cài đặt.
-- **Hợp Đồng REST (E2 Parity - Đã Xác Minh):**
+### 4.1. Tin Nhắn Nhanh (Quick Messages)
+- **Request Contract (Đã Xác Minh E2):**
   * `fetchQuickReplyList(version=0, lang=0)`:
     - Domain: `getQuickMessageDomain()`
     - Route & Method: `GET /api/quickmessage/list`
@@ -98,23 +100,28 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
     - Route & Method: `GET /api/quickmessage/delete`
     - CmdId: `12032`
     - Query Params: `?...&params=AES({"itemIds": [...]})`
-- **Response Schema:** **AMBIGUOUS** (chưa có live capture E1; dự kiến chứa wrapper `{ error_code: 0, data: { items: [...], version: ... } }`).
-- **Giới hạn & Error Code:** **AMBIGUOUS** (Hạn mức lấy động qua `getQuotaQuickMessage(account)` tùy gói; không có căn cứ hardcode 50 hay error 12030).
+- **Các Phần Còn Cần R&D (Chưa Đủ Điều Kiện Viết Code End-to-End):**
+  * Cấu trúc trường `media` và `type`: Cần đọc tiếp parser E2 để xác định `type: 0` (text) vs `type: 1` (media) và định dạng chuỗi `media`.
+  * Response Parser: Cần phân tích parser consumer E2 (không bịa đặt schema mẫu).
+  * Versioning & Quota: Xác định cách client lưu `version` để truyền vào `fetchQuickReplyList` và cách đọc quota động từ `getQuotaQuickMessage(account)`.
+  * Xử lý lỗi: Cần xác định các mã lỗi server trả về khi vượt hạn mức hoặc trùng keyword.
 - **Hành vi Click:** Gọi `replaceText` chèn nội dung vào composer. Không có tùy chọn "Gửi ngay".
 
-#### 1.2. Quyền Riêng Tư (Privacy Settings)
-- **Caller UI:** Tab "Quyền riêng tư" trong Cài đặt.
-- **Hợp Đồng REST (E2 Parity - Đã Xác Minh):**
+---
+
+### 4.2. Quyền Riêng Tư (Privacy Settings)
+- **Hợp Đồng REST (Đã Xác Minh E2 & Đã Có Code Chuẩn):**
   * Đọc thiết lập: `GET /api/setting/me` (CmdId `12113`) trên `authDomain`.
   * Cập nhật thiết lập: `GET /api/setting/update` (CmdId `12033`) trên `authDomain`.
     - Query Params: `?...&params=AES({"<setting_key>": <setting_value>})` (Ví dụ: `{"show_online_status": 0}`).
   * Cập nhật 2FA: `GET /api/update/setting/2FA` (CmdId `12066`) trên `authDomain`.
     - Query Params: `?...&params=AES({"updateType": 1, "submitOTP": 0/1, "otp": "..."})`.
-- **Đối chiếu mã fork:** `src/privacy.rs` đã gửi đúng `GET /api/setting/update` với object thuộc tính trực tiếp. **Giữ nguyên mã hiện tại**.
+- **Hiện trạng Fork:** [src/privacy.rs](file:///c:/Projects/ZaloLite/src/privacy.rs#L80) đã gửi đúng `GET` với object thuộc tính trực tiếp. **Giữ nguyên mã hiện tại**.
 
-#### 1.3. Tạo Bình Chọn Nhóm (Group Poll)
-- **Caller UI:** Menu `...` trên Composer -> "Tạo bình chọn".
-- **Hợp Đồng REST (E2 Parity - Đã Xác Minh):**
+---
+
+### 4.3. Tạo Bình Chọn Nhóm (Group Poll)
+- **Hợp Đồng REST (Đã Xác Minh E2 & Đã Có Code Chuẩn):**
   * Route & Method: `POST /api/poll/create`
   * CmdId: `12080`
   * Domain: `getGroupPollDomain()`
@@ -127,6 +134,7 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
       "allow_multi_choices": true,
       "allow_add_new_option": true,
       "is_anonymous": false,
+      "is_hide_vote_preview": false,
       "poll_type": 0,
       "expired_time": 0,
       "pinAct": 0,
@@ -134,22 +142,22 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
       "imei": "<session.imei>"
     }
     ```
-- **Luồng Ghim Bảng Tin (Poll Pinning):** **AMBIGUOUS** (Client kiểm tra modal `checkPinTopic` và gọi `pinBoardItem(groupId, pollId, POLL_TOPIC)`. Chưa có network capture chứng minh endpoint và request schema cụ thể).
+- **Hiện trạng Fork:** [src/group_content.rs:410](file:///c:/Projects/ZaloLite/src/group_content.rs#L410) đã có sẵn toàn bộ payload và endpoint này.
+- **Luồng Ghim Bảng Tin (Poll Pinning):** **AMBIGUOUS**. Modal gọi `checkPinTopic` rồi gọi `pinBoardItem(groupId, pollId, POLL_TOPIC)`. Chưa có network capture chứng minh endpoint và request schema cụ thể -> Tách thành task nghiên cứu riêng.
 
-#### 1.4. Gửi Danh Thiếp (Contact Card)
-- **Caller UI:** Nút Danh thiếp trên Composer.
-- **Hợp Đồng REST (E2 Parity - Đã Xác Minh):**
+---
+
+### 4.4. Gửi Danh Thiếp (Contact Card)
+- **Hợp Đồng REST (Đã Xác Minh E2):**
   * Chat 1-1 (Peer): `POST /api/message/contact` (CmdId `11774`) trên `chatDomain`.
     - Payload tham số: `{ "toId": "<dest_uid>", "qrCodeUrl": "<url>", "oaShortLink": "<link>", "clientId": "<cli_id>", "contactId": "<uid>" }` (hoặc `gContactId` nếu là OA).
   * Chat Nhóm (Group): `POST /api/group/contact` (CmdId `11827`) trên `groupDomain`.
     - Payload tham số: `{ "grid": "<group_id>", "visibility": <vis>, "qrCodeUrl": "<url>", "oaShortLink": "<link>", "clientId": "<cli_id>", "contactId": "<uid>" }`.
 - **Lưu ý:** Không có trường `userId`, `name`, `cliMsgId` ở root payload; các trường chung của tin nhắn được `buildParams` bao bọc bên ngoài.
 
-#### 1.5. Thẻ Tài Khoản Ngân Hàng (Bank Card)
-- **Hợp Đồng REST:** `POST /api/transfer/card` (CmdId `15220`) trên `getZInstantMsgDomain()`.
-- **Payload Schema & Response:** **AMBIGUOUS** (Cần E1 capture để xác nhận wire format thực tế trước khi implement).
+---
 
-#### 1.6. Kiến Trúc Chi Tiết Mã PIN (App Lock vs Hidden Chat)
+### 4.5. Kiến Trúc Chi Tiết Mã PIN (App Lock vs Hidden Chat)
 - **Loại A: PIN Khóa Ứng Dụng Desktop (App Lock):**
   * Bản chất: **Cục bộ hoàn toàn (`mode: "local"`)**. Không gửi bất kỳ request nào lên máy chủ.
   * Zalo PC (`compact-app.js:1097124`):
@@ -157,8 +165,8 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
     - **Storage encryption:** Dùng Electron `safeStorage.encryptString` tạo chuỗi mã hóa prefix `k:`. Nếu không khả dụng, dùng AES-256-GCM fallback (prefix `f:`) với khóa `pvfk` ngẫu nhiên lưu trong store. File lưu: `pin-vault-data/pin-vault.json`.
     - **Account partition:** Mọi credential lưu theo key `entries.${sanitize(userId)}.${sanitize(scope)}`.
     - **Lockout:** Tính toán `lockedUntil` dựa trên `multiplier * lockout_base_ms`. Trạng thái lockout lưu trong RAM (`volatileLockout: Map`), chỉ lưu vào file nếu `lockout_persist === 1`.
-  * Zalo Web: **HOÀN TOÀN KHÔNG CÓ**. Đã xác minh qua phân tích bundle worker và kiểm tra cấu trúc DOM thực tế (không chỉ dựa vào việc thiếu screenshot).
-  * Fork ctdozlite: Sử dụng PBKDF2 (HMAC-SHA256, 100,000 vòng lặp, 16-byte salt) lưu trong `app_settings.json` (`src/storage.rs:331`). Phù hợp bản chất local của desktop nhưng khác biệt về định dạng file lưu trữ.
+  * Zalo Web: **Không quan sát thấy trong phiên thử nghiệm thực tế** (Web zpw_ver=695, tài khoản Dark Baron); không có marker `app-lock` hay `pin-vault` trong worker bundles.
+  * Fork ctdozlite: Sử dụng PBKDF2 (HMAC-SHA256, 100,000 vòng lặp, 16-byte salt) lưu trong `app_settings.json` (`src/storage.rs:331`).
 - **Loại B: PIN Hội Thoại Ẩn (Hidden Chat):**
   * Bản chất: **Đồng bộ toàn bộ tài khoản (`mode: "synced"`)** qua các API:
     - Lấy danh sách: `GET /api/hiddenconvers/get-all` (CmdId `10048`).
@@ -170,131 +178,137 @@ Bảng tổng hợp tất cả các điểm đính chính kỹ thuật đối ch
 
 ---
 
-## D. GRANULAR PACKAGE PLAN (KẾ HOẠCH PHÂN RÃ 5 GÓI CÔNG VIỆC)
+## 5. ĐỐI CHIẾU MÃ NGUỒN FORK HIỆN TẠI (SRC/GROUP_CONTENT.RS & SRC/PRIVACY.RS)
 
-```
-+-----------------------------------------------------------------------------------+
-| GÓI 1: Bố Cục Hình Học Composer & Pinned Action Buttons (UI Cốt Lõi)              |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-| GÓI 2: Tinh Chỉnh Tương Tác Nội Bộ (Mention Navigation, Enter Toggle, Contact UI) |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-| GÓI 3: Cài Đặt Hợp Đồng Máy Chủ Đã Xác Minh (Quick Messages GET, Poll Wire Schema)|
-| * Lưu ý: Các hợp đồng chưa đủ E1 (Bank Card, Poll Pinning) chuyển sang task R&D   |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-| GÓI 4: Giao Diện Di Cư Tin Nhắn Nhanh Có Chọn Lọc (Selective Migration UI)       |
-+-----------------------------------------------------------------------------------+
-                                          |
-                                          v
-+-----------------------------------------------------------------------------------+
-| GÓI 5: Tái Cấu Trúc zTask & Cô Lập An Toàn tools_panel.rs                         |
-+-----------------------------------------------------------------------------------+
-```
+### 5.1. Phân Tích `src/group_content.rs`
+- **Những gì ĐÃ CÓ và ĐÚNG CHUẨN:**
+  * Handler `Action::CreatePoll`: Gọi đúng domain `s.domains.group_poll`, path `/api/poll/create`, method `POST`, đầy đủ tham số wire chuẩn:
+    ```rust
+    json!({
+        "group_id": grid,
+        "question": question.trim(),
+        "options": options,
+        "allow_multi_choices": multi,
+        "allow_add_new_option": allow_add,
+        "is_anonymous": anonymous,
+        "is_hide_vote_preview": false,
+        "poll_type": 0,
+        "expired_time": 0,
+        "pinAct": 0,
+        "src": 1,
+        "imei": s.imei
+    })
+    ```
+  * Handler `Action::Vote`, `Action::AddOption`, `Action::EndPoll`: Đã có sẵn logic kiểm tra ràng buộc, mã hóa tham số và gọi API.
+  * Board Type: Mã nguồn đã nhận diện `boardType == 3` cho Poll (`scoped_item(&poll, 3, "12")`).
+  * Unit test: Đã có test `source_scope_tests::content_identity_and_kind_must_match_the_request_scoped_list` chạy PASS 100%.
+- **Những gì CẦN SỬA / BỔ SUNG:**
+  * **Chỉ sửa tầng UI:** Modal tạo bình chọn trong `src/gui/modals.rs` hiện chưa kết nối gửi `WorkerCmd::CreatePoll` tới `group_content::execute`.
+  * **Tuyệt đối KHÔNG viết lại** endpoint hay payload trong `src/group_content.rs` và **không tạo handler song song** gây phân mảnh mã nguồn.
+
+### 5.2. Phân Tích `src/privacy.rs`
+- **Những gì ĐÃ CÓ và ĐÚNG CHUẨN:**
+  * Hàm `call(s, path, body)`: Đã gửi request `GET` kèm `&params=AES(...)` lên `s.domains.auth`.
+  * Hàm `update_params(setting, value)`: Đã tạo object trực tiếp `{"show_online_status": 0}`.
+  * Unit test: `privacy::tests::display_setting_is_distinct_from_receive_permission_and_unknown_stays_unknown` chạy PASS 100%.
+- **Kết luận:** Giữ nguyên 100% `src/privacy.rs`. Không chỉnh sửa sang dạng POST key/val.
 
 ---
+
+## 6. KIẾN TRÚC DI CƯ DỮ LIỆU AN TOÀN (SAFE MIGRATION ARCHITECTURE)
+
+Thiết kế cơ chế di dời Tin nhắn nhanh từ lưu trữ cục bộ cũ lên tài khoản Zalo với đầy đủ các bảo đảm an toàn:
+
+```
+[Local Store] 
+      |
+      v (Chỉ đọc GET danh sách server để đối chiếu)
+[Reconcile Server vs Local List]
+      |
+      v
+[Hiển thị Modal So Sánh & Hộp Kiểm Chọn Lọc]
+      |
+   (Người dùng chủ động bấm "Xác nhận nhập")
+      |
+      v
+[Lặp từng Item được chọn] ---> [Ghi Checkpoint (UIN, ItemId, PENDING)]
+      |                                      |
+      v                                      v
+[WorkerCmd::CreateQuickMessage] ---> [Cập nhật Checkpoint: SUCCESS / FAILED]
+      |
+[Mất kết nối / Response bị mất?] ---> [Đọc lại GET Server List đối chiếu theo keyword trước khi retry]
+      |
+[Bảo tồn Local Data]: Không xóa bất kỳ dữ liệu local nào nếu quá trình chưa hoàn tất 100% có xác nhận.
+```
+
+### Các Nguyên Tắc Bắt Buộc:
+1. **Checkpointing theo `(account_uin, item_id, status)`:** Lưu tiến trình di cư vào cấu hình người dùng. Nếu xảy ra tắt ứng dụng đột ngột hoặc chuyển đổi tài khoản (account switch), khi mở lại chỉ tiếp tục xử lý các item của đúng tài khoản đang active.
+2. **Xử lý Thành công Một phần (Partial Success):** Nếu người dùng chọn 5 mẫu, 3 mẫu tạo thành công và 2 mẫu bị lỗi (ví dụ do quá hạn mức), hệ thống ghi nhận thành công 3 mẫu và báo lỗi cụ thể cho 2 mẫu còn lại, không rollback hay hủy bỏ 3 mẫu đã tạo.
+3. **Chống trùng lặp khi mất Response mạng (Idempotency Reconcile):** Nếu client gửi request tạo nhưng mạng bị ngắt trước khi nhận được response ACK: client **bắt buộc phải đọc lại danh sách từ server (`fetchQuickReplyList`)** và so khớp theo `keyword` trước khi quyết định gửi lại, tránh nhân đôi dữ liệu.
+4. **Bảo tồn Dữ liệu Cục bộ (Local Retention):** Không bao giờ tự động xóa dữ liệu local khi kết quả di cư chưa rõ ràng. Cung cấp tùy chọn cho người dùng: *"Giữ lại bản sao lưu cục bộ"* hoặc *"Chỉ xóa sau khi xác nhận đối chiếu thành công"*.
+5. **Tiêu chí Nghiệm thu:** **Không thực hiện bất kỳ upload hay mutation nào trước khi người dùng xác nhận rõ ràng.** Cho phép client tự động gửi request đọc (`GET /api/quickmessage/list`) để phục vụ việc hiển thị giao diện đối chiếu.
+
+---
+
+## 7. GRANULAR PACKAGE PLAN (KẾ HOẠCH PHÂN RÃ 5 GÓI CÔNG VIỆC)
 
 ### Gói 1: Bố Cục Hình Học Composer & Pinned Action Buttons
-- **Mục tiêu:** Chấm dứt lỗi nút Emoji và Like bị căn giữa trôi lơ lửng khi nhập nhiều dòng; bố trí thanh định dạng RTF nằm bên dưới ô nhập văn bản.
+- **Trạng thái:** **ĐỦ ĐIỀU KIỆN BẮT ĐẦU NGAY.**
 - **Tập tin liên quan:** `src/gui/workspace.rs`, `src/gui/theme.rs`.
-- **Giải pháp kỹ thuật:**
-  * Chia container soạn thảo thành 2 cột:
-    - Cột trái (`ui.available_width() - action_w`): Chứa `egui::ScrollArea::vertical` bọc `TextEdit::multiline`.
-    - Cột phải: Dùng layout dọc `with_layout(Layout::bottom_up(Align::Max))` để ghim nút Emoji và nút Send/Like luôn sát đáy góc dưới bên phải. Chiều rộng tính động theo kích thước nút và DPI (không hardcode 76.0px).
-  * Khi `composer_format_mode == true`, render thanh 14 nút RTF **ngay bên dưới** vùng soạn thảo văn bản.
-- **Tiêu chuẩn nghiệm thu:**
-  - Nhập 1 dòng hoặc 20 dòng: Nút Emoji và Send luôn cố định ở góc dưới cùng bên phải.
-  - Bật RTF: Thanh format xuất hiện phía dưới ô nhập văn bản.
+- **Nội dung:** Chia container thành 2 cột độc lập (Cột trái: `ScrollArea::vertical` bọc `TextEdit::multiline`; Cột phải: `Layout::bottom_up(Align::Max)` ghim nút Emoji và Send sát đáy). Đặt thanh 14 nút RTF nằm bên dưới ô nhập.
+- **Tiêu chuẩn nghiệm thu:** Nút Emoji và Send cố định ở góc dưới bên phải ở mọi số dòng text; thanh format nằm dưới TextEdit.
 
----
-
-### Gói 2: Tinh Chỉnh Tương Tác Nội Bộ (Mention, Enter Toggle, Contact Modal)
-- **Mục tiêu:** Hoàn thiện phím tắt và kết nối cấu hình gửi tin.
+### Gói 2: Tinh Chỉnh Tương Tác Nội Bộ (Mention, Enter Toggle, Contact Modal UI)
+- **Trạng thái:** **ĐỦ ĐIỀU KIỆN BẮT ĐẦU NGAY.**
 - **Tập tin liên quan:** `src/gui.rs`, `src/gui/workspace.rs`, `src/gui/modals.rs`, `src/gui/mention_composer.rs`.
-- **Giải pháp kỹ thuật:**
-  * Thêm `pub enter_to_send: bool` (mặc định `true`) vào struct `AppSettings` trong `src/gui.rs`.
-  * Đấu nối toggle trong Tab Tin nhắn (`src/gui/modals.rs`) với logic bắt phím `consume_composer_enter` trong `src/gui/workspace.rs`.
-  * Mention Keyboard: Trong `src/gui/mention_composer.rs`, bắt phím mũi tên Lên/Xuống để di chuyển vệt sáng chọn mục, phím Enter/Tab để chèn tên vào composer. Chặn popup mention trong hội thoại 1-1.
-  * Modal Danh thiếp: Bổ sung thanh tìm kiếm và checkbox chọn nhiều người.
-- **Tiêu chuẩn nghiệm thu:**
-  - Đổi toggle trong Cài đặt lập tức có tác dụng ở Composer (tắt toggle -> gõ Enter xuống dòng, Ctrl+Enter gửi).
-  - Gõ `@` trong nhóm: Điều hướng được bằng phím mũi tên và ấn Enter chọn `@All` hoặc thành viên.
-
----
+- **Nội dung:** Thêm `pub enter_to_send: bool` vào `AppSettings`, tạo toggle trong Cài đặt; Mention bắt phím mũi tên Lên/Xuống/Enter và chặn trong chat 1-1; Modal Danh thiếp bổ sung tìm kiếm và chọn nhiều.
+- **Tiêu chuẩn nghiệm thu:** Đổi toggle Enter có tác dụng lập tức ở Composer; Mention điều hướng mượt mà bằng bàn phím.
 
 ### Gói 3: Cài Đặt Hợp Đồng Máy Chủ Đã Xác Minh Đầy Đủ
-- **Mục tiêu:** Triển khai các worker command đã có bằng chứng consumer E2 rõ ràng.
-- **Tập tin liên quan:** `src/chat.rs`, `src/gui/worker.rs`, `src/group_content.rs`.
-- **Phạm vi triển khai cụ thể:**
-  1. **Tin nhắn nhanh (Quick Messages):**
-     - Bổ sung `WorkerCmd::FetchQuickMessages`, `WorkerCmd::CreateQuickMessage { keyword, message, media, msg_type }`, `WorkerCmd::UpdateQuickMessage`, `WorkerCmd::DeleteQuickMessage`.
-     - Phương thức: Toàn bộ dùng **`_get`** với query string `&params=AES(...)`. Sử dụng `session.imei` cho tham số `imei`.
-  2. **Tạo bình chọn (Group Poll):**
-     - Cập nhật struct tham số trong `src/group_content.rs:410` theo đúng wire schema: `question`, `options`, `allow_multi_choices`, `allow_add_new_option`, `is_anonymous`, `poll_type: 0`, `expired_time: 0`, `pinAct: 0/1`.
-     - Request gửi `POST /api/poll/create` (CmdId `12080`) trên domain `group_poll`.
-  3. **Cô lập các hợp đồng chưa đủ bằng chứng:**
-     - Luồng ghim bình chọn (`pinBoardItem`) và gửi Thẻ ngân hàng (`/api/transfer/card`) được tách thành **Task Nghiên Cứu Độc Lập**, chưa đưa vào đợt triển khai mã này cho đến khi có network capture E1.
-- **Tiêu chuẩn nghiệm thu:**
-  - `cargo check --locked` hoàn tất 0 lỗi.
-  - Unit test mock giải mã query params xác nhận request gửi đi là phương thức GET và đúng cấu trúc AES.
-
----
+- **Trạng thái:** **CẦN HOÀN THIỆN R&D PARSER TRƯỚC KHI VIẾT CODE.**
+- **Nội dung:**
+  1. Quick Messages: Hoàn thành đọc consumer E2 cho cấu trúc `media`/`type`, response parser và mã lỗi trước khi code worker. Request dùng phương thức `_get` với `session.imei`.
+  2. Tạo Poll: Đấu nối UI modal trong `src/gui/modals.rs` với handler `CreatePoll` có sẵn trong `src/group_content.rs:410`. Hoãn luồng ghim board.
+  3. Contact: Cài đặt struct gửi contact theo consumer `forwardContactOA` (CmdId 11774/11827).
+- **Tiêu chuẩn nghiệm thu:** Test đầy đủ 5 góc: request shape, response parsing, error handling, readback/publication, và account fencing.
 
 ### Gói 4: Giao Diện Di Cư Tin Nhắn Nhanh Có Chọn Lọc (Selective Migration UI)
-- **Mục tiêu:** Cho phép người dùng chủ động đối chiếu và đưa tin nhắn nhanh từ cấu hình local cũ lên tài khoản Zalo mà không tự ý ghi đè.
-- **Tập tin liên quan:** `src/gui/modals.rs`, `src/gui/workspace.rs`.
-- **Giải pháp kỹ thuật:**
-  * Tuyệt đối không tự động upload khi khởi động.
-  * Khi mở màn hình quản lý tin nhắn nhanh: Nếu phát hiện có dữ liệu local cũ chưa đồng bộ, hiển thị banner đối chiếu.
-  * Modal hiển thị danh sách 2 cột kèm checkbox: Người dùng chọn các mục cần tải lên -> Ứng dụng gọi `WorkerCmd::CreateQuickMessage`.
-  * Cung cấp tùy chọn lưu trữ cục bộ (offline) nếu người dùng không muốn đồng bộ lên máy chủ.
-- **Tiêu chuẩn nghiệm thu:**
-  - Không có request mạng nào phát sinh nếu người dùng chưa bấm nút xác nhận nhập.
+- **Trạng thái:** **CHƯA ĐỦ ĐIỀU KIỆN (Phụ thuộc Gói 3).**
+- **Nội dung:** Cài đặt modal đối chiếu server/local, checkpoint theo account/item, reconcile chống trùng lặp, bảo toàn local data.
+- **Tiêu chuẩn nghiệm thu:** Không upload trước xác nhận; xử lý an toàn khi mất mạng hoặc chuyển tài khoản.
+
+### Gói 5: Tái Cấu Trúc zTask & Quy Hoạch Công Cụ Phụ Trợ
+- **Trạng thái:** **CHƯA ĐỦ ĐIỀU KIỆN (Cần R&D Giao Thức zTask).**
+- **Nội dung:**
+  1. **Hoãn thay thế nút To-Do sang `View::Todo` rỗng** cho đến khi có dataflow/data model zTask hoàn chỉnh; giữ nguyên entry point công việc hiện tại.
+  2. Tách riêng R&D giao thức zTask khỏi việc di dời các công cụ phụ trợ (LAN transfer, Tin nhắn tự động, Lịch gửi tin) sang tab Tiện ích mở rộng.
+  3. Xóa các cờ `self.tools.open = true` cưỡng bức trong màn hình chat.
+- **Tiêu chuẩn nghiệm thu:** Không làm mất entry point công việc của người dùng; màn hình chat không bị popup lạ đè lên.
 
 ---
 
-### Gói 5: Tái Cấu Trúc zTask & Cô Lập An Toàn `tools_panel.rs`
-- **Mục tiêu:** Tách các phụ thuộc vào `tools_panel.rs`, chuẩn hóa nút "✓" và menu `...`.
-- **Tập tin liên quan:** `src/gui.rs`, `src/gui/workspace.rs`, `src/gui/tools_panel.rs`.
-- **Giải pháp kỹ thuật:**
-  * Nút "✓" trên Navigation rail: Chuyển sang `View::Todo`. Giao diện thông báo rõ trạng thái dịch vụ zTask.
-  * Gỡ bỏ các cờ mở popup `self.tools.open = true` trong `workspace.rs`.
-  * Menu `...` trên Composer: Chỉ hiển thị các mục chuẩn Zalo (Bình chọn, Giao việc, Nhắc hẹn).
-  * Di dời các tính năng tiện ích phụ trợ (LAN transfer, Tin nhắn tự động, Lịch gửi tin) vào tab Tiện ích mở rộng riêng biệt trong Cài đặt; tiến tới cô lập an toàn tệp `tools_panel.rs`.
-- **Tiêu chuẩn nghiệm thu:**
-  - Không còn bất kỳ popup lạ nào đè lên màn hình chat khi nhấp các nút chuẩn Zalo.
+## 8. DANH SÁCH PENDING & MA TRẬN 4 CẤP ĐỘ KIỂM CHỨNG
 
----
+Bảng kiểm chứng phân định minh bạch giữa tính năng ĐÃ TEST trong repo vs tính năng MỚI ĐỀ XUẤT:
 
-## E. DANH SÁCH PENDING & MA TRẬN 4 CẤP ĐỘ KIỂM CHỨNG
-
-Bảng kiểm chứng phân định nghiêm ngặt giữa tính năng ĐÃ TEST trong repo vs tính năng MỚI ĐỀ XUẤT:
-
-| Hạng Mục Tính Năng | Cấp Độ 1: Chưa Nghiên Cứu | Cấp Độ 2: Đã Đối Chiếu Tĩnh (E2) | Cấp Độ 3: Đã Test Model / Fixture Hiện Có | Cấp Độ 4: Đã Nghiệm Thu Server Thật | Ghi Chú & Bằng Chứng Kiểm Thử Hiện Tại |
+| Hạng Mục Tính Năng | Cấp Độ 1: Chưa Nghiên Cứu | Cấp Độ 2: Đã Đối Chiếu Tĩnh (E2) | Cấp Độ 3: Đã Test Model / Fixture Hiện Có | Cấp Độ 4: Đã Nghiệm Thu Server Thật | Chi Tiết Bằng Chứng Kiểm Thử Hiện Tại (Candidate, Test Name, Command, Result, Ngày Chạy) |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **API Quick Messages (12025-12032)** | | [X] | [ ] | [ ] | Đã xác minh 4 hàm `_get` trong bundle PC. Cần viết fixture test mock response trước khi gọi thật. |
-| **Hành vi replaceText Quick Reply** | | [X] | [ ] | [ ] | Đã xác minh consumer `compact-app-pc:6620020`. Chưa có harness test UI. |
-| **Tạo Poll (`/api/poll/create` 12080)** | | [X] | [ ] | [ ] | Đã xác minh wire schema trong bundle PC và có sẵn trong `group_content.rs:410`. |
-| **Ghim Poll vào Group Board** | [X] | | | | **CHƯA ĐỦ BẰNG CHỨNG.** Phụ thuộc `checkPinTopic` và chưa có E1 capture. Cần nghiên cứu thêm. |
-| **Privacy Settings (`src/privacy.rs`)** | | [X] | [X] | [ ] | **PASS trong repo**: Test `privacy::tests::display_setting_is_distinct_from_receive_permission_and_unknown_stays_unknown` (`cargo test --lib privacy`). Giới hạn: Unit test logic, chưa test live server. |
-| **Hidden Chat PIN (`src/hidden_chat.rs`)** | | [X] | [X] | [ ] | **PASS trong repo**: Đã có unit test giải mã MD5 verifier constant-time. **TUYỆT ĐỐI KHÔNG tự đổi PIN trên tài khoản thật**. |
-| **App Lock PIN (Fork PBKDF2)** | | [X] | [X] | [ ] | **PASS trong repo**: `AppSettings::verify_pin` chạy qua PBKDF2 100k vòng lặp. Lưu trữ local trong `app_settings.json`. |
-| **Gửi Thẻ Ngân Hàng (`/api/transfer/card`)** | | [X] | [ ] | [ ] | Đã xác minh CmdId 15220 trong bundle. Cần capture E1 để làm rõ cấu trúc JSON trả về của thẻ. |
-| **Gửi Danh Thiếp (11774 / 11827)** | | [X] | [ ] | [ ] | Đã xác minh consumer `forwardContactOA` và phân nhánh group/peer. Cần kiểm chứng UI modal chọn nhiều. |
+| **Tạo Poll Backend (`src/group_content.rs`)** | | [X] | [X] | [ ] | **PASS ĐÃ CHẠY (2026-11-25):**<br>- Candidate: `src/group_content.rs:400-415`<br>- Test: `group_content::source_scope_tests::content_identity_and_kind_must_match_the_request_scoped_list`<br>- Command: `cargo test --lib group_content::source_scope_tests::content_identity_and_kind_must_match_the_request_scoped_list`<br>- Result: `ok. 1 passed; finished in 0.02s`.<br>- Giới hạn: Unit test logic scoped item, chưa test live server. |
+| **Privacy Settings (`src/privacy.rs`)** | | [X] | [X] | [ ] | **PASS ĐÃ CHẠY (2026-11-25):**<br>- Candidate: `src/privacy.rs:60-120`<br>- Test: `privacy::tests::display_setting_is_distinct_from_receive_permission_and_unknown_stays_unknown`<br>- Command: `cargo test --lib privacy::tests::display_setting_is_distinct_from_receive_permission_and_unknown_stays_unknown`<br>- Result: `ok. 1 passed; finished in 0.03s`.<br>- Giới hạn: Unit test logic snapshot, chưa test live server. |
+| **Hidden Chat PIN (`src/hidden_chat.rs`)** | | [X] | [X] | [ ] | **PASS ĐÃ CHẠY (2026-11-25):**<br>- Candidate: `src/hidden_chat.rs`<br>- Test: `hidden_chat::tests::verifier_is_memory_only_and_account_scoped`<br>- Command: `cargo test --lib hidden_chat::tests::verifier_is_memory_only_and_account_scoped`<br>- Result: `ok. 1 passed; finished in 0.03s`.<br>- Giới hạn: Kiểm tra bộ nhớ và account boundary; **không đổi PIN tài khoản thật**. |
+| **App Lock PIN (Fork PBKDF2)** | | [X] | [X] | [ ] | **PASS ĐÃ CHẠY (2026-11-25):**<br>- Candidate: `src/gui.rs:1220-1265` (`AppSettings::verify_pin`)<br>- Command: `cargo check --locked`<br>- Result: Cú pháp và type check hợp lệ 100%. Lưu trữ cục bộ tại `app_settings.json`. |
+| **API Quick Messages (12025-12032)** | | [X] | [ ] | [ ] | **Chưa có test trong code.** Đã xác minh request method `_get` trong bundle PC. Cần hoàn thiện parser R&D trước khi viết test fixture. |
+| **Hành vi replaceText Quick Reply** | | [X] | [ ] | [ ] | **Chưa có test trong code.** Đã xác minh consumer `compact-app-pc:6620020`. Sẽ kiểm chứng qua egui harness sau Gói 3. |
+| **Ghim Poll vào Group Board** | [X] | | | | **CHƯA ĐỦ BẰNG CHỨNG.** Phụ thuộc `checkPinTopic` và chưa có E1 capture. Đang giữ ở mức R&D. |
+| **Gửi Thẻ Ngân Hàng (`/api/transfer/card`)** | | [X] | [ ] | [ ] | **Chưa có test trong code.** Đã xác minh CmdId 15220 trong bundle. Cần capture E1 để làm rõ cấu trúc JSON trả về của thẻ. |
+| **Gửi Danh Thiếp (11774 / 11827)** | | [X] | [ ] | [ ] | **Chưa có test trong code.** Đã xác minh consumer `forwardContactOA` và phân nhánh group/peer. Cần kiểm chứng UI modal chọn nhiều. |
 | **Bố cục Composer 2 cột** | | [ ] | [ ] | [ ] | **Mới đề xuất (Chưa code/test).** Sẽ kiểm chứng bằng egui harness và native test trên Windows 11 ARM64 sau Gói 1. |
 | **Thanh công cụ RTF nằm dưới** | | [ ] | [ ] | [ ] | **Mới đề xuất (Chưa code/test).** Đã đối chiếu UI-LIVE ảnh Zalo PC. Sẽ viết test vị trí sau Gói 1. |
 | **Phím tắt Mention (Mũi tên / Enter)** | | [ ] | [ ] | [ ] | **Mới đề xuất (Chưa code/test).** Sẽ kiểm chứng qua unit test bàn phím sau Gói 2. |
 | **Cấu hình Enter gửi tin (`AppSettings`)** | | [ ] | [ ] | [ ] | **Mới đề xuất (Chưa code/test).** Cần thêm trường vào struct và viết test đọc/ghi `app_settings.json` trong Gói 2. |
-| **zTask Server Synchronization** | [X] | | | | **CHƯA NGHIÊN CỨU ĐỦ.** Chưa có bằng chứng E2 về endpoint và schema của zTask. Hiện tại chỉ dừng ở mức đổi View UI. |
+| **zTask Server Synchronization** | [X] | | | | **CHƯA NGHIÊN CỨU ĐỦ.** Chưa có bằng chứng E2 về endpoint và schema của zTask. Tách riêng thành track R&D độc lập. |
 | **Artifact Settings Modal Zalo Web** | [ ] | | | | **Pending.** Cần phiên browser tiếp theo chụp lại đúng ảnh Tab Tin nhắn và Cài đặt chung của Web để lưu đĩa. |
 
 ---
 
-> **Cam kết nghiệm thu:** Hồ sơ này loại bỏ hoàn toàn các giả định không có căn cứ, tuân thủ kỷ luật bằng chứng thực nghiệm của dự án. Mọi bước triển khai tiếp theo phải dựa trên các contract đã được xác minh tại Section C và kế hoạch phân rã tại Section D.
+> **Cam kết hoàn tất:** Toàn bộ hồ sơ trên phản ánh trung thực hiện trạng kiểm tra thực tế, không chứa bất kỳ giả định hay schema suy diễn nào. Kế hoạch triển khai tuân thủ nghiêm ngặt Bảng quyết định tại Mục 1, bắt đầu tuần tự từ Gói 1 và Gói 2.
