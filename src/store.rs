@@ -1113,6 +1113,40 @@ impl MessageStore {
         Ok(())
     }
 
+    /// Load the content-free, account-local hidden-message notification watermark.
+    /// # Errors
+    /// Returns database read failures; malformed values safely require acknowledgment again.
+    pub fn hidden_unread_ack(&self) -> Result<i64> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM tool_config WHERE key='hidden_unread_ack_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(0))
+    }
+
+    /// Persist a monotonic hidden-message notification watermark in `tool_config`.
+    /// # Errors
+    /// Returns database write failures.
+    pub fn acknowledge_hidden_unread(&self, timestamp_ms: i64) -> Result<i64> {
+        let current = self.hidden_unread_ack()?;
+        let next = current.max(timestamp_ms.max(0));
+        if next > current {
+            self.conn.execute(
+                "INSERT INTO tool_config(key,value) VALUES('hidden_unread_ack_ms',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [next.to_string()],
+            )?;
+        }
+        Ok(next)
+    }
+
     /// Read local conversation choices without loading message bodies.
     /// # Errors
     /// Returns SQLite errors; preferences belong to this account database only.
@@ -1623,6 +1657,25 @@ impl MessageStore {
                     let promote_local_id = existing.is_outgoing
                         && crate::chat::server_message_id(existing).is_none()
                         && crate::chat::server_message_id(&cm).is_some();
+                    if cm.kind == crate::message_model::MessageKind::Recall
+                        || cm.text == "[Tin nhắn đã thu hồi]"
+                        || existing.kind == crate::message_model::MessageKind::Recall
+                        || existing.text == "[Tin nhắn đã thu hồi]"
+                    {
+                        existing.mark_recalled();
+                        existing.merge_reaction_metadata(&cm);
+                        if promote_local_id {
+                            existing.id = cm.id.clone();
+                            existing.ts = cm.ts;
+                            existing.time = cm.time.clone();
+                        }
+                        if existing.reactions.is_empty() && !cm.reactions.is_empty() {
+                            existing.reactions = cm.reactions;
+                        }
+                        existing.is_pinned = existing.is_pinned || cm.is_pinned;
+                        existing.is_starred = existing.is_starred || cm.is_starred;
+                        continue;
+                    }
                     existing.merge_reaction_metadata(&cm);
                     if promote_local_id {
                         existing.id = cm.id.clone();
@@ -4595,5 +4648,60 @@ mod archive_history_paging_tests {
             ui_thread.messages[0].delivery,
             crate::message_model::DeliveryState::Read
         );
+    }
+}
+
+#[cfg(test)]
+mod hidden_unread_ack_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_unread_ack_roundtrips_monotonically_and_is_account_local() {
+        let first = MessageStore::open(":memory:").unwrap();
+        let other = MessageStore::open(":memory:").unwrap();
+        assert_eq!(first.hidden_unread_ack().unwrap(), 0);
+        assert_eq!(first.acknowledge_hidden_unread(2000).unwrap(), 2000);
+        assert_eq!(first.acknowledge_hidden_unread(1000).unwrap(), 2000);
+        assert_eq!(first.acknowledge_hidden_unread(-1).unwrap(), 2000);
+        assert_eq!(first.hidden_unread_ack().unwrap(), 2000);
+        assert_eq!(other.hidden_unread_ack().unwrap(), 0);
+        assert_eq!(first.acknowledge_hidden_unread(3000).unwrap(), 3000);
+    }
+
+    #[test]
+    fn hydrate_refresh_preserves_recall_over_server_preview_text_and_sticker() {
+        let store = MessageStore::open(":memory:").unwrap();
+        let recalled = ChatMessage {
+            id: "msg-recall-1".into(),
+            text: "[Tin nhắn đã thu hồi]".into(),
+            kind: crate::message_model::MessageKind::Recall,
+            ts: 1_700_000_001_000,
+            ..Default::default()
+        };
+        let mut stored = StoredMessage::from(&recalled);
+        stored.thread_id = "thread-recall".into();
+        stored.msg_type = "chat.undo".into();
+        store.upsert_message(&stored).unwrap();
+
+        let server_preview = ChatMessage {
+            id: "msg-recall-1".into(),
+            text: "Original sticker or text".into(),
+            kind: crate::message_model::MessageKind::Sticker,
+            sticker_id: Some(42),
+            sticker_cate_id: Some(7),
+            sticker_type: Some(1),
+            ts: 1_700_000_001_000,
+            ..Default::default()
+        };
+        let mut threads = vec![crate::chat::Thread {
+            id: "thread-recall".into(),
+            messages: vec![server_preview],
+            ..Default::default()
+        }];
+        store.hydrate_refresh(&mut threads, 20).unwrap();
+        let msg = &threads[0].messages[0];
+        assert_eq!(msg.kind, crate::message_model::MessageKind::Recall);
+        assert_eq!(msg.text, "[Tin nhắn đã thu hồi]");
+        assert_eq!(msg.sticker_id, None);
     }
 }

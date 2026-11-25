@@ -857,6 +857,7 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn reset_sync_status(&mut self) {
+        self.startup_baseline_status = None;
         self.quote_jump = None;
         self.server_pins = Default::default();
         self.server_board = Default::default();
@@ -917,16 +918,25 @@ impl ZaloGuiApp {
 
         match action {
             crate::gui::sync_banner::SyncBannerAction::StartSuggestSync => {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
+                let sent = WORKER_TX.get().is_some_and(|tx| {
+                    tx.send(WorkerCmd::SyncPhoneHistoryFenced {
                         owner: self.user_uin.clone(),
                         runtime_id: self.account_runtime_id,
-                        intent_id: None,
+                        range_days: self.settings.phone_sync_range_days,
                         origin: crate::sync_coordinator::SyncOrigin::Banner,
-                    });
+                    })
+                    .is_ok()
+                });
+                if !sent {
+                    self.show_toast("Worker chưa sẵn sàng để bắt đầu đồng bộ");
+                    return false;
                 }
                 self.phone_sync_running = true;
                 self.sync_cancel_requested = false;
+                self.sync_operation_id = 0;
+                self.sync_state = crate::sync_coordinator::SyncState::Preparing {
+                    source: crate::sync_coordinator::SyncSource::Sync2Full,
+                };
                 self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
                 true
             }
@@ -941,30 +951,45 @@ impl ZaloGuiApp {
                 if !can_retry {
                     return false;
                 }
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::SyncPhoneRecentFenced {
+                let sent = WORKER_TX.get().is_some_and(|tx| {
+                    tx.send(WorkerCmd::SyncPhoneHistoryFenced {
                         owner: self.user_uin.clone(),
                         runtime_id: self.account_runtime_id,
-                        intent_id: None,
+                        range_days: self.settings.phone_sync_range_days,
                         origin: crate::sync_coordinator::SyncOrigin::Banner,
-                    });
+                    })
+                    .is_ok()
+                });
+                if !sent {
+                    self.show_toast("Worker chưa sẵn sàng để thử lại đồng bộ");
+                    return false;
                 }
                 self.phone_sync_running = true;
                 self.sync_cancel_requested = false;
                 self.sync_error_dismissed = false;
+                self.sync_operation_id = 0;
                 self.sync_state = crate::sync_coordinator::SyncState::Preparing {
-                    source: crate::sync_coordinator::SyncSource::Sync2Recent,
+                    source: crate::sync_coordinator::SyncSource::Sync2Full,
                 };
                 self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
                 true
             }
             crate::gui::sync_banner::SyncBannerAction::CancelSync => {
-                if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::CancelPhoneHistoryFenced {
+                if self.sync_operation_id == 0 {
+                    self.show_toast("Đang chờ tác vụ khởi tạo, vui lòng thử lại sau giây lát");
+                    return false;
+                }
+                let sent = WORKER_TX.get().is_some_and(|tx| {
+                    tx.send(WorkerCmd::CancelPhoneHistoryFenced {
                         owner: self.user_uin.clone(),
                         runtime_id: self.account_runtime_id,
                         operation_id: self.sync_operation_id,
-                    });
+                    })
+                    .is_ok()
+                });
+                if !sent {
+                    self.show_toast("Chưa kết nối được tác vụ đồng bộ");
+                    return false;
                 }
                 self.sync_cancel_requested = true;
                 self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
@@ -988,21 +1013,38 @@ impl ZaloGuiApp {
                     };
                     self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
                     true
+                } else if matches!(
+                    self.sync_state,
+                    crate::sync_coordinator::SyncState::Interrupted { .. }
+                ) {
+                    self.phone_sync_running = false;
+                    self.sync_cancel_requested = false;
+                    self.sync_operation_id = 0;
+                    self.sync_state = crate::sync_coordinator::SyncState::Idle {
+                        availability: crate::sync_coordinator::SyncAvailability::Ready,
+                    };
+                    self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
+                    true
                 } else if self.phone_sync_running
                     || self.history_sync_running
                     || self.sync_state.is_running()
-                    || matches!(
-                        self.sync_state,
-                        crate::sync_coordinator::SyncState::Interrupted { .. }
-                    )
                 {
-                    // When Running / Interrupted: cancelSync
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::CancelPhoneHistoryFenced {
+                    // When Running: cancelSync
+                    if self.sync_operation_id == 0 {
+                        self.show_toast("Đang chờ tác vụ khởi tạo, vui lòng thử lại sau giây lát");
+                        return false;
+                    }
+                    let sent = WORKER_TX.get().is_some_and(|tx| {
+                        tx.send(WorkerCmd::CancelPhoneHistoryFenced {
                             owner: self.user_uin.clone(),
                             runtime_id: self.account_runtime_id,
                             operation_id: self.sync_operation_id,
-                        });
+                        })
+                        .is_ok()
+                    });
+                    if !sent {
+                        self.show_toast("Chưa kết nối được tác vụ đồng bộ");
+                        return false;
                     }
                     self.sync_cancel_requested = true;
                     self.sync_state_revision = self.sync_state_revision.wrapping_add(1);
@@ -1452,7 +1494,10 @@ impl ZaloGuiApp {
                         .clicked()
                     {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                            let _ = tx.send(WorkerCmd::RefreshThreadsFenced {
+                                owner: self.user_uin.clone(),
+                                runtime_id: self.account_runtime_id,
+                            });
                         }
                         self.show_toast(format!(
                             "Đang đồng bộ ngầm {} hội thoại…",
@@ -1596,6 +1641,7 @@ impl ZaloGuiApp {
                         if is_narrow_w {
                             // Compact mode: icon-only search / lookup button
                             ui.vertical_centered(|ui| {
+                                let (has_hidden_unread, max_hidden_ts) = self.has_unacknowledged_hidden_unread();
                                 let (srch_r, srch_resp) =
                                     ui.allocate_exact_size(Vec2::new(42.0, 32.0), Sense::click());
                                 ui.painter()
@@ -1603,19 +1649,29 @@ impl ZaloGuiApp {
                                 ui.painter().rect_stroke(
                                     srch_r,
                                     Rounding::same(8.0),
-                                    Stroke::new(1.0_f32, pal.border),
+                                    Stroke::new(1.0_f32, if has_hidden_unread { pal.danger } else { pal.border }),
                                 );
+                                let icon_size = if has_hidden_unread {
+                                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                                    let pulse = ((ctx.input(|i| i.time) * 4.0).sin().abs()) as f32;
+                                    16.0 + pulse * 2.0
+                                } else {
+                                    16.0
+                                };
                                 draw_icon_search(
                                     ui.painter(),
                                     srch_r.center(),
-                                    16.0,
-                                    pal.primary_hover,
+                                    icon_size,
+                                    if has_hidden_unread { pal.danger } else { pal.primary_hover },
                                 );
                                 if srch_resp
                                     .on_hover_cursor(CursorIcon::PointingHand)
                                     .on_hover_text(crate::i18n::tr("Tìm kiếm hội thoại & Tra cứu SĐT"))
                                     .clicked()
                                 {
+                                    if has_hidden_unread {
+                                        self.acknowledge_hidden_unread(max_hidden_ts);
+                                    }
                                     self.phone_modal_open = true;
                                 }
                             });
@@ -1645,15 +1701,34 @@ impl ZaloGuiApp {
                                         ui.set_width(inner_w);
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 6.0;
-                                            let (icon_rect, _) = ui.allocate_exact_size(
+                                            let (has_hidden_unread, max_hidden_ts) = self.has_unacknowledged_hidden_unread();
+                                            let (icon_rect, icon_resp) = ui.allocate_exact_size(
                                                 Vec2::new(15.0, 18.0),
-                                                Sense::hover(),
+                                                Sense::click(),
                                             );
+                                            if icon_resp.clicked() {
+                                                if has_hidden_unread {
+                                                    self.acknowledge_hidden_unread(max_hidden_ts);
+                                                }
+                                                ui.memory_mut(|m| m.request_focus(Id::new("sidebar_search_input")));
+                                            }
+                                            if icon_resp.hovered() {
+                                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                            }
+                                            let icon_size = if has_hidden_unread {
+                                                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                                                let pulse = ((ctx.input(|i| i.time) * 4.0).sin().abs()) as f32;
+                                                13.5 + pulse * 1.5
+                                            } else {
+                                                13.5
+                                            };
                                             draw_icon_search(
                                                 ui.painter(),
                                                 icon_rect.center(),
-                                                13.5,
-                                                if has_q {
+                                                icon_size,
+                                                if has_hidden_unread {
+                                                    pal.danger
+                                                } else if has_q {
                                                     pal.primary_hover
                                                 } else {
                                                     pal.text_muted
@@ -1663,11 +1738,10 @@ impl ZaloGuiApp {
                                                 && self.search_query.trim().chars().all(|c| c.is_ascii_digit());
                                             let show_pin_unlock = is_four_digit_pin && !self.hidden_panel.view.unlocked;
                                             let edit_w = if show_pin_unlock {
-                                                (inner_w - 63.0).max(1.0)
-                                            } else if has_q {
-                                                (inner_w - 43.0).max(1.0)
+                                                (inner_w - 65.0).max(1.0)
                                             } else {
-                                                (inner_w - 21.0).max(1.0)
+                                                // Clear and archive actions both occupy the trailing slot.
+                                                (inner_w - 43.0).max(1.0)
                                             };
                                             let s_resp = ui.add(
                                                 egui::TextEdit::singleline(&mut self.search_query)
@@ -1866,6 +1940,8 @@ impl ZaloGuiApp {
                                 // Create Group Button (`👥+`)
                                 let (grp_rect, grp_resp) =
                                     ui.allocate_exact_size(Vec2::new(32.0, 32.0), Sense::click());
+                                #[cfg(test)]
+                                ctx.data_mut(|data| data.insert_temp(Id::new("sidebar-search-actions"), (add_rect, grp_rect)));
                                 ui.painter().rect_filled(
                                     grp_rect,
                                     Rounding::same(8.0),
@@ -1921,12 +1997,19 @@ impl ZaloGuiApp {
                             // Clean Zalo PC Filter Strip: [Tất cả] | [Chưa đọc] ... [Phân loại ▾] [⋯]
                             let strip_w = (bounds.width() - if is_narrow_w { 8.0 } else { 28.0 }).max(1.0);
                             ui.allocate_ui_with_layout(Vec2::new(strip_w, 26.0), Layout::left_to_right(Align::Center), |ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.spacing_mut().item_spacing.x = if strip_w < 200.0 { 4.0 } else if strip_w < 240.0 { 6.0 } else { 10.0 };
+                                let tab_font = FontId::proportional(if strip_w < 200.0 { 12.0 } else { 13.0 });
+                                let all_label = crate::i18n::tr("Tất cả");
+                                let unread_label = crate::i18n::tr("Chưa đọc");
+                                let all_text_w = ui.fonts(|f| f.layout_no_wrap(all_label.to_string(), tab_font.clone(), pal.text_primary).size().x);
+                                let unread_text_w = ui.fonts(|f| f.layout_no_wrap(unread_label.to_string(), tab_font.clone(), pal.text_primary).size().x);
+                                let tab_all_w = all_text_w + 6.0;
+                                let tab_unr_w = unread_text_w + 6.0;
 
                                 // Tab 1: Tất cả
                                 let is_all = !self.unread_only && self.thread_filter == ThreadFilter::All;
                                 let (tab_all_rect, tab_all_resp) =
-                                    ui.allocate_exact_size(Vec2::new(44.0, 26.0), Sense::click());
+                                    ui.allocate_exact_size(Vec2::new(tab_all_w, 26.0), Sense::click());
                                 let fg_all = if is_all {
                                     pal.primary_hover
                                 } else if tab_all_resp.hovered() {
@@ -1937,8 +2020,8 @@ impl ZaloGuiApp {
                                 ui.painter().text(
                                     tab_all_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    crate::i18n::tr("Tất cả"),
-                                    FontId::proportional(13.0),
+                                    all_label,
+                                    tab_font.clone(),
                                     fg_all,
                                 );
                                 if is_all {
@@ -1959,7 +2042,7 @@ impl ZaloGuiApp {
                                 // Tab 2: Chưa đọc
                                 let is_unread = self.unread_only;
                                 let (tab_unr_rect, tab_unr_resp) =
-                                    ui.allocate_exact_size(Vec2::new(56.0, 26.0), Sense::click());
+                                    ui.allocate_exact_size(Vec2::new(tab_unr_w, 26.0), Sense::click());
                                 let fg_unr = if is_unread {
                                     pal.primary_hover
                                 } else if tab_unr_resp.hovered() {
@@ -1970,8 +2053,8 @@ impl ZaloGuiApp {
                                 ui.painter().text(
                                     tab_unr_rect.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    crate::i18n::tr("Chưa đọc"),
-                                    FontId::proportional(13.0),
+                                    unread_label,
+                                    tab_font,
                                     fg_unr,
                                 );
                                 if is_unread {
@@ -2021,8 +2104,20 @@ impl ZaloGuiApp {
                                     }
 
                                     // Phân loại ▾ Button
+                                    let label_avail = ui.available_width();
+                                    let full_lbl = crate::i18n::tr("Phân loại ▾");
+                                    let short_lbl = crate::i18n::tr("Thẻ ▾");
+                                    let full_w = ui.fonts(|f| f.layout_no_wrap(full_lbl.to_string(), FontId::proportional(12.0), pal.text_secondary).size().x + 8.0);
+                                    let short_w = ui.fonts(|f| f.layout_no_wrap(short_lbl.to_string(), FontId::proportional(12.0), pal.text_secondary).size().x + 8.0);
+                                    let (chosen_label, chosen_w) = if label_avail >= full_w {
+                                        (full_lbl, full_w)
+                                    } else if label_avail >= short_w {
+                                        (short_lbl, short_w)
+                                    } else {
+                                        ("▾", 20.0)
+                                    };
                                     let (lbl_rect, lbl_resp) =
-                                        ui.allocate_exact_size(Vec2::new(72.0, 24.0), Sense::click());
+                                        ui.allocate_exact_size(Vec2::new(chosen_w, 24.0), Sense::click());
                                     #[cfg(test)]
                                     ctx.data_mut(|data| data.insert_temp(Id::new("sidebar-filter-bounds"),
                                         (tab_all_rect, tab_unr_rect, lbl_rect, more_rect)));
@@ -2036,7 +2131,7 @@ impl ZaloGuiApp {
                                     ui.painter().text(
                                         lbl_rect.center(),
                                         egui::Align2::CENTER_CENTER,
-                                        crate::i18n::tr("Phân loại ▾"),
+                                        chosen_label,
                                         FontId::proportional(12.0),
                                         if lbl_resp.hovered() {
                                             pal.text_primary
@@ -2545,7 +2640,7 @@ impl ZaloGuiApp {
                                     pal.text_primary
                                 };
                                 let row_time = t.sidebar_timestamp(crate::login::unix_now() * 1000);
-                                let time_right = row_rect.right() - 9.0;
+                                let time_right = row_rect.right() - 12.0;
                                 let time_width = ui.fonts(|f| f.layout_no_wrap(row_time.clone(), FontId::proportional(11.0), pal.text_muted).size().x);
                                 let is_muted = self.conversation_preferences.get(&t.id).map(|p| p.muted).unwrap_or(false);
                                 let mut right_icons_width = 8.0;
@@ -6033,6 +6128,7 @@ impl ZaloGuiApp {
         self.render_downloads(ctx);
         self.render_quick_schedule(ctx, pal);
         self.render_send_contact_modal(ctx, pal);
+        self.render_phone_sync_wait_modal(ctx, pal);
     }
 
     fn render_send_contact_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
@@ -6364,6 +6460,124 @@ impl ZaloGuiApp {
                     });
                 }
             }
+        }
+    }
+
+    pub(super) fn phone_sync_confirmation_open(&self) -> bool {
+        matches!(
+            self.sync_state,
+            crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation { .. }
+        )
+    }
+
+    pub(super) fn request_settings_phone_sync(&mut self) {
+        let command = WorkerCmd::SyncPhoneHistoryFenced {
+            owner: self.user_uin.clone(),
+            runtime_id: self.account_runtime_id,
+            range_days: self.settings.phone_sync_range_days,
+            origin: crate::sync_coordinator::SyncOrigin::Setting,
+        };
+        if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+            self.phone_sync_running = true;
+            self.sync_cancel_requested = false;
+            self.sync_operation_id = 0;
+            self.phone_sync_status = "Đang chuẩn bị đồng bộ điện thoại…".into();
+            self.sync_notice_dismissed = false;
+        } else {
+            self.show_toast("Chưa kết nối được tác vụ đồng bộ");
+        }
+    }
+
+    fn render_phone_sync_wait_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        let crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation { timeout_at } =
+            self.sync_state
+        else {
+            return;
+        };
+        let remaining = timeout_at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        let mut open = true;
+        let mut cancel = false;
+        cancel |= ctx.input(|input| input.key_pressed(Key::Escape));
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        crate::gui::modals::render_modal_backdrop(ctx, "phone_sync_wait_backdrop");
+        let screen = ctx.screen_rect();
+        let width = (screen.width() - 40.0).clamp(120.0, 380.0);
+        egui::Window::new(crate::i18n::tr("Xác nhận đồng bộ"))
+            .id(Id::new("phone-sync-wait"))
+            .title_bar(false)
+            .order(egui::Order::Foreground)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(width)
+            .min_width(width)
+            .max_width(width)
+            .max_height((screen.height() - 40.0).max(80.0))
+            .vscroll(true)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Xác nhận để bắt đầu đồng bộ").size(15.0).strong());
+                    ui.add_space(8.0);
+                    let (phone_rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
+                    ui.painter().circle_filled(phone_rect.center(), 26.0, pal.bg_elevated);
+                    ui.painter().circle_stroke(phone_rect.center(), 26.0, Stroke::new(1.0_f32, pal.border));
+                    draw_lucide_icon(ui.painter(), phone_rect.center(), lucide::PHONE, 24.0, pal.primary);
+
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Vui lòng mở Zalo trên điện thoại và chọn Xác nhận để bắt đầu quá trình đồng bộ.")
+                            .size(12.5)
+                            .color(pal.text_primary),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("Thời gian xác nhận còn lại: {remaining}s"))
+                            .size(12.0)
+                            .strong()
+                            .color(if remaining < 30 { pal.danger } else { pal.text_secondary }),
+                    );
+                    ui.add_space(14.0);
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        if self.sync_cancel_requested {
+                            ui.label(
+                                RichText::new("Đang hủy yêu cầu đồng bộ...")
+                                    .size(12.0)
+                                    .color(pal.text_secondary),
+                            );
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.sync_cancel_requested,
+                                egui::Button::new(
+                                    RichText::new("Tôi không muốn đồng bộ")
+                                        .size(12.0)
+                                        .color(pal.text_secondary),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                });
+            });
+
+        if (!open || cancel) && !self.sync_cancel_requested {
+            self.handle_sync_banner_action(
+                crate::gui::sync_banner::SyncBannerAction::CancelSync,
+                crate::gui::sync_banner::SyncBannerFencing::new(
+                    self.user_uin.clone(),
+                    self.account_runtime_id as u64,
+                    self.sync_operation_id,
+                    self.sync_state_revision,
+                ),
+            );
         }
     }
 }
@@ -7649,7 +7863,15 @@ mod composer_tests {
                 _ => {}
             }
         }
-        for (width, scale) in [(800.0, 1.0), (1020.0, 1.0), (1020.0, 1.5), (1707.0, 2.0)] {
+        for (width, scale, sidebar_width) in [
+            (800.0, 1.0, None),
+            (1020.0, 1.0, None),
+            (1020.0, 1.5, None),
+            (1707.0, 2.0, None),
+            (1020.0, 1.0, Some(190.0)),
+            (1020.0, 1.25, Some(240.0)),
+            (1020.0, 1.5, Some(320.0)),
+        ] {
             let ctx = egui::Context::default();
             ctx.set_pixels_per_point(scale);
             let mut app = ZaloGuiApp::from_context(
@@ -7662,6 +7884,16 @@ mod composer_tests {
             app.is_logged_in = true;
             app.hidden_panel.view.ready = true;
             app.policy_panel.snapshot = Some(Default::default());
+            if let Some(sidebar_width) = sidebar_width {
+                ctx.data_mut(|data| {
+                    data.insert_persisted(
+                        Id::new("conversation_sidebar_wide"),
+                        egui::containers::panel::PanelState {
+                            rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(sidebar_width, 700.0)),
+                        },
+                    )
+                });
+            }
             let search = "Một từ khóa rất dài trong ô tìm kiếm".repeat(20);
             let mut thread = Thread {
                 id: "sidebar-bounds-fixture".into(),
@@ -7721,6 +7953,34 @@ mod composer_tests {
                     "{width}@{scale} phase {phase}: sidebar filter controls overlap"
                 );
                 assert!(panel.contains_rect(all) && panel.contains_rect(more));
+                let (add, group) = ctx
+                    .data(|data| data.get_temp::<(Rect, Rect)>(Id::new("sidebar-search-actions")))
+                    .unwrap();
+                assert!(
+                    panel.shrink2(Vec2::new(13.0, 0.0)).contains_rect(group),
+                    "{width}@{scale} phase {phase}: clipped group action {group:?} in {panel:?}"
+                );
+                assert!(add.right() <= group.left());
+                for shape in &output.as_ref().unwrap().shapes {
+                    if let egui::Shape::Text(text) = &shape.shape {
+                        let rect = match text.galley.job.text.as_str() {
+                            "Tất cả" => Some(all),
+                            "Chưa đọc" => Some(unread),
+                            "Phân loại ▾" | "Thẻ ▾" => Some(labels),
+                            _ => None,
+                        };
+                        if let Some(rect) = rect {
+                            assert!(
+                                rect.expand(1.0).contains_rect(Rect::from_min_size(
+                                    text.pos,
+                                    text.galley.size()
+                                )),
+                                "filter text escapes its target: {}",
+                                text.galley.job.text
+                            );
+                        }
+                    }
+                }
                 if let Some(expected) = baseline {
                     assert_eq!(
                         panel, expected,
@@ -8192,7 +8452,7 @@ impl ZaloGuiApp {
         }
     }
 
-    fn request_my_documents_usage(&mut self) {
+    pub(super) fn request_my_documents_usage(&mut self) {
         if !self.is_logged_in || self.cloud_usage.pending {
             return;
         }
@@ -9256,7 +9516,7 @@ impl ZaloGuiApp {
                 .circle_stroke(rect.center(), 18.0, Stroke::new(1.0_f32, stroke_col));
             draw_lucide_icon(
                 ui.painter(),
-                rect.center(),
+                rect.center() + Vec2::new(0.0, 2.0),
                 icon,
                 16.0,
                 if active {
@@ -9583,7 +9843,10 @@ impl ZaloGuiApp {
                 if grp_clicked {
                     if d_is_cloud {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::RefreshThreads);
+                            let _ = tx.send(WorkerCmd::RefreshThreadsFenced {
+                                owner: self.user_uin.clone(),
+                                runtime_id: self.account_runtime_id,
+                            });
                             let _ = tx.send(WorkerCmd::LoadGroupHistory {
                                 limit: 500,
                                 group_id: d_id.to_string(),
@@ -12695,7 +12958,9 @@ mod tests {
 
     #[test]
     fn sync_banner_fencing_protection_and_stale_rejection() {
-        let (mut app, _ctx) = test_app_and_context();
+        let (mut app, ctx) = test_app_and_context();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx));
         app.is_logged_in = true;
         app.user_uin = "user_abc".into();
         app.account_runtime_id = 42;
@@ -12735,8 +13000,32 @@ mod tests {
     }
 
     #[test]
+    fn cancel_sync_with_zero_operation_id_does_not_set_cancel_requested() {
+        let (mut app, ctx) = test_app_and_context();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx));
+        app.is_logged_in = true;
+        app.user_uin = "user_abc".into();
+        app.account_runtime_id = 42;
+        app.sync_operation_id = 0;
+        app.sync_state_revision = 5;
+        app.sync_cancel_requested = false;
+
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_abc", 42, 0, 5);
+        assert!(!app.handle_sync_banner_action(
+            crate::gui::sync_banner::SyncBannerAction::CancelSync,
+            fencing
+        ));
+        assert!(!app.sync_cancel_requested);
+        assert_eq!(app.sync_state_revision, 5);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn sync_banner_dismiss_or_close_classification() {
-        let (mut app, _ctx) = test_app_and_context();
+        let (mut app, ctx) = test_app_and_context();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx));
         app.is_logged_in = true;
         app.user_uin = "user_test".into();
         app.account_runtime_id = 1;
@@ -12762,9 +13051,10 @@ mod tests {
         app.sync_state = crate::sync_coordinator::SyncState::Preparing {
             source: crate::sync_coordinator::SyncSource::Sync2Full,
         };
+        app.sync_operation_id = 10;
         app.sync_cancel_requested = false;
         app.sync_state_revision = 2;
-        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 0, 2);
+        let fencing = crate::gui::sync_banner::SyncBannerFencing::new("user_test", 1, 10, 2);
         assert!(app.handle_sync_banner_action(
             crate::gui::sync_banner::SyncBannerAction::DismissOrClose,
             fencing
@@ -13743,5 +14033,167 @@ mod tests {
         app.check_events(&ctx);
         assert!(!app.privacy_panel.pending);
         assert_eq!(app.inbox_policy.show_online, Some(false));
+    }
+}
+
+#[cfg(test)]
+mod sync_confirmation_remediation_tests {
+    use super::*;
+
+    #[test]
+    fn settings_sync_dispatches_one_scoped_history_command() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        app.settings.phone_sync_range_days = 30;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        app.request_settings_phone_sync();
+        assert!(
+            matches!(rx.try_recv().unwrap(), WorkerCmd::SyncPhoneHistoryFenced { owner, runtime_id: 7, range_days: 30, origin: crate::sync_coordinator::SyncOrigin::Setting } if owner == "owner")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(app.phone_sync_running);
+        WORKER_TX.clear();
+    }
+
+    #[test]
+    fn phone_confirmation_blocks_settings_and_retry_without_replaying_sync() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        app.settings_modal_open = true;
+        app.settings_tab = SettingsTab::General;
+        // Isolate pointer admission from the Settings page's automatic device preload.
+        app.settings_devices.devices = Some(Default::default());
+        app.sync_state = crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
+            timeout_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        let draw = |app: &mut ZaloGuiApp, ctx: &egui::Context| {
+            app.render_settings_modal(ctx, &app.palette());
+            app.render_phone_sync_wait_modal(ctx, &app.palette());
+        };
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let mut parent = None;
+        let mut retry = None;
+        for _ in 0..4 {
+            let output = ctx.run(input(vec![]), |ctx| draw(&mut app, ctx));
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    if text.galley.job.text == "Giao diện" {
+                        parent = Some(text.pos + text.galley.size() * 0.5);
+                    }
+                    if text.galley.job.text == "Thử lại" {
+                        retry = Some(text.pos + text.galley.size() * 0.5);
+                    }
+                }
+            }
+        }
+        let parent = parent.expect("parent settings tab is painted");
+        assert!(retry.is_none(), "disabled retry stub should not be painted");
+        for pressed in [true, false] {
+            let events = vec![
+                egui::Event::PointerMoved(parent),
+                egui::Event::PointerButton {
+                    pos: parent,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            let _ = ctx.run(input(events), |ctx| draw(&mut app, ctx));
+        }
+        assert_eq!(app.settings_tab, SettingsTab::General);
+        assert!(app.is_workspace_input_gated(&ctx));
+        assert!(
+            rx.try_recv().is_err(),
+            "neither parent click nor retry may start another sync"
+        );
+        app.sync_state = crate::sync_coordinator::SyncState::Idle {
+            availability: crate::sync_coordinator::SyncAvailability::Ready,
+        };
+        for _ in 0..2 {
+            let _ = ctx.run(input(vec![]), |ctx| draw(&mut app, ctx));
+        }
+        for pressed in [true, false] {
+            let _ = ctx.run(
+                input(vec![
+                    egui::Event::PointerMoved(parent),
+                    egui::Event::PointerButton {
+                        pos: parent,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]),
+                |ctx| draw(&mut app, ctx),
+            );
+        }
+        assert_eq!(app.settings_tab, SettingsTab::Appearance);
+        WORKER_TX.clear();
+    }
+
+    #[test]
+    fn phone_confirmation_gates_input_and_escape_only_cancels_current_operation() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        app.sync_operation_id = 9;
+        app.sync_state = crate::sync_coordinator::SyncState::AwaitingPhoneConfirmation {
+            timeout_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        assert!(app.is_workspace_input_gated(&ctx));
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(320.0, 240.0))),
+            events: vec![egui::Event::Key {
+                key: Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            app.render_phone_sync_wait_modal(ctx, &app.palette())
+        });
+        assert!(
+            matches!(rx.try_recv().unwrap(), WorkerCmd::CancelPhoneHistoryFenced { owner, runtime_id: 7, operation_id: 9 } if owner == "owner")
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(app.sync_cancel_requested);
+        WORKER_TX.clear();
     }
 }

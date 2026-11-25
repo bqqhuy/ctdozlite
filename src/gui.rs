@@ -316,6 +316,13 @@ pub enum GuiEvent {
         owner: String,
         runtime_id: usize,
         preload_threads: Vec<Thread>,
+        baseline_status: crate::gui::worker::BaselineFetchStatus,
+    },
+    StartupBaselineUpdated {
+        owner: String,
+        runtime_id: usize,
+        threads: Vec<Thread>,
+        status: crate::gui::worker::BaselineFetchStatus,
     },
     StartupPreloadSettled {
         owner: String,
@@ -442,6 +449,12 @@ pub enum GuiEvent {
         batch: u64,
         results: Vec<(String, Result<std::path::PathBuf, String>)>,
     },
+    ToolsData {
+        owner: String,
+        runtime_id: usize,
+        generation: u64,
+        result: Result<tools_panel::ToolsResult, String>,
+    },
     Tools {
         owner: String,
         result: Result<tools_panel::ToolsResult, String>,
@@ -488,8 +501,15 @@ pub enum GuiEvent {
     },
     /// A single wake-up represents any number of live deltas while hidden.
     LiveThreadsReady(std::sync::Arc<crate::live_updates::LiveUpdates>),
+    HiddenUnreadAcknowledged {
+        owner: String,
+        runtime_id: usize,
+        timestamp_ms: i64,
+    },
     ConversationPreferences {
         owner: String,
+        runtime_id: usize,
+        revision: u64,
         values: HashMap<String, crate::store::ConversationPreference>,
     },
     ThreadDeleted {
@@ -705,6 +725,9 @@ pub enum GuiEvent {
     },
     ServerPins {
         owner: String,
+        runtime_id: usize,
+        revision: u64,
+        cached: bool,
         snapshot: crate::server_pins::Snapshot,
     },
     Reacted {
@@ -736,7 +759,11 @@ pub enum GuiEvent {
         msg_id: String,
         ts: i64,
     },
-    SessionExpired(String),
+    SessionExpired {
+        owner: String,
+        runtime_id: usize,
+        reason: String,
+    },
     Contact {
         owner: String,
         target: String,
@@ -1410,6 +1437,11 @@ pub struct ZaloGuiApp {
     profile_panel: profile_panel::ProfilePanel,
     avatar_panel: avatar_panel::AvatarPanel,
     hidden_panel: hidden_panel::HiddenPanel,
+    pub(crate) hidden_unread_last_ack_ts: i64,
+    hidden_unread_ack_ready: bool,
+    preferences_revision: u64,
+    pins_revision: u64,
+    pins_authoritative: bool,
     inbox_policy: crate::inbox::Policy,
     own_cloud_id: String,
     // Presentation names: phonebook entries overridden by explicit server aliases.
@@ -1518,6 +1550,7 @@ pub struct ZaloGuiApp {
     native_hwnd: Option<isize>,
     deleted_message_ids: HashSet<(String, String)>,
     status_msg: String,
+    pub(crate) startup_baseline_status: Option<crate::gui::worker::BaselineFetchStatus>,
 
     // Reply / forward state
     replying_to: Option<ChatMessage>,
@@ -1952,6 +1985,7 @@ impl ZaloGuiApp {
             sync_suggestion_timer: None,
             pending_auto_sync: None,
             status_msg: "Đã đăng nhập · Sẵn sàng".into(),
+            startup_baseline_status: None,
             info_drawer_open: loaded_settings.info_drawer_open,
             drawer_view: DrawerView::Overview,
             drawer_search_query: String::new(),
@@ -2119,6 +2153,11 @@ impl ZaloGuiApp {
                 },
                 ..Default::default()
             },
+            hidden_unread_last_ack_ts: 0,
+            hidden_unread_ack_ready: false,
+            preferences_revision: 0,
+            pins_revision: 0,
+            pins_authoritative: false,
             labels_panel: Default::default(),
             manual_mark_pending: false,
             manual_mark_uncertain: false,
@@ -2197,13 +2236,30 @@ impl ZaloGuiApp {
             app.is_logged_in = true;
             app.startup_state = StartupState::Ready;
             app.user_name = "ARM64 UI fixture".into();
-            app.settings_modal_open = !args
-                .iter()
-                .any(|a| a == "--ui-smoke-workspace-sync" || a == "--ui-smoke-phone-sync");
+            app.settings_modal_open = !args.iter().any(|a| {
+                a == "--ui-smoke-workspace-sync"
+                    || a == "--ui-smoke-phone-sync"
+                    || a == "--ui-smoke-sync-suggest"
+            });
             if !app.settings_modal_open {
                 app.history_sync_running = true;
                 app.history_sync_status =
                     "Lịch sử 2/4: Nhóm thử nghiệm — trang 3, 125 tin mới".into();
+                if args.iter().any(|a| a == "--ui-smoke-sync-suggest") {
+                    app.history_sync_running = false;
+                    app.sync_state = crate::sync_coordinator::SyncState::Idle {
+                        availability: crate::sync_coordinator::SyncAvailability::Ready,
+                    };
+                    let banner_text = &mut app
+                        .server_config
+                        .sync_2_pc
+                        .sync_suggestion_zalopc
+                        .banner_text;
+                    banner_text.title.vi = "Đồng bộ tin nhắn gần đây".into();
+                    banner_text.cta.vi = "Nhấn để đồng bộ ngay".into();
+                    app.sync_suggestion_trigger =
+                        Some(crate::gui::sync_banner::SyncSuggestionTrigger::NewLogIn);
+                }
                 if args.iter().any(|a| a == "--ui-smoke-phone-sync") {
                     app.history_sync_running = false;
                     app.phone_sync_running = true;
@@ -2764,6 +2820,7 @@ impl ZaloGuiApp {
 
     /// Forget per-account typing, roster and capture state at an account boundary.
     fn clear_presence_state(&mut self) {
+        self.tools.data_pending = None;
         self.clear_preflight_call();
         self.presence_map.clear();
         self.backup_panel
@@ -2785,6 +2842,11 @@ impl ZaloGuiApp {
         self.profile_panel = Default::default();
         self.avatar_panel = Default::default();
         self.hidden_panel = Default::default();
+        self.hidden_unread_last_ack_ts = 0;
+        self.hidden_unread_ack_ready = false;
+        self.preferences_revision = 0;
+        self.pins_revision = 0;
+        self.pins_authoritative = false;
         self.inbox_policy = Default::default();
         self.own_cloud_id.clear();
         self.server_aliases.clear();
@@ -2863,6 +2925,7 @@ impl ZaloGuiApp {
     /// Return true whenever any modal dialog, blocking overlay, or popover menu is open.
     pub(super) fn is_any_modal_open(&self) -> bool {
         self.settings_modal_open
+            || self.phone_sync_confirmation_open()
             || self.forward_msg.is_some()
             || self.forward_session.is_some()
             || self.phone_modal_open
@@ -3021,6 +3084,43 @@ impl ZaloGuiApp {
             && !crate::message_lifecycle::expired(&context.message, crate::login::unix_now() * 1000)
     }
 
+    fn merge_startup_threads(&mut self, mut preload_threads: Vec<Thread>) {
+        for thread in &mut preload_threads {
+            let before = thread.messages.len();
+            thread.messages.retain(|message| {
+                !self.deleted_message_ids.contains(&(
+                    thread.id.clone(),
+                    if message.id.is_empty() {
+                        format!("msg_{}", message.ts)
+                    } else {
+                        message.id.clone()
+                    },
+                ))
+            });
+            if before != thread.messages.len() {
+                thread.refresh_after_removal();
+            }
+        }
+        if !preload_threads.is_empty() {
+            if self.threads.is_empty() {
+                self.threads = preload_threads;
+            } else {
+                for thread in preload_threads {
+                    if let Some(existing) = self
+                        .threads
+                        .iter_mut()
+                        .find(|t| crate::chat::threads_represent_same_contact(t, &thread))
+                    {
+                        crate::chat::merge_cached_thread_into(existing, thread);
+                    } else {
+                        self.threads.push(thread);
+                    }
+                }
+            }
+            crate::chat::deduplicate_threads(&mut self.threads, None);
+        }
+    }
+
     fn check_events(&mut self, ctx: &egui::Context) {
         for index in 0..64 {
             let Ok(event) = self.event_rx.try_recv() else {
@@ -3037,6 +3137,33 @@ impl ZaloGuiApp {
                 _ => None,
             };
             let event = match event {
+                GuiEvent::ToolsData {
+                    owner,
+                    runtime_id,
+                    generation,
+                    result,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                        || self.tools.data_pending != Some(generation)
+                    {
+                        continue;
+                    }
+                    self.tools.data_pending = None;
+                    match result {
+                        Ok(payload) => GuiEvent::Tools {
+                            owner,
+                            result: Ok(payload),
+                        },
+                        Err(error) => {
+                            // A data operation failure must not cancel an unrelated history search.
+                            self.tools.status = error;
+                            continue;
+                        }
+                    }
+                }
+
                 GuiEvent::ConversationHistoryLoaded {
                     runtime_id,
                     threads,
@@ -3757,6 +3884,9 @@ impl ZaloGuiApp {
                         }
                     }
                 }
+                GuiEvent::ToolsData { .. } => {
+                    unreachable!("data completion normalized before dispatch")
+                }
                 GuiEvent::LiveThreadsReady(_) => {
                     unreachable!("live mailbox normalized before dispatch")
                 }
@@ -3787,6 +3917,12 @@ impl ZaloGuiApp {
                         self.tools.devices.clear();
                         self.tools.two_factor_status = None;
                         self.tools.catalog_items.clear();
+                        self.pins_authoritative = false;
+                        self.pins_revision = 0;
+                        self.preferences_revision = 0;
+                        self.hidden_unread_ack_ready = false;
+                        self.hidden_unread_last_ack_ts = 0;
+                        self.reset_sync_status();
                     }
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
                         self.composer_config = Default::default();
@@ -3856,8 +3992,32 @@ impl ZaloGuiApp {
                     self.login_in_progress = false;
                     self.login_status_msg = format!("Lỗi đăng nhập: {err}");
                 }
-                GuiEvent::ConversationPreferences { owner, values } => {
-                    if self.is_logged_in && owner == self.user_uin {
+                GuiEvent::HiddenUnreadAcknowledged {
+                    owner,
+                    runtime_id,
+                    timestamp_ms,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.hidden_unread_last_ack_ts =
+                            self.hidden_unread_last_ack_ts.max(timestamp_ms);
+                        self.hidden_unread_ack_ready = true;
+                    }
+                }
+                GuiEvent::ConversationPreferences {
+                    owner,
+                    runtime_id,
+                    revision,
+                    values,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                        && revision >= self.preferences_revision
+                    {
+                        self.preferences_revision = revision;
                         self.conversation_preferences = values;
                     }
                 }
@@ -4106,6 +4266,17 @@ impl ZaloGuiApp {
                         // Rewriting/cloning all histories per downloaded page amplified RAM/IO.
                         self.trim_resident_history();
                     }
+                    if let StartupState::Loading {
+                        prerequisites_settled,
+                        ..
+                    } = &mut self.startup_state
+                    {
+                        if *prerequisites_settled
+                            && !self.server_config.o2o.keep_loading_during_preload.enable
+                        {
+                            self.enter_ready_state();
+                        }
+                    }
                     self.refresh_unread_title(ctx);
                     self.status_msg = history_status
                         .unwrap_or_else(|| format!("Đã cập nhật {}", crate::ui::clock()));
@@ -4240,44 +4411,34 @@ impl ZaloGuiApp {
                 GuiEvent::StartupPrerequisitesSettled {
                     owner,
                     runtime_id,
-                    mut preload_threads,
+                    preload_threads,
+                    baseline_status,
                 } => {
                     if self.is_logged_in
                         && owner == self.user_uin
                         && runtime_id == self.account_runtime_id
                     {
-                        for thread in &mut preload_threads {
-                            let before = thread.messages.len();
-                            thread.messages.retain(|message| {
-                                !self.deleted_message_ids.contains(&(
-                                    thread.id.clone(),
-                                    if message.id.is_empty() {
-                                        format!("msg_{}", message.ts)
-                                    } else {
-                                        message.id.clone()
-                                    },
-                                ))
-                            });
-                            if before != thread.messages.len() {
-                                thread.refresh_after_removal();
+                        self.startup_baseline_status = Some(baseline_status.clone());
+                        match &baseline_status {
+                            crate::gui::worker::BaselineFetchStatus::Complete => {
+                                self.status_msg = "Đã đăng nhập · Sẵn sàng".into();
                             }
-                        }
-                        if !preload_threads.is_empty() {
-                            if self.threads.is_empty() {
-                                self.threads = preload_threads;
-                            } else {
-                                for thread in preload_threads {
-                                    if let Some(existing) = self.threads.iter_mut().find(|t| {
-                                        crate::chat::threads_represent_same_contact(t, &thread)
-                                    }) {
-                                        crate::chat::merge_cached_thread_into(existing, thread);
-                                    } else {
-                                        self.threads.push(thread);
-                                    }
-                                }
+                            crate::gui::worker::BaselineFetchStatus::Partial { preview_error } => {
+                                self.status_msg =
+                                    format!("Dữ liệu một phần ({preview_error}) · Đang lấy bù…");
                             }
-                            crate::chat::deduplicate_threads(&mut self.threads, None);
+                            crate::gui::worker::BaselineFetchStatus::Offline { error } => {
+                                self.status_msg = format!("Ngoại tuyến: {error}");
+                            }
+                            crate::gui::worker::BaselineFetchStatus::Failed { error } => {
+                                self.status_msg = format!("Lỗi tải dữ liệu: {error}");
+                            }
+                            crate::gui::worker::BaselineFetchStatus::Empty => {
+                                self.status_msg = "Đã kiểm tra dữ liệu hội thoại".into();
+                            }
+                            crate::gui::worker::BaselineFetchStatus::AccountChanged => {}
                         }
+                        self.merge_startup_threads(preload_threads);
                         if let StartupState::Loading {
                             prerequisites_settled,
                             started_at,
@@ -4287,10 +4448,43 @@ impl ZaloGuiApp {
                             *prerequisites_settled = true;
                             *started_at = std::time::Instant::now();
                             if !self.server_config.o2o.keep_loading_during_preload.enable {
-                                self.startup_state = StartupState::Ready;
+                                self.enter_ready_state();
                             }
                         }
                         self.try_trigger_pending_auto_sync();
+                    }
+                }
+                GuiEvent::StartupBaselineUpdated {
+                    owner,
+                    runtime_id,
+                    threads,
+                    status,
+                } => {
+                    if self.is_logged_in
+                        && owner == self.user_uin
+                        && runtime_id == self.account_runtime_id
+                        && status != worker::BaselineFetchStatus::AccountChanged
+                    {
+                        self.merge_startup_threads(threads);
+                        self.status_msg = match &status {
+                            worker::BaselineFetchStatus::Complete => {
+                                "Đã cập nhật dữ liệu hội thoại".into()
+                            }
+                            worker::BaselineFetchStatus::Empty => {
+                                "Đã kiểm tra dữ liệu hội thoại".into()
+                            }
+                            worker::BaselineFetchStatus::Partial { .. } => {
+                                "Dữ liệu hội thoại vẫn chưa đầy đủ; có thể tải lại".into()
+                            }
+                            worker::BaselineFetchStatus::Offline { .. } => {
+                                "Chưa kết nối được máy chủ; giữ dữ liệu hiện có".into()
+                            }
+                            worker::BaselineFetchStatus::Failed { .. } => {
+                                "Chưa tải được dữ liệu hội thoại; có thể tải lại".into()
+                            }
+                            worker::BaselineFetchStatus::AccountChanged => continue,
+                        };
+                        self.startup_baseline_status = Some(status);
                     }
                 }
                 GuiEvent::StartupPreloadSettled { owner, runtime_id } => {
@@ -4307,11 +4501,11 @@ impl ZaloGuiApp {
                         {
                             if *prerequisites_settled {
                                 if !self.server_config.o2o.keep_loading_during_preload.enable {
-                                    self.startup_state = StartupState::Ready;
+                                    self.enter_ready_state();
                                 } else {
                                     let delay = self.server_config.o2o.screen_dismiss_delay();
                                     if delay.is_zero() {
-                                        self.startup_state = StartupState::Ready;
+                                        self.enter_ready_state();
                                     } else {
                                         *stage_text = "Đã sẵn sàng…".into();
                                         *settle_deadline = Some(std::time::Instant::now() + delay);
@@ -4567,7 +4761,18 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::SessionExpired(reason) => {
+                GuiEvent::SessionExpired {
+                    owner,
+                    runtime_id,
+                    reason,
+                } => {
+                    if !self.is_logged_in
+                        || owner != self.user_uin
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    self.startup_baseline_status = None;
                     self.cancel_voice_recording();
                     self.auth_request_generation = self.auth_request_generation.wrapping_add(1);
                     self.auth_in_progress = false;
@@ -5094,7 +5299,16 @@ impl ZaloGuiApp {
                             }
                         }
                         Ok(tools_panel::ToolsResult::Status(message)) => {
+                            let imported = message.contains("thành công")
+                                || message.contains("hoàn tất")
+                                || message.contains("Đã nhập");
                             self.tools.status = message;
+                            if imported {
+                                self.invalidate_history_search();
+                                if let Some(tx) = WORKER_TX.get() {
+                                    let _ = tx.send(WorkerCmd::RefreshThreads);
+                                }
+                            }
                         }
                         Err(error) => {
                             if self.history_search.open {
@@ -5699,8 +5913,21 @@ impl ZaloGuiApp {
                         }
                     }
                 }
-                GuiEvent::ServerPins { owner, snapshot } => {
-                    if owner == self.user_uin && self.is_logged_in {
+                GuiEvent::ServerPins {
+                    owner,
+                    runtime_id,
+                    revision,
+                    cached,
+                    snapshot,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                        && revision >= self.pins_revision
+                        && !(cached && self.pins_authoritative)
+                    {
+                        self.pins_revision = revision;
+                        self.pins_authoritative |= !cached;
                         self.server_pins = snapshot;
                     }
                 }
@@ -7653,6 +7880,11 @@ impl eframe::App for ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
+    pub(crate) fn enter_ready_state(&mut self) {
+        self.startup_state = StartupState::Ready;
+        self.request_my_documents_usage();
+    }
+
     /// Non-blocking startup progression; `FatalError` never times out into `Ready`.
     pub(crate) fn advance_startup_state(&mut self, now: std::time::Instant, ctx: &egui::Context) {
         self.advance_sync_suggestion_timer(now, ctx);
@@ -7698,18 +7930,18 @@ impl ZaloGuiApp {
             }
 
             if !self.server_config.o2o.keep_loading_during_preload.enable {
-                self.startup_state = StartupState::Ready;
+                self.enter_ready_state();
                 return;
             }
 
             if now.saturating_duration_since(*started_at) >= *timeout {
-                self.startup_state = StartupState::Ready;
+                self.enter_ready_state();
                 return;
             }
 
             if let Some(deadline) = settle_deadline {
                 if now >= *deadline {
-                    self.startup_state = StartupState::Ready;
+                    self.enter_ready_state();
                 } else {
                     ctx.request_repaint_after(deadline.saturating_duration_since(now));
                 }
@@ -8602,28 +8834,42 @@ mod settings_layout_tests {
             shots: 0,
             switch_at: 0,
         });
-        for size in [[480.0, 360.0], [1020.0, 700.0], [320.0, 240.0]] {
-            for tab in [
-                SettingsTab::General,
-                SettingsTab::AccountSecurity,
-                SettingsTab::Privacy,
-                SettingsTab::Sync,
-                SettingsTab::Appearance,
-                SettingsTab::Notifications,
-                SettingsTab::Messages,
-                SettingsTab::Utilities,
-            ] {
-                app.settings_tab = tab;
-                for frame in 0..6 {
-                    app.smoke.as_mut().unwrap().frames = frame;
-                    let input = egui::RawInput {
-                        screen_rect: Some(Rect::from_min_size(
-                            Pos2::ZERO,
-                            Vec2::new(size[0], size[1]),
-                        )),
-                        ..Default::default()
-                    };
-                    let _ = ctx.run(input, |ctx| app.render_settings_modal(ctx, &app.palette()));
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            for size in [[480.0, 360.0], [1020.0, 700.0], [320.0, 240.0]] {
+                for tab in [
+                    SettingsTab::General,
+                    SettingsTab::AccountSecurity,
+                    SettingsTab::Privacy,
+                    SettingsTab::Sync,
+                    SettingsTab::DataManagement,
+                    SettingsTab::Appearance,
+                    SettingsTab::Notifications,
+                    SettingsTab::Messages,
+                    SettingsTab::Calls,
+                    SettingsTab::Utilities,
+                ] {
+                    app.settings_tab = tab;
+                    for frame in 0..6 {
+                        app.smoke.as_mut().unwrap().frames = frame;
+                        let input = egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                Pos2::ZERO,
+                                Vec2::new(size[0], size[1]),
+                            )),
+                            ..Default::default()
+                        };
+                        let _ =
+                            ctx.run(input, |ctx| app.render_settings_modal(ctx, &app.palette()));
+                    }
+                    let screen = ctx.screen_rect();
+                    let window_rect = ctx
+                        .memory(|mem| mem.area_rect(egui::Id::new("settings_window_modal")))
+                        .expect("settings modal area_rect");
+                    assert!(
+                        screen.contains_rect(window_rect),
+                        "settings modal {window_rect:?} exceeded screen {screen:?} at scale {scale} size {size:?} tab {tab:?}"
+                    );
                 }
             }
         }
@@ -8952,6 +9198,87 @@ mod history_residency_benchmark {
 mod conversation_menu_event_tests {
     use super::*;
     #[test]
+    fn startup_metadata_rejects_old_runtime_and_old_cache_revision() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        let values = HashMap::from([(
+            "thread".into(),
+            crate::store::ConversationPreference {
+                muted: true,
+                ..Default::default()
+            },
+        )]);
+        let pins = crate::server_pins::Snapshot {
+            version: 1,
+            conversations: vec!["u12".into()],
+        };
+        for (runtime_id, revision) in [(7, 20), (6, 100), (7, 10)] {
+            app.event_tx
+                .send(GuiEvent::ConversationPreferences {
+                    owner: "owner".into(),
+                    runtime_id,
+                    revision,
+                    values: if revision == 20 {
+                        values.clone()
+                    } else {
+                        HashMap::new()
+                    },
+                })
+                .unwrap();
+            app.event_tx
+                .send(GuiEvent::ServerPins {
+                    owner: "owner".into(),
+                    runtime_id,
+                    revision,
+                    cached: revision != 20,
+                    snapshot: if revision == 20 {
+                        pins.clone()
+                    } else {
+                        Default::default()
+                    },
+                })
+                .unwrap();
+            app.event_tx
+                .send(GuiEvent::HiddenUnreadAcknowledged {
+                    owner: "owner".into(),
+                    runtime_id,
+                    timestamp_ms: if revision == 20 {
+                        2000
+                    } else if runtime_id == 6 {
+                        9000
+                    } else {
+                        1000
+                    },
+                })
+                .unwrap();
+            app.check_events(&ctx);
+        }
+        app.event_tx
+            .send(GuiEvent::ServerPins {
+                owner: "owner".into(),
+                runtime_id: 7,
+                revision: 1000,
+                cached: true,
+                snapshot: Default::default(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.conversation_preferences, values);
+        assert_eq!(app.server_pins.conversations, pins.conversations);
+        assert_eq!(app.hidden_unread_last_ack_ts, 2000);
+        assert!(app.hidden_unread_ack_ready);
+    }
+
+    #[test]
     fn preferences_reject_stale_account_events_and_survive_history_refresh() {
         let ctx = egui::Context::default();
         let session = Session::new(false, false, false).unwrap();
@@ -8971,6 +9298,8 @@ mod conversation_menu_event_tests {
         sender
             .send(GuiEvent::ConversationPreferences {
                 owner: "different-owner".into(),
+                runtime_id: app.account_runtime_id,
+                revision: crate::search::generation(),
                 values: values.clone(),
             })
             .unwrap();
@@ -8979,6 +9308,8 @@ mod conversation_menu_event_tests {
         sender
             .send(GuiEvent::ConversationPreferences {
                 owner: "fixture-owner".into(),
+                runtime_id: app.account_runtime_id,
+                revision: crate::search::generation(),
                 values: values.clone(),
             })
             .unwrap();
@@ -10012,6 +10343,66 @@ mod v008_account_boundary_tests {
             .unwrap();
         app.check_events(&ctx);
         assert!(!app.private_access("12", false));
+    }
+    #[test]
+    fn hidden_chat_unread_search_indicator_lifecycle_and_privacy_invariants() {
+        let (_ctx, mut app) = app();
+        app.hidden_unread_ack_ready = true;
+        app.hidden_panel.view = crate::hidden_chat::Snapshot {
+            ready: true,
+            unlocked: false,
+            ids: std::collections::HashSet::from(["u12".into()]),
+            ..Default::default()
+        };
+        let t12 = Thread {
+            id: "12".into(),
+            name: "Secret Contact".into(),
+            is_group: false,
+            presentation: crate::chat::SidebarPresentation {
+                last_message_ts: 1_700_000_000_000,
+                ..Default::default()
+            },
+            unread: crate::unread::UnreadState {
+                unread_ids: std::collections::BTreeSet::from(["m1".into()]),
+                muted: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        app.threads = vec![t12];
+
+        // 1. Unmuted unread hidden chat triggers indicator
+        let (has_unread, max_ts) = app.has_unacknowledged_hidden_unread();
+        assert!(has_unread);
+        assert_eq!(max_ts, 1_700_000_000_000);
+
+        // 2. Acknowledgment clears the indicator
+        app.hidden_unread_last_ack_ts = max_ts;
+        let (has_unread_after_ack, _) = app.has_unacknowledged_hidden_unread();
+        assert!(!has_unread_after_ack);
+
+        // 3. A newer message (ts = 1_700_000_005_000) re-triggers the indicator
+        app.threads[0].presentation.last_message_ts = 1_700_000_005_000;
+        let (has_new_unread, new_max_ts) = app.has_unacknowledged_hidden_unread();
+        assert!(has_new_unread);
+        assert_eq!(new_max_ts, 1_700_000_005_000);
+
+        // 4. Muted hidden chat does NOT trigger indicator
+        app.threads[0].unread.muted = true;
+        let (has_muted_unread, _) = app.has_unacknowledged_hidden_unread();
+        assert!(!has_muted_unread);
+
+        // 5. Unlocking the hidden vault suppresses the indicator
+        app.threads[0].unread.muted = false;
+        app.hidden_panel.view.unlocked = true;
+        let (has_unlocked_unread, _) = app.has_unacknowledged_hidden_unread();
+        assert!(!has_unlocked_unread);
+
+        // 6. Resetting account state clears ack_ts
+        app.hidden_panel.view.unlocked = false;
+        app.hidden_unread_last_ack_ts = 5000;
+        app.clear_presence_state();
+        assert_eq!(app.hidden_unread_last_ack_ts, 0);
     }
     #[test]
     fn group_control_aliases_clear_permissions_and_ignore_an_old_policy_response() {
@@ -11350,6 +11741,7 @@ mod startup_and_server_config_tests {
                         id: "stale-thread".into(),
                         ..Default::default()
                     }],
+                    baseline_status: crate::gui::worker::BaselineFetchStatus::Complete,
                 })
                 .unwrap();
         }
@@ -11404,6 +11796,7 @@ mod startup_and_server_config_tests {
                         ..Default::default()
                     },
                 ],
+                baseline_status: crate::gui::worker::BaselineFetchStatus::Complete,
             })
             .unwrap();
         app.check_events(&ctx);
@@ -11482,6 +11875,7 @@ mod startup_and_server_config_tests {
                     name: "Bạn bè".into(),
                     ..Default::default()
                 }],
+                baseline_status: crate::gui::worker::BaselineFetchStatus::Complete,
             })
             .unwrap();
         app.check_events(&ctx);
@@ -12350,6 +12744,7 @@ mod startup_and_server_config_tests {
                 owner: "3001".into(),
                 runtime_id: app.account_runtime_id,
                 preload_threads: Vec::new(),
+                baseline_status: crate::gui::worker::BaselineFetchStatus::Complete,
             })
             .unwrap();
         app.check_events(&ctx);
@@ -12385,6 +12780,7 @@ mod startup_and_server_config_tests {
                 owner: "3001".into(),
                 runtime_id: app.account_runtime_id,
                 preload_threads: Vec::new(),
+                baseline_status: crate::gui::worker::BaselineFetchStatus::Complete,
             })
             .unwrap();
         app.check_events(&ctx);
@@ -12393,5 +12789,246 @@ mod startup_and_server_config_tests {
             StartupState::Ready,
             "when keep_loading_during_preload is disabled, settling prerequisites transitions immediately to Ready"
         );
+    }
+}
+
+#[cfg(test)]
+mod baseline_backfill_remediation_tests {
+    use super::*;
+    #[test]
+    fn data_operation_pending_is_not_controlled_by_status_or_stale_completions() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        app.history_search.open = true;
+        app.history_search.status = "search still active".into();
+        app.tools.status = "Đang tải một tác vụ khác".into();
+        assert!(app.tools_command(tools_panel::ToolsCommand::ExportHistory));
+        let generation = app.tools.data_pending.unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), WorkerCmd::ToolsData { runtime_id: 7, generation: actual, .. } if actual == generation)
+        );
+        app.event_tx
+            .send(GuiEvent::Tools {
+                owner: "owner".into(),
+                result: Ok(tools_panel::ToolsResult::Status(
+                    "Unrelated completion".into(),
+                )),
+            })
+            .unwrap();
+        for (owner, runtime_id, request) in [
+            ("owner", 6, generation),
+            ("other", 7, generation),
+            ("owner", 7, generation + 1),
+        ] {
+            app.event_tx
+                .send(GuiEvent::ToolsData {
+                    owner: owner.into(),
+                    runtime_id,
+                    generation: request,
+                    result: Ok(tools_panel::ToolsResult::Status("Wrong completion".into())),
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert_eq!(app.tools.data_pending, Some(generation));
+        assert!(!app.tools_command(tools_panel::ToolsCommand::Import {
+            directory: false,
+            confirmed: true
+        }));
+        assert!(rx.try_recv().is_err());
+        app.event_tx
+            .send(GuiEvent::ToolsData {
+                owner: "owner".into(),
+                runtime_id: 7,
+                generation,
+                result: Err("fixture persistence failure".into()),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.tools.data_pending, None);
+        assert_eq!(app.tools.status, "fixture persistence failure");
+        assert_eq!(app.history_search.status, "search still active");
+        assert!(app.tools_command(tools_panel::ToolsCommand::Import {
+            directory: true,
+            confirmed: true
+        }));
+        WORKER_TX.clear();
+    }
+
+    #[test]
+    fn late_session_expiry_cannot_log_out_replacement_runtime() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 8;
+        app.startup_state = StartupState::Ready;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        WORKER_TX.set(worker::WorkerSender::new_for_test(tx, ctx.clone()));
+        for (owner, runtime_id) in [("owner", 7), ("other", 8)] {
+            app.event_tx
+                .send(GuiEvent::SessionExpired {
+                    owner: owner.into(),
+                    runtime_id,
+                    reason: "stale".into(),
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert!(app.is_logged_in);
+        assert_eq!(app.account_runtime_id, 8);
+        assert_eq!(app.startup_state, StartupState::Ready);
+        assert!(
+            rx.try_recv().is_err(),
+            "late expiry must not dispatch logout"
+        );
+        app.event_tx
+            .send(GuiEvent::SessionExpired {
+                owner: "owner".into(),
+                runtime_id: 8,
+                reason: "expired".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(!app.is_logged_in);
+        assert!(matches!(rx.try_recv().unwrap(), WorkerCmd::Logout));
+        WORKER_TX.clear();
+    }
+
+    #[test]
+    fn baseline_status_is_cleared_at_account_and_runtime_boundaries() {
+        for event in [
+            GuiEvent::LoggedOut,
+            GuiEvent::SessionExpired {
+                owner: "owner".into(),
+                runtime_id: 7,
+                reason: "Phiên đã hết hạn".into(),
+            },
+            GuiEvent::LoginSuccess {
+                name: "Test".into(),
+                uin: "owner".into(),
+                avatar: None,
+                runtime_id: 8,
+                composer_config: None,
+            },
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = ZaloGuiApp::from_context(
+                &ctx,
+                Session::new(false, false, false).unwrap(),
+                false,
+                vec![],
+                false,
+            );
+            app.is_logged_in = true;
+            app.user_uin = "owner".into();
+            app.account_runtime_id = 7;
+            app.startup_baseline_status = Some(worker::BaselineFetchStatus::Partial {
+                preview_error: "old runtime".into(),
+            });
+            app.event_tx.send(event).unwrap();
+            app.check_events(&ctx);
+            assert!(app.startup_baseline_status.is_none());
+        }
+    }
+
+    #[test]
+    fn baseline_backfill_rejects_old_runtime_and_preserves_live_messages() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner".into();
+        app.account_runtime_id = 7;
+        app.startup_state = StartupState::Ready;
+        app.threads = vec![Thread {
+            id: "friend".into(),
+            name: "Live name".into(),
+            messages: vec![ChatMessage {
+                id: "live".into(),
+                text: "live".into(),
+                ts: 1800000002000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        for (owner, runtime_id) in [("other", 7), ("owner", 6)] {
+            app.event_tx
+                .send(GuiEvent::StartupBaselineUpdated {
+                    owner: owner.into(),
+                    runtime_id,
+                    threads: vec![Thread {
+                        id: "foreign".into(),
+                        ..Default::default()
+                    }],
+                    status: worker::BaselineFetchStatus::Complete,
+                })
+                .unwrap();
+        }
+        app.check_events(&ctx);
+        assert_eq!(app.threads.len(), 1);
+        assert!(app.startup_baseline_status.is_none());
+        app.deleted_message_ids
+            .insert(("friend".into(), "deleted".into()));
+        app.event_tx
+            .send(GuiEvent::StartupBaselineUpdated {
+                owner: "owner".into(),
+                runtime_id: 7,
+                threads: vec![Thread {
+                    id: "friend".into(),
+                    name: "Old name".into(),
+                    messages: vec![
+                        ChatMessage {
+                            id: "old".into(),
+                            text: "old".into(),
+                            ts: 1800000000000,
+                            ..Default::default()
+                        },
+                        ChatMessage {
+                            id: "deleted".into(),
+                            text: "deleted".into(),
+                            ts: 1800000001000,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                status: worker::BaselineFetchStatus::Partial {
+                    preview_error: "fixture".into(),
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.threads[0].name, "Live name");
+        assert!(app.threads[0].messages.iter().any(|m| m.id == "live"));
+        assert!(app.threads[0].messages.iter().any(|m| m.id == "old"));
+        assert!(!app.threads[0].messages.iter().any(|m| m.id == "deleted"));
+        assert!(matches!(
+            app.startup_baseline_status,
+            Some(worker::BaselineFetchStatus::Partial { .. })
+        ));
+        assert_eq!(app.startup_state, StartupState::Ready);
     }
 }

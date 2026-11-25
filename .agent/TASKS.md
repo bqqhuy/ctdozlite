@@ -1,63 +1,43 @@
-# .agent/TASKS.md - Trạng thái Kế hoạch Toàn diện Zalo Parity
+# .agent/TASKS.md - Danh sách Nhiệm vụ & Trạng thái Thực thi (Codex Implementation Plan)
 
-## Phase 1 (P0): Triệt tiêu lỗi chuông VoIP dai dẳng & Device Preflight
-- [x] Task 1.0: Trình ADVISOR phê duyệt Phase 1 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 1.1: Sửa khớp danh tính `actor_is_self` (`src/call.rs`, `src/call_lifecycle.rs`)
-- [x] Task 1.2: Xử lý `ReceiveCall` (nghe nơi khác), `MissCall`, dừng stream CPAL & đóng modal (`src/gui/worker.rs`, `src/gui.rs`, `src/media.rs`)
-- [x] Task 1.3: Watchdog timer 65s ngắt chuông an toàn & Window close handler (`src/gui/modals.rs`, `src/gui.rs`)
-- [x] Task 1.4: Preflight Dialog kiểm tra Mic/Loa trước khi gọi (`src/gui.rs`, `src/gui/modals.rs`, `src/gui/workspace.rs`)
-- [x] Task 1.5: Review độc lập Reviewer A & Reviewer B cho Phase 1 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 1.6: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
+> [!NOTE]
+> **LỊCH SỬ CŨ (HISTORICAL / SUPERSEDED)**: Các nhiệm vụ T-01 đến T-10 thuộc đợt audit trước đã hoàn tất và đạt 2 lượt APPROVE liên tiếp vào ngày 24/11/2026. Lịch sử được lưu tại [REVIEW_LOG.md](file:///c:/Projects/ZaloLite/.agent/REVIEW_LOG.md).
+> Dưới đây là danh sách công việc cho đợt triển khai phương án Codex:
 
-## Phase 2 (P0): Tái thiết kế Toàn diện Composer & Đính kèm Tệp (E1 Parity)
-- [x] Task 2.0: Trình ADVISOR phê duyệt chi tiết Phase 2 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 2.1: Toolbar 9 nút chuẩn & popup menu con (...) (`src/gui/workspace.rs`)
-- [x] Task 2.2: Gỡ bỏ chặn gửi file với caption text (`src/gui/file_drop.rs:548-570`)
-- [x] Task 2.3: Tái cấu trúc khu vực thẻ tệp chờ: header Xóa tất cả, thẻ vuông 72x72px bo góc 8px kèm nút X, nút + nét đứt (`src/gui/file_drop.rs`)
-- [x] Task 2.4: Chuyển đổi Nút Thích -> Gửi xanh Zalo khi có file/text; sticker gợi ý nổi; @ mention menu (`src/gui/workspace.rs`)
-- [x] Task 2.5: Modal chọn gửi danh thiếp chuẩn Zalo với search + filter chips (`src/gui/workspace.rs`, `src/gui.rs`)
-- [x] Task 2.6: Review độc lập Reviewer A & Reviewer B cho Phase 2 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 2.7: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
+---
 
-## Phase 3 (P0): Tương tác Tin nhắn Chuẩn UX Zalo & Vòng đời Tệp Local
-- [x] Task 3.0: Trình ADVISOR phê duyệt chi tiết Phase 3 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 3.1: Xóa bỏ trễ hover 150ms (`src/gui/messages.rs`)
-- [x] Task 3.2: Thanh công cụ MQA nổi `80×24px` (`src/gui/messages.rs`, `src/gui/theme.rs`)
-- [x] Task 3.3: Menu Reaction Capsule `236×38px` với 6 emoji zoom 1.25x (`src/gui/messages.rs`)
-- [x] Task 3.4: Reaction Pill Badge đè 12px mép đáy bubble tin nhắn (`src/gui/messages.rs`)
-- [x] Task 3.5: Mở tệp trực tiếp (tệp gửi mở `file_path` ổ cứng, tệp nhận tự lưu cache `%TEMP%` và mở) (`src/gui/messages.rs`, `src/gui/workspace.rs`)
-- [x] Task 3.6: Review độc lập Reviewer A & Reviewer B cho Phase 3 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 3.7: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
+## Bảng Trạng thái Công việc (Job Status Table)
 
-## Phase 4 (P1): Đấu nối 5 Luồng Đồng bộ Server & Xã hội Bị Bỏ Quên
-- [x] Task 4.0: Trình ADVISOR phê duyệt chi tiết Phase 4 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 4.1: Đánh dấu chưa đọc thủ công 2 chiều (`getUnreadMark`, `addUnreadMark`, `removeUnreadMark`) (`src/gui/worker.rs`, `src/gui/workspace.rs`)
-- [x] Task 4.2: Chat ẩn đồng bộ mã PIN Server (`hiddenconvers/get-all`, `update-pin`) (`src/gui/worker.rs`, `src/gui/workspace.rs`)
-- [x] Task 4.3: Đồng bộ danh sách Hội thoại Đã lưu trữ (`archivedchat/list`, `archivedchat/update`) (`src/gui/worker.rs`, `src/gui/workspace.rs`)
-- [x] Task 4.4: Đồng bộ Nhãn hội thoại (`convlabel/get`, `convlabel/update`) (`src/gui/worker.rs`, `src/gui/workspace.rs`)
-- [x] Task 4.5: Trạng thái Online / Last Seen (`lastOnline`) & Mute hội thoại (`getmute`) (`src/gui/worker.rs`, `src/gui/workspace.rs`, `src/gui.rs`)
-- [x] Task 4.6: Review độc lập Reviewer A & Reviewer B cho Phase 4 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 4.7: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
+| Job ID | Task / Patch | Vai trò | Model thực tế | File được cấp quyền (Lease) | Mục tiêu | Trạng thái |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **J-00** | UXS-00 | SCOUT / Orchestrator | `flash_lite` & `gemini-4-carbon-high` | Read-only | Khảo sát `modals.rs`, `tools_panel.rs`, lập bảng inventory | **DONE** |
+| **J-01** | Patch P1 (UXS-01) | WORKER_LOGIC | `gemini-4-hydrogen-medium` | `src/gui/modals.rs`, `src/gui.rs`, `src/gui/theme.rs` | Thích ứng sidebar compact 48px, menu dropdown có chữ khi compact, bọc `ScrollArea::vertical` nội dung | **DONE** |
+| **J-02** | Patch P2 (UXS-02) | WORKER_LOGIC | `gemini-4-hydrogen-medium` | `src/gui/modals.rs`, `src/gui/tools_panel.rs`, `src/gui.rs` | Di chuyển thao tác Backup / Import / Export sang `SettingsTab::DataManagement` thật; single-flight | **DONE** |
+| **J-03** | Patch P3 (UXS-04) | WORKER_LOGIC | `gemini-4-hydrogen-medium` | `src/gui/worker.rs` | Downcast `reqwest::Error` & `RequestDeadlineElapsed` phân loại `Offline`; tối ưu `RefreshThreads` | **DONE** |
+| **J-04** | Gate B3 | Orchestrator | `gemini-4-carbon-high` | Read-only | Chạy fmt, check, clippy, unit test lib 1173 passed, và `audit-prepush.ps1` hard gates pass | **DONE** |
+| **J-05** | Dual Review B4 | REVIEWER_A & B | `gemini-4-carbon-high` & `claude-opus-5-5-high` | Read-only | Rà soát độc lập 2 lượt liên tiếp sạch lỗi (APPROVE kép Lượt 2 & Lượt 3) | **DONE** |
+| **J-06** | Handoff B5 | Orchestrator | `gemini-4-carbon-high` | `.agent/`, `specs/` | Lập biên bản nghiệm thu, tổng hợp hồ sơ sẵn sàng cho Codex audit | **DONE** |
+| **J-07** | Startup & Cache Parity Remediation | WORKER_LOGIC | `gemini-4-hydrogen-medium` | `src/gui/worker.rs`, `src/gui.rs`, `src/gui/workspace.rs` | Tách kết quả per-source (`SourceFetchStatus`), cache usability cấu trúc, preview độc lập danh bạ, fenced backfill, 6 controlled mock pipeline tests | **DONE** |
+| **J-08** | Automated Gate Verification | Orchestrator | `gemini-4-carbon-high` | Read-only | fmt, check, clippy (0 warnings), `cargo test --lib` 1178 passed (11 ignored), prepush audit hard gates passed | **DONE** |
 
-## Phase 5 (P1): Tin nhắn Thoại Native & Dịch thuật Giọng nói AI
-- [x] Task 5.0: Trình ADVISOR phê duyệt chi tiết Phase 5 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 5.1: Thanh ghi âm Composer bám đáy (đếm giây, sóng VU meter qua `cpal`)
-- [x] Task 5.2: Gửi tin thoại chuẩn giao thức (DM CMD 11148, Group CMD 11169)
-- [x] Task 5.3: Waveform Bubble Player & Nút AI dịch giọng nói (CMD 13394)
-- [x] Task 5.4: Review độc lập Reviewer A & Reviewer B cho Phase 5 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 5.5: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
 
-## Phase 6 (P1/P2): zCloud Rehydration, E2EE Realtime Push (CMD 551), Retry Động & Bố cục Responsive
-- [x] Task 6.0: Trình ADVISOR phê duyệt chi tiết Phase 6 (ĐÃ PHÊ DUYỆT: PLAN_APPROVED)
-- [x] Task 6.1: Kích hoạt giải mã realtime WebSocket Push CMD 551 (`CMD_SIGNAL_RECEIVE_1_1`)
-- [x] Task 6.2: Phục hồi zCloud Media theo yêu cầu (`verifyCloudMedia`, `getDownloadUrlByNoiseIds`)
-- [x] Task 6.3: Cấu hình Retry động `[10, 35, 40, 45, 50, 60]`, Gateway Fallback (`chat-wpa.zalo.me`), `alias/list/v2`
-- [x] Task 6.4: Bố cục Responsive & Narrow Mode cho màn hình nhỏ (< 720px thu gọn sidebar về 72px)
-- [x] Task 6.5: Review độc lập Reviewer A & Reviewer B cho Phase 6 (ĐỒNG THUẬN: PASS / PASS)
-- [x] Task 6.6: Prepush check (`powershell scripts/audit-prepush.ps1` - HARD GATES PASSED)
+## Codex remediation — 25/11/2026 (không kế thừa APPROVE của candidate cũ)
 
-## Phase 7 (Audit Remediation): Sửa Ba Hồi quy Audit 24/11/2026
-- [x] Task 7.1: Metadata Snapshot Overwrite (Monotonic Revisions `revision: u64`, `mutation: bool`, loại bỏ `generation = 0` wildcard, gating `AccountMetadata` & cache restore)
-- [x] Task 7.2: Preflight / Mic Lifecycle across Account Boundaries (`owner`, `runtime_id` trên `PreflightCallState`, `WorkerCmd::StartCall`, dọn dẹp khi logout/expiry/switch, mock seam CPAL)
-- [x] Task 7.3: Presence Cache & Privacy Gating (Session fencing `owner`, `runtime_id` trên `ActivityUpdated`, cổng cứng `show_online == Some(true)` trên Header / Online Dot)
-- [x] Task 7.4: Kiểm chứng toàn diện (Full lib test suite 1144 passed, integration `desktop_backup_v2` 4 passed, stress 10 rounds x 8 threads 16/16 passed, clippy 0 warning, fmt & git diff check sạch)
+- Phạm vi: startup/cache/backfill và pending data operation của Settings.
+- Chi tiết finding/candidate/checks: `docs/research/2026-11-25-startup-settings-remediation.md`.
+- Trạng thái: ACCEPTED_SCOPED (CODE/FIXTURE): 1185 library passed/11 ignored,
+  backup 4 passed, stress 200 passed, Clippy/fmt/diff-check PASS; hai audit cùng Codex
+  trên cùng fingerprint, không phải review kép cross-model. Native vẫn pending.
+- Giữ nguyên task native và UXS chưa triển khai; không commit/push/release.
+
+
+## Codex combined session/startup — 25/11/2026
+
+ACCEPTED_SCOPED (CODE/FIXTURE), candidate
+`271610c1f91ad9859bc782830fe683cbca7b86650d2afe7b7433956fbae3db87`.
+Hồ sơ: `docs/research/2026-11-25-session-startup-combined-audit.md`.
+1192 library passed/11 ignored; 260 stress passed; storage/backup integration 6 passed.
+Clippy all-targets -D warnings, fmt, diff-check PASS. Integration LNK4199 DELAYLOAD
+warning được ghi nhận trong hồ sơ. Hai lượt scoped sạch cùng Codex trên cùng source;
+không phải review kép cross-model, không cộng candidate cũ. Native GUI/phone/Web và
+các UXS còn mở vẫn pending. Không commit/merge/push/tag/release.

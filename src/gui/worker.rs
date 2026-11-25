@@ -361,6 +361,12 @@ pub enum WorkerCmd {
         path: std::path::PathBuf,
         folder: bool,
     },
+    ToolsData {
+        owner: String,
+        runtime_id: usize,
+        generation: u64,
+        command: super::tools_panel::ToolsCommand,
+    },
     Tools {
         owner: String,
         command: super::tools_panel::ToolsCommand,
@@ -404,6 +410,10 @@ pub enum WorkerCmd {
         pass: String,
     },
     RefreshThreads,
+    RefreshThreadsFenced {
+        owner: String,
+        runtime_id: usize,
+    },
     ListSettingsDevices {
         generation: u64,
         refresh: bool,
@@ -487,8 +497,20 @@ pub enum WorkerCmd {
     SyncPhoneHistory {
         range_days: u32,
     },
+    SyncPhoneHistoryFenced {
+        owner: String,
+        runtime_id: usize,
+        range_days: u32,
+        origin: crate::sync_coordinator::SyncOrigin,
+    },
     RescanPhoneHistory {
         range_days: u32,
+    },
+    /// Persist only a hidden-message notification watermark in the initiating account's store.
+    AcknowledgeHiddenUnread {
+        owner: String,
+        runtime_id: usize,
+        timestamp_ms: i64,
     },
     SyncPhoneRecent,
     SyncPhoneRecentFenced {
@@ -1770,6 +1792,37 @@ fn current_sync_availability(
     )
 }
 
+type StartupCache = (
+    Vec<Thread>,
+    HashMap<String, crate::store::ConversationPreference>,
+    Option<crate::server_pins::Snapshot>,
+    i64,
+    u64,
+);
+
+fn load_startup_cache(account: &Session) -> anyhow::Result<StartupCache> {
+    use rusqlite::OptionalExtension;
+    let (store, _permit) = crate::store::MessageStore::open_for_account_write(account)?;
+    let mut threads = crate::chat::load_threads_cache_with_store(account, &store);
+    store.hydrate_threads(&mut threads, crate::store::MessageStore::PRELOAD_MSGS)?;
+    let preferences = store.conversation_preferences()?;
+    let raw: Option<String> = store
+        .conn
+        .query_row(
+            "SELECT value FROM tool_config WHERE key='server_pins'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok((
+        threads,
+        preferences,
+        raw.and_then(|value| serde_json::from_str(&value).ok()),
+        store.hidden_unread_ack()?,
+        crate::search::generation(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_startup_preload(
     session_arc: std::sync::Arc<tokio::sync::Mutex<Session>>,
@@ -1781,7 +1834,8 @@ async fn run_startup_preload(
     db_ready_runtime: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ws_ready_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let s = session_arc.lock().await.clone();
+    let initial = session_arc.lock().await;
+    let s = initial.clone();
     if !s.is_active() || s.login.is_none() || s.account_key().is_empty() {
         db_ready_runtime.store(0, std::sync::atomic::Ordering::Release);
         return;
@@ -1807,19 +1861,14 @@ async fn run_startup_preload(
     });
     egui_ctx.request_repaint();
 
+    drop(initial);
+
     // 1. Open and migrate SQLite first; migration/schema errors are fatal and never degrade to Ready.
     let db_session = s.clone();
-    let db_preload = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Thread>> {
-        let (store, _write_permit) =
-            crate::store::MessageStore::open_for_account_write(&db_session)?;
-        let mut preload = crate::chat::load_threads_cache_with_store(&db_session, &store);
-        store.hydrate_threads(&mut preload, crate::store::MessageStore::PRELOAD_MSGS)?;
-        Ok(preload)
-    })
-    .await;
+    let db_preload = tokio::task::spawn_blocking(move || load_startup_cache(&db_session)).await;
 
-    let preload = match db_preload {
-        Ok(Ok(threads)) => threads,
+    let (preload, preferences, pins, hidden_ack, revision) = match db_preload {
+        Ok(Ok(res)) => res,
         Ok(Err(error)) => {
             crate::runtime_metrics::database_error(&error);
             if s.is_active() {
@@ -1844,7 +1893,33 @@ async fn run_startup_preload(
             return;
         }
     };
+    let current = session_arc.lock().await;
+    if !current.is_active() || current.account_key() != owner || current.runtime_id() != runtime_id
+    {
+        return;
+    }
+    live_updates.set_muted_versioned(&preferences, revision);
+    let _ = gui_tx.send(GuiEvent::ConversationPreferences {
+        owner: owner.clone(),
+        runtime_id,
+        revision,
+        values: preferences,
+    });
+    if let Some(snapshot) = pins {
+        let _ = gui_tx.send(GuiEvent::ServerPins {
+            owner: owner.clone(),
+            runtime_id,
+            revision,
+            cached: true,
+            snapshot,
+        });
+    }
     live_updates.seed(&preload);
+    let _ = gui_tx.send(GuiEvent::HiddenUnreadAcknowledged {
+        owner: owner.clone(),
+        runtime_id,
+        timestamp_ms: hidden_ack,
+    });
     db_ready_runtime.store(runtime_id, std::sync::atomic::Ordering::Release);
     let availability = current_sync_availability(
         &s,
@@ -1859,6 +1934,8 @@ async fn run_startup_preload(
         operation_id: 0,
         state: crate::sync_coordinator::SyncState::Idle { availability },
     });
+
+    drop(current);
 
     // 2. Refresh server configuration and apply it directly to the active Session.
     let _ = gui_tx.send(GuiEvent::StartupStage {
@@ -1937,15 +2014,692 @@ async fn run_startup_preload(
         guard.is_active() && guard.runtime_id() == runtime_id && guard.account_key() == owner
     };
     if still_active {
+        // Cached previews do not establish that contacts, groups and recent conversations
+        // are current. Refresh every runtime; retain cache on partial/offline results.
+        let (preload, baseline_status) = {
+            let _ = gui_tx.send(GuiEvent::StartupStage {
+                owner: owner.clone(),
+                runtime_id,
+                stage_text: "Đang tải danh bạ, nhóm và tin nhắn gần đây từ máy chủ…".into(),
+            });
+            egui_ctx.request_repaint();
+
+            // Each source has its own deadline. An outer deadline would discard successful
+            // sources while resolving names or waiting for a local write permit.
+            let report = fetch_baseline_startup_threads_reported(&s, &owner, runtime_id).await;
+            if baseline_auth_expired(&report.sources) {
+                reject_expired_startup(
+                    &session_arc,
+                    &s,
+                    &outgoing_lifecycle,
+                    &outgoing_identity,
+                    &db_ready_runtime,
+                    &gui_tx,
+                    &egui_ctx,
+                )
+                .await;
+                return;
+            }
+            let publishing = session_arc.lock().await;
+            if !publishing.is_active()
+                || publishing.account_key() != owner
+                || publishing.runtime_id() != runtime_id
+            {
+                return;
+            }
+
+            if let Some(err) = report.persist_error.as_deref() {
+                crate::logger::log_error(
+                    "startup baseline",
+                    &format!("Baseline persistence error: {err}"),
+                );
+            }
+            let status_clone = report.status.clone();
+            let cached_preload = preload.clone();
+            let mut final_preload = match report.status {
+                BaselineFetchStatus::AccountChanged => return,
+                BaselineFetchStatus::Complete => {
+                    let _ = gui_tx.send(GuiEvent::StartupStage {
+                        owner: owner.clone(),
+                        runtime_id,
+                        stage_text: "Đã nạp đầy đủ danh bạ và tin nhắn gần đây".into(),
+                    });
+                    egui_ctx.request_repaint();
+                    if !report.threads.is_empty() {
+                        live_updates.seed(&report.threads);
+                        report.threads
+                    } else {
+                        preload
+                    }
+                }
+                BaselineFetchStatus::Partial { ref preview_error } => {
+                    let _ = gui_tx.send(GuiEvent::StartupStage {
+                        owner: owner.clone(),
+                        runtime_id,
+                        stage_text: "Dữ liệu một phần; đang tiếp tục lấy bù…".into(),
+                    });
+                    egui_ctx.request_repaint();
+                    crate::logger::log_error(
+                        "startup baseline",
+                        &format!("Baseline partial failure: {preview_error}"),
+                    );
+                    // Schedule fenced background backfill task
+                    let bf_session = session_arc.clone();
+                    let bf_owner = owner.clone();
+                    let bf_runtime = runtime_id;
+                    let bf_gui_tx = gui_tx.clone();
+                    let bf_ctx = egui_ctx.clone();
+                    let bf_lifecycle = outgoing_lifecycle.clone();
+                    let bf_identity = outgoing_identity.clone();
+                    let bf_db_ready = db_ready_runtime.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        let s_bf = {
+                            let guard = bf_session.lock().await;
+                            if !guard.is_active()
+                                || guard.runtime_id() != bf_runtime
+                                || guard.account_key() != bf_owner
+                            {
+                                return;
+                            }
+                            guard.clone()
+                        };
+                        let bf_report =
+                            fetch_baseline_startup_threads_reported(&s_bf, &bf_owner, bf_runtime)
+                                .await;
+                        if baseline_auth_expired(&bf_report.sources) {
+                            reject_expired_startup(
+                                &bf_session,
+                                &s_bf,
+                                &bf_lifecycle,
+                                &bf_identity,
+                                &bf_db_ready,
+                                &bf_gui_tx,
+                                &bf_ctx,
+                            )
+                            .await;
+                            return;
+                        }
+                        publish_baseline_backfill(&s_bf, bf_report, &bf_gui_tx);
+                        bf_ctx.request_repaint();
+                    });
+                    if !report.threads.is_empty() {
+                        live_updates.seed(&report.threads);
+                        report.threads
+                    } else {
+                        preload
+                    }
+                }
+                BaselineFetchStatus::Offline { ref error } => {
+                    let _ = gui_tx.send(GuiEvent::StartupStage {
+                        owner: owner.clone(),
+                        runtime_id,
+                        stage_text: "Máy chủ chưa phản hồi; đang mở giao diện ngoại tuyến…".into(),
+                    });
+                    egui_ctx.request_repaint();
+                    crate::logger::log_error(
+                        "startup baseline",
+                        &format!("Baseline fetch offline: {error}"),
+                    );
+                    // Schedule fenced retry backfill
+                    let bf_session = session_arc.clone();
+                    let bf_owner = owner.clone();
+                    let bf_runtime = runtime_id;
+                    let bf_gui_tx = gui_tx.clone();
+                    let bf_ctx = egui_ctx.clone();
+                    let bf_lifecycle = outgoing_lifecycle.clone();
+                    let bf_identity = outgoing_identity.clone();
+                    let bf_db_ready = db_ready_runtime.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        let s_bf = {
+                            let guard = bf_session.lock().await;
+                            if !guard.is_active()
+                                || guard.runtime_id() != bf_runtime
+                                || guard.account_key() != bf_owner
+                            {
+                                return;
+                            }
+                            guard.clone()
+                        };
+                        let bf_report =
+                            fetch_baseline_startup_threads_reported(&s_bf, &bf_owner, bf_runtime)
+                                .await;
+                        if baseline_auth_expired(&bf_report.sources) {
+                            reject_expired_startup(
+                                &bf_session,
+                                &s_bf,
+                                &bf_lifecycle,
+                                &bf_identity,
+                                &bf_db_ready,
+                                &bf_gui_tx,
+                                &bf_ctx,
+                            )
+                            .await;
+                            return;
+                        }
+                        publish_baseline_backfill(&s_bf, bf_report, &bf_gui_tx);
+                        bf_ctx.request_repaint();
+                    });
+                    if !report.threads.is_empty() {
+                        live_updates.seed(&report.threads);
+                        report.threads
+                    } else {
+                        preload
+                    }
+                }
+                BaselineFetchStatus::Failed { ref error } => {
+                    let _ = gui_tx.send(GuiEvent::StartupStage {
+                        owner: owner.clone(),
+                        runtime_id,
+                        stage_text: "Không thể tải danh bạ từ máy chủ; dùng dữ liệu cục bộ".into(),
+                    });
+                    egui_ctx.request_repaint();
+                    crate::logger::log_error(
+                        "startup baseline",
+                        &format!("Baseline fetch failed: {error}"),
+                    );
+                    if !report.threads.is_empty() {
+                        live_updates.seed(&report.threads);
+                        report.threads
+                    } else {
+                        preload
+                    }
+                }
+                BaselineFetchStatus::Empty => {
+                    let _ = gui_tx.send(GuiEvent::StartupStage {
+                        owner: owner.clone(),
+                        runtime_id,
+                        stage_text: "Đã kiểm tra hội thoại trên máy chủ".into(),
+                    });
+                    egui_ctx.request_repaint();
+                    preload
+                }
+            };
+            for cached in cached_preload {
+                if let Some(current) = final_preload
+                    .iter_mut()
+                    .find(|thread| crate::chat::threads_represent_same_contact(thread, &cached))
+                {
+                    crate::chat::merge_cached_thread_into(current, cached);
+                } else {
+                    final_preload.push(cached);
+                }
+            }
+            crate::chat::deduplicate_threads(&mut final_preload, None);
+            drop(publishing);
+            (final_preload, status_clone)
+        };
+
         run_optional_startup_preload(
             &s,
             &gui_tx,
             &egui_ctx,
             preload,
+            baseline_status,
             hydrate_e2ee_peers(&s, &gui_tx, &egui_ctx),
         )
         .await;
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceFetchStatus {
+    Success,
+    Empty,
+    Timeout,
+    Offline { error: String },
+    Failed { error: String },
+    Skipped,
+}
+
+impl SourceFetchStatus {
+    pub(crate) fn is_success(&self) -> bool {
+        matches!(self, Self::Success | Self::Empty)
+    }
+
+    pub(crate) fn is_offline(&self) -> bool {
+        matches!(self, Self::Offline { .. } | Self::Timeout)
+    }
+
+    pub(crate) fn error_msg(&self) -> Option<&str> {
+        match self {
+            Self::Offline { error } | Self::Failed { error } => Some(error),
+            Self::Timeout => Some("Quá thời gian chờ phản hồi"),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BaselineSourcesStatus {
+    pub friends: SourceFetchStatus,
+    pub groups: SourceFetchStatus,
+    pub previews: SourceFetchStatus,
+    /// Optional profile enrichment still carries authoritative expiry errors.
+    pub enrichment: Option<SourceFetchStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BaselineFetchStatus {
+    /// All required baseline sources were successfully retrieved and merged.
+    Complete,
+    /// At least one source failed/timed out, but available data was preserved.
+    Partial { preview_error: String },
+    /// Valid empty contacts, groups and threads from server.
+    Empty,
+    /// Network unreachable or transport error across all sources.
+    Offline { error: String },
+    /// Server returned an error across all sources.
+    Failed { error: String },
+    /// Account or runtime changed while fetch was in progress.
+    AccountChanged,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BaselineFetchReport {
+    pub threads: Vec<Thread>,
+    pub status: BaselineFetchStatus,
+    #[allow(dead_code)]
+    pub sources: BaselineSourcesStatus,
+    #[allow(dead_code)]
+    pub persisted: bool,
+    pub persist_error: Option<String>,
+}
+
+/// Persist and hydrate baseline threads into SQLite without triggering auto-reply side effects.
+pub(crate) fn persist_and_hydrate_baseline_threads(
+    session: &Session,
+    threads: &mut Vec<Thread>,
+) -> anyhow::Result<bool> {
+    let (mut store, _write_permit) =
+        match crate::store::MessageStore::open_for_account_write(session) {
+            Ok(value) => value,
+            Err(error) => {
+                threads.clear();
+                return Err(error);
+            }
+        };
+    if let Err(error) = store.filter_deleted(threads) {
+        threads.clear();
+        return Err(error);
+    }
+    crate::store::persist_threads(&mut store, threads)
+        .map_err(|e| anyhow::anyhow!("persist_threads failed: {e}"))?;
+    store
+        .hydrate_refresh(threads, crate::store::MessageStore::PRELOAD_MSGS)
+        .map_err(|e| anyhow::anyhow!("hydrate_refresh failed: {e}"))?;
+    for t in threads.iter_mut() {
+        t.refresh_after_removal();
+    }
+    Ok(true)
+}
+
+fn classify_baseline_error(error: &anyhow::Error) -> (bool, String) {
+    if let Some(code @ (600 | -102)) = crate::api_response::server_code(error) {
+        return (false, format!("server error {code}: session expired"));
+    }
+    // Server messages may contain transport words; only typed causes establish offline.
+    let offline = error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|error| error.is_connect() || error.is_timeout())
+            || cause
+                .downcast_ref::<crate::session::RequestDeadlineElapsed>()
+                .is_some()
+    });
+    (offline, error.to_string())
+}
+
+fn baseline_auth_expired(sources: &BaselineSourcesStatus) -> bool {
+    [&sources.friends, &sources.groups, &sources.previews]
+        .iter()
+        .copied()
+        .chain(sources.enrichment.as_ref())
+        .filter_map(|source| source.error_msg())
+        .any(crate::session::is_expired_error)
+}
+
+pub(crate) async fn fetch_baseline_startup_threads_reported(
+    s: &Session,
+    owner: &str,
+    runtime_id: usize,
+) -> BaselineFetchReport {
+    if !s.is_active() || s.runtime_id() != runtime_id || s.account_key() != owner {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::AccountChanged,
+            sources: BaselineSourcesStatus {
+                enrichment: None,
+                friends: SourceFetchStatus::Skipped,
+                groups: SourceFetchStatus::Skipped,
+                previews: SourceFetchStatus::Skipped,
+            },
+            persisted: false,
+            persist_error: None,
+        };
+    }
+
+    let timeout_duration = std::time::Duration::from_secs(6);
+    let friends_fut = tokio::time::timeout(timeout_duration, crate::chat::get_friend_contacts(s));
+    let groups_fut = tokio::time::timeout(timeout_duration, crate::chat::get_groups(s));
+    let previews_fut = tokio::time::timeout(timeout_duration, async {
+        let response = crate::chat::get_last_msgs(s, &[]).await?;
+        // HTTP success may wrap a refusal or undecodable ciphertext after decryption.
+        let data = crate::api_response::data(response.clone(), usize::MAX, true)?;
+        anyhow::ensure!(
+            data.is_object() || data.is_array(),
+            "Thiếu dữ liệu tin nhắn gần đây"
+        );
+        Ok::<_, anyhow::Error>(response)
+    });
+
+    let (friends_res, groups_res, previews_res) =
+        tokio::join!(friends_fut, groups_fut, previews_fut);
+
+    if !s.is_active() || s.runtime_id() != runtime_id || s.account_key() != owner {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::AccountChanged,
+            sources: BaselineSourcesStatus {
+                enrichment: None,
+                friends: SourceFetchStatus::Skipped,
+                groups: SourceFetchStatus::Skipped,
+                previews: SourceFetchStatus::Skipped,
+            },
+            persisted: false,
+            persist_error: None,
+        };
+    }
+
+    let (friends_status, friends_list) = match friends_res {
+        Ok(Ok(friends)) => {
+            let status = if friends.is_empty() {
+                SourceFetchStatus::Empty
+            } else {
+                SourceFetchStatus::Success
+            };
+            (status, friends)
+        }
+        Ok(Err(e)) => {
+            let (is_off, err_str) = classify_baseline_error(&e);
+            (
+                if is_off {
+                    SourceFetchStatus::Offline { error: err_str }
+                } else {
+                    SourceFetchStatus::Failed { error: err_str }
+                },
+                Vec::new(),
+            )
+        }
+        Err(_) => (SourceFetchStatus::Timeout, Vec::new()),
+    };
+
+    let (groups_status, groups_list) = match groups_res {
+        Ok(Ok(groups)) => {
+            let status = if groups.is_empty() {
+                SourceFetchStatus::Empty
+            } else if groups
+                .iter()
+                .any(|group| !group.presentation.metadata_verified)
+            {
+                // Membership alone cannot certify that names and group metadata loaded.
+                SourceFetchStatus::Failed {
+                    error: "Chưa tải đủ thông tin nhóm".into(),
+                }
+            } else {
+                SourceFetchStatus::Success
+            };
+            (status, groups)
+        }
+        Ok(Err(e)) => {
+            let (is_off, err_str) = classify_baseline_error(&e);
+            (
+                if is_off {
+                    SourceFetchStatus::Offline { error: err_str }
+                } else {
+                    SourceFetchStatus::Failed { error: err_str }
+                },
+                Vec::new(),
+            )
+        }
+        Err(_) => (SourceFetchStatus::Timeout, Vec::new()),
+    };
+
+    let (previews_status, previews_data) = match previews_res {
+        Ok(Ok(val)) => (SourceFetchStatus::Success, Some(val)),
+        Ok(Err(e)) => {
+            let (is_off, err_str) = classify_baseline_error(&e);
+            (
+                if is_off {
+                    SourceFetchStatus::Offline { error: err_str }
+                } else {
+                    SourceFetchStatus::Failed { error: err_str }
+                },
+                None,
+            )
+        }
+        Err(_) => (SourceFetchStatus::Timeout, None),
+    };
+
+    let mut sources = BaselineSourcesStatus {
+        enrichment: None,
+        friends: friends_status.clone(),
+        groups: groups_status.clone(),
+        previews: previews_status.clone(),
+    };
+    if baseline_auth_expired(&sources) {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::Failed {
+                error: "Phiên đăng nhập đã hết hạn".into(),
+            },
+            sources,
+            persisted: false,
+            persist_error: None,
+        };
+    }
+
+    let mut list = friends_list;
+
+    if let Some(li) = &s.login {
+        if !li.send2me_id.is_empty() && !list.iter().any(|t| t.id == li.send2me_id) {
+            list.insert(
+                0,
+                Thread {
+                    presentation: Default::default(),
+                    unread: Default::default(),
+                    id: li.send2me_id.clone(),
+                    name: "Cloud của tôi (Lưu trữ)".into(),
+                    preview: "".into(),
+                    time: crate::ui::clock(),
+                    avatar: None,
+                    is_group: false,
+                    messages: Vec::new(),
+                },
+            );
+        }
+    }
+
+    for g in groups_list {
+        if let Some(existing) = list.iter_mut().find(|t| t.id == g.id && t.is_group) {
+            crate::chat::merge_thread_into(existing, g, true);
+        } else {
+            list.push(g);
+        }
+    }
+
+    if let Some(ref preview_resp) = previews_data {
+        let profile_id = s.login.as_ref().map(|l| l.uin.as_str());
+        crate::chat::merge_previews_with_profile(&mut list, preview_resp, profile_id);
+    }
+
+    // Enrichment is optional for display, but an explicit expiry remains authoritative.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        crate::chat::resolve_thread_names_checked(s, &mut list),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let (offline, error) = classify_baseline_error(&error);
+            sources.enrichment = Some(if offline {
+                SourceFetchStatus::Offline { error }
+            } else {
+                SourceFetchStatus::Failed { error }
+            });
+        }
+        Err(_) => {
+            sources.enrichment = Some(SourceFetchStatus::Timeout);
+        }
+    };
+    if baseline_auth_expired(&sources) {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::Failed {
+                error: "Phiên đăng nhập đã hết hạn".into(),
+            },
+            sources,
+            persisted: false,
+            persist_error: None,
+        };
+    }
+
+    if !s.is_active() || s.runtime_id() != runtime_id || s.account_key() != owner {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::AccountChanged,
+            sources,
+            persisted: false,
+            persist_error: None,
+        };
+    }
+
+    crate::chat::deduplicate_threads(&mut list, None);
+
+    let all_offline =
+        friends_status.is_offline() && groups_status.is_offline() && previews_status.is_offline();
+    let all_failed = matches!(friends_status, SourceFetchStatus::Failed { .. })
+        && matches!(groups_status, SourceFetchStatus::Failed { .. })
+        && matches!(previews_status, SourceFetchStatus::Failed { .. });
+    let any_error = !friends_status.is_success()
+        || !groups_status.is_success()
+        || !previews_status.is_success()
+        || sources
+            .enrichment
+            .as_ref()
+            .is_some_and(|status| !status.is_success());
+
+    let status = if all_offline {
+        let err = friends_status
+            .error_msg()
+            .or_else(|| groups_status.error_msg())
+            .or_else(|| previews_status.error_msg())
+            .unwrap_or("Mất kết nối máy chủ");
+        BaselineFetchStatus::Offline {
+            error: err.to_string(),
+        }
+    } else if all_failed {
+        let err = friends_status
+            .error_msg()
+            .or_else(|| groups_status.error_msg())
+            .or_else(|| previews_status.error_msg())
+            .unwrap_or("Máy chủ từ chối yêu cầu");
+        BaselineFetchStatus::Failed {
+            error: err.to_string(),
+        }
+    } else if any_error {
+        let mut errs = Vec::new();
+        if let Some(e) = friends_status.error_msg() {
+            errs.push(format!("danh bạ: {e}"));
+        }
+        if let Some(e) = groups_status.error_msg() {
+            errs.push(format!("nhóm: {e}"));
+        }
+        if let Some(e) = previews_status.error_msg() {
+            errs.push(format!("tin nhắn gần đây: {e}"));
+        }
+        if let Some(error) = sources
+            .enrichment
+            .as_ref()
+            .and_then(SourceFetchStatus::error_msg)
+        {
+            errs.push(format!("tên hội thoại: {error}"));
+        }
+        BaselineFetchStatus::Partial {
+            preview_error: errs.join("; "),
+        }
+    } else if list.is_empty() {
+        BaselineFetchStatus::Empty
+    } else {
+        BaselineFetchStatus::Complete
+    };
+
+    persist_baseline_report(s, list, status, sources).await
+}
+
+async fn persist_baseline_report(
+    s: &Session,
+    list: Vec<Thread>,
+    status: BaselineFetchStatus,
+    sources: BaselineSourcesStatus,
+) -> BaselineFetchReport {
+    let account = s.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut threads = list;
+        let saved = persist_and_hydrate_baseline_threads(&account, &mut threads);
+        (threads, saved)
+    })
+    .await;
+    if !s.is_active() {
+        return BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::AccountChanged,
+            sources,
+            persisted: false,
+            persist_error: None,
+        };
+    }
+    match result {
+        Ok((threads, Ok(persisted))) => BaselineFetchReport {
+            threads,
+            status,
+            sources,
+            persisted,
+            persist_error: None,
+        },
+        Ok((threads, Err(error))) => BaselineFetchReport {
+            threads,
+            status: BaselineFetchStatus::Partial {
+                preview_error: "Không lưu được dữ liệu hội thoại cục bộ".into(),
+            },
+            sources,
+            persisted: false,
+            persist_error: Some(error.to_string()),
+        },
+        Err(error) => BaselineFetchReport {
+            threads: Vec::new(),
+            status: BaselineFetchStatus::Partial {
+                preview_error: "Tác vụ lưu dữ liệu hội thoại bị gián đoạn".into(),
+            },
+            sources,
+            persisted: false,
+            persist_error: Some(error.to_string()),
+        },
+    }
+}
+
+fn publish_baseline_backfill(s: &Session, report: BaselineFetchReport, tx: &Sender<GuiEvent>) {
+    if !s.is_active() || report.status == BaselineFetchStatus::AccountChanged {
+        return;
+    }
+    let _ = tx.send(GuiEvent::StartupBaselineUpdated {
+        owner: s.account_key().into(),
+        runtime_id: s.runtime_id(),
+        threads: report.threads,
+        status: report.status,
+    });
 }
 
 // Expiry is authoritative; a transport failure is handled separately as Unreachable.
@@ -2003,6 +2757,7 @@ async fn run_optional_startup_preload(
     tx: &Sender<GuiEvent>,
     ctx: &egui::Context,
     preload: Vec<Thread>,
+    baseline_status: BaselineFetchStatus,
     optional: impl std::future::Future<Output = anyhow::Result<()>>,
 ) {
     if !session.is_active() {
@@ -2014,6 +2769,7 @@ async fn run_optional_startup_preload(
         owner: owner.clone(),
         runtime_id,
         preload_threads: preload,
+        baseline_status,
     });
     ctx.request_repaint();
 
@@ -2259,6 +3015,7 @@ pub(super) fn spawn_session_worker(
                     let outgoing_identity_init = outgoing_identity.clone();
                     let db_ready_init = db_ready_runtime.clone();
                     let ws_ready_init = is_ws_connected.clone();
+                    let commands_init = commands.clone();
                     tokio::spawn(async move {
                         let s = session_arc.lock().await.clone();
                         if s.login.is_some() {
@@ -2273,6 +3030,9 @@ pub(super) fn spawn_session_worker(
                                 ws_ready_init,
                             )
                             .await;
+                            if let Some(cmd_tx) = commands_init.upgrade() {
+                                let _ = cmd_tx.send(WorkerCmd::RefreshThreads);
+                            }
                         } else {
                             // Unauthenticated startup still hydrates server_config on the active session.
                             let cached_session = s.clone();
@@ -2803,6 +3563,20 @@ pub(super) fn spawn_session_worker(
                                     Err(error) => GuiEvent::SafetyNumberFailed { owner, peer_id, message: error.to_string() },
                                 };
                                 let _ = tx.send(event); ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::ToolsData { owner, runtime_id, generation, command } => {
+                            let account = session.lock().await.clone();
+                            let tx = gui_tx.clone(); let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let result = if !account.is_active() || account.account_key() != owner || account.runtime_id() != runtime_id
+                                    || !matches!(command, super::tools_panel::ToolsCommand::ExportHistory | super::tools_panel::ToolsCommand::Import { .. }) {
+                                    Err("Phiên hoặc yêu cầu dữ liệu không hợp lệ".into())
+                                } else {
+                                    account_tools(account, command).await.map_err(|error| error.to_string())
+                                };
+                                let _ = tx.send(GuiEvent::ToolsData { owner, runtime_id, generation, result });
+                                ctx.request_repaint();
                             });
                         }
                         WorkerCmd::Tools {owner,command}=>{
@@ -3375,14 +4149,25 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         ctx.request_repaint(); return;
                                     }
                                 }
+                                let runtime_id = s.runtime_id();
                                 let result=tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                     anyhow::ensure!(s.is_active(), "Phiên đã kết thúc");
                                     let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&s)?;
                                     store.set_conversation_preference(&thread_id,value)?;
-                                    store.conversation_preferences()
+                                    let values = store.conversation_preferences()?;
+                                    let revision = crate::search::generation();
+                                    Ok((values, revision))
                                 }).await;
                                 match result {
-                                    Ok(Ok(values)) => { live.set_muted(&values); let _ = tx.send(GuiEvent::ConversationPreferences { owner, values }); }
+                                    Ok(Ok((values, revision))) => {
+                                        live.set_muted_versioned(&values, revision);
+                                        let _ = tx.send(GuiEvent::ConversationPreferences {
+                                            owner,
+                                            runtime_id,
+                                            revision,
+                                            values,
+                                        });
+                                    }
                                     _ => { let _ = tx.send(GuiEvent::StatusUpdate("Không thể lưu tùy chọn hội thoại".into())); }
                                 }
                                 ctx.request_repaint();
@@ -4070,23 +4855,56 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                             egui_ctx.request_repaint();
                         }
+                        WorkerCmd::AcknowledgeHiddenUnread { owner, runtime_id, timestamp_ms } => {
+                            let account = session.lock().await.clone();
+                            if account.is_active() && account.account_key() == owner && account.runtime_id() == runtime_id {
+                                let account_for_db = account.clone();
+                                match tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+                                    let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account_for_db)?;
+                                    store.acknowledge_hidden_unread(timestamp_ms)
+                                }).await {
+                                    Ok(Ok(ack_ts)) => {
+                                        let _ = gui_tx.send(GuiEvent::HiddenUnreadAcknowledged {
+                                            owner,
+                                            runtime_id,
+                                            timestamp_ms: ack_ts,
+                                        });
+                                        egui_ctx.request_repaint();
+                                    }
+                                    Ok(Err(e)) => {
+                                        crate::runtime_metrics::database_error(&e);
+                                        crate::logger::log_error("hidden unread ack", &format!("Failed to persist hidden_unread_ack: {e}"));
+                                    }
+                                    Err(join_err) => {
+                                        crate::logger::log_error("hidden unread ack", &format!("Hidden unread ack task failed: {join_err}"));
+                                    }
+                                }
+                            }
+                        }
                         command @ (WorkerCmd::SyncPhoneHistory { .. }
+                        | WorkerCmd::SyncPhoneHistoryFenced { .. }
                         | WorkerCmd::RescanPhoneHistory { .. }
                         | WorkerCmd::SyncPhoneRecent
                         | WorkerCmd::SyncPhoneRecentFenced { .. }
                         | WorkerCmd::SyncPhoneLegacy) => {
-                            if let WorkerCmd::SyncPhoneRecentFenced { ref owner, runtime_id, .. } = command {
-                                let account = session.lock().await.clone();
+                            reap_finished_phone_sync(&mut active_phone_sync, &phone_sync_running).await;
+                            let account = session.lock().await.clone();
+                            if !account.is_active() {
+                                continue;
+                            }
+                            if let WorkerCmd::SyncPhoneRecentFenced { ref owner, runtime_id, .. }
+                            | WorkerCmd::SyncPhoneHistoryFenced { ref owner, runtime_id, .. } = command
+                            {
                                 if account.account_key() != owner || account.runtime_id() != runtime_id {
                                     continue;
                                 }
                             }
-                            reap_finished_phone_sync(&mut active_phone_sync, &phone_sync_running).await;
                             let legacy = matches!(command, WorkerCmd::SyncPhoneLegacy);
                             let full_rescan = matches!(command, WorkerCmd::RescanPhoneHistory { .. });
                             let recent_only = matches!(command, WorkerCmd::SyncPhoneRecent | WorkerCmd::SyncPhoneRecentFenced { .. });
                             let range_days = match command {
                                 WorkerCmd::SyncPhoneHistory { range_days }
+                                | WorkerCmd::SyncPhoneHistoryFenced { range_days, .. }
                                 | WorkerCmd::RescanPhoneHistory { range_days } => range_days,
                                 _ => 0,
                             };
@@ -4104,12 +4922,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 _ => None,
                             };
                             let origin = match command {
-                                WorkerCmd::SyncPhoneRecentFenced { origin, .. } => origin,
+                                WorkerCmd::SyncPhoneRecentFenced { origin, .. }
+                                | WorkerCmd::SyncPhoneHistoryFenced { origin, .. } => origin,
                                 WorkerCmd::SyncPhoneLegacy => crate::sync_coordinator::SyncOrigin::Legacy,
                                 _ => crate::sync_coordinator::SyncOrigin::Setting,
                             };
 
-                            let account = session.lock().await.clone();
                             let owner = account.account_key().to_owned();
                             let runtime_id = account.runtime_id();
                             let transport = phone_transport_rx.borrow().clone();
@@ -4142,7 +4960,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         owner: owner.clone(),
                                         runtime_id,
                                         intent_id: id,
-                                        temporary: true,
+                                        temporary: !matches!(
+                                            availability.reason(),
+                                            Some(
+                                                crate::sync_coordinator::SyncUnavailableReason::SourceDisabled
+                                                    | crate::sync_coordinator::SyncUnavailableReason::PermissionDenied
+                                            )
+                                        ),
                                         reason: reason_msg.clone(),
                                     });
                                 }
@@ -4201,6 +5025,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let tx = gui_tx.clone();
                             let ctx = egui_ctx.clone();
                             let owner_task = owner.clone();
+                            let post_await_session = session.clone();
 
                             let _ = tx.send(GuiEvent::PhoneSyncState {
                                 owner: owner.clone(),
@@ -4362,6 +5187,15 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         }
                                     }
                                 };
+                                {
+                                    let guard = post_await_session.lock().await;
+                                    if !guard.is_active()
+                                        || guard.runtime_id() != runtime_id
+                                        || guard.account_key() != state_owner
+                                    {
+                                        return;
+                                    }
+                                }
                                 let _ = tx.send(GuiEvent::PhoneSyncState {
                                     owner: state_owner,
                                     runtime_id,
@@ -4673,18 +5507,35 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::RefreshThreads => {
+                        WorkerCmd::RefreshThreads | WorkerCmd::RefreshThreadsFenced { .. } => {
+                            let fenced = match &cmd {
+                                WorkerCmd::RefreshThreadsFenced { ref owner, runtime_id } => {
+                                    Some((owner.clone(), *runtime_id))
+                                }
+                                _ => None,
+                            };
+                            if let Some((ref o, r)) = fenced {
+                                let s_check = session.lock().await;
+                                if !s_check.is_active() || s_check.account_key() != o || s_check.runtime_id() != r {
+                                    continue;
+                                }
+                            }
                             let s=session.lock().await.clone();let gate=pin_gate.clone();let tx=gui_tx.clone();let ctx=egui_ctx.clone();
+                            let fenced_pins = fenced.clone();
                             tokio::spawn(async move {
                                 let _guard=gate.lock().await;
                                 if !s.is_active()||s.account_key().is_empty(){return;}
+                                if let Some((ref o, r)) = fenced_pins {
+                                    if s.account_key() != o || s.runtime_id() != r { return; }
+                                }
                                 let cached=s.clone();
-                                if let Ok(Ok(Some(snapshot)))=tokio::task::spawn_blocking(move||->anyhow::Result<Option<crate::server_pins::Snapshot>>{
+                                if let Ok(Ok((Some(snapshot), revision)))=tokio::task::spawn_blocking(move||->anyhow::Result<(Option<crate::server_pins::Snapshot>, u64)>{
                                     use rusqlite::OptionalExtension;
                                     let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&cached)?;
                                     let raw:Option<String>=store.conn.query_row("SELECT value FROM tool_config WHERE key='server_pins'",[],|r|r.get(0)).optional()?;
-                                    Ok(raw.and_then(|s|serde_json::from_str(&s).ok()))
-                                }).await {let _=tx.send(GuiEvent::ServerPins{owner:s.account_key().into(),snapshot});}
+                                    let revision = crate::search::generation();
+                                    Ok((raw.and_then(|s|serde_json::from_str(&s).ok()), revision))
+                                }).await {let _=tx.send(GuiEvent::ServerPins{owner:s.account_key().into(),runtime_id:s.runtime_id(),revision,cached:true,snapshot});}
                                 match crate::server_pins::fetch(&s).await {
                                     Ok(snapshot)=>publish_pins(&s,snapshot,&tx).await,
                                     Err(_)=>{let _=tx.send(GuiEvent::StatusUpdate("Chưa tải được danh sách ghim server; giữ bản đã lưu".into()));}
@@ -4694,12 +5545,16 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let s_pref=session.lock().await.clone();
                             if !s_pref.account_key().is_empty() && s_pref.is_active() {
                                 let owner=s_pref.account_key().to_owned();
+                                let runtime_id = s_pref.runtime_id();
+                                let active_pref = s_pref.clone();
                                 match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
                                     let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&s_pref)?;
                                     let preferences = store.conversation_preferences()?;
-                                    Ok((preferences, crate::chat::load_threads_cache_with_store(&s_pref, &store)))
+                                    let cached = crate::chat::load_threads_cache_with_store(&s_pref, &store);
+                                    let revision = crate::search::generation();
+                                    Ok((preferences, cached, revision))
                                 }).await {
-                                    Ok(Ok((values,cached))) => { live_updates.seed(&cached); live_updates.set_muted(&values); let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,values}); }
+                                    Ok(Ok((values, cached, revision))) if active_pref.is_active() => { live_updates.seed(&cached); live_updates.set_muted_versioned(&values, revision); let _ = gui_tx.send(GuiEvent::ConversationPreferences {owner,runtime_id,revision,values}); }
                                     _ => { let _ = gui_tx.send(GuiEvent::StatusUpdate("Không thể đọc tùy chọn hội thoại".into())); }
                                 }
                                 let s_mute = session.lock().await.clone();
@@ -4716,12 +5571,18 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             let poll_delivery = poll_delivery.clone();
                             let outgoing_lifecycle = outgoing_lifecycle.clone();
                             let outgoing_identity = outgoing_identity.clone();
+                            let fenced_task = fenced.clone();
                             tokio::spawn(async move {
                                 let _refresh_guard = refresh_guard;
                                 let mut notice=RefreshNotice {sender:gui_tx_clone.clone(),ctx:ctx_clone.clone(),message:"Chưa hoàn tất cập nhật hội thoại".into(),success:false};
                                 let _=gui_tx_clone.send(GuiEvent::ConversationRefreshStatus {running:true,success:false,message:"Đang cập nhật hội thoại và tin nhắn gần đây…".into()});
                                 ctx_clone.request_repaint();
                                 let mut s = session_clone.lock().await.clone();
+                                if let Some((ref o, r)) = fenced_task {
+                                    if !s.is_active() || s.account_key() != o || s.runtime_id() != r {
+                                        return;
+                                    }
+                                }
                                 if s.login.is_some() {
                                     let status = s.validate_session().await;
                                     if let crate::session::SessionStatus::Unreachable(reason) = &status {
@@ -4739,11 +5600,14 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         sl.logout();
                                         refresh_outgoing_identity(&outgoing_identity, &sl);
                                         drop(sl);
-                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(s.runtime_id())).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
-                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                            "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
-                                                .into(),
-                                        ));
+                                        let expired_owner = s.account_key().to_owned();
+                                        let expired_runtime = s.runtime_id();
+                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(expired_runtime)).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
+                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired {
+                                            owner: expired_owner, runtime_id: expired_runtime,
+                                            reason: "Phiên đăng nhập (zpw_sek) đã hết hạn trên máy chủ Zalo"
+                                                .into()
+                                        });
                                         ctx_clone.request_repaint();
                                         return;
                                     }
@@ -4820,6 +5684,12 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         crate::queue_cursors::commit_poll(&s, &processed_state).await;
                                         *known.lock().await = list.iter().map(|t| (t.id.clone(), t.name.clone(), t.is_group)).collect();
                                         // Startup refreshes live/offline queues; historical backfill is explicit.
+                                        if let Some((ref o, r)) = fenced_task {
+                                            let sl = session_clone.lock().await;
+                                            if !sl.is_active() || sl.account_key() != o || sl.runtime_id() != r {
+                                                return;
+                                            }
+                                        }
                                         let count = list.len();
                                         let _ = gui_tx_clone.send(GuiEvent::ThreadsUpdated {threads:list,source:ThreadUpdateSource::History});
                                         notice.success = recent_result.is_ok();
@@ -4929,10 +5799,13 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                         sl.logout();
                                         refresh_outgoing_identity(&outgoing_identity, &sl);
                                         drop(sl);
-                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(s.runtime_id())).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
-                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired(
-                                            "Phiên đăng nhập (zpw_sek) đã hết hạn".into(),
-                                        ));
+                                        let expired_owner = s.account_key().to_owned();
+                                        let expired_runtime = s.runtime_id();
+                                        if let Err(e) = tokio::task::spawn_blocking(move || crate::storage::remove_session_for_runtime(expired_runtime)).await.unwrap_or_else(|e| Err(e.into())) { eprintln!("Cannot remove session: {e}"); }
+                                        let _ = gui_tx_clone.send(GuiEvent::SessionExpired {
+                                            owner: expired_owner, runtime_id: expired_runtime,
+                                            reason: "Phiên đăng nhập (zpw_sek) đã hết hạn".into()
+                                        });
                                         ctx_clone.request_repaint();
                                     } else {
                                         // Pages received before a later poll failed are stored too: the
@@ -7095,16 +7968,18 @@ async fn persist_mutes(
     s: &Session,
     changes: Vec<crate::mute_sync::MuteChange>,
     mark_seeded: bool,
-) -> Option<HashMap<String, crate::store::ConversationPreference>> {
+) -> Option<(HashMap<String, crate::store::ConversationPreference>, u64)> {
     let account = s.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         anyhow::ensure!(account.is_active(), "Session ended");
         let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
-        store.apply_mute_changes(&changes, mark_seeded)
+        let values = store.apply_mute_changes(&changes, mark_seeded)?;
+        let revision = crate::search::generation();
+        Ok((values, revision))
     })
     .await;
     match result {
-        Ok(Ok(values)) => Some(values),
+        Ok(Ok(res)) => Some(res),
         _ => {
             crate::logger::log_error("mute sync", "Cannot persist server mute state");
             None
@@ -7115,13 +7990,16 @@ async fn persist_mutes(
 fn publish_preferences(
     s: &Session,
     values: HashMap<String, crate::store::ConversationPreference>,
+    revision: u64,
     gui_tx: &Sender<GuiEvent>,
     live: &crate::live_updates::LiveUpdates,
     ctx: &egui::Context,
 ) {
-    live.set_muted(&values);
+    live.set_muted_versioned(&values, revision);
     let _ = gui_tx.send(GuiEvent::ConversationPreferences {
         owner: s.account_key().to_owned(),
+        runtime_id: s.runtime_id(),
+        revision,
         values,
     });
     ctx.request_repaint();
@@ -7219,8 +8097,8 @@ async fn apply_server_mutes(
     }
     sync.generation
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    if let Some(values) = persist_mutes(s, changes, false).await {
-        publish_preferences(s, values, gui_tx, live, ctx);
+    if let Some((values, revision)) = persist_mutes(s, changes, false).await {
+        publish_preferences(s, values, revision, gui_tx, live, ctx);
     }
 }
 
@@ -7295,8 +8173,8 @@ async fn sync_mute_snapshot(
     if changes.is_empty() && seeded {
         return;
     }
-    if let Some(values) = persist_mutes(&s, changes, complete).await {
-        publish_preferences(&s, values, &gui_tx, &live, &ctx);
+    if let Some((values, revision)) = persist_mutes(&s, changes, complete).await {
+        publish_preferences(&s, values, revision, &gui_tx, &live, &ctx);
     }
 }
 
@@ -7675,9 +8553,11 @@ fn spawn_outgoing_send(
                         crate::storage::remove_session_for_runtime(runtime_id)
                     })
                     .await;
-                    let _ = tx.send(GuiEvent::SessionExpired(
-                        "Không thể gửi vì phiên đăng nhập đã hết hạn".into(),
-                    ));
+                    let _ = tx.send(GuiEvent::SessionExpired {
+                        owner: session_snapshot.account_key().to_owned(),
+                        runtime_id: session_snapshot.runtime_id(),
+                        reason: "Không thể gửi vì phiên đăng nhập đã hết hạn".into(),
+                    });
                 }
             }
         }
@@ -9375,19 +10255,33 @@ async fn publish_pins(s: &Session, snapshot: crate::server_pins::Snapshot, tx: &
     }
     let account = s.clone();
     let saved = snapshot.clone();
-    let result=tokio::task::spawn_blocking(move||->anyhow::Result<()>{
-        if !account.is_active(){return Ok(());}
-        let (store, _write_permit)=crate::store::MessageStore::open_for_account_write(&account)?;
-        store.conn.execute("INSERT INTO tool_config(key,value) VALUES('server_pins',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&saved)?])?;Ok(())
-    }).await;
-    if !matches!(result, Ok(Ok(()))) {
-        let _ = tx.send(GuiEvent::StatusUpdate(
-            "Không lưu được danh sách ghim server".into(),
-        ));
-    }
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        if !account.is_active() {
+            return Ok(crate::search::generation());
+        }
+        let (store, _write_permit) = crate::store::MessageStore::open_for_account_write(&account)?;
+        store.conn.execute(
+            "INSERT INTO tool_config(key,value) VALUES('server_pins',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [serde_json::to_string(&saved)?],
+        )?;
+        Ok(crate::search::generation())
+    })
+    .await;
+    let revision = match result {
+        Ok(Ok(rev)) => rev,
+        _ => {
+            let _ = tx.send(GuiEvent::StatusUpdate(
+                "Không lưu được danh sách ghim server".into(),
+            ));
+            crate::search::generation()
+        }
+    };
     if s.is_active() {
         let _ = tx.send(GuiEvent::ServerPins {
             owner: s.account_key().into(),
+            runtime_id: s.runtime_id(),
+            revision,
+            cached: false,
             snapshot,
         });
     }
@@ -9741,11 +10635,18 @@ mod db_write_serialization_tests {
                     }],
                     ..Default::default()
                 }];
-                run_optional_startup_preload(&session, &tx, &context, cached, async move {
-                    let _ = entered_tx.send(());
-                    release_rx.await?;
-                    Ok(())
-                })
+                run_optional_startup_preload(
+                    &session,
+                    &tx,
+                    &context,
+                    cached,
+                    BaselineFetchStatus::Complete,
+                    async move {
+                        let _ = entered_tx.send(());
+                        release_rx.await?;
+                        Ok(())
+                    },
+                )
                 .await;
             });
             tokio::time::timeout(Duration::from_secs(2), entered_rx)
@@ -9807,9 +10708,14 @@ mod db_write_serialization_tests {
         let mut session = test_session(&uin);
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = egui::Context::default();
-        run_optional_startup_preload(&session, &tx, &ctx, Vec::new(), async {
-            anyhow::bail!("synthetic optional failure")
-        })
+        run_optional_startup_preload(
+            &session,
+            &tx,
+            &ctx,
+            Vec::new(),
+            BaselineFetchStatus::Complete,
+            async { anyhow::bail!("synthetic optional failure") },
+        )
         .await;
         let events: Vec<_> = rx.try_iter().collect();
         assert!(matches!(
@@ -9825,11 +10731,18 @@ mod db_write_serialization_tests {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            run_optional_startup_preload(&old_session, &tx, &old_context, Vec::new(), async {
-                let _ = entered_tx.send(());
-                release_rx.await?;
-                Ok(())
-            })
+            run_optional_startup_preload(
+                &old_session,
+                &tx,
+                &old_context,
+                Vec::new(),
+                BaselineFetchStatus::Complete,
+                async {
+                    let _ = entered_tx.send(());
+                    release_rx.await?;
+                    Ok(())
+                },
+            )
             .await;
         });
         tokio::time::timeout(Duration::from_secs(2), entered_rx)
@@ -10322,6 +11235,1002 @@ mod db_write_serialization_tests {
         assert!(finished.load(std::sync::atomic::Ordering::Acquire));
 
         let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[test]
+    fn phone_sync_origin_classification_fences_setting_while_permitting_banner() {
+        let mut session = test_session("origin-test");
+        session.server_config.sync_2_pc.enable = true;
+        session
+            .server_config
+            .sync_2_pc
+            .enable_on_sync_source_setting = false; // Setting disabled on server
+
+        let db_ready =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(session.runtime_id()));
+
+        // Command from Banner (StartSuggestSync / RetryFailedSync)
+        let banner_cmd = WorkerCmd::SyncPhoneHistoryFenced {
+            owner: session.account_key().into(),
+            runtime_id: session.runtime_id(),
+            range_days: 0,
+            origin: crate::sync_coordinator::SyncOrigin::Banner,
+        };
+        let banner_origin = match banner_cmd {
+            WorkerCmd::SyncPhoneRecentFenced { origin, .. }
+            | WorkerCmd::SyncPhoneHistoryFenced { origin, .. } => origin,
+            WorkerCmd::SyncPhoneLegacy => crate::sync_coordinator::SyncOrigin::Legacy,
+            _ => crate::sync_coordinator::SyncOrigin::Setting,
+        };
+        assert_eq!(banner_origin, crate::sync_coordinator::SyncOrigin::Banner);
+        let banner_avail = current_sync_availability(
+            &session,
+            &db_ready,
+            true,
+            false,
+            session
+                .server_config
+                .sync_2_pc
+                .is_feature_enabled_by_origin(banner_origin),
+        );
+        assert_eq!(
+            banner_avail,
+            crate::sync_coordinator::SyncAvailability::Ready,
+            "Banner sync must be permitted even if setting origin is disabled"
+        );
+
+        // Command from Settings
+        let setting_cmd = WorkerCmd::SyncPhoneHistoryFenced {
+            owner: session.account_key().into(),
+            runtime_id: session.runtime_id(),
+            range_days: 0,
+            origin: crate::sync_coordinator::SyncOrigin::Setting,
+        };
+        let setting_origin = match setting_cmd {
+            WorkerCmd::SyncPhoneRecentFenced { origin, .. }
+            | WorkerCmd::SyncPhoneHistoryFenced { origin, .. } => origin,
+            WorkerCmd::SyncPhoneLegacy => crate::sync_coordinator::SyncOrigin::Legacy,
+            _ => crate::sync_coordinator::SyncOrigin::Setting,
+        };
+        assert_eq!(setting_origin, crate::sync_coordinator::SyncOrigin::Setting);
+        let setting_avail = current_sync_availability(
+            &session,
+            &db_ready,
+            true,
+            false,
+            session
+                .server_config
+                .sync_2_pc
+                .is_feature_enabled_by_origin(setting_origin),
+        );
+        assert!(
+            matches!(
+                setting_avail,
+                crate::sync_coordinator::SyncAvailability::Unavailable(
+                    crate::sync_coordinator::SyncUnavailableReason::SourceDisabled
+                )
+            ),
+            "Settings sync must be rejected when setting origin is disabled on server"
+        );
+    }
+
+    #[test]
+    fn baseline_error_classification_uses_causes_not_server_words() {
+        for message in [
+            "network permission denied",
+            "connect account denied",
+            "invalid timeout configuration",
+        ] {
+            assert!(!classify_baseline_error(&anyhow::anyhow!(message)).0);
+        }
+        let deadline =
+            anyhow::Error::new(crate::session::RequestDeadlineElapsed).context("request failed");
+        assert!(classify_baseline_error(&deadline).0);
+    }
+
+    #[test]
+    fn startup_cache_hydrates_preferences_pins_and_ack_under_one_permit() {
+        let uin = format!(
+            "startup-metadata-regression-{}",
+            crate::param_cipher::random_hex(12)
+        );
+        let session = test_session(&uin);
+        {
+            let (store, _permit) =
+                crate::store::MessageStore::open_for_account_write(&session).unwrap();
+            store
+                .set_conversation_preference(
+                    "friend",
+                    crate::store::ConversationPreference {
+                        muted: true,
+                        pinned: true,
+                        hidden: false,
+                    },
+                )
+                .unwrap();
+            store.acknowledge_hidden_unread(1234).unwrap();
+            let pins = crate::server_pins::Snapshot {
+                version: 1,
+                conversations: vec!["u42".into()],
+            };
+            store
+                .conn
+                .execute(
+                    "INSERT INTO tool_config(key,value) VALUES('server_pins',?1)",
+                    [serde_json::to_string(&pins).unwrap()],
+                )
+                .unwrap();
+        }
+        let (_, preferences, pins, ack, revision) = load_startup_cache(&session).unwrap();
+        assert!(preferences["friend"].muted);
+        assert_eq!(pins.unwrap().conversations, vec!["u42"]);
+        assert_eq!(ack, 1234);
+        assert!(revision > 0);
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_write_failure_keeps_filtered_payload_and_reports_partial() {
+        let uin = format!(
+            "baseline-write-fault-{}",
+            crate::param_cipher::random_hex(12)
+        );
+        let session = test_session(&uin);
+        {
+            let (mut store, _permit) =
+                crate::store::MessageStore::open_for_account_write(&session).unwrap();
+            store
+                .delete_message("friend", "deleted", 1800000000000)
+                .unwrap();
+            store.conn.execute_batch("CREATE TRIGGER reject_baseline BEFORE INSERT ON threads BEGIN SELECT RAISE(ABORT,'fixture'); END;").unwrap();
+        }
+        let report = persist_baseline_report(
+            &session,
+            vec![Thread {
+                id: "friend".into(),
+                name: "Friend".into(),
+                messages: vec![
+                    ChatMessage {
+                        id: "deleted".into(),
+                        text: "removed".into(),
+                        ts: 1800000000000,
+                        ..Default::default()
+                    },
+                    ChatMessage {
+                        id: "kept".into(),
+                        text: "valid".into(),
+                        ts: 1800000001000,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            BaselineFetchStatus::Complete,
+            BaselineSourcesStatus {
+                enrichment: None,
+                friends: SourceFetchStatus::Success,
+                groups: SourceFetchStatus::Empty,
+                previews: SourceFetchStatus::Success,
+            },
+        )
+        .await;
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert!(!report.persisted);
+        assert!(report.persist_error.is_some());
+        assert_eq!(report.threads.len(), 1);
+        assert_eq!(report.threads[0].messages.len(), 1);
+        assert_eq!(report.threads[0].messages[0].id, "kept");
+        let (tx, rx) = std::sync::mpsc::channel();
+        publish_baseline_backfill(&session, report, &tx);
+        assert!(
+            matches!(rx.try_recv().unwrap(), GuiEvent::StartupBaselineUpdated { runtime_id, threads, status: BaselineFetchStatus::Partial { .. }, .. }
+            if runtime_id == session.runtime_id() && threads[0].messages[0].id == "kept")
+        );
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_keeps_valid_contact_with_placeholder_shaped_name() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code":0,"data":[{"userId":"named_contact","displayName":"Người dùng thật","avatar":""}]}"#.into())
+            } else if path.contains("/api/group/getlg/v4") {
+                (200, r#"{"error_code":0,"data":{"gridVerMap":{}}}"#.into())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (200, r#"{"error_code":0,"data":{"msgs":[],"groupMsgs":[]}}"#.into())
+            } else { (200, r#"{"error_code":0,"data":{}}"#.into()) }
+        }).await;
+        let uin = format!(
+            "baseline-valid-name-{}",
+            crate::param_cipher::random_hex(12)
+        );
+        let mut session = test_session(&uin);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host;
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert_eq!(report.threads.len(), 1);
+        assert_eq!(report.threads[0].id, "named_contact");
+        server.abort();
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_slow_name_enrichment_preserves_successful_sources() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code":0,"data":[{"userId":"slow_name","displayName":"Known name","avatar":""}]}"#.into())
+            } else if path.contains("/api/group/getlg/v4") {
+                (200, r#"{"error_code":0,"data":{"gridVerMap":{}}}"#.into())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (200, r#"{"error_code":0,"data":{"msgs":[],"groupMsgs":[]}}"#.into())
+            } else {
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                (200, r#"{"error_code":0,"data":{}}"#.into())
+            }
+        }).await;
+        let uin = format!(
+            "baseline-name-budget-{}",
+            crate::param_cipher::random_hex(12)
+        );
+        let mut session = test_session(&uin);
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host;
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()),
+        )
+        .await
+        .expect("name enrichment must be bounded");
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert_eq!(report.sources.friends, SourceFetchStatus::Success);
+        assert_eq!(report.threads.len(), 1);
+        assert_eq!(report.threads[0].name, "Known name");
+        server.abort();
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn persist_and_hydrate_baseline_threads_persists_without_auto_reply() {
+        let uin = format!("baseline-test-{}", crate::param_cipher::random_hex(12));
+        let account_dir = crate::storage::account_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+        let session = test_session(&uin);
+
+        let mut threads = vec![Thread {
+            id: "thread-base-1".into(),
+            name: "Baseline Contact".into(),
+            messages: vec![ChatMessage {
+                id: "msg-base-1".into(),
+                sender: "Contact".into(),
+                text: "Hello from server preview".into(),
+                ts: 1_800_000_100_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let persisted = persist_and_hydrate_baseline_threads(&session, &mut threads)
+            .expect("baseline persistence must succeed");
+        assert!(persisted, "baseline threads must be persisted to SQLite");
+        assert_eq!(threads[0].messages.len(), 1);
+
+        // Re-open SQLite to verify persisted state
+        let (store, _permit) =
+            crate::store::MessageStore::open_for_account_write(&session).unwrap();
+        let loaded = store.all_threads().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].thread_id, "thread-base-1");
+        let mut hydrated = vec![Thread {
+            id: "thread-base-1".into(),
+            ..Default::default()
+        }];
+        store.hydrate_threads(&mut hydrated, 10).unwrap();
+        assert_eq!(hydrated[0].messages.len(), 1);
+        assert_eq!(hydrated[0].messages[0].text, "Hello from server preview");
+
+        let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[tokio::test]
+    async fn persist_and_hydrate_baseline_threads_filters_deleted_and_recalled_messages() {
+        let uin = format!("baseline-del-{}", crate::param_cipher::random_hex(12));
+        let account_dir = crate::storage::account_dir(&uin);
+        let _ = std::fs::remove_dir_all(&account_dir);
+        let session = test_session(&uin);
+
+        // Seed a message and mark it deleted in SQLite
+        {
+            let (mut store, _permit) =
+                crate::store::MessageStore::open_for_account_write(&session).unwrap();
+            let initial = vec![Thread {
+                id: "thread-del-1".into(),
+                name: "Test Thread".into(),
+                messages: vec![ChatMessage {
+                    id: "msg-deleted-1".into(),
+                    sender: "Friend".into(),
+                    text: "Secret message".into(),
+                    ts: 1_800_000_200_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            crate::store::persist_threads(&mut store, &initial).unwrap();
+            store
+                .delete_message("thread-del-1", "msg-deleted-1", 1_800_000_250_000)
+                .unwrap();
+        }
+
+        // Now baseline arrives from server with that message still in preview
+        let mut server_batch = vec![Thread {
+            id: "thread-del-1".into(),
+            name: "Test Thread".into(),
+            messages: vec![ChatMessage {
+                id: "msg-deleted-1".into(),
+                sender: "Friend".into(),
+                text: "Secret message".into(),
+                ts: 1_800_000_200_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let _ = persist_and_hydrate_baseline_threads(&session, &mut server_batch).unwrap();
+        assert!(
+            server_batch[0].messages.is_empty(),
+            "deleted/recalled message must not be revived by baseline"
+        );
+
+        let _ = std::fs::remove_dir_all(&account_dir);
+    }
+
+    #[tokio::test]
+    async fn startup_refreshes_server_baseline_and_rejects_expiry_with_warm_cache() {
+        for (partial, refusal) in [
+            (false, None),
+            (true, None),
+            (false, Some(600)),
+            (false, Some(-102)),
+        ] {
+            let preview_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let requests = preview_requests.clone();
+            let (host, server) = setup_mock_zalo_server_async(move |path| {
+                let requests = requests.clone();
+                async move {
+                    // Keep the fixture's localhost domains: successful configuration
+                    // application canonicalizes hosts to production services.
+                    if path.contains("/api/login/getServerInfo") {
+                        return (500, r#"{"error_code":500,"data":{}}"#.to_owned());
+                    }
+                    let data = if path.contains("/api/social/friend/getfriends") {
+                        r#"{"error_code":0,"data":[]}"#
+                    } else if path.contains("/api/group/getlg/v4") {
+                        r#"{"error_code":0,"data":{"gridVerMap":{}}}"#
+                    } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                        requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if let Some(code) = refusal {
+                            let inner = serde_json::json!({"error_code": code, "data": {}});
+                            let response = if code == -102 {
+                                let encrypted = crate::crypto::encode_aes(&[7; 32], &inner.to_string()).unwrap();
+                                serde_json::json!({"error_code": 0, "data": encrypted})
+                            } else { inner };
+                            return (200, response.to_string());
+                        }
+                        r#"{"error_code":0,"data":{"msgs":[{"idTo":"remote_friend","content":"Remote preview","dName":"Remote friend","ts":1800000000}]}}"#
+                    } else {
+                        r#"{"error_code":0,"data":{}}"#
+                    };
+                    (200, data.to_owned())
+                }
+            }).await;
+            let uin = format!("warm-startup-{}", crate::param_cipher::random_hex(12));
+            let mut session = test_session(&uin);
+            session.secret_key = Some(vec![7; 32]);
+            session.zpw_sek = Some("synthetic-localhost-only".into());
+            session.domains.auth = host.clone();
+            session.domains.friend = host.clone();
+            session.domains.profile = host.clone();
+            session.domains.group = host.clone();
+            session.domains.convers_api = host.clone();
+            session.domains.conversation = host;
+            let mut cached = vec![Thread {
+                id: "cached_friend".into(),
+                name: "Cached friend".into(),
+                preview: "Cached preview".into(),
+                messages: vec![ChatMessage {
+                    id: "cached_message".into(),
+                    text: "Cached preview".into(),
+                    ts: 1_800_000_000_000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }];
+            if partial {
+                cached.push(Thread {
+                    id: "missing_friend".into(),
+                    name: "Người dùng missing_friend".into(),
+                    ..Default::default()
+                });
+            }
+            persist_and_hydrate_baseline_threads(&session, &mut cached).unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = egui::Context::default();
+            let lifecycle = OutgoingLifecycle::new(tx.clone(), ctx.clone());
+            let identity =
+                std::sync::Arc::new(std::sync::RwLock::new((uin.clone(), session.runtime_id())));
+            run_startup_preload(
+                std::sync::Arc::new(tokio::sync::Mutex::new(session.clone())),
+                tx,
+                ctx,
+                std::sync::Arc::new(crate::live_updates::LiveUpdates::default()),
+                lifecycle,
+                identity,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+            .await;
+            let events: Vec<_> = rx.try_iter().collect();
+            if refusal.is_some() {
+                assert!(
+                    !session.is_active(),
+                    "expired baseline must revoke its runtime"
+                );
+                assert!(events
+                    .iter()
+                    .any(|event| matches!(event, GuiEvent::StartupFatalError { .. })));
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    GuiEvent::StartupPrerequisitesSettled { .. }
+                        | GuiEvent::StartupPreloadSettled { .. }
+                )));
+                assert_eq!(
+                    preview_requests.load(std::sync::atomic::Ordering::SeqCst),
+                    1
+                );
+                server.abort();
+                let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+                continue;
+            }
+            for event in &events {
+                if let GuiEvent::StartupFatalError { message, .. } = event {
+                    panic!("unexpected startup failure: {message}");
+                }
+            }
+            assert_eq!(
+                preview_requests.load(std::sync::atomic::Ordering::SeqCst),
+                1
+            );
+            let snapshot = events
+                .iter()
+                .find_map(|event| match event {
+                    GuiEvent::StartupPrerequisitesSettled {
+                        preload_threads,
+                        baseline_status,
+                        ..
+                    } => {
+                        assert_eq!(*baseline_status, BaselineFetchStatus::Complete);
+                        Some(preload_threads)
+                    }
+                    _ => None,
+                })
+                .expect("startup must publish its baseline before settling");
+            assert!(snapshot.iter().any(|thread| thread.id == "remote_friend"));
+            assert!(snapshot.iter().any(|thread| thread.id == "cached_friend"
+                && thread
+                    .messages
+                    .iter()
+                    .any(|message| message.id == "cached_message")));
+            let baseline_index = events
+                .iter()
+                .position(|event| matches!(event, GuiEvent::StartupPrerequisitesSettled { .. }))
+                .unwrap();
+            let settled_index = events
+                .iter()
+                .position(|event| matches!(event, GuiEvent::StartupPreloadSettled { .. }))
+                .unwrap();
+            assert!(baseline_index < settled_index);
+            server.abort();
+            let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+        }
+    }
+
+    async fn setup_mock_zalo_server_async<F, Fut>(
+        handler: F,
+    ) -> (String, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(String) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = (u16, String)> + Send + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let host = format!("http://127.0.0.1:{port}");
+        let handler = std::sync::Arc::new(handler);
+
+        let handle = tokio::spawn(async move {
+            for _ in 0..10 {
+                let Ok(Ok((mut socket, _))) =
+                    tokio::time::timeout(std::time::Duration::from_secs(8), listener.accept())
+                        .await
+                else {
+                    break;
+                };
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = socket.read(&mut buf).await {
+                        if n > 0 {
+                            let req_str = String::from_utf8_lossy(&buf[..n]);
+                            let path = req_str
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .split_whitespace()
+                                .nth(1)
+                                .unwrap_or("")
+                                .to_owned();
+                            let (status_code, body) = handler(path).await;
+                            let response = if status_code == 200 {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                )
+                            } else {
+                                format!(
+                                    "HTTP/1.1 {} Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                    status_code,
+                                    body.len(),
+                                    body
+                                )
+                            };
+                            let _ = socket.write_all(response.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        (host, handle)
+    }
+
+    #[tokio::test]
+    async fn baseline_group_cache_preserves_verification_without_reusing_send_permissions() {
+        let uin = format!("group-cache-{}", crate::param_cipher::random_hex(12));
+        let session = test_session(&uin);
+        let mut cached = Thread {
+            id: "123".into(),
+            name: "Verified group".into(),
+            is_group: true,
+            ..Default::default()
+        };
+        cached.presentation.metadata_verified = true;
+        {
+            let (store, _permit) =
+                crate::store::MessageStore::open_for_account_write(&session).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO group_metadata(thread_id,version,data) VALUES(?1,?2,?3)",
+                    rusqlite::params!["123", "1", serde_json::to_string(&cached).unwrap()],
+                )
+                .unwrap();
+        }
+        let mut groups = vec![Thread {
+            id: "123".into(),
+            name: "Nhóm 123".into(),
+            is_group: true,
+            ..Default::default()
+        }];
+        groups[0].presentation.send_policy = Some(crate::chat::GroupSendPolicy {
+            locked: false,
+            managers: vec!["old-manager".into()],
+        });
+        let versions = serde_json::json!({"123": 1}).as_object().unwrap().clone();
+        crate::group_metadata::refresh(&session, &versions, &mut groups)
+            .await
+            .unwrap();
+        assert!(groups[0].presentation.metadata_verified);
+        assert_eq!(groups[0].name, "Verified group");
+        assert!(groups[0].presentation.send_policy.is_none());
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_rejects_decrypted_preview_refusal() {
+        let encrypted =
+            crate::crypto::encode_aes(&[7; 32], r#"{"error_code":240,"data":{}}"#).unwrap();
+        let preview = serde_json::json!({"error_code": 0, "data": encrypted}).to_string();
+        let (host, server) = setup_mock_zalo_server_async(move |path| {
+            let preview = preview.clone();
+            async move {
+                let body = if path.contains("/api/social/friend/getfriends") {
+                    r#"{"error_code":0,"data":[{"userId":"friend","displayName":"Friend"}]}"#.into()
+                } else if path.contains("/api/group/getlg/v4") {
+                    r#"{"error_code":0,"data":{"gridVerMap":{}}}"#.into()
+                } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                    preview
+                } else {
+                    r#"{"error_code":0,"data":{}}"#.into()
+                };
+                (200, body)
+            }
+        })
+        .await;
+        let uin = format!("preview-refusal-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host;
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert!(matches!(
+            report.sources.previews,
+            SourceFetchStatus::Failed { .. }
+        ));
+        assert!(report.threads.iter().any(|thread| thread.id == "friend"));
+        server.abort();
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_profile_refusals_remain_visible_after_decryption() {
+        for code in [
+            serde_json::json!(0),
+            serde_json::json!(600),
+            serde_json::json!("-102"),
+            serde_json::json!(240),
+        ] {
+            let expired = matches!(crate::api_response::integer(&code), Some(600 | -102));
+            let success = crate::api_response::integer(&code) == Some(0);
+            let inner =
+                serde_json::json!({"error_code":code,"data":{"friend":{"displayName":"Friend"}}});
+            let encrypted = crate::crypto::encode_aes(&[7; 32], &inner.to_string()).unwrap();
+            let (host, server) = setup_mock_zalo_server_async(move |path| {
+                let encrypted = encrypted.clone();
+                async move {
+                    let data = if path.contains("/api/social/friend/getfriends") {
+                        serde_json::json!({"error_code":0,"data":[{"userId":"friend","displayName":"Friend"}]})
+                    } else if path.contains("/api/group/getlg/v4") {
+                        serde_json::json!({"error_code":0,"data":{"gridVerMap":{}}})
+                    } else if path.contains("/api/social/friend/getminiprofiles") {
+                        serde_json::json!({"error_code":0,"data":encrypted})
+                    } else { serde_json::json!({"error_code":0,"data":{"msgs":[],"groupMsgs":[]}}) };
+                    (200,data.to_string())
+                }
+            }).await;
+            let uin = format!("profile-expiry-{}", crate::param_cipher::random_hex(12));
+            let mut session = test_session(&uin);
+            session.secret_key = Some(vec![7; 32]);
+            session.domains.friend = host.clone();
+            session.domains.profile = host.clone();
+            session.domains.group = host.clone();
+            session.domains.convers_api = host;
+            let report =
+                fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+            assert_eq!(report.sources.friends, SourceFetchStatus::Success);
+            assert_eq!(baseline_auth_expired(&report.sources), expired);
+            if expired {
+                assert!(report.threads.is_empty());
+                assert!(!report.persisted);
+                assert!(matches!(report.status, BaselineFetchStatus::Failed { .. }));
+            } else {
+                assert_eq!(report.threads.len(), 1);
+                assert!(report.persisted);
+                if success {
+                    assert_eq!(report.status, BaselineFetchStatus::Complete);
+                } else {
+                    assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+                }
+            }
+            server.abort();
+            let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_nested_group_expiry_is_not_swallowed_or_persisted() {
+        for code in [serde_json::json!(600), serde_json::json!("-102")] {
+            let (host, server) = setup_mock_zalo_server_async(move |path| {
+                let code = code.clone();
+                async move {
+                    let data = if path.contains("/api/social/friend/getfriends") {
+                        serde_json::json!({"error_code":0,"data":[]})
+                    } else if path.contains("/api/group/getlg/v4") {
+                        serde_json::json!({"error_code":0,"data":{"gridVerMap":{"42":1}}})
+                    } else if path.contains("/api/group/getmg-v2") {
+                        serde_json::json!({"error_code":0,"data":{"gridInfoMap":{"42":{"error_code":code,"data":{}}}}})
+                    } else { serde_json::json!({"error_code":0,"data":{"msgs":[],"groupMsgs":[]}}) };
+                    (200, data.to_string())
+                }
+            }).await;
+            let uin = format!(
+                "nested-group-expiry-{}",
+                crate::param_cipher::random_hex(12)
+            );
+            let mut session = test_session(&uin);
+            session.secret_key = Some(vec![7; 32]);
+            session.domains.friend = host.clone();
+            session.domains.profile = host.clone();
+            session.domains.group = host.clone();
+            session.domains.convers_api = host;
+            let report =
+                fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+            assert!(
+                baseline_auth_expired(&report.sources),
+                "nested expiry must reach startup rejection"
+            );
+            assert!(matches!(report.status, BaselineFetchStatus::Failed { .. }));
+            assert!(report.threads.is_empty());
+            assert!(!report.persisted);
+            server.abort();
+            let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+        }
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_preserves_membership_when_group_metadata_fails() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code":0,"data":[]}"#.into())
+            } else if path.contains("/api/group/getlg/v4") {
+                (
+                    200,
+                    r#"{"error_code":0,"data":{"gridVerMap":{"123":1}}}"#.into(),
+                )
+            } else if path.contains("/api/group/getmg-v2") {
+                (500, r#"{"error_code":500,"data":{}}"#.into())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (200, r#"{"error_code":0,"data":{"msgs":[]}}"#.into())
+            } else {
+                (200, r#"{"error_code":0,"data":{}}"#.into())
+            }
+        })
+        .await;
+        let uin = format!("group-partial-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host;
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert!(matches!(
+            report.sources.groups,
+            SourceFetchStatus::Failed { .. }
+        ));
+        assert!(report
+            .threads
+            .iter()
+            .any(|thread| thread.id == "123" && thread.is_group));
+        server.abort();
+        let _ = std::fs::remove_dir_all(crate::storage::account_dir(&uin));
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_empty_friends_with_valid_previews_preserves_threads() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code": 0, "data": []}"#.to_string())
+            } else if path.contains("/api/group/getlg/v4") {
+                (200, r#"{"error_code": 0, "data": {"gridVerMap": {}}}"#.to_string())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (200, r#"{"error_code": 0, "data": {"msgs": [{"idTo": "friend_99", "content": "Hello World", "dName": "User 99", "ts": 1700000000}]}}"#.to_string())
+            } else {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            }
+        }).await;
+
+        let uin = format!("empty-friends-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.secret_key = Some(vec![7; 32]);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host.clone();
+
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert_eq!(report.status, BaselineFetchStatus::Complete);
+        assert!(
+            !report.threads.is_empty(),
+            "threads must be discovered from preview even if friends is empty"
+        );
+        assert_eq!(report.sources.friends, SourceFetchStatus::Empty);
+        assert_eq!(report.sources.groups, SourceFetchStatus::Empty);
+        assert_eq!(report.sources.previews, SourceFetchStatus::Success);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_group_error_is_not_swallowed_and_reports_partial() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code": 0, "data": [{"userId": "friend_1", "displayName": "Alice", "avatar": ""}]}"#.to_string())
+            } else if path.contains("/api/group/getlg/v4") {
+                (500, r#"{"error_code": 500, "error_message": "Internal Server Error"}"#.to_string())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (200, r#"{"error_code": 0, "data": {"msgs": []}}"#.to_string())
+            } else {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            }
+        }).await;
+
+        let uin = format!("grp-err-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host.clone();
+
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert!(
+            matches!(report.status, BaselineFetchStatus::Partial { .. }),
+            "group error must produce Partial status, got {:?}",
+            report.status
+        );
+        assert!(matches!(
+            report.sources.groups,
+            SourceFetchStatus::Failed { .. }
+        ));
+        assert_eq!(report.sources.friends, SourceFetchStatus::Success);
+        assert_eq!(
+            report.threads.len(),
+            1,
+            "friends must be preserved despite group failure"
+        );
+        assert_eq!(report.threads[0].name, "Alice");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_preview_error_retains_friends_as_partial() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code": 0, "data": [{"userId": "friend_bob", "displayName": "Bob", "avatar": ""}]}"#.to_string())
+            } else if path.contains("/api/group/getlg/v4") {
+                (200, r#"{"error_code": 0, "data": {"gridVerMap": {}}}"#.to_string())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                (500, r#"{"error_code": 500, "error_message": "Preview unavailable"}"#.to_string())
+            } else {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            }
+        }).await;
+
+        let uin = format!("prev-err-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host.clone();
+
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert!(matches!(
+            report.sources.previews,
+            SourceFetchStatus::Failed { .. }
+        ));
+        assert_eq!(
+            report.threads.len(),
+            1,
+            "friends must be preserved when previews fail"
+        );
+        assert_eq!(report.threads[0].name, "Bob");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn baseline_pipeline_timeout_after_friends_retains_partial_threads() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/social/friend/getfriends") {
+                (200, r#"{"error_code": 0, "data": [{"userId": "friend_charlie", "displayName": "Charlie", "avatar": ""}]}"#.to_string())
+            } else if path.contains("/api/group/getlg/v4") {
+                (200, r#"{"error_code": 0, "data": {"gridVerMap": {}}}"#.to_string())
+            } else if path.contains("/api/preloadconvers/get-last-msgs") {
+                // Sleep past the 6s per-source timeout
+                tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+                (200, r#"{"error_code": 0, "data": {"msgs": []}}"#.to_string())
+            } else {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            }
+        }).await;
+
+        let uin = format!("timeout-{}", crate::param_cipher::random_hex(12));
+        let mut session = test_session(&uin);
+        session.domains.friend = host.clone();
+        session.domains.profile = host.clone();
+        session.domains.group = host.clone();
+        session.domains.convers_api = host.clone();
+        session.domains.conversation = host.clone();
+
+        let report =
+            fetch_baseline_startup_threads_reported(&session, &uin, session.runtime_id()).await;
+        assert_eq!(report.sources.previews, SourceFetchStatus::Timeout);
+        assert!(matches!(report.status, BaselineFetchStatus::Partial { .. }));
+        assert_eq!(
+            report.threads.len(),
+            1,
+            "friends must be retained when preview times out"
+        );
+        assert_eq!(report.threads[0].name, "Charlie");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn baseline_fetch_report_aborts_on_account_runtime_change() {
+        let uin = format!("baseline-abort-{}", crate::param_cipher::random_hex(12));
+        let session = test_session(&uin);
+        let report = fetch_baseline_startup_threads_reported(
+            &session,
+            "different-owner",
+            session.runtime_id(),
+        )
+        .await;
+        assert_eq!(
+            report.status,
+            BaselineFetchStatus::AccountChanged,
+            "baseline fetch must abort when account owner does not match"
+        );
+        assert!(report.threads.is_empty());
+        assert!(!report.persisted);
+    }
+
+    #[tokio::test]
+    async fn refresh_threads_fenced_blocks_mismatched_runtime_or_owner() {
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WorkerCmd>();
+        let uin = format!("fenced-refresh-{}", crate::param_cipher::random_hex(12));
+        let session = test_session(&uin);
+        let valid_runtime = session.runtime_id();
+
+        // Send with mismatched owner
+        cmd_tx
+            .send(WorkerCmd::RefreshThreadsFenced {
+                owner: "wrong-owner".into(),
+                runtime_id: valid_runtime,
+            })
+            .unwrap();
+
+        // Send with mismatched runtime
+        cmd_tx
+            .send(WorkerCmd::RefreshThreadsFenced {
+                owner: uin.clone(),
+                runtime_id: valid_runtime + 99,
+            })
+            .unwrap();
+
+        // Verify that commands preserve their fencing attributes
+        let cmd1 = cmd_rx.recv().await.unwrap();
+        if let WorkerCmd::RefreshThreadsFenced { owner, runtime_id } = cmd1 {
+            assert_ne!(owner, session.account_key());
+            assert_eq!(runtime_id, session.runtime_id());
+        } else {
+            panic!("expected RefreshThreadsFenced");
+        }
+
+        let cmd2 = cmd_rx.recv().await.unwrap();
+        if let WorkerCmd::RefreshThreadsFenced { owner, runtime_id } = cmd2 {
+            assert_eq!(owner, session.account_key());
+            assert_ne!(runtime_id, session.runtime_id());
+        } else {
+            panic!("expected RefreshThreadsFenced");
+        }
     }
 }
 

@@ -1,151 +1,68 @@
-# .agent/PLAN.md - Kế hoạch Hành động Zalo Parity Hợp nhất (Phase 1 -> Phase 6) - 100% HOÀN THÀNH
+# .agent/PLAN.md - Kế hoạch Thực thi Codex Parity & Settings UI/UX (B1 -> B5)
 
-Tài liệu tổng thể 6 Phases: `docs/research/2026-11-24-zalo-parity-unified-master-plan.md`
-Biên bản nghiệm thu & Audit: `.agent/REVIEW_LOG.md`
-Danh sách kiểm tra & Nhiệm vụ: `.agent/TASKS.md`
-Chuẩn mực kỹ thuật: `AGENTS.md` (Karpathy-inspired coding discipline, Parity Evidence, Non-Negotiables)
-
----
-
-## Trạng thái Hoàn thành Toàn diện 6 Phase
-
-| Phase | Trọng số | Nội dung cốt lõi | Trạng thái | Reviewer Consensus | Prepush Check |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Phase 1** | P0 | VoIP Calling Bugfixes & Device Preflight Modal | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
-| **Phase 2** | P0 | Composer & Attachment Draft Overhaul (E1 Parity) | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
-| **Phase 3** | P0 | Message UX Parity & Local File Lifecycle | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
-| **Phase 4** | P1 | 5 Server Sync & Social Flows | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
-| **Phase 5** | P1 | Native Voice Messages & AI Transcription | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
-| **Phase 6** | P1/P2 | zCloud Rehydration, E2EE Push (551), Retry & Responsive | **HOÀN THÀNH** | PASS / PASS | HARD GATES PASSED |
+> [!NOTE]
+> **LỊCH SỬ CŨ (HISTORICAL / SUPERSEDED)**: Chu kỳ audit trước đó về Startup Readiness, Sync Banner & Hidden Chat đã đạt 2 lượt APPROVE liên tiếp (Lượt 3 & Lượt 4) vào ngày 24/11/2026. Lịch sử được bảo lưu nguyên vẹn tại [REVIEW_LOG.md](file:///c:/Projects/ZaloLite/.agent/REVIEW_LOG.md).
+> Phần dưới đây là kế hoạch thực thi mới theo tài liệu chính thức: `docs/research/2026-11-24-codex-ui-ux-settings-implementation-plan.md`.
 
 ---
 
-## 1. Mục tiêu Phase 4
-Đấu nối trọn vẹn 5 hệ thống giao tiếp server đã có sẵn module protocol vào pipeline khởi động nền và hoàn thiện trải nghiệm UI/UX:
-1. **Đánh dấu Chưa đọc Thủ công (Mark as Unread) 2 Chiều Server**: `/api/conv/getUnreadMark`, `/api/conv/addUnreadMark`, `/api/conv/removeUnreadMark`.
-2. **Hội thoại Đã lưu trữ (Archived Chats) Đồng bộ**: `/api/archivedchat/list`, `/api/archivedchat/update`.
-3. **Chat Ẩn Đồng bộ Mã PIN Server (Hidden Chats)**: `/api/hiddenconvers/get-all`, `/api/hiddenconvers/update-pin`, `/api/hiddenconvers/add-remove`.
-4. **Nhãn Hội thoại Đồng bộ Server (Labels)**: `/api/convlabel/get`, `/api/convlabel/update`.
-5. **Trạng thái Hoạt động Realtime (`lastOnline`) & Mute Đồng bộ (`getmute` / `setmute`)**: `/api/social/profile/lastOnline`, `/api/social/profile/getmute`, `setmute`.
+## 1. Mục tiêu & Nguyên tắc Cốt lõi
+- **Nguồn chuẩn**: `AGENTS.md`, `GLOSSARY.md`, `docs/standards/ui-ux-consistency.md`, `docs/research/2026-11-24-codex-ui-ux-settings-implementation-plan.md`.
+- **Ràng buộc cứng**:
+  - Không commit, không push, không tag, không release trong phiên này.
+  - Không reset, clean, stash hoặc xóa các tệp untracked.
+  - Không xóa `tools_panel.rs` hoặc `self.tools` trước khi hoàn tất migration end-to-end từng chức năng.
+  - Giữ nguyên KDF PBKDF2 cho PIN (không downgrade SHA-256).
+  - Không tạo UI stubs; mọi control tương tác phải gắn liền với backend và reactive state.
 
 ---
 
-## 2. Chi tiết Hợp đồng Kỹ thuật Phase 4 (Đã đối soát 100% với Codebase)
+## 2. Bảng Đối chiếu UXS-00 .. UXS-08 (Mục tiêu, Gap thực & Hợp đồng Kỹ thuật)
 
-### Task 4.1: Đánh dấu Chưa đọc Thủ công 2 Chiều Server
-- **Tệp liên quan:** `src/unread.rs`, `src/gui/worker.rs`, `src/gui.rs`, `src/gui/workspace.rs`
-- **Hợp đồng & Sử dụng Mã hiện có:**
-  - `Thread` struct: Sử dụng trường có sẵn `thread.unread.marked_unread: bool` (trong `crate::unread::UnreadState`). **KHÔNG** thêm trường thừa `is_manual_unread`.
-  - `WorkerCmd`: Sử dụng `WorkerCmd::ManualMark { owner, generation, target, group, action: crate::unread::MarkAction }` có sẵn.
-  - `GuiEvent`: Sử dụng `GuiEvent::ManualMarks { owner, generation, mutation, result: Result<Vec<ManualUnreadMark>, String> }` có sẵn.
-  - Handler trong `gui.rs`: Đã có sẵn gọi `crate::unread::merge_manual_unread_marks(&mut self.threads, &marks)`.
-- **Nhiệm vụ triển khai:**
-  1. `src/gui/worker.rs`:
-     - Trong startup background preload (vòng lặp metadata/login): Gọi `crate::unread::fetch_manual_unread_marks(&account).await` cùng lúc với các tác vụ khác qua `tokio::join!` $\rightarrow$ phát `GuiEvent::ManualMarks`.
-  2. `src/gui/workspace.rs`:
-     - Vẽ badge chưa đọc thủ công: Trên sidebar thread row, khi `unread_n == 0 && t.unread.marked_unread`, vẽ một chấm tròn đỏ nổi bật (`pal.danger`, bán kính 4.5px) ở góc phải nơi hiển thị badge.
-     - Khi mở hội thoại (`open_thread`): Nếu `thread.unread.marked_unread == true`, lập tức xóa cờ local `thread.unread.marked_unread = false` và gọi `self.manual_mark_command(tid.clone(), is_group, crate::unread::MarkAction::Remove)` để server Zalo xóa dấu chưa đọc.
-     - Kiểm tra menu chuột phải: Đã có sẵn "Đánh dấu chưa đọc trên máy chủ" và "Bỏ dấu chưa đọc trên máy chủ".
+| Gói | Yêu cầu (Requirement) | Hành vi hiện tại (Current Behavior) | Gap thực tế (Actual Gap) | Bằng chứng (Evidence) | Luồng lệnh & Dữ liệu (Entry -> Backend -> Event -> Persistence) | Giải pháp đề xuất (Proposed Patch) | Kiểm chứng (Verification) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **UXS-00** | Inventory & Khóa hợp đồng | Đã có 10 `SettingsTab` trong `modals.rs`; `ToolsPanel` có 10 tab con trong `tools_panel.rs` | Chưa khóa bản đồ di chuyển từng tính năng | `src/gui/modals.rs:804-814`, `src/gui/tools_panel.rs:5` | Khảo sát tĩnh `file:line`, kiểm kê struct thật | Lập bản đồ phụ thuộc và khoanh vùng lease | SCOUT inventory report |
+| **UXS-01** | Settings host, modal & điều hướng | Khi `win_w < 700.0` (compact), sidebar bị ẩn hoàn toàn, thay bằng `ComboBox` dễ gây nhầm lẫn; vùng nội dung thiếu scroll dọc đồng nhất | Compact mode mất thanh icon điều hướng; nội dung có thể tràn/cắt xén trên màn hình chiều cao nhỏ (<560px) | `src/gui/modals.rs:756, 785, 900-915` | `render_settings_modal` -> egui `Window` -> `egui::ScrollArea::vertical` | Thích ứng sidebar 48px icon-only khi compact; bọc `ScrollArea::vertical` cho toàn bộ panel nội dung và sidebar | Test resize viewport 640x480, 800x600, 1000x800 |
+| **UXS-02** | Di chuyển chức năng khỏi Tools | Tab `DataManagement` trong Settings chứa 2 nút đóng modal và mở `tools_panel.rs` tab 1 & 8 | Người dùng bị đẩy sang popup Tiện ích thay vì thao tác trực tiếp trong Settings; vi phạm Zalo PC parity | `src/gui/modals.rs:1421-1430`, `src/gui/tools_panel.rs:251-290` | UI click -> `self.tools_command(ToolsCommand::ExportHistory / Import)` -> `WorkerCmd::Tools` -> `GuiEvent::Tools` -> `self.tools.status` | Nhúng trực tiếp control Backup (Xuất SQLite) và Import (chọn file/thư mục + checkbox xác nhận) vào `SettingsTab::DataManagement`; giữ nút mở Kho Media & zCloud (chưa migrate tab 8) | Unit test & regression test backup/import workflow |
+| **UXS-03** | Hoàn thiện từng nhóm Settings | Các tab General, Security, Sync, DataManagement, Appearance, Messages có renderer cơ bản | Một số cài đặt chưa phản ánh đúng provenance hoặc chưa gắn kết với consumer thực tế | `src/gui/modals.rs:969-1850` | `AppSettings` -> SQLite `tool_config` / local preferences | Tinh chỉnh từng nhóm theo backend thực tế, không thêm toggle giả lập | Test lưu và nạp lại cấu hình sau restart |
+| **UXS-04** | Startup readiness & Config consumer | Startup preload đã có baseline timeout 9s, lọc deleted/recalled và phân loại status | Phân loại `Offline` dựa trên chuỗi có thể bắt trượt lỗi `reqwest::Error` dạng `"error sending request..."` hoặc `RequestDeadlineElapsed` | `src/gui/worker.rs:2129-2136` | `fetch_baseline_startup_threads_reported` -> `reqwest::Error::is_connect / is_timeout` | Downcast `reqwest::Error` & `RequestDeadlineElapsed` để phân loại `Offline` chính xác; tối ưu lệnh `RefreshThreads` sau startup | Test cold cache, offline simulate, timeout |
+| **UXS-05** | Composer, file card, timeline | Composer đã có preview attachment, đo width, giữ extension; bubble tin nhắn có MQA toolbar | Cần rà soát tính toàn vẹn khi nhiều tệp, draft restore và clear | `src/gui/workspace.rs:2800-3400` | Composer state -> Draft storage -> Attachment pipeline | Kiểm tra và giữ vững các bất biến draft/caption và file card | Unit test composer attachment measuring |
+| **UXS-06** | Emoji màu & Tính đúng của text | egui 0.29.1 render glyph font hệ thống | Cần kiểm tra hiển thị Unicode emoji sequences (ZWJ, skin tone) | `src/gui/theme.rs`, `epaint` font definitions | Font loading -> Glyph rasterizer | Rà soát rendering Unicode sequences trên nền tảng Windows | Kiểm chứng trực quan và test text shaping |
+| **UXS-07** | Media lifecycle & Storage cleanup | Quản lý cache và preview micro/audio đã có token owner/runtime | Cần đảm bảo giải phóng thiết bị micro ngay khi đóng modal/tab switch | `src/gui/modals.rs:2658`, `src/media.rs` | `PreflightMicMonitor::stop` -> CPAL device release | Đảm bảo stop idempotent khi đổi tài khoản hoặc đóng modal | Test preflight monitor cleanup |
+| **UXS-08** | Tích hợp & Nghiệm thu | Hệ thống đã có 1173 tests passed, hard gates prepush sạch | Cần kiểm chứng candidate mới qua chu trình review kép độc lập B4 | Toàn bộ codebase | `cargo test`, `cargo clippy`, `audit-prepush.ps1` | Chạy Cổng B3 và chu trình Dual Review 2 lượt sạch | Automated gates + Biên bản APPROVE kép |
 
 ---
 
-### Task 4.2: Hội thoại Lưu trữ (Archived Chats) Đồng bộ
-- **Tệp liên quan:** `src/archive.rs`, `src/gui/worker.rs`, `src/gui.rs`, `src/gui/workspace.rs`
-- **Hợp đồng & Sử dụng Mã hiện có:**
-  - `Thread` struct: Sử dụng trường có sẵn `thread.presentation.archived: Option<bool>`. **KHÔNG** thêm trường thừa `is_archived`.
-  - `WorkerCmd`: Sử dụng `WorkerCmd::Archive { owner, generation, target, group, archived: Option<bool> }` có sẵn.
-  - `GuiEvent`: Sử dụng `GuiEvent::Archive { owner, generation, mutation, result: Result<crate::archive::Snapshot, String> }` có sẵn.
-  - Handler trong `gui.rs`: Đã có sẵn cập nhật `thread.presentation.archived` cho mọi thread.
-  - Lọc hội thoại lưu trữ: Đã có sẵn `ThreadFilter::Archived` ("📁 Tin nhắn đã lưu trữ") và đã ẩn thread lưu trữ ở danh sách chat chính.
-- **Nhiệm vụ triển khai:**
-  1. `src/gui/worker.rs`:
-     - Trong startup background preload: Thêm `crate::archive::execute(&account, "", false, None).await` vào `tokio::join!` $\rightarrow$ phát `GuiEvent::Archive` để nạp snapshot lưu trữ từ server ngay khi mở app.
-  2. `src/gui/workspace.rs`:
-     - Thêm tùy chọn vào menu chuột phải của thread sidebar:
-       - Nếu `t.presentation.archived == Some(true)`: *"Đưa về hội thoại chính"* (Bỏ lưu trữ).
-       - Ngược lại: *"Lưu trữ cuộc trò chuyện"*.
-       - Click $\rightarrow$ gọi `self.archive_command(target_id.clone(), target_group, Some(!is_archived))`.
+## 3. Ba Patch Đầu Tiên (Triển khai Trọng tâm — Đã Phê Duyệt Sau Thẩm Định Advisor)
 
----
+### Patch P1: Settings Host, Modal & Adaptive Navigation
+- **Tệp được phép sửa**: `src/gui/modals.rs`, `src/gui.rs` (bổ sung test viewport matrix).
+- **Mục tiêu & Điều kiện chốt**:
+  1. Thích ứng sidebar: Khi `compact = (win_w < 700.0)`, hiển thị sidebar thu gọn `sidebar_w = 48.0` icon-only có tooltip tiếng Việt đầy đủ qua `crate::i18n::tr`; khi `win_w >= 700.0`, hiển thị sidebar `sidebar_w = 200.0` (icon + title).
+  2. Tính toán chính xác outer width sidebar: khi compact, sidebar outer width đúng 48px; `content_w = (win_w - sidebar_w - 48.0).max(64.0)` đảm bảo tổng không vượt quá `win_w` và không cắt nút `X`.
+  3. Khi compact: ẩn heading `"Cài đặt"`, căn giữa icon tại `rect.center()`, luôn hiển thị tiêu đề tab đầy đủ `ui.label(tab_title)` ở header bên phải để tránh việc chỉ biết tab qua hover tooltip.
+  4. Bọc `egui::ScrollArea::vertical().auto_shrink([false, false])` cho **cả sidebar** (khi `win_h < 450px`) lẫn **panel nội dung bên phải** (với `.max_height((win_h - 100.0).max(32.0))`).
+  5. Reflow các layout cố định (`Notifications`, `Appearance`, `General`, `Calls`) để hiển thị gọn gàng khi `content_w` hẹp mà không bị scroll ngang.
+  6. Bổ sung `SettingsTab::DataManagement` và `SettingsTab::Calls` vào test viewport matrix `settings_tabs_fit_small_wide_and_high_dpi_viewports`.
 
-### Task 4.3: Chat Ẩn Đồng bộ Mã PIN Server (Hidden Chats)
-- **Tệp liên quan:** `src/hidden_chat.rs`, `src/gui/worker.rs`, `src/gui.rs`, `src/gui/workspace.rs`
-- **Hợp đồng & Sử dụng Mã hiện có:**
-  - `WorkerCmd`: Sử dụng `WorkerCmd::Hidden { owner, generation, action: crate::hidden_chat::Action }` có sẵn.
-  - `GuiEvent`: Sử dụng `GuiEvent::Hidden { owner, generation, view: crate::hidden_chat::Snapshot, result: Result<(), String> }` có sẵn.
-  - Startup preload: `hidden_chat::execute(&account, &Action::Read)` và khôi phục cache ĐÃ ĐƯỢC CHẠY trong vòng lặp metadata ở `worker.rs`.
-  - Bộ lọc: `self.private_access(&t.id, t.is_group)` đã lọc các thread ẩn ra khỏi sidebar và tìm kiếm khi chưa mở khóa.
-  - Giao diện modal: `hidden_panel.rs` đã hoàn chỉnh để nhập PIN, khóa, mở khóa, đổi PIN, thêm/xóa chat ẩn.
-- **Nhiệm vụ triển khai:**
-  - Trong thanh tìm kiếm chat ở sidebar (`workspace.rs`):
-    - Khi người dùng nhập chuỗi 4 chữ số vào ô tìm kiếm và **nhấn Enter** (hoặc hiển thị nút bấm gợi ý *"Mở khóa hội thoại ẩn"*):
-      - Gửi `WorkerCmd::Hidden { owner, generation, action: Action::Unlock(Zeroizing::new(pin)) }`.
-    - **Lưu ý an toàn (BẮT BUỘC):** Tuyệt đối KHÔNG tự động unlock trên sự kiện gõ phím thay đổi chuỗi (`on_change`) để tránh bị khóa an toàn 60 giây khi nhập sai 5 lần (`failures >= 5` $\rightarrow$ `blocked_until = 60s`). Chỉ kích hoạt khi người dùng nhấn Enter có chủ đích.
+### Patch P2: Migration Hoàn chỉnh — Chuyển Backup / Import / Export sang `SettingsTab::DataManagement`
+- **Tệp được phép sửa**: `src/gui/modals.rs`, `src/gui/tools_panel.rs` (mở visibility `pub(super) fn render_tools_import`).
+- **Mục tiêu & Điều kiện chốt**:
+  1. **Bắt buộc giữ lại nút**: `"Mở kho Media và zCloud"` (`modals.rs:1426`) vì tab 8 Media/zCloud chưa được migrate ở patch này.
+  2. Thay thế nút `"Mở công cụ nhập / xuất dữ liệu"` (`modals.rs:1421`) bằng cụm điều khiển trực tiếp:
+     - Nút "Sao lưu ngay (Xuất SQLite)": gọi `self.tools_command(ToolsCommand::ExportHistory)`.
+     - Checkbox xác nhận `self.tools.import_owned`: "Tôi xác nhận dữ liệu nguồn thuộc tài khoản đang đăng nhập".
+     - Nút "Chọn tập tin": gọi `self.tools_command(ToolsCommand::Import { directory: false, confirmed: true })`.
+     - Nút "Chọn thư mục": gọi `self.tools_command(ToolsCommand::Import { directory: true, confirmed: true })`.
+     - Hiển thị nhãn trạng thái `self.tools.status` trực tiếp bên dưới các nút điều khiển.
+  3. Trong `SettingsTab::Sync` (dòng 1312), chuyển hướng nút `"Nhập / Xuất lịch sử…"` chuyển thẳng sang `self.settings_tab = SettingsTab::DataManagement` thay vì đóng modal mở `Tools`.
 
----
-
-### Task 4.4: Nhãn Hội thoại Đồng bộ Server (Labels)
-- **Tệp liên quan:** `src/labels.rs`, `src/gui/labels_panel.rs`, `src/gui/worker.rs`, `src/gui.rs`
-- **Hợp đồng & Sử dụng Mã hiện có:**
-  - `WorkerCmd`: Sử dụng `WorkerCmd::Labels { owner, generation, action: crate::labels::Action }` có sẵn.
-  - `GuiEvent`: Sử dụng `GuiEvent::Labels` có sẵn (gán `self.labels_panel.snapshot = Some(snapshot)`).
-  - Panel nhãn: `labels_panel.rs` đã hoàn thiện giao diện xem, tạo, đổi tên, xóa, gán nhãn cho thread.
-- **Nhiệm vụ triển khai:**
-  1. `src/gui/worker.rs`:
-     - Trong startup background preload: Thêm `crate::labels::execute(&account, &crate::labels::Action::Read).await` vào `tokio::join!` $\rightarrow$ phát `GuiEvent::Labels` để nạp danh sách nhãn từ server ngay khi khởi động.
-  2. `src/gui/workspace.rs`:
-     - Đảm bảo thanh phân loại hiển thị đúng và bộ lọc theo nhãn hoạt động mượt mà với snapshot nhãn từ server.
-
----
-
-### Task 4.5: Trạng thái Online Realtime & Mute Đồng bộ
-- **Tệp liên quan:** `src/last_activity.rs`, `src/mute_sync.rs`, `src/gui/worker.rs`, `src/gui.rs`, `src/gui/workspace.rs`
-- **Hợp đồng & Sử dụng Mã hiện có:**
-  - **Mute Sync:**
-    - `sync_mute_snapshot` trong `worker.rs` ĐÃ ĐƯỢC CHẠY khi khởi động: nạp từ server qua `fetch_mute_snapshot`, reconcile với SQLite, và phát `GuiEvent::ConversationPreferences`.
-    - `WorkerCmd::SetConversationPreference` ĐÃ ĐƯỢC NỐI gọi `crate::mute_sync::set_remote_mute`.
-    - `live_updates.rs` ĐÃ CHẶN thông báo và âm thanh khi thread bị mute (`!thread.unread.is_muted() && !muted.contains(&thread.id)`).
-  - **Last Activity:**
-    - Module `src/last_activity.rs` đã có hàm `read(&s, &target, official)`.
-    - `GuiEvent::ActivityUpdated { owner, uid, status: crate::last_activity::Status }` đã có sẵn trong `gui.rs`.
-- **Nhiệm vụ triển khai:**
-  1. **Mute UI:**
-     - Trên sidebar thread row (`workspace.rs`): Khi `is_muted == true` (lấy từ `conversation_preferences`), vẽ icon chuông gạch chéo `🔕` (FontId 10.5) cạnh timestamp hoặc tên thread.
-     - Cập nhật menu chuột phải: Đổi text hiển thị từ `"Tắt thông báo (trên máy này)"` thành `"Tắt thông báo"` (vì đã đồng bộ 2 chiều với server Zalo).
-  2. **Last Online / Trạng thái Hoạt động:**
-     - `WorkerCmd`: Thêm `FetchLastOnline { owner: String, target: String, official: bool }`.
-     - `worker.rs`: Khi nhận `WorkerCmd::FetchLastOnline`, gọi `crate::last_activity::read(&account, &target, official).await`. Nếu thành công, phát `GuiEvent::ActivityUpdated { owner, uid: target, status }`.
-     - `ZaloGuiApp` (`src/gui.rs`): Thêm trường `pub presence_map: std::collections::HashMap<String, (crate::last_activity::Status, std::time::Instant)>`. Trong handler `GuiEvent::ActivityUpdated`, luôn cập nhật vào `presence_map` (không bị giới hạn bởi `contact_panel.target`).
-     - Khi mở hội thoại 1-1 (`open_thread` trong `workspace.rs`): Nếu là chat 1-1 (`!is_group && !is_cloud`), kiểm tra `presence_map`. Nếu chưa có hoặc đã quá 60 giây, gửi `WorkerCmd::FetchLastOnline`.
-     - Trong Central Chat Header (`workspace.rs`):
-       - Avatar 1-1: Vẽ cutout online dot màu xanh lá (`pal.accent_online`, bán kính 4.5px, viền nền) ở góc dưới-phải avatar khi trạng thái là `LastActivity(ts)` với `now - ts <= 180_000` (hoạt động trong vòng 3 phút).
-       - Dòng text phụ đề dưới tên đối phương:
-         - Nếu `LastActivity(ts)`:
-           - `<= 3 phút`: Hiển thị `"Đang hoạt động"` với màu xanh lá `pal.accent_online`.
-           - `< 60 phút`: Hiển thị format `"Truy cập {mins} phút trước"`.
-           - `< 24 giờ`: Hiển thị format `"Truy cập {hours} giờ trước"`.
-           - `>= 24 giờ`: Hiển thị `"Truy cập hôm qua"` hoặc ngày cụ thể.
-         - Nếu `PrivacyUnavailable` hoặc `Unavailable`: Fallback về trạng thái kết bạn mặc định (`"Đã kết bạn"`).
-
----
-
-## 3. Kiến trúc Preload Khởi động Đồng thời (Concurrent Startup Preload)
-Để đảm bảo thời gian khởi động app luôn dưới 1 giây và không bao giờ block UI thread:
-- Trong `src/gui/worker.rs`, các lệnh nạp metadata từ server được gộp chạy đồng thời bằng `tokio::join!`:
-```rust
-let unread_fut = crate::unread::fetch_manual_unread_marks(&account);
-let archive_fut = crate::archive::execute(&account, "", false, None);
-let labels_fut = crate::labels::execute(&account, &crate::labels::Action::Read);
-let (unread_res, archive_res, labels_res) = tokio::join!(unread_fut, archive_fut, labels_fut);
-```
-- Kết quả được phát lần lượt về `gui_tx` (`GuiEvent::ManualMarks`, `GuiEvent::Archive`, `GuiEvent::Labels`).
-- Tất cả I/O SQLite đều chạy trong `tokio::task::spawn_blocking`.
-- Giao diện người dùng render ngay lập tức từ dữ liệu SQLite đã cache, sau đó cập nhật phản chiếu (reactive render) ngay khi các sự kiện nền trả về.
-
----
-
-## 4. Invariants & Tiêu chí Nghiệm thu (Non-Negotiables)
-- Tuyệt đối không gọi I/O hoặc network trên UI thread.
-- Duy trì nguyên tắc Độc nhất Nguồn Chân lý (Single Source of Truth), không tạo trường dữ liệu trùng lặp (`marked_unread` và `archived` đã có vị trí chuẩn trên `Thread`).
-- Không tạo UI stubs: mọi nút bấm (lưu trữ, tắt thông báo, đánh dấu chưa đọc, mở khóa PIN) đều phải đi trọn vẹn luồng `UI -> WorkerCmd -> Server API -> GuiEvent -> App State -> Reactive UI`.
-- Chạy `cargo check --locked` và `powershell scripts/audit-prepush.ps1` đạt 100% trước khi kết thúc Phase 4.
+### Patch P3: Chuẩn hóa Phân loại Lỗi Mạng & Startup Readiness
+- **Tệp được phép sửa**: `src/gui/worker.rs`.
+- **Mục tiêu & Điều kiện chốt**:
+  1. Trong `fetch_baseline_startup_threads_reported`: Duyệt `e.chain()` kiểm tra:
+     - `cause.downcast_ref::<reqwest::Error>().is_some_and(|re| re.is_connect() || re.is_timeout())`
+     - `cause.downcast_ref::<crate::session::RequestDeadlineElapsed>().is_some()`
+     - Kết hợp kiểm tra lowercase message (`connect`, `timed out`, `timeout`, `dns`, `tcp`, `network`).
+     - Giữ nguyên lỗi HTTP (500), Envelope error, decode JSON, auth error ở trạng thái `BaselineFetchStatus::Failed`.
+  2. Trì hoãn việc gửi `WorkerCmd::RefreshThreads` trong worker khi `run_startup_preload` đang chạy dở bước 1–3 để không chạy tranh chấp với cold baseline.

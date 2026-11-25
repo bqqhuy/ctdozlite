@@ -1728,6 +1728,27 @@ async fn delete_upload_checkpoint(session: &Session, upload_id: &str) {
 /// Uses `s.domains.friend` (defaulting to `tt-friend-wpa.chat.zalo.me`), falling back
 /// to `s.domains.profile` only if `domains.friend` is empty.
 pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
+    let mut threads = get_friend_contacts(s).await?;
+    // Merge user groups into threads list
+    if let Ok(mut groups) = get_groups(s).await {
+        for g in groups.drain(..) {
+            if let Some(existing) = threads.iter_mut().find(|t| t.id == g.id && t.is_group) {
+                merge_thread_into(existing, g, true);
+            } else {
+                threads.push(g);
+            }
+        }
+    }
+
+    resolve_thread_names(s, &mut threads).await;
+
+    Ok(threads)
+}
+
+/// Fetch the contact source without group/profile enrichment for independent startup deadlines.
+/// # Errors
+/// Returns the existing friend-list request, envelope and parse errors.
+pub(crate) async fn get_friend_contacts(s: &Session) -> Result<Vec<Thread>> {
     if s.login.is_none() {
         anyhow::bail!("chưa đăng nhập");
     }
@@ -1811,19 +1832,6 @@ pub async fn get_friends(s: &Session) -> Result<Vec<Thread>> {
             );
         }
     }
-
-    // Merge user groups into threads list
-    if let Ok(mut groups) = get_groups(s).await {
-        for g in groups.drain(..) {
-            if let Some(existing) = threads.iter_mut().find(|t| t.id == g.id && t.is_group) {
-                merge_thread_into(existing, g, true);
-            } else {
-                threads.push(g);
-            }
-        }
-    }
-
-    resolve_thread_names(s, &mut threads).await;
 
     Ok(threads)
 }
@@ -5287,12 +5295,12 @@ pub async fn get_group_history_raw(s: &Session, grid: &str, count: u32) -> Resul
 /// Unwrap encrypted/stringified JSON data without dropping server errors.
 fn response_data(mut value: Value) -> Result<Value> {
     for _ in 0..4 {
-        if let Some(code) = value
-            .get("error_code")
-            .and_then(Value::as_i64)
-            .filter(|code| *code != 0)
-        {
-            anyhow::bail!("server error {code}: metadata unavailable");
+        if let Some(raw_code) = value.get("error_code") {
+            let code = crate::api_response::integer(raw_code)
+                .context("Mã lỗi phản hồi metadata không hợp lệ")?;
+            if code != 0 {
+                anyhow::bail!("server error {code}: metadata unavailable");
+            }
         }
         if let Some(text) = value.as_str() {
             value = serde_json::from_str(text)?;
@@ -5463,7 +5471,16 @@ pub(crate) async fn resolve_group_metadata(
                 if let Some(info_map) = info.get("gridInfoMap").and_then(Value::as_object) {
                     for group in chunk {
                         if let Some(raw) = info_map.get(&group.id) {
-                            if let Ok(info) = response_data(raw.clone()) {
+                            let info = match response_data(raw.clone()) {
+                                Ok(info) => info,
+                                Err(error)
+                                    if crate::session::is_expired_error(&error.to_string()) =>
+                                {
+                                    return Err(error)
+                                }
+                                Err(_) => continue,
+                            };
+                            {
                                 group.apply_group_sidebar_metadata(&info);
                                 if let Some(name) =
                                     pick_str(&info, &["name", "groupName", "displayName"])
@@ -5524,11 +5541,10 @@ pub async fn get_mini_profiles(
     let resp = s.post_form(&url, form).await?;
     let resp = s.maybe_decrypt(resp, s.session_key_bytes()).await;
 
-    if let Some(data) = resp.get("data").and_then(Value::as_object) {
-        Ok(data.clone())
-    } else {
-        Ok(serde_json::Map::new())
-    }
+    response_data(resp)?
+        .as_object()
+        .cloned()
+        .context("Danh sách profile không hợp lệ")
 }
 
 /// Largest roster resolved for the member panel; larger groups show the first ones.
@@ -5590,6 +5606,19 @@ pub async fn group_members(
 
 /// Automatically resolve real display names and avatars for threads that only have placeholder names.
 pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
+    if let Err(error) = resolve_thread_names_checked(s, threads).await {
+        crate::logger::log_error("thread name resolution", &error.to_string());
+    }
+}
+
+/// Resolve display metadata while preserving server refusals for startup admission.
+/// # Errors
+/// Returns enrichment failures after keeping useful results; expiry stops immediately.
+pub(crate) async fn resolve_thread_names_checked(
+    s: &Session,
+    threads: &mut [Thread],
+) -> Result<()> {
+    let mut failure = None;
     let mut unknown_groups: Vec<Thread> = threads
         .iter()
         .filter(|t| {
@@ -5600,7 +5629,10 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
         .collect();
     if !unknown_groups.is_empty() {
         if let Err(e) = resolve_group_metadata(s, &mut unknown_groups).await {
-            crate::logger::log_error("group name resolution", &e.to_string());
+            if crate::session::is_expired_error(&e.to_string()) {
+                return Err(e);
+            }
+            failure = Some(e);
         }
         for resolved in unknown_groups {
             if let Some(thread) = threads
@@ -5627,7 +5659,17 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
 
     if !unknown_ids.is_empty() {
         for chunk in unknown_ids.chunks(50) {
-            if let Ok(profiles) = get_mini_profiles(s, chunk).await {
+            let profiles = match get_mini_profiles(s, chunk).await {
+                Ok(profiles) => profiles,
+                Err(error) if crate::session::is_expired_error(&error.to_string()) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    continue;
+                }
+            };
+            {
                 for t in threads.iter_mut() {
                     if let Some(p) = profiles.get(&t.id) {
                         t.presentation.inbox.apply_profile(p);
@@ -5649,6 +5691,10 @@ pub async fn resolve_thread_names(s: &Session, threads: &mut [Thread]) {
                 }
             }
         }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 

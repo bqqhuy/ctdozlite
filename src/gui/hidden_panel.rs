@@ -37,11 +37,37 @@ impl ZaloGuiApp {
             view.unlocked = false;
         }
         let previous = &self.hidden_panel.view;
+        let unlocked_now = !previous.unlocked && view.unlocked;
         let restrictive = !view.unlocked
             && ((!view.ready && previous.ready)
                 || previous.unlocked
                 || (view.ids != previous.ids && !view.ids.is_empty()));
         self.hidden_panel.view = view;
+        if unlocked_now {
+            let mut max_ts = 0i64;
+            for t in &self.threads {
+                let is_hidden = crate::server_pins::identity(&t.id, t.is_group)
+                    .ok()
+                    .is_some_and(|id| self.hidden_panel.view.ids.contains(&id));
+                if is_hidden && t.unread.count() > 0 {
+                    let thread_ts = crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
+                        .max(
+                            t.messages
+                                .iter()
+                                .map(|m| crate::clock::normalize_ts_ms(m.ts))
+                                .max()
+                                .unwrap_or(0),
+                        )
+                        .max(1);
+                    if thread_ts > max_ts {
+                        max_ts = thread_ts;
+                    }
+                }
+            }
+            if max_ts > 0 {
+                self.acknowledge_hidden_unread(max_ts);
+            }
+        }
         // Invalidate late search responses, close decrypted previews, and drop GPU copies on relock.
         if restrictive {
             self.hidden_panel.show_in_sidebar = false;
@@ -138,5 +164,68 @@ impl ZaloGuiApp {
             }
             self.hidden_command(action);
         }
+    }
+
+    pub(super) fn acknowledge_hidden_unread(&mut self, timestamp_ms: i64) {
+        if !self.is_logged_in || timestamp_ms <= self.hidden_unread_last_ack_ts {
+            return;
+        }
+        let command = WorkerCmd::AcknowledgeHiddenUnread {
+            owner: self.user_uin.clone(),
+            runtime_id: self.account_runtime_id,
+            timestamp_ms,
+        };
+        if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+            self.hidden_unread_last_ack_ts = timestamp_ms;
+        } else {
+            self.show_toast("Chưa lưu được xác nhận thông báo trò chuyện ẩn");
+        }
+    }
+
+    /// Evaluates whether unmuted hidden conversations contain unread messages newer than the last acknowledgment.
+    ///
+    /// # Privacy Invariant
+    /// Returns only `(has_unread, max_ts)` without disclosing conversation identity, sender name, message content,
+    /// or unread badge counts. Never alters PIN state or marks server read receipts.
+    pub(crate) fn has_unacknowledged_hidden_unread(&self) -> (bool, i64) {
+        if !self.is_logged_in
+            || !self.hidden_unread_ack_ready
+            || self.hidden_panel.view.unlocked
+            || !self.hidden_panel.view.ready
+        {
+            return (false, 0);
+        }
+        let mut max_ts = 0i64;
+        let mut has_unread = false;
+        for t in &self.threads {
+            let is_hidden = crate::server_pins::identity(&t.id, t.is_group)
+                .ok()
+                .is_some_and(|id| self.hidden_panel.view.ids.contains(&id));
+            if is_hidden
+                && !t.unread.is_muted()
+                && !self
+                    .conversation_preferences
+                    .get(&t.id)
+                    .is_some_and(|preference| preference.muted)
+                && t.unread.count() > 0
+            {
+                let thread_ts = crate::clock::normalize_ts_ms(t.presentation.last_message_ts)
+                    .max(
+                        t.messages
+                            .iter()
+                            .map(|m| crate::clock::normalize_ts_ms(m.ts))
+                            .max()
+                            .unwrap_or(0),
+                    )
+                    .max(1);
+                if thread_ts > self.hidden_unread_last_ack_ts {
+                    has_unread = true;
+                    if thread_ts > max_ts {
+                        max_ts = thread_ts;
+                    }
+                }
+            }
+        }
+        (has_unread, max_ts)
     }
 }

@@ -1,3 +1,5 @@
+> Cập nhật 24/11/2026: Với đợt tái cấu trúc Settings/UI và readiness đang giao, dùng [phương án Codex](2026-11-24-codex-ui-ux-settings-implementation-plan.md) và [prompt phân việc subagent](2026-11-24-antigravity-settings-parity-execution-prompt.md). Prompt cũ bên dưới giữ làm tham khảo cho phạm vi V2; không chép trạng thái hay triển khai trùng phần đã sửa.
+
 # Prompt bàn giao Antigravity — 24/11/2026
 
 Prompt điều phối [kế hoạch V2](2026-11-24-zalo-full-parity-master-implementation-plan.md); không thay chính sách, đặc tả hoặc trạng thái nghiệm thu.

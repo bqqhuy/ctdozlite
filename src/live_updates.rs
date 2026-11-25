@@ -15,6 +15,8 @@ pub struct LiveUpdates {
     // One short ownership lock covers snapshots only, never disk/network/render work.
     pending: Mutex<(HashMap<String, Thread>, bool)>,
     muted: Mutex<std::collections::HashSet<String>>,
+    #[allow(dead_code)]
+    muted_revision: Mutex<u64>,
     suppressed: Mutex<std::collections::HashSet<String>>,
     metadata_needed: std::sync::atomic::AtomicBool,
     baselines: Mutex<HashMap<String, Baseline>>,
@@ -244,6 +246,24 @@ impl LiveUpdates {
             }
         }
     }
+    /// Apply a mute snapshot only if its serialized DB revision is not stale.
+    pub(crate) fn set_muted_versioned(
+        &self,
+        values: &HashMap<String, crate::store::ConversationPreference>,
+        revision: u64,
+    ) {
+        // Lock order is revision -> muted; readers only take muted.
+        let mut current = self
+            .muted_revision
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if revision < *current {
+            return;
+        }
+        self.set_muted(values);
+        *current = revision;
+    }
+
     pub(crate) fn set_muted(&self, values: &HashMap<String, crate::store::ConversationPreference>) {
         *self.muted.lock().unwrap_or_else(|e| e.into_inner()) = values
             .iter()
@@ -550,5 +570,27 @@ mod inbox_metadata_tests {
         updates.request_metadata();
         assert!(updates.take_metadata_request());
         assert!(!updates.take_metadata_request());
+    }
+}
+
+#[cfg(test)]
+mod mute_revision_tests {
+    use super::*;
+
+    #[test]
+    fn late_cache_cannot_unmute_a_newer_live_snapshot() {
+        let live = LiveUpdates::default();
+        let muted = HashMap::from([(
+            "thread".into(),
+            crate::store::ConversationPreference {
+                muted: true,
+                ..Default::default()
+            },
+        )]);
+        live.set_muted_versioned(&muted, 20);
+        live.set_muted_versioned(&HashMap::new(), 10);
+        assert!(live.muted.lock().unwrap().contains("thread"));
+        live.set_muted_versioned(&HashMap::new(), 30);
+        assert!(live.muted.lock().unwrap().is_empty());
     }
 }

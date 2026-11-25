@@ -18,6 +18,7 @@ pub(super) struct ToolsPanel {
     pub when_local: String,
     pub import_owned: bool,
     pub status: String,
+    pub data_pending: Option<u64>,
     pub paused: bool,
     pub devices: Vec<crate::device::DeviceSession>,
     pub group_todos: Vec<crate::todo::TodoItem>,
@@ -141,12 +142,36 @@ pub enum ToolsResult {
 }
 
 impl ZaloGuiApp {
-    pub(super) fn tools_command(&self, command: ToolsCommand) {
-        if let Some(tx) = WORKER_TX.get() {
-            let _ = tx.send(WorkerCmd::Tools {
+    pub(super) fn tools_command(&mut self, command: ToolsCommand) -> bool {
+        let data_operation = matches!(
+            command,
+            ToolsCommand::ExportHistory | ToolsCommand::Import { .. }
+        );
+        if data_operation && self.tools.data_pending.is_some() {
+            return false;
+        }
+        let generation = crate::search::generation();
+        let command = if data_operation {
+            WorkerCmd::ToolsData {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                generation,
+                command,
+            }
+        } else {
+            WorkerCmd::Tools {
                 owner: self.user_uin.clone(),
                 command,
-            });
+            }
+        };
+        if WORKER_TX.get().is_some_and(|tx| tx.send(command).is_ok()) {
+            if data_operation {
+                self.tools.data_pending = Some(generation);
+            }
+            true
+        } else {
+            self.show_toast("Không thể gửi lệnh tới tác vụ nền");
+            false
         }
     }
     pub(super) fn render_tools_panel(&mut self, ctx: &egui::Context) {

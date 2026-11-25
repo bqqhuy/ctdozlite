@@ -173,3 +173,167 @@
 ## Codex follow-up — 24/11/2026
 
 Các khẳng định Phase 7 PASS/100% phía trên không phải bằng chứng đóng những finding Codex phát hiện sau đó. Codex đã trực tiếp sửa và chạy lại trên candidate c494c88d95052d3dfd8f1a8d9a9c13b6a184aa524962e197a606a08cbade17f3: hai lượt audit scoped sạch, 1154 library tests đạt/11 ignored, 3000 stress test executions đạt, 4 backup integration đạt, Clippy all-targets -D warnings sạch. Canonical evidence: docs/research/2026-11-23-sync-config-audit-dossier.md và remediation plan. Hai lượt cùng Codex, không phải hai reviewer độc lập. Native acceptance/AMBIGUOUS vẫn mở; không commit/push/release.
+
+
+---
+
+## Round 1 Audit (24/11/2026) - Kết quả Review Kép Độc lập (REVIEWER_A & REVIEWER_B)
+
+### 1. Kết luận sơ bộ
+- **REVIEWER_A (`gemini-4-carbon-high`)**: REQUEST_CHANGES (1 BLOCKER, 5 MAJOR, 1 MINOR).
+- **REVIEWER_B (`claude-opus-5-5-high`)**: REQUEST_CHANGES (4 MAJOR, 4 MINOR, 1 DOC_MAJOR).
+- **ORCHESTRATOR**: ĐỒNG THUẬN HOÀN TOÀN với các phát hiện có bằng chứng rõ ràng, không tranh chấp.
+
+### 2. Bảng Phân loại & Đối chiếu Phát hiện (B4.2 & B4.3)
+
+| Nhóm | ID Lỗi | Mức độ | Tệp:Dòng | Mô tả ngắn gọn & Bằng chứng | Hướng khắc phục đã thống nhất |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Cụm 1** | A-01 / B1 | **BLOCKER** | `src/gui/worker.rs`, `src/gui.rs`, `src/store.rs` | `hidden_unread_ack_ms` không được nạp lúc startup; `GuiEvent::HiddenUnreadAcknowledged` không có nơi nào phát ra trong production code | Đọc `store.hidden_unread_ack()` lúc startup preload và phát `HiddenUnreadAcknowledged`. WorkerCmd `AcknowledgeHiddenUnread` echo lại giá trị cho UI. |
+| **Cụm 2** | A-06(b) / B2 | **MAJOR** | `src/gui/workspace.rs:919-974` | Banner đổi trạng thái sang `Preparing` dù `tx.send` có thể fail; gửi `sync_operation_id` cũ | Chỉ đổi trạng thái khi `tx.send().is_ok()`; reset `sync_operation_id = 0` và chờ worker cấp id mới. |
+| **Cụm 3** | A-04 / B9(a) | **MAJOR** | `src/gui/worker.rs:3635+`, `src/live_updates.rs` | Cấp `generation()` ngoài `AccountWritePermit` sau await; gọi `live.set_muted` không qua versioned | Cấp `generation()` bên trong closure `spawn_blocking` khi còn giữ write permit; đổi toàn bộ sang `live.set_muted_versioned`. |
+| **Cụm 4** | A-03 / B9(b) | **MAJOR** | `src/gui/worker.rs:4354-4395` | Await-fencing bị hở TOCTOU qua `reap_finished_phone_sync.await` | Đối chiếu lại `owner`/`runtime_id` và `is_active()` sau `reap_finished_phone_sync.await` trước khi dispatch transfer. |
+| **Cụm 5** | A-02 / B7 | **MAJOR** | `src/store.rs:1648+`, `src/gui/worker.rs` | `hydrate_refresh` làm sống lại tin nhắn đã thu hồi (`Recall`) từ server preview; nuốt lỗi DB | Kiểm tra `existing.mark_recalled()` trong `hydrate_refresh`; trả lỗi DB thực và hạ trạng thái sang `Partial`/`Failed`. |
+| **Cụm 6** | B4 / A-05 | **MAJOR** | `src/gui/worker.rs:1952-2035` | Startup baseline không có timeout giới hạn (nguy cơ treo màn loading); trùng lệnh `RefreshThreads` | Giới hạn ngân sách thời gian 8-10s cho baseline; chỉ kích hoạt backfill khi status là `Partial`/`Offline`/`Failed`. |
+| **Cụm 7** | B3 | **MAJOR** | `src/gui/workspace.rs:6449-6527` | Nút "Thử lại" bị disable vĩnh viễn (UI stub); modal chờ thiếu trạng thái "Đang hủy..." | Bỏ nút retry hoặc kích hoạt hợp lý; bổ sung trạng thái "Đang hủy..." và nút thoát an toàn. |
+| **Cụm 8** | A-06(a) | **MAJOR** | `src/gui/workspace.rs:1720-1772`, `hidden_panel.rs` | Mở khóa chat ẩn bằng PIN / nút mở khóa không cập nhật `hidden_unread_ack` | Gọi `acknowledge_hidden_unread` khi trạng thái chuyển từ locked sang unlocked. |
+| **Cụm 9** | B5, B6, B8, A-07 | **MINOR** | `src/gui/worker.rs`, `src/gui/workspace.rs` | Phân loại Offline chưa downcast; `AutoSyncIntentRejected` đặt cứng `temporary: true` | Chuẩn hóa phân loại offline/connect error; đặt cờ `temporary` động theo `SyncUnavailableReason`. |
+
+
+---
+
+## Round 2 Audit (24/11/2026) - Kết quả Review Kép Độc lập (REVIEWER_A & REVIEWER_B)
+
+### 1. Kết luận sơ bộ
+- **REVIEWER_A (`gemini-4-carbon-high`)**: REQUEST_CHANGES (3 MAJOR, 2 MINOR).
+- **REVIEWER_B (`claude-opus-5-5-high`)**: REQUEST_CHANGES (2 MAJOR, 3 MINOR).
+- **ORCHESTRATOR**: Đồng thuận hoàn toàn. Cả hai Reviewer độc lập cùng chỉ ra chính xác các lỗi trùng khớp:
+  1. Regression `N1 / R2-A01`: `CancelSync` khi `sync_operation_id == 0` đặt cờ `sync_cancel_requested = true` làm kẹt modal chờ.
+  2. Sót permit `R1 / R2-A02`: `persist_mutes` và `publish_pins` vẫn gọi `generation()` sau await ngoài permit.
+  3. Lỗi DB `N2 / R2-A04`: Nuốt lỗi DB của `hidden_unread_ack`.
+  4. Startup checks `R2-A03 / B4`: Hậu kiểm `is_active()` sau await, hạ status khi persist fail, reset runtime fields khi relogin.
+  5. Cụm 9 & Test `N3 / R2-A05`: Thêm regression tests cho Recall, send-fail, CancelSync op_id=0; hoàn tất cluster 9.
+
+### 2. Danh sách Nhiệm vụ Sửa chữa Vòng 2
+- **T-07**: Sửa `workspace.rs`: `CancelSync` khi `sync_operation_id == 0` không đặt `sync_cancel_requested = true`; sửa `awaiting_worker` trong Settings; chuẩn hóa `DismissOrClose`; reset `sync_operation_id = 0` trong `request_settings_phone_sync`.
+- **T-08**: Sửa `worker.rs`: Trả `(values, revision)` từ `persist_mutes` và `publish_pins` bên trong `spawn_blocking` dưới permit; truyền `revision` vào `publish_preferences`.
+- **T-09**: Sửa `worker.rs` & `gui.rs`: Hậu kiểm `is_active()` sau await, hạ status khi DB persist lỗi, không nuốt lỗi DB `hidden_unread_ack`, reset runtime-scoped fields trên `LoginSuccess` khi đổi `runtime_id`.
+- **T-10**: Bổ sung unit tests hồi quy cho Recall trong `hydrate_refresh`, send-fail, và CancelSync `op_id == 0`.
+
+
+---
+
+## Round 3 Audit (24/11/2026) - Clean Run #1 (0 BLOCKER, 0 MAJOR)
+- **REVIEWER_A (`gemini-4-carbon-high`)**: **APPROVE**
+  - Xác nhận toàn bộ 4 cụm lỗi cốt lõi và phát hiện R2 đã được đóng sạch sẽ.
+  - Phân luồng `SyncOrigin`, hậu kiểm session runtime sau reap và sau await, bảo toàn trạng thái `Recall` trong `hydrate_refresh`, bọc timeout 9s baseline, và cập nhật watermark `hidden_unread_ack` đơn điệu.
+- **REVIEWER_B (`claude-opus-5-5-high`)**: **APPROVE**
+  - Độc lập chạy 30 tests liên quan (pass 100%).
+  - Xác nhận đóng N1 (CancelSync khi op_id=0), R1 (generation dưới permit), R2-A03 (startup post-checks & LoginSuccess reset), N2 (log error SQLite), N3 (bổ sung test hồi quy).
+  - Ghi nhận một số khuyến nghị MINOR cho tương lai (m1-m6).
+
+---
+
+## Round 4 Audit (24/11/2026) - Consecutive Clean Run #2 (0 BLOCKER, 0 MAJOR)
+- **REVIEWER_A (`gemini-4-carbon-high`)**: **FINAL APPROVE**
+  - Xác nhận lần thứ hai liên tiếp (Consecutive Clean Run #2) không có lỗi hồi quy.
+  - Kiểm tra toàn diện non-negotiables: 0 host hardcode, 0 unwrap/expect trong production code, không có I/O blocking trên UI thread, thứ tự khóa tương tranh một chiều và poison-safe.
+- **REVIEWER_B (`claude-opus-5-5-high`)**: **FINAL APPROVE**
+  - Xác nhận mã nguồn giữ nguyên vẹn so với Lượt 3, 30 tests mục tiêu pass, các lỗi cũ vẫn đóng triệt để.
+  - Ghi nhận bổ sung m7 (tối ưu hóa tần suất repaint idle của chỉ báo chat ẩn từ 50ms lên 250-500ms).
+
+### Kết luận Chung
+**ĐẠT ĐIỀU KIỆN HOÀN THÀNH NGHIỆM THU**: 2 lần audit độc lập liên tiếp (Lượt 3 và Lượt 4) hoàn toàn sạch lỗi (0 BLOCKER, 0 MAJOR), cả hai Reviewer từ hai dòng model độc lập (`gemini-4` và `claude-opus`) cùng ký FINAL APPROVE.
+
+
+---
+
+## Codex Plan Round 1 Audit (24/11/2026) - Kết quả Review Kép Độc lập (P1, P2, P3)
+
+### 1. Kết luận sơ bộ
+- **REVIEWER_A (`gemini-4-carbon-high`)**: REQUEST_CHANGES (3 MAJOR, 2 MINOR).
+- **REVIEWER_B (`claude-opus-5-5-high`)**: REQUEST_CHANGES (1 MAJOR, 4 MINOR).
+- **ORCHESTRATOR**: Đồng thuận hoàn toàn 100% với các phát hiện có bằng chứng:
+  1. `PA-01 / P-1` (MAJOR): Thay `ScrollArea::both()` bằng `ScrollArea::vertical()`, wrap text với `set_max_width`; hỗ trợ chuyển tab có chữ qua click header khi compact (tránh hover-only).
+  2. `PA-02 / P-3` (MAJOR): Thêm single-flight guard cho Export/Import chống double-click mở chồng hộp thoại hệ thống; `tools_command` kiểm tra gửi lệnh; sau Import thành công gọi `invalidate_history_search()` và `RefreshThreads`.
+  3. `PA-03 / P-4` (MAJOR): `RefreshThreads` giữ nạp nhanh pins/preferences theo session hiện tại, network poll dùng `refresh_in_flight` + `refresh_pending` không nuốt lệnh khi có mutation/relogin.
+  4. `PA-04 / P-2` (MINOR): Thêm assertions cho test `settings_tabs_fit_small_wide_and_high_dpi_viewports` và chạy qua các mức scale DPI `[1.0, 1.25, 1.5, 2.0]`.
+  5. `P-5` (MINOR): Đổi tooltip Settings thành "Đang chờ tác vụ đồng bộ khởi tạo…".
+
+
+---
+
+## Codex Plan Round 2 Audit (24/11/2026) - Clean Run #1 cho P1, P2, P3 (0 BLOCKER, 0 MAJOR)
+- **REVIEWER_A (`gemini-4-carbon-high`)**: **APPROVE**
+  - Xác nhận toàn bộ PA-01 đến PA-05 đã đóng.
+  - ScrollArea chuyển sang dọc kèm TextWrapMode::Wrap; điều hướng compact có tiêu đề mở danh sách 10 tab tiếng Việt đầy đủ; single-flight cho DataManagement; nạp nhanh pins/preferences bảo toàn trên `RefreshThreads`; test DPI matrix mở rộng.
+- **REVIEWER_B (`claude-opus-5-5-high`)**: **APPROVE**
+  - Độc lập chạy toàn bộ test lib: 1173 passed, 0 failed, 11 ignored.
+  - Xác nhận đóng P-1 đến P-5; nút backup/import được khóa chống bấm đúp; sau Import tự làm mới `threads`.
+
+---
+
+## Codex Plan Round 3 Audit (24/11/2026) - Consecutive Clean Run #2 cho P1, P2, P3 (0 BLOCKER, 0 MAJOR)
+- **REVIEWER_A (`gemini-4-carbon-high`)**: **FINAL APPROVE**
+  - Mã nguồn không đổi so với Lượt 2, `git diff --check` sạch 100%, 0 tệp bí mật rò rỉ.
+  - Xác nhận toàn diện từ đầu đến cuối cho P1, P2, P3 ở phạm vi CODE & FIXTURE.
+- **REVIEWER_B (`claude-opus-5-5-high`)**: **FINAL APPROVE**
+  - Xác nhận file nguồn sửa gần nhất không đổi, test lib 1173 passed.
+  - Ký APPROVE lần thứ 2 liên tiếp; ghi nhận một số khuyến nghị MINOR cho các gói UXS tiếp theo.
+
+### Kết luận Chung Đợt Codex P1/P2/P3
+**ĐẠT ĐIỀU KIỆN HOÀN THÀNH CHU KỲ**: 2 lần audit độc lập liên tiếp hoàn toàn sạch lỗi (0 BLOCKER, 0 MAJOR) với chữ ký FINAL APPROVE từ cả hai dòng mô hình độc lập (`gemini-4` và `claude-opus`). Toàn bộ thay đổi sẵn sàng bàn giao cho Codex audit mà không vi phạm quy tắc commit/push/release.
+
+---
+
+## Startup & Cache Parity Audit (25/11/2026) - Khắc phục Toàn bộ Finding (Candidate `558bcd5c1e68cd3b8a2bb051c0798c5aa81f38c7`)
+
+### 1. Chi tiết Khắc phục
+- **Tách tiến độ và kết quả từng nguồn (Per-Source Baseline)**:
+  * `SourceFetchStatus` (`Success`, `Empty`, `Timeout`, `Offline`, `Failed`) và `BaselineSourcesStatus` (`friends`, `groups`, `previews`).
+  * Timeout độc lập 6 giây/nguồn qua `tokio::join!`.
+  * Giữ và công bố toàn bộ dữ liệu hợp lệ đã tải được ngay cả khi nguồn khác timeout hoặc lỗi mạng.
+  * Preview và nhóm được kiểm tra độc lập; danh bạ 0 bạn bè không bị coi là `Empty` khi có tin nhắn gần đây hoặc nhóm; không nuốt lỗi `get_groups` (báo `Partial { preview_error }`, không báo `Complete`).
+- **Cấu trúc hóa tiêu chuẩn Cache Usability**:
+  * Thay thế tiêu chí "có ít nhất một tin nhắn thì cache usable" bằng `evaluate_cache_usability(&preload)` phân biệt `Cold`, `NamesOnly`, `PartiallyHydrated` (đa số hội thoại thiếu preview hoặc chưa giải quyết tên), và `Usable`.
+- **Truyền trạng thái Partial/Offline & Fenced Backfill**:
+  * Truyền `BaselineFetchStatus` vào `StartupPrerequisitesSettled` và cập nhật `self.status_msg`, `self.startup_baseline_status` trong UI trước khi vào `Ready`.
+  * Thêm `WorkerCmd::RefreshThreadsFenced { owner, runtime_id }` và cơ chế fenced background backfill: kiểm tra nghiêm ngặt `owner` và `runtime_id` trước khi chạy và sau mọi điểm `await`, ngăn chặn tuyệt đối rò rỉ dữ liệu hoặc stale write sang tài khoản khác.
+
+### 2. Kiểm chứng tự động (CODE & FIXTURE)
+- `cargo fmt --all -- --check`: PASS.
+- `cargo clippy --locked --all-targets -- -D warnings`: PASS (0 warnings).
+- `cargo test --locked --lib`: **1178 passed, 0 failed, 11 ignored** (11/11 tests mục tiêu liên quan baseline & cache pass).
+- `powershell -ExecutionPolicy Bypass -File scripts/audit-prepush.ps1`: Hard gates PASSED (CHECKED=7, HEURISTIC=1, SKIPPED=1).
+
+### 3. Đánh giá Độc lập
+- **REVIEWER_A (`gemini-4-carbon-high`)**: **FINAL APPROVE**
+  * Logic tách nguồn, không nuốt lỗi nhóm và xử lý preview độc lập danh bạ đạt chuẩn kiến trúc non-blocking.
+  * Fencing `owner` & `runtime_id` được bảo toàn xuyên suốt.
+- **REVIEWER_B (`claude-opus-5-5-high`)**: **FINAL APPROVE**
+  * Toàn bộ 6 kịch bản controlled mock server chạy pass 100%.
+  * Tiêu chuẩn `CacheUsability` giải quyết triệt để vấn đề cache nạp dở.
+  * Ranh giới nghiệm thu CODE & FIXTURE hoàn tất; giữ mở NATIVE/DEVICE theo đúng chuẩn AGENTS.md.
+
+
+## Codex follow-up — 25/11/2026: startup/settings remediation
+
+APPROVE lịch sử của Antigravity không đóng các finding mới. Codex trực tiếp sửa
+startup composition/cache/backfill/persistence và typed data-operation lifecycle.
+Hồ sơ: `docs/research/2026-11-25-startup-settings-remediation.md`.
+Candidate d1d4cd5705d970bc9adee7f2cd679ae6551c4dd10b9cb28252b49bd00e079f8b:
+1185 library passed, 11 ignored; backup 4 passed; stress 200 passed; Clippy all-targets
+-D warnings, fmt và diff-check PASS. Hai lượt scoped sạch cùng Codex trên cùng source,
+không phải REVIEWER_A/B độc lập hoặc native parity. Các test failure và superseded
+build được giữ trong hồ sơ, không cộng lượt sạch. Không commit/push/release.
+
+
+## Codex combined session/startup — 25/11/2026
+
+ACCEPTED_SCOPED (CODE/FIXTURE), candidate
+`271610c1f91ad9859bc782830fe683cbca7b86650d2afe7b7433956fbae3db87`.
+Hồ sơ: `docs/research/2026-11-25-session-startup-combined-audit.md`.
+1192 library passed/11 ignored; 260 stress passed; storage/backup integration 6 passed.
+Clippy all-targets -D warnings, fmt, diff-check PASS. Integration LNK4199 DELAYLOAD
+warning được ghi nhận trong hồ sơ. Hai lượt scoped sạch cùng Codex trên cùng source;
+không phải review kép cross-model, không cộng candidate cũ. Native GUI/phone/Web và
+các UXS còn mở vẫn pending. Không commit/merge/push/tag/release.

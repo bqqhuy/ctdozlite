@@ -788,7 +788,13 @@ pub(super) fn draw_icon_cloud(painter: &egui::Painter, center: Pos2, size: f32, 
 }
 
 pub(super) fn draw_icon_settings(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    draw_lucide_icon(painter, center, lucide::SETTINGS, size, color);
+    draw_lucide_icon(
+        painter,
+        center + Vec2::new(0.0, 1.5),
+        lucide::SETTINGS,
+        size,
+        color,
+    );
 }
 
 pub(super) fn draw_icon_lock(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
@@ -1254,7 +1260,8 @@ impl ZaloGuiApp {
                     "Phông hệ thống (có dự phòng)",
                 );
             });
-        ui.add(egui::Slider::new(&mut settings.zoom, 0.8..=1.5).text("Tỷ lệ giao diện"));
+        ui.label("Tỷ lệ giao diện");
+        ui.add(egui::Slider::new(&mut settings.zoom, 0.8..=1.5));
         ui.horizontal_wrapped(|ui| {
             for (label, zoom) in [("Nhỏ", 0.9), ("Chuẩn", 1.0), ("Lớn", 1.2)] {
                 if ui.button(label).clicked() {
@@ -1288,7 +1295,10 @@ impl ZaloGuiApp {
                 });
             }
         }
-        if ui.button("Khôi phục giao diện mặc định").clicked() {
+        if ui
+            .add(egui::Button::new("Khôi phục giao diện mặc định").wrap())
+            .clicked()
+        {
             *settings = Default::default();
         }
         if *settings != before {
@@ -1296,7 +1306,10 @@ impl ZaloGuiApp {
             // Save once after interaction rather than for every frame of a color drag.
             ui.ctx().request_repaint();
         }
-        if ui.button("Lưu tùy chỉnh giao diện").clicked() {
+        if ui
+            .add(egui::Button::new("Lưu tùy chỉnh giao diện").wrap())
+            .clicked()
+        {
             self.save_settings();
         }
         let palette = self.palette();

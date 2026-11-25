@@ -35,6 +35,7 @@ graphify-out/
 src.bak*
 *.zip
 .env
+scratch/
 
 # Python bytecode
 __pycache__/

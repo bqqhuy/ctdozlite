@@ -192,8 +192,11 @@ pub enum SessionStatus {
 pub fn is_expired_error(message: &str) -> bool {
     ["server error ", "server envelope error "]
         .iter()
-        .filter_map(|prefix| message.split_once(prefix).map(|(_, part)| part))
-        .any(|part| {
+        .filter_map(|prefix| message.find(prefix).map(|offset| (offset, prefix)))
+        .min_by_key(|(offset, _)| *offset)
+        .is_some_and(|(offset, prefix)| {
+            // A refusal's description cannot override its actual leading server code.
+            let part = &message[offset + prefix.len()..];
             matches!(
                 part.split(|c: char| !c.is_ascii_digit() && c != '-').next(),
                 Some("600" | "-102")
@@ -2365,7 +2368,11 @@ mod validation_tests {
     use super::*;
     #[test]
     fn expiry_requires_exact_server_code() {
-        for text in ["server error 600: expired", "server error -102: expired"] {
+        for text in [
+            "server error 600: expired",
+            "server error -102: expired",
+            "request failed: server envelope error 600",
+        ] {
             assert!(is_expired_error(text));
         }
         for text in [
@@ -2374,6 +2381,8 @@ mod validation_tests {
             "zpw_sek missing in response",
             "timeout",
             "server error -1020",
+            "server error 500: upstream reported server envelope error 600",
+            "server envelope error 500: server error -102 was retried upstream",
         ] {
             assert!(!is_expired_error(text));
         }
