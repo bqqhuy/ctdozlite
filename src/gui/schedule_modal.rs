@@ -3,7 +3,9 @@ use super::*;
 use chrono::{TimeZone, Timelike};
 
 pub(super) struct Draft {
-    owner: String,
+    pub(super) owner: String,
+    pub(super) runtime_id: usize,
+    pub(super) draft_generation: u64,
     thread: String,
     group: bool,
     name: String,
@@ -11,8 +13,8 @@ pub(super) struct Draft {
     minutes: i64,
     when: String,
     error: String,
-    pending_at: Option<i64>,
-    request: u64,
+    pub(super) pending_at: Option<i64>,
+    pub(super) request: u64,
 }
 impl Draft {
     pub(super) fn matches_saved(
@@ -112,14 +114,21 @@ impl ZaloGuiApp {
             self.status_msg = "Chưa hỗ trợ hẹn giờ tin có mention; hãy gửi trực tiếp".into();
             return;
         }
-        let Some(thread) = self.threads.get(self.selected_thread_index) else {
+        let Some((thread_id, is_group, thread_name)) = self
+            .threads
+            .get(self.selected_thread_index)
+            .map(|t| (t.id.clone(), t.is_group, t.name.clone()))
+        else {
             return;
         };
+        let draft_gen = self.current_draft_generation(&thread_id);
         self.quick_schedule = Some(Draft {
             owner: self.user_uin.clone(),
-            thread: thread.id.clone(),
-            group: thread.is_group,
-            name: thread.name.clone(),
+            runtime_id: self.account_runtime_id,
+            draft_generation: draft_gen,
+            thread: thread_id,
+            group: is_group,
+            name: thread_name,
             text: self.input_message.clone(),
             minutes: 15,
             when: String::new(),
@@ -205,6 +214,7 @@ impl ZaloGuiApp {
                 if WORKER_TX.get().is_some_and(|tx| {
                     tx.send(WorkerCmd::Tools {
                         owner: self.user_uin.clone(),
+                        origin: None,
                         command,
                     })
                     .is_ok()
@@ -270,6 +280,8 @@ mod tests {
     fn sample() -> Draft {
         Draft {
             owner: "owner-a".into(),
+            runtime_id: 1,
+            draft_generation: 1,
             thread: "thread-a".into(),
             group: true,
             name: "Trùng tên".into(),

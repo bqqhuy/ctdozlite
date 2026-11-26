@@ -183,52 +183,6 @@ pub fn parse_poll_item(val: &Value) -> Option<PollItem> {
     })
 }
 
-/// Build create poll payload (`/api/group/poll/create`).
-pub fn build_create_poll_params(
-    grid: &str,
-    question: &str,
-    options: &[String],
-    multi_choice: bool,
-    allow_add_opt: bool,
-    hide_voters: bool,
-) -> Value {
-    let opts: Vec<Value> = options.iter().map(|o| json!({ "content": o })).collect();
-    json!({
-        "grid": grid,
-        "question": question,
-        "options": opts,
-        "multi_choice": multi_choice,
-        "allow_add_opt": allow_add_opt,
-        "hide_voters": hide_voters,
-    })
-}
-
-/// Call `/api/group/poll/create`.
-pub async fn create_group_poll(
-    s: &Session,
-    grid: &str,
-    question: &str,
-    options: &[String],
-    multi_choice: bool,
-    allow_add_opt: bool,
-    hide_voters: bool,
-) -> Result<Value> {
-    let url = s.resolve_service_url("group", "/api/group/poll/create");
-    let payload = build_create_poll_params(
-        grid,
-        question,
-        options,
-        multi_choice,
-        allow_add_opt,
-        hide_voters,
-    );
-    let params = s
-        .encoded_params(&payload)
-        .context("Mã hoá tham số tạo bình chọn thất bại")?;
-    let resp = s.post_form(&url, format!("params={params}")).await?;
-    crate::chat::confirmed_mutation(s.maybe_decrypt(resp, s.session_key_bytes()).await)
-}
-
 /// Call `/api/group/poll/vote`.
 pub async fn vote_group_poll(s: &Session, poll_id: i64, option_ids: &[i64]) -> Result<Value> {
     let url = s.resolve_service_url("group", "/api/group/poll/vote");

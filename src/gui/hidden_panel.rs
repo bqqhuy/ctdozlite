@@ -148,6 +148,7 @@ impl ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::Tools {
                     owner: self.user_uin.clone(),
+                    origin: None,
                     command: tools_panel::ToolsCommand::OpenThread {
                         thread: id.clone(),
                         group: id.starts_with('g'),

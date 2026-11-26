@@ -47,6 +47,8 @@ pub(super) use modals::render_modal_backdrop;
 mod policy_panel;
 mod privacy_panel;
 mod profile_panel;
+#[cfg(test)]
+mod quick_message_lifecycle_tests;
 mod schedule_modal;
 mod search_panel;
 mod stickers;
@@ -69,6 +71,15 @@ use worker::*;
 pub enum ThreadUpdateSource {
     Live,
     History,
+}
+
+/// Typed outcome of a conversation history load attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryLoadOutcome {
+    Success { exhausted: bool },
+    Partial { server_error: String },
+    LocalError { error: String },
+    ServerError { error: String },
 }
 
 fn merge_sent_message(thread: &mut Thread, message: ChatMessage) {
@@ -202,6 +213,54 @@ pub enum MetadataResultKind {
     Mutation,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PollOpPhase {
+    Pending,
+    Created { poll_id: String },
+    CreatedReadbackFailed { poll_id: String, error: String },
+    Rejected { error: String },
+    Indeterminate { error: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct PollOperation {
+    pub owner: String,
+    pub runtime_id: usize,
+    pub thread_id: String,
+    pub request_id: u64,
+    pub question: String,
+    pub options: Vec<String>,
+    pub phase: PollOpPhase,
+    pub created_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickMessageActivationContext {
+    pub owner: String,
+    pub runtime_id: usize,
+    pub thread_id: String,
+    pub byte_range: (usize, usize),
+    pub token: String,
+    pub draft_revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuickMessageMediaOutcome {
+    Success { path: std::path::PathBuf },
+    MissingFile { path: String },
+    Unsupported { url: String },
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuickMessageMediaOp {
+    pub op_id: u64,
+    pub owner: String,
+    pub runtime_id: usize,
+    pub thread_id: String,
+    pub draft_generation: u64,
+}
+
 pub enum GuiEvent {
     SyncSuggestionRequested {
         owner: String,
@@ -270,6 +329,169 @@ pub enum GuiEvent {
         generation: u64,
         imported: bool,
         result: Result<crate::desktop_backup::Report, String>,
+    },
+    QuickMessagesLoaded {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        mutation_epoch: u64,
+        items: Vec<crate::quick_message::QuickMessage>,
+        version: u32,
+    },
+    BankConfLoaded {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        banks: Vec<crate::bank_account::BankInfo>,
+    },
+    BankAccountsLoaded {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        accounts: Vec<crate::bank_account::BankAccount>,
+        total: u32,
+        has_more: bool,
+    },
+    BankAccountCreated {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        account: Box<crate::bank_account::BankAccount>,
+    },
+    BankAccountCreateFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+        is_transport_unknown: bool,
+    },
+    BankAccountUpdated {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        account_id: String,
+    },
+    BankAccountUpdateFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+    },
+    BankAccountDeleted {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        account_id: String,
+    },
+    BankAccountDeleteFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+    },
+    QuickMessageCreated {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        item: crate::quick_message::QuickMessage,
+    },
+    QuickMessageCreateFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+    },
+    QuickMessageUpdated {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        item: crate::quick_message::QuickMessage,
+    },
+    QuickMessageUpdateFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+    },
+    QuickMessagesDeleted {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+    },
+    QuickMessagesDeleteFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        error: String,
+        /// True when the server may have processed the delete (no typed refusal).
+        is_transport_unknown: bool,
+    },
+    QuickMessagesLoadFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        mutation_epoch: u64,
+        error: String,
+    },
+    QuickMessageMediaPrepared {
+        op_id: u64,
+        owner: String,
+        runtime_id: usize,
+        thread_id: String,
+        draft_generation: u64,
+        outcome: QuickMessageMediaOutcome,
+    },
+    ContactBatchCompleted(crate::gui::worker::ContactBatchResult),
+    PollCreated {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        poll_id: String,
+        poll: Option<crate::poll::PollItem>,
+    },
+    PollCreatedWithReadbackError {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        poll_id: String,
+        error: String,
+    },
+    PollAckMissingId {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        error: String,
+    },
+    PollRejected {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        error: String,
+    },
+    PollTransportUnknown {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        error: String,
+    },
+    PollLocalValidationFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        error: String,
+    },
+    PollCreationFailed {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
+        error: String,
     },
     DesktopBackupPath {
         owner: String,
@@ -570,9 +792,13 @@ pub enum GuiEvent {
         source: ThreadUpdateSource,
     },
     ConversationHistoryLoaded {
+        owner: String,
         runtime_id: usize,
+        request_id: u64,
+        thread_id: String,
         threads: Vec<Thread>,
         status: String,
+        outcome: HistoryLoadOutcome,
     },
     LocalCallRecord {
         runtime_id: usize,
@@ -875,6 +1101,7 @@ pub enum GuiEvent {
         page_num: u32,
         page: crate::server_media::ServerMediaPage,
         generation: u64,
+        target: crate::server_media::ServerMediaTarget,
     },
     ServerMediaLoadFailed {
         runtime_id: usize,
@@ -882,6 +1109,7 @@ pub enum GuiEvent {
         media_type: u8,
         generation: u64,
         error: String,
+        target: crate::server_media::ServerMediaTarget,
     },
     CloudViewerKeyLoaded(crate::zcloud::CloudViewerKey),
     BusinessCatalogLoaded(Vec<crate::business::ProductCatalogItem>),
@@ -1101,6 +1329,7 @@ struct AppSettings {
     play_notification_sound: bool,
     call_notifications_enabled: bool,
     // 5. Tin nhắn
+    pub enter_to_send: bool,
     quick_messages_enabled: bool,
     /// Show "đang soạn tin" from other people.
     show_typing: bool,
@@ -1163,13 +1392,14 @@ impl Default for AppSettings {
             friend_src_qr: true,
             friend_src_group: true,
             friend_src_card: true,
-            theme_mode: "dark".into(),
+            theme_mode: "light".into(),
             appearance: Default::default(),
             use_avatar_as_wallpaper: false,
             info_drawer_open: true,
             enable_notifications: true,
             play_notification_sound: false,
             call_notifications_enabled: true,
+            enter_to_send: true,
             quick_messages_enabled: true,
             show_typing: true,
             send_typing: true,
@@ -1421,6 +1651,32 @@ pub enum DrawerView {
     SecuritySettings,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InFlightMediaFetch {
+    pub generation: u64,
+    pub is_refresh: bool,
+    pub requested_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DrawerCategoryMediaState {
+    pub items: Vec<crate::server_media::ServerMediaItem>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+    pub is_loading: bool,
+    pub is_initial_loaded: bool,
+    pub error: Option<String>,
+    pub generation: u64,
+    pub in_flight: Option<InFlightMediaFetch>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DrawerConversationMediaState {
+    pub photos: DrawerCategoryMediaState,
+    pub files: DrawerCategoryMediaState,
+    pub links: DrawerCategoryMediaState,
+}
+
 pub struct ZaloGuiApp {
     worker_bootstrap_enabled: bool,
     tools: tools_panel::ToolsPanel,
@@ -1512,6 +1768,7 @@ pub struct ZaloGuiApp {
 
     // Chat screen state
     threads: Vec<Thread>,
+    pub active_thread_id: Option<String>,
     selected_thread_index: usize,
     chat_render_window: (String, usize),
     thread_filter: ThreadFilter,
@@ -1526,6 +1783,13 @@ pub struct ZaloGuiApp {
     chat_layout_key: u64,
     chat_geometry_revision: u64,
     chat_anchor: Option<(String, String, f32)>,
+    pub timeline_loading_more: bool,
+    pub timeline_exhausted: HashSet<String>,
+    pub timeline_anchor_id: Option<String>,
+    pub timeline_error: Option<String>,
+    pub history_pending_requests: HashMap<String, u64>,
+    pub history_errors: HashMap<String, String>,
+    pub next_history_request_id: u64,
     /// `(thread without prefix, is_group)` → (who is typing, when it was reported).
     typing_map: HashMap<(String, bool), (String, std::time::Instant)>,
     pub presence_map:
@@ -1546,6 +1810,11 @@ pub struct ZaloGuiApp {
     composer_draft: composer_drafts::ComposerDraft,
     composer_mentions: crate::mentions::Draft,
     attachment_drafts: file_drop::Drafts,
+    pub quick_message_activation_context: Option<QuickMessageActivationContext>,
+    pub quick_message_draft_revision: u64,
+    pub thread_draft_generations: HashMap<String, u64>,
+    pub next_qm_media_op_id: u64,
+    pub pending_qm_media_ops: HashMap<u64, QuickMessageMediaOp>,
     #[cfg(windows)]
     native_hwnd: Option<isize>,
     deleted_message_ids: HashSet<(String, String)>,
@@ -1573,6 +1842,9 @@ pub struct ZaloGuiApp {
     trusted_peers: HashSet<String>,
     trial_peers: HashSet<String>,
     pub(super) reset_e2ee_confirm_peer: Option<String>,
+    pub(crate) poll_pending_intents: HashSet<(String, String)>,
+    pub(crate) poll_operations: HashMap<u64, PollOperation>,
+    pub(crate) poll_intent_lock: HashMap<(String, String), u64>,
     pending_reaction_actions: HashMap<(String, String), u64>,
     next_reaction_action_id: u64,
     profiles: Vec<crate::profiles::Profile>,
@@ -1612,6 +1884,9 @@ pub struct ZaloGuiApp {
     archive_history: workspace::ArchiveHistory,
     drawer_media_batch: Option<u64>,
     drawer_media_batch_status: String,
+    pub drawer_media_source_server: bool,
+    pub drawer_media: HashMap<(usize, String), DrawerConversationMediaState>,
+    pub drawer_media_generation: u64,
     // Common groups cache (MAP-07)
     common_groups_cache: HashMap<String, Vec<Thread>>,
     common_groups_state: HashMap<String, Option<String>>,
@@ -1669,6 +1944,8 @@ pub struct ZaloGuiApp {
     last_composer_text: String,
     last_composer_edit_at: std::time::Instant,
     composer_sticker_selected: Option<usize>,
+    quick_message_popover_open: bool,
+    quick_message_selected_index: usize,
     composer_focus_pending: bool,
     clipboard_read_pending: bool,
     attachment_picker_pending: bool,
@@ -1711,8 +1988,32 @@ pub struct ZaloGuiApp {
     selected_msg_ids: HashSet<String>,
     send_contact_modal_open: bool,
     send_contact_query: String,
-    send_contact_selected: Option<String>,
+    send_contact_selected: std::collections::HashSet<String>,
+    send_contact_include_phone: bool,
     send_contact_filter: usize,
+    bank_conf_list: Vec<crate::bank_account::BankInfo>,
+    bank_accounts_list: Vec<crate::bank_account::BankAccount>,
+    bank_account_modal_open: bool,
+    new_bank_bin: String,
+    new_bank_number: String,
+    new_bank_holder_name: String,
+    pub bank_intent_lock: HashMap<(String, String, String), u64>,
+    pub quick_message_mutation_epoch: u64,
+    pub quick_message_latest_applied_list_id: u64,
+    pub quick_message_in_flight_list_id: Option<u64>,
+    pub quick_message_refresh_pending: bool,
+    pub quick_message_applied_mutations: std::collections::HashSet<u64>,
+    /// Dispatched server deletes by request id; the items stay in the confirmed cache until ACK.
+    pub quick_message_pending_deletes: HashMap<u64, Vec<String>>,
+    /// Server item ids whose delete outcome is unknown after dispatch.
+    pub quick_message_delete_unknown: std::collections::HashSet<String>,
+    pub quick_message_list_error: Option<String>,
+    /// Bumped whenever confirmed Quick Messages state changes (server list/mutation, local edit,
+    /// cache hydration, account boundary). Distinct from `quick_message_mutation_epoch`, which only
+    /// orders server lists against server mutations.
+    pub quick_message_state_revision: u64,
+    /// Highest cache-load request already applied; older loads arriving later are dropped.
+    pub quick_message_latest_cache_load_id: u64,
     voice_worker: Option<crate::voice::VoiceWorker>,
     voice_start_pending: bool,
     voice_finish_pending: bool,
@@ -1830,8 +2131,9 @@ impl ZaloGuiApp {
         crate::media::set_selected_camera_device(&loaded_settings.selected_camera_device);
         let dark_mode = match loaded_settings.theme_mode.as_str() {
             "light" => false,
+            "dark" => true,
             "system" => ctx.system_theme() != Some(egui::Theme::Light),
-            _ => true,
+            _ => false,
         };
         if dark_mode {
             ThemePalette::dark().apply_to_ctx(ctx);
@@ -1924,6 +2226,7 @@ impl ZaloGuiApp {
             qr_texture: None,
             qr_status: "Đang tạo mã QR đăng nhập…".into(),
             threads,
+            active_thread_id: None,
             selected_thread_index,
             chat_render_window: (String::new(), 150),
             thread_filter: ThreadFilter::All,
@@ -1934,6 +2237,13 @@ impl ZaloGuiApp {
             chat_layout_key: 0,
             chat_geometry_revision: 0,
             chat_anchor: None,
+            timeline_loading_more: false,
+            timeline_exhausted: HashSet::new(),
+            timeline_anchor_id: None,
+            timeline_error: None,
+            history_pending_requests: HashMap::new(),
+            history_errors: HashMap::new(),
+            next_history_request_id: 1,
             typing_map: HashMap::new(),
             presence_map: HashMap::new(),
             typing_sent: HashMap::new(),
@@ -1948,6 +2258,11 @@ impl ZaloGuiApp {
             composer_draft: Default::default(),
             composer_mentions: Default::default(),
             attachment_drafts: Default::default(),
+            quick_message_activation_context: None,
+            quick_message_draft_revision: 0,
+            thread_draft_generations: HashMap::new(),
+            next_qm_media_op_id: 1,
+            pending_qm_media_ops: HashMap::new(),
             #[cfg(windows)]
             native_hwnd: None,
             deleted_message_ids: HashSet::new(),
@@ -1971,6 +2286,9 @@ impl ZaloGuiApp {
             trusted_peers: HashSet::new(),
             trial_peers: HashSet::new(),
             reset_e2ee_confirm_peer: None,
+            poll_pending_intents: HashSet::new(),
+            poll_operations: HashMap::new(),
+            poll_intent_lock: HashMap::new(),
             pending_reaction_actions: HashMap::new(),
             next_reaction_action_id: 0,
             profiles: Vec::new(),
@@ -2007,6 +2325,9 @@ impl ZaloGuiApp {
             archive_history: Default::default(),
             drawer_media_batch: None,
             drawer_media_batch_status: String::new(),
+            drawer_media_source_server: true,
+            drawer_media: HashMap::new(),
+            drawer_media_generation: 0,
             common_groups_cache: HashMap::new(),
             common_groups_state: HashMap::new(),
             common_groups_generations: HashMap::new(),
@@ -2068,6 +2389,8 @@ impl ZaloGuiApp {
             last_composer_text: String::new(),
             last_composer_edit_at: std::time::Instant::now(),
             composer_sticker_selected: None,
+            quick_message_popover_open: false,
+            quick_message_selected_index: 0,
             composer_focus_pending: false,
             clipboard_read_pending: false,
             attachment_picker_pending: false,
@@ -2107,8 +2430,26 @@ impl ZaloGuiApp {
             selected_msg_ids: HashSet::new(),
             send_contact_modal_open: false,
             send_contact_query: String::new(),
-            send_contact_selected: None,
+            send_contact_selected: std::collections::HashSet::new(),
+            send_contact_include_phone: false,
             send_contact_filter: 0,
+            bank_conf_list: Vec::new(),
+            bank_accounts_list: Vec::new(),
+            bank_account_modal_open: false,
+            new_bank_bin: String::new(),
+            new_bank_number: String::new(),
+            new_bank_holder_name: String::new(),
+            bank_intent_lock: HashMap::new(),
+            quick_message_mutation_epoch: 0,
+            quick_message_latest_applied_list_id: 0,
+            quick_message_in_flight_list_id: None,
+            quick_message_refresh_pending: false,
+            quick_message_applied_mutations: std::collections::HashSet::new(),
+            quick_message_pending_deletes: HashMap::new(),
+            quick_message_delete_unknown: std::collections::HashSet::new(),
+            quick_message_list_error: None,
+            quick_message_state_revision: 0,
+            quick_message_latest_cache_load_id: 0,
             voice_worker: None,
             voice_start_pending: false,
             voice_finish_pending: false,
@@ -2681,6 +3022,59 @@ impl ZaloGuiApp {
         }
     }
 
+    pub fn active_thread_id(&self) -> Option<&str> {
+        self.active_thread_id.as_deref()
+    }
+
+    pub fn current_thread(&self) -> Option<&Thread> {
+        if let Some(id) = &self.active_thread_id {
+            self.threads.iter().find(|t| &t.id == id)
+        } else {
+            None
+        }
+    }
+
+    pub fn current_thread_mut(&mut self) -> Option<&mut Thread> {
+        if let Some(id) = &self.active_thread_id {
+            self.threads.iter_mut().find(|t| &t.id == id)
+        } else {
+            None
+        }
+    }
+
+    pub fn sync_selected_thread_index(&mut self) {
+        if let Some(id) = &self.active_thread_id {
+            if let Some(idx) = self.threads.iter().position(|t| &t.id == id) {
+                self.selected_thread_index = idx;
+            } else {
+                self.active_thread_id = None;
+                self.selected_thread_index = 0;
+            }
+        } else {
+            self.selected_thread_index = 0;
+        }
+    }
+
+    pub fn select_thread_by_id(&mut self, thread_id: Option<String>) {
+        self.active_thread_id = thread_id;
+        self.sync_selected_thread_index();
+    }
+
+    pub fn select_thread_by_index(&mut self, idx: usize) {
+        if let Some(t) = self.threads.get(idx) {
+            self.active_thread_id = Some(t.id.clone());
+            self.selected_thread_index = idx;
+        } else {
+            self.active_thread_id = None;
+            self.selected_thread_index = 0;
+        }
+    }
+
+    pub fn clear_thread_selection(&mut self) {
+        self.active_thread_id = None;
+        self.selected_thread_index = 0;
+    }
+
     pub(crate) fn open_preflight_call(
         &mut self,
         partner_id: String,
@@ -2907,6 +3301,19 @@ impl ZaloGuiApp {
         self.drawer_media_filter_key.clear();
         self.drawer_media_batch = None;
         self.drawer_media_batch_status.clear();
+        self.drawer_media.clear();
+        self.timeline_exhausted.clear();
+        self.timeline_loading_more = false;
+        self.timeline_anchor_id = None;
+        self.timeline_error = None;
+        self.history_pending_requests.clear();
+        self.history_errors.clear();
+        self.poll_pending_intents.clear();
+        self.poll_operations.clear();
+        self.poll_intent_lock.clear();
+        self.quick_message_activation_context = None;
+        self.pending_qm_media_ops.clear();
+        self.thread_draft_generations.clear();
         self.drawer_media_selected.clear();
         self.drawer_media_selection_mode = false;
     }
@@ -2974,7 +3381,7 @@ impl ZaloGuiApp {
         if self.screen_capture_pending {
             return;
         }
-        let Some(thread) = self.threads.get(self.selected_thread_index) else {
+        let Some(thread) = self.current_thread() else {
             return;
         };
         if let Some(tx) = WORKER_TX.get() {
@@ -2995,16 +3402,15 @@ impl ZaloGuiApp {
         if self.clipboard_read_pending {
             return;
         }
+        let Some(thread) = self.current_thread() else {
+            return;
+        };
         if let Some(tx) = WORKER_TX.get() {
             self.clipboard_read_pending = tx
                 .send(WorkerCmd::ReadClipboardImage {
                     owner: self.user_uin.clone(),
                     runtime_id: self.account_runtime_id,
-                    thread: self
-                        .threads
-                        .get(self.selected_thread_index)
-                        .map(|t| t.id.clone())
-                        .unwrap_or_default(),
+                    thread: thread.id.clone(),
                 })
                 .is_ok();
         }
@@ -3165,16 +3571,87 @@ impl ZaloGuiApp {
                 }
 
                 GuiEvent::ConversationHistoryLoaded {
+                    owner,
                     runtime_id,
+                    request_id,
+                    thread_id,
                     threads,
                     status,
+                    outcome,
                 } => {
-                    if !self.is_logged_in || runtime_id != self.account_runtime_id {
+                    if !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                        || owner != self.user_uin
+                    {
                         continue;
+                    }
+                    let is_current_req = request_id != 0
+                        && self.history_pending_requests.get(&thread_id).copied()
+                            == Some(request_id);
+                    if is_current_req {
+                        self.history_pending_requests.remove(&thread_id);
+                        if self.active_thread_id.as_deref() == Some(&thread_id) {
+                            self.timeline_loading_more = false;
+                            match &outcome {
+                                HistoryLoadOutcome::Success { exhausted } => {
+                                    self.timeline_error = None;
+                                    self.history_errors.remove(&thread_id);
+                                    if *exhausted {
+                                        self.timeline_exhausted.insert(thread_id.clone());
+                                    }
+                                    if self.chat_render_window.0 == thread_id {
+                                        let resident = threads
+                                            .iter()
+                                            .find(|t| t.id == thread_id)
+                                            .map(|t| t.messages.len())
+                                            .unwrap_or(0);
+                                        let cur = self.chat_render_window.1;
+                                        self.chat_render_window.1 =
+                                            cur.saturating_add(150).min(resident.max(cur));
+                                    }
+                                }
+                                HistoryLoadOutcome::Partial { server_error } => {
+                                    self.timeline_error = Some(server_error.clone());
+                                    self.history_errors
+                                        .insert(thread_id.clone(), server_error.clone());
+                                    if self.chat_render_window.0 == thread_id {
+                                        let resident = threads
+                                            .iter()
+                                            .find(|t| t.id == thread_id)
+                                            .map(|t| t.messages.len())
+                                            .unwrap_or(0);
+                                        let cur = self.chat_render_window.1;
+                                        self.chat_render_window.1 =
+                                            cur.saturating_add(150).min(resident.max(cur));
+                                    }
+                                }
+                                HistoryLoadOutcome::LocalError { error } => {
+                                    self.timeline_error = Some(error.clone());
+                                    self.history_errors.insert(thread_id.clone(), error.clone());
+                                }
+                                HistoryLoadOutcome::ServerError { error } => {
+                                    self.timeline_error = Some(error.clone());
+                                    self.history_errors.insert(thread_id.clone(), error.clone());
+                                }
+                            }
+                        }
                     }
                     if threads.is_empty() {
                         GuiEvent::StatusUpdate(status)
                     } else {
+                        for t in &threads {
+                            if let Some(existing) = self.threads.iter().find(|old| old.id == t.id) {
+                                if is_current_req
+                                    && t.messages.len() <= existing.messages.len()
+                                    && matches!(
+                                        outcome,
+                                        HistoryLoadOutcome::Success { exhausted: true }
+                                    )
+                                {
+                                    self.timeline_exhausted.insert(t.id.clone());
+                                }
+                            }
+                        }
                         self.status_msg = status;
                         GuiEvent::ThreadsUpdated {
                             threads,
@@ -3925,6 +4402,7 @@ impl ZaloGuiApp {
                         self.reset_sync_status();
                     }
                     if self.user_uin != uin || self.account_runtime_id != runtime_id {
+                        self.reset_bank_state();
                         self.composer_config = Default::default();
                         self.server_config = Default::default();
                         self.cancel_voice_recording();
@@ -4026,9 +4504,11 @@ impl ZaloGuiApp {
                         self.invalidate_history_search();
                         self.discard_deleted_conversation_draft(&owner, &thread);
                         self.threads.retain(|t| t.id != thread);
-                        self.selected_thread_index = self
-                            .selected_thread_index
-                            .min(self.threads.len().saturating_sub(1));
+                        if self.active_thread_id.as_deref() == Some(&thread) {
+                            self.clear_thread_selection();
+                        } else {
+                            self.sync_selected_thread_index();
+                        }
                         self.status_msg = "Đã xóa hội thoại sau khi máy chủ xác nhận".into();
                     }
                 }
@@ -4786,6 +5266,7 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.is_logged_in = false;
                     self.account_runtime_id = 0;
+                    self.reset_bank_state();
                     self.composer_config = Default::default();
                     self.server_config = Default::default();
                     self.startup_state = StartupState::Unauthenticated;
@@ -4900,6 +5381,7 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.is_logged_in = false;
                     self.account_runtime_id = 0;
+                    self.reset_bank_state();
                     self.composer_config = Default::default();
                     self.server_config = Default::default();
                     self.startup_state = StartupState::Unauthenticated;
@@ -4993,6 +5475,7 @@ impl ZaloGuiApp {
                     self.clear_downloads();
                     self.user_uin = uid.clone();
                     self.account_runtime_id = runtime_id;
+                    self.reset_bank_state();
                     self.server_config = session.server_config.clone();
                     self.composer_config = session
                         .composer_config
@@ -5170,13 +5653,31 @@ impl ZaloGuiApp {
                             config,
                             tasks,
                             paused,
+                            origin,
                         }) => {
                             for old in &self.tools.config.stickers {
                                 self.sticker_pack_items.remove(&old.cate_id);
                                 self.pinned_sticker_packs
                                     .retain(|(id, _)| *id != old.cate_id);
                             }
+                            // Quick Messages are hydrated from this snapshot only when nothing
+                            // changed them since the command was dispatched and no newer load was
+                            // applied. Every other config group follows the normal policy.
+                            let accept_quick_messages = origin.is_some_and(|o| {
+                                o.runtime_id == self.account_runtime_id
+                                    && o.quick_message_revision == self.quick_message_state_revision
+                                    && o.request_id > self.quick_message_latest_cache_load_id
+                            });
+                            let current_qm = std::mem::take(&mut self.tools.config.quick_messages);
                             self.tools.config = config;
+                            if let (true, Some(o)) = (accept_quick_messages, origin) {
+                                self.quick_message_latest_cache_load_id = o.request_id;
+                                if self.tools.config.quick_messages != current_qm {
+                                    self.bump_quick_message_revision();
+                                }
+                            } else {
+                                self.tools.config.quick_messages = current_qm;
+                            }
                             self.tools.tasks = tasks;
                             self.tools.paused = paused;
                             self.theme_dirty = true;
@@ -5239,6 +5740,7 @@ impl ZaloGuiApp {
                                 }
                             };
                             self.selected_thread_index = index;
+                            self.active_thread_id = Some(thread.id.clone());
                             self.sync_composer_draft(ctx);
                             let opened_id = thread.id.clone();
                             let opened_group = thread.is_group;
@@ -5267,19 +5769,26 @@ impl ZaloGuiApp {
                             at,
                             result,
                         }) => {
-                            let matching = self.quick_schedule.as_ref().is_some_and(|draft| {
-                                draft.matches_saved(request, &thread, &text, at)
+                            let matching_draft = self.quick_schedule.as_ref().filter(|draft| {
+                                draft.owner == self.user_uin
+                                    && draft.runtime_id == self.account_runtime_id
+                                    && draft.matches_saved(request, &thread, &text, at)
                             });
+                            let source_gen = matching_draft.map(|d| d.draft_generation);
+                            let matching = source_gen.is_some();
                             match result {
                                 Ok(()) => {
-                                    if matching {
-                                        if self
-                                            .threads
-                                            .get(self.selected_thread_index)
-                                            .is_some_and(|t| t.id == thread)
-                                            && self.input_message == text
-                                        {
-                                            self.input_message.clear();
+                                    if let Some(source_gen) = source_gen {
+                                        if self.current_draft_generation(&thread) == source_gen {
+                                            self.bump_draft_generation(&thread);
+                                            if self
+                                                .threads
+                                                .get(self.selected_thread_index)
+                                                .is_some_and(|t| t.id == thread)
+                                                && self.input_message == text
+                                            {
+                                                self.input_message.clear();
+                                            }
                                         }
                                         self.quick_schedule = None;
                                     }
@@ -5719,6 +6228,552 @@ impl ZaloGuiApp {
                             self.backup_panel.status=format!("Không hoàn tất: {error}. Các lô đã nhập được giữ lại; có thể kiểm tra rồi chạy lại.");
                             self.backup_panel.report = None;
                         }
+                    }
+                }
+                GuiEvent::QuickMessagesLoaded {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    mutation_epoch,
+                    items,
+                    version: _,
+                } => {
+                    if owner != self.user_uin
+                        || !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    if self.quick_message_in_flight_list_id == Some(request_id) {
+                        self.quick_message_in_flight_list_id = None;
+                    }
+                    let is_stale_epoch = mutation_epoch < self.quick_message_mutation_epoch;
+                    let is_stale_order = request_id <= self.quick_message_latest_applied_list_id;
+
+                    if is_stale_epoch || is_stale_order {
+                        // Stale snapshot rejected: do not mutate state, do not persist to cache.
+                        if self.quick_message_refresh_pending || is_stale_epoch {
+                            self.quick_message_refresh_pending = false;
+                            self.trigger_quick_messages_fetch();
+                        }
+                        continue;
+                    }
+
+                    self.quick_message_latest_applied_list_id = request_id;
+                    self.bump_quick_message_revision();
+                    self.quick_message_list_error = None;
+                    self.tools.config.quick_messages.merge_server_items(items);
+                    // Readback resolves unknown deletes only when the item is gone from the server.
+                    let present: std::collections::HashSet<&str> = self
+                        .tools
+                        .config
+                        .quick_messages
+                        .items
+                        .iter()
+                        .map(|it| it.id.as_str())
+                        .collect();
+                    self.quick_message_delete_unknown
+                        .retain(|id| present.contains(id.as_str()));
+                    self.tools_command(crate::gui::tools_panel::ToolsCommand::Save(
+                        self.tools.config.clone(),
+                    ));
+                    if self.quick_message_refresh_pending {
+                        self.quick_message_refresh_pending = false;
+                        self.trigger_quick_messages_fetch();
+                    }
+                }
+                GuiEvent::QuickMessageCreated {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    item,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                        && self.quick_message_applied_mutations.insert(request_id)
+                    {
+                        self.tools.config.quick_messages.upsert_item(item);
+                        self.bump_quick_message_revision();
+                        self.quick_message_mutation_epoch =
+                            self.quick_message_mutation_epoch.wrapping_add(1);
+                        self.tools_command(crate::gui::tools_panel::ToolsCommand::Save(
+                            self.tools.config.clone(),
+                        ));
+                        self.status_msg = "Đã lưu tin nhắn nhanh lên máy chủ".into();
+                        self.trigger_quick_messages_fetch();
+                    }
+                }
+                GuiEvent::QuickMessageCreateFailed {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.status_msg = format!("Lưu tin nhắn nhanh thất bại: {error}");
+                    }
+                }
+                GuiEvent::QuickMessageUpdated {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    item,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                        && self.quick_message_applied_mutations.insert(request_id)
+                    {
+                        let item_id = item.id.clone();
+                        self.tools.config.quick_messages.upsert_item(item);
+                        self.bump_quick_message_revision();
+                        self.quick_message_mutation_epoch =
+                            self.quick_message_mutation_epoch.wrapping_add(1);
+                        self.tools_command(crate::gui::tools_panel::ToolsCommand::Save(
+                            self.tools.config.clone(),
+                        ));
+                        self.status_msg = format!("Đã cập nhật tin nhắn nhanh {item_id}");
+                        self.trigger_quick_messages_fetch();
+                    }
+                }
+                GuiEvent::QuickMessageUpdateFailed {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.status_msg = format!("Cập nhật tin nhắn nhanh thất bại: {error}");
+                    }
+                }
+                GuiEvent::QuickMessagesDeleted {
+                    owner,
+                    runtime_id,
+                    request_id,
+                } => {
+                    if owner != self.user_uin
+                        || !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    // Only a still-pending dispatched request may remove confirmed items;
+                    // duplicate or stale completions find no entry and do nothing.
+                    let Some(item_ids) = self.quick_message_pending_deletes.remove(&request_id)
+                    else {
+                        continue;
+                    };
+                    for id in &item_ids {
+                        self.quick_message_delete_unknown.remove(id);
+                    }
+                    self.tools
+                        .config
+                        .quick_messages
+                        .items
+                        .retain(|it| it.id.is_empty() || !item_ids.contains(&it.id));
+                    self.bump_quick_message_revision();
+                    self.quick_message_mutation_epoch =
+                        self.quick_message_mutation_epoch.wrapping_add(1);
+                    self.tools_command(crate::gui::tools_panel::ToolsCommand::Save(
+                        self.tools.config.clone(),
+                    ));
+                    self.status_msg = "Đã xóa tin nhắn nhanh trên máy chủ".into();
+                    self.trigger_quick_messages_fetch();
+                }
+                GuiEvent::QuickMessagesDeleteFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    error,
+                    is_transport_unknown,
+                } => {
+                    if owner != self.user_uin
+                        || !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    let Some(item_ids) = self.quick_message_pending_deletes.remove(&request_id)
+                    else {
+                        continue;
+                    };
+                    if is_transport_unknown {
+                        // The server may have deleted the items: keep them, mark the outcome
+                        // unknown and reconcile with a read-only list refresh. Never re-send.
+                        self.quick_message_delete_unknown.extend(item_ids);
+                        self.status_msg = format!(
+                            "Chưa xác định kết quả xóa tin nhắn nhanh ({error}). Dữ liệu được giữ lại."
+                        );
+                        self.trigger_quick_messages_fetch();
+                    } else {
+                        self.status_msg = format!(
+                            "Máy chủ chưa xóa tin nhắn nhanh: {error}. Có thể thử xóa lại."
+                        );
+                    }
+                }
+                GuiEvent::QuickMessagesLoadFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    mutation_epoch: _,
+                    error,
+                } => {
+                    if owner != self.user_uin
+                        || !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                    {
+                        continue;
+                    }
+                    // A failure of an older request must not retire or annotate a newer one.
+                    if self.quick_message_in_flight_list_id != Some(request_id) {
+                        continue;
+                    }
+                    self.quick_message_in_flight_list_id = None;
+                    // Policy: stop and let the user retry; never loop on a failing network.
+                    self.quick_message_refresh_pending = false;
+                    self.quick_message_list_error = Some(error.clone());
+                    self.status_msg = format!("Không thể tải tin nhắn nhanh: {error}");
+                }
+                GuiEvent::QuickMessageMediaPrepared {
+                    op_id,
+                    owner,
+                    runtime_id,
+                    thread_id,
+                    draft_generation,
+                    outcome,
+                } => {
+                    let Some(op) = self.pending_qm_media_ops.remove(&op_id) else {
+                        continue;
+                    };
+                    if !self.is_logged_in
+                        || runtime_id != self.account_runtime_id
+                        || owner != self.user_uin
+                        || op.owner != owner
+                        || op.runtime_id != runtime_id
+                        || op.thread_id != thread_id
+                        || op.draft_generation != draft_generation
+                    {
+                        continue;
+                    }
+                    let active_gen = self
+                        .thread_draft_generations
+                        .get(&thread_id)
+                        .copied()
+                        .unwrap_or(1);
+                    if active_gen != draft_generation {
+                        // Draft was sent, cleared, or replaced in the meantime. Retire without attaching!
+                        continue;
+                    }
+                    match outcome {
+                        QuickMessageMediaOutcome::Success { path } => {
+                            self.add_attachment_draft_paths(ctx, &thread_id, vec![path]);
+                        }
+                        QuickMessageMediaOutcome::MissingFile { path } => {
+                            self.show_toast(format!(
+                                "Tệp đính kèm tin nhắn nhanh không tồn tại: {path}"
+                            ));
+                        }
+                        QuickMessageMediaOutcome::Unsupported { url } => {
+                            self.show_toast(format!(
+                                "Định dạng media tin nhắn nhanh chưa được hỗ trợ: {url}"
+                            ));
+                        }
+                        QuickMessageMediaOutcome::Failed { error } => {
+                            self.show_toast(format!("Không thể nạp tệp tin nhắn nhanh: {error}"));
+                        }
+                    }
+                }
+                GuiEvent::BankConfLoaded {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    banks,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.bank_conf_list = banks;
+                    }
+                }
+                GuiEvent::BankAccountsLoaded {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    accounts,
+                    total: _,
+                    has_more: _,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.bank_accounts_list = accounts;
+                        self.bank_intent_lock.clear();
+                    }
+                }
+                GuiEvent::BankAccountCreated {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    account,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.bank_intent_lock.retain(|_, req| *req != request_id);
+                        if let Some(pos) = self
+                            .bank_accounts_list
+                            .iter()
+                            .position(|a| a.account_id == account.account_id)
+                        {
+                            self.bank_accounts_list[pos] = *account;
+                        } else {
+                            self.bank_accounts_list.push(*account);
+                        }
+                        self.new_bank_number.clear();
+                        self.new_bank_holder_name.clear();
+                        self.status_msg = "Đã lưu số tài khoản thành công".into();
+                    }
+                }
+                GuiEvent::BankAccountCreateFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    error,
+                    is_transport_unknown,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if is_transport_unknown {
+                            self.status_msg = format!("Lỗi kết nối khi tạo tài khoản (chưa rõ kết quả): {error}. Vui lòng tải lại danh sách.");
+                        } else {
+                            self.bank_intent_lock.retain(|_, req| *req != request_id);
+                            self.status_msg = format!("Lưu tài khoản thất bại: {error}");
+                        }
+                    }
+                }
+                GuiEvent::BankAccountUpdated {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    account_id: _,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.bank_intent_lock.retain(|_, req| *req != request_id);
+                        self.status_msg = "Đã cập nhật số tài khoản thành công".into();
+                    }
+                }
+                GuiEvent::BankAccountUpdateFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.bank_intent_lock.retain(|_, req| *req != request_id);
+                        self.status_msg = format!("Cập nhật tài khoản thất bại: {error}");
+                    }
+                }
+                GuiEvent::BankAccountDeleted {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    account_id,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        self.bank_accounts_list
+                            .retain(|a| a.account_id != account_id);
+                        self.status_msg = "Đã xóa số tài khoản thành công".into();
+                    }
+                }
+                GuiEvent::BankAccountDeleteFailed {
+                    owner,
+                    runtime_id,
+                    request_id: _,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        self.status_msg = format!("Xóa tài khoản thất bại: {error}");
+                    }
+                }
+                GuiEvent::ContactBatchCompleted(batch) => {
+                    if batch.owner == self.user_uin
+                        && self.is_logged_in
+                        && batch.runtime_id == self.account_runtime_id
+                    {
+                        let mut ok_cnt = 0;
+                        let mut fail_cnt = 0;
+                        for (_, st) in &batch.results {
+                            match st {
+                                crate::gui::worker::ContactSendStatus::Success => ok_cnt += 1,
+                                _ => fail_cnt += 1,
+                            }
+                        }
+                        if fail_cnt == 0 {
+                            self.status_msg = format!("Đã gửi thành công {ok_cnt} danh thiếp");
+                        } else {
+                            self.status_msg =
+                                format!("Gửi danh thiếp: {ok_cnt} thành công, {fail_cnt} thất bại");
+                        }
+                    }
+                }
+                GuiEvent::PollCreated {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    poll_id,
+                    poll: _,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Created {
+                                poll_id: poll_id.clone(),
+                            };
+                            self.poll_intent_lock
+                                .remove(&(op.thread_id.clone(), op.question.clone()));
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg =
+                            format!("Đã tạo cuộc bình chọn thành công (Mã: {poll_id})");
+                    }
+                }
+                GuiEvent::PollCreatedWithReadbackError {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    poll_id,
+                    error,
+                } => {
+                    if owner == self.user_uin
+                        && self.is_logged_in
+                        && runtime_id == self.account_runtime_id
+                    {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::CreatedReadbackFailed {
+                                poll_id: poll_id.clone(),
+                                error: error.clone(),
+                            };
+                            self.poll_intent_lock
+                                .remove(&(op.thread_id.clone(), op.question.clone()));
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg = format!(
+                            "Đã tạo bình chọn (Mã: {poll_id}) nhưng đọc lại thất bại: {error}"
+                        );
+                    }
+                }
+                GuiEvent::PollAckMissingId {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Indeterminate {
+                                error: error.clone(),
+                            };
+                            // Invariant: keep poll_intent_lock active so duplicate creation is blocked
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg = format!("Lỗi tạo bình chọn (chưa rõ kết quả): {error}");
+                    }
+                }
+                GuiEvent::PollRejected {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Rejected {
+                                error: error.clone(),
+                            };
+                            self.poll_intent_lock
+                                .remove(&(op.thread_id.clone(), op.question.clone()));
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg = format!("Máy chủ từ chối tạo bình chọn: {error}");
+                    }
+                }
+                GuiEvent::PollTransportUnknown {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Indeterminate {
+                                error: error.clone(),
+                            };
+                            // Invariant: keep poll_intent_lock active so duplicate creation is blocked
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg =
+                            format!("Lỗi kết nối khi tạo bình chọn (chưa rõ kết quả): {error}");
+                    }
+                }
+                GuiEvent::PollLocalValidationFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Rejected {
+                                error: error.clone(),
+                            };
+                            self.poll_intent_lock
+                                .remove(&(op.thread_id.clone(), op.question.clone()));
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg = format!("Lỗi xác thực bình chọn: {error}");
+                    }
+                }
+                GuiEvent::PollCreationFailed {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id,
+                    error,
+                } => {
+                    if owner == self.user_uin && runtime_id == self.account_runtime_id {
+                        if let Some(op) = self.poll_operations.get_mut(&request_id) {
+                            op.phase = PollOpPhase::Rejected {
+                                error: error.clone(),
+                            };
+                            self.poll_intent_lock
+                                .remove(&(op.thread_id.clone(), op.question.clone()));
+                        }
+                        self.poll_pending_intents
+                            .retain(|(tid, _)| tid != &thread_id);
+                        self.status_msg = format!("Không thể tạo bình chọn: {error}");
                     }
                 }
                 GuiEvent::Group {
@@ -7306,43 +8361,170 @@ impl ZaloGuiApp {
                     page_num,
                     page,
                     generation,
+                    target,
                 } => {
-                    // Only update if generation matches and thread/media_type match current tools state
-                    if self.is_logged_in
-                        && runtime_id == self.account_runtime_id
-                        && self
-                            .threads
-                            .get(self.selected_thread_index)
-                            .is_some_and(|thread| thread.id == thread_id)
-                        && generation == self.tools.server_media_generation
-                        && thread_id == self.tools.server_media_thread_id
-                        && media_type == self.tools.server_media_type
-                    {
-                        self.tools.server_media_loading = false;
-                        self.tools.server_media_page = page_num;
-                        self.tools.server_media_has_more = page.has_more;
-                        self.tools.server_media_next_cursor = page.next_cursor;
-                        if page_num <= 1 {
-                            self.tools.server_media_items = page.items;
-                        } else {
-                            // Deduplicate items by ID (or URL if ID is empty)
-                            for new_item in page.items {
-                                let exists = self.tools.server_media_items.iter().any(|existing| {
-                                    if !new_item.id.is_empty() && !existing.id.is_empty() {
-                                        existing.id == new_item.id
-                                    } else {
-                                        existing.url == new_item.url
+                    match target {
+                        crate::server_media::ServerMediaTarget::ToolsPanel => {
+                            if self.is_logged_in
+                                && runtime_id == self.account_runtime_id
+                                && generation == self.tools.server_media_generation
+                            {
+                                self.tools.server_media_loading = false;
+                                let pending = self.tools.server_media_pending.take();
+                                if self
+                                    .threads
+                                    .get(self.selected_thread_index)
+                                    .is_some_and(|thread| thread.id == thread_id)
+                                    && thread_id == self.tools.server_media_thread_id
+                                    && media_type == self.tools.server_media_type
+                                {
+                                    let mode = pending.as_ref().map(|p| p.mode).unwrap_or(
+                                        if page_num > 1 {
+                                            tools_panel::ServerMediaFetchMode::Append
+                                        } else {
+                                            tools_panel::ServerMediaFetchMode::Reload
+                                        },
+                                    );
+
+                                    match mode {
+                                        tools_panel::ServerMediaFetchMode::Reload => {
+                                            let has_cursor = page
+                                                .next_cursor
+                                                .as_ref()
+                                                .is_some_and(|c| !c.is_empty());
+                                            self.tools.server_media_items = page.items;
+                                            self.tools.server_media_page = 1;
+                                            self.tools.server_media_has_more =
+                                                page.has_more && has_cursor;
+                                            self.tools.server_media_next_cursor = page.next_cursor;
+                                            self.status_msg = format!(
+                                                "Đã tải {} mục từ kho media server",
+                                                self.tools.server_media_items.len()
+                                            );
+                                        }
+                                        tools_panel::ServerMediaFetchMode::Append => {
+                                            let cursor_advances = match (
+                                                &page.next_cursor,
+                                                &self.tools.server_media_next_cursor,
+                                            ) {
+                                                (Some(next), Some(prev)) => {
+                                                    !next.is_empty() && next != prev
+                                                }
+                                                (Some(next), None) => !next.is_empty(),
+                                                _ => false,
+                                            };
+                                            let is_valid = !page.has_more || cursor_advances;
+                                            if !is_valid {
+                                                // F3/F1 Invariant: Do not corrupt snapshot on non-advancing pagination error
+                                                self.status_msg =
+                                                    "Lỗi phân trang: con trỏ media máy chủ không thay đổi"
+                                                        .into();
+                                            } else {
+                                                self.tools.server_media_page = pending
+                                                    .as_ref()
+                                                    .map(|p| p.requested_page)
+                                                    .unwrap_or(page_num);
+                                                self.tools.server_media_has_more =
+                                                    page.has_more && cursor_advances;
+                                                self.tools.server_media_next_cursor =
+                                                    page.next_cursor;
+                                                for new_item in page.items {
+                                                    let exists =
+                                                        self.tools.server_media_items.iter().any(
+                                                            |existing| {
+                                                                if !new_item.id.is_empty()
+                                                                    && !existing.id.is_empty()
+                                                                {
+                                                                    existing.id == new_item.id
+                                                                } else {
+                                                                    existing.url == new_item.url
+                                                                }
+                                                            },
+                                                        );
+                                                    if !exists {
+                                                        self.tools
+                                                            .server_media_items
+                                                            .push(new_item);
+                                                    }
+                                                }
+                                                self.status_msg = format!(
+                                                    "Đã tải {} mục từ kho media server",
+                                                    self.tools.server_media_items.len()
+                                                );
+                                            }
+                                        }
                                     }
-                                });
-                                if !exists {
-                                    self.tools.server_media_items.push(new_item);
                                 }
                             }
                         }
-                        self.status_msg = format!(
-                            "Đã tải {} mục từ kho media server",
-                            self.tools.server_media_items.len()
-                        );
+                        crate::server_media::ServerMediaTarget::RightDrawer => {
+                            if self.is_logged_in && runtime_id == self.account_runtime_id {
+                                if let Some(entry) =
+                                    self.drawer_media.get_mut(&(runtime_id, thread_id.clone()))
+                                {
+                                    let cat = match media_type {
+                                        1 | 2 => &mut entry.photos,
+                                        3 => &mut entry.files,
+                                        4 => &mut entry.links,
+                                        _ => return,
+                                    };
+                                    if generation == cat.generation {
+                                        cat.is_loading = false;
+                                        let in_flight = cat.in_flight.take();
+                                        let is_refresh = in_flight
+                                            .as_ref()
+                                            .map(|f| f.is_refresh)
+                                            .unwrap_or(false);
+                                        let requested_cursor = in_flight
+                                            .as_ref()
+                                            .and_then(|f| f.requested_cursor.as_deref());
+                                        let cursor_advances =
+                                            match (&page.next_cursor, requested_cursor) {
+                                                (Some(next), Some(prev)) => {
+                                                    !next.is_empty() && next != prev
+                                                }
+                                                (Some(next), None) => !next.is_empty(),
+                                                _ => false,
+                                            };
+                                        let is_valid = if requested_cursor.is_some() {
+                                            !page.has_more || cursor_advances
+                                        } else {
+                                            true
+                                        };
+                                        if !is_valid {
+                                            // F3 Invariant: Do not corrupt snapshot on non-advancing pagination error
+                                            cat.error = Some(
+                                                "Lỗi phân trang máy chủ: con trỏ media không thay đổi dù báo còn dữ liệu"
+                                                    .into(),
+                                            );
+                                        } else {
+                                            cat.is_initial_loaded = true;
+                                            cat.has_more = page.has_more && cursor_advances;
+                                            cat.error = None;
+                                            cat.next_cursor = page.next_cursor;
+                                            if is_refresh {
+                                                cat.items = page.items;
+                                            } else {
+                                                for new_item in page.items {
+                                                    let exists = cat.items.iter().any(|existing| {
+                                                        if !new_item.id.is_empty()
+                                                            && !existing.id.is_empty()
+                                                        {
+                                                            existing.id == new_item.id
+                                                        } else {
+                                                            existing.url == new_item.url
+                                                        }
+                                                    });
+                                                    if !exists {
+                                                        cat.items.push(new_item);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 GuiEvent::ServerMediaLoadFailed {
@@ -7351,21 +8533,45 @@ impl ZaloGuiApp {
                     media_type,
                     generation,
                     error,
-                } => {
-                    if self.is_logged_in
-                        && runtime_id == self.account_runtime_id
-                        && self
-                            .threads
-                            .get(self.selected_thread_index)
-                            .is_some_and(|thread| thread.id == thread_id)
-                        && generation == self.tools.server_media_generation
-                        && thread_id == self.tools.server_media_thread_id
-                        && media_type == self.tools.server_media_type
-                    {
-                        self.tools.server_media_loading = false;
-                        self.status_msg = error;
+                    target,
+                } => match target {
+                    crate::server_media::ServerMediaTarget::ToolsPanel => {
+                        if self.is_logged_in
+                            && runtime_id == self.account_runtime_id
+                            && generation == self.tools.server_media_generation
+                        {
+                            self.tools.server_media_loading = false;
+                            self.tools.server_media_pending = None;
+                            if self
+                                .threads
+                                .get(self.selected_thread_index)
+                                .is_some_and(|thread| thread.id == thread_id)
+                                && thread_id == self.tools.server_media_thread_id
+                                && media_type == self.tools.server_media_type
+                            {
+                                self.status_msg = error;
+                            }
+                        }
                     }
-                }
+                    crate::server_media::ServerMediaTarget::RightDrawer => {
+                        if self.is_logged_in && runtime_id == self.account_runtime_id {
+                            if let Some(entry) = self.drawer_media.get_mut(&(runtime_id, thread_id))
+                            {
+                                let cat = match media_type {
+                                    1 | 2 => &mut entry.photos,
+                                    3 => &mut entry.files,
+                                    4 => &mut entry.links,
+                                    _ => return,
+                                };
+                                if generation == cat.generation {
+                                    cat.is_loading = false;
+                                    cat.in_flight = None;
+                                    cat.error = Some(error);
+                                }
+                            }
+                        }
+                    }
+                },
                 GuiEvent::CloudViewerKeyLoaded(key) => {
                     self.status_msg =
                         format!("Đã nhận khoá giải mã zCloud cho tệp {}", key.file_id);
@@ -7414,7 +8620,10 @@ impl ZaloGuiApp {
                     if self.tools.todo_poll_thread_id != thread_id {
                         self.tools.group_todos.clear();
                     }
-                    self.tools.todo_poll_thread_id = thread_id;
+                    self.tools.todo_poll_thread_id = thread_id.clone();
+                    // F2 Safety Invariant: Group poll list does not carry a request correlation token;
+                    // list is displayed for user inspection only and NEVER auto-reconciles pending/indeterminate
+                    // operations to false success. Authoritative creation requires verified create ACK.
                     self.tools.group_polls = polls;
                     self.status_msg =
                         format!("Đã tải {} cuộc bình chọn", self.tools.group_polls.len());
@@ -7539,7 +8748,8 @@ impl eframe::App for ZaloGuiApp {
         if let Some(notice) = crate::desktop_notice::take_activation() {
             if self.is_logged_in && notice.owner == self.user_uin {
                 if let Some(index) = self.threads.iter().position(|t| t.id == notice.thread_id) {
-                    self.selected_thread_index = index;
+                    let is_group = self.threads.get(index).is_some_and(|t| t.is_group);
+                    self.open_thread(ctx, index, notice.thread_id, is_group);
                     self.filter_starred_only = false;
                 } else {
                     self.tools_command(tools_panel::ToolsCommand::OpenHit {
@@ -7668,11 +8878,23 @@ impl eframe::App for ZaloGuiApp {
             if let Some(tx) = WORKER_TX.get() {
                 let _ = tx.send(WorkerCmd::RefreshThreads);
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                    let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                        group_id: thread.id.clone(),
-                        is_group: thread.is_group,
-                        limit: thread.messages.len().max(500),
-                    });
+                    let req_id = self.next_history_request_id;
+                    if tx
+                        .send(WorkerCmd::LoadGroupHistory {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            request_id: req_id,
+                            group_id: thread.id.clone(),
+                            is_group: thread.is_group,
+                            limit: thread.messages.len().max(500),
+                        })
+                        .is_ok()
+                    {
+                        self.next_history_request_id =
+                            self.next_history_request_id.wrapping_add(1).max(1);
+                        self.history_pending_requests
+                            .insert(thread.id.clone(), req_id);
+                    }
                 }
             }
         }
@@ -7734,6 +8956,9 @@ impl eframe::App for ZaloGuiApp {
             && self.tools.loaded_for != self.user_uin
             && self.smoke.is_none()
         {
+            // The panel state (including Quick Messages) is replaced, so the revision must change
+            // before the first cache load captures it.
+            self.bump_quick_message_revision();
             self.tools = tools_panel::ToolsPanel {
                 loaded_for: self.user_uin.clone(),
                 ..Default::default()
@@ -7741,6 +8966,7 @@ impl eframe::App for ZaloGuiApp {
             self.tools_command(tools_panel::ToolsCommand::Load);
         }
         if !self.is_logged_in && !self.tools.loaded_for.is_empty() {
+            self.bump_quick_message_revision();
             self.tools = Default::default();
             self.theme_dirty = true;
         }
@@ -7880,6 +9106,145 @@ impl eframe::App for ZaloGuiApp {
 // ---------------------------------------------------------------------------
 
 impl ZaloGuiApp {
+    pub(crate) fn reset_bank_state(&mut self) {
+        self.bank_conf_list.clear();
+        self.bank_accounts_list.clear();
+        self.bank_account_modal_open = false;
+        self.new_bank_bin.clear();
+        self.new_bank_number.clear();
+        self.new_bank_holder_name.clear();
+        self.bank_intent_lock.clear();
+        self.reset_quick_message_lifecycle();
+    }
+
+    pub(crate) fn bump_quick_message_revision(&mut self) {
+        self.quick_message_state_revision = self.quick_message_state_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn reset_quick_message_lifecycle(&mut self) {
+        self.quick_message_mutation_epoch = 0;
+        self.quick_message_latest_applied_list_id = 0;
+        self.quick_message_in_flight_list_id = None;
+        self.quick_message_refresh_pending = false;
+        self.quick_message_applied_mutations.clear();
+        self.quick_message_latest_cache_load_id = 0;
+        // Account/runtime boundary: any cache load still in flight carries an older revision.
+        self.bump_quick_message_revision();
+        self.quick_message_pending_deletes.clear();
+        self.quick_message_delete_unknown.clear();
+        self.quick_message_list_error = None;
+    }
+
+    /// Entry point for every quick-message delete. Local items are removed directly;
+    /// server items stay in the confirmed cache until the delete is acknowledged.
+    /// Returns true only when a state change or a dispatch actually happened.
+    pub(crate) fn request_quick_message_delete(
+        &mut self,
+        item: &crate::quick_message::QuickMessage,
+    ) -> bool {
+        if item.id.is_empty() {
+            let pos = self
+                .tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .position(|it| {
+                    it.id.is_empty() && it.shortcut.eq_ignore_ascii_case(&item.shortcut)
+                });
+            let Some(pos) = pos else {
+                return false;
+            };
+            self.tools.config.quick_messages.items.remove(pos);
+            self.bump_quick_message_revision();
+            self.tools_command(crate::gui::tools_panel::ToolsCommand::Save(
+                self.tools.config.clone(),
+            ));
+            return true;
+        }
+        if !self.is_logged_in || self.account_runtime_id == 0 || self.user_uin.is_empty() {
+            self.status_msg = "Cần đăng nhập để xóa tin nhắn nhanh trên máy chủ".into();
+            return false;
+        }
+        if !self
+            .tools
+            .config
+            .quick_messages
+            .items
+            .iter()
+            .any(|it| it.id == item.id)
+        {
+            return false;
+        }
+        if self
+            .quick_message_pending_deletes
+            .values()
+            .any(|ids| ids.contains(&item.id))
+        {
+            self.status_msg = "Tin nhắn nhanh này đang được xóa".into();
+            return false;
+        }
+        let request_id = crate::search::generation();
+        let sent = worker::WORKER_TX.get().is_some_and(|tx| {
+            tx.send(worker::WorkerCmd::DeleteQuickMessages {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                request_id,
+                item_ids: vec![item.id.clone()],
+            })
+            .is_ok()
+        });
+        if !sent {
+            self.status_msg =
+                "Không gửi được yêu cầu xóa tới worker; tin nhắn nhanh được giữ nguyên".into();
+            return false;
+        }
+        // Pending is recorded only after the command was enqueued successfully.
+        self.quick_message_delete_unknown.remove(&item.id);
+        self.quick_message_pending_deletes
+            .insert(request_id, vec![item.id.clone()]);
+        true
+    }
+
+    pub(crate) fn quick_message_delete_pending(&self, item_id: &str) -> bool {
+        self.quick_message_pending_deletes
+            .values()
+            .any(|ids| ids.iter().any(|id| id == item_id))
+    }
+
+    /// Dispatch a list fetch with fresh monotonic request_id and current mutation epoch.
+    pub(crate) fn trigger_quick_messages_fetch(&mut self) -> bool {
+        if !self.is_logged_in || self.account_runtime_id == 0 || self.user_uin.is_empty() {
+            return false;
+        }
+        if self.quick_message_in_flight_list_id.is_some() {
+            self.quick_message_refresh_pending = true;
+            return false;
+        }
+        let request_id = crate::search::generation();
+        let mutation_epoch = self.quick_message_mutation_epoch;
+        if let Some(tx) = worker::WORKER_TX.get() {
+            let sent = tx
+                .send(worker::WorkerCmd::FetchQuickMessages {
+                    owner: self.user_uin.clone(),
+                    runtime_id: self.account_runtime_id,
+                    request_id,
+                    mutation_epoch,
+                    version: 0,
+                })
+                .is_ok();
+            if sent {
+                self.quick_message_in_flight_list_id = Some(request_id);
+                self.quick_message_list_error = None;
+                return true;
+            }
+        }
+        self.quick_message_in_flight_list_id = None;
+        self.quick_message_refresh_pending = false;
+        self.quick_message_list_error = Some("Không gửi được yêu cầu tải tới worker".to_string());
+        false
+    }
+
     pub(crate) fn enter_ready_state(&mut self) {
         self.startup_state = StartupState::Ready;
         self.request_my_documents_usage();
@@ -8801,6 +10166,21 @@ impl ZaloGuiApp {
         self.status_msg = text.clone();
         self.toast_notice = Some((text, std::time::Instant::now()));
     }
+
+    pub fn current_draft_generation(&mut self, thread_id: &str) -> u64 {
+        *self
+            .thread_draft_generations
+            .entry(thread_id.to_string())
+            .or_insert(1)
+    }
+
+    pub fn bump_draft_generation(&mut self, thread_id: &str) {
+        let gen = self
+            .thread_draft_generations
+            .entry(thread_id.to_string())
+            .or_insert(1);
+        *gen = gen.wrapping_add(1).max(1);
+    }
 }
 
 #[cfg(all(test, windows, target_arch = "aarch64"))]
@@ -8814,6 +10194,9 @@ mod renderer_tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(super) static TEST_WORKER_TX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod settings_layout_tests {
@@ -8895,9 +10278,13 @@ mod history_residency_tests {
         for threads in [vec![thread("stale", 1, 1)], Vec::new()] {
             app.event_tx
                 .send(GuiEvent::ConversationHistoryLoaded {
+                    owner: app.user_uin.clone(),
                     runtime_id: runtime.wrapping_add(1),
+                    request_id: 0,
+                    thread_id: "stale".into(),
                     threads,
                     status: "stale status".into(),
+                    outcome: HistoryLoadOutcome::Success { exhausted: false },
                 })
                 .unwrap();
         }
@@ -8908,9 +10295,13 @@ mod history_residency_tests {
         app.is_logged_in = false;
         app.event_tx
             .send(GuiEvent::ConversationHistoryLoaded {
+                owner: app.user_uin.clone(),
                 runtime_id: runtime,
+                request_id: 0,
+                thread_id: "logged-out".into(),
                 threads: vec![thread("logged-out", 1, 1)],
                 status: "logged-out status".into(),
+                outcome: HistoryLoadOutcome::Success { exhausted: false },
             })
             .unwrap();
         app.check_events(&ctx);
@@ -8918,16 +10309,551 @@ mod history_residency_tests {
         assert_eq!(app.status_msg, "current session");
 
         app.is_logged_in = true;
+        app.history_pending_requests.insert("current".into(), 42);
         app.event_tx
             .send(GuiEvent::ConversationHistoryLoaded {
+                owner: app.user_uin.clone(),
                 runtime_id: runtime,
+                request_id: 42,
+                thread_id: "current".into(),
                 threads: vec![thread("current", 1, 1)],
                 status: "current history".into(),
+                outcome: HistoryLoadOutcome::Success { exhausted: false },
             })
             .unwrap();
         app.check_events(&ctx);
         assert!(app.threads.iter().any(|t| t.id == "current"));
         assert_eq!(app.status_msg, "current history");
+        assert!(!app.history_pending_requests.contains_key("current"));
+    }
+
+    #[test]
+    fn test_f1_exhaustion_does_not_block_resident_messages_reveal() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("t400", 1, 400)],
+            false,
+        );
+        app.is_logged_in = true;
+        app.active_thread_id = Some("t400".into());
+        app.chat_render_window = ("t400".into(), 150);
+        // Backend source is marked exhausted from a previous sync
+        app.timeline_exhausted.insert("t400".into());
+
+        // 1. First trigger: expands resident window from 150 to 300 without network fetch
+        let progress1 = app.trigger_load_older_history("t400", false);
+        assert!(progress1);
+        assert_eq!(app.chat_render_window.1, 300);
+        assert!(!app.history_pending_requests.contains_key("t400"));
+        assert!(!app.timeline_loading_more);
+
+        // 2. Second trigger: expands resident window from 300 to 400 without network fetch
+        let progress2 = app.trigger_load_older_history("t400", false);
+        assert!(progress2);
+        assert_eq!(app.chat_render_window.1, 400);
+        assert!(!app.history_pending_requests.contains_key("t400"));
+        assert!(!app.timeline_loading_more);
+
+        // 3. Third trigger: all 400 resident messages are now rendered; backend is exhausted -> returns false
+        let progress3 = app.trigger_load_older_history("t400", false);
+        assert!(!progress3);
+        assert_eq!(app.chat_render_window.1, 400);
+        assert!(!app.history_pending_requests.contains_key("t400"));
+    }
+
+    #[test]
+    fn test_f2_stale_history_completion_and_id_zero_cannot_retire_current_request() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("thread-a", 1, 10)],
+            false,
+        );
+        app.is_logged_in = true;
+        app.active_thread_id = Some("thread-a".into());
+        let runtime = app.account_runtime_id;
+
+        // Current active request is A2 with ID 102
+        app.history_pending_requests.insert("thread-a".into(), 102);
+        app.timeline_loading_more = true;
+
+        // Stale A1 completion arrives with ID 101 and exhausted=true
+        app.event_tx
+            .send(GuiEvent::ConversationHistoryLoaded {
+                owner: app.user_uin.clone(),
+                runtime_id: runtime,
+                request_id: 101, // Stale!
+                thread_id: "thread-a".into(),
+                threads: vec![thread("thread-a", 1, 10)],
+                status: "stale A1".into(),
+                outcome: HistoryLoadOutcome::Success { exhausted: true },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: A2 MUST still be pending, loading_more remains true, exhausted NOT set by stale A1
+        assert_eq!(
+            app.history_pending_requests.get("thread-a").copied(),
+            Some(102)
+        );
+        assert!(app.timeline_loading_more);
+        assert!(!app.timeline_exhausted.contains("thread-a"));
+
+        // Event with request_id = 0 (invalid sentinel/bypass attempt) arrives
+        app.event_tx
+            .send(GuiEvent::ConversationHistoryLoaded {
+                owner: app.user_uin.clone(),
+                runtime_id: runtime,
+                request_id: 0, // Sentinel zero
+                thread_id: "thread-a".into(),
+                threads: vec![thread("thread-a", 1, 10)],
+                status: "sentinel 0".into(),
+                outcome: HistoryLoadOutcome::Success { exhausted: true },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: request_id 0 was rejected, A2 is STILL pending
+        assert_eq!(
+            app.history_pending_requests.get("thread-a").copied(),
+            Some(102)
+        );
+        assert!(app.timeline_loading_more);
+        assert!(!app.timeline_exhausted.contains("thread-a"));
+
+        // Finally, current A2 arrives with matching ID 102
+        app.event_tx
+            .send(GuiEvent::ConversationHistoryLoaded {
+                owner: app.user_uin.clone(),
+                runtime_id: runtime,
+                request_id: 102, // Matching current request!
+                thread_id: "thread-a".into(),
+                threads: vec![thread("thread-a", 1, 20)],
+                status: "current A2 finished".into(),
+                outcome: HistoryLoadOutcome::Success { exhausted: true },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Now A2 successfully retires
+        assert!(!app.history_pending_requests.contains_key("thread-a"));
+        assert!(!app.timeline_loading_more);
+        assert!(app.timeline_exhausted.contains("thread-a"));
+        assert_eq!(app.status_msg, "current A2 finished");
+    }
+
+    #[test]
+    fn test_f3_poll_reconciliation_requires_strict_identity_and_never_resolves_foreign_or_mismatched_poll(
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("grp-1", 1, 5)],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "my-user-uin".into();
+        app.selected_thread_index = 0;
+        let runtime = app.account_runtime_id;
+
+        let req_id = 201;
+        let q = "Trưa nay ăn gì?".to_string();
+        let opts = vec!["Phở".to_string(), "Cơm".to_string()];
+        app.poll_operations.insert(
+            req_id,
+            PollOperation {
+                owner: app.user_uin.clone(),
+                runtime_id: runtime,
+                thread_id: "grp-1".into(),
+                request_id: req_id,
+                question: q.clone(),
+                options: opts.clone(),
+                phase: PollOpPhase::Indeterminate {
+                    error: "Mất kết nối mạng".into(),
+                },
+                created_at: std::time::Instant::now(),
+            },
+        );
+        app.poll_intent_lock
+            .insert(("grp-1".into(), q.clone()), req_id);
+
+        // 1. GroupPollsLoaded contains a poll with SAME question, but created by SOMEONE ELSE
+        let foreign_poll = crate::poll::PollItem {
+            id: 99901,
+            grid: "grp-1".into(),
+            question: q.clone(),
+            creator_id: "other-user".into(), // Different creator!
+            options: vec![
+                crate::poll::PollOption {
+                    id: 1,
+                    text: "Phở".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+                crate::poll::PollOption {
+                    id: 2,
+                    text: "Cơm".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+            ],
+            multi_choice: false,
+            is_closed: false,
+            total_votes: 0,
+        };
+        app.event_tx
+            .send(GuiEvent::GroupPollsLoaded {
+                runtime_id: runtime,
+                thread_id: "grp-1".into(),
+                polls: vec![foreign_poll],
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: operation MUST stay Indeterminate, lock MUST remain held
+        assert!(matches!(
+            app.poll_operations.get(&req_id).unwrap().phase,
+            PollOpPhase::Indeterminate { .. }
+        ));
+        assert!(app
+            .poll_intent_lock
+            .contains_key(&("grp-1".into(), q.clone())));
+
+        // 2. GroupPollsLoaded contains a poll created by ME, with same question, but DIFFERENT options
+        let mismatched_opts_poll = crate::poll::PollItem {
+            id: 99902,
+            grid: "grp-1".into(),
+            question: q.clone(),
+            creator_id: "my-user-uin".into(),
+            options: vec![
+                crate::poll::PollOption {
+                    id: 1,
+                    text: "Bún bò".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+                crate::poll::PollOption {
+                    id: 2,
+                    text: "Miến gà".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+            ],
+            multi_choice: false,
+            is_closed: false,
+            total_votes: 0,
+        };
+        app.event_tx
+            .send(GuiEvent::GroupPollsLoaded {
+                runtime_id: runtime,
+                thread_id: "grp-1".into(),
+                polls: vec![mismatched_opts_poll],
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: still Indeterminate, lock remains held
+        assert!(matches!(
+            app.poll_operations.get(&req_id).unwrap().phase,
+            PollOpPhase::Indeterminate { .. }
+        ));
+        assert!(app
+            .poll_intent_lock
+            .contains_key(&("grp-1".into(), q.clone())));
+
+        // 3. GroupPollsLoaded contains the genuine poll matching creator, options, and ID
+        let matching_poll = crate::poll::PollItem {
+            id: 99903,
+            grid: "grp-1".into(),
+            question: q.clone(),
+            creator_id: "my-user-uin".into(), // Matches owner!
+            options: vec![
+                crate::poll::PollOption {
+                    id: 1,
+                    text: "Phở".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+                crate::poll::PollOption {
+                    id: 2,
+                    text: "Cơm".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+            ],
+            multi_choice: false,
+            is_closed: false,
+            total_votes: 0,
+        };
+        app.event_tx
+            .send(GuiEvent::GroupPollsLoaded {
+                runtime_id: runtime,
+                thread_id: "grp-1".into(),
+                polls: vec![matching_poll],
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant (F2 Remediation): GroupPollsLoaded must NEVER heuristically adopt polls into Created.
+        // Without authoritative Create ACK, operation MUST remain Indeterminate and intent lock remains held.
+        assert!(matches!(
+            app.poll_operations.get(&req_id).unwrap().phase,
+            PollOpPhase::Indeterminate { .. }
+        ));
+        assert!(app
+            .poll_intent_lock
+            .contains_key(&("grp-1".into(), q.clone())));
+    }
+
+    #[test]
+    fn test_f4_quick_message_stale_context_does_not_truncate_text() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("thread-qm", 1, 10)],
+            false,
+        );
+        app.is_logged_in = true;
+        app.active_thread_id = Some("thread-qm".into());
+
+        let qm_item = crate::quick_message::QuickMessage {
+            id: "1".into(),
+            title: "Tài liệu".into(),
+            shortcut: "doc".into(),
+            text: "Đây là tài liệu đính kèm".into(),
+            media: Some("doc.pdf".into()),
+            msg_type: 0,
+        };
+
+        // Case A: User has entered text that happens to start with '/', but has NO active token match
+        app.input_message = "/home/user/workspace/important_notes.txt".into();
+        app.quick_message_activation_context = None;
+        app.quick_message_draft_revision = 1;
+
+        // User clicks an item while cursor is at position 10 (inside "/home/user") where quick_message_token_at_cursor returns None
+        app.apply_quick_message_expansion(&ctx, "thread-qm", &qm_item, 10);
+
+        // INVARIANT: Text MUST NOT be truncated or overwritten with qm_item.text!
+        assert_eq!(
+            app.input_message, "/home/user/workspace/important_notes.txt",
+            "Mismatched context must never overwrite or truncate input_message"
+        );
+        assert_eq!(app.quick_message_draft_revision, 1);
+
+        // Case B: User has typed a valid trigger token "/doc" with cursor right after it
+        app.input_message = "Xin chào /doc bạn nhé".into();
+        // Char index 13 is right after "/doc" (0..9: "Xin chào ", 9..13: "/doc")
+        app.apply_quick_message_expansion(&ctx, "thread-qm", &qm_item, 13);
+
+        // INVARIANT: Token "/doc" is expanded in place
+        assert_eq!(
+            app.input_message,
+            "Xin chào Đây là tài liệu đính kèm bạn nhé"
+        );
+        assert_eq!(app.quick_message_draft_revision, 2);
+
+        // Case C: Leading shortcut without prefix
+        app.input_message = "/doc".into();
+        app.apply_quick_message_expansion(&ctx, "thread-qm", &qm_item, 4);
+        assert_eq!(app.input_message, "Đây là tài liệu đính kèm");
+        assert_eq!(app.quick_message_draft_revision, 3);
+    }
+
+    #[test]
+    fn test_f4_quick_message_media_routes_to_background_thread_draft() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("thread-active", 1, 5), thread("thread-bg", 1, 5)],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "my-user".into();
+        let runtime = app.account_runtime_id;
+        app.active_thread_id = Some("thread-active".into());
+
+        // Create a temporary file to simulate valid prepared media
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("qm_test_file.png");
+        let _ = std::fs::write(&temp_file, b"fake png data");
+
+        let op_id = 1;
+        let gen = app.current_draft_generation("thread-bg");
+        app.pending_qm_media_ops.insert(
+            op_id,
+            crate::gui::QuickMessageMediaOp {
+                op_id,
+                owner: "my-user".into(),
+                runtime_id: runtime,
+                thread_id: "thread-bg".into(),
+                draft_generation: gen,
+            },
+        );
+
+        // Media completion arrives for "thread-bg" (user already switched to "thread-active")
+        app.event_tx
+            .send(GuiEvent::QuickMessageMediaPrepared {
+                op_id,
+                owner: "my-user".into(),
+                runtime_id: runtime,
+                thread_id: "thread-bg".into(),
+                draft_generation: gen,
+                outcome: QuickMessageMediaOutcome::Success {
+                    path: temp_file.clone(),
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // INVARIANT: The attachment must be safely routed to "thread-bg" draft, NOT lost, and NOT polluting "thread-active"
+        assert_eq!(app.attachment_drafts.len("thread-bg"), 1);
+        assert_eq!(app.attachment_drafts.len("thread-active"), 0);
+
+        let op_id2 = 2;
+        app.pending_qm_media_ops.insert(
+            op_id2,
+            crate::gui::QuickMessageMediaOp {
+                op_id: op_id2,
+                owner: "my-user".into(),
+                runtime_id: runtime,
+                thread_id: "thread-bg".into(),
+                draft_generation: gen,
+            },
+        );
+
+        // Also test MissingFile terminal outcome shows feedback and doesn't crash or corrupt
+        app.event_tx
+            .send(GuiEvent::QuickMessageMediaPrepared {
+                op_id: op_id2,
+                owner: "my-user".into(),
+                runtime_id: runtime,
+                thread_id: "thread-bg".into(),
+                draft_generation: gen,
+                outcome: QuickMessageMediaOutcome::MissingFile {
+                    path: "nonexistent.jpg".into(),
+                },
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(app
+            .toast_notice
+            .as_ref()
+            .is_some_and(|(t, _)| t.contains("không tồn tại")));
+
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_f5_mediastore_reload_failure_preserves_snapshot_and_cursor() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![thread("thread-media", 1, 5)],
+            false,
+        );
+        app.is_logged_in = true;
+        let runtime = app.account_runtime_id;
+        let thread_id = "thread-media".to_string();
+
+        let dummy_item = crate::server_media::ServerMediaItem {
+            id: "item-1".into(),
+            sender_id: "u1".into(),
+            group_id: thread_id.clone(),
+            global_message_id: "g1".into(),
+            client_message_id: "c1".into(),
+            created_ts: 1000,
+            sub_type: None,
+            media_type: crate::server_media::ServerMediaType::Photo,
+            url: "https://example.com/p1.jpg".into(),
+            thumbnail_url: None,
+            file_name: "p1.jpg".into(),
+            file_size: 2048,
+            is_expired: false,
+        };
+
+        // Initialize snapshot in drawer cache: 1 item, cursor = "cursor_p1", has_more = true
+        let entry = app
+            .drawer_media
+            .entry((runtime, thread_id.clone()))
+            .or_default();
+        entry.photos.items = vec![dummy_item];
+        entry.photos.next_cursor = Some("cursor_p1".into());
+        entry.photos.has_more = true;
+        entry.photos.is_loading = false;
+
+        let _lock = TEST_WORKER_TX_LOCK.lock().unwrap();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        worker::WORKER_TX.set(worker::WorkerSender::new_for_test(cmd_tx, ctx.clone()));
+
+        // User triggers force_refresh
+        app.request_drawer_server_media(&thread_id, MediaTab::Photos, true);
+
+        // INVARIANT 1: Immediate trigger MUST NOT wipe snapshot items or next_cursor!
+        let cat_pre = &app
+            .drawer_media
+            .get(&(runtime, thread_id.clone()))
+            .unwrap()
+            .photos;
+        assert_eq!(
+            cat_pre.items.len(),
+            1,
+            "Snapshot items must remain visible during reload"
+        );
+        assert_eq!(
+            cat_pre.next_cursor.as_deref(),
+            Some("cursor_p1"),
+            "Cursor must NOT be prematurely set to None"
+        );
+        assert!(cat_pre.is_loading);
+        assert!(cat_pre
+            .in_flight
+            .as_ref()
+            .is_some_and(|f| f.is_refresh && f.requested_cursor.is_none()));
+        let gen = cat_pre.generation;
+
+        // Reload encounters a network error
+        app.event_tx
+            .send(GuiEvent::ServerMediaLoadFailed {
+                runtime_id: runtime,
+                thread_id: thread_id.clone(),
+                media_type: 1,
+                generation: gen,
+                error: "Máy chủ media quá tải".into(),
+                target: crate::server_media::ServerMediaTarget::RightDrawer,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // INVARIANT 2: After failure, snapshot items and next_cursor MUST STILL be preserved!
+        let cat_post = &app.drawer_media.get(&(runtime, thread_id)).unwrap().photos;
+        assert!(!cat_post.is_loading);
+        assert_eq!(
+            cat_post.items.len(),
+            1,
+            "Snapshot items preserved after failed reload"
+        );
+        assert_eq!(
+            cat_post.next_cursor.as_deref(),
+            Some("cursor_p1"),
+            "Previous cursor preserved after failed reload"
+        );
+        assert!(cat_post.has_more);
+        assert_eq!(cat_post.error.as_deref(), Some("Máy chủ media quá tải"));
+        assert!(cat_post.in_flight.is_none());
+        worker::WORKER_TX.clear();
     }
 
     fn thread(id: &str, start: i64, count: usize) -> Thread {
@@ -11587,6 +13513,91 @@ mod phase3_completion_tests {
         app.check_events(&ctx);
         assert!(!app.loading_link_previews.contains(&url));
     }
+
+    #[test]
+    fn drawer_media_cursor_loop_guard_and_snapshot_retention() {
+        let (ctx, mut app, tx) = app();
+        let runtime = app.account_runtime_id;
+        let thread_id = "test-thread".to_string();
+
+        let entry = app
+            .drawer_media
+            .entry((runtime, thread_id.clone()))
+            .or_default();
+        entry.photos.generation = 1;
+        entry.photos.is_loading = true;
+
+        let dummy_item = crate::server_media::ServerMediaItem {
+            id: "m1".into(),
+            sender_id: "u1".into(),
+            group_id: "test-thread".into(),
+            global_message_id: "g1".into(),
+            client_message_id: "c1".into(),
+            created_ts: 1000,
+            sub_type: None,
+            media_type: crate::server_media::ServerMediaType::Photo,
+            url: "https://example.com/1.jpg".into(),
+            thumbnail_url: None,
+            file_name: "photo.jpg".into(),
+            file_size: 1024,
+            is_expired: false,
+        };
+
+        let page1 = crate::server_media::ServerMediaPage {
+            has_more: true,
+            next_cursor: None,
+            items: vec![dummy_item],
+        };
+
+        tx.send(GuiEvent::ServerMediaLoaded {
+            runtime_id: runtime,
+            thread_id: thread_id.clone(),
+            media_type: 1,
+            page_num: 1,
+            page: page1,
+            generation: 1,
+            target: crate::server_media::ServerMediaTarget::RightDrawer,
+        })
+        .unwrap();
+
+        app.check_events(&ctx);
+
+        let cat = &app
+            .drawer_media
+            .get(&(runtime, thread_id.clone()))
+            .unwrap()
+            .photos;
+        assert_eq!(cat.items.len(), 1);
+        assert!(
+            !cat.has_more,
+            "Non-advancing cursor must force has_more=false"
+        );
+        assert!(!cat.is_loading);
+
+        let entry = app
+            .drawer_media
+            .get_mut(&(runtime, thread_id.clone()))
+            .unwrap();
+        entry.photos.generation = 2;
+        entry.photos.is_loading = true;
+
+        tx.send(GuiEvent::ServerMediaLoadFailed {
+            runtime_id: runtime,
+            thread_id: thread_id.clone(),
+            media_type: 1,
+            generation: 2,
+            error: "Mạng lỗi".into(),
+            target: crate::server_media::ServerMediaTarget::RightDrawer,
+        })
+        .unwrap();
+
+        app.check_events(&ctx);
+
+        let cat = &app.drawer_media.get(&(runtime, thread_id)).unwrap().photos;
+        assert_eq!(cat.items.len(), 1, "Snapshot must be retained on failure");
+        assert_eq!(cat.error.as_deref(), Some("Mạng lỗi"));
+        assert!(!cat.is_loading);
+    }
 }
 
 #[cfg(test)]
@@ -11826,8 +13837,6 @@ mod startup_and_server_config_tests {
         });
         s
     }
-
-    static TEST_WORKER_TX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn startup_loading_settles_with_dismiss_delay_and_fatal_error_never_times_out_to_ready() {
@@ -13030,5 +15039,1462 @@ mod baseline_backfill_remediation_tests {
             Some(worker::BaselineFetchStatus::Partial { .. })
         ));
         assert_eq!(app.startup_state, StartupState::Ready);
+    }
+}
+
+#[cfg(test)]
+mod bank_account_isolation_tests {
+    use super::*;
+
+    #[test]
+    fn bank_account_state_resets_on_runtime_boundary() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_a".into();
+        app.account_runtime_id = 1;
+        app.bank_account_modal_open = true;
+        app.bank_accounts_list
+            .push(crate::bank_account::BankAccount {
+                account_id: "acc_1".into(),
+                bin: "970407".into(),
+                bank_number: "123456789".into(),
+                holder_name: "NGUYEN VAN A".into(),
+                is_default: true,
+                bank_name: "Techcombank".into(),
+                logo: "".into(),
+            });
+        app.bank_conf_list.push(crate::bank_account::BankInfo {
+            bin: "970407".into(),
+            name: "Techcombank".into(),
+            short_name: "TCB".into(),
+            name_eng: "Techcombank".into(),
+            search_key_word: "TCB".into(),
+            logo: "".into(),
+        });
+        app.new_bank_bin = "970407".into();
+        app.new_bank_number = "123456789".into();
+        app.new_bank_holder_name = "NGUYEN VAN A".into();
+
+        // Simulate runtime switch / logout / session expiration
+        app.reset_bank_state();
+
+        assert!(!app.bank_account_modal_open);
+        assert!(app.bank_accounts_list.is_empty());
+        assert!(app.bank_conf_list.is_empty());
+        assert!(app.new_bank_bin.is_empty());
+        assert!(app.new_bank_number.is_empty());
+        assert!(app.new_bank_holder_name.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod codex_f1_to_f4_audit_remediation_tests {
+    use super::*;
+
+    #[test]
+    fn test_f1_quick_message_media_draft_generation_isolation() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+
+        let thread_a = "thread_a";
+        let thread_b = "thread_b";
+
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("qm_f1_test.png");
+        let _ = std::fs::write(&temp_file, b"test-data");
+
+        // Initial generation is 1
+        assert_eq!(app.current_draft_generation(thread_a), 1);
+        let op_id_1 = 1001;
+
+        // Register op for thread_a at gen 1
+        app.pending_qm_media_ops.insert(
+            op_id_1,
+            QuickMessageMediaOp {
+                op_id: op_id_1,
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                thread_id: thread_a.into(),
+                draft_generation: 1,
+            },
+        );
+
+        // Case 1: Active thread is thread_b, media completes for thread_a
+        app.active_thread_id = Some(thread_b.into());
+        tx.send(GuiEvent::QuickMessageMediaPrepared {
+            op_id: op_id_1,
+            owner: "owner_1".into(),
+            runtime_id: 42,
+            thread_id: thread_a.into(),
+            draft_generation: 1,
+            outcome: QuickMessageMediaOutcome::Success {
+                path: temp_file.clone(),
+            },
+        })
+        .unwrap();
+        app.check_events(&ctx);
+
+        // Op is retired one-shot
+        assert!(!app.pending_qm_media_ops.contains_key(&op_id_1));
+        // Attached to thread_a, NOT thread_b
+        assert_eq!(app.attachment_drafts.len(thread_a), 1);
+        assert_eq!(app.attachment_drafts.len(thread_b), 0);
+
+        // Case 2: Draft is superseded (bumped) while media is preparing
+        let op_id_2 = 1002;
+        let gen_before = app.current_draft_generation(thread_a);
+        app.pending_qm_media_ops.insert(
+            op_id_2,
+            QuickMessageMediaOp {
+                op_id: op_id_2,
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                thread_id: thread_a.into(),
+                draft_generation: gen_before,
+            },
+        );
+
+        // User sends or clears draft -> bumps generation
+        app.bump_draft_generation(thread_a);
+        assert_eq!(app.current_draft_generation(thread_a), gen_before + 1);
+
+        // Late event arrives for op_id_2 with old draft_generation
+        tx.send(GuiEvent::QuickMessageMediaPrepared {
+            op_id: op_id_2,
+            owner: "owner_1".into(),
+            runtime_id: 42,
+            thread_id: thread_a.into(),
+            draft_generation: gen_before,
+            outcome: QuickMessageMediaOutcome::Success {
+                path: temp_file.clone(),
+            },
+        })
+        .unwrap();
+        app.check_events(&ctx);
+
+        // Op retired one-shot, but attachment count did NOT increase!
+        assert!(!app.pending_qm_media_ops.contains_key(&op_id_2));
+        assert_eq!(app.attachment_drafts.len(thread_a), 1);
+
+        // Case 3: Duplicate event for op_id_1 does nothing because op was already retired
+        tx.send(GuiEvent::QuickMessageMediaPrepared {
+            op_id: op_id_1,
+            owner: "owner_1".into(),
+            runtime_id: 42,
+            thread_id: thread_a.into(),
+            draft_generation: 1,
+            outcome: QuickMessageMediaOutcome::Success {
+                path: temp_file.clone(),
+            },
+        })
+        .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.attachment_drafts.len(thread_a), 1);
+
+        let _ = std::fs::remove_file(&temp_file);
+    }
+
+    #[test]
+    fn test_f2_poll_reconciliation_never_adopts_existing_poll_without_create_ack() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+
+        let thread_id = "group_123";
+        let req_id = 555;
+        let q = "Ăn trưa ở đâu?".to_string();
+        let opts = vec!["Cơm tấm".to_string(), "Phở".to_string()];
+
+        // Poll operation is in Indeterminate phase and thread is intent locked
+        app.poll_operations.insert(
+            req_id,
+            PollOperation {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                thread_id: thread_id.into(),
+                request_id: req_id,
+                question: q.clone(),
+                options: opts.clone(),
+                phase: PollOpPhase::Indeterminate {
+                    error: "Network timeout".into(),
+                },
+                created_at: std::time::Instant::now(),
+            },
+        );
+        app.poll_intent_lock
+            .insert((thread_id.into(), q.clone()), req_id);
+
+        // GroupPollsLoaded arrives with matching question & options & creator
+        let matching_poll = crate::poll::PollItem {
+            id: 888,
+            grid: thread_id.into(),
+            question: q.clone(),
+            creator_id: "owner_1".into(),
+            options: vec![
+                crate::poll::PollOption {
+                    id: 1,
+                    text: "Cơm tấm".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+                crate::poll::PollOption {
+                    id: 2,
+                    text: "Phở".into(),
+                    vote_count: 0,
+                    is_voted_by_me: false,
+                },
+            ],
+            multi_choice: false,
+            is_closed: false,
+            total_votes: 0,
+        };
+
+        tx.send(GuiEvent::GroupPollsLoaded {
+            runtime_id: 42,
+            thread_id: thread_id.into(),
+            polls: vec![matching_poll],
+        })
+        .unwrap();
+        app.check_events(&ctx);
+
+        // INVARIANT (F2): Must NOT adopt matching poll into Created state without authoritative ACK
+        let op = app.poll_operations.get(&req_id).unwrap();
+        assert!(
+            matches!(op.phase, PollOpPhase::Indeterminate { .. }),
+            "Operation must remain Indeterminate without server create ACK"
+        );
+        assert!(
+            app.poll_intent_lock
+                .contains_key(&(thread_id.into(), q.clone())),
+            "Intent lock must remain held"
+        );
+    }
+
+    #[test]
+    fn test_f3_mediastore_transactional_validation_preserves_snapshot_on_invalid_cursor() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let (tx, rx) = channel();
+        app.event_rx = rx;
+
+        let thread_id = "thread_media";
+        let dummy_item = crate::server_media::ServerMediaItem {
+            id: "p1".into(),
+            sender_id: "u1".into(),
+            group_id: thread_id.into(),
+            global_message_id: "g1".into(),
+            client_message_id: "c1".into(),
+            created_ts: 100,
+            sub_type: None,
+            media_type: crate::server_media::ServerMediaType::Photo,
+            url: "https://example.com/p1.jpg".into(),
+            thumbnail_url: None,
+            file_name: "p1.jpg".into(),
+            file_size: 1024,
+            is_expired: false,
+        };
+
+        // Snapshot in drawer media
+        let entry = app.drawer_media.entry((42, thread_id.into())).or_default();
+        entry.photos.items = vec![dummy_item];
+        entry.photos.next_cursor = Some("cursor_page_1".into());
+        entry.photos.has_more = true;
+        entry.photos.is_loading = true;
+        entry.photos.generation = 10;
+        entry.photos.in_flight = Some(InFlightMediaFetch {
+            generation: 10,
+            is_refresh: false,
+            requested_cursor: Some("cursor_page_1".into()),
+        });
+
+        // Response arrives with non-advancing cursor while has_more is true (invalid pagination)
+        let page = crate::server_media::ServerMediaPage {
+            items: vec![],
+            next_cursor: Some("cursor_page_1".into()),
+            has_more: true,
+        };
+
+        tx.send(GuiEvent::ServerMediaLoaded {
+            runtime_id: 42,
+            thread_id: thread_id.into(),
+            media_type: 1,
+            page_num: 2,
+            generation: 10,
+            page,
+            target: crate::server_media::ServerMediaTarget::RightDrawer,
+        })
+        .unwrap();
+        app.check_events(&ctx);
+
+        let cat = &app
+            .drawer_media
+            .get(&(42, thread_id.into()))
+            .unwrap()
+            .photos;
+        // Invariant: Snapshot items, cursor, and has_more MUST NOT be modified or wiped
+        assert_eq!(cat.items.len(), 1, "Snapshot items must remain intact");
+        assert_eq!(
+            cat.next_cursor.as_deref(),
+            Some("cursor_page_1"),
+            "Cursor must remain unchanged"
+        );
+        assert!(cat.has_more, "has_more must remain true");
+        assert!(!cat.is_loading, "Loading flag must be cleared");
+        assert!(cat.in_flight.is_none(), "In-flight fetch must be retired");
+        assert!(
+            cat.error
+                .as_ref()
+                .is_some_and(|e| e.contains("con trỏ media không thay đổi")),
+            "Must report pagination error"
+        );
+    }
+
+    #[test]
+    fn test_f4_enqueue_failure_rollbacks_pending_and_prevents_infinite_spinner() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let _lock = TEST_WORKER_TX_LOCK.lock().unwrap();
+        worker::WORKER_TX.clear(); // Ensure WORKER_TX is None
+
+        // 1. History loading enqueue failure rollback
+        let thread_id = "test_thread_history";
+        let res = app.trigger_load_older_history(thread_id, false);
+        assert!(!res, "Should return false on enqueue failure");
+        assert!(
+            !app.history_pending_requests.contains_key(thread_id),
+            "Must remove from history_pending_requests on enqueue failure"
+        );
+        assert!(
+            !app.timeline_loading_more,
+            "timeline_loading_more must be rolled back to false"
+        );
+        assert!(
+            app.timeline_error
+                .as_ref()
+                .is_some_and(|e| e.contains("worker chưa sẵn sàng")),
+            "Must set timeline_error"
+        );
+
+        // 2. Right drawer media enqueue failure rollback
+        let drawer_thread = "test_thread_drawer";
+        app.request_drawer_server_media(drawer_thread, MediaTab::Photos, false);
+        let cat = &app
+            .drawer_media
+            .get(&(42, drawer_thread.into()))
+            .unwrap()
+            .photos;
+        assert!(
+            !cat.is_loading,
+            "cat.is_loading must be rolled back to false on enqueue failure"
+        );
+        assert!(
+            cat.in_flight.is_none(),
+            "cat.in_flight must be rolled back to None on enqueue failure"
+        );
+        assert!(
+            cat.error
+                .as_ref()
+                .is_some_and(|e| e.contains("worker chưa sẵn sàng")),
+            "Must set cat.error on enqueue failure"
+        );
+    }
+
+    #[test]
+    fn test_poll_lock_retained_on_indeterminate_and_released_on_rejection() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let thread_id = "group_123".to_string();
+        let question = "Cơm trưa gì?".to_string();
+        let intent_key = (thread_id.clone(), question.clone());
+
+        // Setup pending poll operation
+        let req_id = 1001;
+        app.poll_operations.insert(
+            req_id,
+            PollOperation {
+                owner: app.user_uin.clone(),
+                runtime_id: app.account_runtime_id,
+                thread_id: thread_id.clone(),
+                request_id: req_id,
+                question: question.clone(),
+                options: vec!["Phở".into(), "Cơm".into()],
+                phase: PollOpPhase::Pending,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        app.poll_intent_lock.insert(intent_key.clone(), req_id);
+        app.poll_pending_intents.insert(intent_key.clone());
+
+        app.event_tx
+            .send(GuiEvent::PollTransportUnknown {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id,
+                thread_id: thread_id.clone(),
+                error: "Connection timeout".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: PollTransportUnknown MUST RETAIN intent lock to prevent duplicate creation
+        assert!(
+            app.poll_intent_lock.contains_key(&intent_key),
+            "PollTransportUnknown MUST retain intent lock"
+        );
+        assert!(matches!(
+            app.poll_operations.get(&req_id).unwrap().phase,
+            PollOpPhase::Indeterminate { .. }
+        ));
+        // Verify that duplicate attempt is blocked by intent lock when in Indeterminate phase
+        let locked_op = app
+            .poll_operations
+            .get(app.poll_intent_lock.get(&intent_key).unwrap())
+            .unwrap();
+        assert!(
+            matches!(locked_op.phase, PollOpPhase::Indeterminate { .. }),
+            "Second attempt must be blocked while indeterminate intent lock is held"
+        );
+
+        // Now test PollRejected (explicit server rejection): MUST release intent lock
+        let req_id2 = 1002;
+        app.poll_operations.insert(
+            req_id2,
+            PollOperation {
+                owner: app.user_uin.clone(),
+                runtime_id: app.account_runtime_id,
+                thread_id: thread_id.clone(),
+                request_id: req_id2,
+                question: question.clone(),
+                options: vec!["Phở".into(), "Cơm".into()],
+                phase: PollOpPhase::Pending,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        app.poll_intent_lock.insert(intent_key.clone(), req_id2);
+
+        app.event_tx
+            .send(GuiEvent::PollRejected {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id2,
+                thread_id: thread_id.clone(),
+                error: "Rejected by server (code 500)".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.poll_intent_lock.contains_key(&intent_key),
+            "PollRejected MUST release intent lock"
+        );
+
+        // Test PollLocalValidationFailed: MUST release intent lock
+        let req_id3 = 1003;
+        app.poll_operations.insert(
+            req_id3,
+            PollOperation {
+                owner: app.user_uin.clone(),
+                runtime_id: app.account_runtime_id,
+                thread_id: thread_id.clone(),
+                request_id: req_id3,
+                question: question.clone(),
+                options: vec!["Phở".into()],
+                phase: PollOpPhase::Pending,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        app.poll_intent_lock.insert(intent_key.clone(), req_id3);
+
+        app.event_tx
+            .send(GuiEvent::PollLocalValidationFailed {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id3,
+                thread_id: thread_id.clone(),
+                error: "Too few options".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.poll_intent_lock.contains_key(&intent_key),
+            "PollLocalValidationFailed MUST release intent lock"
+        );
+    }
+
+    #[test]
+    fn test_schedule_saved_retires_matching_draft_and_guards_against_stale_wipe() {
+        let ctx = egui::Context::default();
+        let thread_id = "test_thread_schedule".to_string();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![Thread {
+                id: thread_id.clone(),
+                is_group: true,
+                ..Default::default()
+            }],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+        app.selected_thread_index = 0;
+        app.input_message = "Tin hẹn giờ 1".into();
+
+        app.open_quick_schedule(&ctx);
+        assert!(app.quick_schedule.is_some());
+        let draft = app.quick_schedule.as_ref().unwrap();
+        assert_eq!(draft.draft_generation, 1);
+        let req_id = draft.request;
+
+        // Case 1: Matching ScheduleSaved -> retires draft, clears input_message
+        if let Some(d) = &mut app.quick_schedule {
+            d.pending_at = Some(0);
+        }
+        app.event_tx
+            .send(GuiEvent::Tools {
+                owner: "owner_1".into(),
+                result: Ok(tools_panel::ToolsResult::ScheduleSaved {
+                    request: Some(req_id),
+                    thread: thread_id.clone(),
+                    text: "Tin hẹn giờ 1".into(),
+                    at: 0,
+                    result: Ok(()),
+                }),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(app.input_message, "", "Matching schedule must clear text");
+        assert_eq!(
+            app.current_draft_generation(&thread_id),
+            2,
+            "Matching schedule must bump draft generation"
+        );
+        assert!(app.quick_schedule.is_none());
+
+        // Case 2: Stale ScheduleSaved after user typed new draft
+        app.input_message = "Tin nhắn mới không được xóa".into();
+        app.open_quick_schedule(&ctx);
+        let draft2 = app.quick_schedule.as_ref().unwrap();
+        let req_id2 = draft2.request;
+        assert_eq!(draft2.draft_generation, 2);
+
+        // Simulate user typing more or draft being bumped before ScheduleSaved completes
+        app.bump_draft_generation(&thread_id); // now gen 3
+        app.input_message = "Tin nhắn mới đang soạn thảo".into();
+
+        if let Some(d) = &mut app.quick_schedule {
+            d.pending_at = Some(100);
+        }
+        app.event_tx
+            .send(GuiEvent::Tools {
+                owner: "owner_1".into(),
+                result: Ok(tools_panel::ToolsResult::ScheduleSaved {
+                    request: Some(req_id2),
+                    thread: thread_id.clone(),
+                    text: "Tin nhắn mới không được xóa".into(),
+                    at: 100,
+                    result: Ok(()),
+                }),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.input_message, "Tin nhắn mới đang soạn thảo",
+            "Mismatched draft generation must NOT wipe active text"
+        );
+        assert_eq!(
+            app.current_draft_generation(&thread_id),
+            3,
+            "Generation must not be bumped again on mismatched draft"
+        );
+    }
+
+    #[test]
+    fn test_tools_panel_media_reload_retention_and_chat_switch() {
+        let ctx = egui::Context::default();
+        let thread_1 = "thread_media_1".to_string();
+        let thread_2 = "thread_media_2".to_string();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![
+                Thread {
+                    id: thread_1.clone(),
+                    is_group: false,
+                    ..Default::default()
+                },
+                Thread {
+                    id: thread_2.clone(),
+                    is_group: false,
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+        app.selected_thread_index = 0;
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Set up initial confirmed snapshot for ToolsPanel (page 3 with cursor)
+        let initial_item = crate::server_media::ServerMediaItem {
+            id: "photo_100".into(),
+            sender_id: "s1".into(),
+            group_id: thread_1.clone(),
+            global_message_id: "gm1".into(),
+            client_message_id: "cm1".into(),
+            created_ts: 1000,
+            sub_type: None,
+            media_type: crate::server_media::ServerMediaType::Photo,
+            url: "https://example.com/p1.jpg".into(),
+            thumbnail_url: None,
+            file_name: "p1.jpg".into(),
+            file_size: 1024,
+            is_expired: false,
+        };
+        app.tools.server_media_thread_id = thread_1.clone();
+        app.tools.server_media_type = 1;
+        app.tools.server_media_page = 3;
+        app.tools.server_media_has_more = true;
+        app.tools.server_media_next_cursor = Some("cursor_page3".into());
+        app.tools.server_media_items = vec![initial_item.clone()];
+        app.tools.server_media_generation = 10;
+        app.tools.server_media_loading = false;
+
+        // 1. Dispatch reload for the SAME category:
+        // Must preserve the entire snapshot (items, page=3, has_more=true, next_cursor=cursor_page3)
+        // while the request is pending!
+        let enqueued = app.dispatch_tools_server_media_request(
+            &thread_1,
+            1,
+            tools_panel::ServerMediaFetchMode::Reload,
+            Some(&cmd_tx),
+        );
+        assert!(enqueued, "Reload must be enqueued");
+        assert!(app.tools.server_media_loading);
+        assert_eq!(
+            app.tools.server_media_page, 3,
+            "Page must not be overwritten during in-flight reload"
+        );
+        assert!(
+            app.tools.server_media_has_more,
+            "has_more must not be overwritten during in-flight reload"
+        );
+        assert_eq!(
+            app.tools.server_media_next_cursor.as_deref(),
+            Some("cursor_page3"),
+            "next_cursor must not be wiped to None during in-flight reload"
+        );
+        assert_eq!(app.tools.server_media_items.len(), 1);
+
+        let sent_cmd = cmd_rx.try_recv().expect("Command must be received");
+        match sent_cmd {
+            WorkerCmd::FetchServerMedia { page, cursor, .. } => {
+                assert_eq!(page, 1, "Reload must request page 1");
+                assert_eq!(cursor, None, "Reload must request cursor None");
+            }
+            _ => panic!("Expected FetchServerMedia"),
+        }
+
+        // 2. Failed reload for same category: MUST retain existing snapshot and unlock loading
+        let current_gen = app.tools.server_media_generation;
+        app.event_tx
+            .send(GuiEvent::ServerMediaLoadFailed {
+                runtime_id: 42,
+                thread_id: thread_1.clone(),
+                media_type: 1,
+                generation: current_gen,
+                error: "Network error".into(),
+                target: crate::server_media::ServerMediaTarget::ToolsPanel,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.tools.server_media_loading,
+            "Loading must be false on failure"
+        );
+        assert_eq!(
+            app.tools.server_media_items.len(),
+            1,
+            "Existing items must be preserved on reload failure"
+        );
+        assert_eq!(
+            app.tools.server_media_page, 3,
+            "Page 3 must be preserved on reload failure"
+        );
+        assert!(
+            app.tools.server_media_has_more,
+            "has_more must be preserved on reload failure"
+        );
+        assert_eq!(
+            app.tools.server_media_next_cursor.as_deref(),
+            Some("cursor_page3"),
+            "Cursor must be preserved on reload failure"
+        );
+
+        // 3. Dispatch append from the preserved snapshot:
+        // Must use preserved cursor_page3 and page 4!
+        let append_enqueued = app.dispatch_tools_server_media_request(
+            &thread_1,
+            1,
+            tools_panel::ServerMediaFetchMode::Append,
+            Some(&cmd_tx),
+        );
+        assert!(append_enqueued, "Append must be enqueued");
+        let append_cmd = cmd_rx.try_recv().expect("Append command must be received");
+        let append_gen = match append_cmd {
+            WorkerCmd::FetchServerMedia {
+                page,
+                cursor,
+                generation,
+                ..
+            } => {
+                assert_eq!(page, 4, "Append must request next page (3 + 1 = 4)");
+                assert_eq!(
+                    cursor.as_deref(),
+                    Some("cursor_page3"),
+                    "Append must use preserved cursor"
+                );
+                generation
+            }
+            _ => panic!("Expected FetchServerMedia for append"),
+        };
+
+        // 4. Successful append response commits merge and advances page
+        let item2 = crate::server_media::ServerMediaItem {
+            id: "photo_101".into(),
+            sender_id: "s1".into(),
+            group_id: thread_1.clone(),
+            global_message_id: "gm2".into(),
+            client_message_id: "cm2".into(),
+            created_ts: 2000,
+            sub_type: None,
+            media_type: crate::server_media::ServerMediaType::Photo,
+            url: "https://example.com/p2.jpg".into(),
+            thumbnail_url: None,
+            file_name: "p2.jpg".into(),
+            file_size: 2048,
+            is_expired: false,
+        };
+        app.event_tx
+            .send(GuiEvent::ServerMediaLoaded {
+                runtime_id: 42,
+                thread_id: thread_1.clone(),
+                media_type: 1,
+                page_num: 4,
+                page: crate::server_media::ServerMediaPage {
+                    items: vec![item2],
+                    has_more: false,
+                    next_cursor: None,
+                },
+                generation: append_gen,
+                target: crate::server_media::ServerMediaTarget::ToolsPanel,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.tools.server_media_items.len(),
+            2,
+            "Items must be merged"
+        );
+        assert_eq!(app.tools.server_media_page, 4, "Page must commit to 4");
+        assert!(!app.tools.server_media_has_more, "has_more is false");
+
+        // 5. Chat switch during loading: must clear loading so buttons are never hung
+        app.tools.server_media_loading = true;
+        app.tools.server_media_generation = 15;
+        // User switches to thread 2
+        app.selected_thread_index = 1;
+
+        app.event_tx
+            .send(GuiEvent::ServerMediaLoaded {
+                runtime_id: 42,
+                thread_id: thread_1.clone(),
+                media_type: 1,
+                page_num: 1,
+                page: crate::server_media::ServerMediaPage {
+                    items: vec![],
+                    has_more: false,
+                    next_cursor: None,
+                },
+                generation: 15,
+                target: crate::server_media::ServerMediaTarget::ToolsPanel,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.tools.server_media_loading,
+            "Loading must be cleared even when user switched active chat"
+        );
+    }
+
+    #[test]
+    fn test_bank_account_intent_lock_retained_on_transport_unknown_and_released_on_server_rejection_and_success(
+    ) {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_1".into();
+        app.account_runtime_id = 42;
+
+        let bin = "970407".to_string();
+        let bank_number = "19036789999".to_string();
+        let intent_key = (app.user_uin.clone(), bin.clone(), bank_number.clone());
+
+        let req_id_1 = 2001;
+        app.bank_intent_lock.insert(intent_key.clone(), req_id_1);
+
+        // Case 1: Transport/Network unknown error -> MUST retain intent lock to prevent duplicate creation
+        app.event_tx
+            .send(GuiEvent::BankAccountCreateFailed {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id_1,
+                error: "Connection reset by peer".into(),
+                is_transport_unknown: true,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            app.bank_intent_lock.contains_key(&intent_key),
+            "BankAccountCreateFailed with is_transport_unknown=true MUST retain intent lock"
+        );
+        assert!(app
+            .status_msg
+            .contains("Lỗi kết nối khi tạo tài khoản (chưa rõ kết quả)"));
+
+        // Case 2: Explicit server rejection -> MUST release intent lock so user can edit and retry
+        let req_id_2 = 2002;
+        app.bank_intent_lock.insert(intent_key.clone(), req_id_2);
+
+        app.event_tx
+            .send(GuiEvent::BankAccountCreateFailed {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id_2,
+                error: "Số tài khoản không tồn tại (mã 15001)".into(),
+                is_transport_unknown: false,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.bank_intent_lock.contains_key(&intent_key),
+            "BankAccountCreateFailed with is_transport_unknown=false MUST release intent lock"
+        );
+        assert!(app.status_msg.contains("Lưu tài khoản thất bại"));
+
+        // Case 3: Success -> MUST release intent lock and clear inputs
+        let req_id_3 = 2003;
+        app.bank_intent_lock.insert(intent_key.clone(), req_id_3);
+        app.new_bank_number = bank_number.clone();
+        app.new_bank_holder_name = "NGUYEN VAN A".into();
+
+        app.event_tx
+            .send(GuiEvent::BankAccountCreated {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: req_id_3,
+                account: Box::new(crate::bank_account::BankAccount {
+                    account_id: "acc_99".into(),
+                    bin: bin.clone(),
+                    bank_number: bank_number.clone(),
+                    holder_name: "NGUYEN VAN A".into(),
+                    is_default: false,
+                    bank_name: "Techcombank".into(),
+                    logo: String::new(),
+                }),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.bank_intent_lock.contains_key(&intent_key),
+            "BankAccountCreated MUST release intent lock"
+        );
+        assert!(app.new_bank_number.is_empty());
+        assert!(app.new_bank_holder_name.is_empty());
+        assert_eq!(app.bank_accounts_list.len(), 1);
+
+        // Case 4: BankAccountsLoaded refreshes and clears any stale locks
+        app.bank_intent_lock.insert(intent_key.clone(), 9999);
+        app.event_tx
+            .send(GuiEvent::BankAccountsLoaded {
+                owner: "owner_1".into(),
+                runtime_id: 42,
+                request_id: 0,
+                accounts: vec![],
+                total: 0,
+                has_more: false,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            app.bank_intent_lock.is_empty(),
+            "BankAccountsLoaded MUST clear intent lock"
+        );
+
+        // Case 5: reset_bank_state clears intent lock
+        app.bank_intent_lock.insert(intent_key.clone(), 8888);
+        app.reset_bank_state();
+        assert!(
+            app.bank_intent_lock.is_empty(),
+            "reset_bank_state MUST clear intent lock"
+        );
+    }
+
+    #[test]
+    fn test_quick_messages_stale_snapshot_and_mutation_epoch_lifecycle() {
+        let _lock = TEST_WORKER_TX_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        worker::WORKER_TX.clear();
+
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![],
+            false,
+        );
+        app.is_logged_in = true;
+        app.user_uin = "owner_qm".into();
+        app.account_runtime_id = 100;
+
+        let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        worker::WORKER_TX.set(worker::WorkerSender::new_for_test(cmd_tx, ctx.clone()));
+
+        let item_a = crate::quick_message::QuickMessage {
+            id: "srv_a".into(),
+            shortcut: "/a".into(),
+            title: "A".into(),
+            text: "Initial A".into(),
+            media: None,
+            msg_type: 0,
+        };
+        app.tools.config.quick_messages.items = vec![item_a.clone()];
+
+        // 1. List A pending -> create B confirmed -> A returns snapshot lacking B
+        // Step 1a: Dispatch List A
+        assert!(app.trigger_quick_messages_fetch());
+        let req_id_a = app
+            .quick_message_in_flight_list_id
+            .expect("Fetch must be in flight");
+        assert_eq!(app.quick_message_mutation_epoch, 0);
+
+        let dispatched_cmd = cmd_rx.try_recv().expect("WorkerCmd must be dispatched");
+        match dispatched_cmd {
+            WorkerCmd::FetchQuickMessages {
+                request_id,
+                mutation_epoch,
+                ..
+            } => {
+                assert_eq!(request_id, req_id_a);
+                assert_eq!(mutation_epoch, 0);
+            }
+            other => panic!(
+                "Expected FetchQuickMessages, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+
+        // Step 1b: Create B confirmed while List A is still pending
+        let item_b = crate::quick_message::QuickMessage {
+            id: "srv_b".into(),
+            shortcut: "/b".into(),
+            title: "B".into(),
+            text: "Text B".into(),
+            media: Some("file://img.png".into()),
+            msg_type: 1,
+        };
+        app.event_tx
+            .send(GuiEvent::QuickMessageCreated {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 501,
+                item: item_b.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Verify state & mutation epoch bumped to 1
+        assert_eq!(app.quick_message_mutation_epoch, 1);
+        assert_eq!(app.tools.config.quick_messages.items.len(), 2);
+        assert!(app
+            .tools
+            .config
+            .quick_messages
+            .items
+            .iter()
+            .any(|i| i.id == "srv_b"));
+
+        // Verify save was enqueued with item_b
+        let mut save_found = false;
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if let WorkerCmd::Tools {
+                command: tools_panel::ToolsCommand::Save(config),
+                ..
+            } = cmd
+            {
+                assert!(config.quick_messages.items.iter().any(|i| i.id == "srv_b"));
+                save_found = true;
+            }
+        }
+        assert!(save_found, "Save must be persisted with item B");
+
+        // Step 1c: List A arrives late lacking B (snapshot was initialized at epoch 0)
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: req_id_a,
+                mutation_epoch: 0,
+                items: vec![item_a.clone()],
+                version: 1,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        // Invariant: Stale List A MUST NOT overwrite state or cache
+        assert_eq!(
+            app.tools.config.quick_messages.items.len(),
+            2,
+            "Item B must NOT be wiped by stale List A"
+        );
+        assert!(
+            app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .any(|i| i.id == "srv_b"),
+            "Item B must persist in state"
+        );
+
+        // 2. List pending -> update B confirmed -> stale list returns old B content
+        let item_b_updated = crate::quick_message::QuickMessage {
+            id: "srv_b".into(),
+            shortcut: "/b".into(),
+            title: "B".into(),
+            text: "Updated Text B".into(),
+            media: Some("file://img.png".into()),
+            msg_type: 1,
+        };
+        app.event_tx
+            .send(GuiEvent::QuickMessageUpdated {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 502,
+                item: item_b_updated.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(app.quick_message_mutation_epoch, 2);
+        assert_eq!(
+            app.tools.config.quick_messages.expand("/b"),
+            Some("Updated Text B"),
+            "Updated content must be applied immediately"
+        );
+
+        // Stale list from epoch 1 arrives with old text B
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 9001,
+                mutation_epoch: 1,
+                items: vec![item_a.clone(), item_b.clone()],
+                version: 2,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.tools.config.quick_messages.expand("/b"),
+            Some("Updated Text B"),
+            "Stale list must NOT overwrite updated text"
+        );
+
+        // 3. List pending -> delete B confirmed -> stale list returns snapshot with B
+        assert!(app.request_quick_message_delete(&item_b));
+        let delete_req = *app
+            .quick_message_pending_deletes
+            .keys()
+            .next()
+            .expect("delete must be pending after dispatch");
+        assert!(
+            app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .any(|i| i.id == "srv_b"),
+            "Item B must stay in the confirmed cache before the ACK"
+        );
+        app.event_tx
+            .send(GuiEvent::QuickMessagesDeleted {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: delete_req,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(app.quick_message_mutation_epoch, 3);
+        assert!(
+            !app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .any(|i| i.id == "srv_b"),
+            "Deleted item B must be removed from state"
+        );
+
+        // Stale list from epoch 2 arrives containing srv_b
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 9002,
+                mutation_epoch: 2,
+                items: vec![item_a.clone(), item_b.clone()],
+                version: 3,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert!(
+            !app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .any(|i| i.id == "srv_b"),
+            "Stale list must NOT resurrect deleted item B"
+        );
+
+        // 4. Out-of-order list responses: List 11 arrives before List 10
+        let item_c = crate::quick_message::QuickMessage {
+            id: "srv_c".into(),
+            shortcut: "/c".into(),
+            title: "C".into(),
+            text: "Text C".into(),
+            media: None,
+            msg_type: 0,
+        };
+        // List 11 (req 2011, epoch 3) arrives first
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 2011,
+                mutation_epoch: 3,
+                items: vec![item_a.clone(), item_c.clone()],
+                version: 4,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(app.quick_message_latest_applied_list_id, 2011);
+        assert_eq!(app.tools.config.quick_messages.items.len(), 2);
+        assert!(app
+            .tools
+            .config
+            .quick_messages
+            .items
+            .iter()
+            .any(|i| i.id == "srv_c"));
+
+        // List 10 (req 2010, epoch 3) arrives later
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 2010,
+                mutation_epoch: 3,
+                items: vec![item_a.clone()],
+                version: 4,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.tools.config.quick_messages.items.len(),
+            2,
+            "Older list response must NOT roll back state"
+        );
+        assert!(
+            app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .any(|i| i.id == "srv_c"),
+            "Item C must remain in state"
+        );
+
+        // 5. Mutation success -> refresh capture đúng epoch sau mutation và được chấp nhận
+        let item_d = crate::quick_message::QuickMessage {
+            id: "srv_d".into(),
+            shortcut: "/d".into(),
+            title: "D".into(),
+            text: "Text D".into(),
+            media: None,
+            msg_type: 0,
+        };
+        app.event_tx
+            .send(GuiEvent::QuickMessageCreated {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 504,
+                item: item_d.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.quick_message_mutation_epoch, 4);
+
+        // A refresh with epoch 4 arrives
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 3001,
+                mutation_epoch: 4,
+                items: vec![item_a.clone(), item_c.clone(), item_d.clone()],
+                version: 5,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(app.quick_message_latest_applied_list_id, 3001);
+        assert_eq!(app.tools.config.quick_messages.items.len(), 3);
+
+        // 6. Create success -> refresh error: item still retained
+        let item_e = crate::quick_message::QuickMessage {
+            id: "srv_e".into(),
+            shortcut: "/e".into(),
+            title: "E".into(),
+            text: "Text E".into(),
+            media: Some("file://voice.ogg".into()),
+            msg_type: 2,
+        };
+        app.event_tx
+            .send(GuiEvent::QuickMessageCreated {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 505,
+                item: item_e.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert_eq!(app.quick_message_mutation_epoch, 5);
+
+        // Refresh fails with network status update
+        app.event_tx
+            .send(GuiEvent::StatusUpdate(
+                "Không thể tải tin nhắn nhanh: Timeout".into(),
+            ))
+            .unwrap();
+        app.check_events(&ctx);
+
+        let retrieved_e = app
+            .tools
+            .config
+            .quick_messages
+            .items
+            .iter()
+            .find(|i| i.id == "srv_e")
+            .expect("Item E must be retained despite refresh error");
+        assert_eq!(retrieved_e.media.as_deref(), Some("file://voice.ogg"));
+        assert_eq!(retrieved_e.msg_type, 2);
+
+        // 7. Mutation rejection: no false epoch advance, state unchanged
+        let current_epoch = app.quick_message_mutation_epoch;
+        let current_count = app.tools.config.quick_messages.items.len();
+        app.event_tx
+            .send(GuiEvent::QuickMessageCreateFailed {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 506,
+                error: "Invalid keyword".into(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.quick_message_mutation_epoch, current_epoch,
+            "Epoch must NOT advance on failed mutation"
+        );
+        assert_eq!(
+            app.tools.config.quick_messages.items.len(),
+            current_count,
+            "Items count must remain unchanged"
+        );
+
+        // 8. Duplicate mutation completion: applied only once, epoch bumped only once
+        app.event_tx
+            .send(GuiEvent::QuickMessageCreated {
+                owner: "owner_qm".into(),
+                runtime_id: 100,
+                request_id: 505, // same request_id as item_e
+                item: item_e.clone(),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.quick_message_mutation_epoch, 5,
+            "Duplicate mutation must NOT advance epoch again"
+        );
+        assert_eq!(
+            app.tools
+                .config
+                .quick_messages
+                .items
+                .iter()
+                .filter(|i| i.id == "srv_e")
+                .count(),
+            1,
+            "Duplicate mutation must NOT duplicate item in list"
+        );
+
+        // 9. Logout / account switch / runtime replacement
+        // Stale event from old runtime
+        app.event_tx
+            .send(GuiEvent::QuickMessagesLoaded {
+                owner: "owner_qm".into(),
+                runtime_id: 99, // old runtime
+                request_id: 9999,
+                mutation_epoch: 5,
+                items: vec![],
+                version: 0,
+            })
+            .unwrap();
+        app.check_events(&ctx);
+        assert!(
+            !app.tools.config.quick_messages.items.is_empty(),
+            "Old runtime event must be ignored"
+        );
+
+        // Lifecycle reset
+        app.reset_quick_message_lifecycle();
+        assert_eq!(app.quick_message_mutation_epoch, 0);
+        assert_eq!(app.quick_message_latest_applied_list_id, 0);
+        assert!(app.quick_message_in_flight_list_id.is_none());
+        assert!(!app.quick_message_refresh_pending);
+        assert!(app.quick_message_applied_mutations.is_empty());
+
+        // 10. Worker unavailable / receiver closed
+        worker::WORKER_TX.clear();
+        assert!(!app.trigger_quick_messages_fetch());
+        assert!(app.quick_message_in_flight_list_id.is_none());
+        assert!(!app.quick_message_refresh_pending);
+
+        // Bonus: ToolsResult::Loaded protection against stale SQLite load
+        app.quick_message_mutation_epoch = 1;
+        app.tools.config.quick_messages.items = vec![item_a.clone()];
+        app.event_tx
+            .send(GuiEvent::Tools {
+                owner: "owner_qm".into(),
+                result: Ok(tools_panel::ToolsResult::Loaded {
+                    config: crate::tools::Preferences::default(), // empty quick_messages
+                    tasks: vec![],
+                    paused: false,
+                    origin: None, // unstamped snapshots never hydrate Quick Messages
+                }),
+            })
+            .unwrap();
+        app.check_events(&ctx);
+
+        assert_eq!(
+            app.tools.config.quick_messages.items.len(),
+            1,
+            "Unstamped ToolsResult::Loaded must NOT wipe active quick_messages"
+        );
+        assert_eq!(app.tools.config.quick_messages.items[0].id, "srv_a");
+
+        worker::WORKER_TX.clear();
     }
 }

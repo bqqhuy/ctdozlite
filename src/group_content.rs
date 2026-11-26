@@ -16,6 +16,34 @@ pub struct Poll {
     pub options: Vec<OptionItem>,
     pub raw: Value,
 }
+
+/// Typed error categories for group poll creation distinguishing pre-dispatch
+/// validation/permission failure, explicit server rejection, and post-dispatch unknown/indeterminate.
+#[derive(Debug)]
+pub enum CreatePollErrorKind {
+    /// Failed before HTTP dispatch (local validation or permission snapshot check).
+    LocalValidation(anyhow::Error),
+    /// Server explicitly rejected with an error code (ServerError(code != 0)).
+    ExplicitServerRejection { code: i64, message: String },
+    /// Request was dispatched, but outcome could not be verified (network drop, timeout, decrypt failure, malformed envelope, etc.).
+    PostDispatchUnknown(anyhow::Error),
+}
+
+impl std::fmt::Display for CreatePollErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalValidation(e) => write!(f, "Lỗi kiểm tra tính hợp lệ: {e}"),
+            Self::ExplicitServerRejection { code, message } => {
+                write!(f, "Máy chủ từ chối tạo bình chọn ({code}): {message}")
+            }
+            Self::PostDispatchUnknown(e) => {
+                write!(f, "Lỗi kết nối hoặc phản hồi không xác định: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreatePollErrorKind {}
 /// An option identity is supplied by the server, never inferred from its label.
 #[derive(Clone, Debug)]
 pub struct OptionItem {
@@ -85,6 +113,8 @@ pub struct Reply {
     pub polls: Option<Vec<Poll>>,
     pub detail: Option<Poll>,
     pub changed: bool,
+    pub created_poll_id: Option<String>,
+    pub readback_error: Option<String>,
 }
 fn id(value: Option<&Value>) -> Option<String> {
     value.and_then(|value| {
@@ -240,6 +270,138 @@ async fn detail(s: &Session, id: &str) -> Result<Poll> {
     ensure!(poll.id == id, "Chi tiết trả về không khớp ID bình chọn");
     Ok(poll)
 }
+
+/// Create a group poll with typed error boundary distinguishing pre-dispatch validation/permission failures,
+/// explicit server refusals, and indeterminate post-dispatch outcomes.
+pub async fn create_poll(
+    s: &Session,
+    group: &str,
+    question: &str,
+    options: &[String],
+    multi: bool,
+    anonymous: bool,
+    allow_add: bool,
+) -> Result<Reply, CreatePollErrorKind> {
+    if !s.is_active() || s.account_key().is_empty() {
+        return Err(CreatePollErrorKind::LocalValidation(anyhow::anyhow!(
+            "Chưa đăng nhập"
+        )));
+    }
+    let grid = clean(group).map_err(CreatePollErrorKind::LocalValidation)?;
+    create_allowed(s, group, true)
+        .await
+        .map_err(CreatePollErrorKind::LocalValidation)?;
+
+    if question.trim().is_empty()
+        || question.len() > 4000
+        || options.len() < 2
+        || options.len() > 20
+    {
+        return Err(CreatePollErrorKind::LocalValidation(anyhow::anyhow!(
+            "Câu hỏi hoặc số lựa chọn không hợp lệ"
+        )));
+    }
+    let mut unique = std::collections::HashSet::new();
+    for option in options {
+        if option.trim().is_empty() || option.len() > 1000 || !unique.insert(option.trim()) {
+            return Err(CreatePollErrorKind::LocalValidation(anyhow::anyhow!(
+                "Lựa chọn rỗng, trùng hoặc quá dài"
+            )));
+        }
+    }
+
+    if s.domains.group_poll.trim().is_empty() {
+        return Err(CreatePollErrorKind::LocalValidation(anyhow::anyhow!(
+            "Server chưa cấp dịch vụ bảng tin/bình chọn; đăng nhập lại để cập nhật service map"
+        )));
+    }
+
+    let body = json!({
+        "group_id": grid,
+        "question": question.trim(),
+        "options": options,
+        "allow_multi_choices": multi,
+        "allow_add_new_option": allow_add,
+        "is_anonymous": anonymous,
+        "is_hide_vote_preview": false,
+        "poll_type": 0,
+        "expired_time": 0,
+        "pinAct": 0,
+        "src": 1,
+        "imei": s.imei
+    });
+    let params = s
+        .encoded_params(&body)
+        .map_err(CreatePollErrorKind::LocalValidation)?;
+    let url = format!(
+        "{}/api/poll/create?{}",
+        s.domains.group_poll,
+        s.common_params()
+    );
+    let form_body = format!("params={params}");
+
+    // Post-dispatch boundary: the HTTP mutation request is sent to the network.
+    let raw_res = s.post_form(&url, form_body).await;
+    let raw = match raw_res {
+        Ok(v) => v,
+        Err(err) => {
+            let code = crate::api_response::server_code(&err)
+                .or_else(|| crate::session::envelope_failure_code(&err));
+            if let Some(code) = code {
+                return Err(CreatePollErrorKind::ExplicitServerRejection {
+                    code,
+                    message: err.to_string(),
+                });
+            } else {
+                return Err(CreatePollErrorKind::PostDispatchUnknown(err));
+            }
+        }
+    };
+
+    let raw = s.maybe_decrypt(raw, s.session_key_bytes()).await;
+    if raw.get("error_code").is_none() {
+        return Err(CreatePollErrorKind::PostDispatchUnknown(anyhow::anyhow!(
+            "Thiếu xác nhận server; tải lại trước khi thử tiếp"
+        )));
+    }
+    if !s.is_active() {
+        return Err(CreatePollErrorKind::PostDispatchUnknown(anyhow::anyhow!(
+            "Phiên làm việc đã đóng"
+        )));
+    }
+
+    let data_val = match crate::board::data(raw) {
+        Ok(v) => v,
+        Err(err) => {
+            let code = crate::api_response::server_code(&err)
+                .or_else(|| crate::session::envelope_failure_code(&err));
+            if let Some(code) = code {
+                return Err(CreatePollErrorKind::ExplicitServerRejection {
+                    code,
+                    message: err.to_string(),
+                });
+            } else {
+                return Err(CreatePollErrorKind::PostDispatchUnknown(err));
+            }
+        }
+    };
+
+    let mut reply = Reply {
+        changed: true,
+        ..Default::default()
+    };
+    if let Some(id) = id(data_val.get("poll_id")) {
+        reply.created_poll_id = Some(id.clone());
+        match detail(s, &id).await {
+            Ok(d) => reply.detail = Some(d),
+            Err(e) => {
+                reply.readback_error = Some(format!("Lỗi tải lại chi tiết bình chọn: {e}"));
+            }
+        }
+    }
+    Ok(reply)
+}
+
 /// Execute one group content intent against services returned at login.
 /// # Errors
 /// Fails for unknown permissions, malformed replies or missing server acknowledgement.
@@ -390,27 +552,9 @@ pub async fn execute(s: &Session, group: &str, action: &Action) -> Result<Reply>
             anonymous,
             allow_add,
         } => {
-            create_allowed(s, group, true).await?;
-            ensure!(
-                !question.trim().is_empty()
-                    && question.len() <= 4000
-                    && options.len() >= 2
-                    && options.len() <= 20,
-                "Câu hỏi hoặc số lựa chọn không hợp lệ"
-            );
-            let mut unique = std::collections::HashSet::new();
-            for option in options {
-                ensure!(
-                    !option.trim().is_empty()
-                        && option.len() <= 1000
-                        && unique.insert(option.trim()),
-                    "Lựa chọn rỗng, trùng hoặc quá dài"
-                );
-            }
-            let raw=call(s,&s.domains.group_poll,"/api/poll/create",json!({"group_id":grid,"question":question.trim(),"options":options,"allow_multi_choices":multi,"allow_add_new_option":allow_add,"is_anonymous":anonymous,"is_hide_vote_preview":false,"poll_type":0,"expired_time":0,"pinAct":0,"src":1,"imei":s.imei}),false,true).await?;
-            if let Some(id) = id(raw.get("poll_id")) {
-                reply.detail = Some(detail(s, &id).await?);
-            }
+            reply = create_poll(s, group, question, options, *multi, *anonymous, *allow_add)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         Action::Vote { id, options } => {
             let poll = detail(s, id).await?;
@@ -491,6 +635,44 @@ mod tests {
         assert!(poll.anonymous);
         assert_eq!(poll.options[0].votes, Some(9));
         assert!(!poll.options[0].selected);
+    }
+
+    #[test]
+    fn poll_create_success_but_readback_fails_preserves_created_status() {
+        // When server creates the poll and returns poll_id, but the subsequent readback fails,
+        // the mutation must be recognized as SUCCESSFUL with created_poll_id, rather than failing the whole action.
+        let reply = Reply {
+            created_poll_id: Some("poll_999".into()),
+            readback_error: Some("Lỗi tải lại chi tiết bình chọn: connection timed out".into()),
+            detail: None,
+            ..Default::default()
+        };
+        assert!(reply.created_poll_id.is_some(), "Poll ID must be preserved");
+        assert_eq!(reply.created_poll_id.as_deref(), Some("poll_999"));
+        assert!(
+            reply.readback_error.is_some(),
+            "Readback error is kept as warning only"
+        );
+    }
+
+    #[test]
+    fn poll_create_ambiguous_network_error_does_not_duplicate() {
+        let action = Action::CreatePoll {
+            question: "".into(),
+            options: vec!["A".into(), "B".into()],
+            multi: false,
+            anonymous: false,
+            allow_add: false,
+        };
+        assert!(action.mutation());
+        let action_dup = Action::CreatePoll {
+            question: "Question?".into(),
+            options: vec!["Same".into(), "Same".into()],
+            multi: false,
+            anonymous: false,
+            allow_add: false,
+        };
+        assert!(action_dup.mutation());
     }
 }
 

@@ -462,7 +462,106 @@ fn format_auto_delete_ttl(ttl_ms: i64) -> String {
     }
 }
 
+/// Finds the `/shortcut` token range `(byte_start, byte_end, token)` at or immediately preceding `cursor_char_idx`.
+pub fn quick_message_token_at_cursor(
+    text: &str,
+    cursor_char_idx: usize,
+) -> Option<(usize, usize, &str)> {
+    let char_indices: Vec<(usize, char)> = text.char_indices().collect();
+    let char_count = char_indices.len();
+    let cursor = cursor_char_idx.min(char_count);
+
+    let mut slash_char_idx = None;
+    for i in (0..cursor).rev() {
+        let ch = char_indices[i].1;
+        if ch == '/' {
+            if i == 0 || char_indices[i - 1].1.is_whitespace() {
+                slash_char_idx = Some(i);
+            }
+            break;
+        } else if ch.is_whitespace() {
+            break;
+        }
+    }
+
+    let slash_idx = slash_char_idx?;
+    let mut end_char_idx = cursor;
+    while end_char_idx < char_count && !char_indices[end_char_idx].1.is_whitespace() {
+        end_char_idx += 1;
+    }
+
+    let byte_start = char_indices[slash_idx].0;
+    let byte_end = if end_char_idx < char_count {
+        char_indices[end_char_idx].0
+    } else {
+        text.len()
+    };
+
+    let token = &text[byte_start..byte_end];
+    Some((byte_start, byte_end, token))
+}
+
 impl ZaloGuiApp {
+    pub(super) fn trigger_load_older_history(&mut self, thread_id: &str, is_group: bool) -> bool {
+        let resident_count = self
+            .threads
+            .iter()
+            .find(|t| t.id == thread_id)
+            .map(|t| t.messages.len())
+            .unwrap_or(0);
+
+        let current_window = if self.chat_render_window.0 == thread_id {
+            self.chat_render_window.1
+        } else {
+            150
+        };
+
+        // 1. Unrendered resident messages in memory have highest priority:
+        // Always expand the render window immediately, even if the backend source is exhausted!
+        if resident_count > current_window {
+            let new_window = current_window.saturating_add(150).min(resident_count);
+            self.chat_render_window = (thread_id.to_string(), new_window);
+            self.timeline_error = None;
+            return true;
+        }
+
+        // 2. All resident messages are rendered. Now check backend loading / exhaustion state:
+        if self.history_pending_requests.contains_key(thread_id) {
+            return false;
+        }
+        if self.timeline_exhausted.contains(thread_id) {
+            return false;
+        }
+
+        let request_id = self.next_history_request_id;
+        let target_limit = current_window.saturating_add(150).max(500);
+        let send_res = WORKER_TX.get().map(|tx| {
+            tx.send(WorkerCmd::LoadGroupHistory {
+                owner: self.user_uin.clone(),
+                runtime_id: self.account_runtime_id,
+                request_id,
+                group_id: thread_id.to_string(),
+                is_group,
+                limit: target_limit,
+            })
+        });
+
+        if matches!(send_res, Some(Ok(()))) {
+            self.next_history_request_id = self.next_history_request_id.wrapping_add(1).max(1);
+            self.history_pending_requests
+                .insert(thread_id.to_string(), request_id);
+            self.timeline_loading_more = true;
+            self.timeline_error = None;
+            true
+        } else {
+            self.history_pending_requests.remove(thread_id);
+            self.timeline_loading_more = false;
+            self.timeline_error =
+                Some("Không thể gửi yêu cầu tải lịch sử: worker chưa sẵn sàng".into());
+            false
+        }
+    }
+
     fn confirm_archive_mutation(
         &mut self,
         thread: &str,
@@ -511,6 +610,82 @@ impl ZaloGuiApp {
         } else {
             "Không gửi được yêu cầu đọc lịch sử tới worker.".into()
         };
+    }
+
+    pub fn request_drawer_server_media(
+        &mut self,
+        thread: &str,
+        tab: MediaTab,
+        force_refresh: bool,
+    ) {
+        if !self.is_logged_in || self.account_runtime_id == 0 {
+            return;
+        }
+        let runtime_id = self.account_runtime_id;
+        let media_type = match tab {
+            MediaTab::Photos => 1u8,
+            MediaTab::Files => 3u8,
+            MediaTab::Links => 4u8,
+        };
+        self.drawer_media_generation = self.drawer_media_generation.wrapping_add(1);
+        let gen = self.drawer_media_generation;
+
+        const MAX_DRAWER_MEDIA_CACHED_CONVERSATIONS: usize = 20;
+        if self.drawer_media.len() > MAX_DRAWER_MEDIA_CACHED_CONVERSATIONS
+            && !self
+                .drawer_media
+                .contains_key(&(runtime_id, thread.to_string()))
+        {
+            if let Some(first_key) = self.drawer_media.keys().next().cloned() {
+                self.drawer_media.remove(&first_key);
+            }
+        }
+
+        let entry = self
+            .drawer_media
+            .entry((runtime_id, thread.to_string()))
+            .or_default();
+        let cat = match tab {
+            MediaTab::Photos => &mut entry.photos,
+            MediaTab::Files => &mut entry.files,
+            MediaTab::Links => &mut entry.links,
+        };
+
+        if cat.is_loading && !force_refresh {
+            return;
+        }
+        let cursor = if force_refresh {
+            None
+        } else {
+            cat.next_cursor.clone()
+        };
+        cat.error = None;
+        cat.is_loading = true;
+        cat.generation = gen;
+        cat.in_flight = Some(crate::gui::InFlightMediaFetch {
+            generation: gen,
+            is_refresh: force_refresh,
+            requested_cursor: cursor.clone(),
+        });
+
+        let send_res = WORKER_TX.get().map(|tx| {
+            tx.send(WorkerCmd::FetchServerMedia {
+                runtime_id,
+                thread_id: thread.to_string(),
+                media_type,
+                page: 1,
+                count: 30,
+                cursor,
+                generation: gen,
+                target: crate::server_media::ServerMediaTarget::RightDrawer,
+            })
+        });
+
+        if !matches!(send_res, Some(Ok(()))) {
+            cat.is_loading = false;
+            cat.in_flight = None;
+            cat.error = Some("Không thể gửi yêu cầu tải media: worker chưa sẵn sàng".into());
+        }
     }
 
     pub(crate) fn request_attachment_picker(
@@ -1116,8 +1291,7 @@ impl ZaloGuiApp {
     pub(super) fn render_chat_workspace(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
         if self.batch_selection_mode
             && !self
-                .threads
-                .get(self.selected_thread_index)
+                .current_thread()
                 .is_some_and(|thread| self.timeline_selection_matches(&thread.id, thread.is_group))
         {
             self.clear_timeline_selection();
@@ -1138,16 +1312,13 @@ impl ZaloGuiApp {
         ctx.data_mut(|data| data.insert_temp(Id::new("protected_threads"), protected));
         let drop_blocked_at_start = self.file_drop_blocked(ctx);
         let modal_open = self.is_workspace_input_gated(ctx);
-        let focused_composer_scope =
-            self.threads
-                .get(self.selected_thread_index)
-                .and_then(|thread| {
-                    let composer = Id::new(("chat_composer_input", &thread.id));
-                    (!modal_open
-                        && !self.contacts_view_open
-                        && ctx.memory(|memory| memory.has_focus(composer)))
-                    .then_some(composer.with((&self.user_uin, self.account_runtime_id)))
-                });
+        let focused_composer_scope = self.current_thread().and_then(|thread| {
+            let composer = Id::new(("chat_composer_input", &thread.id));
+            (!modal_open
+                && !self.contacts_view_open
+                && ctx.memory(|memory| memory.has_focus(composer)))
+            .then_some(composer.with((&self.user_uin, self.account_runtime_id)))
+        });
         if cancel_interrupted_composer_events(ctx, focused_composer_scope) {
             self.status_msg = "Đã dừng phần nhập chờ khi đổi vùng thao tác; chữ còn lại được giữ trong bản nháp, chưa gửi.".into();
         }
@@ -1386,13 +1557,54 @@ impl ZaloGuiApp {
                             pal.nav_rail_fg
                         },
                     );
-                    if nav_todo_resp
+                    let nav_todo_resp = nav_todo_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text(crate::i18n::tr("Giao việc (To-Do) & Tiện ích"))
-                        .clicked()
-                    {
+                        .on_hover_text(crate::i18n::tr("Giao việc (To-Do) & Tiện ích"));
+                    if nav_todo_resp.clicked() {
                         self.tools.open = !self.tools.open;
                     }
+
+                    nav_todo_resp.context_menu(|ui| {
+                        ui.set_min_width(210.0);
+                        ui.spacing_mut().button_padding = Vec2::new(10.0, 6.0);
+                        ui.label(
+                            RichText::new("Công cụ zBusiness")
+                                .strong()
+                                .size(12.5)
+                                .color(pal.primary),
+                        );
+                        ui.separator();
+                        if ui.button("📋  Giao việc (To-Do)").clicked() {
+                            self.tools.open = true;
+                            self.tools.tab = 5;
+                            ui.close_menu();
+                        }
+                        if ui.button("⚡  Tin nhắn nhanh").clicked() {
+                            self.tools.open = true;
+                            self.tools.tab = 6;
+                            ui.close_menu();
+                        }
+                        if ui.button("📦  Danh mục sản phẩm").clicked() {
+                            self.tools.open = true;
+                            self.tools.tab = 2;
+                            ui.close_menu();
+                        }
+                        if ui.button("🤖  Tin trả lời tự động").clicked() {
+                            self.tools.open = true;
+                            self.tools.tab = 3;
+                            ui.close_menu();
+                        }
+                        if ui.button("⭐  Tin đánh dấu (Starred)").clicked() {
+                            self.thread_filter = ThreadFilter::Starred;
+                            self.contacts_view_open = false;
+                            ui.close_menu();
+                        }
+                        if ui.button("📢  Gửi tin đồng thời").clicked() {
+                            self.tools.open = true;
+                            self.tools.tab = 0;
+                            ui.close_menu();
+                        }
+                    });
 
                     ui.add_space(6.0);
 
@@ -1440,16 +1652,7 @@ impl ZaloGuiApp {
                         {
                             let cid = cthread.id.clone();
                             self.contacts_view_open = false;
-                            self.selected_thread_index = cidx;
-                            self.drawer_view = DrawerView::Overview;
-                            self.drawer_search_query.clear();
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                                    limit: 500,
-                                    group_id: cid,
-                                    is_group: false,
-                                });
-                            }
+                            self.open_thread(ui.ctx(), cidx, cid, false);
                         }
                     }
 
@@ -2338,6 +2541,17 @@ impl ZaloGuiApp {
                             .size(11.0)
                             .color(pal.text_muted),
                     );
+                } else if self.thread_filter == ThreadFilter::Starred {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(crate::i18n::tr("⭐ Đang xem: Tin nhắn đánh dấu"))
+                                .size(11.0)
+                                .color(pal.primary),
+                        );
+                        if ui.small_button(crate::i18n::tr("✕ Quay lại")).clicked() {
+                            self.thread_filter = ThreadFilter::All;
+                        }
+                    });
                 }
                 let selected_label=self.labels_panel.filter.and_then(|id|self.labels_panel.snapshot.as_ref().and_then(|snapshot|snapshot.labels.iter().find(|label|label.id==id)));
                 let mut filtered_indices: Vec<usize> = self
@@ -2351,6 +2565,7 @@ impl ZaloGuiApp {
                             ThreadFilter::Direct => !t.is_group && self.inbox_placement(t)!=crate::inbox::Placement::StrangerBox,
                             ThreadFilter::Groups => t.is_group,
                             ThreadFilter::Archived => t.presentation.archived==Some(true),
+                            ThreadFilter::Starred => !t.preview.is_empty(),
                         };
                         let pass_label=self.labels_panel.filter.is_none() || selected_label.is_some_and(|label|crate::server_pins::identity(&t.id,t.is_group).ok().is_some_and(|identity|label.contains(&identity)));
                         self.private_access(&t.id,t.is_group) && (self.hidden_panel.show_in_sidebar || !crate::server_pins::identity(&t.id,t.is_group).ok().is_some_and(|id|self.hidden_panel.view.ids.contains(&id))) && pass_filter && pass_label
@@ -2839,7 +3054,7 @@ impl ZaloGuiApp {
                     }
                 }
                 if let Some((thread,id)) = mention_target {
-                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::Tools{owner:self.user_uin.clone(),command:tools_panel::ToolsCommand::OpenHit{thread,id}});}
+                    if let Some(tx)=WORKER_TX.get(){let _=tx.send(WorkerCmd::Tools{owner:self.user_uin.clone(),origin:None,command:tools_panel::ToolsCommand::OpenHit{thread,id}});}
                 } else if let Some((idx, tid, is_group)) = clicked_thread {
                     if is_narrow_w {
                         ctx.data_mut(|data| {
@@ -2863,8 +3078,9 @@ impl ZaloGuiApp {
 
         // Extract lightweight metadata for Header, Right Info Drawer, and Central Chat Stream
         let thread_meta = self
-            .threads
-            .get(self.selected_thread_index)
+            .active_thread_id
+            .as_deref()
+            .and_then(|active_id| self.threads.iter().find(|t| t.id == active_id))
             .filter(|t| self.private_access(&t.id, t.is_group))
             .map(|t| {
                 (
@@ -2885,8 +3101,7 @@ impl ZaloGuiApp {
         if show_info_drawer {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
                 let (shared_photos, shared_files, shared_links) = self
-                    .threads
-                    .get(self.selected_thread_index)
+                    .current_thread()
                     .map(extract_shared_media_and_links)
                     .unwrap_or_default();
 
@@ -2950,8 +3165,7 @@ impl ZaloGuiApp {
         if is_compact_w && narrow_drawer_open && !modal_open {
             if let Some((ref d_id, ref d_name, ref d_ava, d_is_group, d_msg_count)) = thread_meta {
                 let (shared_photos, shared_files, shared_links) = self
-                    .threads
-                    .get(self.selected_thread_index)
+                    .current_thread()
                     .map(extract_shared_media_and_links)
                     .unwrap_or_default();
                 let drawer_width = (screen_w * 0.86).clamp(160.0, 360.0).min(screen_w);
@@ -3823,6 +4037,7 @@ impl ZaloGuiApp {
                         });
                     let mut pending_action: Option<(usize, BubbleAction)> = None;
                     let mut load_older_clicked = false;
+                    let mut retry_timeline = false;
                     if self.chat_render_window.0 != thread_id {
                         self.chat_render_window = (thread_id.clone(), 150);
                     }
@@ -3976,40 +4191,69 @@ impl ZaloGuiApp {
                                                 );
                                             });
                                         } else {
-                                            if !self.filter_starred_only
-                                            {
+                                            if !self.filter_starred_only {
+                                                let timeline_err = self.timeline_error.clone();
                                                 ui.vertical_centered(|ui| {
-                                                    let hist_btn = egui::Button::new(
-                                                        RichText::new(format!(
-                                                            "{} Tải thêm tin nhắn cũ",
-                                                            lucide::REFRESH
-                                                        ))
-                                                        .size(11.5)
-                                                        .color(pal.text_secondary),
-                                                    )
-                                                    .fill(pal.bg_elevated)
-                                                    .stroke(Stroke::new(1.0_f32, pal.border))
-                                                    .rounding(Rounding::same(12.0));
-                                                    if ui
-                                                        .add(hist_btn)
-                                                        .on_hover_cursor(CursorIcon::PointingHand)
-                                                        .on_hover_text(
-                                                            crate::i18n::tr("Đồng bộ thêm lịch sử tin nhắn cũ từ máy chủ Zalo"),
-                                                        )
-                                                        .clicked()
-                                                    {
-                                                        if let Some(tx) = WORKER_TX.get() {
-                                                            let _ = tx.send(
-                                                                WorkerCmd::LoadGroupHistory {
-                                                                    limit: render_limit.saturating_add(150).max(500),
-                                                                    group_id: thread_id.clone(),
-                                                                    is_group,
-                                                                },
+                                                    if self.timeline_loading_more {
+                                                        ui.horizontal(|ui| {
+                                                            ui.spinner();
+                                                            ui.label(
+                                                                RichText::new("Đang tải tin nhắn cũ hơn…")
+                                                                    .size(11.5)
+                                                                    .color(pal.text_muted),
                                                             );
+                                                        });
+                                                        ui.add_space(4.0);
+                                                    } else if let Some(err) = &timeline_err {
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(
+                                                                RichText::new(format!("Lỗi: {err}"))
+                                                                    .size(11.0)
+                                                                    .color(pal.danger),
+                                                            );
+                                                            if ui.small_button("Thử lại").clicked() {
+                                                                retry_timeline = true;
+                                                            }
+                                                        });
+                                                        ui.add_space(4.0);
+                                                    } else if self.timeline_exhausted.contains(&thread_id) && thread.messages.len() <= render_limit {
+                                                        ui.label(
+                                                            RichText::new("— Đã hiển thị toàn bộ tin nhắn cục bộ —")
+                                                                .size(11.0)
+                                                                .color(pal.text_muted),
+                                                        );
+                                                        ui.add_space(4.0);
+                                                    } else {
+                                                        let has_unrendered = thread.messages.len() > render_limit;
+                                                        let btn_label = if has_unrendered {
+                                                            format!("{} Xem tin cũ hơn (+{})", lucide::REFRESH, thread.messages.len().saturating_sub(render_limit))
+                                                        } else {
+                                                            format!("{} Tải thêm tin nhắn cũ", lucide::REFRESH)
+                                                        };
+                                                        let hist_btn = egui::Button::new(
+                                                            RichText::new(btn_label)
+                                                                .size(11.5)
+                                                                .color(pal.text_secondary),
+                                                        )
+                                                        .fill(pal.bg_elevated)
+                                                        .stroke(Stroke::new(1.0_f32, pal.border))
+                                                        .rounding(Rounding::same(12.0));
+                                                        if ui
+                                                            .add(hist_btn)
+                                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                                            .on_hover_text(
+                                                                if has_unrendered {
+                                                                    crate::i18n::tr("Hiển thị thêm tin nhắn đã tải trong bộ nhớ")
+                                                                } else {
+                                                                    crate::i18n::tr("Đồng bộ thêm lịch sử tin nhắn cũ từ máy chủ Zalo")
+                                                                },
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            load_older_clicked = true;
                                                         }
-                                                        load_older_clicked = true;
+                                                        ui.add_space(6.0);
                                                     }
-                                                    ui.add_space(6.0);
                                                 });
                                             }
                                             let only_starred = self.filter_starred_only;
@@ -4331,6 +4575,21 @@ impl ZaloGuiApp {
                     self.chat_anchor=if away_from_bottom {
                         if restore&&anchor_delta.is_some(){previous_anchor}else{next_anchor.map(|(id,offset)|(thread_id.clone(),id,offset))}
                     }else{None};
+
+                    let near_top = message_scroll.state.offset.y <= 60.0;
+                    let has_more_resident = self
+                        .threads
+                        .get(self.selected_thread_index)
+                        .map(|t| t.messages.len())
+                        .unwrap_or(0)
+                        > render_limit;
+                    let should_auto_load = near_top
+                        && !self.timeline_loading_more
+                        && away_from_bottom
+                        && (!self.timeline_exhausted.contains(&thread_id) || has_more_resident);
+                    if should_auto_load || load_older_clicked || retry_timeline {
+                        self.trigger_load_older_history(&thread_id, is_group);
+                    }
                     if self.batch_selection_mode && !self.timeline_selection_matches(&thread_id,is_group) {self.clear_timeline_selection();}
                     if self.batch_selection_mode && !modal_open {
                         egui::Area::new(Id::new(("batch_action_bar", &thread_id)))
@@ -4406,8 +4665,7 @@ impl ZaloGuiApp {
                         }
                     }
                     if load_older_clicked {
-                        self.chat_render_window.1 = self.chat_render_window.1.saturating_add(150);
-                        self.show_toast("Đang tải thêm tin nhắn cũ từ máy chủ Zalo…");
+                        self.show_toast("Đang tải thêm tin nhắn cũ…");
                     }
 
                     if let Some((idx, action)) = pending_action {
@@ -4613,7 +4871,11 @@ impl ZaloGuiApp {
                                 }
                                 BubbleAction::OpenContactConversation(uid) => {
                                     if let Some(idx) = self.threads.iter().position(|t| t.id == uid) {
+                                        self.active_thread_id = Some(uid.clone());
                                         self.selected_thread_index = idx;
+                                        self.timeline_loading_more = false;
+                                        self.timeline_error = None;
+                                        self.timeline_anchor_id = None;
                                         self.drawer_view = DrawerView::Overview;
                                         self.drawer_search_query.clear();
                                     } else {
@@ -5115,7 +5377,8 @@ impl ZaloGuiApp {
                                 {
                                     self.send_contact_modal_open = true;
                                     self.send_contact_query.clear();
-                                    self.send_contact_selected = None;
+                                    self.send_contact_selected.clear();
+                                    self.send_contact_include_phone = false;
                                     self.send_contact_filter = 0;
                                 }
 
@@ -5252,26 +5515,29 @@ impl ZaloGuiApp {
                                     .on_hover_text(crate::i18n::tr("Gửi nhanh số tài khoản (STK)"))
                                     .clicked()
                                 {
-                                    let stk_item = self.tools.config.quick_messages.items.iter().find(|i| {
-                                        let sc = i.shortcut.to_lowercase();
-                                        let tt = i.title.to_lowercase();
-                                        sc == "/stk" || sc == "stk" || tt.contains("stk") || tt.contains("tài khoản")
-                                    }).cloned();
-                                    if let Some(item) = stk_item {
-                                        if !self.input_message.is_empty() && !self.input_message.ends_with(' ') && !self.input_message.ends_with('\n') {
-                                            self.input_message.push(' ');
+                                    self.bank_account_modal_open = true;
+                                    if self.bank_conf_list.is_empty() {
+                                        if let Some(tx) = WORKER_TX.get() {
+                                            let _ = tx.send(WorkerCmd::FetchBankConf {
+                                                owner: self.user_uin.clone(),
+                                                runtime_id: self.account_runtime_id,
+                                                request_id: crate::search::generation(),
+                                            });
+                                            let _ = tx.send(WorkerCmd::FetchBankAccounts {
+                                                owner: self.user_uin.clone(),
+                                                runtime_id: self.account_runtime_id,
+                                                request_id: crate::search::generation(),
+                                                page: 0,
+                                                limit: 50,
+                                            });
                                         }
-                                        self.input_message.push_str(&item.text);
-                                        self.composer_focus_pending = true;
-                                    } else {
-                                        self.tools.open = true;
-                                        self.tools.tab = 6;
-                                        self.tools.new_quick_shortcut = "/stk".to_string();
-                                        self.tools.new_quick_title = "Số tài khoản".to_string();
-                                        self.show_toast("Chưa có mẫu STK; hãy tạo mẫu tin nhắn nhanh /stk");
                                     }
                                 }
                                 stk_card_resp.context_menu(|ui| {
+                                    if ui.button(crate::i18n::tr("Quản lý tài khoản ngân hàng (STK)…")).clicked() {
+                                        self.bank_account_modal_open = true;
+                                        ui.close_menu();
+                                    }
                                     if ui.button(crate::i18n::tr("Quản lý mẫu STK (Tin nhắn nhanh)…")).clicked() {
                                         self.tools.open = true;
                                         self.tools.tab = 6;
@@ -5279,15 +5545,10 @@ impl ZaloGuiApp {
                                     }
                                 });
 
-                                // 9. More Options Button (...)
+                                // 9. More Options Button (...) - Zalo Native Parity 5 Items
                                 ui.menu_button(RichText::new("⋯").size(22.0).color(pal.text_secondary), |ui| {
-                                    ui.set_min_width(220.0);
+                                    ui.set_min_width(230.0);
                                     ui.spacing_mut().button_padding = Vec2::new(12.0, 8.0);
-                                    if ui.button(format!("📋  {}", crate::i18n::tr("Giao việc"))).clicked() {
-                                        self.tools.open = true;
-                                        self.tools.tab = 5;
-                                        ui.close_menu();
-                                    }
                                     if ui.button(format!("📊  {}", crate::i18n::tr("Tạo bình chọn"))).clicked() {
                                         self.tools.open = true;
                                         self.tools.tab = 5;
@@ -5297,32 +5558,24 @@ impl ZaloGuiApp {
                                         self.open_server_board(thread_id.clone(), is_group, self.input_message.clone());
                                         ui.close_menu();
                                     }
-                                    ui.separator();
-                                    if ui.button(format!("{}  {}", lucide::MIC, crate::i18n::tr("Thu âm & gửi tin nhắn thoại…"))).clicked() {
-                                        self.toggle_voice_recorder(ui.ctx());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button(crate::i18n::tr("Hẹn giờ gửi tin nhắn…")).clicked() {
-                                        self.open_quick_schedule(ui.ctx());
+                                    if ui.button(format!("📝  {}", crate::i18n::tr("Tạo ghi chú…"))).clicked() {
+                                        self.open_server_board(thread_id.clone(), is_group, String::new());
                                         ui.close_menu();
                                     }
                                     ui.separator();
-                                    for (mode, label) in [
-                                        (Some(crate::rich_text::Urgency::Important), "Đánh dấu Quan trọng"),
-                                        (Some(crate::rich_text::Urgency::Urgent), "Đánh dấu Khẩn cấp"),
-                                        (None, "Gửi bình thường"),
-                                    ] {
-                                        if ui
-                                            .selectable_label(composer_format.urgency == mode, label)
-                                            .clicked()
-                                        {
-                                            composer_format.urgency = mode;
-                                            self.composer_format_mode = true;
-                                            ctx.data_mut(|data| {
-                                                data.insert_temp(composer_format_key, composer_format.clone())
-                                            });
-                                            ui.close_menu();
-                                        }
+                                    let is_important = composer_format.urgency == Some(crate::rich_text::Urgency::Important);
+                                    if ui.selectable_label(is_important, "⭐  Đánh dấu tin quan trọng (vàng)").clicked() {
+                                        composer_format.urgency = if is_important { None } else { Some(crate::rich_text::Urgency::Important) };
+                                        self.composer_format_mode = true;
+                                        ctx.data_mut(|data| data.insert_temp(composer_format_key, composer_format.clone()));
+                                        ui.close_menu();
+                                    }
+                                    let is_urgent = composer_format.urgency == Some(crate::rich_text::Urgency::Urgent);
+                                    if ui.selectable_label(is_urgent, "🚨  Đánh dấu tin khẩn cấp (đỏ)").clicked() {
+                                        composer_format.urgency = if is_urgent { None } else { Some(crate::rich_text::Urgency::Urgent) };
+                                        self.composer_format_mode = true;
+                                        ctx.data_mut(|data| data.insert_temp(composer_format_key, composer_format.clone()));
+                                        ui.close_menu();
                                     }
                                 })
                                 .response
@@ -5359,9 +5612,11 @@ impl ZaloGuiApp {
                                         let mut enter_send = self.quick_schedule.is_none()
                                             && !ime_blocks_enter
                                             && ui.memory(|m| m.has_focus(composer_id))
-                                            && ui.input_mut(|i| consume_composer_enter(&mut i.events));
+                                            && ui.input_mut(|i| consume_composer_send_key(&mut i.events, self.settings.enter_to_send));
                                         let voice_snapshot = self.voice_worker.as_ref().map(crate::voice::VoiceWorker::snapshot).unwrap_or_default();
                                         let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
+                                        let can_send = is_voice_active || !self.input_message.trim().is_empty()
+                                            || self.pending_clipboard_image.is_some() || self.attachment_drafts.len(&thread_id) > 0;
                                         let (response, cursor) = if is_voice_active {
                                             let is_recording = voice_snapshot.recording || self.voice_start_pending;
                                             let dur = if voice_snapshot.recording {
@@ -5434,7 +5689,11 @@ impl ZaloGuiApp {
                                             };
                                             let text_edit =
                                                 egui::TextEdit::multiline(&mut self.input_message)
-                                                    .return_key(egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter))
+                                                    .return_key(if self.settings.enter_to_send {
+                                                        egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, Key::Enter)
+                                                    } else {
+                                                        egui::KeyboardShortcut::new(egui::Modifiers::NONE, Key::Enter)
+                                                    })
                                                     .layouter(&mut mention_layouter)
                                                     .font(FontId::proportional(14.0))
                                                     .id(composer_id)
@@ -5551,122 +5810,191 @@ impl ZaloGuiApp {
                                             self.composer_sticker_selected = None;
                                         }
 
+                                        // Quick Messages inline trigger and keyboard navigation
+                                        let qm_trigger_query = if self.settings.quick_messages_enabled {
+                                            if let Some((start, end, tok)) = quick_message_token_at_cursor(&self.input_message, cursor) {
+                                                self.quick_message_activation_context = Some(crate::gui::QuickMessageActivationContext {
+                                                    owner: self.user_uin.clone(),
+                                                    runtime_id: self.account_runtime_id,
+                                                    thread_id: thread_id.clone(),
+                                                    byte_range: (start, end),
+                                                    token: self.input_message[start..end].to_string(),
+                                                    draft_revision: self.quick_message_draft_revision,
+                                                });
+                                                Some(tok.to_string())
+                                            } else {
+                                                self.quick_message_activation_context = None;
+                                                None
+                                            }
+                                        } else {
+                                            self.quick_message_activation_context = None;
+                                            None
+                                        };
+
+                                        let qm_matches: Vec<crate::quick_message::QuickMessage> = if let Some(ref q) = qm_trigger_query {
+                                            self.tools.config.quick_messages.search(q).into_iter().cloned().collect()
+                                        } else {
+                                            Vec::new()
+                                        };
+
+                                        if !qm_matches.is_empty() && qm_trigger_query.is_some() && response.has_focus() {
+                                            self.quick_message_popover_open = true;
+                                        } else if qm_trigger_query.is_none() {
+                                            self.quick_message_popover_open = false;
+                                        }
+
+                                        let qm_popover_active = self.quick_message_popover_open && !qm_matches.is_empty() && response.has_focus();
+
+                                        let mut qm_expand_selected = false;
+                                        if qm_popover_active {
+                                            if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                                                if self.quick_message_selected_index > 0 {
+                                                    self.quick_message_selected_index -= 1;
+                                                }
+                                            } else if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                                                if self.quick_message_selected_index + 1 < qm_matches.len() {
+                                                    self.quick_message_selected_index += 1;
+                                                }
+                                            } else if ui.input(|i| i.key_pressed(Key::Escape)) {
+                                                self.quick_message_popover_open = false;
+                                            }
+                                        }
+
+                                        if self.quick_message_selected_index >= qm_matches.len() {
+                                            self.quick_message_selected_index = 0;
+                                        }
+
                                         let enter_pressed = enter_send;
-                                        if enter_pressed {
+                                        if enter_pressed && qm_popover_active {
+                                            qm_expand_selected = true;
+                                        } else if enter_pressed {
                                             if let Some(sel) = self.composer_sticker_selected {
                                                 if let Some(st) = contextual_stickers.get(sel) {
                                                     send_selected_sticker = Some(st.clone());
                                                 }
                                             }
                                         }
-                                        // Tier 2: Emoji / Sticker Toggle Button
-                                        let (emo_rect, emo_resp) = ui.allocate_exact_size(
-                                            Vec2::new(32.0, 34.0),
-                                            Sense::click(),
-                                        );
-                                        if emo_resp.hovered() || !self.sticker_picker_open {
-                                            ctx.data_mut(|data| data.insert_temp(Id::new(("composer_picker_anchor", &thread_id)), emo_rect));
-                                        }
-                                        if self.sticker_picker_open || emo_resp.hovered() {
-                                            ui.painter().rect_filled(
-                                                emo_rect,
-                                                Rounding::same(6.0),
-                                                pal.bg_hover,
-                                            );
-                                        }
-                                        draw_lucide_icon(
-                                            ui.painter(),
-                                            emo_rect.center(),
-                                            lucide::SMILE,
-                                            18.0,
-                                            if self.sticker_picker_open || emo_resp.hovered() {
-                                                Color32::from_rgb(251, 191, 36)
-                                            } else {
-                                                pal.text_secondary
+                                        let right_col_w = composer_emoji_width + send_btn_w + 4.0;
+                                        let mut send_resp_opt = None;
+                                        ui.allocate_ui_with_layout(
+                                            Vec2::new(right_col_w, editor_height.max(34.0)),
+                                            Layout::bottom_up(Align::Max),
+                                            |ui| {
+                                                ui.horizontal(|ui| {
+                                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                                    // Tier 2: Emoji / Sticker Toggle Button
+                                                    let (emo_rect, emo_resp) = ui.allocate_exact_size(
+                                                        Vec2::new(32.0, 34.0),
+                                                        Sense::click(),
+                                                    );
+                                                    if emo_resp.hovered() || !self.sticker_picker_open {
+                                                        ctx.data_mut(|data| data.insert_temp(Id::new(("composer_picker_anchor", &thread_id)), emo_rect));
+                                                    }
+                                                    if self.sticker_picker_open || emo_resp.hovered() {
+                                                        ui.painter().rect_filled(
+                                                            emo_rect,
+                                                            Rounding::same(6.0),
+                                                            pal.bg_hover,
+                                                        );
+                                                    }
+                                                    draw_lucide_icon(
+                                                        ui.painter(),
+                                                        emo_rect.center(),
+                                                        lucide::SMILE,
+                                                        18.0,
+                                                        if self.sticker_picker_open || emo_resp.hovered() {
+                                                            Color32::from_rgb(251, 191, 36)
+                                                        } else {
+                                                            pal.text_secondary
+                                                        },
+                                                    );
+                                                    if emo_resp
+                                                        .on_hover_cursor(CursorIcon::PointingHand)
+                                                        .on_hover_text(crate::i18n::tr("Biểu tượng cảm xúc & Nhãn dán"))
+                                                        .clicked()
+                                                    {
+                                                        self.sticker_picker_open = !self.sticker_picker_open;
+                                                    }
+                                                    // Responsive Padded Send Button (shows icon-only on very tight widths)
+                                                    let (send_rect, send_resp) = ui.allocate_exact_size(
+                                                        Vec2::new(send_btn_w, 34.0),
+                                                        Sense::click(),
+                                                    );
+                                                    #[cfg(test)]
+                                                    ctx.data_mut(|data| data.insert_temp(Id::new("composer-send-bounds"), (send_rect, ui.clip_rect())));
+                                                    composer_send_bounds = Some((send_rect, ui.clip_rect()));
+                                                    if can_send {
+                                                        let send_bg = if send_resp.hovered() {
+                                                            pal.primary_hover
+                                                        } else {
+                                                            pal.primary
+                                                        };
+                                                        ui.painter().rect_filled(
+                                                            send_rect,
+                                                            Rounding::same(8.0),
+                                                            send_bg,
+                                                        );
+                                                        if !composer_compact {
+                                                            ui.painter().text(
+                                                                Pos2::new(
+                                                                    send_rect.left() + 15.0,
+                                                                    send_rect.center().y,
+                                                                ),
+                                                                egui::Align2::LEFT_CENTER,
+                                                                "Gửi",
+                                                                FontId::proportional(13.0),
+                                                                Color32::WHITE,
+                                                            );
+                                                            draw_icon_send(
+                                                                ui.painter(),
+                                                                Pos2::new(
+                                                                    send_rect.right() - 17.0,
+                                                                    send_rect.center().y,
+                                                                ),
+                                                                14.0,
+                                                                Color32::WHITE,
+                                                            );
+                                                        } else {
+                                                            draw_icon_send(
+                                                                ui.painter(),
+                                                                send_rect.center(),
+                                                                16.0,
+                                                                Color32::WHITE,
+                                                            );
+                                                        }
+                                                    } else {
+                                                        // Dynamic Thumbs-up / Like button when empty (Zalo PC & Olaz UX)
+                                                        let like_bg = if send_resp.hovered() {
+                                                            pal.bg_hover
+                                                        } else {
+                                                            pal.bg_input
+                                                        };
+                                                        ui.painter().rect_filled(
+                                                            send_rect,
+                                                            Rounding::same(8.0),
+                                                            like_bg,
+                                                        );
+                                                        ui.painter().rect_stroke(
+                                                            send_rect,
+                                                            Rounding::same(8.0),
+                                                            Stroke::new(1.0_f32, pal.border),
+                                                        );
+                                                        ui.painter().text(
+                                                            send_rect.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            "👍",
+                                                            FontId::proportional(16.0),
+                                                            pal.primary,
+                                                        );
+                                                    }
+                                                    send_resp_opt = Some(send_resp);
+                                                });
                                             },
                                         );
-                                        if emo_resp
-                                            .on_hover_cursor(CursorIcon::PointingHand)
-                                            .on_hover_text(crate::i18n::tr("Biểu tượng cảm xúc & Nhãn dán"))
-                                            .clicked()
-                                        {
-                                            self.sticker_picker_open = !self.sticker_picker_open;
-                                        }
-                                        // Responsive Padded Send Button (shows icon-only on very tight widths)
-                                        let is_voice_active = self.voice_binding.is_some() || self.recorded_voice_samples.is_some();
-                                        let can_send = is_voice_active || !self.input_message.trim().is_empty()
-                                            || self.pending_clipboard_image.is_some() || self.attachment_drafts.len(&thread_id)>0;
-                                        let (send_rect, send_resp) = ui.allocate_exact_size(
-                                            Vec2::new(send_btn_w, 34.0),
-                                            Sense::click(),
-                                        );
-                                        #[cfg(test)]
-                                        ctx.data_mut(|data| data.insert_temp(Id::new("composer-send-bounds"), (send_rect, ui.clip_rect())));
-                                        composer_send_bounds = Some((send_rect, ui.clip_rect()));
-                                        if can_send {
-                                            let send_bg = if send_resp.hovered() {
-                                                pal.primary_hover
-                                            } else {
-                                                pal.primary
-                                            };
-                                            ui.painter().rect_filled(
-                                                send_rect,
-                                                Rounding::same(8.0),
-                                                send_bg,
-                                            );
-                                            if !composer_compact {
-                                                ui.painter().text(
-                                                    Pos2::new(
-                                                        send_rect.left() + 15.0,
-                                                        send_rect.center().y,
-                                                    ),
-                                                    egui::Align2::LEFT_CENTER,
-                                                    "Gửi",
-                                                    FontId::proportional(13.0),
-                                                    Color32::WHITE,
-                                                );
-                                                draw_icon_send(
-                                                    ui.painter(),
-                                                    Pos2::new(
-                                                        send_rect.right() - 17.0,
-                                                        send_rect.center().y,
-                                                    ),
-                                                    14.0,
-                                                    Color32::WHITE,
-                                                );
-                                            } else {
-                                                draw_icon_send(
-                                                    ui.painter(),
-                                                    send_rect.center(),
-                                                    16.0,
-                                                    Color32::WHITE,
-                                                );
-                                            }
-                                        } else {
-                                            // Dynamic Thumbs-up / Like button when empty (Zalo PC & Olaz UX)
-                                            let like_bg = if send_resp.hovered() {
-                                                pal.bg_hover
-                                            } else {
-                                                pal.bg_input
-                                            };
-                                            ui.painter().rect_filled(
-                                                send_rect,
-                                                Rounding::same(8.0),
-                                                like_bg,
-                                            );
-                                            ui.painter().rect_stroke(
-                                                send_rect,
-                                                Rounding::same(8.0),
-                                                Stroke::new(1.0_f32, pal.border),
-                                            );
-                                            ui.painter().text(
-                                                send_rect.center(),
-                                                egui::Align2::CENTER_CENTER,
-                                                "👍",
-                                                FontId::proportional(16.0),
-                                                pal.primary,
-                                            );
-                                        }
+                                        let send_resp = send_resp_opt.unwrap_or_else(|| {
+                                            let (_, r) = ui.allocate_exact_size(Vec2::new(send_btn_w, 34.0), Sense::click());
+                                            r
+                                        });
 
 
                                         send_resp.context_menu(|ui|{
@@ -5690,6 +6018,8 @@ impl ZaloGuiApp {
                                             if ui.button(crate::i18n::tr("Gửi danh thiếp…")).clicked() {
                                                 self.send_contact_modal_open = true;
                                                 self.send_contact_query.clear();
+                                                self.send_contact_selected.clear();
+                                                self.send_contact_include_phone = false;
                                                 ui.close_menu();
                                             }
                                             if ui.add_enabled(self.settings.quick_messages_enabled, egui::Button::new(crate::i18n::tr("Tin nhắn nhanh…"))).clicked() {
@@ -5718,7 +6048,8 @@ impl ZaloGuiApp {
                                             if ui.button(crate::i18n::tr("Quản lý lịch gửi")).clicked(){self.tools.open=true;self.tools.tab=3;ui.close_menu();}
                                         });
                                         let send_resp = if can_send {
-                                            send_resp.on_hover_text(crate::i18n::tr("Gửi tin nhắn (Enter)"))
+                                            let shortcut_hint = if self.settings.enter_to_send { "Enter" } else { "Ctrl+Enter" };
+                                            send_resp.on_hover_text(format!("{} ({})", crate::i18n::tr("Gửi tin nhắn"), shortcut_hint))
                                         } else {
                                             send_resp.on_hover_text(crate::i18n::tr("Gửi nhanh biểu tượng thích (Like)"))
                                         };
@@ -5743,6 +6074,7 @@ impl ZaloGuiApp {
                                             self.status_msg = "Hãy gửi mention bằng tin nhắn riêng trước khi gửi nhãn dán".into();
                                         } else if let Some(chosen) = send_selected_sticker {
                                             self.input_message.clear();
+                                            self.bump_draft_generation(&thread_id);
                                             self.dismissed_sticker_suggest_for.clear();
                                             self.composer_sticker_selected = None;
                                             response.request_focus();
@@ -5771,6 +6103,12 @@ impl ZaloGuiApp {
                                                     let _ = self.retire_pending_clipboard_image();
                                                     self.dismissed_sticker_suggest_for.clear();self.composer_sticker_selected=None;
                                                 } else {self.status_msg="Không gửi được ảnh; ảnh và nội dung soạn thảo vẫn được giữ.".into();}
+                                                response.request_focus();
+                                            }
+                                        } else if qm_expand_selected {
+                                            if let Some(item) = qm_matches.get(self.quick_message_selected_index) {
+                                                let item_clone = item.clone();
+                                                self.apply_quick_message_expansion(ctx, &thread_id, &item_clone, cursor);
                                                 response.request_focus();
                                             }
                                         } else if (send_clicked || enter_pressed) && can_send {
@@ -5811,6 +6149,7 @@ impl ZaloGuiApp {
                                                     self.replying_to = None;
                                                     self.dismissed_sticker_suggest_for.clear();
                                                     self.composer_sticker_selected = None;
+                                                    self.bump_draft_generation(&thread_id);
                                                     ctx.data_mut(|data|data.remove::<crate::rich_text::ComposerFormat>(composer_format_key));
                                                 } else {
                                                     self.status_msg = "Không thể gửi; nội dung vẫn được giữ trong ô soạn thảo".into();
@@ -5836,33 +6175,95 @@ impl ZaloGuiApp {
                                 ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
                                     ui.spacing_mut().item_spacing.x = 4.0;
-                                    for (index, active, label) in [
-                                        (0, composer_format.bold, RichText::new("B").strong()),
-                                        (1, composer_format.italic, RichText::new("I").italics()),
-                                        (2, composer_format.underline, RichText::new("U").underline()),
-                                        (3, composer_format.strike, RichText::new("S").strikethrough()),
+                                    for (index, active, label, tip) in [
+                                        (0, composer_format.bold, RichText::new("B").strong(), "In đậm (Ctrl+B)"),
+                                        (1, composer_format.italic, RichText::new("I").italics(), "In nghiêng (Ctrl+I)"),
+                                        (2, composer_format.underline, RichText::new("U").underline(), "Gạch chân (Ctrl+U)"),
+                                        (3, composer_format.strike, RichText::new("S").strikethrough(), "Gạch ngang"),
                                     ] {
-                                        if ui.add_sized([28.0,26.0], egui::SelectableLabel::new(active,label)).clicked() {
-                                            let (start,end) = ctx.data(|data| data.get_temp::<(usize,usize)>(composer_scope.with("selection")))
+                                        if ui.add_sized([28.0, 26.0], egui::SelectableLabel::new(active, label))
+                                            .on_hover_text(tip)
+                                            .clicked()
+                                        {
+                                            let (start, end) = ctx.data(|data| data.get_temp::<(usize, usize)>(composer_scope.with("selection")))
                                                 .unwrap_or_default();
-                                            composer_format.toggle_selection(&self.input_message,start,end,index);
+                                            composer_format.toggle_selection(&self.input_message, start, end, index);
                                             self.composer_focus_pending = true;
                                         }
                                     }
-                                    if let Some(urgency) = composer_format.urgency {
-                                        ui.label(match urgency {
-                                            crate::rich_text::Urgency::Important => "Quan trọng",
-                                            crate::rich_text::Urgency::Urgent => "Khẩn cấp",
-                                        });
+                                    ui.separator();
+                                    // Bullet list
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new("•").frame(false))
+                                        .on_hover_text("Danh sách dấu đầu dòng")
+                                        .clicked()
+                                    {
+                                        if !self.input_message.is_empty() && !self.input_message.ends_with('\n') {
+                                            self.input_message.push('\n');
+                                        }
+                                        self.input_message.push_str("• ");
+                                        self.composer_focus_pending = true;
                                     }
-                                    if ui.add_sized([28.0,26.0],egui::Button::new(
-                                        RichText::new(if composer_expanded {"↙"} else {"↗"}).size(18.0)).frame(false))
-                                        .on_hover_text(if composer_expanded {"Thu gọn vùng soạn thảo"} else {"Mở rộng vùng soạn thảo"}).clicked() {
+                                    // Numbered list
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new("1.").frame(false))
+                                        .on_hover_text("Danh sách đánh số")
+                                        .clicked()
+                                    {
+                                        if !self.input_message.is_empty() && !self.input_message.ends_with('\n') {
+                                            self.input_message.push('\n');
+                                        }
+                                        self.input_message.push_str("1. ");
+                                        self.composer_focus_pending = true;
+                                    }
+                                    // Quote
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new("❝").frame(false))
+                                        .on_hover_text("Trích dẫn khối")
+                                        .clicked()
+                                    {
+                                        if !self.input_message.is_empty() && !self.input_message.ends_with('\n') {
+                                            self.input_message.push('\n');
+                                        }
+                                        self.input_message.push_str("> ");
+                                        self.composer_focus_pending = true;
+                                    }
+                                    // Code
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new("</>").frame(false))
+                                        .on_hover_text("Khối mã lệnh (Code)")
+                                        .clicked()
+                                    {
+                                        let (start, end) = ctx.data(|data| data.get_temp::<(usize, usize)>(composer_scope.with("selection")))
+                                            .unwrap_or_default();
+                                        if start < end && end <= self.input_message.len() {
+                                            let selected = self.input_message[start..end].to_string();
+                                            self.input_message.replace_range(start..end, &format!("`{selected}`"));
+                                        } else {
+                                            self.input_message.push_str("``");
+                                        }
+                                        self.composer_focus_pending = true;
+                                    }
+                                    ui.separator();
+                                    // Urgency level badges
+                                    for (mode, label, color) in [
+                                        (Some(crate::rich_text::Urgency::Important), "Quan trọng", Color32::from_rgb(234, 179, 8)),
+                                        (Some(crate::rich_text::Urgency::Urgent), "Khẩn cấp", Color32::from_rgb(239, 68, 68)),
+                                    ] {
+                                        let is_active = composer_format.urgency == mode;
+                                        let btn = egui::Button::new(RichText::new(label).color(if is_active { Color32::WHITE } else { color }).size(11.5))
+                                            .fill(if is_active { color } else { Color32::TRANSPARENT })
+                                            .stroke(Stroke::new(1.0_f32, color))
+                                            .rounding(Rounding::same(4.0));
+                                        if ui.add(btn).clicked() {
+                                            composer_format.urgency = if is_active { None } else { mode };
+                                        }
+                                    }
+                                    ui.separator();
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new(
+                                        RichText::new(if composer_expanded { "↙" } else { "↗" }).size(18.0)).frame(false))
+                                        .on_hover_text(if composer_expanded { "Thu gọn vùng soạn thảo" } else { "Mở rộng vùng soạn thảo" }).clicked() {
                                         composer_expanded = !composer_expanded;
                                         ctx.data_mut(|data| data.insert_temp(expanded_key, composer_expanded));
                                         ctx.request_repaint();
                                     }
-                                    if ui.add_sized([28.0,26.0],egui::Button::new("×").frame(false))
+                                    if ui.add_sized([28.0, 26.0], egui::Button::new("×").frame(false))
                                         .on_hover_text("Tắt định dạng (Ctrl+Shift+X)").clicked() {
                                         self.composer_format_mode = false;
                                         composer_format = Default::default();
@@ -5916,19 +6317,148 @@ impl ZaloGuiApp {
                             );
                         }
                     }
-                } else {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(120.0);
-                        ui.label(
-                            RichText::new(crate::i18n::tr("Chọn một hội thoại bên trái để bắt đầu trò chuyện"))
-                                .size(15.0)
-                                .color(pal.text_muted),
+                    let qm_matches: Vec<crate::quick_message::QuickMessage> = if self.quick_message_popover_open {
+                        let query = self
+                            .quick_message_activation_context
+                            .as_ref()
+                            .filter(|act| act.draft_revision == self.quick_message_draft_revision)
+                            .map(|act| act.token.as_str())
+                            .or_else(|| {
+                                quick_message_token_at_cursor(
+                                    &self.input_message,
+                                    self.input_message.chars().count(),
+                                )
+                                .map(|(_, _, tok)| tok)
+                            });
+                        if let Some(q) = query {
+                            self.tools.config.quick_messages.search(q).into_iter().cloned().collect()
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if self.quick_message_popover_open && !qm_matches.is_empty() && !self.sticker_picker_open {
+                        self.render_quick_messages_inline_popover(
+                            ctx,
+                            &thread_id,
+                            composer_frame.response.rect,
+                            &qm_matches,
+                            pal,
                         );
-                    });
+                    }
+                } else {
+                    self.render_welcome_onboarding_view(ui, pal);
                 }
             });
 
         self.render_workspace_overlays(ctx, pal);
+    }
+
+    fn render_welcome_onboarding_view(&mut self, ui: &mut egui::Ui, pal: &ThemePalette) {
+        let slide_id = Id::new("welcome_carousel_slide_idx");
+        let mut slide_idx = ui
+            .ctx()
+            .data(|d| d.get_temp::<usize>(slide_id))
+            .unwrap_or(0);
+
+        let slides = [
+            (
+                "🚀",
+                "Tối ưu cho Windows 11 ARM64",
+                "Ứng dụng máy tính native viết bằng Rust, tiêu thụ ít tài nguyên, khởi động nhanh và hoạt động bền bỉ.",
+            ),
+            (
+                "🔒",
+                "Trò chuyện bảo mật E2EE",
+                "Hỗ trợ mã hóa đầu cuối chuẩn Signal Protocol cho các cuộc trò chuyện riêng tư trên máy tính.",
+            ),
+            (
+                "☁️",
+                "Lưu trữ đám mây & Kho Media",
+                "Quản lý tập trung tài liệu cá nhân trong Cloud của tôi và truy cập kho media server nhanh chóng.",
+            ),
+            (
+                "🎨",
+                "Giao diện hiện đại & Linh hoạt",
+                "Hỗ trợ giao diện Sáng (Light) mặc định, giao diện Tối (Dark) và tự động đồng bộ theo chủ đề Windows.",
+            ),
+        ];
+
+        ui.vertical_centered(|ui| {
+            let available_height = ui.available_height();
+            let top_space = (available_height * 0.16).clamp(20.0, 100.0);
+            ui.add_space(top_space);
+
+            ui.label(
+                RichText::new("Chào mừng bạn đến với Zalo Lite!")
+                    .size(22.0)
+                    .strong()
+                    .color(pal.text_primary),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new("Khám phá các tiện ích hỗ trợ làm việc và trò chuyện tối ưu hóa cho máy tính của bạn.")
+                    .size(13.0)
+                    .color(pal.text_secondary),
+            );
+            ui.add_space(28.0);
+
+            // Carousel card
+            egui::Frame::none()
+                .fill(pal.bg_elevated)
+                .stroke(Stroke::new(1.0_f32, pal.border))
+                .rounding(Rounding::same(12.0))
+                .inner_margin(Margin::symmetric(36.0, 24.0))
+                .show(ui, |ui| {
+                    ui.set_width(380.0_f32.min(ui.available_width() - 40.0));
+                    let (icon, title, desc) = slides[slide_idx % slides.len()];
+
+                    ui.label(RichText::new(icon).size(36.0));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(title).size(15.0).strong().color(pal.text_primary));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(desc)
+                            .size(12.5)
+                            .color(pal.text_secondary),
+                    );
+                    ui.add_space(16.0);
+
+                    // Carousel navigation
+                    ui.horizontal(|ui| {
+                        if ui.small_button("◀").on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            slide_idx = (slide_idx + slides.len() - 1) % slides.len();
+                            ui.ctx().data_mut(|d| d.insert_temp(slide_id, slide_idx));
+                        }
+
+                        ui.add_space(12.0);
+                        for i in 0..slides.len() {
+                            let is_active = i == (slide_idx % slides.len());
+                            let color = if is_active { pal.primary } else { pal.border };
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::splat(8.0), Sense::click());
+                            ui.painter().circle_filled(rect.center(), 4.0, color);
+                            if resp.clicked() {
+                                slide_idx = i;
+                                ui.ctx().data_mut(|d| d.insert_temp(slide_id, slide_idx));
+                            }
+                        }
+                        ui.add_space(12.0);
+
+                        if ui.small_button("▶").on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                            slide_idx = (slide_idx + 1) % slides.len();
+                            ui.ctx().data_mut(|d| d.insert_temp(slide_id, slide_idx));
+                        }
+                    });
+                });
+
+            ui.add_space(24.0);
+            ui.label(
+                RichText::new("👈 Chọn một cuộc trò chuyện từ danh sách bên trái để bắt đầu.")
+                    .size(12.5)
+                    .color(pal.text_muted),
+            );
+        });
     }
 
     /// Select a conversation, mark visible messages read and load server history when needed.
@@ -5968,7 +6498,11 @@ impl ZaloGuiApp {
             self.group_member_popover = None;
             self.common_groups_expanded = false;
         }
+        self.active_thread_id = Some(tid.clone());
         self.selected_thread_index = idx;
+        self.timeline_loading_more = false;
+        self.timeline_error = None;
+        self.timeline_anchor_id = None;
         if let Some(tx) = WORKER_TX.get() {
             let _ = tx.send(WorkerCmd::PrioritizeConversationSync {
                 owner: self.user_uin.clone(),
@@ -6030,11 +6564,22 @@ impl ZaloGuiApp {
             .is_some_and(|t| self.is_cloud_thread(t));
         if is_group || is_cloud {
             if let Some(tx) = WORKER_TX.get() {
-                let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                    limit: 500,
-                    group_id: tid,
-                    is_group,
-                });
+                let req_id = self.next_history_request_id;
+                if tx
+                    .send(WorkerCmd::LoadGroupHistory {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        request_id: req_id,
+                        limit: 500,
+                        group_id: tid.clone(),
+                        is_group,
+                    })
+                    .is_ok()
+                {
+                    self.next_history_request_id =
+                        self.next_history_request_id.wrapping_add(1).max(1);
+                    self.history_pending_requests.insert(tid.clone(), req_id);
+                }
             }
         } else {
             let should_fetch = match self.presence_map.get(&tid) {
@@ -6128,6 +6673,7 @@ impl ZaloGuiApp {
         self.render_downloads(ctx);
         self.render_quick_schedule(ctx, pal);
         self.render_send_contact_modal(ctx, pal);
+        self.render_bank_account_modal(ctx, pal);
         self.render_phone_sync_wait_modal(ctx, pal);
     }
 
@@ -6136,281 +6682,487 @@ impl ZaloGuiApp {
             return;
         }
         let mut open = self.send_contact_modal_open;
-        let mut chosen_contact = None;
+        let mut send_triggered = false;
         let mut close_modal = false;
         egui::Window::new(RichText::new("Gửi danh thiếp").strong().size(15.0))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(380.0)
-            .min_width(360.0)
+            .default_width(640.0)
+            .min_width(600.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                // 1. Search bar with icon
+                // Two-column layout: Left (search + filters + grouped contacts), Right (selected tray)
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(lucide::SEARCH)
-                            .size(15.0)
-                            .color(pal.text_secondary),
-                    );
-                    let search_edit = egui::TextEdit::singleline(&mut self.send_contact_query)
-                        .hint_text("Tìm danh thiếp theo tên...")
-                        .desired_width(ui.available_width());
-                    ui.add(search_edit);
-                });
-                ui.add_space(6.0);
+                    // LEFT COLUMN
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(370.0, 360.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            // 1. Search bar with icon
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(lucide::SEARCH)
+                                        .size(15.0)
+                                        .color(pal.text_secondary),
+                                );
+                                let search_edit =
+                                    egui::TextEdit::singleline(&mut self.send_contact_query)
+                                        .hint_text("Tìm danh thiếp theo tên...")
+                                        .desired_width(ui.available_width());
+                                ui.add(search_edit);
+                            });
+                            ui.add_space(6.0);
 
-                // 2. Filter chips (pills)
-                const FILTERS: [&str; 5] =
-                    ["Tất cả", "Khách hàng", "Gia đình", "Công việc", "Bạn bè"];
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-                    for (idx, &filter_name) in FILTERS.iter().enumerate() {
-                        let is_selected = self.send_contact_filter == idx;
-                        let bg_color = if is_selected {
-                            pal.primary
-                        } else {
-                            pal.bg_input
-                        };
-                        let text_color = if is_selected {
-                            Color32::WHITE
-                        } else {
-                            pal.text_secondary
-                        };
-                        let stroke = if is_selected {
-                            Stroke::NONE
-                        } else {
-                            Stroke::new(1.0_f32, pal.border)
-                        };
-                        let pill_btn = egui::Button::new(
-                            RichText::new(filter_name).size(12.0).color(text_color),
-                        )
-                        .fill(bg_color)
-                        .stroke(stroke)
-                        .rounding(Rounding::same(12.0));
-                        if ui.add(pill_btn).clicked() {
-                            self.send_contact_filter = idx;
-                        }
-                    }
-                });
-                ui.add_space(4.0);
-                ui.separator();
-
-                // 3. Contacts list
-                let query = fold_vn_search(self.send_contact_query.trim());
-                let filter_idx = self.send_contact_filter;
-                let friends_set = self.inbox_policy.friends.as_ref();
-                let labels_snapshot = self.labels_panel.snapshot.as_ref();
-
-                let mut matched_count = 0;
-                egui::ScrollArea::vertical()
-                    .max_height(280.0)
-                    .min_scrolled_height(180.0)
-                    .show(ui, |ui| {
-                        for t in &self.threads {
-                            if t.is_group
-                                || t.id.starts_with("group_")
-                                || t.id == self.user_uin
-                                || t.id.is_empty()
-                                || t.name.contains("Cloud của tôi")
-                            {
-                                continue;
-                            }
-                            let display_name =
-                                resolve_contact_name_from(&self.server_aliases, &t.id, &t.name);
-                            let folded_name = fold_vn_search(display_name.trim());
-                            if !query.is_empty()
-                                && !folded_name.contains(&query)
-                                && !t.id.contains(&query)
-                            {
-                                continue;
-                            }
-
-                            // Filter logic
-                            let passes_category = match filter_idx {
-                                0 => true, // Tất cả
-                                1 => {
-                                    // Khách hàng
-                                    let mut found = false;
-                                    if let Some(snapshot) = labels_snapshot {
-                                        for label in &snapshot.labels {
-                                            if label.text.to_lowercase().contains("khách")
-                                                && label.conversations.iter().any(|c| c == &t.id)
-                                            {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
+                            // 2. Filter chips (pills)
+                            const FILTERS: [&str; 5] =
+                                ["Tất cả", "Khách hàng", "Gia đình", "Công việc", "Bạn bè"];
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                                for (idx, &filter_name) in FILTERS.iter().enumerate() {
+                                    let is_selected = self.send_contact_filter == idx;
+                                    let bg_color = if is_selected {
+                                        pal.primary
+                                    } else {
+                                        pal.bg_input
+                                    };
+                                    let text_color = if is_selected {
+                                        Color32::WHITE
+                                    } else {
+                                        pal.text_secondary
+                                    };
+                                    let stroke = if is_selected {
+                                        Stroke::NONE
+                                    } else {
+                                        Stroke::new(1.0_f32, pal.border)
+                                    };
+                                    let pill_btn = egui::Button::new(
+                                        RichText::new(filter_name).size(12.0).color(text_color),
+                                    )
+                                    .fill(bg_color)
+                                    .stroke(stroke)
+                                    .rounding(Rounding::same(12.0));
+                                    if ui.add(pill_btn).clicked() {
+                                        self.send_contact_filter = idx;
                                     }
-                                    found || display_name.to_lowercase().contains("khách")
                                 }
-                                2 => {
-                                    // Gia đình
-                                    let mut found = false;
-                                    if let Some(snapshot) = labels_snapshot {
-                                        for label in &snapshot.labels {
-                                            if label.text.to_lowercase().contains("gia đình")
-                                                && label.conversations.iter().any(|c| c == &t.id)
-                                            {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    found || display_name.to_lowercase().contains("gia đình")
+                            });
+                            ui.add_space(4.0);
+                            ui.separator();
+
+                            // 3. Collect & Filter Contacts
+                            let query = fold_vn_search(self.send_contact_query.trim());
+                            let filter_idx = self.send_contact_filter;
+                            let friends_set = self.inbox_policy.friends.as_ref();
+                            let labels_snapshot = self.labels_panel.snapshot.as_ref();
+
+                            let mut matched_contacts: Vec<(
+                                String,
+                                String,
+                                Option<String>,
+                                Option<String>,
+                            )> = Vec::new();
+                            for t in &self.threads {
+                                if t.is_group
+                                    || t.id.starts_with("group_")
+                                    || t.id == self.user_uin
+                                    || t.id.is_empty()
+                                    || t.name.contains("Cloud của tôi")
+                                {
+                                    continue;
                                 }
-                                3 => {
-                                    // Công việc
-                                    let mut found = false;
-                                    if let Some(snapshot) = labels_snapshot {
-                                        for label in &snapshot.labels {
-                                            if (label.text.to_lowercase().contains("công việc")
-                                                || label.text.to_lowercase().contains("việc"))
-                                                && label.conversations.iter().any(|c| c == &t.id)
-                                            {
-                                                found = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    found
-                                        || display_name.to_lowercase().contains("việc")
-                                        || display_name.to_lowercase().contains("work")
+                                let display_name =
+                                    resolve_contact_name_from(&self.server_aliases, &t.id, &t.name)
+                                        .to_string();
+                                let folded_name = fold_vn_search(display_name.trim());
+                                if !query.is_empty()
+                                    && !folded_name.contains(&query)
+                                    && !t.id.contains(&query)
+                                {
+                                    continue;
                                 }
-                                4 => {
-                                    // Bạn bè
-                                    if let Some(friends) = friends_set {
-                                        if friends.contains(&t.id) {
-                                            true
-                                        } else {
-                                            let mut found = false;
-                                            if let Some(snapshot) = labels_snapshot {
-                                                for label in &snapshot.labels {
-                                                    if label.text.to_lowercase().contains("bạn")
-                                                        && label
-                                                            .conversations
-                                                            .iter()
-                                                            .any(|c| c == &t.id)
-                                                    {
-                                                        found = true;
-                                                        break;
-                                                    }
+
+                                // Category filter logic
+                                let passes_category = match filter_idx {
+                                    0 => true, // Tất cả
+                                    1 => {
+                                        let mut found = false;
+                                        if let Some(snapshot) = labels_snapshot {
+                                            for label in &snapshot.labels {
+                                                if label.text.to_lowercase().contains("khách")
+                                                    && label
+                                                        .conversations
+                                                        .iter()
+                                                        .any(|c| c == &t.id)
+                                                {
+                                                    found = true;
+                                                    break;
                                                 }
                                             }
-                                            found
                                         }
-                                    } else {
-                                        true
+                                        found || display_name.to_lowercase().contains("khách")
                                     }
-                                }
-                                _ => true,
-                            };
-
-                            if !passes_category {
-                                continue;
-                            }
-
-                            matched_count += 1;
-                            let is_selected = self.send_contact_selected.as_deref() == Some(&t.id);
-                            let row_bg = if is_selected {
-                                pal.primary.linear_multiply(0.12)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-
-                            let row_resp = egui::Frame::none()
-                                .fill(row_bg)
-                                .rounding(Rounding::same(6.0))
-                                .inner_margin(Margin::symmetric(8.0, 5.0))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        // Radio selection indicator
-                                        let radio_val = is_selected;
-                                        if ui.radio(radio_val, "").clicked() {
-                                            self.send_contact_selected = Some(t.id.clone());
-                                        }
-
-                                        // Contact avatar
-                                        let (rect, _) = ui
-                                            .allocate_exact_size(Vec2::splat(32.0), Sense::hover());
-                                        let bg = avatar_color_for(display_name, false);
-                                        ui.painter().circle_filled(rect.center(), 16.0, bg);
-                                        let initials = avatar_initials(display_name);
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            initials,
-                                            FontId::proportional(12.5),
-                                            Color32::WHITE,
-                                        );
-
-                                        // Contact Name & preview / subtitle
-                                        ui.vertical(|ui| {
-                                            ui.label(
-                                                RichText::new(display_name)
-                                                    .strong()
-                                                    .size(13.5)
-                                                    .color(if is_selected {
-                                                        pal.primary
-                                                    } else {
-                                                        pal.text_primary
-                                                    }),
-                                            );
-                                            if !t.preview.is_empty() && !t.preview.starts_with('{')
-                                            {
-                                                ui.label(
-                                                    RichText::new(&t.preview)
-                                                        .size(11.5)
-                                                        .color(pal.text_secondary),
-                                                );
+                                    2 => {
+                                        let mut found = false;
+                                        if let Some(snapshot) = labels_snapshot {
+                                            for label in &snapshot.labels {
+                                                if label.text.to_lowercase().contains("gia đình")
+                                                    && label
+                                                        .conversations
+                                                        .iter()
+                                                        .any(|c| c == &t.id)
+                                                {
+                                                    found = true;
+                                                    break;
+                                                }
                                             }
-                                        });
-                                    });
-                                })
-                                .response;
+                                        }
+                                        found || display_name.to_lowercase().contains("gia đình")
+                                    }
+                                    3 => {
+                                        let mut found = false;
+                                        if let Some(snapshot) = labels_snapshot {
+                                            for label in &snapshot.labels {
+                                                if (label.text.to_lowercase().contains("công việc")
+                                                    || label.text.to_lowercase().contains("việc"))
+                                                    && label
+                                                        .conversations
+                                                        .iter()
+                                                        .any(|c| c == &t.id)
+                                                {
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        found
+                                            || display_name.to_lowercase().contains("việc")
+                                            || display_name.to_lowercase().contains("work")
+                                    }
+                                    4 => {
+                                        if let Some(friends) = friends_set {
+                                            if friends.contains(&t.id) {
+                                                true
+                                            } else {
+                                                let mut found = false;
+                                                if let Some(snapshot) = labels_snapshot {
+                                                    for label in &snapshot.labels {
+                                                        if label.text.to_lowercase().contains("bạn")
+                                                            && label
+                                                                .conversations
+                                                                .iter()
+                                                                .any(|c| c == &t.id)
+                                                        {
+                                                            found = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                found
+                                            }
+                                        } else {
+                                            true
+                                        }
+                                    }
+                                    _ => true,
+                                };
 
-                            let row_interact =
-                                ui.interact(row_resp.rect, ui.id().with(&t.id), Sense::click());
-                            if row_interact.clicked() {
-                                self.send_contact_selected = Some(t.id.clone());
-                            }
-                            if row_interact.double_clicked() {
-                                self.send_contact_selected = Some(t.id.clone());
-                                chosen_contact = Some((
+                                if !passes_category {
+                                    continue;
+                                }
+
+                                matched_contacts.push((
                                     t.id.clone(),
-                                    display_name.to_string(),
-                                    t.avatar.clone().unwrap_or_default(),
+                                    display_name,
+                                    t.avatar.clone(),
+                                    if !t.preview.is_empty() && !t.preview.starts_with('{') {
+                                        Some(t.preview.clone())
+                                    } else {
+                                        None
+                                    },
                                 ));
                             }
 
-                            ui.add_space(2.0);
-                        }
-
-                        if matched_count == 0 {
-                            ui.vertical_centered(|ui| {
-                                ui.add_space(24.0);
-                                ui.label(
-                                    RichText::new("Không tìm thấy danh thiếp nào")
-                                        .size(13.0)
-                                        .color(pal.text_secondary),
-                                );
-                                ui.add_space(24.0);
+                            // Sort alphabetically
+                            matched_contacts.sort_by(|a, b| {
+                                let fa = fold_vn_search(&a.1);
+                                let fb = fold_vn_search(&b.1);
+                                fa.cmp(&fb)
                             });
-                        }
-                    });
 
-                // 4. Modal footer with Cancel and Send buttons
+                            // 4. Alphabet-grouped contact list
+                            egui::ScrollArea::vertical()
+                                .max_height(280.0)
+                                .min_scrolled_height(180.0)
+                                .show(ui, |ui| {
+                                    if matched_contacts.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(24.0);
+                                            ui.label(
+                                                RichText::new("Không tìm thấy danh thiếp nào")
+                                                    .size(13.0)
+                                                    .color(pal.text_secondary),
+                                            );
+                                            ui.add_space(24.0);
+                                        });
+                                    } else {
+                                        let mut current_section = '\0';
+                                        for (cid, display_name, _, cpreview) in &matched_contacts {
+                                            let first_char = fold_vn_search(display_name.trim())
+                                                .chars()
+                                                .next()
+                                                .map(|c| c.to_ascii_uppercase())
+                                                .filter(|c| c.is_ascii_alphabetic())
+                                                .unwrap_or('#');
+                                            if first_char != current_section {
+                                                current_section = first_char;
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    RichText::new(current_section.to_string())
+                                                        .strong()
+                                                        .size(12.0)
+                                                        .color(pal.primary),
+                                                );
+                                            }
+
+                                            let is_selected =
+                                                self.send_contact_selected.contains(cid);
+                                            let can_select =
+                                                is_selected || self.send_contact_selected.len() < 9;
+                                            let row_bg = if is_selected {
+                                                pal.primary.linear_multiply(0.12)
+                                            } else {
+                                                Color32::TRANSPARENT
+                                            };
+
+                                            let mut toggle = false;
+                                            egui::Frame::none()
+                                                .fill(row_bg)
+                                                .rounding(Rounding::same(6.0))
+                                                .inner_margin(Margin::symmetric(6.0, 4.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        // Checkbox (hard limit of 9)
+                                                        let mut checked = is_selected;
+                                                        if ui
+                                                            .add_enabled(
+                                                                can_select,
+                                                                egui::Checkbox::new(
+                                                                    &mut checked,
+                                                                    "",
+                                                                ),
+                                                            )
+                                                            .changed()
+                                                        {
+                                                            toggle = true;
+                                                        }
+
+                                                        // Avatar
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            Vec2::splat(28.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        let bg =
+                                                            avatar_color_for(display_name, false);
+                                                        ui.painter().circle_filled(
+                                                            rect.center(),
+                                                            14.0,
+                                                            bg,
+                                                        );
+                                                        let initials =
+                                                            avatar_initials(display_name);
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            initials,
+                                                            FontId::proportional(11.5),
+                                                            Color32::WHITE,
+                                                        );
+
+                                                        // Name & preview
+                                                        ui.vertical(|ui| {
+                                                            ui.label(
+                                                                RichText::new(display_name)
+                                                                    .strong()
+                                                                    .size(13.0)
+                                                                    .color(if is_selected {
+                                                                        pal.primary
+                                                                    } else {
+                                                                        pal.text_primary
+                                                                    }),
+                                                            );
+                                                            if let Some(prev) = cpreview {
+                                                                ui.label(
+                                                                    RichText::new(prev)
+                                                                        .size(11.0)
+                                                                        .color(pal.text_secondary),
+                                                                );
+                                                            }
+                                                        });
+                                                    });
+                                                });
+
+                                            if toggle {
+                                                if is_selected {
+                                                    self.send_contact_selected.remove(cid);
+                                                } else if can_select {
+                                                    self.send_contact_selected.insert(cid.clone());
+                                                }
+                                            }
+
+                                            ui.add_space(2.0);
+                                        }
+                                    }
+                                });
+                        },
+                    );
+
+                    ui.separator();
+
+                    // RIGHT COLUMN (Selected tray)
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(230.0, 360.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let selected_count = self.send_contact_selected.len();
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!("Đã chọn: {selected_count}/9"))
+                                        .strong()
+                                        .size(13.5)
+                                        .color(if selected_count > 0 {
+                                            pal.primary
+                                        } else {
+                                            pal.text_secondary
+                                        }),
+                                );
+                            });
+                            ui.add_space(6.0);
+
+                            egui::ScrollArea::vertical()
+                                .max_height(320.0)
+                                .show(ui, |ui| {
+                                    if self.send_contact_selected.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.add_space(40.0);
+                                            ui.label(
+                                                RichText::new("Chưa có liên hệ nào được chọn")
+                                                    .size(12.0)
+                                                    .color(pal.text_muted),
+                                            );
+                                        });
+                                    } else {
+                                        let mut to_remove = None;
+                                        for sel_id in &self.send_contact_selected {
+                                            let name = if let Some(contact) =
+                                                self.threads.iter().find(|t| &t.id == sel_id)
+                                            {
+                                                resolve_contact_name_from(
+                                                    &self.server_aliases,
+                                                    &contact.id,
+                                                    &contact.name,
+                                                )
+                                                .to_string()
+                                            } else {
+                                                sel_id.clone()
+                                            };
+
+                                            egui::Frame::none()
+                                                .fill(pal.bg_input)
+                                                .rounding(Rounding::same(6.0))
+                                                .inner_margin(Margin::symmetric(6.0, 4.0))
+                                                .show(ui, |ui| {
+                                                    ui.horizontal(|ui| {
+                                                        // Small avatar
+                                                        let (rect, _) = ui.allocate_exact_size(
+                                                            Vec2::splat(22.0),
+                                                            Sense::hover(),
+                                                        );
+                                                        let bg = avatar_color_for(&name, false);
+                                                        ui.painter().circle_filled(
+                                                            rect.center(),
+                                                            11.0,
+                                                            bg,
+                                                        );
+                                                        let initials = avatar_initials(&name);
+                                                        ui.painter().text(
+                                                            rect.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            initials,
+                                                            FontId::proportional(10.0),
+                                                            Color32::WHITE,
+                                                        );
+
+                                                        // Name
+                                                        let truncated = if name.chars().count() > 14
+                                                        {
+                                                            format!(
+                                                                "{}...",
+                                                                name.chars()
+                                                                    .take(12)
+                                                                    .collect::<String>()
+                                                            )
+                                                        } else {
+                                                            name.clone()
+                                                        };
+                                                        ui.label(
+                                                            RichText::new(truncated)
+                                                                .size(12.0)
+                                                                .color(pal.text_primary),
+                                                        );
+
+                                                        // Remove chip button
+                                                        ui.with_layout(
+                                                            egui::Layout::right_to_left(
+                                                                egui::Align::Center,
+                                                            ),
+                                                            |ui| {
+                                                                if ui
+                                                                    .button(
+                                                                        RichText::new("✕")
+                                                                            .size(10.0)
+                                                                            .color(
+                                                                                pal.text_secondary,
+                                                                            ),
+                                                                    )
+                                                                    .on_hover_text("Bỏ chọn")
+                                                                    .clicked()
+                                                                {
+                                                                    to_remove =
+                                                                        Some(sel_id.clone());
+                                                                }
+                                                            },
+                                                        );
+                                                    });
+                                                });
+                                            ui.add_space(3.0);
+                                        }
+                                        if let Some(rem_id) = to_remove {
+                                            self.send_contact_selected.remove(&rem_id);
+                                        }
+                                    }
+                                });
+                        },
+                    );
+                });
+
+                // Footer with Phone Checkbox, Cancel and Send buttons
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button(crate::i18n::tr("Hủy")).clicked() {
-                        close_modal = true;
-                    }
+                    ui.checkbox(
+                        &mut self.send_contact_include_phone,
+                        "Gửi kèm số điện thoại",
+                    );
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let has_selection = self.send_contact_selected.is_some();
+                        let has_selection = !self.send_contact_selected.is_empty();
+                        let send_title = if has_selection {
+                            format!("Gửi danh thiếp ({})", self.send_contact_selected.len())
+                        } else {
+                            crate::i18n::tr("Gửi danh thiếp").to_string()
+                        };
                         let send_btn = egui::Button::new(
-                            RichText::new(crate::i18n::tr("Gửi danh thiếp"))
-                                .strong()
-                                .color(Color32::WHITE),
+                            RichText::new(send_title).strong().color(Color32::WHITE),
                         )
                         .fill(if has_selection {
                             pal.primary
@@ -6419,21 +7171,10 @@ impl ZaloGuiApp {
                         })
                         .rounding(Rounding::same(6.0));
                         if ui.add_enabled(has_selection, send_btn).clicked() {
-                            if let Some(sel_id) = &self.send_contact_selected {
-                                if let Some(contact) = self.threads.iter().find(|t| &t.id == sel_id)
-                                {
-                                    chosen_contact = Some((
-                                        contact.id.clone(),
-                                        resolve_contact_name_from(
-                                            &self.server_aliases,
-                                            &contact.id,
-                                            &contact.name,
-                                        )
-                                        .to_string(),
-                                        contact.avatar.clone().unwrap_or_default(),
-                                    ));
-                                }
-                            }
+                            send_triggered = true;
+                        }
+                        if ui.button(crate::i18n::tr("Hủy")).clicked() {
+                            close_modal = true;
                         }
                     });
                 });
@@ -6443,20 +7184,594 @@ impl ZaloGuiApp {
             open = false;
         }
         self.send_contact_modal_open = open;
-        if let Some((cid, cname, cava)) = chosen_contact {
+        if send_triggered {
             self.send_contact_modal_open = false;
-            self.send_contact_selected = None;
+            let selected_ids: Vec<String> = self.send_contact_selected.drain().collect();
             if let Some(t) = self.threads.get(self.selected_thread_index) {
                 let to_id = t.id.clone();
                 let is_group = t.is_group;
+                let mut cards = Vec::new();
+                let base_client_id = crate::search::generation();
+                for (idx, cid) in selected_ids.into_iter().enumerate() {
+                    if let Some(contact) = self.threads.iter().find(|th| th.id == cid) {
+                        let name = resolve_contact_name_from(
+                            &self.server_aliases,
+                            &contact.id,
+                            &contact.name,
+                        )
+                        .to_string();
+                        let phone = if self.send_contact_include_phone {
+                            self.profiles
+                                .iter()
+                                .find(|p| p.uid == contact.id)
+                                .and_then(|p| p.phone.as_ref())
+                                .filter(|p| !p.trim().is_empty())
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        cards.push(crate::gui::worker::ContactCardItem {
+                            client_id: base_client_id.wrapping_add(idx as u64),
+                            contact_id: contact.id.clone(),
+                            contact_name: name,
+                            phone,
+                            avatar: contact.avatar.clone().unwrap_or_default(),
+                        });
+                    }
+                }
                 if let Some(tx) = WORKER_TX.get() {
-                    let _ = tx.send(WorkerCmd::SendContactCard {
+                    let _ = tx.send(WorkerCmd::SendContactCards {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        request_id: base_client_id,
                         to_id,
                         is_group,
-                        contact_id: cid,
-                        contact_name: cname,
-                        phone: String::new(),
-                        avatar: cava,
+                        cards,
+                    });
+                }
+            }
+        }
+    }
+
+    pub(super) fn apply_quick_message_expansion(
+        &mut self,
+        _ctx: &egui::Context,
+        thread_id: &str,
+        item: &crate::quick_message::QuickMessage,
+        cursor: usize,
+    ) -> bool {
+        let mut replaced = false;
+        if let Some(act) = self.quick_message_activation_context.take() {
+            if act.owner == self.user_uin
+                && act.runtime_id == self.account_runtime_id
+                && act.thread_id == thread_id
+                && act.draft_revision == self.quick_message_draft_revision
+                && act.byte_range.1 <= self.input_message.len()
+                && self.input_message.is_char_boundary(act.byte_range.0)
+                && self.input_message.is_char_boundary(act.byte_range.1)
+                && self.input_message[act.byte_range.0..act.byte_range.1] == act.token
+            {
+                self.input_message
+                    .replace_range(act.byte_range.0..act.byte_range.1, &item.text);
+                self.quick_message_draft_revision =
+                    self.quick_message_draft_revision.wrapping_add(1);
+                replaced = true;
+            }
+        }
+        if !replaced {
+            if let Some((start, end, _)) =
+                quick_message_token_at_cursor(&self.input_message, cursor)
+            {
+                self.input_message.replace_range(start..end, &item.text);
+                self.quick_message_draft_revision =
+                    self.quick_message_draft_revision.wrapping_add(1);
+                replaced = true;
+            }
+        }
+        if replaced {
+            if let Some(media_str) = &item.media {
+                let op_id = self.next_qm_media_op_id;
+                self.next_qm_media_op_id = self.next_qm_media_op_id.wrapping_add(1).max(1);
+                let draft_generation = self.current_draft_generation(thread_id);
+                self.pending_qm_media_ops.insert(
+                    op_id,
+                    crate::gui::QuickMessageMediaOp {
+                        op_id,
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        thread_id: thread_id.to_string(),
+                        draft_generation,
+                    },
+                );
+                if let Some(tx) = WORKER_TX.get() {
+                    if tx
+                        .send(WorkerCmd::PrepareQuickMessageMedia {
+                            op_id,
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            thread_id: thread_id.to_string(),
+                            draft_generation,
+                            media: media_str.clone(),
+                        })
+                        .is_err()
+                    {
+                        self.pending_qm_media_ops.remove(&op_id);
+                        self.show_toast(
+                            "Không thể gửi yêu cầu nạp tệp tin nhắn nhanh: worker đã dừng",
+                        );
+                    }
+                } else {
+                    self.pending_qm_media_ops.remove(&op_id);
+                    self.show_toast("Không thể nạp tệp tin nhắn nhanh: worker chưa sẵn sàng");
+                }
+            }
+        }
+        self.quick_message_popover_open = false;
+        replaced
+    }
+
+    pub(super) fn insert_or_append_quick_message(
+        &mut self,
+        ctx: &egui::Context,
+        thread_id: &str,
+        item: &crate::quick_message::QuickMessage,
+    ) {
+        let cursor = self.input_message.chars().count();
+        if !self.apply_quick_message_expansion(ctx, thread_id, item, cursor) {
+            if !self.input_message.is_empty() && !self.input_message.ends_with(' ') {
+                self.input_message.push(' ');
+            }
+            self.input_message.push_str(&item.text);
+            self.quick_message_draft_revision = self.quick_message_draft_revision.wrapping_add(1);
+            if let Some(media_str) = &item.media {
+                let op_id = self.next_qm_media_op_id;
+                self.next_qm_media_op_id = self.next_qm_media_op_id.wrapping_add(1).max(1);
+                let draft_generation = self.current_draft_generation(thread_id);
+                self.pending_qm_media_ops.insert(
+                    op_id,
+                    crate::gui::QuickMessageMediaOp {
+                        op_id,
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        thread_id: thread_id.to_string(),
+                        draft_generation,
+                    },
+                );
+                if let Some(tx) = WORKER_TX.get() {
+                    if tx
+                        .send(WorkerCmd::PrepareQuickMessageMedia {
+                            op_id,
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            thread_id: thread_id.to_string(),
+                            draft_generation,
+                            media: media_str.clone(),
+                        })
+                        .is_err()
+                    {
+                        self.pending_qm_media_ops.remove(&op_id);
+                        self.show_toast(
+                            "Không thể gửi yêu cầu nạp tệp tin nhắn nhanh: worker đã dừng",
+                        );
+                    }
+                } else {
+                    self.pending_qm_media_ops.remove(&op_id);
+                    self.show_toast("Không thể nạp tệp tin nhắn nhanh: worker chưa sẵn sàng");
+                }
+            }
+        }
+    }
+
+    fn render_quick_messages_inline_popover(
+        &mut self,
+        ctx: &egui::Context,
+        thread_id: &str,
+        composer_rect: Rect,
+        matches: &[crate::quick_message::QuickMessage],
+        pal: &ThemePalette,
+    ) {
+        let popover_w = 380.0_f32;
+        let popover_h = (38.0 + matches.len().min(5) as f32 * 36.0 + 26.0).min(240.0);
+        let pos = Pos2::new(
+            composer_rect.left() + 8.0,
+            (composer_rect.top() - popover_h - 4.0).max(48.0),
+        );
+
+        let mut chosen_item = None;
+        egui::Area::new(Id::new("zalo_inline_quick_message_popover"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(if pal.is_dark {
+                        Color32::from_rgba_unmultiplied(33, 37, 43, 252)
+                    } else {
+                        Color32::from_rgba_unmultiplied(255, 255, 255, 252)
+                    })
+                    .stroke(Stroke::new(1.0_f32, pal.border))
+                    .rounding(Rounding::same(8.0))
+                    .shadow(egui::epaint::Shadow {
+                        offset: Vec2::new(0.0, 2.0),
+                        blur: 8.0,
+                        spread: 0.0,
+                        color: Color32::from_black_alpha(40),
+                    })
+                    .inner_margin(Margin::symmetric(10.0, 8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(popover_w);
+
+                        // Hint bar
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Bấm phím ↑ ↓ để chọn, Enter để thêm vào khung soạn thảo, Esc để ẩn.")
+                                    .size(11.0)
+                                    .color(pal.text_secondary),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(2.0);
+
+                        // Matching items
+                        egui::ScrollArea::vertical()
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for (idx, qm) in matches.iter().enumerate() {
+                                    let is_selected = idx == self.quick_message_selected_index;
+                                    let row_bg = if is_selected {
+                                        pal.primary.linear_multiply(0.15)
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    };
+
+                                    let row_resp = egui::Frame::none()
+                                        .fill(row_bg)
+                                        .rounding(Rounding::same(4.0))
+                                        .inner_margin(Margin::symmetric(6.0, 4.0))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                // Shortcut pill
+                                                let sc = if qm.shortcut.starts_with('/') {
+                                                    qm.shortcut.clone()
+                                                } else {
+                                                    format!("/{}", qm.shortcut)
+                                                };
+                                                ui.label(
+                                                    RichText::new(sc)
+                                                        .strong()
+                                                        .size(12.5)
+                                                        .color(pal.primary),
+                                                );
+                                                ui.add_space(4.0);
+                                                // Text preview
+                                                let display_text = if qm.text.chars().count() > 32 {
+                                                    format!("{}...", qm.text.chars().take(30).collect::<String>())
+                                                } else {
+                                                    qm.text.clone()
+                                                };
+                                                ui.label(
+                                                    RichText::new(display_text)
+                                                        .size(12.0)
+                                                        .color(pal.text_primary),
+                                                );
+                                            });
+                                        })
+                                        .response;
+
+                                    if row_resp.clicked() {
+                                        chosen_item = Some(qm.clone());
+                                    }
+                                    if row_resp.hovered() {
+                                        self.quick_message_selected_index = idx;
+                                    }
+                                }
+                            });
+                    });
+            });
+
+        if let Some(chosen) = chosen_item {
+            self.insert_or_append_quick_message(ctx, thread_id, &chosen);
+        }
+    }
+
+    fn render_bank_account_modal(&mut self, ctx: &egui::Context, pal: &ThemePalette) {
+        if !self.bank_account_modal_open || !self.is_logged_in || self.account_runtime_id == 0 {
+            self.bank_account_modal_open = false;
+            return;
+        }
+        let mut open = self.bank_account_modal_open;
+        let mut close_modal = false;
+        let mut save_account = false;
+        let mut send_to_chat = false;
+        egui::Window::new(
+            RichText::new("Tài khoản ngân hàng (STK)")
+                .strong()
+                .size(15.0),
+        )
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Thêm hoặc quản lý tài khoản nhận chuyển khoản nhanh")
+                    .size(12.0)
+                    .color(pal.text_secondary),
+            );
+            ui.add_space(8.0);
+
+            // Saved accounts list if any
+            if !self.bank_accounts_list.is_empty() {
+                ui.label(
+                    RichText::new("Tài khoản đã lưu:")
+                        .strong()
+                        .size(12.5)
+                        .color(pal.text_primary),
+                );
+                let mut delete_acc_id = None;
+                for acc in &self.bank_accounts_list {
+                    egui::Frame::none()
+                        .fill(pal.bg_input)
+                        .rounding(Rounding::same(6.0))
+                        .inner_margin(Margin::symmetric(8.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("💳").size(14.0));
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(&acc.bank_number)
+                                            .strong()
+                                            .size(13.0)
+                                            .color(pal.text_primary),
+                                    );
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} — {}",
+                                            acc.holder_name,
+                                            if acc.bank_name.is_empty() {
+                                                &acc.bin
+                                            } else {
+                                                &acc.bank_name
+                                            }
+                                        ))
+                                        .size(11.5)
+                                        .color(pal.text_secondary),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button("Gửi")
+                                            .on_hover_text("Gửi vào cuộc trò chuyện")
+                                            .clicked()
+                                        {
+                                            self.new_bank_bin = acc.bin.clone();
+                                            self.new_bank_number = acc.bank_number.clone();
+                                            self.new_bank_holder_name = acc.holder_name.clone();
+                                            send_to_chat = true;
+                                        }
+                                        if ui
+                                            .small_button("✕")
+                                            .on_hover_text("Xóa tài khoản")
+                                            .clicked()
+                                        {
+                                            delete_acc_id =
+                                                Some((acc.account_id.clone(), acc.is_default));
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.add_space(4.0);
+                }
+                if let Some((acc_id, is_def)) = delete_acc_id {
+                    if let Some(tx) = WORKER_TX.get() {
+                        let _ = tx.send(WorkerCmd::DeleteBankAccount {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            request_id: crate::search::generation(),
+                            account_id: acc_id,
+                            is_default: is_def,
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+            }
+
+            // Add new bank account form
+            ui.label(
+                RichText::new("Thêm tài khoản mới:")
+                    .strong()
+                    .size(12.5)
+                    .color(pal.text_primary),
+            );
+            ui.add_space(4.0);
+
+            // Bank selection / BIN
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Ngân hàng:")
+                        .size(12.5)
+                        .color(pal.text_secondary),
+                );
+                if self.new_bank_bin.is_empty() {
+                    self.new_bank_bin = "970407".to_string(); // Default Techcombank
+                }
+                egui::ComboBox::from_id_salt("bank_bin_select")
+                    .selected_text(match self.new_bank_bin.as_str() {
+                        "970407" => "Techcombank (TCB)",
+                        "970436" => "Vietcombank (VCB)",
+                        "970422" => "MB Bank (MB)",
+                        "970415" => "VietinBank (CTG)",
+                        "970418" => "BIDV",
+                        "970416" => "ACB",
+                        "970432" => "VPBank",
+                        "970423" => "TPBank",
+                        _ => "Khác",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.new_bank_bin,
+                            "970407".into(),
+                            "Techcombank (TCB)",
+                        );
+                        ui.selectable_value(
+                            &mut self.new_bank_bin,
+                            "970436".into(),
+                            "Vietcombank (VCB)",
+                        );
+                        ui.selectable_value(
+                            &mut self.new_bank_bin,
+                            "970422".into(),
+                            "MB Bank (MB)",
+                        );
+                        ui.selectable_value(
+                            &mut self.new_bank_bin,
+                            "970415".into(),
+                            "VietinBank (CTG)",
+                        );
+                        ui.selectable_value(&mut self.new_bank_bin, "970418".into(), "BIDV");
+                        ui.selectable_value(&mut self.new_bank_bin, "970416".into(), "ACB");
+                        ui.selectable_value(&mut self.new_bank_bin, "970432".into(), "VPBank");
+                        ui.selectable_value(&mut self.new_bank_bin, "970423".into(), "TPBank");
+                    });
+            });
+            ui.add_space(4.0);
+
+            // Account Number Input
+            let is_valid_num = crate::bank_account::validate_bank_number(&self.new_bank_number);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Số tài khoản:")
+                        .size(12.5)
+                        .color(pal.text_secondary),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_bank_number)
+                        .hint_text("Ví dụ: 19036789999"),
+                );
+            });
+            if !self.new_bank_number.is_empty() && !is_valid_num {
+                ui.label(
+                    RichText::new("Số tài khoản phải từ 1-19 ký tự chữ hoặc số")
+                        .size(11.0)
+                        .color(pal.danger),
+                );
+            }
+            ui.add_space(4.0);
+
+            // Holder Name Input
+            let norm_name =
+                crate::bank_account::normalize_and_validate_holder_name(&self.new_bank_holder_name);
+            let is_valid_name = norm_name.is_some();
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Tên chủ thẻ:")
+                        .size(12.5)
+                        .color(pal.text_secondary),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.new_bank_holder_name)
+                        .hint_text("NGUYEN VAN A"),
+                );
+                if resp.lost_focus() {
+                    if let Some(ref n) = norm_name {
+                        self.new_bank_holder_name = n.clone();
+                    }
+                }
+            });
+            if !self.new_bank_holder_name.is_empty() && !is_valid_name {
+                ui.label(
+                    RichText::new("Tên chủ thẻ từ 5-50 ký tự viết hoa không dấu")
+                        .size(11.0)
+                        .color(pal.danger),
+                );
+            }
+            ui.add_space(8.0);
+            ui.separator();
+
+            // Buttons
+            ui.horizontal(|ui| {
+                if ui.button(crate::i18n::tr("Đóng")).clicked() {
+                    close_modal = true;
+                }
+                let can_submit = is_valid_num && is_valid_name;
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            can_submit,
+                            egui::Button::new(
+                                RichText::new("Gửi vào chat").strong().color(Color32::WHITE),
+                            )
+                            .fill(pal.primary),
+                        )
+                        .clicked()
+                    {
+                        send_to_chat = true;
+                    }
+                    if ui
+                        .add_enabled(can_submit, egui::Button::new("Lưu tài khoản"))
+                        .clicked()
+                    {
+                        save_account = true;
+                    }
+                });
+            });
+        });
+
+        if close_modal {
+            open = false;
+        }
+        self.bank_account_modal_open = open;
+        if save_account {
+            let holder =
+                crate::bank_account::normalize_and_validate_holder_name(&self.new_bank_holder_name)
+                    .unwrap_or_else(|| self.new_bank_holder_name.clone());
+            let intent_key = (
+                self.user_uin.clone(),
+                self.new_bank_bin.clone(),
+                self.new_bank_number.clone(),
+            );
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.bank_intent_lock.entry(intent_key)
+            {
+                let req_id = crate::search::generation();
+                e.insert(req_id);
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::CreateBankAccount {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        request_id: req_id,
+                        bin: self.new_bank_bin.clone(),
+                        bank_number: self.new_bank_number.clone(),
+                        holder_name: holder,
+                    });
+                }
+            } else {
+                self.show_toast("Yêu cầu lưu tài khoản đang được xử lý, vui lòng chờ");
+            }
+        }
+        if send_to_chat {
+            self.bank_account_modal_open = false;
+            let holder =
+                crate::bank_account::normalize_and_validate_holder_name(&self.new_bank_holder_name)
+                    .unwrap_or_else(|| self.new_bank_holder_name.clone());
+            if let Some(t) = self.threads.get(self.selected_thread_index) {
+                if let Some(tx) = WORKER_TX.get() {
+                    let _ = tx.send(WorkerCmd::SendBankCard {
+                        owner: self.user_uin.clone(),
+                        runtime_id: self.account_runtime_id,
+                        request_id: crate::search::generation(),
+                        to_id: t.id.clone(),
+                        is_group: t.is_group,
+                        bin: self.new_bank_bin.clone(),
+                        bank_number: self.new_bank_number.clone(),
+                        holder_name: holder,
                     });
                 }
             }
@@ -6778,7 +8093,7 @@ mod sync_and_order_tests {
             name: "Fixture chat".into(),
             ..Default::default()
         }];
-        app.selected_thread_index = 0;
+        app.select_thread_by_index(0);
         for modal in [true, false] {
             app.settings_modal_open = modal;
             app.info_drawer_open = false;
@@ -6824,7 +8139,7 @@ mod sync_and_order_tests {
             name: "Fixture chat".into(),
             ..Default::default()
         }];
-        app.selected_thread_index = 0;
+        app.select_thread_by_index(0);
         app.info_drawer_open = true;
         let _ = ctx.run(
             egui::RawInput {
@@ -6872,7 +8187,7 @@ mod sync_and_order_tests {
             }],
             ..Default::default()
         }];
-        app.selected_thread_index = 0;
+        app.select_thread_by_index(0);
         app.bind_timeline_selection("100", false);
         app.selected_msg_ids.insert("message-one".into());
         ctx.data_mut(|data| data.insert_temp(Id::new("narrow_drawer_open"), true));
@@ -7277,13 +8592,28 @@ fn plain_composer_enter(event: &egui::Event) -> bool {
         if !modifiers.shift && !modifiers.ctrl && !modifiers.alt && !modifiers.command && !modifiers.mac_cmd)
 }
 
-fn consume_composer_enter(events: &mut Vec<egui::Event>) -> bool {
-    if let Some(index) = events.iter().position(plain_composer_enter) {
+fn ctrl_composer_enter(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. }
+        if (modifiers.ctrl || modifiers.command || modifiers.mac_cmd) && !modifiers.shift && !modifiers.alt)
+}
+
+fn consume_composer_send_key(events: &mut Vec<egui::Event>, enter_to_send: bool) -> bool {
+    let matcher = if enter_to_send {
+        plain_composer_enter
+    } else {
+        ctrl_composer_enter
+    };
+    if let Some(index) = events.iter().position(matcher) {
         events.remove(index);
         true
     } else {
         false
     }
+}
+
+#[cfg(test)]
+fn consume_composer_enter(events: &mut Vec<egui::Event>) -> bool {
+    consume_composer_send_key(events, true)
 }
 
 fn consume_composer_format_shortcut(events: &mut Vec<egui::Event>) -> bool {
@@ -7703,6 +9033,31 @@ mod composer_tests {
     }
 
     #[test]
+    fn enter_to_send_toggle_switches_between_plain_and_ctrl_enter() {
+        let plain_enter = key(Key::Enter, egui::Modifiers::NONE);
+        let ctrl_enter = key(Key::Enter, egui::Modifiers::CTRL);
+        let shift_enter = key(Key::Enter, egui::Modifiers::SHIFT);
+
+        // When enter_to_send is true:
+        let mut events1 = vec![plain_enter.clone(), ctrl_enter.clone(), shift_enter.clone()];
+        assert!(consume_composer_send_key(&mut events1, true));
+        assert_eq!(events1.len(), 2, "plain enter consumed");
+        assert!(
+            !consume_composer_send_key(&mut events1, true),
+            "shift or ctrl enter not consumed as send"
+        );
+
+        // When enter_to_send is false:
+        let mut events2 = vec![plain_enter, ctrl_enter, shift_enter];
+        assert!(consume_composer_send_key(&mut events2, false));
+        assert_eq!(events2.len(), 2, "ctrl enter consumed");
+        assert!(
+            !consume_composer_send_key(&mut events2, false),
+            "plain or shift enter not consumed as send"
+        );
+    }
+
+    #[test]
     fn enter_bursts_keep_each_draft_boundary_in_one_native_frame() {
         let ctx = egui::Context::default();
         let id = Id::new("burst-editor");
@@ -8062,7 +9417,7 @@ mod composer_tests {
                 is_group: true,
                 ..Default::default()
             }];
-            app.selected_thread_index = 0;
+            app.select_thread_by_index(0);
             for _ in 0..4 {
                 let input = egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -8126,7 +9481,7 @@ mod composer_tests {
             name: "Composer".into(),
             ..Default::default()
         }];
-        app.selected_thread_index = 0;
+        app.select_thread_by_index(0);
         let scope = Id::new(("chat_composer_input", "composer-fixture"))
             .with((&app.user_uin, app.account_runtime_id));
         let mut heights = Vec::new();
@@ -8227,9 +9582,51 @@ mod composer_tests {
         assert!(app.send_contact_modal_open);
         assert_eq!(app.send_contact_filter, 0);
 
-        // Test selection
-        app.send_contact_selected = Some("peer-direct-1".into());
-        assert_eq!(app.send_contact_selected.as_deref(), Some("peer-direct-1"));
+        // Test selection and 9-contact hard limit
+        app.send_contact_selected.insert("peer-direct-1".into());
+        assert!(app.send_contact_selected.contains("peer-direct-1"));
+        assert_eq!(app.send_contact_selected.len(), 1);
+        for i in 2..=9 {
+            app.send_contact_selected.insert(format!("peer-direct-{i}"));
+        }
+        assert_eq!(app.send_contact_selected.len(), 9);
+        // Phone include checkbox
+        assert!(!app.send_contact_include_phone);
+        app.send_contact_include_phone = true;
+        assert!(app.send_contact_include_phone);
+    }
+
+    #[test]
+    fn send_contact_cards_worker_command_structure() {
+        let item = crate::gui::worker::ContactCardItem {
+            contact_id: "u123".into(),
+            contact_name: "Test User".into(),
+            phone: "0912345678".into(),
+            avatar: "https://avatar".into(),
+            client_id: 10001,
+        };
+        let cmd = crate::gui::worker::WorkerCmd::SendContactCards {
+            owner: "test_owner".into(),
+            runtime_id: 1,
+            request_id: 100,
+            to_id: "thread_1".into(),
+            is_group: false,
+            cards: vec![item.clone()],
+        };
+        match cmd {
+            crate::gui::worker::WorkerCmd::SendContactCards {
+                owner,
+                runtime_id,
+                cards,
+                ..
+            } => {
+                assert_eq!(owner, "test_owner");
+                assert_eq!(runtime_id, 1);
+                assert_eq!(cards.len(), 1);
+                assert_eq!(cards[0], item);
+            }
+            _ => panic!("Expected SendContactCards"),
+        }
     }
 
     #[test]
@@ -8266,6 +9663,113 @@ mod composer_tests {
             app.input_message,
             "Chuyển tiền qua STK: 19036789999 Techcombank"
         );
+    }
+
+    #[test]
+    fn test_quick_message_inline_search_and_expansion_without_immediate_send() {
+        let (mut app, _) = super::sync_and_order_tests::app_and_context();
+        app.tools.config.quick_messages.upsert(
+            "/hello".into(),
+            "Chào".into(),
+            "Xin chào bạn, chúc một ngày tốt lành!".into(),
+        );
+
+        // Search trigger
+        let matches = app.tools.config.quick_messages.search("/he");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].shortcut, "/hello");
+
+        // Simulate typing "/hello" in composer and expanding via Enter
+        app.input_message = "/hello".into();
+        let chosen = matches[0];
+        // Invariant: template expands into input_message, but DOES NOT SEND IMMEDIATELY
+        app.input_message = chosen.text.clone();
+        assert_eq!(app.input_message, "Xin chào bạn, chúc một ngày tốt lành!");
+        let can_send = !app.input_message.trim().is_empty();
+        assert!(
+            can_send,
+            "Like button must switch to Send button after template expansion"
+        );
+    }
+
+    #[test]
+    fn test_quick_message_token_at_cursor_and_expansion_preserves_surrounding_text() {
+        let (mut app, _) = super::sync_and_order_tests::app_and_context();
+        let text = "Gửi hàng về /dc nhé bạn";
+        // Cursor is after /dc (find the char offset)
+        let byte_end = text.find("/dc").unwrap() + 3;
+        let char_cursor = text[..byte_end].chars().count();
+        let token = quick_message_token_at_cursor(text, char_cursor);
+        assert!(token.is_some());
+        let (start, end, tok) = token.unwrap();
+        assert_eq!(tok, "/dc");
+        assert_eq!(&text[start..end], "/dc");
+
+        let qm = crate::quick_message::QuickMessage {
+            id: "1".into(),
+            shortcut: "/dc".into(),
+            title: "Địa chỉ".into(),
+            text: "123 Đường Láng".into(),
+            media: None,
+            msg_type: 0,
+        };
+
+        app.input_message = text.into();
+        let ctx = egui::Context::default();
+        app.apply_quick_message_expansion(&ctx, "test-thread", &qm, char_cursor);
+        assert_eq!(app.input_message, "Gửi hàng về 123 Đường Láng nhé bạn");
+
+        // Modal / Toolbar pick with no inline token appends to message safely
+        let qm_append = crate::quick_message::QuickMessage {
+            id: "2".into(),
+            shortcut: "/phone".into(),
+            title: "SĐT".into(),
+            text: "0912345678".into(),
+            media: None,
+            msg_type: 0,
+        };
+        app.quick_message_activation_context = None;
+        app.insert_or_append_quick_message(&ctx, "test-thread", &qm_append);
+        assert_eq!(
+            app.input_message,
+            "Gửi hàng về 123 Đường Láng nhé bạn 0912345678"
+        );
+    }
+
+    #[test]
+    fn test_bank_account_suite_validation_and_fencing() {
+        assert!(crate::bank_account::validate_bank_number("19036789999"));
+        assert!(!crate::bank_account::validate_bank_number(""));
+        assert!(!crate::bank_account::validate_bank_number(
+            "12345678901234567890"
+        )); // > 19
+
+        let holder = crate::bank_account::normalize_and_validate_holder_name("Nguyễn Văn A");
+        assert_eq!(holder, Some("NGUYEN VAN A".to_string()));
+
+        let cmd = crate::gui::worker::WorkerCmd::SendBankCard {
+            owner: "test_owner".into(),
+            runtime_id: 1,
+            request_id: 10,
+            to_id: "thread_123".into(),
+            is_group: false,
+            bin: "970407".into(),
+            bank_number: "19036789999".into(),
+            holder_name: "NGUYEN VAN A".into(),
+        };
+        match cmd {
+            crate::gui::worker::WorkerCmd::SendBankCard {
+                owner,
+                runtime_id,
+                bank_number,
+                ..
+            } => {
+                assert_eq!(owner, "test_owner");
+                assert_eq!(runtime_id, 1);
+                assert_eq!(bank_number, "19036789999");
+            }
+            _ => panic!("Expected SendBankCard"),
+        }
     }
 
     #[test]
@@ -9847,13 +11351,29 @@ impl ZaloGuiApp {
                                 owner: self.user_uin.clone(),
                                 runtime_id: self.account_runtime_id,
                             });
-                            let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                                limit: 500,
-                                group_id: d_id.to_string(),
-                                is_group: false,
-                            });
+                            let req_id = self.next_history_request_id;
+                            if tx
+                                .send(WorkerCmd::LoadGroupHistory {
+                                    owner: self.user_uin.clone(),
+                                    runtime_id: self.account_runtime_id,
+                                    request_id: req_id,
+                                    limit: 500,
+                                    group_id: d_id.to_string(),
+                                    is_group: false,
+                                })
+                                .is_ok()
+                            {
+                                self.next_history_request_id =
+                                    self.next_history_request_id.wrapping_add(1).max(1);
+                                self.history_pending_requests
+                                    .insert(d_id.to_string(), req_id);
+                                self.show_toast("Đang đồng bộ dữ liệu Cloud…");
+                            } else {
+                                self.show_toast(
+                                    "Không thể gửi yêu cầu đồng bộ Cloud: worker chưa sẵn sàng",
+                                );
+                            }
                         }
-                        self.show_toast("Đang đồng bộ dữ liệu Cloud…");
                     } else if d_is_group {
                         self.open_group_panel(d_id.to_string(), true, false);
                     } else {
@@ -10040,11 +11560,26 @@ impl ZaloGuiApp {
                         });
                         ui.add_space(6.0);
                         if shared_photos.is_empty() {
-                            ui.label(
-                                RichText::new("Chưa có ảnh hoặc video chia sẻ.")
+                            let server_count = self
+                                .drawer_media
+                                .get(&(self.account_runtime_id, d_id.to_string()))
+                                .map(|v| v.photos.items.len())
+                                .unwrap_or(0);
+                            if server_count > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Có {server_count} ảnh/video trên máy chủ (bấm 'Xem tất cả >' để mở)."
+                                    ))
                                     .size(11.0)
-                                    .color(pal.text_muted),
-                            );
+                                    .color(pal.primary),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Chưa có ảnh/video cục bộ (bấm 'Xem tất cả >' để mở kho máy chủ).")
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                );
+                            }
                         } else {
                             let cell_sz = ((ui.available_width() - 18.0) / 4.0).clamp(56.0, 72.0);
                             ui.horizontal_wrapped(|ui| {
@@ -10097,11 +11632,26 @@ impl ZaloGuiApp {
                         });
                         ui.add_space(6.0);
                         if shared_files.is_empty() {
-                            ui.label(
-                                RichText::new("Chưa có file nào được gửi.")
+                            let server_count = self
+                                .drawer_media
+                                .get(&(self.account_runtime_id, d_id.to_string()))
+                                .map(|v| v.files.items.len())
+                                .unwrap_or(0);
+                            if server_count > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Có {server_count} tệp tin trên máy chủ (bấm 'Xem tất cả >' để mở)."
+                                    ))
                                     .size(11.0)
-                                    .color(pal.text_muted),
-                            );
+                                    .color(pal.primary),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Chưa có file cục bộ (bấm 'Xem tất cả >' để mở kho máy chủ).")
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                );
+                            }
                         } else {
                             for (media, msg) in shared_files.iter().take(3) {
                                 self.render_file_row(ui, media, msg, d_id, d_is_group, pal);
@@ -10148,11 +11698,26 @@ impl ZaloGuiApp {
                         });
                         ui.add_space(6.0);
                         if shared_links.is_empty() {
-                            ui.label(
-                                RichText::new("Chưa có liên kết nào.")
+                            let server_count = self
+                                .drawer_media
+                                .get(&(self.account_runtime_id, d_id.to_string()))
+                                .map(|v| v.links.items.len())
+                                .unwrap_or(0);
+                            if server_count > 0 {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Có {server_count} liên kết trên máy chủ (bấm 'Xem tất cả >' để mở)."
+                                    ))
                                     .size(11.0)
-                                    .color(pal.text_muted),
-                            );
+                                    .color(pal.primary),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Chưa có liên kết cục bộ (bấm 'Xem tất cả >' để mở kho máy chủ).")
+                                        .size(11.0)
+                                        .color(pal.text_muted),
+                                );
+                            }
                         } else {
                             for (url, title, msg) in shared_links.iter().take(3) {
                                 self.render_link_row(ui, url, title, msg, d_id, d_is_group, pal);
@@ -11045,6 +12610,343 @@ impl ZaloGuiApp {
         }
     }
 
+    fn render_drawer_server_media_view(
+        &mut self,
+        ui: &mut egui::Ui,
+        d_id: &str,
+        _d_is_group: bool,
+        tab: MediaTab,
+        pal: &ThemePalette,
+    ) {
+        let runtime_id = self.account_runtime_id;
+        let needs_initial_load = self
+            .drawer_media
+            .get(&(runtime_id, d_id.to_string()))
+            .map(|entry| {
+                let cat = match tab {
+                    MediaTab::Photos => &entry.photos,
+                    MediaTab::Files => &entry.files,
+                    MediaTab::Links => &entry.links,
+                };
+                !cat.is_initial_loaded && !cat.is_loading
+            })
+            .unwrap_or(true);
+
+        if needs_initial_load {
+            self.request_drawer_server_media(d_id, tab, false);
+        }
+
+        let mut trigger_refresh = false;
+        let mut trigger_load_more = false;
+        let mut download_item = None;
+        let mut open_link_url = None;
+
+        ui.horizontal(|ui| {
+            let p_sel = tab == MediaTab::Photos;
+            if ui.selectable_label(p_sel, "🖼️ Ảnh/Video").clicked() {
+                self.drawer_media_active_tab = MediaTab::Photos;
+                self.drawer_view = DrawerView::MediaStorage {
+                    tab: MediaTab::Photos,
+                };
+            }
+            let f_sel = tab == MediaTab::Files;
+            if ui.selectable_label(f_sel, "📄 File").clicked() {
+                self.drawer_media_active_tab = MediaTab::Files;
+                self.drawer_view = DrawerView::MediaStorage {
+                    tab: MediaTab::Files,
+                };
+            }
+            let l_sel = tab == MediaTab::Links;
+            if ui.selectable_label(l_sel, "🔗 Link").clicked() {
+                self.drawer_media_active_tab = MediaTab::Links;
+                self.drawer_view = DrawerView::MediaStorage {
+                    tab: MediaTab::Links,
+                };
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("🔄")
+                    .on_hover_text("Tải lại từ máy chủ Zalo")
+                    .clicked()
+                {
+                    trigger_refresh = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        if tab != MediaTab::Photos {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.drawer_media_query)
+                    .hint_text("Tìm trong danh sách đã tải…")
+                    .desired_width(180.0_f32.min(ui.available_width())),
+            );
+        }
+
+        let cat_opt =
+            self.drawer_media
+                .get(&(runtime_id, d_id.to_string()))
+                .map(|entry| match tab {
+                    MediaTab::Photos => &entry.photos,
+                    MediaTab::Files => &entry.files,
+                    MediaTab::Links => &entry.links,
+                });
+
+        let is_loading = cat_opt.map(|c| c.is_loading).unwrap_or(true);
+        let is_empty = cat_opt.map(|c| c.items.is_empty()).unwrap_or(true);
+        let is_initial_loaded = cat_opt.map(|c| c.is_initial_loaded).unwrap_or(false);
+        let error = cat_opt.and_then(|c| c.error.clone());
+        let has_more = cat_opt.map(|c| c.has_more).unwrap_or(false);
+
+        if is_loading && is_empty {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    RichText::new("Đang tải dữ liệu từ kho media máy chủ Zalo…")
+                        .color(pal.text_muted),
+                );
+            });
+            if trigger_refresh {
+                self.request_drawer_server_media(d_id, tab, true);
+            }
+            return;
+        }
+
+        if let Some(ref err) = error {
+            ui.colored_label(pal.danger, format!("Lỗi kết nối máy chủ: {err}"));
+            if ui.button("Thử lại").clicked() {
+                trigger_refresh = true;
+            }
+            if is_empty {
+                if trigger_refresh {
+                    self.request_drawer_server_media(d_id, tab, true);
+                }
+                return;
+            }
+        }
+
+        if is_empty && is_initial_loaded {
+            ui.label(
+                RichText::new("Chưa có mục nào trong kho media máy chủ.").color(pal.text_muted),
+            );
+            if trigger_refresh {
+                self.request_drawer_server_media(d_id, tab, true);
+            }
+            return;
+        }
+
+        let query = crate::search::fold(self.drawer_media_query.trim());
+        let items: Vec<crate::server_media::ServerMediaItem> =
+            cat_opt.map(|c| c.items.clone()).unwrap_or_default();
+        let filtered: Vec<&crate::server_media::ServerMediaItem> = items
+            .iter()
+            .filter(|item| {
+                if query.is_empty() {
+                    true
+                } else {
+                    crate::search::fold(&item.file_name).contains(&query)
+                        || crate::search::fold(&item.url).contains(&query)
+                }
+            })
+            .collect();
+
+        ui.small(format!(
+            "Hiển thị {} / {} mục đã tải từ máy chủ (chỉ mục server)",
+            filtered.len(),
+            items.len()
+        ));
+
+        egui::ScrollArea::vertical()
+            .id_salt("drawer_server_media_scroll")
+            .max_height((ui.available_height() - 40.0).max(120.0))
+            .show(ui, |ui| {
+                match tab {
+                    MediaTab::Photos => {
+                        let gap = 6.0;
+                        let columns = ((ui.available_width() + gap) / (72.0 + gap))
+                            .floor()
+                            .clamp(1.0, 3.0) as usize;
+                        let cell_sz = ((ui.available_width() - (columns - 1) as f32 * gap)
+                            / columns as f32)
+                            .clamp(32.0, 112.0);
+                        for chunk in filtered.chunks(columns) {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing = Vec2::new(gap, gap);
+                                for item in chunk {
+                                    let (rect, resp) = ui
+                                        .allocate_exact_size(Vec2::splat(cell_sz), Sense::click());
+                                    let painter = ui.painter();
+                                    painter.rect_filled(rect, Rounding::same(4.0), pal.bg_elevated);
+                                    let border_color = if resp.hovered() {
+                                        pal.primary
+                                    } else {
+                                        pal.border
+                                    };
+                                    painter.rect_stroke(
+                                        rect,
+                                        Rounding::same(4.0),
+                                        Stroke::new(1.0_f32, border_color),
+                                    );
+
+                                    let icon = if item.media_type
+                                        == crate::server_media::ServerMediaType::Video
+                                    {
+                                        "🎬"
+                                    } else {
+                                        "🖼️"
+                                    };
+                                    painter.text(
+                                        rect.center() - Vec2::new(0.0, 6.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        icon,
+                                        FontId::proportional(20.0),
+                                        pal.text_primary,
+                                    );
+                                    let short_name = if item.file_name.is_empty() {
+                                        "Media"
+                                    } else {
+                                        &item.file_name
+                                    };
+                                    let truncated = if short_name.len() > 10 {
+                                        format!("{}…", &short_name[..8])
+                                    } else {
+                                        short_name.to_string()
+                                    };
+                                    painter.text(
+                                        rect.center() + Vec2::new(0.0, 16.0),
+                                        egui::Align2::CENTER_CENTER,
+                                        truncated,
+                                        FontId::proportional(9.0),
+                                        pal.text_secondary,
+                                    );
+
+                                    if resp.clicked() && !item.url.is_empty() {
+                                        download_item = Some((
+                                            item.url.clone(),
+                                            if item.file_name.is_empty() {
+                                                "media.jpg".into()
+                                            } else {
+                                                item.file_name.clone()
+                                            },
+                                            item.media_type
+                                                == crate::server_media::ServerMediaType::Video,
+                                        ));
+                                    }
+                                }
+                            });
+                            ui.add_space(gap);
+                        }
+                    }
+                    MediaTab::Files => {
+                        for item in &filtered {
+                            ui.horizontal(|ui| {
+                                ui.label("📁");
+                                ui.vertical(|ui| {
+                                    let name = if item.file_name.is_empty() {
+                                        "Tập tin"
+                                    } else {
+                                        &item.file_name
+                                    };
+                                    let size_str = crate::chat::format_file_size(item.file_size);
+                                    let date_str =
+                                        chrono::DateTime::from_timestamp_millis(item.created_ts)
+                                            .map(|d| {
+                                                d.with_timezone(&chrono::Local)
+                                                    .format("%d/%m/%Y %H:%M")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_default();
+                                    let btn = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(name).size(12.0).color(pal.primary_hover),
+                                        )
+                                        .sense(Sense::click()),
+                                    );
+                                    if btn.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if btn.clicked() && !item.url.is_empty() {
+                                        download_item =
+                                            Some((item.url.clone(), item.file_name.clone(), false));
+                                    }
+                                    ui.small(format!("{size_str} · {date_str}"));
+                                });
+                            });
+                            ui.separator();
+                        }
+                    }
+                    MediaTab::Links => {
+                        for item in &filtered {
+                            ui.horizontal(|ui| {
+                                ui.label("🔗");
+                                ui.vertical(|ui| {
+                                    let title = if item.file_name.is_empty() {
+                                        &item.url
+                                    } else {
+                                        &item.file_name
+                                    };
+                                    let btn = ui.add(
+                                        egui::Label::new(
+                                            RichText::new(title)
+                                                .size(12.0)
+                                                .color(pal.primary_hover),
+                                        )
+                                        .sense(Sense::click()),
+                                    );
+                                    if btn.hovered() {
+                                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                                    }
+                                    if btn.clicked() && !item.url.is_empty() {
+                                        open_link_url = Some(item.url.clone());
+                                    }
+                                    if title != &item.url {
+                                        ui.small(&item.url);
+                                    }
+                                });
+                            });
+                            ui.separator();
+                        }
+                    }
+                }
+
+                if has_more {
+                    ui.add_space(8.0);
+                    if is_loading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.small("Đang tải trang tiếp theo từ máy chủ…");
+                        });
+                    } else if ui.button("⬇️ Tải thêm từ máy chủ").clicked() {
+                        trigger_load_more = true;
+                    }
+                } else if !items.is_empty() {
+                    ui.add_space(4.0);
+                    ui.small("Đã hiển thị toàn bộ mục từ máy chủ.");
+                }
+            });
+
+        if trigger_refresh {
+            self.request_drawer_server_media(d_id, tab, true);
+        }
+        if trigger_load_more {
+            self.request_drawer_server_media(d_id, tab, false);
+        }
+        if let Some((url, name, is_video)) = download_item {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::DownloadMedia {
+                    url,
+                    name,
+                    play: is_video,
+                    open: true,
+                    context: None,
+                });
+            }
+        }
+        if let Some(url) = open_link_url {
+            ui.ctx().open_url(egui::OpenUrl::same_tab(&url));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_drawer_media_storage_view(
         &mut self,
@@ -11058,6 +12960,25 @@ impl ZaloGuiApp {
         pal: &ThemePalette,
     ) {
         self.render_drawer_subview_header(ui, "Kho lưu trữ", pal);
+
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.drawer_media_source_server,
+                true,
+                "🌐 Kho Media Server",
+            );
+            ui.selectable_value(
+                &mut self.drawer_media_source_server,
+                false,
+                "💾 Tin nhắn cục bộ",
+            );
+        });
+        ui.separator();
+
+        if self.drawer_media_source_server {
+            self.render_drawer_server_media_view(ui, d_id, d_is_group, tab, pal);
+            return;
+        }
 
         let mut sender_entries = std::collections::BTreeMap::new();
         for message in self.archive_history.messages.iter().chain(
@@ -12271,17 +14192,14 @@ impl ZaloGuiApp {
     }
 
     pub(super) fn cancel_voice_if_context_changed(&mut self) {
-        let matches_selected = self
-            .threads
-            .get(self.selected_thread_index)
-            .is_some_and(|thread| {
-                self.voice_draft_matches(
-                    &self.user_uin,
-                    self.account_runtime_id,
-                    &thread.id,
-                    thread.is_group,
-                )
-            });
+        let matches_selected = self.current_thread().is_some_and(|thread| {
+            self.voice_draft_matches(
+                &self.user_uin,
+                self.account_runtime_id,
+                &thread.id,
+                thread.is_group,
+            )
+        });
         if self.voice_binding.is_some() && !matches_selected {
             self.cancel_voice_recording();
         }
@@ -12316,7 +14234,7 @@ impl ZaloGuiApp {
                 }
             }
         } else {
-            let Some(thread) = self.threads.get(self.selected_thread_index) else {
+            let Some(thread) = self.current_thread() else {
                 return;
             };
             if !self.is_logged_in || thread.id.is_empty() {
@@ -12388,18 +14306,15 @@ impl ZaloGuiApp {
                 } => {
                     let current_binding = self.voice_binding.as_ref().is_some_and(|binding| {
                         binding.generation == generation
-                            && binding.matches(
-                                &self.user_uin,
-                                self.account_runtime_id,
-                                self.threads
-                                    .get(self.selected_thread_index)
-                                    .map(|thread| thread.id.as_str())
-                                    .unwrap_or_default(),
-                                self.threads
-                                    .get(self.selected_thread_index)
-                                    .is_some_and(|thread| thread.is_group),
-                                self.voice_context_generation,
-                            )
+                            && self.current_thread().is_some_and(|thread| {
+                                binding.matches(
+                                    &self.user_uin,
+                                    self.account_runtime_id,
+                                    &thread.id,
+                                    thread.is_group,
+                                    self.voice_context_generation,
+                                )
+                            })
                     });
                     if !current_binding {
                         continue;
@@ -12501,17 +14416,10 @@ impl ZaloGuiApp {
         rate: u32,
         dur: std::time::Duration,
     ) {
-        if !self.voice_draft_matches(
-            &self.user_uin,
-            self.account_runtime_id,
-            self.threads
-                .get(self.selected_thread_index)
-                .map(|t| t.id.as_str())
-                .unwrap_or_default(),
-            self.threads
-                .get(self.selected_thread_index)
-                .is_some_and(|t| t.is_group),
-        ) {
+        let draft_matches = self.current_thread().is_some_and(|t| {
+            self.voice_draft_matches(&self.user_uin, self.account_runtime_id, &t.id, t.is_group)
+        });
+        if !draft_matches {
             self.cancel_voice_recording();
             return;
         }

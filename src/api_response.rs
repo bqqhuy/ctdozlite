@@ -16,6 +16,22 @@ pub fn integer(value: &Value) -> Option<i64> {
         .as_i64()
         .or_else(|| value.as_str()?.trim().parse().ok())
 }
+/// Extract a string or numeric scalar as String for identifiers across server schemas.
+pub fn string_or_integer(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(n) = value.as_i64() {
+        return Some(n.to_string());
+    }
+    if let Some(u) = value.as_u64() {
+        return Some(u.to_string());
+    }
+    None
+}
 /// Read a typed refusal through anyhow context instead of matching error text.
 pub fn server_code(error: &anyhow::Error) -> Option<i64> {
     error.downcast_ref::<ServerError>().map(|error| error.0)

@@ -2,6 +2,7 @@
 pub const PRODUCT_VERSION: &str = "v0.016-arm";
 
 pub mod account_recovery;
+pub mod bank_account;
 pub mod business;
 pub mod call;
 pub mod chat;

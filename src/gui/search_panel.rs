@@ -417,6 +417,7 @@ impl ZaloGuiApp {
                         let sent = WORKER_TX.get().is_some_and(|tx| {
                             tx.send(WorkerCmd::Tools {
                                 owner: self.user_uin.clone(),
+                                origin: None,
                                 command: super::tools_panel::ToolsCommand::SearchPage(
                                     self.history_search.request.clone(),
                                 ),
@@ -463,11 +464,22 @@ impl ZaloGuiApp {
                     self.history_search.open = false;
                     if !group {
                         if let Some(tx) = WORKER_TX.get() {
-                            let _ = tx.send(WorkerCmd::LoadGroupHistory {
-                                group_id: thread,
-                                is_group: false,
-                                limit: 150,
-                            });
+                            let req_id = self.next_history_request_id;
+                            if tx
+                                .send(WorkerCmd::LoadGroupHistory {
+                                    owner: self.user_uin.clone(),
+                                    runtime_id: self.account_runtime_id,
+                                    request_id: req_id,
+                                    group_id: thread.clone(),
+                                    is_group: false,
+                                    limit: 150,
+                                })
+                                .is_ok()
+                            {
+                                self.next_history_request_id =
+                                    self.next_history_request_id.wrapping_add(1).max(1);
+                                self.history_pending_requests.insert(thread, req_id);
+                            }
                         }
                     }
                 }
@@ -477,6 +489,7 @@ impl ZaloGuiApp {
                 let sent = WORKER_TX.get().is_some_and(|tx| {
                     tx.send(WorkerCmd::Tools {
                         owner: self.user_uin.clone(),
+                        origin: None,
                         command: super::tools_panel::ToolsCommand::OpenSearchHit {
                             generation,
                             thread,

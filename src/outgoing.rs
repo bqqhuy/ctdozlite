@@ -32,6 +32,11 @@ pub enum Payload {
         #[serde(default)]
         hd_source: Option<HdSource>,
     },
+    BankCard {
+        bin: String,
+        bank_number: String,
+        holder_name: String,
+    },
 }
 /// The original photo an HD copy was made from.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -637,6 +642,29 @@ async fn send_inner(s: &Session, to: &str, message: &ChatMessage) -> Result<Chat
                 let _ = tokio::fs::remove_file(&upload).await;
             }
             sent = result;
+            serde_json::Value::Null
+        }
+        Payload::BankCard {
+            bin,
+            bank_number,
+            holder_name,
+        } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            crate::bank_account::send_bank_card(
+                s,
+                to,
+                job.is_group,
+                bin,
+                bank_number,
+                holder_name,
+                id,
+                now,
+            )
+            .await?;
+            sent.id = format!("stk_{id}");
             serde_json::Value::Null
         }
     };

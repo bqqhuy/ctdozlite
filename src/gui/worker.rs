@@ -213,6 +213,411 @@ async fn run_friend_action(
     read_status().await
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactCardItem {
+    pub client_id: u64,
+    pub contact_id: String,
+    pub contact_name: String,
+    pub phone: String,
+    pub avatar: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContactSendStatus {
+    Success,
+    Failed(String),
+    SessionAborted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContactBatchResult {
+    pub owner: String,
+    pub runtime_id: usize,
+    pub request_id: u64,
+    pub to_id: String,
+    pub results: Vec<(String, ContactSendStatus)>,
+}
+
+struct InflightGuard {
+    set: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+    key: (String, u64),
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        let set = self.set.clone();
+        let key = self.key.clone();
+        tokio::spawn(async move {
+            let mut s = set.lock().await;
+            s.remove(&key);
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_send_contact_cards_cmd(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+    inflight_dedup: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+    owner: String,
+    runtime_id: usize,
+    request_id: u64,
+    to_id: String,
+    is_group: bool,
+    cards: Vec<ContactCardItem>,
+) {
+    {
+        let mut set = inflight_dedup.lock().await;
+        if !set.insert((owner.clone(), request_id)) {
+            return;
+        }
+    }
+    let _guard = InflightGuard {
+        set: inflight_dedup.clone(),
+        key: (owner.clone(), request_id),
+    };
+
+    // Pre-flight session check
+    let s = session.lock().await.clone();
+    if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() {
+        return;
+    }
+
+    let mut results = Vec::new();
+    for card in cards {
+        // Mid-flight fencing: verify session hasn't switched/logged out between requests
+        let current_s = session.lock().await.clone();
+        if current_s.runtime_id() != runtime_id
+            || current_s.account_key() != owner
+            || !current_s.is_active()
+        {
+            results.push((card.contact_id.clone(), ContactSendStatus::SessionAborted));
+            break;
+        }
+
+        let send_res = crate::chat::send_contact_card(
+            &current_s,
+            &to_id,
+            is_group,
+            &card.contact_id,
+            &card.contact_name,
+            &card.phone,
+            &card.avatar,
+            card.client_id,
+        )
+        .await;
+
+        // Post-await fencing: verify session hasn't changed during network flight
+        let post_s = session.lock().await.clone();
+        if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active()
+        {
+            results.push((card.contact_id.clone(), ContactSendStatus::SessionAborted));
+            break;
+        }
+
+        match send_res {
+            Ok(_) => {
+                results.push((card.contact_id.clone(), ContactSendStatus::Success));
+            }
+            Err(e) => {
+                results.push((
+                    card.contact_id.clone(),
+                    ContactSendStatus::Failed(e.to_string()),
+                ));
+            }
+        }
+    }
+
+    let _ = events.send(GuiEvent::ContactBatchCompleted(ContactBatchResult {
+        owner,
+        runtime_id,
+        request_id,
+        to_id,
+        results,
+    }));
+    ctx.request_repaint();
+}
+
+/// Attach the dispatch-time identity to a config snapshot so the GUI can reject stale hydration.
+pub(crate) fn stamp_tools_origin(
+    result: &mut Result<super::tools_panel::ToolsResult, String>,
+    origin: Option<super::tools_panel::ToolsOrigin>,
+) {
+    if let Ok(super::tools_panel::ToolsResult::Loaded { origin: slot, .. }) = result {
+        *slot = origin;
+    }
+}
+
+/// True when a delete failure does not prove the server refused the operation.
+/// Only a typed server refusal or envelope failure is an explicit rejection;
+/// anything else after dispatch (timeout, transport, malformed ACK) is unknown.
+pub(crate) fn quick_message_delete_outcome_unknown(error: &anyhow::Error) -> bool {
+    crate::api_response::server_code(error).is_none()
+        && crate::session::envelope_failure_code(error).is_none()
+}
+
+/// Run one quick-message list request and always emit exactly one terminal event
+/// (`QuickMessagesLoaded` or `QuickMessagesLoadFailed`) scoped to the request.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_fetch_quick_messages_cmd<F, Fut>(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+    owner: String,
+    runtime_id: usize,
+    request_id: u64,
+    mutation_epoch: u64,
+    version: u32,
+    fetch: F,
+) where
+    F: FnOnce(Session, u32) -> Fut,
+    Fut: std::future::Future<
+        Output = anyhow::Result<(Vec<crate::quick_message::QuickMessage>, u32)>,
+    >,
+{
+    let fail = |error: String| {
+        let _ = events.send(GuiEvent::QuickMessagesLoadFailed {
+            owner: owner.clone(),
+            runtime_id,
+            request_id,
+            mutation_epoch,
+            error,
+        });
+    };
+    let s = session.lock().await.clone();
+    if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() {
+        fail("Phiên đăng nhập không còn hợp lệ".into());
+        ctx.request_repaint();
+        return;
+    }
+    let result = fetch(s, version).await;
+    let post_s = session.lock().await.clone();
+    if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() {
+        fail("Phiên đăng nhập đã thay đổi trong lúc tải".into());
+        ctx.request_repaint();
+        return;
+    }
+    match result {
+        Ok((items, new_v)) => {
+            let _ = events.send(GuiEvent::QuickMessagesLoaded {
+                owner: owner.clone(),
+                runtime_id,
+                request_id,
+                mutation_epoch,
+                items,
+                version: new_v,
+            });
+        }
+        Err(e) => fail(e.to_string()),
+    }
+    ctx.request_repaint();
+}
+
+/// Run one quick-message delete and emit exactly one terminal event.
+/// A pre-dispatch refusal is a definite failure; a post-dispatch failure without a
+/// typed server refusal is reported as unknown and never retried here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_delete_quick_messages_cmd<F, Fut>(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+    inflight_dedup: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+    owner: String,
+    runtime_id: usize,
+    request_id: u64,
+    item_ids: Vec<String>,
+    delete: F,
+) where
+    F: FnOnce(Session, Vec<String>) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    {
+        let mut set = inflight_dedup.lock().await;
+        if !set.insert((owner.clone(), request_id)) {
+            return;
+        }
+    }
+    let _guard = InflightGuard {
+        set: inflight_dedup.clone(),
+        key: (owner.clone(), request_id),
+    };
+    let s = session.lock().await.clone();
+    if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() {
+        let _ = events.send(GuiEvent::QuickMessagesDeleteFailed {
+            owner,
+            runtime_id,
+            request_id,
+            error: "Phiên đăng nhập không còn hợp lệ".into(),
+            is_transport_unknown: false,
+        });
+        ctx.request_repaint();
+        return;
+    }
+    // The consumer fences owner/runtime, so a result is never dropped here.
+    match delete(s, item_ids).await {
+        Ok(()) => {
+            let _ = events.send(GuiEvent::QuickMessagesDeleted {
+                owner,
+                runtime_id,
+                request_id,
+            });
+        }
+        Err(e) => {
+            let is_transport_unknown = quick_message_delete_outcome_unknown(&e);
+            let _ = events.send(GuiEvent::QuickMessagesDeleteFailed {
+                owner,
+                runtime_id,
+                request_id,
+                error: e.to_string(),
+                is_transport_unknown,
+            });
+        }
+    }
+    ctx.request_repaint();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_create_poll_cmd(
+    session: std::sync::Arc<tokio::sync::Mutex<Session>>,
+    events: Sender<GuiEvent>,
+    ctx: egui::Context,
+    inflight_dedup: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>>,
+    owner: String,
+    runtime_id: usize,
+    request_id: u64,
+    thread_id: String,
+    question: String,
+    options: Vec<String>,
+    multi: bool,
+    anonymous: bool,
+    allow_add: bool,
+) {
+    {
+        let mut set = inflight_dedup.lock().await;
+        if !set.insert((owner.clone(), request_id)) {
+            return;
+        }
+    }
+    let _guard = InflightGuard {
+        set: inflight_dedup.clone(),
+        key: (owner.clone(), request_id),
+    };
+
+    let s = session.lock().await.clone();
+    if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() {
+        return;
+    }
+    let res = crate::group_content::create_poll(
+        &s, &thread_id, &question, &options, multi, anonymous, allow_add,
+    )
+    .await;
+
+    // Post-await fencing: verify session hasn't switched during await
+    let post_s = session.lock().await.clone();
+    if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() {
+        return;
+    }
+
+    match res {
+        Ok(reply) => {
+            if let Some(poll_id) = reply.created_poll_id {
+                if let Some(rb_err) = reply.readback_error {
+                    let _ = events.send(GuiEvent::PollCreatedWithReadbackError {
+                        owner,
+                        runtime_id,
+                        request_id,
+                        thread_id: thread_id.clone(),
+                        poll_id,
+                        error: rb_err,
+                    });
+                } else {
+                    let poll_item = reply.detail.map(Into::into);
+                    let _ = events.send(GuiEvent::PollCreated {
+                        owner: owner.clone(),
+                        runtime_id,
+                        request_id,
+                        thread_id: thread_id.clone(),
+                        poll_id,
+                        poll: poll_item,
+                    });
+                    if let Ok(list_rep) = crate::group_content::execute(
+                        &post_s,
+                        &thread_id,
+                        &crate::group_content::Action::ListPolls {
+                            page: 1,
+                            last: String::new(),
+                            last_type: 0,
+                        },
+                    )
+                    .await
+                    {
+                        let mut poll_items: Vec<crate::poll::PollItem> = list_rep
+                            .polls
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(Into::into)
+                            .collect();
+                        for p in &mut poll_items {
+                            p.grid = thread_id.clone();
+                        }
+                        let current = session.lock().await.clone();
+                        if current.runtime_id() == runtime_id
+                            && current.account_key() == owner
+                            && current.is_active()
+                        {
+                            let _ = events.send(GuiEvent::GroupPollsLoaded {
+                                runtime_id: post_s.runtime_id(),
+                                thread_id: thread_id.clone(),
+                                polls: poll_items,
+                            });
+                        }
+                    }
+                }
+            } else {
+                let _ = events.send(GuiEvent::PollAckMissingId {
+                    owner,
+                    runtime_id,
+                    request_id,
+                    thread_id: thread_id.clone(),
+                    error: "Máy chủ xác nhận nhưng thiếu mã bình chọn (ACK thiếu ID)".into(),
+                });
+            }
+        }
+        Err(crate::group_content::CreatePollErrorKind::LocalValidation(e)) => {
+            let _ = events.send(GuiEvent::PollLocalValidationFailed {
+                owner,
+                runtime_id,
+                request_id,
+                thread_id: thread_id.clone(),
+                error: e.to_string(),
+            });
+        }
+        Err(crate::group_content::CreatePollErrorKind::ExplicitServerRejection {
+            code,
+            message,
+        }) => {
+            let _ = events.send(GuiEvent::PollRejected {
+                owner,
+                runtime_id,
+                request_id,
+                thread_id: thread_id.clone(),
+                error: format!("{message} (mã {code})"),
+            });
+        }
+        Err(crate::group_content::CreatePollErrorKind::PostDispatchUnknown(e)) => {
+            let _ = events.send(GuiEvent::PollTransportUnknown {
+                owner,
+                runtime_id,
+                request_id,
+                thread_id: thread_id.clone(),
+                error: e.to_string(),
+            });
+        }
+    }
+    ctx.request_repaint();
+}
+
 pub enum WorkerCmd {
     RetryStartup,
     PrepareE2eeTrial {
@@ -369,6 +774,9 @@ pub enum WorkerCmd {
     },
     Tools {
         owner: String,
+        /// Dispatch-time identity for config-bearing commands; `None` for commands that never
+        /// carry a config snapshot (search, schedule, open-hit).
+        origin: Option<super::tools_panel::ToolsOrigin>,
         command: super::tools_panel::ToolsCommand,
     },
     RunAutomation,
@@ -539,6 +947,9 @@ pub enum WorkerCmd {
         known_threads: Vec<(String, String, bool)>,
     },
     LoadGroupHistory {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
         group_id: String,
         is_group: bool,
         limit: usize,
@@ -617,6 +1028,14 @@ pub enum WorkerCmd {
         contact_name: String,
         phone: String,
         avatar: String,
+    },
+    SendContactCards {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        to_id: String,
+        is_group: bool,
+        cards: Vec<ContactCardItem>,
     },
     BatchRecall {
         to_id: String,
@@ -756,6 +1175,7 @@ pub enum WorkerCmd {
         before: Option<crate::store::HistoryCursor>,
     },
     FetchServerMedia {
+        target: crate::server_media::ServerMediaTarget,
         runtime_id: usize,
         thread_id: String,
         media_type: u8,
@@ -782,9 +1202,15 @@ pub enum WorkerCmd {
         thread_id: String,
     },
     CreatePoll {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
         thread_id: String,
         question: String,
         options: Vec<String>,
+        multi: bool,
+        anonymous: bool,
+        allow_add: bool,
     },
     FetchPolls {
         thread_id: String,
@@ -817,6 +1243,92 @@ pub enum WorkerCmd {
     },
     CancelUpload {
         upload_id: String,
+    },
+    FetchQuickMessages {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        mutation_epoch: u64,
+        version: u32,
+    },
+    CreateQuickMessage {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        keyword: String,
+        message: String,
+        media: Option<String>,
+        msg_type: i32,
+    },
+    UpdateQuickMessage {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        item_id: String,
+        keyword: String,
+        message: String,
+        media: Option<String>,
+        msg_type: i32,
+    },
+    DeleteQuickMessages {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        item_ids: Vec<String>,
+    },
+    PrepareQuickMessageMedia {
+        op_id: u64,
+        owner: String,
+        runtime_id: usize,
+        thread_id: String,
+        draft_generation: u64,
+        media: String,
+    },
+    FetchBankConf {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+    },
+    FetchBankAccounts {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        page: u32,
+        limit: u32,
+    },
+    CreateBankAccount {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        bin: String,
+        bank_number: String,
+        holder_name: String,
+    },
+    UpdateBankAccount {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        account_id: String,
+        bin: String,
+        bank_number: String,
+        holder_name: String,
+    },
+    DeleteBankAccount {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        account_id: String,
+        is_default: bool,
+    },
+    SendBankCard {
+        owner: String,
+        runtime_id: usize,
+        request_id: u64,
+        to_id: String,
+        is_group: bool,
+        bin: String,
+        bank_number: String,
+        holder_name: String,
     },
     SwitchProfile {
         owner: String,
@@ -3416,6 +3928,7 @@ pub(super) fn spawn_session_worker(
                 }
                 let mut recovered_accounts=HashSet::new();
                 let automation_running=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let inflight_dedup = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::<(String, u64)>::new()));
                 while let Some(cmd) = cmd_rx.recv().await {
                     if let Some((thread_id, message)) = outgoing_command(&cmd) {
                         let tx = gui_tx.clone();
@@ -3579,7 +4092,7 @@ pub(super) fn spawn_session_worker(
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::Tools {owner,command}=>{
+                        WorkerCmd::Tools {owner,origin,command}=>{
                             let s=session.lock().await.clone();if owner!=s.account_key() || owner.is_empty() || !s.is_active(){continue;}
                             let tx=gui_tx.clone();let ctx=egui_ctx.clone();
                             let open_request=match &command {super::tools_panel::ToolsCommand::OpenSearchHit{generation,thread,id}=>Some((*generation,thread.clone(),id.clone())),_=>None};
@@ -3591,6 +4104,8 @@ pub(super) fn spawn_session_worker(
                                 let permit=if search_request.is_some(){search_gate.acquire_owned().await.ok()}else{None};
                                 let stale=search_request.as_ref().is_some_and(|r|latest.load(std::sync::atomic::Ordering::Acquire)!=r.generation);
                                 let mut result=if stale{Err("Đã thay bằng truy vấn mới".into())}else{account_tools(s,command).await.map_err(|e|e.to_string())};
+                                // Stamp the dispatch-time identity; completion time is too late to capture it.
+                                stamp_tools_origin(&mut result,origin);
                                 drop(permit);
                                 if let (Err(error),Some((generation,thread,id)))=(&result,open_request){result=Ok(super::tools_panel::ToolsResult::SearchOpenFailed{generation,thread,id,error:error.clone()});}
                                 if let (Err(error),Some(request))=(&result,search_request){result=Ok(super::tools_panel::ToolsResult::SearchPage{request,result:Err(error.clone()),senders:Vec::new()});}
@@ -5830,13 +6345,20 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 }
                             });
                         }
-                        WorkerCmd::LoadGroupHistory { group_id, is_group, limit } => {
+                        WorkerCmd::LoadGroupHistory {
+                            owner,
+                            runtime_id,
+                            request_id,
+                            group_id,
+                            is_group,
+                            limit,
+                        } => {
                             let session_clone = session.clone();
                             let gui_tx_clone = gui_tx.clone();
                             let ctx_clone = egui_ctx.clone();
                             tokio::spawn(async move {
                                 let s = session_clone.lock().await.clone();
-                                if s.login.is_some() {
+                                if s.is_active() && s.runtime_id() == runtime_id && s.account_key() == owner && s.login.is_some() {
                                     let is_send2me = s
                                         .login
                                         .as_ref()
@@ -5862,22 +6384,43 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }).await;
                                     let mut t = match loaded {
                                         Ok(Ok(mut list)) => list.remove(0),
-                                        _ => {
+                                        Err(e) => {
+                                            let err_msg = format!("Lỗi đọc DB: {e}");
                                             let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                                owner: s.account_key().to_string(),
                                                 runtime_id: s.runtime_id(),
+                                                request_id,
+                                                thread_id: group_id.clone(),
                                                 threads: Vec::new(),
                                                 status: "Không thể đọc lịch sử cục bộ".into(),
+                                                outcome: HistoryLoadOutcome::LocalError { error: err_msg },
+                                            });
+                                            ctx_clone.request_repaint(); return;
+                                        }
+                                        Ok(Err(e)) => {
+                                            let err_msg = format!("Lỗi tải hội thoại: {e}");
+                                            let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                                owner: s.account_key().to_string(),
+                                                runtime_id: s.runtime_id(),
+                                                request_id,
+                                                thread_id: group_id.clone(),
+                                                threads: Vec::new(),
+                                                status: "Không thể đọc lịch sử cục bộ".into(),
+                                                outcome: HistoryLoadOutcome::LocalError { error: err_msg },
                                             });
                                             ctx_clone.request_repaint(); return;
                                         }
                                     };
+                                    let mut head_fetch_err: Option<String> = None;
                                     let mut head_fetch_failed = false;
                                     let head=if is_group||is_send2me {
                                         match crate::history_open::fetch(&s,&group_id,is_group).await {
                                             Ok(head) => head,
                                             Err(error) => {
                                                 head_fetch_failed = true;
-                                                crate::logger::log_error("history head", &format!("Server history fetch failed: {error}"));
+                                                let err_str = error.to_string();
+                                                head_fetch_err = Some(err_str.clone());
+                                                crate::logger::log_error("history head", &format!("Server history fetch failed: {err_str}"));
                                                 None
                                             }
                                         }
@@ -5900,24 +6443,62 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                                 return;
                                             }
                                         }
-                                        let status = if head_fetch_failed {
-                                            format!("Đã đọc {cnt} tin cục bộ; không tải được lịch sử máy chủ")
+                                        let (status, outcome) = if head_fetch_failed {
+                                            let err_str = head_fetch_err.unwrap_or_else(|| "Lỗi kết nối máy chủ".into());
+                                            (
+                                                format!("Đã đọc {cnt} tin cục bộ; không tải được lịch sử máy chủ"),
+                                                HistoryLoadOutcome::Partial { server_error: err_str },
+                                            )
                                         } else {
-                                            format!("Đã đọc {cnt} tin từ lịch sử cục bộ và tin gần đây; lịch sử server theo dõi trong Đồng bộ")
+                                            let exhausted = cnt < limit;
+                                            (
+                                                format!("Đã đọc {cnt} tin từ lịch sử"),
+                                                HistoryLoadOutcome::Success { exhausted },
+                                            )
                                         };
                                         let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            owner: s.account_key().to_string(),
                                             runtime_id: s.runtime_id(),
+                                            request_id,
+                                            thread_id: group_id.clone(),
                                             threads: filtered,
                                             status,
+                                            outcome,
                                         });
                                         ctx_clone.request_repaint();
                                     } else if let Some(head)=head {
                                         if head.commit().await.is_err(){crate::logger::log_error("history head","Cannot persist empty head freshness");}
-                                    } else if head_fetch_failed {
                                         let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            owner: s.account_key().to_string(),
                                             runtime_id: s.runtime_id(),
+                                            request_id,
+                                            thread_id: group_id.clone(),
+                                            threads: Vec::new(),
+                                            status: "Hội thoại chưa có tin nhắn".into(),
+                                            outcome: HistoryLoadOutcome::Success { exhausted: true },
+                                        });
+                                        ctx_clone.request_repaint();
+                                    } else if head_fetch_failed {
+                                        let err_str = head_fetch_err.unwrap_or_else(|| "Không thể tải lịch sử máy chủ".into());
+                                        let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            owner: s.account_key().to_string(),
+                                            runtime_id: s.runtime_id(),
+                                            request_id,
+                                            thread_id: group_id.clone(),
                                             threads: Vec::new(),
                                             status: "Không thể tải lịch sử máy chủ".into(),
+                                            outcome: HistoryLoadOutcome::ServerError { error: err_str },
+                                        });
+                                        ctx_clone.request_repaint();
+                                    } else {
+                                        let _ = gui_tx_clone.send(GuiEvent::ConversationHistoryLoaded {
+                                            owner: s.account_key().to_string(),
+                                            runtime_id: s.runtime_id(),
+                                            request_id,
+                                            thread_id: group_id.clone(),
+                                            threads: Vec::new(),
+                                            status: "Hội thoại chưa có tin nhắn".into(),
+                                            outcome: HistoryLoadOutcome::Success { exhausted: true },
                                         });
                                         ctx_clone.request_repaint();
                                     }
@@ -6134,6 +6715,33 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     }
                                 }
                                 ctx_clone.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SendContactCards {
+                            owner,
+                            runtime_id,
+                            request_id,
+                            to_id,
+                            is_group,
+                            cards,
+                        } => {
+                            let session_clone = session.clone();
+                            let gui_tx_clone = gui_tx.clone();
+                            let ctx_clone = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                handle_send_contact_cards_cmd(
+                                    session_clone,
+                                    gui_tx_clone,
+                                    ctx_clone,
+                                    inflight_clone,
+                                    owner,
+                                    runtime_id,
+                                    request_id,
+                                    to_id,
+                                    is_group,
+                                    cards,
+                                ).await;
                             });
                         }
                         WorkerCmd::BatchRecall {
@@ -6905,6 +7513,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                             });
                         }
                         WorkerCmd::FetchServerMedia {
+                            target,
                             runtime_id,
                             thread_id,
                             media_type,
@@ -6928,6 +7537,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     4 => crate::server_media::ServerMediaType::Link,
                                     _ => {
                                         let _ = events.send(GuiEvent::ServerMediaLoadFailed {
+                                            target,
                                             runtime_id,
                                             thread_id,
                                             media_type,
@@ -6950,6 +7560,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 match res {
                                     Ok(media_page) => {
                                         let _ = events.send(GuiEvent::ServerMediaLoaded {
+                                            target,
                                             runtime_id,
                                             thread_id,
                                             media_type,
@@ -6961,6 +7572,7 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                     Err(e) => {
                                         let err_msg = e.to_string();
                                         let _ = events.send(GuiEvent::ServerMediaLoadFailed {
+                                            target,
                                             runtime_id,
                                             thread_id,
                                             media_type,
@@ -7059,30 +7671,37 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 ctx.request_repaint();
                             });
                         }
-                        WorkerCmd::CreatePoll { thread_id, question, options } => {
+                        WorkerCmd::CreatePoll {
+                            owner,
+                            runtime_id,
+                            request_id,
+                            thread_id,
+                            question,
+                            options,
+                            multi,
+                            anonymous,
+                            allow_add,
+                        } => {
                             let s_clone = session.clone();
                             let events = gui_tx.clone();
                             let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
                             tokio::spawn(async move {
-                                let s = s_clone.lock().await.clone();
-                                match crate::poll::create_group_poll(&s, &thread_id, &question, &options, false, false, false).await {
-                                    Ok(_) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Đã tạo cuộc bình chọn: {question}")));
-                                        if let Ok(reply) = crate::group_content::execute(&s, &thread_id, &crate::group_content::Action::ListPolls { page: 1, last: String::new(), last_type: 0 }).await {
-                                            let mut poll_items: Vec<crate::poll::PollItem> = reply.polls.unwrap_or_default().into_iter().map(Into::into).collect();
-                                            for p in &mut poll_items {
-                                                p.grid = thread_id.clone();
-                                            }
-                                            let _ = events.send(GuiEvent::GroupPollsLoaded {
-                                                runtime_id: s.runtime_id(), thread_id: thread_id.clone(), polls: poll_items,
-                                            });
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Tạo bình chọn thất bại: {e}")));
-                                    }
-                                }
-                                ctx.request_repaint();
+                                handle_create_poll_cmd(
+                                    s_clone,
+                                    events,
+                                    ctx,
+                                    inflight_clone,
+                                    owner,
+                                    runtime_id,
+                                    request_id,
+                                    thread_id,
+                                    question,
+                                    options,
+                                    multi,
+                                    anonymous,
+                                    allow_add,
+                                ).await;
                             });
                         }
                         WorkerCmd::FetchPolls { thread_id } => {
@@ -7164,6 +7783,382 @@ if !threads.is_empty(){let _=tx.send(GuiEvent::ThreadsUpdated{threads,source:Thr
                                 });
                                 ctx.request_repaint();
                             });
+                        }
+                        WorkerCmd::FetchQuickMessages {
+                            owner,
+                            runtime_id,
+                            request_id,
+                            mutation_epoch,
+                            version,
+                        } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(handle_fetch_quick_messages_cmd(
+                                s_clone,
+                                events,
+                                ctx,
+                                owner,
+                                runtime_id,
+                                request_id,
+                                mutation_epoch,
+                                version,
+                                |s, v| async move {
+                                    crate::quick_message::fetch_quick_messages(&s, v).await
+                                },
+                            ));
+                        }
+                        WorkerCmd::CreateQuickMessage { owner, runtime_id, request_id, keyword, message, media, msg_type } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut set = inflight_clone.lock().await;
+                                    if !set.insert((owner.clone(), request_id)) {
+                                        return;
+                                    }
+                                }
+                                let _guard = InflightGuard {
+                                    set: inflight_clone.clone(),
+                                    key: (owner.clone(), request_id),
+                                };
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                let res = crate::quick_message::create_quick_message(&s, &keyword, &message, media.as_deref(), msg_type).await;
+                                let post_s = s_clone.lock().await.clone();
+                                if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() { return; }
+                                match res {
+                                    Ok(item) => {
+                                        let _ = events.send(GuiEvent::QuickMessageCreated {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            request_id,
+                                            item,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::QuickMessageCreateFailed {
+                                            owner,
+                                            runtime_id,
+                                            request_id,
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::UpdateQuickMessage { owner, runtime_id, request_id, item_id, keyword, message, media, msg_type } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut set = inflight_clone.lock().await;
+                                    if !set.insert((owner.clone(), request_id)) {
+                                        return;
+                                    }
+                                }
+                                let _guard = InflightGuard {
+                                    set: inflight_clone.clone(),
+                                    key: (owner.clone(), request_id),
+                                };
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                let res = crate::quick_message::update_quick_message(&s, &item_id, &keyword, &message, media.as_deref(), msg_type).await;
+                                let post_s = s_clone.lock().await.clone();
+                                if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() { return; }
+                                match res {
+                                    Ok(_) => {
+                                        let shortcut = if keyword.starts_with('/') {
+                                            keyword.clone()
+                                        } else {
+                                            format!("/{keyword}")
+                                        };
+                                        let clean_title =
+                                            keyword.trim_start_matches('/').to_string();
+                                        let item = crate::quick_message::QuickMessage {
+                                            id: item_id,
+                                            shortcut,
+                                            title: clean_title,
+                                            text: message,
+                                            media,
+                                            msg_type,
+                                        };
+                                        let _ = events.send(GuiEvent::QuickMessageUpdated {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            request_id,
+                                            item,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::QuickMessageUpdateFailed {
+                                            owner,
+                                            runtime_id,
+                                            request_id,
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DeleteQuickMessages {
+                            owner,
+                            runtime_id,
+                            request_id,
+                            item_ids,
+                        } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(handle_delete_quick_messages_cmd(
+                                s_clone,
+                                events,
+                                ctx,
+                                inflight_clone,
+                                owner,
+                                runtime_id,
+                                request_id,
+                                item_ids,
+                                |s, ids| async move {
+                                    crate::quick_message::delete_quick_messages(&s, &ids).await
+                                },
+                            ));
+                        }
+                        WorkerCmd::PrepareQuickMessageMedia {
+                            op_id,
+                            owner,
+                            runtime_id,
+                            thread_id,
+                            draft_generation,
+                            media,
+                        } => {
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let outcome = if media.starts_with("http://") || media.starts_with("https://") {
+                                    crate::gui::QuickMessageMediaOutcome::Unsupported { url: media }
+                                } else {
+                                    let path = std::path::PathBuf::from(&media);
+                                    if path.exists() {
+                                        crate::gui::QuickMessageMediaOutcome::Success { path }
+                                    } else {
+                                        crate::gui::QuickMessageMediaOutcome::MissingFile { path: media }
+                                    }
+                                };
+                                let _ = events.send(GuiEvent::QuickMessageMediaPrepared {
+                                    op_id,
+                                    owner,
+                                    runtime_id,
+                                    thread_id,
+                                    draft_generation,
+                                    outcome,
+                                });
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchBankConf { owner, runtime_id, request_id } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                match crate::bank_account::fetch_bank_conf(&s).await {
+                                    Ok(banks) => {
+                                        let _ = events.send(GuiEvent::BankConfLoaded { owner, runtime_id, request_id, banks });
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách ngân hàng: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::FetchBankAccounts { owner, runtime_id, request_id, page, limit } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            tokio::spawn(async move {
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                match crate::bank_account::fetch_bank_accounts(&s, page, limit).await {
+                                    Ok((accounts, total, has_more)) => {
+                                        let _ = events.send(GuiEvent::BankAccountsLoaded { owner, runtime_id, request_id, accounts, total, has_more });
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::StatusUpdate(format!("Không thể tải danh sách STK: {e}")));
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::CreateBankAccount { owner, runtime_id, request_id, bin, bank_number, holder_name } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut set = inflight_clone.lock().await;
+                                    if !set.insert((owner.clone(), request_id)) {
+                                        return;
+                                    }
+                                }
+                                let _guard = InflightGuard {
+                                    set: inflight_clone.clone(),
+                                    key: (owner.clone(), request_id),
+                                };
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                let res = crate::bank_account::create_bank_account(&s, &bin, &bank_number, &holder_name).await;
+                                let post_s = s_clone.lock().await.clone();
+                                if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() { return; }
+                                match res {
+                                    Ok(acc) => {
+                                        let _ = events.send(GuiEvent::BankAccountCreated {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            request_id,
+                                            account: Box::new(acc),
+                                        });
+                                        if let Ok((accounts, total, has_more)) = crate::bank_account::fetch_bank_accounts(&post_s, 1, 50).await {
+                                            let _ = events.send(GuiEvent::BankAccountsLoaded {
+                                                owner,
+                                                runtime_id,
+                                                request_id: 0,
+                                                accounts,
+                                                total,
+                                                has_more,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let is_transport_unknown = crate::api_response::server_code(&e).is_none()
+                                            && crate::session::envelope_failure_code(&e).is_none();
+                                        let _ = events.send(GuiEvent::BankAccountCreateFailed {
+                                            owner,
+                                            runtime_id,
+                                            request_id,
+                                            error: e.to_string(),
+                                            is_transport_unknown,
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::UpdateBankAccount { owner, runtime_id, request_id, account_id, bin, bank_number, holder_name } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut set = inflight_clone.lock().await;
+                                    if !set.insert((owner.clone(), request_id)) {
+                                        return;
+                                    }
+                                }
+                                let _guard = InflightGuard {
+                                    set: inflight_clone.clone(),
+                                    key: (owner.clone(), request_id),
+                                };
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                match crate::bank_account::update_bank_account(&s, &account_id, &bin, &bank_number, &holder_name).await {
+                                    Ok(_) => {
+                                        let post_s = s_clone.lock().await.clone();
+                                        if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() { return; }
+                                        let _ = events.send(GuiEvent::BankAccountUpdated {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            request_id,
+                                            account_id,
+                                        });
+                                        if let Ok((accounts, total, has_more)) = crate::bank_account::fetch_bank_accounts(&post_s, 1, 50).await {
+                                            let _ = events.send(GuiEvent::BankAccountsLoaded {
+                                                owner,
+                                                runtime_id,
+                                                request_id: 0,
+                                                accounts,
+                                                total,
+                                                has_more,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::BankAccountUpdateFailed {
+                                            owner,
+                                            runtime_id,
+                                            request_id,
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::DeleteBankAccount { owner, runtime_id, request_id, account_id, is_default } => {
+                            let s_clone = session.clone();
+                            let events = gui_tx.clone();
+                            let ctx = egui_ctx.clone();
+                            let inflight_clone = inflight_dedup.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut set = inflight_clone.lock().await;
+                                    if !set.insert((owner.clone(), request_id)) {
+                                        return;
+                                    }
+                                }
+                                let _guard = InflightGuard {
+                                    set: inflight_clone.clone(),
+                                    key: (owner.clone(), request_id),
+                                };
+                                let s = s_clone.lock().await.clone();
+                                if s.runtime_id() != runtime_id || s.account_key() != owner || !s.is_active() { return; }
+                                let res = crate::bank_account::delete_bank_account(&s, &account_id, is_default).await;
+                                let post_s = s_clone.lock().await.clone();
+                                if post_s.runtime_id() != runtime_id || post_s.account_key() != owner || !post_s.is_active() { return; }
+                                match res {
+                                    Ok(_) => {
+                                        let _ = events.send(GuiEvent::BankAccountDeleted {
+                                            owner: owner.clone(),
+                                            runtime_id,
+                                            request_id,
+                                            account_id: account_id.clone(),
+                                        });
+                                        if let Ok((accounts, total, has_more)) = crate::bank_account::fetch_bank_accounts(&post_s, 1, 50).await {
+                                            let _ = events.send(GuiEvent::BankAccountsLoaded {
+                                                owner,
+                                                runtime_id,
+                                                request_id: 0,
+                                                accounts,
+                                                total,
+                                                has_more,
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let _ = events.send(GuiEvent::BankAccountDeleteFailed {
+                                            owner,
+                                            runtime_id,
+                                            request_id,
+                                            error: e.to_string(),
+                                        });
+                                    }
+                                }
+                                ctx.request_repaint();
+                            });
+                        }
+                        WorkerCmd::SendBankCard { .. } => {
+                            // Intercepted and processed via outgoing_command / outgoing_lifecycle
                         }
                         WorkerCmd::LookupPhone { phone } => {
                             let session_clone = session.clone();
@@ -8405,6 +9400,34 @@ fn outgoing_command(cmd: &WorkerCmd) -> Option<(String, ChatMessage)> {
             msg.sticker_type = Some(*sticker_type);
             Some((to_id.clone(), msg))
         }
+        WorkerCmd::SendBankCard {
+            to_id,
+            is_group,
+            bin,
+            bank_number,
+            holder_name,
+            ..
+        } => {
+            let mut msg = pending(
+                format!("[Tài khoản ngân hàng] {bin} - {bank_number} - {holder_name}"),
+                *is_group,
+                Payload::BankCard {
+                    bin: bin.clone(),
+                    bank_number: bank_number.clone(),
+                    holder_name: holder_name.clone(),
+                },
+            );
+            msg.wire_ref
+                .fields
+                .insert("bin".into(), serde_json::json!(bin));
+            msg.wire_ref
+                .fields
+                .insert("bank_number".into(), serde_json::json!(bank_number));
+            msg.wire_ref
+                .fields
+                .insert("holder_name".into(), serde_json::json!(holder_name));
+            Some((to_id.clone(), msg))
+        }
         WorkerCmd::Forward {
             target_id,
             target_is_group,
@@ -8859,6 +9882,7 @@ async fn account_tools(
                     config: crate::tools::preferences(&store)?,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: false,
+                    origin: None,
                 })
             }
             C::Update { id, text, at } => {
@@ -8869,6 +9893,7 @@ async fn account_tools(
                     config: crate::tools::preferences(&store)?,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: crate::tools::paused(&store)?,
+                    origin: None,
                 })
             }
             C::Search { query, hidden } => {
@@ -8944,6 +9969,7 @@ async fn account_tools(
                     config: crate::tools::preferences(&store)?,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: crate::tools::paused(&store)?,
+                    origin: None,
                 })
             }
             C::Save(config) => {
@@ -8955,6 +9981,7 @@ async fn account_tools(
                     config,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: crate::tools::paused(&store)?,
+                    origin: None,
                 })
             }
             C::Schedule {
@@ -8991,6 +10018,7 @@ async fn account_tools(
                     config: crate::tools::preferences(&store)?,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: crate::tools::paused(&store)?,
+                    origin: None,
                 })
             }
             C::ReadConfig { stickers } => {
@@ -9026,6 +10054,7 @@ async fn account_tools(
                     config,
                     tasks: crate::tools::scheduled(&store, session.account_key())?,
                     paused: crate::tools::paused(&store)?,
+                    origin: None,
                 })
             }
             C::ExportConfig { stickers } => {
@@ -10804,8 +11833,9 @@ mod db_write_serialization_tests {
         assert!(!current_sync_availability(&session, &ready, true, false, true).is_ready());
     }
 
-    fn test_session(uin: &str) -> Session {
+    pub(super) fn test_session(uin: &str) -> Session {
         let mut s = Session::new(false, false, false).unwrap();
+        s.secret_key = Some(vec![7; 32]);
         s.login = Some(crate::session::LoginInfo {
             uin: uin.to_owned(),
             zpw_enk: String::new(),
@@ -11741,7 +12771,7 @@ mod db_write_serialization_tests {
         }
     }
 
-    async fn setup_mock_zalo_server_async<F, Fut>(
+    pub(super) async fn setup_mock_zalo_server_async<F, Fut>(
         handler: F,
     ) -> (String, tokio::task::JoinHandle<()>)
     where
@@ -12271,5 +13301,1003 @@ mod metadata_admission_tests {
             "snapshot must observe the completed write"
         );
         assert_eq!(gate.available_permits(), 1);
+    }
+}
+
+#[cfg(test)]
+mod poll_and_batch_worker_tests {
+    use super::db_write_serialization_tests::*;
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn build_poll_mock_response(
+        path: &str,
+        poll_success: bool,
+        poll_id_missing: bool,
+        readback_success: bool,
+    ) -> (u16, String) {
+        if path.contains("/api/group/getmg-v2") {
+            (200, r#"{"error_code": 0, "data": {"gridInfoMap": {"123456": {"error_code": 0, "data": {"setting": {"lockCreatePoll": 0}}}}}}"#.to_string())
+        } else if path.contains("/api/poll/create") {
+            if !poll_success {
+                (
+                    500,
+                    r#"{"error_code": 500, "error_message": "Network refusal"}"#.to_string(),
+                )
+            } else if poll_id_missing {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"error_code": 0, "data": {"poll_id": "poll_999"}}"#.to_string(),
+                )
+            }
+        } else if path.contains("/api/poll/detail") {
+            if readback_success {
+                (200, r#"{"error_code": 0, "data": {"poll_id": "poll_999", "question": "Question?", "is_anonymous": false, "options": [{"option_id": 1, "content": "Opt 1", "voters": []}, {"option_id": 2, "content": "Opt 2", "voters": []}]}}"#.to_string())
+            } else {
+                (
+                    500,
+                    r#"{"error_code": 500, "error_message": "Readback error"}"#.to_string(),
+                )
+            }
+        } else if path.contains("/api/poll/list") {
+            (
+                200,
+                r#"{"error_code": 0, "data": {"polls": []}}"#.to_string(),
+            )
+        } else {
+            (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_success_with_created_id_and_readback() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-ok-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            101,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollCreated { poll_id, .. } => {
+                assert_eq!(poll_id, "poll_999");
+            }
+            _ => panic!("Expected PollCreated"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_created_id_with_readback_error() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, true, false, false)
+        })
+        .await;
+
+        let uin = format!("poll-rb-err-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            102,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollCreatedWithReadbackError { poll_id, error, .. } => {
+                assert_eq!(poll_id, "poll_999");
+                assert!(
+                    error.contains("Lỗi tải lại chi tiết bình chọn"),
+                    "Expected readback error note, got {error}"
+                );
+            }
+            _ => panic!("Expected PollCreatedWithReadbackError"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_ack_missing_poll_id() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, true, true, false)
+        })
+        .await;
+
+        let uin = format!("poll-no-id-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            103,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollAckMissingId { error, .. } => {
+                assert!(
+                    error.contains("ACK thiếu ID"),
+                    "Error must report ACK missing ID, got {error}"
+                );
+            }
+            _ => panic!("Expected PollAckMissingId"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_network_refusal_or_lost_ack() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, false, false, false)
+        })
+        .await;
+
+        let uin = format!("poll-net-err-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            104,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollTransportUnknown { error, .. } => {
+                assert!(
+                    !error.is_empty(),
+                    "Transport unknown must carry error message"
+                );
+            }
+            _ => panic!("Expected PollTransportUnknown for HTTP 500 transport error"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_explicit_server_rejection() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/poll/create") {
+                (
+                    200,
+                    r#"{"error_code": 11003, "error_message": "Chỉ trưởng/phó nhóm mới được tạo bình chọn"}"#.to_string(),
+                )
+            } else {
+                build_poll_mock_response(&path, true, false, true)
+            }
+        })
+        .await;
+
+        let uin = format!("poll-server-rej-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            1040,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollRejected { error, .. } => {
+                assert!(
+                    error.contains("11003"),
+                    "Expected code 11003 in rejection error, got: {error}"
+                );
+            }
+            GuiEvent::PollTransportUnknown { error, .. } => {
+                panic!("Got PollTransportUnknown: {error}");
+            }
+            GuiEvent::PollLocalValidationFailed { error, .. } => {
+                panic!("Got PollLocalValidationFailed: {error}");
+            }
+            GuiEvent::PollAckMissingId { error, .. } => {
+                panic!("Got PollAckMissingId: {error}");
+            }
+            GuiEvent::PollCreated { poll_id, .. } => {
+                panic!("Got PollCreated: {poll_id}");
+            }
+            _ => panic!("Expected PollRejected for explicit server refusal"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_pre_dispatch_validation_failure() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/poll/create") {
+                panic!("Pre-dispatch validation failure must not dispatch HTTP create request!");
+            }
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-val-err-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // Options length is 1 (minimum required is 2)
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            1041,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Only 1 Option".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollLocalValidationFailed { error, .. } => {
+                assert!(
+                    error.contains("số lựa chọn không hợp lệ"),
+                    "Expected validation error, got: {error}"
+                );
+            }
+            _ => panic!("Expected PollLocalValidationFailed"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_empty_host_fails_pre_dispatch_without_http_request() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/poll/create") {
+                panic!("Pre-dispatch empty host check must not dispatch HTTP create request!");
+            }
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-empty-host-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = "".into();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            1043,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollLocalValidationFailed { error, .. } => {
+                assert!(
+                    error.contains("Server chưa cấp dịch vụ bảng tin/bình chọn"),
+                    "Expected missing service domain error, got: {error}"
+                );
+            }
+            _ => panic!("Expected PollLocalValidationFailed for empty group_poll host"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_post_dispatch_transport_unknown() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/poll/create") {
+                // Post-dispatch response missing error_code / malformed payload
+                (200, r#"{"unexpected": "no error_code"}"#.to_string())
+            } else {
+                build_poll_mock_response(&path, true, false, true)
+            }
+        })
+        .await;
+
+        let uin = format!("poll-trans-err-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            1042,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let event = rx.try_recv().expect("Event must be received");
+        match event {
+            GuiEvent::PollTransportUnknown { error, .. } => {
+                assert!(
+                    !error.is_empty(),
+                    "Transport unknown error should have message"
+                );
+            }
+            _ => panic!("Expected PollTransportUnknown"),
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_in_flight_duplicate_dedup() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-dedup-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // Pre-populate inflight with the exact (owner, request_id)
+        inflight.lock().await.insert((uin.clone(), 105));
+
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            105,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Duplicate request in flight must be dropped immediately"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_account_switch_before_dispatch() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-pre-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        // Pass mismatched runtime_id to simulate account switch before dispatch
+        handle_create_poll_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id + 99,
+            106,
+            "123456".into(),
+            "Question?".into(),
+            vec!["Opt 1".into(), "Opt 2".into()],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Mismatched runtime_id must be rejected before network call"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_poll_worker_account_switch_during_await() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/poll/create") {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            build_poll_mock_response(&path, true, false, true)
+        })
+        .await;
+
+        let uin = format!("poll-mid-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        session.domains.group_poll = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        let s_clone = session_arc.clone();
+        let uin_clone = uin.clone();
+        let handle = tokio::spawn(async move {
+            handle_create_poll_cmd(
+                s_clone,
+                tx,
+                ctx,
+                inflight,
+                uin_clone,
+                runtime_id,
+                107,
+                "123456".into(),
+                "Question?".into(),
+                vec!["Opt 1".into(), "Opt 2".into()],
+                false,
+                false,
+                false,
+            )
+            .await;
+        });
+
+        // While request is in flight, switch session account key
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        {
+            let mut s = session_arc.lock().await;
+            s.login = None; // Logged out
+        }
+
+        handle.await.unwrap();
+
+        assert!(
+            rx.try_recv().is_err(),
+            "Publication must be aborted when session switches or logs out in await"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_batch_contact_in_flight_dedup_and_per_item_outcomes() {
+        let (host, server) = setup_mock_zalo_server_async(|path| async move {
+            if path.contains("/api/group/contact") {
+                (200, r#"{"error_code": 0, "data": {}}"#.to_string())
+            } else {
+                (500, r#"{"error_code": 500}"#.to_string())
+            }
+        })
+        .await;
+
+        let uin = format!("contact-batch-{}", crate::param_cipher::random_hex(8));
+        let mut session = test_session(&uin);
+        session.domains.group = host.clone();
+        let runtime_id = session.runtime_id();
+
+        let session_arc = Arc::new(Mutex::new(session));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
+        let cards = vec![
+            ContactCardItem {
+                contact_id: "c_1".into(),
+                contact_name: "User One".into(),
+                phone: "0901111111".into(),
+                avatar: "".into(),
+                client_id: 10001,
+            },
+            ContactCardItem {
+                contact_id: "c_2".into(),
+                contact_name: "User Two".into(),
+                phone: "0902222222".into(),
+                avatar: "".into(),
+                client_id: 10002,
+            },
+        ];
+
+        handle_send_contact_cards_cmd(
+            session_arc,
+            tx,
+            ctx,
+            inflight,
+            uin.clone(),
+            runtime_id,
+            201,
+            "g123456".into(),
+            true,
+            cards,
+        )
+        .await;
+
+        let event = rx
+            .try_recv()
+            .expect("Batch completed event must be received");
+        match event {
+            GuiEvent::ContactBatchCompleted(result) => {
+                assert_eq!(result.owner, uin);
+                assert_eq!(result.request_id, 201);
+                assert_eq!(result.results.len(), 2);
+                assert_eq!(result.results[0].0, "c_1");
+                assert_eq!(result.results[0].1, ContactSendStatus::Success);
+                assert_eq!(result.results[1].0, "c_2");
+                assert_eq!(result.results[1].1, ContactSendStatus::Success);
+            }
+            _ => panic!("Expected ContactBatchCompleted"),
+        }
+        server.abort();
+    }
+
+    #[test]
+    fn test_quick_message_merge_preserves_local_items() {
+        let mut store = crate::quick_message::QuickMessageStore::default();
+        store.items.push(crate::quick_message::QuickMessage {
+            id: String::new(), // Local only, no server ID
+            shortcut: "/hello".into(),
+            title: "Hello".into(),
+            text: "Hello from local".into(),
+            msg_type: 0,
+            media: None,
+        });
+
+        let server_items = vec![crate::quick_message::QuickMessage {
+            id: "srv_1".into(),
+            shortcut: "/thanks".into(),
+            title: "Thanks".into(),
+            text: "Thank you!".into(),
+            msg_type: 0,
+            media: None,
+        }];
+
+        store.merge_server_items(server_items);
+
+        assert_eq!(
+            store.items.len(),
+            2,
+            "Local item without server ID must NOT be destroyed"
+        );
+        assert!(store.items.iter().any(|i| i.shortcut == "/hello"));
+        assert!(store
+            .items
+            .iter()
+            .any(|i| i.shortcut == "/thanks" && i.id == "srv_1"));
+    }
+
+    fn qm_active_session(uin: &str) -> Arc<Mutex<Session>> {
+        Arc::new(Mutex::new(test_session(uin)))
+    }
+
+    #[tokio::test]
+    async fn quick_message_list_handler_always_emits_one_scoped_terminal_event() {
+        let errors: Vec<anyhow::Error> = vec![
+            anyhow::anyhow!("operation timed out"),
+            crate::api_response::ServerError(11).into(),
+            anyhow::anyhow!("Phản hồi tin nhắn nhanh từ máy chủ thiếu danh sách 'items'"),
+        ];
+        for (n, error) in errors.into_iter().enumerate() {
+            let uin = format!("qm-list-fail-{n}-{}", crate::param_cipher::random_hex(6));
+            let session = qm_active_session(&uin);
+            let runtime_id = session.lock().await.runtime_id();
+            let (tx, rx) = std::sync::mpsc::channel();
+            handle_fetch_quick_messages_cmd(
+                session,
+                tx,
+                egui::Context::default(),
+                uin.clone(),
+                runtime_id,
+                40 + n as u64,
+                7,
+                0,
+                move |_s, _v| async move { Err(error) },
+            )
+            .await;
+            match rx.try_recv().expect("terminal event required") {
+                GuiEvent::QuickMessagesLoadFailed {
+                    owner,
+                    runtime_id: rid,
+                    request_id,
+                    mutation_epoch,
+                    error,
+                } => {
+                    assert_eq!(owner, uin);
+                    assert_eq!(rid, runtime_id);
+                    assert_eq!(request_id, 40 + n as u64);
+                    assert_eq!(mutation_epoch, 7);
+                    assert!(!error.is_empty());
+                }
+                _ => panic!("expected QuickMessagesLoadFailed"),
+            }
+            assert!(rx.try_recv().is_err(), "exactly one terminal event");
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_message_list_handler_success_carries_request_identity() {
+        let uin = format!("qm-list-ok-{}", crate::param_cipher::random_hex(6));
+        let session = qm_active_session(&uin);
+        let runtime_id = session.lock().await.runtime_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle_fetch_quick_messages_cmd(
+            session,
+            tx,
+            egui::Context::default(),
+            uin,
+            runtime_id,
+            51,
+            3,
+            0,
+            |_s, _v| async move { Ok((vec![], 9)) },
+        )
+        .await;
+        match rx.try_recv().unwrap() {
+            GuiEvent::QuickMessagesLoaded {
+                request_id,
+                mutation_epoch,
+                version,
+                ..
+            } => assert_eq!((request_id, mutation_epoch, version), (51, 3, 9)),
+            _ => panic!("expected QuickMessagesLoaded"),
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_message_list_handler_inactive_session_fails_without_network_call() {
+        let uin = format!("qm-list-inactive-{}", crate::param_cipher::random_hex(6));
+        let session = test_session(&uin);
+        let runtime_id = session.runtime_id();
+        session.revoke_runtime();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_in = called.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle_fetch_quick_messages_cmd(
+            Arc::new(Mutex::new(session)),
+            tx,
+            egui::Context::default(),
+            uin,
+            runtime_id,
+            52,
+            0,
+            0,
+            move |_s, _v| async move {
+                called_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok((vec![], 0))
+            },
+        )
+        .await;
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::QuickMessagesLoadFailed { request_id: 52, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn quick_message_list_failure_of_older_request_is_ordered_after_newer_success() {
+        let uin = format!("qm-list-order-{}", crate::param_cipher::random_hex(6));
+        let session = qm_active_session(&uin);
+        let runtime_id = session.lock().await.runtime_id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (release_a, hold_a) = tokio::sync::oneshot::channel::<()>();
+
+        let task_a = tokio::spawn(handle_fetch_quick_messages_cmd(
+            session.clone(),
+            tx.clone(),
+            egui::Context::default(),
+            uin.clone(),
+            runtime_id,
+            61,
+            0,
+            0,
+            move |_s, _v| async move {
+                let _ = hold_a.await;
+                Err(anyhow::anyhow!("late network failure"))
+            },
+        ));
+        handle_fetch_quick_messages_cmd(
+            session,
+            tx,
+            egui::Context::default(),
+            uin,
+            runtime_id,
+            62,
+            0,
+            0,
+            |_s, _v| async move { Ok((vec![], 1)) },
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::QuickMessagesLoaded { request_id: 62, .. }
+        ));
+        assert!(rx.try_recv().is_err(), "A is still held back");
+        release_a.send(()).unwrap();
+        task_a.await.unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::QuickMessagesLoadFailed { request_id: 61, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn quick_message_delete_handler_classifies_ack_outcomes() {
+        // (error, expected unknown flag)
+        let cases: Vec<(anyhow::Error, bool)> = vec![
+            (crate::api_response::ServerError(120).into(), false),
+            (anyhow::anyhow!("connection reset before response"), true),
+            (anyhow::anyhow!("Thiếu xác nhận máy chủ"), true),
+        ];
+        for (n, (error, expect_unknown)) in cases.into_iter().enumerate() {
+            let uin = format!("qm-del-fail-{n}-{}", crate::param_cipher::random_hex(6));
+            let session = qm_active_session(&uin);
+            let runtime_id = session.lock().await.runtime_id();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls_in = calls.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            handle_delete_quick_messages_cmd(
+                session,
+                tx,
+                egui::Context::default(),
+                Arc::new(Mutex::new(std::collections::HashSet::new())),
+                uin,
+                runtime_id,
+                70 + n as u64,
+                vec!["srv_a".into()],
+                move |_s, ids| async move {
+                    assert_eq!(ids, vec!["srv_a".to_string()]);
+                    calls_in.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Err(error)
+                },
+            )
+            .await;
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "no resend"
+            );
+            match rx.try_recv().expect("terminal event required") {
+                GuiEvent::QuickMessagesDeleteFailed {
+                    request_id,
+                    is_transport_unknown,
+                    ..
+                } => {
+                    assert_eq!(request_id, 70 + n as u64);
+                    assert_eq!(is_transport_unknown, expect_unknown, "case {n}");
+                }
+                _ => panic!("expected QuickMessagesDeleteFailed"),
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_message_delete_handler_success_session_and_duplicate_paths() {
+        // Success.
+        let uin = format!("qm-del-ok-{}", crate::param_cipher::random_hex(6));
+        let session = qm_active_session(&uin);
+        let runtime_id = session.lock().await.runtime_id();
+        let inflight = Arc::new(Mutex::new(std::collections::HashSet::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        handle_delete_quick_messages_cmd(
+            session.clone(),
+            tx.clone(),
+            egui::Context::default(),
+            inflight.clone(),
+            uin.clone(),
+            runtime_id,
+            81,
+            vec!["srv_a".into()],
+            |_s, _ids| async move { Ok(()) },
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::QuickMessagesDeleted { request_id: 81, .. }
+        ));
+
+        // Duplicate in-flight request id: closure must not run and no event is emitted.
+        inflight.lock().await.insert((uin.clone(), 82));
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in = ran.clone();
+        handle_delete_quick_messages_cmd(
+            session,
+            tx.clone(),
+            egui::Context::default(),
+            inflight,
+            uin.clone(),
+            runtime_id,
+            82,
+            vec!["srv_a".into()],
+            move |_s, _ids| async move {
+                ran_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(rx.try_recv().is_err());
+
+        // Inactive session: definite failure, nothing was dispatched.
+        let dead = test_session(&uin);
+        let dead_runtime = dead.runtime_id();
+        dead.revoke_runtime();
+        let ran2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2_in = ran2.clone();
+        handle_delete_quick_messages_cmd(
+            Arc::new(Mutex::new(dead)),
+            tx,
+            egui::Context::default(),
+            Arc::new(Mutex::new(std::collections::HashSet::new())),
+            uin,
+            dead_runtime,
+            83,
+            vec!["srv_a".into()],
+            move |_s, _ids| async move {
+                ran2_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(!ran2.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            GuiEvent::QuickMessagesDeleteFailed {
+                request_id: 83,
+                is_transport_unknown: false,
+                ..
+            }
+        ));
     }
 }

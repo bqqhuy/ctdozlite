@@ -94,8 +94,24 @@ impl ZaloGuiApp {
                 && (m.name.to_lowercase().contains(&query) || m.id == query)
         });
         members.truncate(8);
+        let sel_key = Id::new(("member_suggest_selected", thread));
+        let mut selected_idx = ui.ctx().data(|d| d.get_temp::<usize>(sel_key)).unwrap_or(0);
+        if !members.is_empty() {
+            if ui.input(|i| i.key_pressed(Key::ArrowDown)) {
+                selected_idx = (selected_idx + 1) % members.len();
+                ui.ctx().data_mut(|d| d.insert_temp(sel_key, selected_idx));
+            } else if ui.input(|i| i.key_pressed(Key::ArrowUp)) {
+                selected_idx = (selected_idx + members.len() - 1) % members.len();
+                ui.ctx().data_mut(|d| d.insert_temp(sel_key, selected_idx));
+            }
+        }
+        if selected_idx >= members.len() {
+            selected_idx = 0;
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(sel_key, selected_idx));
+
         let mut chosen = if *enter {
-            members.first().cloned()
+            members.get(selected_idx).cloned()
         } else {
             None
         };
@@ -108,7 +124,9 @@ impl ZaloGuiApp {
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.set_width(240.0);
-                    ui.label(crate::i18n::tr("Nhắc đến · Enter chọn · Esc giữ dạng chữ"));
+                    ui.label(crate::i18n::tr(
+                        "Nhắc đến · ↑ ↓ chọn · Enter chèn · Esc hủy",
+                    ));
                     if members.is_empty() {
                         ui.label(
                             if matches!(self.group_members_state.get(thread), Some(None)) {
@@ -132,13 +150,26 @@ impl ZaloGuiApp {
                             }
                         }
                     }
-                    for m in &members {
+                    for (idx, m) in members.iter().enumerate() {
+                        let is_highlighted = idx == selected_idx;
                         let label = if m.id == "-1" {
                             "@All · Tất cả thành viên".into()
                         } else {
                             format!("{} · {}", m.name, m.id)
                         };
-                        if ui.button(label).clicked() {
+                        let fill_color = if is_highlighted {
+                            ui.visuals().selection.bg_fill
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        let text_color = if is_highlighted {
+                            ui.visuals().selection.stroke.color
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        let btn = egui::Button::new(RichText::new(label).color(text_color))
+                            .fill(fill_color);
+                        if ui.add(btn).clicked() {
                             chosen = Some(m.clone());
                         }
                     }
@@ -260,5 +291,89 @@ mod tests {
         assert!(!enter);
         assert_eq!(app.input_message, "@All");
         assert!(app.composer_mentions.mentions.is_empty());
+    }
+
+    #[test]
+    fn arrow_keys_navigate_members_and_direct_chat_blocks_mention() {
+        let ctx = egui::Context::default();
+        let mut app = ZaloGuiApp::from_context(
+            &ctx,
+            Session::new(false, false, false).unwrap(),
+            false,
+            vec![
+                Thread {
+                    id: "group_1".into(),
+                    is_group: true,
+                    ..Default::default()
+                },
+                Thread {
+                    id: "direct_1".into(),
+                    is_group: false,
+                    ..Default::default()
+                },
+            ],
+            false,
+        );
+        app.group_members.insert(
+            "group_1".into(),
+            (
+                vec![
+                    crate::chat::SidebarMember {
+                        id: "101".into(),
+                        name: "Bình".into(),
+                        ..Default::default()
+                    },
+                    crate::chat::SidebarMember {
+                        id: "102".into(),
+                        name: "Cường".into(),
+                        ..Default::default()
+                    },
+                ],
+                None,
+            ),
+        );
+
+        // 1. Direct chat blocks mention suggestions
+        app.input_message = "@B".into();
+        let mut enter = true;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let editor = ui.text_edit_multiline(&mut app.input_message);
+                app.mention_suggestions(ui, "direct_1", 2, &editor, &mut enter, false);
+            });
+        });
+        assert!(
+            enter,
+            "Direct 1-1 chat must not consume enter or show mention popup"
+        );
+        assert_eq!(app.input_message, "@B");
+
+        // 2. Group chat with ArrowDown selects next member
+        app.input_message = "@".into();
+        let sel_key = Id::new(("member_suggest_selected", "group_1"));
+        ctx.data_mut(|d| d.insert_temp(sel_key, 1usize)); // Start at index 1
+        enter = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let editor = ui.text_edit_multiline(&mut app.input_message);
+                    editor.request_focus();
+                    app.mention_suggestions(ui, "group_1", 1, &editor, &mut enter, false);
+                });
+            },
+        );
+        assert!(!enter);
+        // After ArrowDown from 1, it should advance to index 2 ("Cường")
+        assert_eq!(app.composer_mentions.mentions[0].uid, "102");
     }
 }

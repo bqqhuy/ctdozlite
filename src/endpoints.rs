@@ -84,6 +84,12 @@ pub const RELEASE_REDIRECT_HOSTS: &[&str] = &[
 /// PC 26.11.10 getnuid adapter, command 12390.
 pub const ZNOISE: &str = "https://zwid.api.zalo.me";
 
+/// Quick Message API endpoint (`quickmessage.chat.zalo.me`, CmdId 12025-12032).
+pub const QUICK_MESSAGE: &str = "https://quickmessage.chat.zalo.me";
+
+/// ZInstantMsg Transfer / STK endpoint (`zimsg.chat.zalo.me`, CmdId 15298-15309).
+pub const Z_INSTANT_MSG: &str = "https://zimsg.chat.zalo.me";
+
 /// Public group invitation URLs recognized by the official join flow.
 pub const GROUP_INVITE_HOST: &str = "zalo.me";
 

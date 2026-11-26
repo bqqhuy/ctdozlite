@@ -1,6 +1,23 @@
 //! User-facing account tools; all persistence is dispatched to the worker.
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerMediaFetchMode {
+    Reload,
+    Append,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingServerMediaRequest {
+    pub runtime_id: usize,
+    pub thread_id: String,
+    pub media_type: u8,
+    pub generation: u64,
+    pub mode: ServerMediaFetchMode,
+    pub requested_page: u32,
+    pub requested_cursor: Option<String>,
+}
+
 #[derive(Default)]
 pub(super) struct ToolsPanel {
     pub open: bool,
@@ -36,6 +53,7 @@ pub(super) struct ToolsPanel {
     pub server_media_next_cursor: Option<String>,
     pub server_media_generation: u64,
     pub server_media_loading: bool,
+    pub server_media_pending: Option<PendingServerMediaRequest>,
     pub cloud_viewer_keys: std::collections::HashMap<String, crate::zcloud::CloudViewerKey>,
     pub catalog_items: Vec<crate::business::ProductCatalogItem>,
     pub two_factor_status: Option<crate::account_recovery::TwoFactorStatus>,
@@ -133,12 +151,24 @@ pub enum ToolsResult {
         config: crate::tools::Preferences,
         tasks: Vec<crate::tools::Scheduled>,
         paused: bool,
+        /// Dispatch-time identity stamped by the worker. `None` never hydrates Quick Messages.
+        origin: Option<ToolsOrigin>,
     },
     Search {
         query: String,
         hits: Vec<crate::tools::SearchHit>,
     },
     Status(String),
+}
+
+/// Identity captured when a config-bearing Tools command is dispatched, never at completion.
+/// It lets the consumer reject a config snapshot whose Quick Messages are older than the
+/// confirmed state (server list, server mutation, or local edit applied in between).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolsOrigin {
+    pub runtime_id: usize,
+    pub request_id: u64,
+    pub quick_message_revision: u64,
 }
 
 impl ZaloGuiApp {
@@ -161,6 +191,11 @@ impl ZaloGuiApp {
         } else {
             WorkerCmd::Tools {
                 owner: self.user_uin.clone(),
+                origin: Some(ToolsOrigin {
+                    runtime_id: self.account_runtime_id,
+                    request_id: generation,
+                    quick_message_revision: self.quick_message_state_revision,
+                }),
                 command,
             }
         };
@@ -711,19 +746,81 @@ impl ZaloGuiApp {
                 if !self.tools.new_poll_option_2.trim().is_empty() {
                     options.push(self.tools.new_poll_option_2.trim().to_string());
                 }
-                if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::CreatePoll {
-                            thread_id: thread.id.clone(),
+                let active_thread_id = self.current_thread().map(|t| t.id.clone());
+                if let Some(thread_id) = active_thread_id {
+                    let intent_key = (thread_id.clone(), question.clone());
+                    if let Some(&locked_req_id) = self.poll_intent_lock.get(&intent_key) {
+                        if let Some(op) = self.poll_operations.get(&locked_req_id) {
+                            match &op.phase {
+                                crate::gui::PollOpPhase::Pending => {
+                                    self.show_toast(
+                                        "Bình chọn này đang được gửi, vui lòng chờ máy chủ xác nhận",
+                                    );
+                                    return;
+                                }
+                                crate::gui::PollOpPhase::Indeterminate { error } => {
+                                    self.show_toast(format!(
+                                        "Bình chọn này chưa rõ kết quả ({error}). Vui lòng bấm '🔄 Tải bình chọn' để kiểm tra trước khi gửi lại."
+                                    ));
+                                    return;
+                                }
+                                _ => {
+                                    self.poll_intent_lock.remove(&intent_key);
+                                }
+                            }
+                        } else {
+                            self.poll_intent_lock.remove(&intent_key);
+                        }
+                    }
+
+                    let req_id = crate::search::generation();
+                    self.poll_operations.insert(
+                        req_id,
+                        crate::gui::PollOperation {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            thread_id: thread_id.clone(),
+                            request_id: req_id,
                             question: question.clone(),
-                            options,
-                        });
+                            options: options.clone(),
+                            phase: crate::gui::PollOpPhase::Pending,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+                    self.poll_intent_lock.insert(intent_key.clone(), req_id);
+                    self.poll_pending_intents.insert(intent_key.clone());
+                    let mut sent = false;
+                    if let Some(tx) = WORKER_TX.get() {
+                        if tx
+                            .send(WorkerCmd::CreatePoll {
+                                owner: self.user_uin.clone(),
+                                runtime_id: self.account_runtime_id,
+                                request_id: req_id,
+                                thread_id,
+                                question: question.clone(),
+                                options,
+                                multi: false,
+                                anonymous: false,
+                                allow_add: false,
+                            })
+                            .is_ok()
+                        {
+                            sent = true;
+                        }
+                    }
+                    if !sent {
+                        self.poll_operations.remove(&req_id);
+                        self.poll_intent_lock.remove(&intent_key);
+                        self.poll_pending_intents.remove(&intent_key);
+                        self.status_msg =
+                            "Không thể gửi lệnh tạo bình chọn: worker chưa sẵn sàng".into();
+                    } else {
+                        self.tools.new_poll_question.clear();
+                        self.tools.new_poll_option_1.clear();
+                        self.tools.new_poll_option_2.clear();
+                        self.status_msg = format!("Đang gửi lệnh tạo bình chọn: {question}...");
                     }
                 }
-                self.tools.new_poll_question.clear();
-                self.tools.new_poll_option_1.clear();
-                self.tools.new_poll_option_2.clear();
-                self.status_msg = format!("Đang gửi lệnh tạo bình chọn: {question}...");
             }
             if ui.button("🔄 Tải bình chọn").clicked() {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
@@ -735,6 +832,46 @@ impl ZaloGuiApp {
                 }
             }
         });
+
+        let current_tid = self.current_thread().map(|t| t.id.clone());
+        if let Some(ref tid) = current_tid {
+            let indeterminate_keys: Vec<(String, u64, String)> = self
+                .poll_operations
+                .iter()
+                .filter(|(_, op)| {
+                    op.thread_id == *tid
+                        && matches!(op.phase, crate::gui::PollOpPhase::Indeterminate { .. })
+                })
+                .map(|(&req_id, op)| {
+                    let err = match &op.phase {
+                        crate::gui::PollOpPhase::Indeterminate { error } => error.clone(),
+                        _ => String::new(),
+                    };
+                    (op.question.clone(), req_id, err)
+                })
+                .collect();
+            for (q, req_id, err) in indeterminate_keys {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!("⚠️ Bình chọn '{q}': chưa rõ kết quả ({err})"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(220, 100, 0)),
+                    );
+                    if ui
+                        .small_button("Hủy khóa")
+                        .on_hover_text("Bỏ khóa bình chọn này để cho phép tạo lại")
+                        .clicked()
+                    {
+                        self.poll_intent_lock.remove(&(tid.clone(), q.clone()));
+                        if let Some(op) = self.poll_operations.get_mut(&req_id) {
+                            op.phase = crate::gui::PollOpPhase::Rejected {
+                                error: "Người dùng hủy khóa".into(),
+                            };
+                        }
+                    }
+                });
+            }
+        }
 
         if !self.tools.group_polls.is_empty() {
             ui.add_space(6.0);
@@ -771,10 +908,59 @@ impl ZaloGuiApp {
         ui.label(
             "Gõ phím tắt (bắt đầu bằng '/') trong khung chat để gợi ý và chèn nhanh nội dung.",
         );
+        ui.add_space(4.0);
+
+        // Server sync and local migration buttons
+        ui.horizontal(|ui| {
+            let loading = self.quick_message_in_flight_list_id.is_some();
+            if ui
+                .add_enabled(!loading, egui::Button::new("🔄 Tải lại từ máy chủ"))
+                .clicked()
+                && self.is_logged_in
+            {
+                self.trigger_quick_messages_fetch();
+            }
+            if loading {
+                ui.label(RichText::new("Đang tải…").size(11.0));
+            } else if let Some(err) = &self.quick_message_list_error {
+                ui.label(
+                    RichText::new(format!("Tải thất bại: {err}"))
+                        .size(11.0)
+                        .color(Color32::from_rgb(200, 90, 40)),
+                );
+            }
+            let unmigrated_count = self.tools.config.quick_messages.unmigrated_items().len();
+            if unmigrated_count > 0
+                && self.is_logged_in
+                && ui
+                    .button(
+                        RichText::new(format!("☁️ Đồng bộ {unmigrated_count} mục lên máy chủ"))
+                            .strong()
+                            .color(Color32::from_rgb(0, 120, 215)),
+                    )
+                    .clicked()
+            {
+                if let Some(tx) = WORKER_TX.get() {
+                    for qm in self.tools.config.quick_messages.unmigrated_items() {
+                        let _ = tx.send(WorkerCmd::CreateQuickMessage {
+                            owner: self.user_uin.clone(),
+                            runtime_id: self.account_runtime_id,
+                            request_id: crate::search::generation(),
+                            keyword: qm.shortcut.clone(),
+                            message: qm.text.clone(),
+                            media: qm.media.clone(),
+                            msg_type: qm.msg_type,
+                        });
+                    }
+                }
+            }
+        });
         ui.add_space(6.0);
 
-        let mut remove_shortcut = None;
-        for (idx, qm) in self.tools.config.quick_messages.items.iter().enumerate() {
+        let mut remove_item = None;
+        for qm in self.tools.config.quick_messages.items.iter() {
+            let deleting = !qm.id.is_empty() && self.quick_message_delete_pending(&qm.id);
+            let unknown = !qm.id.is_empty() && self.quick_message_delete_unknown.contains(&qm.id);
             ui.group(|ui| {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -783,18 +969,41 @@ impl ZaloGuiApp {
                             .color(Color32::from_rgb(0, 120, 215)),
                     );
                     ui.label(format!("({})", qm.title));
+                    if qm.id.is_empty() {
+                        ui.label(
+                            RichText::new("[Cục bộ]")
+                                .size(10.5)
+                                .color(Color32::from_rgb(180, 140, 40)),
+                        );
+                    }
+                    if deleting {
+                        ui.label(
+                            RichText::new("Đang xóa trên máy chủ…")
+                                .size(10.5)
+                                .color(Color32::from_rgb(180, 140, 40)),
+                        );
+                    } else if unknown {
+                        ui.label(
+                            RichText::new("Chưa xác định kết quả xóa")
+                                .size(10.5)
+                                .color(Color32::from_rgb(200, 90, 40)),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("Xoá").clicked() {
-                            remove_shortcut = Some(idx);
+                        let label = if unknown { "Xoá lại" } else { "Xoá" };
+                        if ui
+                            .add_enabled(!deleting, egui::Button::new(label).small())
+                            .clicked()
+                        {
+                            remove_item = Some(qm.clone());
                         }
                     });
                 });
                 ui.label(RichText::new(&qm.text).size(12.5));
             });
         }
-        if let Some(idx) = remove_shortcut {
-            self.tools.config.quick_messages.items.remove(idx);
-            self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
+        if let Some(item) = remove_item {
+            self.request_quick_message_delete(&item);
         }
 
         ui.separator();
@@ -810,25 +1019,50 @@ impl ZaloGuiApp {
             ui.text_edit_singleline(&mut self.tools.new_quick_text);
         });
         if ui.button("➕ Thêm tin nhắn nhanh").clicked() {
-            let sc = self.tools.new_quick_shortcut.trim();
-            let title = self.tools.new_quick_title.trim();
-            let text = self.tools.new_quick_text.trim();
-            if !sc.is_empty() && !text.is_empty() {
-                let shortcut = if sc.starts_with('/') {
-                    sc.to_string()
-                } else {
-                    format!("/{sc}")
-                };
-                self.tools
-                    .config
-                    .quick_messages
-                    .upsert(shortcut, title.into(), text.into());
-                self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
+            let sc = self.tools.new_quick_shortcut.trim().to_string();
+            let title = self.tools.new_quick_title.trim().to_string();
+            let text = self.tools.new_quick_text.trim().to_string();
+            if self.add_quick_message_local(&sc, &title, &text) {
                 self.tools.new_quick_shortcut.clear();
                 self.tools.new_quick_title.clear();
                 self.tools.new_quick_text.clear();
             }
         }
+    }
+
+    /// Local create/update of a quick message (also queues the server create when logged in).
+    /// Returns false when the input is empty. Changes confirmed state, so the revision is bumped
+    /// before the config is persisted.
+    pub(super) fn add_quick_message_local(&mut self, sc: &str, title: &str, text: &str) -> bool {
+        if sc.is_empty() || text.is_empty() {
+            return false;
+        }
+        let shortcut = if sc.starts_with('/') {
+            sc.to_string()
+        } else {
+            format!("/{sc}")
+        };
+        if self.is_logged_in {
+            if let Some(tx) = WORKER_TX.get() {
+                let _ = tx.send(WorkerCmd::CreateQuickMessage {
+                    owner: self.user_uin.clone(),
+                    runtime_id: self.account_runtime_id,
+                    request_id: crate::search::generation(),
+                    keyword: shortcut.clone(),
+                    message: text.to_string(),
+                    media: None,
+                    msg_type: 0,
+                });
+            }
+        }
+        self.tools
+            .config
+            .quick_messages
+            .upsert(shortcut, title.into(), text.into());
+        // A local edit changes confirmed Quick Messages state: older cache loads are stale.
+        self.bump_quick_message_revision();
+        self.tools_command(ToolsCommand::Save(self.tools.config.clone()));
+        true
     }
 
     fn render_tools_business_lan(&mut self, ui: &mut egui::Ui) {
@@ -870,6 +1104,92 @@ impl ZaloGuiApp {
         ui.label(format!("Trạng thái OCR: {status_desc}"));
     }
 
+    /// Dispatch a server media fetch request for ToolsPanel.
+    ///
+    /// Preserves the confirmed snapshot across in-flight reloads for the same category/thread,
+    /// tracking pending request metadata independently.
+    /// Returns `true` if the request was successfully enqueued to the worker.
+    pub fn dispatch_tools_server_media_request(
+        &mut self,
+        thread_id: &str,
+        media_type: u8,
+        mode: ServerMediaFetchMode,
+        sender: Option<&tokio::sync::mpsc::UnboundedSender<WorkerCmd>>,
+    ) -> bool {
+        if thread_id.is_empty() || self.tools.server_media_loading {
+            return false;
+        }
+
+        let is_same_scope = self.tools.server_media_thread_id == thread_id
+            && self.tools.server_media_type == media_type;
+
+        // When switching thread or category on reload, reset the confirmed snapshot
+        // so items from previous scope are not mislabeled.
+        if mode == ServerMediaFetchMode::Reload && !is_same_scope {
+            self.tools.server_media_items.clear();
+            self.tools.server_media_page = 0;
+            self.tools.server_media_has_more = false;
+            self.tools.server_media_next_cursor = None;
+            self.tools.server_media_thread_id = thread_id.to_string();
+            self.tools.server_media_type = media_type;
+        }
+
+        let (page, cursor) = match mode {
+            ServerMediaFetchMode::Reload => (1, None),
+            ServerMediaFetchMode::Append => {
+                if !self.tools.server_media_has_more
+                    || self.tools.server_media_next_cursor.is_none()
+                {
+                    return false;
+                }
+                (
+                    self.tools.server_media_page + 1,
+                    self.tools.server_media_next_cursor.clone(),
+                )
+            }
+        };
+
+        let gen = self.tools.server_media_generation.wrapping_add(1);
+        let cmd = WorkerCmd::FetchServerMedia {
+            runtime_id: self.account_runtime_id,
+            thread_id: thread_id.to_string(),
+            media_type,
+            page,
+            count: 30,
+            cursor: cursor.clone(),
+            generation: gen,
+            target: crate::server_media::ServerMediaTarget::ToolsPanel,
+        };
+
+        let sent = if let Some(tx) = sender {
+            tx.send(cmd).is_ok()
+        } else if let Some(tx) = WORKER_TX.get() {
+            tx.send(cmd).is_ok()
+        } else {
+            false
+        };
+
+        if sent {
+            self.tools.server_media_generation = gen;
+            self.tools.server_media_loading = true;
+            self.tools.server_media_pending = Some(PendingServerMediaRequest {
+                runtime_id: self.account_runtime_id,
+                thread_id: thread_id.to_string(),
+                media_type,
+                generation: gen,
+                mode,
+                requested_page: page,
+                requested_cursor: cursor,
+            });
+            true
+        } else {
+            self.tools.server_media_loading = false;
+            self.tools.server_media_pending = None;
+            self.status_msg = "Không thể gửi yêu cầu tải media: worker chưa sẵn sàng".into();
+            false
+        }
+    }
+
     fn render_tools_server_media_zcloud(&mut self, ui: &mut egui::Ui) {
         // Finding 4: Stale Server Media State Across Thread Switches
         // When active thread differs from self.tools.server_media_thread_id while non-empty,
@@ -884,10 +1204,11 @@ impl ZaloGuiApp {
         {
             self.tools.server_media_thread_id = current_thread_id.to_string();
             self.tools.server_media_items.clear();
-            self.tools.server_media_page = 1;
+            self.tools.server_media_page = 0;
             self.tools.server_media_has_more = false;
             self.tools.server_media_next_cursor = None;
             self.tools.server_media_loading = false;
+            self.tools.server_media_pending = None;
             self.tools.server_media_generation = self.tools.server_media_generation.wrapping_add(1);
         }
 
@@ -907,26 +1228,13 @@ impl ZaloGuiApp {
                 .clicked()
             {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                    self.tools.server_media_generation =
-                        self.tools.server_media_generation.wrapping_add(1);
-                    self.tools.server_media_thread_id = thread.id.clone();
-                    self.tools.server_media_type = 1;
-                    self.tools.server_media_page = 1;
-                    self.tools.server_media_has_more = false;
-                    self.tools.server_media_next_cursor = None;
-                    self.tools.server_media_loading = true;
-                    self.tools.server_media_items.clear();
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::FetchServerMedia {
-                            runtime_id: self.account_runtime_id,
-                            thread_id: thread.id.clone(),
-                            media_type: 1,
-                            page: 1,
-                            count: 30,
-                            cursor: None,
-                            generation: self.tools.server_media_generation,
-                        });
-                    }
+                    let tid = thread.id.clone();
+                    self.dispatch_tools_server_media_request(
+                        &tid,
+                        1,
+                        ServerMediaFetchMode::Reload,
+                        None,
+                    );
                 }
             }
             if ui
@@ -934,26 +1242,13 @@ impl ZaloGuiApp {
                 .clicked()
             {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                    self.tools.server_media_generation =
-                        self.tools.server_media_generation.wrapping_add(1);
-                    self.tools.server_media_thread_id = thread.id.clone();
-                    self.tools.server_media_type = 3;
-                    self.tools.server_media_page = 1;
-                    self.tools.server_media_has_more = false;
-                    self.tools.server_media_next_cursor = None;
-                    self.tools.server_media_loading = true;
-                    self.tools.server_media_items.clear();
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::FetchServerMedia {
-                            runtime_id: self.account_runtime_id,
-                            thread_id: thread.id.clone(),
-                            media_type: 3,
-                            page: 1,
-                            count: 30,
-                            cursor: None,
-                            generation: self.tools.server_media_generation,
-                        });
-                    }
+                    let tid = thread.id.clone();
+                    self.dispatch_tools_server_media_request(
+                        &tid,
+                        3,
+                        ServerMediaFetchMode::Reload,
+                        None,
+                    );
                 }
             }
             if ui
@@ -961,26 +1256,13 @@ impl ZaloGuiApp {
                 .clicked()
             {
                 if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                    self.tools.server_media_generation =
-                        self.tools.server_media_generation.wrapping_add(1);
-                    self.tools.server_media_thread_id = thread.id.clone();
-                    self.tools.server_media_type = 4;
-                    self.tools.server_media_page = 1;
-                    self.tools.server_media_has_more = false;
-                    self.tools.server_media_next_cursor = None;
-                    self.tools.server_media_loading = true;
-                    self.tools.server_media_items.clear();
-                    if let Some(tx) = WORKER_TX.get() {
-                        let _ = tx.send(WorkerCmd::FetchServerMedia {
-                            runtime_id: self.account_runtime_id,
-                            thread_id: thread.id.clone(),
-                            media_type: 4,
-                            page: 1,
-                            count: 30,
-                            cursor: None,
-                            generation: self.tools.server_media_generation,
-                        });
-                    }
+                    let tid = thread.id.clone();
+                    self.dispatch_tools_server_media_request(
+                        &tid,
+                        4,
+                        ServerMediaFetchMode::Reload,
+                        None,
+                    );
                 }
             }
             if is_loading {
@@ -1093,19 +1375,14 @@ impl ZaloGuiApp {
                         .clicked()
                     {
                         if let Some(thread) = self.threads.get(self.selected_thread_index) {
-                            let next_page = self.tools.server_media_page + 1;
-                            self.tools.server_media_loading = true;
-                            if let Some(tx) = WORKER_TX.get() {
-                                let _ = tx.send(WorkerCmd::FetchServerMedia {
-                                    runtime_id: self.account_runtime_id,
-                                    thread_id: thread.id.clone(),
-                                    media_type: self.tools.server_media_type,
-                                    page: next_page,
-                                    count: 30,
-                                    cursor: self.tools.server_media_next_cursor.clone(),
-                                    generation: self.tools.server_media_generation,
-                                });
-                            }
+                            let tid = thread.id.clone();
+                            let media_type = self.tools.server_media_type;
+                            self.dispatch_tools_server_media_request(
+                                &tid,
+                                media_type,
+                                ServerMediaFetchMode::Append,
+                                None,
+                            );
                         }
                     }
                     if is_loading {

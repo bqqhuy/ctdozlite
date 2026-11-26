@@ -689,6 +689,7 @@ impl ZaloGuiApp {
             .is_ok()
         }) {
             self.attachment_drafts.threads.remove(thread);
+            self.bump_draft_generation(thread);
             self.input_message.clear();
             self.composer_mentions.clear();
             self.composer_focus_pending = true;

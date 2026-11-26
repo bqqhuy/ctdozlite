@@ -1783,6 +1783,17 @@ impl ZaloGuiApp {
                                                 .show(ui, |ui| {
                                                     let msg_lbl_w = (content_w - 96.0).max(48.0);
                                                     ui.horizontal(|ui| {
+                                                        ui.vertical(|ui| {
+                                                            ui.set_max_width(msg_lbl_w);
+                                                            ui.label(RichText::new(crate::i18n::tr("Nhấn Enter để gửi tin nhắn")).color(pal.text_primary).size(13.2))
+                                                                .on_hover_text(crate::i18n::tr("Khi bật: Enter để gửi tin, Shift+Enter xuống dòng. Khi tắt: Enter để xuống dòng, Ctrl+Enter để gửi tin."));
+                                                        });
+                                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                                            render_toggle_switch(ui, &mut self.settings.enter_to_send, pal);
+                                                        });
+                                                    });
+                                                    ui.add_space(8.0);
+                                                    ui.horizontal(|ui| {
                                                         ui.vertical(|ui| { ui.set_max_width(msg_lbl_w); ui.label(RichText::new(crate::i18n::tr("Tin nhắn nhanh")).color(pal.text_primary).size(13.2)); });
                                                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                                             render_toggle_switch(ui, &mut self.settings.quick_messages_enabled, pal);

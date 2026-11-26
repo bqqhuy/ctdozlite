@@ -22,6 +22,7 @@ pub(super) enum ThreadFilter {
     Direct,
     Groups,
     Archived,
+    Starred,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2162,6 +2163,7 @@ impl ZaloGuiApp {
                 return;
             }
             self.input_message.clear();
+            self.bump_draft_generation(thread_id);
             self.dismissed_sticker_suggest_for.clear();
             self.composer_sticker_selected = None;
             self.composer_focus_pending = true;

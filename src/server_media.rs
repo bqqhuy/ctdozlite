@@ -9,6 +9,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Target consumer for server media requests, separating tools panel from right drawer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServerMediaTarget {
+    ToolsPanel,
+    RightDrawer,
+}
+
 /// Category of media stored on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerMediaType {

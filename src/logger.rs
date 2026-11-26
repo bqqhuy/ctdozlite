@@ -147,6 +147,40 @@ pub fn log_error(context: &str, err: &str) {
     }
 }
 
+pub fn log_info(context: &str, msg: &str) {
+    if !is_dev_mode() {
+        return;
+    }
+    let now = crate::login::unix_now();
+    let time_str = format!(
+        "{:02}:{:02}:{:02}",
+        (now / 3600) % 24,
+        (now / 60) % 60,
+        now % 60
+    );
+
+    if let Ok(mut state) = LOGGER.lock() {
+        state.counter += 1;
+        let entry = LogEntry {
+            id: state.counter,
+            timestamp: time_str,
+            method: "INFO".to_string(),
+            url: crate::session::redact_url(context),
+            status: Some(200),
+            latency_ms: 0,
+            payload_preview: crate::session::redact_text(msg),
+            decrypted_preview: None,
+            is_error: false,
+            error_msg: None,
+        };
+
+        state.entries.push_back(entry);
+        if state.entries.len() > state.max_entries {
+            state.entries.pop_front();
+        }
+    }
+}
+
 pub fn get_entries() -> Vec<LogEntry> {
     LOGGER
         .lock()
